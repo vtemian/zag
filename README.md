@@ -4,11 +4,6 @@
 
 Built in Zig. Modal. Extensible. Everything above the primitives is a plugin.
 
-[![Zig](https://img.shields.io/badge/zig-0.15+-f7a41d?style=flat&logo=zig)](https://ziglang.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Lines of Code](https://img.shields.io/badge/loc-5.8k-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
-
 > **Warning**
 > This is a **personal, highly opinionated project** in heavy development. I'm building it because I want to. It will be slow. It will take time. APIs will change, things will break, and the architecture is still taking shape. If you're here, you're early.
 
