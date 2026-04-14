@@ -48,14 +48,14 @@ pub const definition = types.ToolDefinition{
     .name = "read",
     .description = "Read the contents of a file. Returns the text content, truncated to max_lines (default 2000).",
     .input_schema_json =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "path": { "type": "string", "description": "Path to the file to read" },
-        \\    "max_lines": { "type": "integer", "description": "Maximum lines to return (default 2000)" }
-        \\  },
-        \\  "required": ["path"]
-        \\}
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "path": { "type": "string", "description": "Path to the file to read" },
+    \\    "max_lines": { "type": "integer", "description": "Maximum lines to return (default 2000)" }
+    \\  },
+    \\  "required": ["path"]
+    \\}
     ,
 };
 

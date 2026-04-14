@@ -70,15 +70,15 @@ pub const definition = types.ToolDefinition{
     .name = "edit",
     .description = "Replace text in an existing file. old_text must match exactly once. If it matches zero or multiple times, an error is returned.",
     .input_schema_json =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "path": { "type": "string", "description": "Path to the file to edit" },
-        \\    "old_text": { "type": "string", "description": "Exact text to find (must match once)" },
-        \\    "new_text": { "type": "string", "description": "Text to replace old_text with" }
-        \\  },
-        \\  "required": ["path", "old_text", "new_text"]
-        \\}
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "path": { "type": "string", "description": "Path to the file to edit" },
+    \\    "old_text": { "type": "string", "description": "Exact text to find (must match once)" },
+    \\    "new_text": { "type": "string", "description": "Text to replace old_text with" }
+    \\  },
+    \\  "required": ["path", "old_text", "new_text"]
+    \\}
     ,
 };
 
