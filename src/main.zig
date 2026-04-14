@@ -1,21 +1,17 @@
+//! Entry point for the zag agent — handles stdin loop, banner display,
+//! and dispatches user input to the agent loop.
+
 const std = @import("std");
 const agent = @import("agent.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
-fn print(comptime fmt: []const u8, args: anytype) void {
-    const stdout = std.fs.File.stdout();
-    var buf: [8192]u8 = undefined;
-    var w = stdout.writer(&buf);
-    w.interface.print(fmt, args) catch {};
-    w.interface.flush() catch {};
-}
+const log = std.log.scoped(.main);
 
-fn write(msg: []const u8) void {
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll(msg) catch {};
-}
+const stdout = std.fs.File.stdout();
 
+/// Read a single line from stdin, trimming whitespace.
+/// Returns null on EOF or read error.
 fn readLine(buf: []u8) ?[]const u8 {
     const stdin = std.fs.File.stdin();
     var reader_buf: [4096]u8 = undefined;
@@ -36,6 +32,7 @@ fn readLine(buf: []u8) ?[]const u8 {
     return std.mem.trim(u8, buf[0..i], " \t\r\n");
 }
 
+/// Top-level entry: initializes allocator, reads API key, runs the REPL loop.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -43,7 +40,7 @@ pub fn main() !void {
 
     // Get API key
     const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch {
-        write("error: ANTHROPIC_API_KEY not set\n");
+        log.err("ANTHROPIC_API_KEY not set", .{});
         return;
     };
     defer allocator.free(api_key);
@@ -57,19 +54,22 @@ pub fn main() !void {
     defer messages.deinit(allocator);
 
     // Print banner
-    write("zag v0.1.0\n");
-    write("model: claude-sonnet-4-20250514\n");
-    write("tools: read, write, edit, bash\n");
+    stdout.writeAll("zag v0.1.0\n") catch {};
+    stdout.writeAll("model: claude-sonnet-4-20250514\n") catch {};
+    stdout.writeAll("tools: read, write, edit, bash\n") catch {};
 
     // Get current working directory for display
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
-    print("cwd: {s}\n\n", .{cwd});
+    var write_buf: [8192]u8 = undefined;
+    var w = stdout.writer(&write_buf);
+    w.interface.print("cwd: {s}\n\n", .{cwd}) catch {};
+    w.interface.flush() catch {};
 
     // Main input loop
     var input_buf: [64 * 1024]u8 = undefined;
     while (true) {
-        write("> ");
+        stdout.writeAll("> ") catch {};
 
         const trimmed = readLine(&input_buf) orelse break;
         if (trimmed.len == 0) continue;
@@ -79,9 +79,13 @@ pub fn main() !void {
         }
 
         agent.runLoop(trimmed, &messages, &registry, api_key, allocator) catch |err| {
-            print("[error] {s}\n", .{@errorName(err)});
+            log.err("agent loop failed: {s}", .{@errorName(err)});
         };
     }
+}
+
+test {
+    @import("std").testing.refAllDecls(@This());
 }
 
 test "imports compile" {
