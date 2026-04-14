@@ -1,8 +1,14 @@
+//! Agent loop: drives the LLM call → tool execution → repeat cycle.
+//! Each turn sends the conversation to Claude, executes any requested tools,
+//! appends results, and loops until the model returns a text-only response.
+
 const std = @import("std");
 const types = @import("types.zig");
 const llm = @import("llm.zig");
 const tools_mod = @import("tools.zig");
 const Allocator = std.mem.Allocator;
+
+const log = std.log.scoped(.agent);
 
 const system_prompt =
     \\You are an expert coding assistant operating inside zag, a coding agent harness.
@@ -21,18 +27,9 @@ const system_prompt =
     \\- Prefer editing over rewriting entire files
 ;
 
-fn printOut(comptime fmt: []const u8, args: anytype) void {
-    const stdout = std.fs.File.stdout();
-    var buf: [8192]u8 = undefined;
-    var w = stdout.writer(&buf);
-    w.interface.print(fmt, args) catch {};
-    w.interface.flush() catch {};
-}
-
-fn writeOut(msg: []const u8) void {
-    std.fs.File.stdout().writeAll(msg) catch {};
-}
-
+/// Runs the agent loop for a single user turn. Appends the user message,
+/// then repeatedly calls the LLM and executes tool requests until the model
+/// produces a text-only response with no tool calls.
 pub fn runLoop(
     user_text: []const u8,
     messages: *std.ArrayList(types.Message),
@@ -42,6 +39,7 @@ pub fn runLoop(
 ) !void {
     // Add user message
     const user_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(user_content);
     user_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, user_text) } };
     try messages.append(allocator, .{ .role = .user, .content = user_content });
 
@@ -58,24 +56,26 @@ pub fn runLoop(
             api_key,
             allocator,
         ) catch |err| {
-            printOut("\n[error] LLM call failed: {s}\n", .{@errorName(err)});
+            log.err("LLM call failed: {s}", .{@errorName(err)});
             return;
         };
 
         // Add assistant message
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
-        // Print token usage
-        printOut("\n[tokens] in: {d}, out: {d}\n", .{ response.input_tokens, response.output_tokens });
+        log.info("tokens in: {d}, out: {d}", .{ response.input_tokens, response.output_tokens });
 
         // Collect tool calls and text
         var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
         defer tool_calls.deinit(allocator);
 
+        const stdout = std.fs.File.stdout();
         for (response.content) |block| {
             switch (block) {
                 .text => |t| {
-                    printOut("\n{s}\n", .{t.text});
+                    stdout.writeAll("\n") catch {};
+                    stdout.writeAll(t.text) catch {};
+                    stdout.writeAll("\n") catch {};
                 },
                 .tool_use => |tu| {
                     try tool_calls.append(allocator, tu);
@@ -91,20 +91,19 @@ pub fn runLoop(
         var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
 
         for (tool_calls.items) |tc| {
-            printOut("[tool] {s}\n", .{tc.name});
+            log.info("executing tool: {s}", .{tc.name});
 
             const result = try registry.execute(tc.name, tc.input_raw, allocator);
 
-            // Print a short summary
             if (result.is_error) {
-                printOut("  > error: {s}\n", .{result.content});
+                log.info("tool error: {s}", .{result.content});
             } else {
                 const preview = blk: {
                     const max_preview = 80;
                     if (result.content.len <= max_preview) break :blk result.content;
                     break :blk result.content[0..max_preview];
                 };
-                printOut("  > {s}...\n", .{preview});
+                log.info("tool result: {s}...", .{preview});
             }
 
             try result_blocks.append(allocator, .{ .tool_result = .{
@@ -119,5 +118,77 @@ pub fn runLoop(
             .role = .user,
             .content = try result_blocks.toOwnedSlice(allocator),
         });
+    }
+}
+
+test "user message is appended with correct role and content" {
+    const allocator = std.testing.allocator;
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            for (msg.content) |block| {
+                switch (block) {
+                    .text => |t| allocator.free(t.text),
+                    .tool_use => {},
+                    .tool_result => {},
+                }
+            }
+            allocator.free(msg.content);
+        }
+        messages.deinit(allocator);
+    }
+
+    const user_text = "hello world";
+    const user_content = try allocator.alloc(types.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, user_text) } };
+    try messages.append(allocator, .{ .role = .user, .content = user_content });
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqual(@as(usize, 1), messages.items[0].content.len);
+
+    switch (messages.items[0].content[0]) {
+        .text => |t| try std.testing.expectEqualStrings("hello world", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tool results are collected into a user message" {
+    const allocator = std.testing.allocator;
+
+    var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+    defer result_blocks.deinit(allocator);
+
+    try result_blocks.append(allocator, .{ .tool_result = .{
+        .tool_use_id = "toolu_123",
+        .content = "file contents here",
+        .is_error = false,
+    } });
+    try result_blocks.append(allocator, .{ .tool_result = .{
+        .tool_use_id = "toolu_456",
+        .content = "error: not found",
+        .is_error = true,
+    } });
+
+    const slice = try result_blocks.toOwnedSlice(allocator);
+    defer allocator.free(slice);
+
+    try std.testing.expectEqual(@as(usize, 2), slice.len);
+
+    switch (slice[0]) {
+        .tool_result => |tr| {
+            try std.testing.expectEqualStrings("toolu_123", tr.tool_use_id);
+            try std.testing.expect(!tr.is_error);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (slice[1]) {
+        .tool_result => |tr| {
+            try std.testing.expectEqualStrings("toolu_456", tr.tool_use_id);
+            try std.testing.expect(tr.is_error);
+        },
+        else => return error.TestUnexpectedResult,
     }
 }

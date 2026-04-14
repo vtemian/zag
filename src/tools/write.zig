@@ -1,3 +1,8 @@
+//! Write tool — creates or overwrites a file with the given content.
+//!
+//! Automatically creates parent directories if they do not exist.
+//! Returns a confirmation message with the number of lines written.
+
 const std = @import("std");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
@@ -7,6 +12,7 @@ const WriteInput = struct {
     content: []const u8,
 };
 
+/// Write content to a file, creating parent directories as needed.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
         return .{ .content = "error: invalid input — expected { \"path\": \"...\", \"content\": \"...\" }", .is_error = true };
@@ -45,6 +51,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     return .{ .content = msg };
 }
 
+/// JSON schema and metadata sent to the LLM so it knows how to invoke this tool.
 pub const definition = types.ToolDefinition{
     .name = "write",
     .description = "Create or overwrite a file with the given content. Creates parent directories if needed.",
@@ -60,7 +67,52 @@ pub const definition = types.ToolDefinition{
     ,
 };
 
+/// Pre-built Tool value combining definition and execute function.
 pub const tool = types.Tool{
     .definition = definition,
     .execute = &execute,
 };
+
+test "write a new file" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/zag-test-write-new.txt";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"hello world\\n\"}}", .{tmp_path});
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote") != null);
+
+    // Verify file was actually written
+    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings("hello world\n", written);
+}
+
+test "write counts lines correctly" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/zag-test-write-lines.txt";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // 3 newlines => 4 lines (trailing partial line counts)
+    const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"a\\nb\\nc\\n\"}}", .{tmp_path});
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote 4 lines") != null);
+}
+
+test "write with invalid input returns error" {
+    const allocator = std.testing.allocator;
+    const result = try execute("not json", allocator);
+    try std.testing.expect(result.is_error);
+}

@@ -1,3 +1,8 @@
+//! Read tool — reads file contents and returns them as text.
+//!
+//! Supports a `max_lines` parameter to truncate large files (default 2000).
+//! Files larger than 10 MB are rejected.
+
 const std = @import("std");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
@@ -7,6 +12,7 @@ const ReadInput = struct {
     max_lines: ?u32 = null,
 };
 
+/// Read a file from disk. Returns the text content, truncated to max_lines if the file is long.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(ReadInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
         return .{ .content = "error: invalid input — expected { \"path\": \"...\" }", .is_error = true };
@@ -44,6 +50,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     return .{ .content = content };
 }
 
+/// JSON schema and metadata sent to the LLM so it knows how to invoke this tool.
 pub const definition = types.ToolDefinition{
     .name = "read",
     .description = "Read the contents of a file. Returns the text content, truncated to max_lines (default 2000).",
@@ -59,7 +66,69 @@ pub const definition = types.ToolDefinition{
     ,
 };
 
+/// Pre-built Tool value combining definition and execute function.
 pub const tool = types.Tool{
     .definition = definition,
     .execute = &execute,
 };
+
+test "read existing file" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/zag-test-read-existing.txt";
+    const test_content = "line one\nline two\nline three\n";
+
+    // Write a temp file to read back
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        try file.writeAll(test_content);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\"}}", .{tmp_path});
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(test_content, result.content);
+}
+
+test "read non-existent file returns error" {
+    const allocator = std.testing.allocator;
+
+    const input =
+        \\{"path": "/tmp/zag-test-does-not-exist-12345.txt"}
+    ;
+
+    const result = try execute(input, allocator);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "error:") != null);
+}
+
+test "read with max_lines truncation" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/zag-test-read-truncate.txt";
+    // 5 lines
+    const test_content = "a\nb\nc\nd\ne\n";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        try file.writeAll(test_content);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"max_lines\": 2}}", .{tmp_path});
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated at 2 lines") != null);
+}
