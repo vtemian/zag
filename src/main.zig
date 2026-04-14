@@ -484,6 +484,7 @@ test "imports compile" {
     _ = @import("NodeRenderer.zig");
     _ = @import("Layout.zig");
     _ = @import("Compositor.zig");
+    _ = @import("VtBuffer.zig");
 }
 
 test "inputAppendChar adds character" {
