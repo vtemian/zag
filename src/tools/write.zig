@@ -40,6 +40,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     };
 
     const line_count = blk: {
+        if (input.content.len == 0) break :blk @as(u32, 0);
         var count: u32 = 1;
         for (input.content) |c| {
             if (c == '\n') count += 1;
@@ -72,6 +73,10 @@ pub const tool = types.Tool{
     .definition = definition,
     .execute = &execute,
 };
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
 
 test "write a new file" {
     const allocator = std.testing.allocator;

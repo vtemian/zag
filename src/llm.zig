@@ -10,7 +10,7 @@ const log = std.log.scoped(.llm);
 const api_url = "https://api.anthropic.com/v1/messages";
 const api_version = "2023-06-01";
 const default_model = "claude-sonnet-4-20250514";
-const max_tokens = 8096;
+const max_tokens = 8192;
 
 /// Sends a conversation to Claude's Messages API and returns the parsed response.
 /// Caller owns the returned LlmResponse and its content block allocations.
@@ -220,21 +220,6 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
     };
 }
 
-fn freeContentBlocks(blocks: []const types.ContentBlock, allocator: Allocator) void {
-    for (blocks) |block| {
-        switch (block) {
-            .text => |t| allocator.free(t.text),
-            .tool_use => |tu| {
-                allocator.free(tu.id);
-                allocator.free(tu.name);
-                allocator.free(tu.input_raw);
-            },
-            .tool_result => {},
-        }
-    }
-    allocator.free(blocks);
-}
-
 test "parseResponse parses text-only response" {
     const allocator = std.testing.allocator;
 
@@ -253,7 +238,7 @@ test "parseResponse parses text-only response" {
     ;
 
     const response = try parseResponse(json, allocator);
-    defer freeContentBlocks(response.content, allocator);
+    defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), response.content.len);
     try std.testing.expectEqual(.end_turn, response.stop_reason);
@@ -285,7 +270,7 @@ test "parseResponse parses tool_use response" {
     ;
 
     const response = try parseResponse(json, allocator);
-    defer freeContentBlocks(response.content, allocator);
+    defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), response.content.len);
     try std.testing.expectEqual(.tool_use, response.stop_reason);
@@ -304,6 +289,159 @@ test "parseResponse parses tool_use response" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "writeMessage serializes tool_use content block" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_use = .{
+        .id = "toolu_001",
+        .name = "read",
+        .input_raw = "{\"path\":\"/tmp/test.txt\"}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    // Verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    const blocks = root.get("content").?.array;
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expectEqualStrings("tool_use", blocks.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("toolu_001", blocks.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("read", blocks.items[0].object.get("name").?.string);
+}
+
+test "writeMessage serializes tool_result content block" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_result = .{
+        .tool_use_id = "toolu_001",
+        .content = "file contents here",
+        .is_error = false,
+    } };
+
+    const msg = types.Message{ .role = .user, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("user", root.get("role").?.string);
+    const blocks = root.get("content").?.array;
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expectEqualStrings("tool_result", blocks.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("toolu_001", blocks.items[0].object.get("tool_use_id").?.string);
+}
+
+test "writeMessage serializes error tool_result with is_error flag" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_result = .{
+        .tool_use_id = "toolu_002",
+        .content = "error: not found",
+        .is_error = true,
+    } };
+
+    const msg = types.Message{ .role = .user, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const blocks = parsed.value.object.get("content").?.array;
+    const block = blocks.items[0].object;
+    try std.testing.expect(block.get("is_error").?.bool);
+}
+
+test "parseResponse returns error for malformed JSON" {
+    const allocator = std.testing.allocator;
+    const result = parseResponse("not valid json at all", allocator);
+    try std.testing.expectError(error.SyntaxError, result);
+}
+
+test "parseResponse handles empty content array" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "id": "msg_789",
+        \\  "type": "message",
+        \\  "role": "assistant",
+        \\  "content": [],
+        \\  "stop_reason": "end_turn",
+        \\  "usage": {"input_tokens": 1, "output_tokens": 1}
+        \\}
+    ;
+
+    const response = try parseResponse(json, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), response.content.len);
+    try std.testing.expectEqual(.end_turn, response.stop_reason);
+}
+
+test "parseResponse handles missing usage gracefully" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "id": "msg_789",
+        \\  "type": "message",
+        \\  "role": "assistant",
+        \\  "content": [{"type": "text", "text": "hi"}],
+        \\  "stop_reason": "end_turn"
+        \\}
+    ;
+
+    const response = try parseResponse(json, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
+    try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
+}
+
+test "parseResponse maps unknown stop_reason to end_turn" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "id": "msg_789",
+        \\  "type": "message",
+        \\  "role": "assistant",
+        \\  "content": [{"type": "text", "text": "hi"}],
+        \\  "stop_reason": "some_future_reason",
+        \\  "usage": {"input_tokens": 1, "output_tokens": 1}
+        \\}
+    ;
+
+    const response = try parseResponse(json, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(.end_turn, response.stop_reason);
 }
 
 test "buildRequestBody produces valid JSON" {

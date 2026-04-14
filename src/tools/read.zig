@@ -72,6 +72,10 @@ pub const tool = types.Tool{
     .execute = &execute,
 };
 
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
 test "read existing file" {
     const allocator = std.testing.allocator;
 

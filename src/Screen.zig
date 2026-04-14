@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.screen);
 
 const Screen = @This();
 
@@ -21,11 +22,17 @@ pub const Color = union(enum) {
 
 /// Text style attributes, packed for compact storage within each Cell.
 pub const Style = packed struct {
+    /// Bold/increased intensity (SGR 1).
     bold: bool = false,
+    /// Italic (SGR 3).
     italic: bool = false,
+    /// Underlined text (SGR 4).
     underline: bool = false,
+    /// Dim/faint intensity (SGR 2).
     dim: bool = false,
+    /// Swap foreground and background colors (SGR 7).
     inverse: bool = false,
+    /// Strikethrough / crossed-out text (SGR 9).
     strikethrough: bool = false,
 };
 
@@ -56,7 +63,10 @@ const empty_cell = Cell{};
 
 /// Initialize a new screen with the given dimensions.
 /// Both grids are filled with empty (space) cells.
+/// Width and height must both be non-zero.
 pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
+    if (width == 0 or height == 0) return error.ZeroDimension;
+
     const size: usize = @as(usize, width) * @as(usize, height);
     const current = try allocator.alloc(Cell, size);
     errdefer allocator.free(current);
@@ -103,14 +113,20 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
 
 /// Get a mutable pointer to a cell in the current grid.
 /// Row and column are zero-indexed.
+/// Caller must ensure row < height and col < width.
 pub fn getCell(self: *Screen, row: u16, col: u16) *Cell {
+    std.debug.assert(row < self.height);
+    std.debug.assert(col < self.width);
     const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
     return &self.current[idx];
 }
 
 /// Get a const pointer to a cell in the current grid.
 /// Row and column are zero-indexed.
+/// Caller must ensure row < height and col < width.
 pub fn getCellConst(self: *const Screen, row: u16, col: u16) *const Cell {
+    std.debug.assert(row < self.height);
+    std.debug.assert(col < self.width);
     const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
     return &self.current[idx];
 }
@@ -148,8 +164,10 @@ fn colorsEqual(a: Color, b: Color) bool {
 }
 
 /// Diff the current grid against the previous grid and write minimal ANSI
-/// escape sequences to the provided stdout file. After rendering, copies
-/// current → previous for the next frame.
+/// escape sequences to the provided stdout file.
+///
+/// **Mutates self**: copies current → previous after writing, so a
+/// subsequent render with no intervening cell changes produces no output.
 pub fn render(self: *Screen, file: std.fs.File) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(self.allocator);
@@ -197,9 +215,16 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                 last_bg = cur.bg;
             }
 
-            // Write the codepoint as UTF-8
+            // Write the codepoint as UTF-8, falling back to U+FFFD for invalid codepoints
             var cp_buf: [4]u8 = undefined;
-            const cp_len = std.unicode.utf8Encode(cur.codepoint, &cp_buf) catch 1;
+            const cp_len = std.unicode.utf8Encode(cur.codepoint, &cp_buf) catch |err| blk: {
+                log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cur.codepoint), err });
+                // U+FFFD REPLACEMENT CHARACTER (0xEF 0xBF 0xBD)
+                cp_buf[0] = 0xEF;
+                cp_buf[1] = 0xBF;
+                cp_buf[2] = 0xBD;
+                break :blk 3;
+            };
             try writer.writeAll(cp_buf[0..cp_len]);
 
             cursor_col +|= 1;
@@ -215,7 +240,7 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
     try writer.writeAll("\x1b[?2026l");
 
     // Single write to stdout
-    file.writeAll(buf.items) catch |err| return err;
+    try file.writeAll(buf.items);
 
     // Copy current → previous
     @memcpy(self.previous, self.current);
@@ -262,19 +287,15 @@ fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
 
 // -- Tests -------------------------------------------------------------------
 
-/// Read all bytes from a pipe's read end into a stack buffer. Only for tests.
-fn readPipe(read_end: std.fs.File) ![]const u8 {
-    const State = struct {
-        var buf: [8192]u8 = undefined;
-        var total: usize = 0;
-    };
-    State.total = 0;
-    while (true) {
-        const n = std.posix.read(read_end.handle, State.buf[State.total..]) catch break;
+/// Read all bytes from a pipe's read end into a caller-provided buffer. Only for tests.
+fn readPipe(read_end: std.fs.File, buf: []u8) ![]const u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(read_end.handle, buf[total..]) catch break;
         if (n == 0) break;
-        State.total += n;
+        total += n;
     }
-    return State.buf[0..State.total];
+    return buf[0..total];
 }
 
 test {
@@ -365,7 +386,8 @@ test "render with no changes produces only sync markers" {
     write_end.close();
 
     // Read what was written using raw posix read
-    const output = try readPipe(read_end);
+    var pipe_buf: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &pipe_buf);
 
     // Should contain only the sync markers, no SGR or cursor movement
     try std.testing.expectEqualStrings("\x1b[?2026h\x1b[?2026l", output);
@@ -390,7 +412,8 @@ test "render emits output for changed cells" {
     try screen.render(write_end);
     write_end.close();
 
-    const output = try readPipe(read_end);
+    var pipe_buf: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &pipe_buf);
 
     // Should start with sync begin
     try std.testing.expect(std.mem.startsWith(u8, output, "\x1b[?2026h"));
@@ -451,7 +474,8 @@ test "second render with no new changes produces only sync markers" {
         try screen.render(write_end);
         write_end.close();
 
-        const output = try readPipe(read_end);
+        var pipe_buf: [8192]u8 = undefined;
+        const output = try readPipe(read_end, &pipe_buf);
         try std.testing.expectEqualStrings("\x1b[?2026h\x1b[?2026l", output);
     }
 }
@@ -482,4 +506,97 @@ test "colorsEqual covers all variants" {
         .{ .rgb = .{ .r = 10, .g = 20, .b = 31 } },
     ));
     try std.testing.expect(!colorsEqual(.{ .palette = 0 }, .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } }));
+}
+
+test "init rejects zero width" {
+    const allocator = std.testing.allocator;
+    const result = Screen.init(allocator, 0, 10);
+    try std.testing.expectError(error.ZeroDimension, result);
+}
+
+test "init rejects zero height" {
+    const allocator = std.testing.allocator;
+    const result = Screen.init(allocator, 10, 0);
+    try std.testing.expectError(error.ZeroDimension, result);
+}
+
+test "init rejects zero width and height" {
+    const allocator = std.testing.allocator;
+    const result = Screen.init(allocator, 0, 0);
+    try std.testing.expectError(error.ZeroDimension, result);
+}
+
+test "render encodes non-ASCII multi-byte UTF-8 codepoints" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 5, 1);
+    defer screen.deinit();
+
+    // U+00E9 LATIN SMALL LETTER E WITH ACUTE (2-byte UTF-8: 0xC3 0xA9)
+    screen.getCell(0, 0).codepoint = 0x00E9;
+    // U+4E16 CJK UNIFIED IDEOGRAPH (3-byte UTF-8: 0xE4 0xB8 0x96) — "世"
+    screen.getCell(0, 1).codepoint = 0x4E16;
+    // U+1F600 GRINNING FACE (4-byte UTF-8: 0xF0 0x9F 0x98 0x80)
+    screen.getCell(0, 2).codepoint = 0x1F600;
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var pipe_buf: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &pipe_buf);
+
+    // Verify each multi-byte sequence appears in the output
+    try std.testing.expect(std.mem.indexOf(u8, output, "\xC3\xA9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\xE4\xB8\x96") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\xF0\x9F\x98\x80") != null);
+}
+
+test "render emits RGB background color SGR sequences" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 2, 1);
+    defer screen.deinit();
+
+    screen.getCell(0, 0).codepoint = 'A';
+    screen.getCell(0, 0).bg = .{ .rgb = .{ .r = 255, .g = 128, .b = 0 } };
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var pipe_buf: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &pipe_buf);
+
+    // Should contain the RGB background SGR: 48;2;255;128;0
+    try std.testing.expect(std.mem.indexOf(u8, output, "48;2;255;128;0") != null);
+}
+
+test "render emits palette background color SGR sequences" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 2, 1);
+    defer screen.deinit();
+
+    screen.getCell(0, 0).codepoint = 'B';
+    screen.getCell(0, 0).bg = .{ .palette = 42 };
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var pipe_buf: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &pipe_buf);
+
+    // Should contain the palette background SGR: 48;5;42
+    try std.testing.expect(std.mem.indexOf(u8, output, "48;5;42") != null);
 }

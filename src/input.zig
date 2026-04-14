@@ -5,6 +5,7 @@
 //! non-blocking polling against a raw-mode terminal file descriptor.
 
 const std = @import("std");
+const log = std.log.scoped(.input);
 
 /// A terminal input event: key press, mouse action, terminal resize, or nothing.
 pub const Event = union(enum) {
@@ -100,7 +101,10 @@ pub fn pollEvent(fd: std.posix.fd_t) ?Event {
     var buf: [READ_BUF_SIZE]u8 = undefined;
     const n = std.posix.read(fd, &buf) catch |err| switch (err) {
         error.WouldBlock => return null,
-        else => return null,
+        else => {
+            log.warn("unexpected read error: {}", .{err});
+            return null;
+        },
     };
     if (n == 0) return null;
     return parseBytes(buf[0..n]);
@@ -240,9 +244,9 @@ fn parseCsi(seq: []const u8) Event {
                 modifier_param = 0;
             } else if (c >= '0' and c <= '9') {
                 if (in_second) {
-                    modifier_param = (modifier_param orelse 0) * 10 + (c - '0');
+                    modifier_param = (modifier_param orelse 0) *| 10 +| (c - '0');
                 } else {
-                    num = num * 10 + (c - '0');
+                    num = num *| 10 +| (c - '0');
                 }
             }
         }
@@ -299,25 +303,28 @@ fn parseSgrMouse(seq: []const u8) Event {
     var nums: [3]u16 = .{ 0, 0, 0 };
     var idx: usize = 0;
     var is_press = true;
+    var terminated = false;
 
     for (seq) |c| {
         if (c == ';') {
             idx += 1;
             if (idx >= 3) return Event.none;
         } else if (c >= '0' and c <= '9') {
-            nums[idx] = nums[idx] * 10 + (c - '0');
+            nums[idx] = nums[idx] *| 10 +| (c - '0');
         } else if (c == 'M') {
             is_press = true;
+            terminated = true;
             break;
         } else if (c == 'm') {
             is_press = false;
+            terminated = true;
             break;
         } else {
             return Event.none;
         }
     }
 
-    if (idx < 2) return Event.none;
+    if (!terminated or idx < 2) return Event.none;
 
     const b = nums[0];
     const button: u8 = @truncate(b & 0x03);
@@ -350,7 +357,7 @@ fn parseModifierParam(params: []const u8) KeyEvent.Modifiers {
     var val: u16 = 0;
     for (params[mod_start..]) |c| {
         if (c >= '0' and c <= '9') {
-            val = val * 10 + (c - '0');
+            val = val *| 10 +| (c - '0');
         }
     }
     return decodeModifier(val);
@@ -734,4 +741,122 @@ test "parse End key (CSI F)" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parse invalid UTF-8 returns none" {
+    // 0xFF is never valid as a UTF-8 start byte
+    const event = parseBytes(&.{0xFF}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Event.none, event);
+}
+
+test "parse truncated UTF-8 returns none" {
+    // 0xC3 starts a 2-byte sequence, but we only provide 1 byte
+    const event = parseBytes(&.{0xC3}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Event.none, event);
+}
+
+test "parse invalid UTF-8 continuation returns none" {
+    // 0xC3 expects a continuation byte (0x80..0xBF), but 0x00 is not one
+    const event = parseBytes(&.{ 0xC3, 0x00 }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Event.none, event);
+}
+
+test "parse UTF-8 four-byte character (emoji)" {
+    // 😀 = U+1F600 = 0xF0 0x9F 0x98 0x80
+    const event = parseBytes(&.{ 0xF0, 0x9F, 0x98, 0x80 }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 0x1F600 }, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse unrecognized CSI sequence returns none" {
+    // ESC [ x — 'x' is not a recognized single-letter CSI final byte
+    const event = parseBytes(&.{ 0x1b, '[', 'x' }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Event.none, event);
+}
+
+test "parse truncated CSI (ESC [) returns Alt+[" {
+    // ESC [ with nothing after — only 2 bytes, so the Alt+char path matches
+    // before the CSI branch can fire (CSI requires a third byte)
+    const event = parseBytes(&.{ 0x1b, '[' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = '[' }, k.key);
+            try std.testing.expectEqual(true, k.modifiers.alt);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse Backspace via 0x08" {
+    const event = parseBytes(&.{0x08}) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.backspace, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse Enter via 0x0a (LF)" {
+    const event = parseBytes(&.{0x0a}) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.enter, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SS3 F1 (ESC O P)" {
+    const event = parseBytes(&.{ 0x1b, 'O', 'P' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .function = 1 }, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SS3 F2 (ESC O Q)" {
+    const event = parseBytes(&.{ 0x1b, 'O', 'Q' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .function = 2 }, k.key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SS3 F3 (ESC O R)" {
+    const event = parseBytes(&.{ 0x1b, 'O', 'R' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .function = 3 }, k.key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SS3 F4 (ESC O S)" {
+    const event = parseBytes(&.{ 0x1b, 'O', 'S' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .function = 4 }, k.key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse truncated SGR mouse returns none" {
+    // ESC [ < 0 ; 1 0 ; 5 — missing M/m terminator
+    const event = parseBytes(&.{ 0x1b, '[', '<', '0', ';', '1', '0', ';', '5' }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Event.none, event);
 }
