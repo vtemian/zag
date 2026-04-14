@@ -113,6 +113,9 @@ src/
     edit.zig    — exact text replacement
     bash.zig    — shell command execution
   types.zig     — Message, ContentBlock, ToolCall, ToolResult
+  Terminal.zig  — terminal control and raw mode handling
+  input.zig     — input event parsing and key mapping
+  Screen.zig    — screen buffer and rendering
 ```
 
 ## Commit messages

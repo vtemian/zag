@@ -7,6 +7,8 @@
 const std = @import("std");
 const posix = std.posix;
 
+const log = std.log.scoped(.terminal);
+
 const Terminal = @This();
 
 /// Terminal dimensions in rows and columns.
@@ -25,6 +27,9 @@ size: Size,
 
 // -- Atomic SIGWINCH flag (file-level global for signal handler access) ------
 
+/// Must be file-level global because POSIX signal handlers receive no user context
+/// pointer — `handleSigwinch` cannot access any Terminal instance, so the flag it
+/// sets must live at a fixed address visible to both the handler and `checkResize`.
 var resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// Enter raw mode, alternate screen buffer, hide cursor, enable synchronized
@@ -71,12 +76,16 @@ pub fn init() !Terminal {
 
     // 6. Enable mouse tracking (X10 + SGR extended)
     try writeEscapeSequence("\x1b[?1000h\x1b[?1006h");
+    errdefer writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch {};
 
     // 7. Install SIGWINCH handler
     installSigwinchHandler();
 
     // 8. Query initial terminal size
-    const size = getSize() catch Size{ .rows = 24, .cols = 80 };
+    const size = getSize() catch |err| blk: {
+        log.warn("getSize failed ({s}), falling back to 24x80", .{@errorName(err)});
+        break :blk Size{ .rows = 24, .cols = 80 };
+    };
 
     return .{
         .original_termios = original,
@@ -86,13 +95,27 @@ pub fn init() !Terminal {
 
 /// Restore terminal state in reverse order: disable mouse, disable synchronized
 /// output, show cursor, leave alternate screen, restore original termios.
+///
+/// Takes `*Terminal` (not `*const Terminal`) because Zig convention requires deinit
+/// to take a mutable pointer — the allocator's destroy expects `*Self`, and using a
+/// consistent signature across init/deinit pairs avoids callsite friction.
 pub fn deinit(self: *Terminal) void {
     // Reverse order of init
-    writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch {};
-    writeEscapeSequence("\x1b[?2026l") catch {};
-    writeEscapeSequence("\x1b[?25h") catch {};
-    writeEscapeSequence("\x1b[?1049l") catch {};
-    posix.tcsetattr(posix.STDOUT_FILENO, .NOW, self.original_termios) catch {};
+    writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch |err| {
+        log.warn("failed to disable mouse tracking: {s}", .{@errorName(err)});
+    };
+    writeEscapeSequence("\x1b[?2026l") catch |err| {
+        log.warn("failed to disable synchronized output: {s}", .{@errorName(err)});
+    };
+    writeEscapeSequence("\x1b[?25h") catch |err| {
+        log.warn("failed to show cursor: {s}", .{@errorName(err)});
+    };
+    writeEscapeSequence("\x1b[?1049l") catch |err| {
+        log.warn("failed to leave alternate screen: {s}", .{@errorName(err)});
+    };
+    posix.tcsetattr(posix.STDOUT_FILENO, .NOW, self.original_termios) catch |err| {
+        log.warn("failed to restore termios: {s}", .{@errorName(err)});
+    };
 }
 
 /// Query terminal size via ioctl TIOCGWINSZ.
@@ -135,10 +158,12 @@ pub fn checkResize(self: *Terminal) ?Size {
 
 fn writeEscapeSequence(seq: []const u8) !void {
     const stdout = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    // 256 bytes: longest escape sequence we emit is ~30 bytes (mouse tracking
+    // enable/disable pair). 256 gives generous headroom without touching the heap.
     var buf: [256]u8 = undefined;
     var w = stdout.writer(&buf);
-    w.interface.writeAll(seq) catch return error.WriteFailed;
-    w.interface.flush() catch return error.WriteFailed;
+    try w.interface.writeAll(seq);
+    try w.interface.flush();
 }
 
 fn installSigwinchHandler() void {

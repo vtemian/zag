@@ -40,7 +40,9 @@ pub fn runLoop(
     // Add user message
     const user_content = try allocator.alloc(types.ContentBlock, 1);
     errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, user_text) } };
+    const duped = try allocator.dupe(u8, user_text);
+    errdefer allocator.free(duped);
+    user_content[0] = .{ .text = .{ .text = duped } };
     try messages.append(allocator, .{ .role = .user, .content = user_content });
 
     const tool_defs = try registry.definitions(allocator);
@@ -89,6 +91,7 @@ pub fn runLoop(
 
         // Execute tools and collect results
         var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+        errdefer result_blocks.deinit(allocator);
 
         for (tool_calls.items) |tc| {
             log.info("executing tool: {s}", .{tc.name});

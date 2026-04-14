@@ -27,6 +27,11 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     };
     defer allocator.free(content);
 
+    // Guard against underflow when old_text is longer than file content
+    if (input.old_text.len > content.len) {
+        return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true };
+    }
+
     // Count occurrences
     var count: u32 = 0;
     var pos: usize = 0;
@@ -94,6 +99,10 @@ pub const tool = types.Tool{
     .definition = definition,
     .execute = &execute,
 };
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
 
 test "successful replacement" {
     const allocator = std.testing.allocator;

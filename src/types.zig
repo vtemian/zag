@@ -108,6 +108,22 @@ pub const LlmResponse = struct {
     input_tokens: u32 = 0,
     /// Number of output tokens produced by this response.
     output_tokens: u32 = 0,
+
+    /// Free all owned allocations within content blocks, then the slice itself.
+    pub fn deinit(self: LlmResponse, allocator: Allocator) void {
+        for (self.content) |block| {
+            switch (block) {
+                .text => |t| allocator.free(t.text),
+                .tool_use => |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input_raw);
+                },
+                .tool_result => {},
+            }
+        }
+        allocator.free(self.content);
+    }
 };
 
 // -- Tests ------------------------------------------------------------------

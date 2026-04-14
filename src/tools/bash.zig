@@ -86,6 +86,10 @@ pub const tool = types.Tool{
     .execute = &execute,
 };
 
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
 test "echo hello" {
     const allocator = std.testing.allocator;
 
