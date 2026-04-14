@@ -12,7 +12,6 @@ const input_mod = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
-const VtBuffer = @import("VtBuffer.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
@@ -60,9 +59,8 @@ fn tuiLogHandler(
 // synchronously on the same thread, no mutex is needed.
 // ---------------------------------------------------------------------------
 
-/// Module-level buffer, VtBuffer, and renderer, initialized in main().
+/// Module-level buffer and renderer, initialized in main().
 var buffer: Buffer = undefined;
-var vt_buffer: VtBuffer = undefined;
 var node_renderer: NodeRenderer = undefined;
 var buffer_alloc: std.mem.Allocator = undefined;
 
@@ -75,9 +73,6 @@ var next_buffer_id: u32 = 1;
 
 /// Extra buffers created by splits — tracked for cleanup.
 var extra_buffers: std.ArrayList(*Buffer) = .empty;
-
-/// Extra VtBuffers created by splits — tracked for cleanup.
-var extra_vt_buffers: std.ArrayList(*VtBuffer) = .empty;
 
 /// Last tool_call node, used to parent tool_result nodes.
 var last_tool_call: ?*Buffer.Node = null;
@@ -171,8 +166,8 @@ fn inputDeleteBack(len: usize) usize {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Create a new empty buffer with a VtBuffer wrapper and track both for cleanup.
-fn createSplitVtBuffer(allocator: std.mem.Allocator) !*VtBuffer {
+/// Create a new empty buffer and track it for cleanup.
+fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
     const buf = try allocator.create(Buffer);
     errdefer allocator.destroy(buf);
 
@@ -181,15 +176,7 @@ fn createSplitVtBuffer(allocator: std.mem.Allocator) !*VtBuffer {
 
     next_buffer_id += 1;
     try extra_buffers.append(allocator, buf);
-
-    const vt_buf = try allocator.create(VtBuffer);
-    errdefer allocator.destroy(vt_buf);
-
-    vt_buf.* = try VtBuffer.init(allocator, buf, 80, 24);
-    errdefer vt_buf.deinit();
-
-    try extra_vt_buffers.append(allocator, vt_buf);
-    return vt_buf;
+    return buf;
 }
 
 /// Draw the input/status line on the last row, overwriting the compositor's status line.
@@ -228,16 +215,12 @@ pub fn main() !void {
     defer buffer.deinit();
     node_renderer = NodeRenderer.initDefault();
 
-    // Wrap the buffer in a VtBuffer for cell-level access
-    vt_buffer = try VtBuffer.init(allocator, &buffer, 80, 24);
-    defer vt_buffer.deinit();
-
-    // Initialize layout with the session VtBuffer in the first tab
+    // Initialize layout with the session buffer in the first tab
     layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("session", &vt_buffer);
+    _ = try layout.addTab("session", &buffer);
 
-    // Extra buffers and VtBuffers created by splits
+    // Extra buffers created by splits
     extra_buffers = .empty;
     defer {
         for (extra_buffers.items) |buf| {
@@ -245,14 +228,6 @@ pub fn main() !void {
             allocator.destroy(buf);
         }
         extra_buffers.deinit(allocator);
-    }
-    extra_vt_buffers = .empty;
-    defer {
-        for (extra_vt_buffers.items) |vt_buf| {
-            vt_buf.deinit();
-            allocator.destroy(vt_buf);
-        }
-        extra_vt_buffers.deinit(allocator);
     }
 
     // Get API key
@@ -294,6 +269,7 @@ pub fn main() !void {
     compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
+        .renderer = &node_renderer,
     };
 
     const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
@@ -327,8 +303,6 @@ pub fn main() !void {
     awaiting_window_cmd = false;
 
     // -- Initial render ------------------------------------------------------
-    // Refresh VtBuffer from buffer content before initial render
-    vt_buffer.refresh(&node_renderer) catch {};
     compositor.composite(&layout);
     drawInputLine(&screen, &input_buf, input_len, status_msg);
     try screen.render(stdout_file);
@@ -339,7 +313,6 @@ pub fn main() !void {
         if (term.checkResize()) |new_size| {
             try screen.resize(new_size.cols, new_size.rows);
             layout.recalculate(new_size.cols, new_size.rows);
-            vt_buffer.refresh(&node_renderer) catch {};
             compositor.composite(&layout);
             drawInputLine(&screen, &input_buf, input_len, status_msg);
             try screen.render(stdout_file);
@@ -363,15 +336,15 @@ pub fn main() !void {
                         .char => |ch| switch (ch) {
                             'v' => {
                                 // Split vertical
-                                if (createSplitVtBuffer(allocator)) |new_vt_buf| {
-                                    layout.splitVertical(0.5, new_vt_buf) catch {};
+                                if (createSplitBuffer(allocator)) |new_buf| {
+                                    layout.splitVertical(0.5, new_buf) catch {};
                                     layout.recalculate(screen.width, screen.height);
                                 } else |_| {}
                             },
                             's' => {
                                 // Split horizontal
-                                if (createSplitVtBuffer(allocator)) |new_vt_buf| {
-                                    layout.splitHorizontal(0.5, new_vt_buf) catch {};
+                                if (createSplitBuffer(allocator)) |new_buf| {
+                                    layout.splitHorizontal(0.5, new_buf) catch {};
                                     layout.recalculate(screen.width, screen.height);
                                 } else |_| {}
                             },
@@ -426,7 +399,6 @@ pub fn main() !void {
 
                             // Show status while agent is working
                             status_msg = "thinking...";
-                            vt_buffer.refresh(&node_renderer) catch {};
                             compositor.composite(&layout);
                             drawInputLine(&screen, &input_buf, input_len, status_msg);
                             try screen.render(stdout_file);
@@ -475,7 +447,6 @@ pub fn main() !void {
         }
 
         // Redraw after every event
-        vt_buffer.refresh(&node_renderer) catch {};
         compositor.composite(&layout);
         drawInputLine(&screen, &input_buf, input_len, status_msg);
         try screen.render(stdout_file);
@@ -513,7 +484,6 @@ test "imports compile" {
     _ = @import("NodeRenderer.zig");
     _ = @import("Layout.zig");
     _ = @import("Compositor.zig");
-    _ = @import("VtBuffer.zig");
 }
 
 test "inputAppendChar adds character" {

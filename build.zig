@@ -4,14 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const ghostty_dep = b.dependency("ghostty", .{});
-
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("ghostty-vt", ghostty_dep.module("ghostty-vt"));
 
     const exe = b.addExecutable(.{
         .name = "zag",
@@ -35,7 +32,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addImport("ghostty-vt", ghostty_dep.module("ghostty-vt"));
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
