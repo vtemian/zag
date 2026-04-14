@@ -27,12 +27,27 @@ const system_prompt =
     \\- Prefer editing over rewriting entire files
 ;
 
-/// Callback that receives text output from the agent loop.
-/// Called once per text block or tool status line that the UI should display.
-pub const OutputCallback = *const fn (text: []const u8) void;
+/// Semantic type of content emitted by the agent loop.
+pub const ContentType = enum {
+    /// LLM text response.
+    assistant_text,
+    /// Tool being executed (content is the tool name).
+    tool_call,
+    /// Result returned from a tool execution.
+    tool_result,
+    /// Informational diagnostic (e.g. token counts).
+    info,
+    /// An error occurred during agent execution.
+    err,
+};
+
+/// Callback that receives typed output from the agent loop.
+/// Called once per content block, tool status, or diagnostic line.
+pub const OutputCallback = *const fn (content_type: ContentType, text: []const u8) void;
 
 /// Default output callback: writes text to stdout (used by non-TUI mode).
-fn stdoutCallback(text: []const u8) void {
+fn stdoutCallback(content_type: ContentType, text: []const u8) void {
+    _ = content_type;
     const stdout = std.fs.File.stdout();
     stdout.writeAll(text) catch {};
 }
@@ -74,6 +89,7 @@ pub fn runLoop(
             allocator,
         ) catch |err| {
             log.err("LLM call failed: {s}", .{@errorName(err)});
+            emit(.err, @errorName(err));
             return;
         };
 
@@ -82,6 +98,13 @@ pub fn runLoop(
 
         log.info("tokens in: {d}, out: {d}", .{ response.input_tokens, response.output_tokens });
 
+        // Emit token usage as info
+        {
+            var info_buf: [128]u8 = undefined;
+            const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
+            emit(.info, info_msg);
+        }
+
         // Collect tool calls and text
         var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
         defer tool_calls.deinit(allocator);
@@ -89,9 +112,7 @@ pub fn runLoop(
         for (response.content) |block| {
             switch (block) {
                 .text => |t| {
-                    emit("\n");
-                    emit(t.text);
-                    emit("\n");
+                    emit(.assistant_text, t.text);
                 },
                 .tool_use => |tu| {
                     try tool_calls.append(allocator, tu);
@@ -109,14 +130,13 @@ pub fn runLoop(
 
         for (tool_calls.items) |tc| {
             log.info("executing tool: {s}", .{tc.name});
-            emit("[tool] ");
-            emit(tc.name);
-            emit("\n");
+            emit(.tool_call, tc.name);
 
             const result = try registry.execute(tc.name, tc.input_raw, allocator);
 
             if (result.is_error) {
                 log.info("tool error: {s}", .{result.content});
+                emit(.err, result.content);
             } else {
                 const preview = blk: {
                     const max_preview = 80;
@@ -124,6 +144,7 @@ pub fn runLoop(
                     break :blk result.content[0..max_preview];
                 };
                 log.info("tool result: {s}...", .{preview});
+                emit(.tool_result, result.content);
             }
 
             try result_blocks.append(allocator, .{ .tool_result = .{
