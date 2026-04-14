@@ -1,0 +1,10 @@
+.{
+    .name = .zag,
+    .version = "0.1.0",
+    .fingerprint = 0x9179a895b492806,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
