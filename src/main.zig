@@ -97,4 +97,7 @@ test "imports compile" {
     _ = @import("tools/bash.zig");
     _ = @import("agent.zig");
     _ = @import("llm.zig");
+    _ = @import("Screen.zig");
+    _ = @import("input.zig");
+    _ = @import("Terminal.zig");
 }
