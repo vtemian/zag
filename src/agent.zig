@@ -27,16 +27,31 @@ const system_prompt =
     \\- Prefer editing over rewriting entire files
 ;
 
+/// Callback that receives text output from the agent loop.
+/// Called once per text block or tool status line that the UI should display.
+pub const OutputCallback = *const fn (text: []const u8) void;
+
+/// Default output callback: writes text to stdout (used by non-TUI mode).
+fn stdoutCallback(text: []const u8) void {
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(text) catch {};
+}
+
 /// Runs the agent loop for a single user turn. Appends the user message,
 /// then repeatedly calls the LLM and executes tool requests until the model
 /// produces a text-only response with no tool calls.
+///
+/// The `on_output` callback receives each text block and tool status line
+/// for display. Pass `null` to use the default stdout writer.
 pub fn runLoop(
     user_text: []const u8,
     messages: *std.ArrayList(types.Message),
     registry: *const tools_mod.Registry,
     api_key: []const u8,
     allocator: Allocator,
+    on_output: ?OutputCallback,
 ) !void {
+    const emit = on_output orelse stdoutCallback;
     // Add user message
     const user_content = try allocator.alloc(types.ContentBlock, 1);
     errdefer allocator.free(user_content);
@@ -71,13 +86,12 @@ pub fn runLoop(
         var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
         defer tool_calls.deinit(allocator);
 
-        const stdout = std.fs.File.stdout();
         for (response.content) |block| {
             switch (block) {
                 .text => |t| {
-                    stdout.writeAll("\n") catch {};
-                    stdout.writeAll(t.text) catch {};
-                    stdout.writeAll("\n") catch {};
+                    emit("\n");
+                    emit(t.text);
+                    emit("\n");
                 },
                 .tool_use => |tu| {
                     try tool_calls.append(allocator, tu);
@@ -95,6 +109,9 @@ pub fn runLoop(
 
         for (tool_calls.items) |tc| {
             log.info("executing tool: {s}", .{tc.name});
+            emit("[tool] ");
+            emit(tc.name);
+            emit("\n");
 
             const result = try registry.execute(tc.name, tc.input_raw, allocator);
 
