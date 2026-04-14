@@ -57,14 +57,14 @@ pub const definition = types.ToolDefinition{
     .name = "bash",
     .description = "Execute a shell command via /bin/sh -c. Returns stdout, stderr, and exit code. Default timeout: 30 seconds.",
     .input_schema_json =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "command": { "type": "string", "description": "Shell command to execute" },
-        \\    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 30000)" }
-        \\  },
-        \\  "required": ["command"]
-        \\}
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "command": { "type": "string", "description": "Shell command to execute" },
+    \\    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 30000)" }
+    \\  },
+    \\  "required": ["command"]
+    \\}
     ,
 };
 

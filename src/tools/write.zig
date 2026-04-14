@@ -49,14 +49,14 @@ pub const definition = types.ToolDefinition{
     .name = "write",
     .description = "Create or overwrite a file with the given content. Creates parent directories if needed.",
     .input_schema_json =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "path": { "type": "string", "description": "Path to the file to write" },
-        \\    "content": { "type": "string", "description": "Content to write to the file" }
-        \\  },
-        \\  "required": ["path", "content"]
-        \\}
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "path": { "type": "string", "description": "Path to the file to write" },
+    \\    "content": { "type": "string", "description": "Content to write to the file" }
+    \\  },
+    \\  "required": ["path", "content"]
+    \\}
     ,
 };
 
