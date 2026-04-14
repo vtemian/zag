@@ -1,0 +1,296 @@
+//! Buffer — structured content as a tree of typed nodes.
+//!
+//! Replaces flat line-based output with a node tree where each node has a type
+//! (user message, assistant text, tool call, etc.) and optional children.
+//! Nodes are rendered to display lines via NodeRenderer.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const NodeRenderer = @import("NodeRenderer.zig");
+
+const Buffer = @This();
+
+/// Semantic classification of a node's content.
+pub const NodeType = enum {
+    custom,
+    user_message,
+    assistant_text,
+    tool_call,
+    tool_result,
+    status,
+    err,
+    separator,
+};
+
+/// A single node in the buffer tree. Owns its content and children.
+pub const Node = struct {
+    /// Unique identifier within this buffer.
+    id: u32,
+    /// Semantic type used by renderers to decide formatting.
+    node_type: NodeType,
+    /// Tag for custom-typed nodes (e.g. plugin-defined types).
+    custom_tag: ?[]const u8 = null,
+    /// The textual content of this node. Owned by the node.
+    content: std.ArrayList(u8),
+    /// Child nodes (e.g. tool_result children of a tool_call).
+    children: std.ArrayList(*Node),
+    /// Whether this node's children are hidden from rendering.
+    collapsed: bool = false,
+    /// Back-pointer to the parent node, null for root children.
+    parent: ?*Node = null,
+
+    /// Release all memory owned by this node and its descendants.
+    pub fn deinit(self: *Node, allocator: Allocator) void {
+        for (self.children.items) |child| {
+            child.deinit(allocator);
+            allocator.destroy(child);
+        }
+        self.children.deinit(allocator);
+        self.content.deinit(allocator);
+    }
+};
+
+/// Buffer identifier.
+id: u32,
+/// Human-readable buffer name (e.g. "session"). Owned.
+name: []const u8,
+/// Top-level nodes in insertion order.
+root_children: std.ArrayList(*Node),
+/// Monotonically increasing counter for assigning node IDs.
+next_id: u32,
+/// Allocator used for all buffer and node allocations.
+allocator: Allocator,
+
+/// Create a new empty buffer with the given id and name.
+pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+
+    return .{
+        .id = id,
+        .name = owned_name,
+        .root_children = .empty,
+        .next_id = 0,
+        .allocator = allocator,
+    };
+}
+
+/// Release all memory owned by this buffer — nodes, name, and lists.
+pub fn deinit(self: *Buffer) void {
+    for (self.root_children.items) |node| {
+        node.deinit(self.allocator);
+        self.allocator.destroy(node);
+    }
+    self.root_children.deinit(self.allocator);
+    self.allocator.free(self.name);
+}
+
+/// Create a new node and attach it to `parent`. If `parent` is null the node
+/// is appended to the buffer's root children list.
+pub fn appendNode(self: *Buffer, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
+    const node = try self.allocator.create(Node);
+    errdefer self.allocator.destroy(node);
+
+    var content_list: std.ArrayList(u8) = .empty;
+    try content_list.appendSlice(self.allocator, content);
+    errdefer content_list.deinit(self.allocator);
+
+    node.* = .{
+        .id = self.next_id,
+        .node_type = node_type,
+        .content = content_list,
+        .children = .empty,
+        .parent = parent,
+    };
+    self.next_id += 1;
+
+    if (parent) |p| {
+        try p.children.append(self.allocator, node);
+    } else {
+        try self.root_children.append(self.allocator, node);
+    }
+
+    return node;
+}
+
+/// Walk the tree and return flat display lines for the current state.
+/// Collapsed nodes have their children skipped. Each line is a separate
+/// allocation owned by the caller.
+pub fn getVisibleLines(self: *const Buffer, allocator: Allocator, renderer: *const NodeRenderer) !std.ArrayList([]const u8) {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+
+    for (self.root_children.items) |node| {
+        try collectVisibleLines(node, allocator, renderer, &lines);
+    }
+
+    return lines;
+}
+
+/// Recursive helper: render a node and its non-collapsed children.
+fn collectVisibleLines(
+    node: *const Node,
+    allocator: Allocator,
+    renderer: *const NodeRenderer,
+    lines: *std.ArrayList([]const u8),
+) !void {
+    try renderer.render(node, lines, allocator);
+
+    if (!node.collapsed) {
+        for (node.children.items) |child| {
+            try collectVisibleLines(child, allocator, renderer, lines);
+        }
+    }
+}
+
+/// Count the total number of visible lines (including children of non-collapsed nodes).
+pub fn lineCount(self: *const Buffer, renderer: *const NodeRenderer) !usize {
+    var count: usize = 0;
+    for (self.root_children.items) |node| {
+        count += try countVisibleLines(node, renderer);
+    }
+    return count;
+}
+
+/// Recursive line counter.
+fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer) !usize {
+    var count = renderer.lineCountForNode(node);
+    if (!node.collapsed) {
+        for (node.children.items) |child| {
+            count += try countVisibleLines(child, renderer);
+        }
+    }
+    return count;
+}
+
+/// Remove all nodes from the buffer, freeing their memory.
+pub fn clear(self: *Buffer) void {
+    for (self.root_children.items) |node| {
+        node.deinit(self.allocator);
+        self.allocator.destroy(node);
+    }
+    self.root_children.clearRetainingCapacity();
+    self.next_id = 0;
+}
+
+// -- Tests -------------------------------------------------------------------
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
+test "init and deinit" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 0, "test");
+    defer buf.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), buf.id);
+    try std.testing.expectEqualStrings("test", buf.name);
+    try std.testing.expectEqual(@as(usize, 0), buf.root_children.items.len);
+}
+
+test "appendNode creates root-level nodes" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 1, "session");
+    defer buf.deinit();
+
+    const n1 = try buf.appendNode(null, .user_message, "hello");
+    const n2 = try buf.appendNode(null, .assistant_text, "hi there");
+
+    try std.testing.expectEqual(@as(u32, 0), n1.id);
+    try std.testing.expectEqual(@as(u32, 1), n2.id);
+    try std.testing.expectEqual(@as(usize, 2), buf.root_children.items.len);
+    try std.testing.expectEqualStrings("hello", n1.content.items);
+    try std.testing.expectEqualStrings("hi there", n2.content.items);
+    try std.testing.expect(n1.parent == null);
+}
+
+test "appendNode creates child nodes" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 2, "session");
+    defer buf.deinit();
+
+    const parent = try buf.appendNode(null, .tool_call, "bash");
+    const child = try buf.appendNode(parent, .tool_result, "output here");
+
+    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(parent, child.parent.?);
+    try std.testing.expectEqualStrings("output here", child.content.items);
+    // Child should not be in root list
+    try std.testing.expectEqual(@as(usize, 1), buf.root_children.items.len);
+}
+
+test "getVisibleLines returns rendered lines" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 3, "session");
+    defer buf.deinit();
+
+    _ = try buf.appendNode(null, .user_message, "hello");
+    _ = try buf.appendNode(null, .separator, "");
+
+    var renderer = NodeRenderer.initDefault();
+
+    var lines = try buf.getVisibleLines(allocator, &renderer);
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+
+    try std.testing.expect(lines.items.len >= 2);
+    try std.testing.expectEqualStrings("> hello", lines.items[0]);
+    try std.testing.expectEqualStrings("---", lines.items[1]);
+}
+
+test "collapsed nodes hide children" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 4, "session");
+    defer buf.deinit();
+
+    const parent = try buf.appendNode(null, .tool_call, "read");
+    _ = try buf.appendNode(parent, .tool_result, "file contents");
+    parent.collapsed = true;
+
+    var renderer = NodeRenderer.initDefault();
+
+    var lines = try buf.getVisibleLines(allocator, &renderer);
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+
+    // Should have the tool_call line but not the tool_result child
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("[tool] read", lines.items[0]);
+}
+
+test "clear removes all nodes" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 5, "session");
+    defer buf.deinit();
+
+    _ = try buf.appendNode(null, .user_message, "msg1");
+    _ = try buf.appendNode(null, .assistant_text, "msg2");
+    try std.testing.expectEqual(@as(usize, 2), buf.root_children.items.len);
+
+    buf.clear();
+    try std.testing.expectEqual(@as(usize, 0), buf.root_children.items.len);
+    try std.testing.expectEqual(@as(u32, 0), buf.next_id);
+}
+
+test "lineCount counts visible lines" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 6, "session");
+    defer buf.deinit();
+
+    _ = try buf.appendNode(null, .user_message, "hello");
+    const tc = try buf.appendNode(null, .tool_call, "bash");
+    _ = try buf.appendNode(tc, .tool_result, "output");
+
+    var renderer = NodeRenderer.initDefault();
+
+    const count = try buf.lineCount(&renderer);
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
