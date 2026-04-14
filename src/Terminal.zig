@@ -1,4 +1,4 @@
-//! Terminal state management — raw mode, alternate screen buffer, terminal size, SIGWINCH.
+//! Terminal state management: raw mode, alternate screen buffer, terminal size, SIGWINCH.
 //!
 //! Manages the lifecycle of terminal state: saves original termios on init,
 //! switches to raw mode with alternate screen, and restores everything on deinit.
@@ -28,7 +28,7 @@ size: Size,
 // -- Atomic SIGWINCH flag (file-level global for signal handler access) ------
 
 /// Must be file-level global because POSIX signal handlers receive no user context
-/// pointer — `handleSigwinch` cannot access any Terminal instance, so the flag it
+/// pointer. `handleSigwinch` cannot access any Terminal instance, so the flag it
 /// sets must live at a fixed address visible to both the handler and `checkResize`.
 var resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -97,7 +97,7 @@ pub fn init() !Terminal {
 /// output, show cursor, leave alternate screen, restore original termios.
 ///
 /// Takes `*Terminal` (not `*const Terminal`) because Zig convention requires deinit
-/// to take a mutable pointer — the allocator's destroy expects `*Self`, and using a
+/// to take a mutable pointer. The allocator's destroy expects `*Self`, and using a
 /// consistent signature across init/deinit pairs avoids callsite friction.
 pub fn deinit(self: *Terminal) void {
     // Reverse order of init

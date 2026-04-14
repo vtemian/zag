@@ -1,4 +1,4 @@
-//! Layout — binary tree of splits and leaves for composable windows.
+//! Layout: binary tree of splits and leaves for composable windows.
 //!
 //! Manages a tabbed layout where each tab contains a binary tree of window
 //! splits. Leaves hold buffer references and screen rects. The tree is
@@ -16,7 +16,7 @@ pub const SplitDirection = enum { horizontal, vertical };
 /// Direction for vim-style focus navigation.
 pub const FocusDirection = enum { left, right, up, down };
 
-/// Screen rectangle — position and dimensions of a window pane.
+/// Screen rectangle, position and dimensions of a window pane.
 pub const Rect = struct {
     /// Column offset from left edge.
     x: u16,
@@ -28,7 +28,7 @@ pub const Rect = struct {
     height: u16,
 };
 
-/// A node in the binary layout tree — either a leaf (buffer) or an internal split.
+/// A node in the binary layout tree: either a leaf (buffer) or an internal split.
 pub const LayoutNode = union(enum) {
     leaf: Leaf,
     split: Split,
@@ -281,7 +281,7 @@ pub fn visibleLeaves(self: *const Layout, out: []*LayoutNode, out_len: *usize) v
     out_len.* = 0;
     if (self.tabs.items.len == 0) return;
     const tab = self.tabs.items[self.active_tab];
-    collectLeavesGeneric(tab.root, out, out_len);
+    collectLeaves(tab.root, out, out_len);
 }
 
 // ---- Internal helpers -------------------------------------------------------
@@ -381,7 +381,7 @@ fn recalculateNode(node: *LayoutNode, rect: Rect) void {
             s.rect = rect;
             switch (s.direction) {
                 .vertical => {
-                    // Left/right split — subtract 1 col for the border
+                    // Left/right split, subtract 1 col for the border
                     const usable = if (rect.width > 1) rect.width - 1 else rect.width;
                     const first_width = floatToU16(ratio: {
                         break :ratio @as(f32, @floatFromInt(usable)) * s.ratio;
@@ -403,7 +403,7 @@ fn recalculateNode(node: *LayoutNode, rect: Rect) void {
                     });
                 },
                 .horizontal => {
-                    // Top/bottom split — subtract 1 row for the border
+                    // Top/bottom split, subtract 1 row for the border
                     const usable = if (rect.height > 1) rect.height - 1 else rect.height;
                     const first_height = floatToU16(ratio: {
                         break :ratio @as(f32, @floatFromInt(usable)) * s.ratio;
@@ -448,22 +448,6 @@ fn collectLeaves(node: *LayoutNode, buf: []*LayoutNode, count: *usize) void {
         .split => |s| {
             collectLeaves(s.first, buf, count);
             collectLeaves(s.second, buf, count);
-        },
-    }
-}
-
-/// Collect leaf nodes into a caller-provided slice.
-fn collectLeavesGeneric(node: *LayoutNode, buf: []*LayoutNode, count: *usize) void {
-    switch (node.*) {
-        .leaf => {
-            if (count.* < buf.len) {
-                buf[count.*] = node;
-                count.* += 1;
-            }
-        },
-        .split => |s| {
-            collectLeavesGeneric(s.first, buf, count);
-            collectLeavesGeneric(s.second, buf, count);
         },
     }
 }
@@ -713,7 +697,7 @@ test "switchTab selects by index" {
     layout.switchTab(2);
     try std.testing.expectEqual(@as(usize, 2), layout.active_tab);
 
-    // Out of range — no-op
+    // Out of range, no-op
     layout.switchTab(10);
     try std.testing.expectEqual(@as(usize, 2), layout.active_tab);
 }
@@ -792,7 +776,7 @@ test "recalculate with tiny screen is safe" {
 
     _ = try layout.addTab("tab1", &buf);
 
-    // Screen too small — should not crash
+    // Screen too small, should not crash
     layout.recalculate(5, 2);
     layout.recalculate(0, 0);
     layout.recalculate(1, 3);

@@ -1,4 +1,4 @@
-//! Screen — cell grid with dirty-rectangle ANSI rendering.
+//! Screen: cell grid with dirty-rectangle ANSI rendering.
 //!
 //! Maintains two cell grids (current and previous) and diffs them to produce
 //! minimal ANSI escape sequences for efficient terminal updates. Uses
@@ -10,7 +10,7 @@ const log = std.log.scoped(.screen);
 
 const Screen = @This();
 
-/// Terminal cell color — supports default terminal color, 256-color palette, and true color.
+/// Terminal cell color. Supports default terminal color, 256-color palette, and true color.
 pub const Color = union(enum) {
     /// Use the terminal's default foreground or background color.
     default,
@@ -52,9 +52,9 @@ pub const Cell = struct {
 width: u16,
 /// Height of the screen in rows.
 height: u16,
-/// The current frame's cell grid — mutations go here before render().
+/// The current frame's cell grid. Mutations go here before render().
 current: []Cell,
-/// The previous frame's cell grid — used for diffing.
+/// The previous frame's cell grid, used for diffing.
 previous: []Cell,
 /// Allocator used for grid memory.
 allocator: Allocator,
@@ -115,8 +115,8 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
 /// Row and column are zero-indexed.
 /// Caller must ensure row < height and col < width.
 pub fn getCell(self: *Screen, row: u16, col: u16) *Cell {
-    std.debug.assert(row < self.height);
-    std.debug.assert(col < self.width);
+    if (row >= self.height) unreachable;
+    if (col >= self.width) unreachable;
     const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
     return &self.current[idx];
 }
@@ -125,10 +125,26 @@ pub fn getCell(self: *Screen, row: u16, col: u16) *Cell {
 /// Row and column are zero-indexed.
 /// Caller must ensure row < height and col < width.
 pub fn getCellConst(self: *const Screen, row: u16, col: u16) *const Cell {
-    std.debug.assert(row < self.height);
-    std.debug.assert(col < self.width);
+    if (row >= self.height) unreachable;
+    if (col >= self.width) unreachable;
     const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
     return &self.current[idx];
+}
+
+/// Write a string into the screen grid at (row, col), clipping to screen width.
+/// Returns the column after the last written character.
+pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Style, fg: Color) u16 {
+    var c = col;
+    for (text) |byte| {
+        if (c >= self.width) break;
+        if (row >= self.height) break;
+        const cell = self.getCell(row, c);
+        cell.codepoint = byte;
+        cell.style = style;
+        cell.fg = fg;
+        c += 1;
+    }
+    return c;
 }
 
 /// Fill the current grid with empty (space) cells.
@@ -260,7 +276,7 @@ fn optColorsEqual(maybe_last: ?Color, cur: Color) bool {
 
 /// Write SGR (Select Graphic Rendition) escape sequences for the given style and colors.
 fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
-    // Reset first, then apply — simpler and avoids stale attributes
+    // Reset first, then apply. Simpler and avoids stale attributes.
     try writer.writeAll("\x1b[0");
 
     if (style.bold) try writer.writeAll(";1");
@@ -453,7 +469,7 @@ test "second render with no new changes produces only sync markers" {
 
     screen.getCell(0, 0).codepoint = 'A';
 
-    // First render — flushes the change
+    // First render: flushes the change
     {
         const pipe = try std.posix.pipe();
         const write_end: std.fs.File = .{ .handle = pipe[1] };
@@ -464,7 +480,7 @@ test "second render with no new changes produces only sync markers" {
         read_end.close();
     }
 
-    // Second render — no changes since first render
+    // Second render: no changes since first render
     {
         const pipe = try std.posix.pipe();
         const write_end: std.fs.File = .{ .handle = pipe[1] };
@@ -533,7 +549,7 @@ test "render encodes non-ASCII multi-byte UTF-8 codepoints" {
 
     // U+00E9 LATIN SMALL LETTER E WITH ACUTE (2-byte UTF-8: 0xC3 0xA9)
     screen.getCell(0, 0).codepoint = 0x00E9;
-    // U+4E16 CJK UNIFIED IDEOGRAPH (3-byte UTF-8: 0xE4 0xB8 0x96) — "世"
+    // U+4E16 CJK UNIFIED IDEOGRAPH (3-byte UTF-8: 0xE4 0xB8 0x96), "世"
     screen.getCell(0, 1).codepoint = 0x4E16;
     // U+1F600 GRINNING FACE (4-byte UTF-8: 0xF0 0x9F 0x98 0x80)
     screen.getCell(0, 2).codepoint = 0x1F600;

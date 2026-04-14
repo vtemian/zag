@@ -1,4 +1,4 @@
-//! Read tool — reads file contents and returns them as text.
+//! Read tool: reads file contents and returns them as text.
 //!
 //! Supports a `max_lines` parameter to truncate large files (default 2000).
 //! Files larger than 10 MB are rejected.
@@ -6,6 +6,8 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
+
+const max_file_bytes = 10 * 1024 * 1024;
 
 const ReadInput = struct {
     path: []const u8,
@@ -15,7 +17,7 @@ const ReadInput = struct {
 /// Read a file from disk. Returns the text content, truncated to max_lines if the file is long.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(ReadInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input — expected { \"path\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"path\": \"...\" }", .is_error = true };
     };
     defer parsed.deinit();
     const input = parsed.value;
@@ -23,8 +25,8 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     const max_lines = input.max_lines orelse 2000;
 
     // Read the whole file into memory (up to 10MB)
-    const content = std.fs.cwd().readFileAlloc(allocator, input.path, 10 * 1024 * 1024) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+    const content = std.fs.cwd().readFileAlloc(allocator, input.path, max_file_bytes) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
@@ -42,7 +44,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     }
 
     if (truncate_pos < content.len) {
-        const result = std.fmt.allocPrint(allocator, "{s}\n... truncated at {d} lines (file continues)", .{ content[0..truncate_pos], max_lines }) catch return .{ .content = "error: out of memory", .is_error = true };
+        const result = std.fmt.allocPrint(allocator, "{s}\n... truncated at {d} lines (file continues)", .{ content[0..truncate_pos], max_lines }) catch return types.oomResult();
         allocator.free(content);
         return .{ .content = result };
     }

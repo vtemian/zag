@@ -1,8 +1,6 @@
-//! Bash tool — executes shell commands via `/bin/sh -c`.
+//! Bash tool: executes shell commands via /bin/sh -c.
 //!
-//! Returns stdout, stderr, and exit code. The `timeout_ms` input field is
-//! accepted for schema compatibility but not yet enforced (Child.collectOutput
-//! does not support timeouts directly).
+//! Returns stdout, stderr, and exit code.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -10,28 +8,22 @@ const Allocator = std.mem.Allocator;
 
 const BashInput = struct {
     command: []const u8,
-    timeout_ms: ?u32 = null,
 };
 
 /// Spawn `/bin/sh -c <command>`, collect output, and return stdout/stderr/exit code.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(BashInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input — expected { \"command\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"command\": \"...\" }", .is_error = true };
     };
     defer parsed.deinit();
     const input = parsed.value;
-
-    // NOTE: timeout_ms is accepted but not enforced — Child.collectOutput
-    // does not support timeouts directly. A future implementation could use
-    // a separate thread or poll-based approach.
-    _ = input.timeout_ms;
 
     var child = std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
     child.spawn() catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: failed to spawn shell: {s}", .{@errorName(err)}) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: failed to spawn shell: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
@@ -42,12 +34,12 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 
     child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024) catch |err| {
         _ = child.kill() catch {};
-        const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
     const term = child.wait() catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: command wait failed: {s}", .{@errorName(err)}) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: command wait failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
@@ -56,7 +48,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
         else => 1,
     };
 
-    const msg = std.fmt.allocPrint(allocator, "exit code: {d}\n\nstdout:\n{s}\nstderr:\n{s}", .{ exit_code, stdout_buf.items, stderr_buf.items }) catch return .{ .content = "error: out of memory", .is_error = true };
+    const msg = std.fmt.allocPrint(allocator, "exit code: {d}\n\nstdout:\n{s}\nstderr:\n{s}", .{ exit_code, stdout_buf.items, stderr_buf.items }) catch return types.oomResult();
     return .{
         .content = msg,
         .is_error = exit_code != 0,
@@ -64,16 +56,14 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 }
 
 /// JSON schema and metadata sent to the LLM so it knows how to invoke this tool.
-/// Note: timeout_ms is accepted for forward compatibility but not yet enforced.
 pub const definition = types.ToolDefinition{
     .name = "bash",
-    .description = "Execute a shell command via /bin/sh -c. Returns stdout, stderr, and exit code. timeout_ms is accepted but not yet enforced.",
+    .description = "Execute a shell command via /bin/sh -c. Returns stdout, stderr, and exit code.",
     .input_schema_json =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "command": { "type": "string", "description": "Shell command to execute" },
-    \\    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (not yet enforced)" }
+    \\    "command": { "type": "string", "description": "Shell command to execute" }
     \\  },
     \\  "required": ["command"]
     \\}

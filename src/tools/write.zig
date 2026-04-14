@@ -1,4 +1,4 @@
-//! Write tool — creates or overwrites a file with the given content.
+//! Write tool: creates or overwrites a file with the given content.
 //!
 //! Automatically creates parent directories if they do not exist.
 //! Returns a confirmation message with the number of lines written.
@@ -15,7 +15,7 @@ const WriteInput = struct {
 /// Write content to a file, creating parent directories as needed.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input — expected { \"path\": \"...\", \"content\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"path\": \"...\", \"content\": \"...\" }", .is_error = true };
     };
     defer parsed.deinit();
     const input = parsed.value;
@@ -23,19 +23,19 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     // Create parent directories if needed
     if (std.fs.path.dirname(input.path)) |dir| {
         std.fs.cwd().makePath(dir) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+            const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
     }
 
     const file = std.fs.cwd().createFile(input.path, .{}) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
     defer file.close();
 
     file.writeAll(input.content) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: writing to '{s}': {s}", .{ input.path, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: writing to '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
@@ -48,7 +48,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
         break :blk count;
     };
 
-    const msg = std.fmt.allocPrint(allocator, "wrote {d} lines to {s}", .{ line_count, input.path }) catch return .{ .content = "error: out of memory", .is_error = true };
+    const msg = std.fmt.allocPrint(allocator, "wrote {d} lines to {s}", .{ line_count, input.path }) catch return types.oomResult();
     return .{ .content = msg };
 }
 
