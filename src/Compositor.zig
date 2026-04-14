@@ -1,4 +1,4 @@
-//! Compositor — merges buffer content into a Screen grid via the layout tree.
+//! Compositor: merges buffer content into a Screen grid via the layout tree.
 //!
 //! Reads visible lines from each buffer leaf in the active tab and writes them
 //! into the Screen at each leaf's rect position. Draws tab bar, split borders,
@@ -62,20 +62,20 @@ fn drawTabBar(self: *Compositor, layout: *const Layout) void {
 
         // Tab indicator
         if (is_active) {
-            col = writeStrToScreen(self.screen, 0, col, "[", style, .default);
+            col = self.screen.writeStr(0, col, "[", style, .default);
         } else {
-            col = writeStrToScreen(self.screen, 0, col, " ", style, .default);
+            col = self.screen.writeStr(0, col, " ", style, .default);
         }
 
-        col = writeStrToScreen(self.screen, 0, col, tab.name, style, .default);
+        col = self.screen.writeStr(0, col, tab.name, style, .default);
 
         if (is_active) {
-            col = writeStrToScreen(self.screen, 0, col, "]", style, .default);
+            col = self.screen.writeStr(0, col, "]", style, .default);
         } else {
-            col = writeStrToScreen(self.screen, 0, col, " ", style, .default);
+            col = self.screen.writeStr(0, col, " ", style, .default);
         }
 
-        col = writeStrToScreen(self.screen, 0, col, " ", Screen.Style{ .inverse = true }, .default);
+        col = self.screen.writeStr(0, col, " ", Screen.Style{ .inverse = true }, .default);
     }
 }
 
@@ -116,7 +116,7 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
         const screen_row = rect.y + @as(u16, @intCast(row_off));
         if (screen_row >= self.screen.height) break;
 
-        _ = writeStrToScreen(self.screen, screen_row, rect.x, line, .{}, .default);
+        _ = self.screen.writeStr(screen_row, rect.x, line, .{}, .default);
     }
 }
 
@@ -186,28 +186,13 @@ fn drawStatusLine(self: *Compositor, tab: *const Layout.Tab) void {
     };
 
     var col: u16 = 1;
-    col = writeStrToScreen(self.screen, last_row, col, leaf.buffer.name, status_style, .default);
-    col = writeStrToScreen(self.screen, last_row, col, " | ", status_style, .default);
+    col = self.screen.writeStr(last_row, col, leaf.buffer.name, status_style, .default);
+    col = self.screen.writeStr(last_row, col, " | ", status_style, .default);
 
     // Show pane rect info
     var info_buf: [64]u8 = undefined;
     const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
-    _ = writeStrToScreen(self.screen, last_row, col, info, status_style, .default);
-}
-
-/// Write a string into the screen grid at the given position, returning the next column.
-fn writeStrToScreen(screen: *Screen, row: u16, col: u16, text: []const u8, style: Screen.Style, fg: Screen.Color) u16 {
-    var c = col;
-    for (text) |byte| {
-        if (c >= screen.width) break;
-        if (row >= screen.height) break;
-        const cell = screen.getCell(row, c);
-        cell.codepoint = byte;
-        cell.style = style;
-        cell.fg = fg;
-        c += 1;
-    }
-    return c;
+    _ = self.screen.writeStr(last_row, col, info, status_style, .default);
 }
 
 // -- Tests -------------------------------------------------------------------

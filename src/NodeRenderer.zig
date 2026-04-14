@@ -1,4 +1,4 @@
-//! NodeRenderer — converts buffer nodes to display lines.
+//! NodeRenderer: converts buffer nodes to display lines.
 //!
 //! Provides default renderers for each node type and a registry that allows
 //! overriding renderers per node type (for plugin support). For now, renderers

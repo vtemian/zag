@@ -1,4 +1,4 @@
-//! Tool registry — maps tool names to their implementations and dispatches execution.
+//! Tool registry: maps tool names to their implementations and dispatches execution.
 //!
 //! The Registry holds all registered tools and provides lookup and execution by name.
 //! `createDefaultRegistry` builds a registry pre-loaded with the built-in tool set

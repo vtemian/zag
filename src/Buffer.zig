@@ -1,4 +1,4 @@
-//! Buffer — structured content as a tree of typed nodes.
+//! Buffer: structured content as a tree of typed nodes.
 //!
 //! Replaces flat line-based output with a node tree where each node has a type
 //! (user message, assistant text, tool call, etc.) and optional children.
@@ -75,7 +75,7 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
     };
 }
 
-/// Release all memory owned by this buffer — nodes, name, and lists.
+/// Release all memory owned by this buffer: nodes, name, and lists.
 pub fn deinit(self: *Buffer) void {
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);

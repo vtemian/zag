@@ -1,4 +1,4 @@
-//! Edit tool — performs exact text replacement in an existing file.
+//! Edit tool: performs exact text replacement in an existing file.
 //!
 //! The old_text must match exactly once in the file. Zero matches or multiple
 //! matches both produce an error, forcing the caller to provide unambiguous context.
@@ -6,6 +6,8 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
+
+const max_file_bytes = 10 * 1024 * 1024;
 
 const EditInput = struct {
     path: []const u8,
@@ -16,13 +18,13 @@ const EditInput = struct {
 /// Replace a unique occurrence of old_text with new_text in the given file.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(EditInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input — expected { \"path\": \"...\", \"old_text\": \"...\", \"new_text\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"path\": \"...\", \"old_text\": \"...\", \"new_text\": \"...\" }", .is_error = true };
     };
     defer parsed.deinit();
     const input = parsed.value;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, input.path, 10 * 1024 * 1024) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+    const content = std.fs.cwd().readFileAlloc(allocator, input.path, max_file_bytes) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
     defer allocator.free(content);
@@ -49,31 +51,31 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     }
 
     if (count > 1) {
-        const msg = std.fmt.allocPrint(allocator, "error: old_text found {d} times in '{s}'. Provide more surrounding context to make the match unique.", .{ count, input.path }) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: old_text found {d} times in '{s}'. Provide more surrounding context to make the match unique.", .{ count, input.path }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     }
 
-    // Single occurrence — replace
+    // Single occurrence, replace
     const idx = std.mem.indexOf(u8, content, input.old_text) orelse unreachable;
     const new_content = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
         content[0..idx],
         input.new_text,
         content[idx + input.old_text.len ..],
-    }) catch return .{ .content = "error: out of memory", .is_error = true };
+    }) catch return types.oomResult();
     defer allocator.free(new_content);
 
     const file = std.fs.cwd().createFile(input.path, .{}) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: cannot write '{s}': {s}", .{ input.path, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: cannot write '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
     defer file.close();
 
     file.writeAll(new_content) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: writing '{s}': {s}", .{ input.path, @errorName(err) }) catch return .{ .content = "error: out of memory", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "error: writing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
-    const msg = std.fmt.allocPrint(allocator, "replaced in {s}", .{input.path}) catch return .{ .content = "error: out of memory", .is_error = true };
+    const msg = std.fmt.allocPrint(allocator, "replaced in {s}", .{input.path}) catch return types.oomResult();
     return .{ .content = msg };
 }
 

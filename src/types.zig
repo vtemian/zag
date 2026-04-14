@@ -68,6 +68,11 @@ pub const ToolResult = struct {
     is_error: bool = false,
 };
 
+/// Convenience constructor for a ToolResult indicating an out-of-memory error.
+pub fn oomResult() ToolResult {
+    return .{ .content = "error: out of memory", .is_error = true };
+}
+
 /// Metadata describing a tool that can be offered to the LLM.
 pub const ToolDefinition = struct {
     /// The unique name the LLM uses to invoke this tool.

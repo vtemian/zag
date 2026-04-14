@@ -1,4 +1,4 @@
-//! Entry point for zag — full-screen TUI agent application.
+//! Entry point for zag, a full-screen TUI agent application.
 //!
 //! Initializes the terminal in raw mode with alternate screen buffer, renders a
 //! cell-grid UI via Screen, and drives the agent loop with captured output.
@@ -39,7 +39,7 @@ fn tuiLogHandler(
     const scope_prefix = if (scope == .default) "" else @tagName(scope) ++ ": ";
 
     if (tui_active) {
-        // Capture into output buffer — format into a stack buffer
+        // Capture into output buffer. Format into a stack buffer.
         var buf: [4096]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, scope_prefix ++ format, args) catch return;
         appendOutputText(msg) catch {};
@@ -54,7 +54,7 @@ fn tuiLogHandler(
 }
 
 // ---------------------------------------------------------------------------
-// Buffer — structured node tree for agent output. Written by the agent
+// Buffer: structured node tree for agent output. Written by the agent
 // output callback and read by the render loop. Since the agent runs
 // synchronously on the same thread, no mutex is needed.
 // ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ var compositor: Compositor = undefined;
 /// Counter for creating new buffers when splitting windows.
 var next_buffer_id: u32 = 1;
 
-/// Extra buffers created by splits — tracked for cleanup.
+/// Extra buffers created by splits, tracked for cleanup.
 var extra_buffers: std.ArrayList(*Buffer) = .empty;
 
 /// Last tool_call node, used to parent tool_result nodes.
@@ -80,7 +80,7 @@ var last_tool_call: ?*Buffer.Node = null;
 /// State for Ctrl+W prefix key sequence.
 var awaiting_window_cmd: bool = false;
 
-/// Typed callback passed to agent.runLoop — creates nodes in the buffer.
+/// Typed callback passed to agent.runLoop. Creates nodes in the buffer.
 fn agentOutputCallback(content_type: agent.ContentType, text: []const u8) void {
     const node_type: Buffer.NodeType = switch (content_type) {
         .assistant_text => .assistant_text,
@@ -112,21 +112,6 @@ fn appendOutputText(text: []const u8) !void {
 // ---------------------------------------------------------------------------
 // TUI rendering helpers
 // ---------------------------------------------------------------------------
-
-/// Write a string into the screen grid at (row, col), clipping to screen width.
-/// Returns the column after the last written character.
-fn writeStr(screen: *Screen, row: u16, col: u16, text: []const u8, style: Screen.Style, fg: Screen.Color) u16 {
-    var c = col;
-    for (text) |byte| {
-        if (c >= screen.width) break;
-        const cell = screen.getCell(row, c);
-        cell.codepoint = byte;
-        cell.style = style;
-        cell.fg = fg;
-        c += 1;
-    }
-    return c;
-}
 
 /// Fill an entire row with a given character, style, fg, and bg.
 fn fillRow(screen: *Screen, row: u16, codepoint: u21, style: Screen.Style, fg: Screen.Color, bg: Screen.Color) void {
@@ -196,10 +181,10 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
 
     if (status_msg.len > 0) {
         const status_style = Screen.Style{ .dim = true };
-        _ = writeStr(screen, input_row, 0, status_msg, status_style, .{ .palette = 3 });
+        _ = screen.writeStr(input_row, 0, status_msg, status_style, .{ .palette = 3 });
     } else {
-        const c = writeStr(screen, input_row, 0, "> ", .{ .bold = true }, .{ .palette = 2 });
-        _ = writeStr(screen, input_row, c, input_buf_ptr[0..input_len], .{}, .default);
+        const c = screen.writeStr(input_row, 0, "> ", .{ .bold = true }, .{ .palette = 2 });
+        _ = screen.writeStr(input_row, c, input_buf_ptr[0..input_len], .{}, .default);
     }
 }
 
@@ -232,7 +217,7 @@ pub fn main() !void {
 
     // Get API key
     const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch {
-        // Can't use TUI yet — print to stderr and exit
+        // Can't use TUI yet; print to stderr and exit
         const stderr = std.fs.File.stderr();
         stderr.writeAll("error: ANTHROPIC_API_KEY not set\n") catch {};
         return;
@@ -321,7 +306,7 @@ pub fn main() !void {
         // Poll for input
         const maybe_event = input_mod.pollEvent(posix.STDIN_FILENO);
         if (maybe_event == null) {
-            // No input available — sleep briefly to avoid busy-spinning
+            // No input available; sleep briefly to avoid busy-spinning
             posix.nanosleep(0, 10 * std.time.ns_per_ms);
             continue;
         }
@@ -337,14 +322,18 @@ pub fn main() !void {
                             'v' => {
                                 // Split vertical
                                 if (createSplitBuffer(allocator)) |new_buf| {
-                                    layout.splitVertical(0.5, new_buf) catch {};
+                                    layout.splitVertical(0.5, new_buf) catch |err| {
+                                        log.warn("split failed: {}", .{err});
+                                    };
                                     layout.recalculate(screen.width, screen.height);
                                 } else |_| {}
                             },
                             's' => {
                                 // Split horizontal
                                 if (createSplitBuffer(allocator)) |new_buf| {
-                                    layout.splitHorizontal(0.5, new_buf) catch {};
+                                    layout.splitHorizontal(0.5, new_buf) catch |err| {
+                                        log.warn("split failed: {}", .{err});
+                                    };
                                     layout.recalculate(screen.width, screen.height);
                                 } else |_| {}
                             },
@@ -362,7 +351,7 @@ pub fn main() !void {
                         else => {},
                     }
                 } else {
-                    // Ctrl+C — exit
+                    // Ctrl+C: exit
                     if (k.modifiers.ctrl) {
                         switch (k.key) {
                             .char => |ch| {
@@ -406,7 +395,7 @@ pub fn main() !void {
                             // Reset tool_call tracking for this turn
                             last_tool_call = null;
 
-                            // Run agent loop (blocking) — output captured via callback
+                            // Run agent loop (blocking), output captured via callback
                             agent.runLoop(
                                 user_input,
                                 &messages,
@@ -571,7 +560,7 @@ test "writeStr clips to screen width" {
     var screen = try Screen.init(allocator, 5, 1);
     defer screen.deinit();
 
-    const end_col = writeStr(&screen, 0, 0, "hello world", .{}, .default);
+    const end_col = screen.writeStr(0, 0, "hello world", .{}, .default);
 
     // Should clip at width 5
     try std.testing.expectEqual(@as(u16, 5), end_col);
@@ -584,7 +573,7 @@ test "writeStr starts at offset column" {
     var screen = try Screen.init(allocator, 10, 1);
     defer screen.deinit();
 
-    const end_col = writeStr(&screen, 0, 3, "ab", .{}, .default);
+    const end_col = screen.writeStr(0, 3, "ab", .{}, .default);
 
     try std.testing.expectEqual(@as(u16, 5), end_col);
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 2).codepoint);

@@ -1,4 +1,4 @@
-//! Input handling — parses keyboard and mouse events from raw stdin bytes.
+//! Input handling: parses keyboard and mouse events from raw stdin bytes.
 //!
 //! Decodes escape sequences (CSI), SGR mouse encoding, UTF-8 characters,
 //! and Ctrl+key combinations into structured Event values. Designed for
@@ -26,7 +26,7 @@ pub const KeyEvent = struct {
     /// Which modifier keys were held.
     modifiers: Modifiers,
 
-    /// The logical key identity — either a Unicode codepoint or a named special key.
+    /// The logical key identity: either a Unicode codepoint or a named special key.
     pub const Key = union(enum) {
         /// A printable or Unicode character.
         char: u21,
@@ -62,7 +62,7 @@ pub const KeyEvent = struct {
         function: u8,
     };
 
-    /// Modifier key state — shift, alt, ctrl as individual booleans.
+    /// Modifier key state: shift, alt, ctrl as individual booleans.
     pub const Modifiers = packed struct {
         /// Shift is held.
         shift: bool = false,
@@ -90,7 +90,7 @@ pub const MouseEvent = struct {
     modifiers: KeyEvent.Modifiers,
 };
 
-/// Maximum bytes we read in a single poll — enough for any escape sequence.
+/// Maximum bytes we read in a single poll, enough for any escape sequence.
 const READ_BUF_SIZE = 64;
 
 /// Read and parse a single event from the given file descriptor (non-blocking).
@@ -161,7 +161,7 @@ pub fn parseBytes(buf: []const u8) ?Event {
         };
     }
 
-    // DEL (0x7f) — backspace on most terminals
+    // DEL (0x7f), backspace on most terminals
     if (first == 0x7f) {
         return Event{ .key = .{ .key = .backspace, .modifiers = KeyEvent.no_modifiers } };
     }
@@ -215,7 +215,7 @@ fn parseCsi(seq: []const u8) Event {
     const final_byte = seq[seq.len - 1];
     const params = seq[0 .. seq.len - 1];
 
-    // CSI 1;mod X — modified arrow/special key
+    // CSI 1;mod X, modified arrow/special key
     if (final_byte >= 'A' and final_byte <= 'Z') {
         const modifiers = parseModifierParam(params);
         return switch (final_byte) {
@@ -233,7 +233,7 @@ fn parseCsi(seq: []const u8) Event {
         };
     }
 
-    // CSI n ~ — special keys identified by number
+    // CSI n ~, special keys identified by number
     if (final_byte == '~') {
         var num: u16 = 0;
         var modifier_param: ?u16 = null;
@@ -446,7 +446,7 @@ test "parse CSI D as left arrow" {
 }
 
 test "parse SS3 arrow keys" {
-    // ESC O A — up arrow via SS3
+    // ESC O A, up arrow via SS3
     const event = parseBytes(&.{ 0x1b, 'O', 'A' }) orelse return error.TestUnexpectedResult;
     switch (event) {
         .key => |k| {
@@ -774,13 +774,13 @@ test "parse UTF-8 four-byte character (emoji)" {
 }
 
 test "parse unrecognized CSI sequence returns none" {
-    // ESC [ x — 'x' is not a recognized single-letter CSI final byte
+    // ESC [ x, 'x' is not a recognized single-letter CSI final byte
     const event = parseBytes(&.{ 0x1b, '[', 'x' }) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(Event.none, event);
 }
 
 test "parse truncated CSI (ESC [) returns Alt+[" {
-    // ESC [ with nothing after — only 2 bytes, so the Alt+char path matches
+    // ESC [ with nothing after; only 2 bytes, so the Alt+char path matches
     // before the CSI branch can fire (CSI requires a third byte)
     const event = parseBytes(&.{ 0x1b, '[' }) orelse return error.TestUnexpectedResult;
     switch (event) {
@@ -856,7 +856,7 @@ test "parse SS3 F4 (ESC O S)" {
 }
 
 test "parse truncated SGR mouse returns none" {
-    // ESC [ < 0 ; 1 0 ; 5 — missing M/m terminator
+    // ESC [ < 0 ; 1 0 ; 5, missing M/m terminator
     const event = parseBytes(&.{ 0x1b, '[', '<', '0', ';', '1', '0', ';', '5' }) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(Event.none, event);
 }

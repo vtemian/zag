@@ -121,7 +121,7 @@ pub fn runLoop(
             }
         }
 
-        // No tool calls — we're done
+        // No tool calls; we're done
         if (tool_calls.items.len == 0) break;
 
         // Execute tools and collect results
