@@ -1,12 +1,7 @@
 .{
     .name = .zag,
     .version = "0.1.0",
-    .dependencies = .{
-        .ghostty = .{
-            .url = "https://github.com/ghostty-org/ghostty/archive/79a470d.tar.gz",
-            .hash = "ghostty-1.3.2-dev-5UdBC2LLBwU3C86r-SUA40OG8twjD8Jh0WrJZwo0VEEL",
-        },
-    },
+    .dependencies = .{},
     .fingerprint = 0x9179a895b492806,
     .paths = .{
         "build.zig",
