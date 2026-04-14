@@ -10,7 +10,7 @@ Built in Zig. Modal. Extensible. Everything above the primitives is a plugin.
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
 > **Warning**
-> This project is in **heavy development**. APIs will change. Things will break. The architecture is taking shape but nothing is stable yet. If you're here, you're early — and that's the point.
+> This is a **personal, highly opinionated project** in heavy development. I'm building it because I want to. It will be slow. It will take time. APIs will change, things will break, and the architecture is still taking shape. If you're here, you're early.
 
 * * *
 
@@ -20,7 +20,7 @@ Every AI coding agent ships the same UI: a chat box. Type a message, watch text 
 
 You can't split the screen. You can't run two sessions side by side. You can't build a file browser plugin, or a git panel, or a session tree that shows all your conversations. The window is fixed. The layout is fixed. The experience is whatever the vendor decided.
 
-Zag is different. The window system is the platform. Splits, tabs, buffers, focus — these are primitives. Everything else is a plugin. The session tree? A plugin. The git panel? A plugin. Even how agent responses render? A plugin.
+Zag is different. The window system is the platform. Splits, tabs, buffers, focus. These are primitives. Everything else is a plugin. The session tree? A plugin. The git panel? A plugin. Even how agent responses render? A plugin.
 
 Think Neovim, but for AI agents.
 
@@ -32,7 +32,7 @@ Think Neovim, but for AI agents.
 ┌─ session | scratch ───────────────────────────┐
 │                    │                          │
 │  > read main.zig   │                          │
-│                    │  (new split — Ctrl+W v)  │
+│                    │  (new split, Ctrl+W v)   │
 │  [tool] read       │                          │
 │    85 lines read   │                          │
 │                    │                          │
@@ -52,17 +52,17 @@ Composable windows. Vim-style navigation. Structured output. Real splits, not CS
 
 ## Features
 
-**Composable window system** — splits, tabs, and buffers as first-class primitives. `Ctrl+W v` to split vertical, `Ctrl+W s` for horizontal, `Ctrl+W h/j/k/l` to navigate. Each window holds a buffer. You control the layout.
+**Composable window system.** Splits, tabs, and buffers as first-class primitives. `Ctrl+W v` to split vertical, `Ctrl+W s` for horizontal, `Ctrl+W h/j/k/l` to navigate. Each window holds a buffer. You control the layout.
 
-**Structured content** — agent output isn't flat text. It's a tree of typed nodes: user messages, assistant responses, tool calls, tool results. Nodes can be collapsed, filtered, rendered differently by plugins.
+**Structured content.** Agent output isn't flat text. It's a tree of typed nodes: user messages, assistant responses, tool calls, tool results. Nodes can be collapsed, filtered, rendered differently by plugins.
 
-**Real coding agent** — Claude API integration with four tools out of the box: `read`, `write`, `edit`, `bash`. The same tools that power every major agent, running in a 4.9MB binary with zero external dependencies.
+**Real coding agent.** Claude API integration with four tools out of the box: `read`, `write`, `edit`, `bash`. The same tools that power every major agent, running in a 4.9MB binary with zero external dependencies.
 
-**Vim-native** — modal interaction is the foundation, not an afterthought. The keybinding system is designed for composition.
+**Vim-native.** Modal interaction is the foundation, not an afterthought. The keybinding system is designed for composition.
 
-**Plugin-ready architecture** — node renderers are overridable per type. The buffer API, window API, and tool registry are all designed for Lua extension (coming soon).
+**Plugin-ready architecture.** Node renderers are overridable per type. The buffer API, window API, and tool registry are all designed for Lua extension (coming soon).
 
-**Built in Zig** — zero runtime dependencies. Single static binary. Compiles in seconds. ANSI rendering with dirty-rectangle diffing and synchronized output for flicker-free updates.
+**Built in Zig.** Zero runtime dependencies. Single static binary. Compiles in seconds. ANSI rendering with dirty-rectangle diffing and synchronized output for flicker-free updates.
 
 * * *
 
@@ -81,7 +81,7 @@ Window System (binary layout tree)
     │
     │  Compositor merges buffer content → screen grid
     ▼
-Renderer (abstract — ANSI today, GPU tomorrow)
+Renderer (abstract, ANSI today, GPU tomorrow)
     │
     └── Screen grid → escape sequences → terminal
 ```
@@ -120,15 +120,15 @@ zig fmt --check .  # check formatting
 
 ## Vision
 
-Zag is an Agent Development Environment (ADE). Not a TUI chat app. Not a terminal emulator. A platform for AI agent interaction with a composable, vim-native window system.
+Zag is an Agent Development Environment. Not a TUI chat app. Not a terminal emulator. A platform for AI agent interaction with a composable, vim-native window system.
 
 The window system is what you'd get if Neovim and Ghostty had a baby that only cared about AI agents. Everything above the primitives is a plugin. The core ships splits, tabs, buffers, and focus. The community builds everything else.
 
 **Planned:**
-- Lua plugin system (Neovim model — LuaJIT embedded, deep API access)
+- Lua plugin system (Neovim model, LuaJIT embedded, deep API access)
 - libghostty-vt integration (terminal emulation per buffer)
 - Session persistence (JSONL tree structure with branching)
-- Event system with steering/follow-up queues
+- Event system with steering and follow-up queues
 - Tree-sitter repo map for context intelligence
 - Multi-provider LLM support
 
@@ -136,10 +136,10 @@ The window system is what you'd get if Neovim and Ghostty had a baby that only c
 
 ## Inspiration
 
-- [Neovim](https://neovim.io) — modal editing, Lua plugins, buffer/window/tab model
-- [Ghostty](https://ghostty.org) — taste in terminal software, Zig, libghostty
-- [pi-mono](https://github.com/badlogic/pi-mono) — event-driven architecture, radical minimalism
-- [Amp](https://ampcode.com) — TUI polish, multi-model orchestration
+- [Neovim](https://neovim.io). Modal editing, Lua plugins, buffer/window/tab model.
+- [Ghostty](https://ghostty.org). Taste in terminal software. Zig. libghostty.
+- [pi-mono](https://github.com/badlogic/pi-mono). Event-driven architecture, radical minimalism.
+- [Amp](https://ampcode.com). TUI polish, multi-model orchestration.
 
 * * *
 
