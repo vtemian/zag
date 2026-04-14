@@ -11,6 +11,8 @@ const types = @import("types.zig");
 const input_mod = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
+const Buffer = @import("Buffer.zig");
+const NodeRenderer = @import("NodeRenderer.zig");
 
 const log = std.log.scoped(.main);
 
@@ -56,57 +58,46 @@ const version = "zag v0.1.0";
 const model = "claude-sonnet-4-20250514";
 
 // ---------------------------------------------------------------------------
-// Output line buffer — shared state written by the agent output callback
-// and read by the render loop. Since the agent runs synchronously on the
-// same thread, no mutex is needed.
+// Buffer — structured node tree for agent output. Written by the agent
+// output callback and read by the render loop. Since the agent runs
+// synchronously on the same thread, no mutex is needed.
 // ---------------------------------------------------------------------------
 
-/// Mutable module-level state for agent output capture.
-/// Safe because the agent loop and render loop never run concurrently.
-var output_lines: std.ArrayList([]const u8) = .empty;
-var output_alloc: std.mem.Allocator = undefined;
+/// Module-level buffer and renderer, initialized in main().
+var buffer: Buffer = undefined;
+var node_renderer: NodeRenderer = undefined;
+var buffer_alloc: std.mem.Allocator = undefined;
 
-/// Callback passed to agent.runLoop — appends text to the output line buffer,
-/// splitting on newlines so each line can be rendered independently.
-fn agentOutputCallback(text: []const u8) void {
-    appendOutputText(text) catch |err| {
-        log.warn("output capture failed: {}", .{err});
+/// Last tool_call node, used to parent tool_result nodes.
+var last_tool_call: ?*Buffer.Node = null;
+
+/// Typed callback passed to agent.runLoop — creates nodes in the buffer.
+fn agentOutputCallback(content_type: agent.ContentType, text: []const u8) void {
+    const node_type: Buffer.NodeType = switch (content_type) {
+        .assistant_text => .assistant_text,
+        .tool_call => .tool_call,
+        .tool_result => .tool_result,
+        .info => .status,
+        .err => .err,
     };
+
+    const parent: ?*Buffer.Node = if (content_type == .tool_result) last_tool_call else null;
+
+    const node = buffer.appendNode(parent, node_type, text) catch |err| {
+        log.warn("output capture failed: {}", .{err});
+        return;
+    };
+
+    // Track the last tool_call so tool_results can be parented to it
+    if (content_type == .tool_call) {
+        last_tool_call = node;
+    }
 }
 
-/// Split text on newlines and append each segment to `output_lines`.
-/// An empty trailing segment from a final '\n' is intentionally kept
-/// so the next append starts on a fresh line.
+/// Append a plain text line to the buffer as a status node.
+/// Used for welcome messages and non-agent output.
 fn appendOutputText(text: []const u8) !void {
-    var rest: []const u8 = text;
-    while (rest.len > 0) {
-        if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
-            const line = rest[0..nl];
-            if (line.len > 0) {
-                const duped = try output_alloc.dupe(u8, line);
-                try output_lines.append(output_alloc, duped);
-            } else {
-                // Empty line — push an empty string so it renders as a blank row
-                try output_lines.append(output_alloc, "");
-            }
-            rest = rest[nl + 1 ..];
-        } else {
-            // No more newlines — append the remainder as a partial line
-            const duped = try output_alloc.dupe(u8, rest);
-            try output_lines.append(output_alloc, duped);
-            break;
-        }
-    }
-}
-
-/// Free all owned strings in the output_lines buffer.
-fn freeOutputLines() void {
-    for (output_lines.items) |line| {
-        if (line.len > 0) {
-            output_alloc.free(line);
-        }
-    }
-    output_lines.deinit(output_alloc);
+    _ = try buffer.appendNode(null, .status, text);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +132,7 @@ fn fillRow(screen: *Screen, row: u16, codepoint: u21, style: Screen.Style, fg: S
 }
 
 /// Render the full TUI frame: header bar, message area, and input line.
+/// Uses the module-level buffer and node_renderer to produce visible lines.
 fn drawFrame(
     screen: *Screen,
     input_buf: []const u8,
@@ -166,7 +158,15 @@ fn drawFrame(
 
     // -- Message area (rows 1 .. height-2) -----------------------------------
     const msg_rows = height - 2; // rows available for messages
-    const total_lines = output_lines.items.len;
+
+    // Get visible lines from the buffer's node tree
+    var lines = buffer.getVisibleLines(buffer_alloc, &node_renderer) catch return;
+    defer {
+        for (lines.items) |line| buffer_alloc.free(line);
+        lines.deinit(buffer_alloc);
+    }
+
+    const total_lines = lines.items.len;
 
     // Determine which lines to show: scroll_offset is measured from the bottom
     const visible_start = if (total_lines > scroll_offset + msg_rows)
@@ -179,7 +179,7 @@ fn drawFrame(
         0;
 
     var screen_row: u16 = 1;
-    for (output_lines.items[visible_start..visible_end]) |line| {
+    for (lines.items[visible_start..visible_end]) |line| {
         if (screen_row >= height - 1) break;
         _ = writeStr(screen, screen_row, 0, line, .{}, .default);
         screen_row += 1;
@@ -229,9 +229,11 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Module-level output buffer allocator
-    output_alloc = allocator;
-    defer freeOutputLines();
+    // Module-level buffer and renderer
+    buffer_alloc = allocator;
+    buffer = try Buffer.init(allocator, 0, "session");
+    defer buffer.deinit();
+    node_renderer = NodeRenderer.initDefault();
 
     // Get API key
     const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch {
@@ -343,9 +345,7 @@ pub fn main() !void {
                         }
 
                         // Show user message in output
-                        try appendOutputText("> ");
-                        try appendOutputText(user_input);
-                        try appendOutputText("");
+                        _ = try buffer.appendNode(null, .user_message, user_input);
 
                         // Clear input
                         input_len = 0;
@@ -356,6 +356,9 @@ pub fn main() !void {
                         drawFrame(&screen, &input_buf, input_len, scroll_offset, status_msg);
                         try screen.render(stdout_file);
 
+                        // Reset tool_call tracking for this turn
+                        last_tool_call = null;
+
                         // Run agent loop (blocking) — output captured via callback
                         agent.runLoop(
                             user_input,
@@ -365,9 +368,7 @@ pub fn main() !void {
                             allocator,
                             agentOutputCallback,
                         ) catch |err| {
-                            const err_msg = @errorName(err);
-                            try appendOutputText("[error] agent loop failed: ");
-                            try appendOutputText(err_msg);
+                            _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
                         };
 
                         // Clear status after agent completes
@@ -387,9 +388,10 @@ pub fn main() !void {
                         const msg_rows = if (screen.height > 2) screen.height - 2 else 1;
                         scroll_offset +|= msg_rows / 2;
                         // Clamp: can't scroll past the top
-                        if (output_lines.items.len > 0) {
-                            const max_scroll = if (output_lines.items.len > msg_rows)
-                                output_lines.items.len - msg_rows
+                        const total_lines = buffer.lineCount(&node_renderer) catch 0;
+                        if (total_lines > 0) {
+                            const max_scroll = if (total_lines > msg_rows)
+                                total_lines - msg_rows
                             else
                                 0;
                             if (scroll_offset > max_scroll) scroll_offset = max_scroll;
@@ -449,6 +451,8 @@ test "imports compile" {
     _ = @import("Screen.zig");
     _ = @import("input.zig");
     _ = @import("Terminal.zig");
+    _ = @import("Buffer.zig");
+    _ = @import("NodeRenderer.zig");
 }
 
 test "inputAppendChar adds character" {
@@ -480,61 +484,55 @@ test "inputDeleteBack on empty returns zero" {
     try std.testing.expectEqual(@as(usize, 0), inputDeleteBack(0));
 }
 
-test "appendOutputText splits on newlines" {
+test "appendOutputText creates a status node" {
     const allocator = std.testing.allocator;
-    output_alloc = allocator;
-    output_lines = .empty;
-    defer {
-        for (output_lines.items) |line| {
-            if (line.len > 0) allocator.free(line);
-        }
-        output_lines.deinit(allocator);
-    }
+    buffer_alloc = allocator;
+    buffer = try Buffer.init(allocator, 0, "test");
+    node_renderer = NodeRenderer.initDefault();
+    defer buffer.deinit();
 
-    try appendOutputText("hello\nworld\n");
+    try appendOutputText("hello world");
 
-    // "hello\nworld\n" produces: "hello", "world" — trailing newline
-    // consumes the rest but does not produce an extra entry.
-    try std.testing.expectEqual(@as(usize, 2), output_lines.items.len);
-    try std.testing.expectEqualStrings("hello", output_lines.items[0]);
-    try std.testing.expectEqualStrings("world", output_lines.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
+    try std.testing.expectEqual(Buffer.NodeType.status, buffer.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("hello world", buffer.root_children.items[0].content.items);
 }
 
-test "appendOutputText preserves empty lines between content" {
+test "agentOutputCallback creates typed nodes" {
     const allocator = std.testing.allocator;
-    output_alloc = allocator;
-    output_lines = .empty;
-    defer {
-        for (output_lines.items) |line| {
-            if (line.len > 0) allocator.free(line);
-        }
-        output_lines.deinit(allocator);
-    }
+    buffer_alloc = allocator;
+    buffer = try Buffer.init(allocator, 0, "test");
+    node_renderer = NodeRenderer.initDefault();
+    last_tool_call = null;
+    defer buffer.deinit();
 
-    try appendOutputText("hello\n\nworld");
+    agentOutputCallback(.assistant_text, "hello");
+    agentOutputCallback(.tool_call, "bash");
+    agentOutputCallback(.tool_result, "output");
 
-    // "hello\n\nworld" produces: "hello", "" (blank line), "world"
-    try std.testing.expectEqual(@as(usize, 3), output_lines.items.len);
-    try std.testing.expectEqualStrings("hello", output_lines.items[0]);
-    try std.testing.expectEqualStrings("", output_lines.items[1]);
-    try std.testing.expectEqualStrings("world", output_lines.items[2]);
+    try std.testing.expectEqual(@as(usize, 2), buffer.root_children.items.len);
+    try std.testing.expectEqual(Buffer.NodeType.assistant_text, buffer.root_children.items[0].node_type);
+    try std.testing.expectEqual(Buffer.NodeType.tool_call, buffer.root_children.items[1].node_type);
+
+    // tool_result should be a child of the tool_call node
+    const tc_node = buffer.root_children.items[1];
+    try std.testing.expectEqual(@as(usize, 1), tc_node.children.items.len);
+    try std.testing.expectEqual(Buffer.NodeType.tool_result, tc_node.children.items[0].node_type);
 }
 
-test "appendOutputText handles text without newlines" {
+test "agentOutputCallback err node at root" {
     const allocator = std.testing.allocator;
-    output_alloc = allocator;
-    output_lines = .empty;
-    defer {
-        for (output_lines.items) |line| {
-            if (line.len > 0) allocator.free(line);
-        }
-        output_lines.deinit(allocator);
-    }
+    buffer_alloc = allocator;
+    buffer = try Buffer.init(allocator, 0, "test");
+    node_renderer = NodeRenderer.initDefault();
+    defer buffer.deinit();
+    last_tool_call = null;
 
-    try appendOutputText("no newline here");
+    agentOutputCallback(.err, "something broke");
 
-    try std.testing.expectEqual(@as(usize, 1), output_lines.items.len);
-    try std.testing.expectEqualStrings("no newline here", output_lines.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
+    try std.testing.expectEqual(Buffer.NodeType.err, buffer.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("something broke", buffer.root_children.items[0].content.items);
 }
 
 test "writeStr clips to screen width" {
