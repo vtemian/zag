@@ -13,6 +13,8 @@ const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
+const Layout = @import("Layout.zig");
+const Compositor = @import("Compositor.zig");
 
 const log = std.log.scoped(.main);
 
@@ -51,12 +53,6 @@ fn tuiLogHandler(
     }
 }
 
-/// Version string shown in the header bar.
-const version = "zag v0.1.0";
-
-/// Model identifier shown in the header bar.
-const model = "claude-sonnet-4-20250514";
-
 // ---------------------------------------------------------------------------
 // Buffer — structured node tree for agent output. Written by the agent
 // output callback and read by the render loop. Since the agent runs
@@ -68,8 +64,21 @@ var buffer: Buffer = undefined;
 var node_renderer: NodeRenderer = undefined;
 var buffer_alloc: std.mem.Allocator = undefined;
 
+/// Layout and compositor, initialized in main().
+var layout: Layout = undefined;
+var compositor: Compositor = undefined;
+
+/// Counter for creating new buffers when splitting windows.
+var next_buffer_id: u32 = 1;
+
+/// Extra buffers created by splits — tracked for cleanup.
+var extra_buffers: std.ArrayList(*Buffer) = .empty;
+
 /// Last tool_call node, used to parent tool_result nodes.
 var last_tool_call: ?*Buffer.Node = null;
+
+/// State for Ctrl+W prefix key sequence.
+var awaiting_window_cmd: bool = false;
 
 /// Typed callback passed to agent.runLoop — creates nodes in the buffer.
 fn agentOutputCallback(content_type: agent.ContentType, text: []const u8) void {
@@ -131,72 +140,6 @@ fn fillRow(screen: *Screen, row: u16, codepoint: u21, style: Screen.Style, fg: S
     }
 }
 
-/// Render the full TUI frame: header bar, message area, and input line.
-/// Uses the module-level buffer and node_renderer to produce visible lines.
-fn drawFrame(
-    screen: *Screen,
-    input_buf: []const u8,
-    input_len: usize,
-    scroll_offset: usize,
-    status_msg: []const u8,
-) void {
-    screen.clear();
-
-    const width = screen.width;
-    const height = screen.height;
-    if (height < 3 or width < 10) return;
-
-    // -- Header bar (row 0) — inverse video ----------------------------------
-    const header_style = Screen.Style{ .inverse = true };
-    fillRow(screen, 0, ' ', header_style, .default, .default);
-
-    var col: u16 = 1;
-    col = writeStr(screen, 0, col, version, header_style, .default);
-    col = writeStr(screen, 0, col, " | model: ", header_style, .default);
-    col = writeStr(screen, 0, col, model, header_style, .default);
-    _ = writeStr(screen, 0, col, " | /quit to exit", header_style, .default);
-
-    // -- Message area (rows 1 .. height-2) -----------------------------------
-    const msg_rows = height - 2; // rows available for messages
-
-    // Get visible lines from the buffer's node tree
-    var lines = buffer.getVisibleLines(buffer_alloc, &node_renderer) catch return;
-    defer {
-        for (lines.items) |line| buffer_alloc.free(line);
-        lines.deinit(buffer_alloc);
-    }
-
-    const total_lines = lines.items.len;
-
-    // Determine which lines to show: scroll_offset is measured from the bottom
-    const visible_start = if (total_lines > scroll_offset + msg_rows)
-        total_lines - scroll_offset - msg_rows
-    else
-        0;
-    const visible_end = if (total_lines > scroll_offset)
-        total_lines - scroll_offset
-    else
-        0;
-
-    var screen_row: u16 = 1;
-    for (lines.items[visible_start..visible_end]) |line| {
-        if (screen_row >= height - 1) break;
-        _ = writeStr(screen, screen_row, 0, line, .{}, .default);
-        screen_row += 1;
-    }
-
-    // -- Input line (last row) -----------------------------------------------
-    const input_row = height - 1;
-    // Status message or prompt
-    if (status_msg.len > 0) {
-        const status_style = Screen.Style{ .dim = true };
-        _ = writeStr(screen, input_row, 0, status_msg, status_style, .{ .palette = 3 });
-    } else {
-        const c: u16 = writeStr(screen, input_row, 0, "> ", .{ .bold = true }, .{ .palette = 2 });
-        _ = writeStr(screen, input_row, c, input_buf[0..input_len], .{}, .default);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Input buffer helpers (tested below)
 // ---------------------------------------------------------------------------
@@ -223,6 +166,43 @@ fn inputDeleteBack(len: usize) usize {
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/// Create a new empty buffer and track it for cleanup.
+fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
+    const buf = try allocator.create(Buffer);
+    errdefer allocator.destroy(buf);
+
+    buf.* = try Buffer.init(allocator, next_buffer_id, "scratch");
+    errdefer buf.deinit();
+
+    next_buffer_id += 1;
+    try extra_buffers.append(allocator, buf);
+    return buf;
+}
+
+/// Draw the input/status line on the last row, overwriting the compositor's status line.
+fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8) void {
+    if (screen.height == 0) return;
+    const input_row = screen.height - 1;
+
+    // Clear the row first
+    for (0..screen.width) |col_usize| {
+        const col: u16 = @intCast(col_usize);
+        const cell = screen.getCell(input_row, col);
+        cell.codepoint = ' ';
+        cell.style = .{};
+        cell.fg = .default;
+        cell.bg = .default;
+    }
+
+    if (status_msg.len > 0) {
+        const status_style = Screen.Style{ .dim = true };
+        _ = writeStr(screen, input_row, 0, status_msg, status_style, .{ .palette = 3 });
+    } else {
+        const c = writeStr(screen, input_row, 0, "> ", .{ .bold = true }, .{ .palette = 2 });
+        _ = writeStr(screen, input_row, c, input_buf_ptr[0..input_len], .{}, .default);
+    }
+}
+
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -234,6 +214,21 @@ pub fn main() !void {
     buffer = try Buffer.init(allocator, 0, "session");
     defer buffer.deinit();
     node_renderer = NodeRenderer.initDefault();
+
+    // Initialize layout with the session buffer in the first tab
+    layout = Layout.init(allocator);
+    defer layout.deinit();
+    _ = try layout.addTab("session", &buffer);
+
+    // Extra buffers list for split-created buffers
+    extra_buffers = .empty;
+    defer {
+        for (extra_buffers.items) |buf| {
+            buf.deinit();
+            allocator.destroy(buf);
+        }
+        extra_buffers.deinit(allocator);
+    }
 
     // Get API key
     const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch {
@@ -270,12 +265,22 @@ pub fn main() !void {
     var screen = try Screen.init(allocator, term.size.cols, term.size.rows);
     defer screen.deinit();
 
+    // Initialize compositor
+    compositor = Compositor{
+        .screen = &screen,
+        .node_renderer = &node_renderer,
+        .allocator = allocator,
+    };
+
     const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
 
     // Set stdin to non-blocking for polling
     setNonBlocking(posix.STDIN_FILENO) catch |err| {
         log.warn("failed to set stdin non-blocking: {}", .{err});
     };
+
+    // Recalculate layout for initial screen size
+    layout.recalculate(screen.width, screen.height);
 
     // -- Get current working directory for welcome message -------------------
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -287,18 +292,19 @@ pub fn main() !void {
     try appendOutputText(cwd);
     try appendOutputText("");
     try appendOutputText("Type a message and press Enter to chat with Claude.");
-    try appendOutputText("Press Ctrl+C or type /quit to exit.");
+    try appendOutputText("Ctrl+C or /quit to exit. Ctrl+W then v/s/q/h/j/k/l for windows.");
     try appendOutputText("");
 
     // -- Input state ---------------------------------------------------------
     var input_buf: [MAX_INPUT]u8 = undefined;
     var input_len: usize = 0;
-    var scroll_offset: usize = 0;
     var running = true;
     var status_msg: []const u8 = "";
+    awaiting_window_cmd = false;
 
     // -- Initial render ------------------------------------------------------
-    drawFrame(&screen, &input_buf, input_len, scroll_offset, status_msg);
+    compositor.composite(&layout) catch {};
+    drawInputLine(&screen, &input_buf, input_len, status_msg);
     try screen.render(stdout_file);
 
     // -- Event loop ----------------------------------------------------------
@@ -306,7 +312,9 @@ pub fn main() !void {
         // Check for terminal resize (SIGWINCH)
         if (term.checkResize()) |new_size| {
             try screen.resize(new_size.cols, new_size.rows);
-            drawFrame(&screen, &input_buf, input_len, scroll_offset, status_msg);
+            layout.recalculate(new_size.cols, new_size.rows);
+            compositor.composite(&layout) catch {};
+            drawInputLine(&screen, &input_buf, input_len, status_msg);
             try screen.render(stdout_file);
         }
 
@@ -321,105 +329,126 @@ pub fn main() !void {
         const event = maybe_event.?;
         switch (event) {
             .key => |k| {
-                // Ctrl+C — exit
-                if (k.modifiers.ctrl) {
+                // Handle Ctrl+W window command prefix
+                if (awaiting_window_cmd) {
+                    awaiting_window_cmd = false;
                     switch (k.key) {
-                        .char => |ch| if (ch == 'c') {
-                            running = false;
-                            continue;
+                        .char => |ch| switch (ch) {
+                            'v' => {
+                                // Split vertical
+                                if (createSplitBuffer(allocator)) |new_buf| {
+                                    layout.splitVertical(0.5, new_buf) catch {};
+                                    layout.recalculate(screen.width, screen.height);
+                                } else |_| {}
+                            },
+                            's' => {
+                                // Split horizontal
+                                if (createSplitBuffer(allocator)) |new_buf| {
+                                    layout.splitHorizontal(0.5, new_buf) catch {};
+                                    layout.recalculate(screen.width, screen.height);
+                                } else |_| {}
+                            },
+                            'q' => {
+                                // Close window
+                                layout.closeWindow();
+                                layout.recalculate(screen.width, screen.height);
+                            },
+                            'h' => layout.focusDirection(.left),
+                            'j' => layout.focusDirection(.down),
+                            'k' => layout.focusDirection(.up),
+                            'l' => layout.focusDirection(.right),
+                            else => {},
                         },
                         else => {},
                     }
-                }
-
-                switch (k.key) {
-                    .enter => {
-                        if (input_len == 0) continue;
-
-                        const user_input = input_buf[0..input_len];
-
-                        // Check for /quit command
-                        if (std.mem.eql(u8, user_input, "/quit") or std.mem.eql(u8, user_input, "/q")) {
-                            running = false;
-                            continue;
+                } else {
+                    // Ctrl+C — exit
+                    if (k.modifiers.ctrl) {
+                        switch (k.key) {
+                            .char => |ch| {
+                                if (ch == 'c') {
+                                    running = false;
+                                    continue;
+                                }
+                                if (ch == 'w') {
+                                    awaiting_window_cmd = true;
+                                    continue;
+                                }
+                            },
+                            else => {},
                         }
+                    }
 
-                        // Show user message in output
-                        _ = try buffer.appendNode(null, .user_message, user_input);
+                    switch (k.key) {
+                        .enter => {
+                            if (input_len == 0) continue;
 
-                        // Clear input
-                        input_len = 0;
+                            const user_input = input_buf[0..input_len];
 
-                        // Show status while agent is working
-                        status_msg = "thinking...";
-                        scroll_offset = 0;
-                        drawFrame(&screen, &input_buf, input_len, scroll_offset, status_msg);
-                        try screen.render(stdout_file);
+                            // Check for /quit command
+                            if (std.mem.eql(u8, user_input, "/quit") or std.mem.eql(u8, user_input, "/q")) {
+                                running = false;
+                                continue;
+                            }
 
-                        // Reset tool_call tracking for this turn
-                        last_tool_call = null;
+                            // Show user message in output
+                            _ = try buffer.appendNode(null, .user_message, user_input);
 
-                        // Run agent loop (blocking) — output captured via callback
-                        agent.runLoop(
-                            user_input,
-                            &messages,
-                            &registry,
-                            api_key,
-                            allocator,
-                            agentOutputCallback,
-                        ) catch |err| {
-                            _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
-                        };
+                            // Clear input
+                            input_len = 0;
 
-                        // Clear status after agent completes
-                        status_msg = "";
-                        scroll_offset = 0;
-                    },
-                    .backspace => {
-                        input_len = inputDeleteBack(input_len);
-                    },
-                    .char => |ch| {
-                        // Only handle ASCII printable for now
-                        if (ch >= 0x20 and ch < 0x7f) {
-                            input_len = inputAppendChar(&input_buf, input_len, @intCast(ch));
-                        }
-                    },
-                    .page_up => {
-                        const msg_rows = if (screen.height > 2) screen.height - 2 else 1;
-                        scroll_offset +|= msg_rows / 2;
-                        // Clamp: can't scroll past the top
-                        const total_lines = buffer.lineCount(&node_renderer) catch 0;
-                        if (total_lines > 0) {
-                            const max_scroll = if (total_lines > msg_rows)
-                                total_lines - msg_rows
-                            else
-                                0;
-                            if (scroll_offset > max_scroll) scroll_offset = max_scroll;
-                        } else {
-                            scroll_offset = 0;
-                        }
-                    },
-                    .page_down => {
-                        const msg_rows = if (screen.height > 2) screen.height - 2 else 1;
-                        if (scroll_offset > msg_rows / 2) {
-                            scroll_offset -= msg_rows / 2;
-                        } else {
-                            scroll_offset = 0;
-                        }
-                    },
-                    else => {},
+                            // Show status while agent is working
+                            status_msg = "thinking...";
+                            compositor.composite(&layout) catch {};
+                            drawInputLine(&screen, &input_buf, input_len, status_msg);
+                            try screen.render(stdout_file);
+
+                            // Reset tool_call tracking for this turn
+                            last_tool_call = null;
+
+                            // Run agent loop (blocking) — output captured via callback
+                            agent.runLoop(
+                                user_input,
+                                &messages,
+                                &registry,
+                                api_key,
+                                allocator,
+                                agentOutputCallback,
+                            ) catch |err| {
+                                _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
+                            };
+
+                            // Clear status after agent completes
+                            status_msg = "";
+                        },
+                        .backspace => {
+                            input_len = inputDeleteBack(input_len);
+                        },
+                        .char => |ch| {
+                            // Only handle ASCII printable for now
+                            if (ch >= 0x20 and ch < 0x7f) {
+                                input_len = inputAppendChar(&input_buf, input_len, @intCast(ch));
+                            }
+                        },
+                        .page_up, .page_down => {
+                            // Scrolling is now per-buffer via the compositor; no-op for now
+                        },
+                        else => {},
+                    }
                 }
             },
             .mouse => {},
             .resize => |sz| {
                 try screen.resize(sz.cols, sz.rows);
                 term.size = .{ .rows = sz.rows, .cols = sz.cols };
+                layout.recalculate(sz.cols, sz.rows);
             },
             .none => {},
         }
 
         // Redraw after every event
-        drawFrame(&screen, &input_buf, input_len, scroll_offset, status_msg);
+        compositor.composite(&layout) catch {};
+        drawInputLine(&screen, &input_buf, input_len, status_msg);
         try screen.render(stdout_file);
     }
 }
@@ -453,6 +482,8 @@ test "imports compile" {
     _ = @import("Terminal.zig");
     _ = @import("Buffer.zig");
     _ = @import("NodeRenderer.zig");
+    _ = @import("Layout.zig");
+    _ = @import("Compositor.zig");
 }
 
 test "inputAppendChar adds character" {
