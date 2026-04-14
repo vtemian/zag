@@ -9,6 +9,9 @@ Built in Zig. Modal. Extensible. Everything above the primitives is a plugin.
 [![Lines of Code](https://img.shields.io/badge/loc-5.8k-brightgreen)]()
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
+> **Warning**
+> This project is in **heavy development**. APIs will change. Things will break. The architecture is taking shape but nothing is stable yet. If you're here, you're early — and that's the point.
+
 * * *
 
 ## Your Agent Deserves a Window System
@@ -102,20 +105,6 @@ zig build run
 
 Requires **Zig 0.15+**. No other dependencies.
 
-### Keybindings
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Send message to agent |
-| `Backspace` | Delete last character |
-| `Page Up/Down` | Scroll conversation |
-| `Ctrl+W v` | Split window vertical |
-| `Ctrl+W s` | Split window horizontal |
-| `Ctrl+W h/j/k/l` | Navigate between windows |
-| `Ctrl+W q` | Close window |
-| `Ctrl+C` | Exit |
-| `/quit` | Exit |
-
 * * *
 
 ## Development
@@ -126,33 +115,6 @@ zig build run      # run
 zig build test     # run tests
 zig fmt --check .  # check formatting
 ```
-
-### Project Structure
-
-```
-src/
-  main.zig          — entry point, TUI event loop
-  agent.zig         — agent loop (LLM → tools → repeat)
-  llm.zig           — Claude API client
-  types.zig         — core types (Message, ContentBlock, etc.)
-  tools.zig         — tool registry and dispatch
-  tools/
-    read.zig        — read file contents
-    write.zig       — create/overwrite files
-    edit.zig        — exact text replacement
-    bash.zig        — shell command execution
-  Buffer.zig        — structured node tree for content
-  NodeRenderer.zig  — type-specific node rendering
-  Layout.zig        — binary tree window system
-  Compositor.zig    — merges buffers into screen grid
-  Screen.zig        — cell grid with ANSI renderer
-  Terminal.zig      — raw mode, alt screen, input handling
-  input.zig         — keyboard/mouse event parsing
-devlog/             — design journal
-docs/plans/         — implementation plans
-```
-
-16 source files. ~5,800 lines of Zig. Zero external dependencies.
 
 * * *
 
