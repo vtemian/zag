@@ -8,21 +8,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
-const Buffer = @import("Buffer.zig");
-const NodeRenderer = @import("NodeRenderer.zig");
+const VtBuffer = @import("VtBuffer.zig");
 
 const Compositor = @This();
 
 /// The screen grid to write into.
 screen: *Screen,
-/// Node renderer for converting buffer nodes to display lines.
-node_renderer: *NodeRenderer,
-/// Allocator for temporary line allocations during compositing.
+/// Allocator for temporary allocations during compositing.
 allocator: Allocator,
 
 /// Composite the layout into the screen grid.
 /// Clears the screen, draws tab bar, buffer content, borders, and status line.
-pub fn composite(self: *Compositor, layout: *const Layout) !void {
+pub fn composite(self: *Compositor, layout: *const Layout) void {
     self.screen.clear();
 
     const tab_ptr = layout.getActiveTab();
@@ -33,7 +30,7 @@ pub fn composite(self: *Compositor, layout: *const Layout) !void {
     self.drawTabBar(layout);
 
     // Draw buffer content for each visible leaf
-    try self.drawLeaves(tab.root, tab.focused);
+    self.drawLeaves(tab.root, tab.focused);
 
     // Draw borders between splits
     self.drawBorders(tab.root);
@@ -80,57 +77,55 @@ fn drawTabBar(self: *Compositor, layout: *const Layout) void {
 }
 
 /// Recursively draw buffer content for all leaf nodes.
-fn drawLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) !void {
+fn drawLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
-            try self.drawBufferContent(&leaf, node == focused);
+            self.drawBufferContent(&leaf, node == focused);
         },
         .split => |split| {
-            try self.drawLeaves(split.first, focused);
-            try self.drawLeaves(split.second, focused);
+            self.drawLeaves(split.first, focused);
+            self.drawLeaves(split.second, focused);
         },
     }
 }
 
 /// Draw the content of a single buffer into its rect on the screen.
-fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, is_focused: bool) !void {
+///
+/// Reads cells directly from the VtBuffer's ghostty-vt terminal grid,
+/// preserving full color and style information.
+fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, is_focused: bool) void {
     const rect = leaf.rect;
     if (rect.width == 0 or rect.height == 0) return;
 
-    // Get visible lines from the buffer
-    var lines = try leaf.buffer.getVisibleLines(self.allocator, self.node_renderer);
-    defer {
-        for (lines.items) |line| self.allocator.free(line);
-        lines.deinit(self.allocator);
-    }
+    const vt_buf = leaf.vt_buffer;
 
-    // Auto-scroll: show the last N lines that fit in the rect
-    const visible_count = @min(lines.items.len, rect.height);
-    const start = if (lines.items.len > rect.height) lines.items.len - rect.height else 0;
+    // Copy cells from VtBuffer grid into screen grid
+    for (0..rect.height) |row_off| {
+        const vt_row: u16 = @intCast(row_off);
+        const screen_row = rect.y + vt_row;
+        if (screen_row >= self.screen.height) break;
 
-    for (0..visible_count) |i| {
-        const line = lines.items[start + i];
-        const row = rect.y + @as(u16, @intCast(i));
-        if (row >= self.screen.height) break;
+        for (0..rect.width) |col_off| {
+            const vt_col: u16 = @intCast(col_off);
+            const screen_col = rect.x + vt_col;
+            if (screen_col >= self.screen.width) break;
 
-        for (line, 0..) |byte, col_idx| {
-            const col = rect.x + @as(u16, @intCast(col_idx));
-            if (col >= rect.x + rect.width) break;
-            if (col >= self.screen.width) break;
-
-            const cell = self.screen.getCell(row, col);
-            cell.codepoint = byte;
+            const src = vt_buf.getCell(vt_row, vt_col);
+            const dst = self.screen.getCell(screen_row, screen_col);
+            dst.* = src;
         }
     }
 
     // Draw a subtle cursor indicator for the focused pane
     if (is_focused and rect.width >= 2 and rect.height >= 1) {
-        // Place a dim block cursor at the last content line + 1 or rect bottom
-        const cursor_row = rect.y + @as(u16, @intCast(visible_count));
-        if (cursor_row < rect.y + rect.height and cursor_row < self.screen.height) {
-            const cell = self.screen.getCell(cursor_row, rect.x);
-            cell.codepoint = '_';
-            cell.style = .{ .dim = true };
+        const cursor_pos = vt_buf.getCursorPos();
+        const cursor_row = rect.y + cursor_pos.y;
+        const cursor_col = rect.x + cursor_pos.x;
+        if (cursor_row < rect.y + rect.height and cursor_row < self.screen.height and
+            cursor_col < rect.x + rect.width and cursor_col < self.screen.width)
+        {
+            const cell = self.screen.getCell(cursor_row, cursor_col);
+            cell.style = .{ .inverse = true };
         }
     }
 }
@@ -201,7 +196,7 @@ fn drawStatusLine(self: *Compositor, tab: *const Layout.Tab) void {
     };
 
     var col: u16 = 1;
-    col = writeStrToScreen(self.screen, last_row, col, leaf.buffer.name, status_style, .default);
+    col = writeStrToScreen(self.screen, last_row, col, leaf.vt_buffer.buffer.name, status_style, .default);
     col = writeStrToScreen(self.screen, last_row, col, " | ", status_style, .default);
 
     // Show pane rect info
@@ -227,6 +222,9 @@ fn writeStrToScreen(screen: *Screen, row: u16, col: u16, text: []const u8, style
 
 // -- Tests -------------------------------------------------------------------
 
+const Buffer = @import("Buffer.zig");
+const NodeRenderer = @import("NodeRenderer.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
@@ -235,41 +233,39 @@ test "composite with empty layout does not crash" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
-    var renderer = NodeRenderer.initDefault();
 
     var compositor = Compositor{
         .screen = &screen,
-        .node_renderer = &renderer,
         .allocator = allocator,
     };
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    try compositor.composite(&layout);
+    compositor.composite(&layout);
 }
 
 test "composite draws tab bar on row 0" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
-    var renderer = NodeRenderer.initDefault();
 
     var compositor = Compositor{
         .screen = &screen,
-        .node_renderer = &renderer,
         .allocator = allocator,
     };
 
     var buf = try Buffer.init(allocator, 0, "session");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 40, 8);
+    defer vt_buf.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("session", &buf);
+    _ = try layout.addTab("session", &vt_buf);
     layout.recalculate(40, 10);
 
-    try compositor.composite(&layout);
+    compositor.composite(&layout);
 
     // Row 0 should have inverse styling (tab bar)
     const cell = screen.getCellConst(0, 0);
@@ -290,11 +286,9 @@ test "composite writes buffer content at leaf rect" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
-    var renderer = NodeRenderer.initDefault();
 
     var compositor = Compositor{
         .screen = &screen,
-        .node_renderer = &renderer,
         .allocator = allocator,
     };
 
@@ -302,12 +296,20 @@ test "composite writes buffer content at leaf rect" {
     defer buf.deinit();
     _ = try buf.appendNode(null, .user_message, "hello");
 
+    var renderer = NodeRenderer.initDefault();
+    defer renderer.deinit();
+
+    // Content area is 40x8 (rows 1..8, minus tab bar and status line)
+    var vt_buf = try VtBuffer.init(allocator, &buf, 40, 8);
+    defer vt_buf.deinit();
+    try vt_buf.refresh(&renderer);
+
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("test", &buf);
+    _ = try layout.addTab("test", &vt_buf);
     layout.recalculate(40, 10);
 
-    try compositor.composite(&layout);
+    compositor.composite(&layout);
 
     // The rendered line for user_message "hello" is "> hello"
     // It should appear starting at row 1 (after tab bar), col 0
@@ -320,23 +322,23 @@ test "composite draws status line on last row" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
-    var renderer = NodeRenderer.initDefault();
 
     var compositor = Compositor{
         .screen = &screen,
-        .node_renderer = &renderer,
         .allocator = allocator,
     };
 
     var buf = try Buffer.init(allocator, 0, "mybuf");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 40, 8);
+    defer vt_buf.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("mybuf", &buf);
+    _ = try layout.addTab("mybuf", &vt_buf);
     layout.recalculate(40, 10);
 
-    try compositor.composite(&layout);
+    compositor.composite(&layout);
 
     // Last row (9) should have inverse styling (status line)
     const cell = screen.getCellConst(9, 0);
@@ -351,11 +353,9 @@ test "composite draws vertical split border" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
-    var renderer = NodeRenderer.initDefault();
 
     var compositor = Compositor{
         .screen = &screen,
-        .node_renderer = &renderer,
         .allocator = allocator,
     };
 
@@ -363,15 +363,19 @@ test "composite draws vertical split border" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "right");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 40, 8);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 40, 8);
+    defer vt_buf2.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("split", &buf1);
+    _ = try layout.addTab("split", &vt_buf1);
     layout.recalculate(40, 10);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, &vt_buf2);
     layout.recalculate(40, 10);
 
-    try compositor.composite(&layout);
+    compositor.composite(&layout);
 
     // The border column should be at the boundary between first and second leaves
     // width=40, usable=39, first gets 19 cols, border at col 19
@@ -389,11 +393,9 @@ test "composite draws horizontal split border" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 12);
     defer screen.deinit();
-    var renderer = NodeRenderer.initDefault();
 
     var compositor = Compositor{
         .screen = &screen,
-        .node_renderer = &renderer,
         .allocator = allocator,
     };
 
@@ -401,15 +403,19 @@ test "composite draws horizontal split border" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "bottom");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 40, 10);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 40, 10);
+    defer vt_buf2.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("split", &buf1);
+    _ = try layout.addTab("split", &vt_buf1);
     layout.recalculate(40, 12);
-    try layout.splitHorizontal(0.5, &buf2);
+    try layout.splitHorizontal(0.5, &vt_buf2);
     layout.recalculate(40, 12);
 
-    try compositor.composite(&layout);
+    compositor.composite(&layout);
 
     // The border row should be between the two halves
     const tab = layout.getActiveTab().?;

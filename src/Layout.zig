@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
+const VtBuffer = @import("VtBuffer.zig");
 
 const Layout = @This();
 
@@ -42,8 +43,8 @@ pub const LayoutNode = union(enum) {
     }
 
     pub const Leaf = struct {
-        /// The buffer displayed in this window pane.
-        buffer: *Buffer,
+        /// The VtBuffer displayed in this window pane (wraps a Buffer with a ghostty-vt terminal).
+        vt_buffer: *VtBuffer,
         /// Screen rectangle for this pane, computed by recalculate().
         rect: Rect,
     };
@@ -102,8 +103,8 @@ pub fn deinit(self: *Layout) void {
     self.tabs.deinit(self.allocator);
 }
 
-/// Create a new tab with a single leaf pointing to the given buffer.
-pub fn addTab(self: *Layout, name: []const u8, buf: *Buffer) !*Tab {
+/// Create a new tab with a single leaf pointing to the given VtBuffer.
+pub fn addTab(self: *Layout, name: []const u8, vt_buf: *VtBuffer) !*Tab {
     const owned_name = try self.allocator.dupe(u8, name);
     errdefer self.allocator.free(owned_name);
 
@@ -111,7 +112,7 @@ pub fn addTab(self: *Layout, name: []const u8, buf: *Buffer) !*Tab {
     errdefer self.allocator.destroy(leaf);
 
     leaf.* = .{ .leaf = .{
-        .buffer = buf,
+        .vt_buffer = vt_buf,
         .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     } };
 
@@ -126,16 +127,14 @@ pub fn addTab(self: *Layout, name: []const u8, buf: *Buffer) !*Tab {
     return &self.tabs.items[self.tabs.items.len - 1];
 }
 
-/// Split the focused window vertically (left/right). Creates a new empty
-/// buffer for the new pane using the provided buffer factory.
-pub fn splitVertical(self: *Layout, ratio: f32, new_buffer: *Buffer) !void {
-    try self.splitFocused(.vertical, ratio, new_buffer);
+/// Split the focused window vertically (left/right).
+pub fn splitVertical(self: *Layout, ratio: f32, new_vt_buffer: *VtBuffer) !void {
+    try self.splitFocused(.vertical, ratio, new_vt_buffer);
 }
 
-/// Split the focused window horizontally (top/bottom). Creates a new empty
-/// buffer for the new pane using the provided buffer factory.
-pub fn splitHorizontal(self: *Layout, ratio: f32, new_buffer: *Buffer) !void {
-    try self.splitFocused(.horizontal, ratio, new_buffer);
+/// Split the focused window horizontally (top/bottom).
+pub fn splitHorizontal(self: *Layout, ratio: f32, new_vt_buffer: *VtBuffer) !void {
+    try self.splitFocused(.horizontal, ratio, new_vt_buffer);
 }
 
 /// Close the focused window. If the tab has only one window, this is a no-op.
@@ -289,7 +288,7 @@ pub fn visibleLeaves(self: *const Layout, out: []*LayoutNode, out_len: *usize) v
 // ---- Internal helpers -------------------------------------------------------
 
 /// Split the focused leaf into a split node with the existing leaf and a new one.
-fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer: *Buffer) !void {
+fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_vt_buffer: *VtBuffer) !void {
     if (self.tabs.items.len == 0) return error.NoTabs;
     const tab = &self.tabs.items[self.active_tab];
 
@@ -298,12 +297,12 @@ fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer
 
     const existing_rect = tab.focused.leaf.rect;
 
-    // Create the new leaf for the new buffer
+    // Create the new leaf for the new VtBuffer
     const new_leaf = try self.allocator.create(LayoutNode);
     errdefer self.allocator.destroy(new_leaf);
 
     new_leaf.* = .{ .leaf = .{
-        .buffer = new_buffer,
+        .vt_buffer = new_vt_buffer,
         .rect = existing_rect,
     } };
 
@@ -521,14 +520,16 @@ test "addTab creates a single-leaf tab" {
 
     var buf = try Buffer.init(allocator, 0, "test");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 80, 24);
+    defer vt_buf.deinit();
 
-    const tab = try layout.addTab("tab1", &buf);
+    const tab = try layout.addTab("tab1", &vt_buf);
 
     try std.testing.expectEqual(@as(usize, 1), layout.tabs.items.len);
     try std.testing.expectEqualStrings("tab1", tab.name);
     try std.testing.expectEqual(tab.root, tab.focused);
     try std.testing.expect(tab.root.* == .leaf);
-    try std.testing.expectEqual(&buf, tab.root.leaf.buffer);
+    try std.testing.expectEqual(&vt_buf, tab.root.leaf.vt_buffer);
 }
 
 test "recalculate sets leaf rect with reserved rows" {
@@ -538,8 +539,10 @@ test "recalculate sets leaf rect with reserved rows" {
 
     var buf = try Buffer.init(allocator, 0, "test");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 80, 24);
+    defer vt_buf.deinit();
 
-    _ = try layout.addTab("tab1", &buf);
+    _ = try layout.addTab("tab1", &vt_buf);
     layout.recalculate(80, 24);
 
     const leaf = layout.getFocusedLeaf().?;
@@ -559,11 +562,15 @@ test "vertical split divides width with border" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "buf2");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
+    _ = try layout.addTab("tab1", &vt_buf1);
     layout.recalculate(80, 24);
 
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, &vt_buf2);
     layout.recalculate(80, 24);
 
     // Root should now be a split
@@ -595,11 +602,15 @@ test "horizontal split divides height with border" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "buf2");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
+    _ = try layout.addTab("tab1", &vt_buf1);
     layout.recalculate(80, 24);
 
-    try layout.splitHorizontal(0.5, &buf2);
+    try layout.splitHorizontal(0.5, &vt_buf2);
     layout.recalculate(80, 24);
 
     const tab = layout.getActiveTab().?;
@@ -628,25 +639,29 @@ test "focus navigation between vertical splits" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "right");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
+    _ = try layout.addTab("tab1", &vt_buf1);
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, &vt_buf2);
     layout.recalculate(80, 24);
 
     // Focus should be on first (left) leaf
-    const left_buf = layout.getFocusedLeaf().?.buffer;
-    try std.testing.expectEqual(&buf1, left_buf);
+    const left_vt = layout.getFocusedLeaf().?.vt_buffer;
+    try std.testing.expectEqual(&vt_buf1, left_vt);
 
     // Navigate right
     layout.focusDirection(.right);
-    const right_buf = layout.getFocusedLeaf().?.buffer;
-    try std.testing.expectEqual(&buf2, right_buf);
+    const right_vt = layout.getFocusedLeaf().?.vt_buffer;
+    try std.testing.expectEqual(&vt_buf2, right_vt);
 
     // Navigate left
     layout.focusDirection(.left);
-    const back_buf = layout.getFocusedLeaf().?.buffer;
-    try std.testing.expectEqual(&buf1, back_buf);
+    const back_vt = layout.getFocusedLeaf().?.vt_buffer;
+    try std.testing.expectEqual(&vt_buf1, back_vt);
 }
 
 test "focus navigation between horizontal splits" {
@@ -658,17 +673,21 @@ test "focus navigation between horizontal splits" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "bottom");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
+    _ = try layout.addTab("tab1", &vt_buf1);
     layout.recalculate(80, 24);
-    try layout.splitHorizontal(0.5, &buf2);
+    try layout.splitHorizontal(0.5, &vt_buf2);
     layout.recalculate(80, 24);
 
     layout.focusDirection(.down);
-    try std.testing.expectEqual(&buf2, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqual(&vt_buf2, layout.getFocusedLeaf().?.vt_buffer);
 
     layout.focusDirection(.up);
-    try std.testing.expectEqual(&buf1, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqual(&vt_buf1, layout.getFocusedLeaf().?.vt_buffer);
 }
 
 test "tab navigation wraps around" {
@@ -680,9 +699,13 @@ test "tab navigation wraps around" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "buf2");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
-    _ = try layout.addTab("tab2", &buf2);
+    _ = try layout.addTab("tab1", &vt_buf1);
+    _ = try layout.addTab("tab2", &vt_buf2);
 
     try std.testing.expectEqual(@as(usize, 0), layout.active_tab);
 
@@ -707,10 +730,16 @@ test "switchTab selects by index" {
     defer buf2.deinit();
     var buf3 = try Buffer.init(allocator, 2, "buf3");
     defer buf3.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
+    var vt_buf3 = try VtBuffer.init(allocator, &buf3, 80, 24);
+    defer vt_buf3.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
-    _ = try layout.addTab("tab2", &buf2);
-    _ = try layout.addTab("tab3", &buf3);
+    _ = try layout.addTab("tab1", &vt_buf1);
+    _ = try layout.addTab("tab2", &vt_buf2);
+    _ = try layout.addTab("tab3", &vt_buf3);
 
     layout.switchTab(2);
     try std.testing.expectEqual(@as(usize, 2), layout.active_tab);
@@ -729,23 +758,27 @@ test "closeWindow removes focused pane" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "right");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
+    _ = try layout.addTab("tab1", &vt_buf1);
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, &vt_buf2);
     layout.recalculate(80, 24);
 
     // Focus right pane
     layout.focusDirection(.right);
-    try std.testing.expectEqual(&buf2, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqual(&vt_buf2, layout.getFocusedLeaf().?.vt_buffer);
 
     // Close the right pane
     layout.closeWindow();
 
-    // Root should be a leaf again, focused on buf1
+    // Root should be a leaf again, focused on vt_buf1
     const tab = layout.getActiveTab().?;
     try std.testing.expect(tab.root.* == .leaf);
-    try std.testing.expectEqual(&buf1, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqual(&vt_buf1, layout.getFocusedLeaf().?.vt_buffer);
 }
 
 test "closeWindow is no-op on single leaf" {
@@ -755,8 +788,10 @@ test "closeWindow is no-op on single leaf" {
 
     var buf = try Buffer.init(allocator, 0, "only");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 80, 24);
+    defer vt_buf.deinit();
 
-    _ = try layout.addTab("tab1", &buf);
+    _ = try layout.addTab("tab1", &vt_buf);
 
     // Should not crash or change anything
     layout.closeWindow();
@@ -772,10 +807,14 @@ test "visibleLeaves returns all leaves in active tab" {
     defer buf1.deinit();
     var buf2 = try Buffer.init(allocator, 1, "buf2");
     defer buf2.deinit();
+    var vt_buf1 = try VtBuffer.init(allocator, &buf1, 80, 24);
+    defer vt_buf1.deinit();
+    var vt_buf2 = try VtBuffer.init(allocator, &buf2, 80, 24);
+    defer vt_buf2.deinit();
 
-    _ = try layout.addTab("tab1", &buf1);
+    _ = try layout.addTab("tab1", &vt_buf1);
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, &vt_buf2);
 
     var leaves: [16]*LayoutNode = undefined;
     var count: usize = 0;
@@ -791,8 +830,10 @@ test "recalculate with tiny screen is safe" {
 
     var buf = try Buffer.init(allocator, 0, "test");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 80, 24);
+    defer vt_buf.deinit();
 
-    _ = try layout.addTab("tab1", &buf);
+    _ = try layout.addTab("tab1", &vt_buf);
 
     // Screen too small — should not crash
     layout.recalculate(5, 2);
@@ -807,8 +848,10 @@ test "focus direction no-op when no neighbor exists" {
 
     var buf = try Buffer.init(allocator, 0, "only");
     defer buf.deinit();
+    var vt_buf = try VtBuffer.init(allocator, &buf, 80, 24);
+    defer vt_buf.deinit();
 
-    _ = try layout.addTab("tab1", &buf);
+    _ = try layout.addTab("tab1", &vt_buf);
     layout.recalculate(80, 24);
 
     // Navigating in any direction should be a no-op
@@ -817,5 +860,5 @@ test "focus direction no-op when no neighbor exists" {
     layout.focusDirection(.up);
     layout.focusDirection(.down);
 
-    try std.testing.expectEqual(&buf, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqual(&vt_buf, layout.getFocusedLeaf().?.vt_buffer);
 }
