@@ -14,6 +14,41 @@ const Terminal = @import("Terminal.zig");
 
 const log = std.log.scoped(.main);
 
+/// Override the default std.log handler to suppress all log output in TUI mode.
+/// In TUI mode, writing to stderr corrupts the alternate screen buffer.
+/// Log messages are captured into the output line buffer instead.
+pub const std_options: std.Options = .{
+    .logFn = tuiLogHandler,
+};
+
+/// Whether TUI mode is active. When true, log output is captured into the
+/// output buffer instead of written to stderr.
+var tui_active: bool = false;
+
+fn tuiLogHandler(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = level;
+    const scope_prefix = if (scope == .default) "" else @tagName(scope) ++ ": ";
+
+    if (tui_active) {
+        // Capture into output buffer — format into a stack buffer
+        var buf: [4096]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, scope_prefix ++ format, args) catch return;
+        appendOutputText(msg) catch {};
+    } else {
+        // Before TUI is active, write to stderr normally
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        var w = stderr.writer(&buf);
+        w.interface.print(scope_prefix ++ format ++ "\n", args) catch {};
+        w.interface.flush() catch {};
+    }
+}
+
 /// Version string shown in the header bar.
 const version = "zag v0.1.0";
 
@@ -224,7 +259,11 @@ pub fn main() !void {
         w.interface.flush() catch {};
         return;
     };
-    defer term.deinit();
+    tui_active = true;
+    defer {
+        tui_active = false;
+        term.deinit();
+    }
 
     var screen = try Screen.init(allocator, term.size.cols, term.size.rows);
     defer screen.deinit();
