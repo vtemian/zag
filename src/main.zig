@@ -601,6 +601,7 @@ test "imports compile" {
     _ = @import("Compositor.zig");
     _ = @import("Metrics.zig");
     _ = @import("Theme.zig");
+    _ = @import("providers/anthropic.zig");
 }
 
 test "inputAppendChar adds character" {
