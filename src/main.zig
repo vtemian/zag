@@ -618,6 +618,7 @@ pub fn main() !void {
                         last_tool_call = buffer.appendNode(null, .tool_call, name) catch null;
                     },
                     .tool_result => |result| {
+                        defer allocator.free(result.content);
                         _ = buffer.appendNode(last_tool_call, .tool_result, result.content) catch {};
                     },
                     .info => |text| {
