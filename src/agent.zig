@@ -202,8 +202,10 @@ fn runLoopStreamingInner(
     defer allocator.free(tool_defs);
 
     thread_local_queue = queue;
+    thread_local_allocator = allocator;
     defer {
         thread_local_queue = null;
+        thread_local_allocator = null;
     }
 
     // Inner loop: call LLM, execute tools, repeat
@@ -287,17 +289,21 @@ fn runLoopStreamingInner(
 /// required by callStreaming to the EventQueue. Set before each
 /// callStreaming invocation and cleared afterward.
 threadlocal var thread_local_queue: ?*AgentThread.EventQueue = null;
+threadlocal var thread_local_allocator: ?Allocator = null;
 
 /// Callback that converts a provider StreamEvent to an AgentEvent and
-/// pushes it to the thread-local EventQueue.
+/// pushes it to the thread-local EventQueue. String data is duped because
+/// the source slices point into temporary JSON parser memory that is freed
+/// after the callback returns.
 fn streamEventToQueue(event: llm.StreamEvent) void {
     const q = thread_local_queue orelse return;
+    const alloc = thread_local_allocator orelse return;
     const agent_event: AgentThread.AgentEvent = switch (event) {
-        .text_delta => |t| .{ .text_delta = t },
-        .tool_start => |t| .{ .tool_start = t },
-        .info => |t| .{ .info = t },
+        .text_delta => |t| .{ .text_delta = alloc.dupe(u8, t) catch return },
+        .tool_start => |t| .{ .tool_start = alloc.dupe(u8, t) catch return },
+        .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
         .done => .done,
-        .err => |t| .{ .err = t },
+        .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
     };
     q.push(agent_event) catch {};
 }

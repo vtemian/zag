@@ -605,6 +605,7 @@ pub fn main() !void {
             for (event_buf[0..count]) |agent_event| {
                 switch (agent_event) {
                     .text_delta => |text| {
+                        defer allocator.free(text);
                         if (current_assistant_node) |node| {
                             buffer.appendToNode(node, text) catch {};
                         } else {
@@ -612,6 +613,7 @@ pub fn main() !void {
                         }
                     },
                     .tool_start => |name| {
+                        defer allocator.free(name);
                         current_assistant_node = null;
                         last_tool_call = buffer.appendNode(null, .tool_call, name) catch null;
                     },
@@ -619,6 +621,7 @@ pub fn main() !void {
                         _ = buffer.appendNode(last_tool_call, .tool_result, result.content) catch {};
                     },
                     .info => |text| {
+                        defer allocator.free(text);
                         _ = buffer.appendNode(null, .status, text) catch {};
                     },
                     .done => {
@@ -629,6 +632,7 @@ pub fn main() !void {
                         current_assistant_node = null;
                     },
                     .err => |text| {
+                        defer allocator.free(text);
                         _ = buffer.appendNode(null, .err, text) catch {};
                     },
                 }
