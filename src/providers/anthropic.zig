@@ -292,43 +292,21 @@ fn parseSseStream(
         blocks.deinit(allocator);
     }
 
-    // SSE parsing: read lines incrementally from the network
-    var current_event_type: [128]u8 = undefined;
-    var current_event_len: usize = 0;
-    var current_data: std.ArrayList(u8) = .empty;
-    defer current_data.deinit(allocator);
+    var event_buf: [128]u8 = undefined;
+    var data_buf: std.ArrayList(u8) = .empty;
+    defer data_buf.deinit(allocator);
 
-    while (true) {
-        if (cancel.load(.acquire)) break;
-
-        const maybe_line = try stream.readLine();
-        const line = maybe_line orelse break;
-
-        if (line.len == 0) {
-            // Blank line = dispatch event
-            if (current_data.items.len > 0) {
-                try processSseEvent(
-                    current_event_type[0..current_event_len],
-                    current_data.items,
-                    allocator,
-                    &blocks,
-                    &stop_reason,
-                    &input_tokens,
-                    &output_tokens,
-                    on_event,
-                );
-            }
-            current_event_len = 0;
-            current_data.clearRetainingCapacity();
-        } else if (std.mem.startsWith(u8, line, "event: ")) {
-            const val = line["event: ".len..];
-            const copy_len = @min(val.len, current_event_type.len);
-            @memcpy(current_event_type[0..copy_len], val[0..copy_len]);
-            current_event_len = copy_len;
-        } else if (std.mem.startsWith(u8, line, "data: ")) {
-            const val = line["data: ".len..];
-            try current_data.appendSlice(allocator, val);
-        }
+    while (try stream.nextSseEvent(cancel, &event_buf, &data_buf)) |sse| {
+        try processSseEvent(
+            sse.event_type,
+            sse.data,
+            allocator,
+            &blocks,
+            &stop_reason,
+            &input_tokens,
+            &output_tokens,
+            on_event,
+        );
     }
 
     // Assemble final LlmResponse

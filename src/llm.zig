@@ -359,6 +359,81 @@ pub const StreamingResponse = struct {
         if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
         return line;
     }
+
+    /// A single dispatched SSE event with its type and data payload.
+    pub const SseEvent = struct {
+        /// Event type from the "event:" field. Empty if no event field was present.
+        event_type: []const u8,
+        /// Data payload from the "data:" field(s).
+        data: []const u8,
+    };
+
+    /// Read SSE events from the stream, yielding one at a time.
+    /// Accumulates "event:" and "data:" fields across lines, dispatches on
+    /// blank line. Skips comment lines (including pings). Checks the cancel
+    /// flag between lines. Returns null at end of stream or cancellation.
+    ///
+    /// The returned slices point into `event_buf` and `data_buf` and are
+    /// valid until the next call.
+    pub fn nextSseEvent(
+        self: *StreamingResponse,
+        cancel: *std.atomic.Value(bool),
+        event_buf: *[128]u8,
+        data_buf: *std.ArrayList(u8),
+    ) !?SseEvent {
+        var event_len: usize = 0;
+        data_buf.clearRetainingCapacity();
+
+        while (true) {
+            if (cancel.load(.acquire)) return null;
+
+            const maybe_line = try self.readLine();
+            const line = maybe_line orelse {
+                // End of stream — return a final event if data accumulated
+                if (data_buf.items.len > 0) {
+                    return SseEvent{
+                        .event_type = event_buf[0..event_len],
+                        .data = data_buf.items,
+                    };
+                }
+                return null;
+            };
+
+            if (line.len == 0) {
+                // Blank line: dispatch event if we have data
+                if (data_buf.items.len > 0) {
+                    return SseEvent{
+                        .event_type = event_buf[0..event_len],
+                        .data = data_buf.items,
+                    };
+                }
+                // No data accumulated, reset and keep reading
+                event_len = 0;
+                continue;
+            }
+
+            // Comment lines (including ": ping") — skip
+            if (line[0] == ':') continue;
+
+            if (std.mem.startsWith(u8, line, "event: ")) {
+                const val = line["event: ".len..];
+                const copy_len = @min(val.len, event_buf.len);
+                @memcpy(event_buf[0..copy_len], val[0..copy_len]);
+                event_len = copy_len;
+            } else if (std.mem.startsWith(u8, line, "event:")) {
+                const val = line["event:".len..];
+                const copy_len = @min(val.len, event_buf.len);
+                @memcpy(event_buf[0..copy_len], val[0..copy_len]);
+                event_len = copy_len;
+            } else if (std.mem.startsWith(u8, line, "data: ")) {
+                const val = line["data: ".len..];
+                try data_buf.appendSlice(self.allocator, val);
+            } else if (std.mem.startsWith(u8, line, "data:")) {
+                const val = line["data:".len..];
+                try data_buf.appendSlice(self.allocator, val);
+            }
+        }
+    }
 };
 
 // -- Tests -------------------------------------------------------------------
