@@ -117,6 +117,7 @@ src/
   Buffer.zig        structured node tree for content
   NodeRenderer.zig  type-specific node rendering
   Layout.zig        binary tree window system (splits, tabs, focus)
+  Theme.zig         design system (colors, highlights, spacing, borders)
   Metrics.zig       span-based performance tracing (compile-time toggle)
   Compositor.zig    merges buffer content into screen grid
   Screen.zig        cell grid with dirty-rectangle ANSI renderer
