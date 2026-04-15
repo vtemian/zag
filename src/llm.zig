@@ -231,8 +231,11 @@ pub fn httpPostJson(
 /// Each call returns a line (without trailing newline), or `null` at end of
 /// stream. The returned slice is valid until the next `readLine` call.
 pub const StreamingResponse = struct {
+    /// HTTP client that owns the underlying TCP connection.
     client: std.http.Client,
+    /// In-flight HTTP request handle for the streaming POST.
     req: std.http.Client.Request,
+    /// Reader over the chunked/content-length HTTP body.
     body_reader: *std.Io.Reader,
     /// Transfer buffer for the HTTP body reader. The body reader holds a
     /// pointer into this buffer, which is why the struct must be pinned.
@@ -242,6 +245,7 @@ pub const StreamingResponse = struct {
     line_buf: std.ArrayList(u8),
     /// Leftover bytes after a newline that belong to subsequent lines.
     remainder: std.ArrayList(u8),
+    /// Backing allocator used for all owned resources.
     allocator: Allocator,
 
     /// Open a streaming HTTP POST connection.
@@ -389,7 +393,7 @@ pub const StreamingResponse = struct {
 
             const maybe_line = try self.readLine();
             const line = maybe_line orelse {
-                // End of stream — return a final event if data accumulated
+                // End of stream: return a final event if data accumulated
                 if (data_buf.items.len > 0) {
                     return SseEvent{
                         .event_type = event_buf[0..event_len],
@@ -412,7 +416,7 @@ pub const StreamingResponse = struct {
                 continue;
             }
 
-            // Comment lines (including ": ping") — skip
+            // Comment lines (including ": ping"), skip
             if (line[0] == ':') continue;
 
             if (std.mem.startsWith(u8, line, "event: ")) {
