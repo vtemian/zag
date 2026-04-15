@@ -155,7 +155,7 @@ fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
 }
 
 /// Draw the input/status line on the last row, overwriting the compositor's status line.
-fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8) void {
+fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8, fps: u32) void {
     if (screen.height == 0) return;
     const input_row = screen.height - 1;
 
@@ -177,12 +177,15 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
         _ = screen.writeStr(input_row, c, input_buf_ptr[0..input_len], .{}, .default);
     }
 
-    // Show frame time right-aligned on the input line when metrics are enabled
+    // Show render time and FPS right-aligned when metrics are enabled
     if (trace.enabled) {
         const frame_us = trace.getLastFrameTimeUs();
         const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
-        var time_buf: [16]u8 = undefined;
-        const time_str = std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
+        var time_buf: [32]u8 = undefined;
+        const time_str = if (fps > 0)
+            std.fmt.bufPrint(&time_buf, "{d:.1}ms {d}fps", .{ frame_ms, fps }) catch return
+        else
+            std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
         const dim_style = Screen.Style{ .dim = true };
         const time_col = screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
         _ = screen.writeStr(input_row, time_col, time_str, dim_style, .{ .palette = 3 });
@@ -299,13 +302,33 @@ pub fn main() !void {
     var status_msg: []const u8 = "";
     awaiting_window_cmd = false;
 
+    // FPS tracking: count frames rendered per second
+    var fps_timer = std.time.Instant.now() catch null;
+    var fps_frame_count: u32 = 0;
+    var current_fps: u32 = 0;
+
     // -- Initial render ------------------------------------------------------
     compositor.composite(&layout);
-    drawInputLine(&screen, &input_buf, input_len, status_msg);
+    drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps);
     try screen.render(stdout_file);
 
-    // -- Event loop ----------------------------------------------------------
     while (running) {
+        // Poll for input (outside frame span, so sleep doesn't count)
+        const maybe_event = input_mod.pollEvent(posix.STDIN_FILENO);
+
+        // Check for terminal resize (SIGWINCH)
+        if (term.checkResize()) |new_size| {
+            try screen.resize(new_size.cols, new_size.rows);
+            layout.recalculate(new_size.cols, new_size.rows);
+        }
+
+        if (maybe_event == null and term.checkResize() == null) {
+            // No input, no resize; sleep briefly to avoid busy-spinning
+            posix.nanosleep(0, 10 * std.time.ns_per_ms);
+            continue;
+        }
+
+        // Start frame timing (only for frames that do real work)
         trace.frameStart();
         if (build_options.metrics) counting.resetFrame();
 
@@ -321,25 +344,16 @@ pub fn main() !void {
             }
         }
 
-        // Check for terminal resize (SIGWINCH)
-        if (term.checkResize()) |new_size| {
-            try screen.resize(new_size.cols, new_size.rows);
-            layout.recalculate(new_size.cols, new_size.rows);
-            compositor.composite(&layout);
-            drawInputLine(&screen, &input_buf, input_len, status_msg);
-            try screen.render(stdout_file);
-        }
-
-        // Poll for input
-        const maybe_event = blk: {
-            var poll_span = trace.span("poll");
-            defer poll_span.end();
-            break :blk input_mod.pollEvent(posix.STDIN_FILENO);
-        };
-        if (maybe_event == null) {
-            // No input available; sleep briefly to avoid busy-spinning
-            posix.nanosleep(0, 10 * std.time.ns_per_ms);
-            continue;
+        // Update FPS counter
+        fps_frame_count += 1;
+        if (fps_timer) |start| {
+            const now = std.time.Instant.now() catch start;
+            const elapsed_ns = now.since(start);
+            if (elapsed_ns >= std.time.ns_per_s) {
+                current_fps = fps_frame_count;
+                fps_frame_count = 0;
+                fps_timer = std.time.Instant.now() catch null;
+            }
         }
 
         const event = maybe_event.?;
@@ -470,7 +484,7 @@ pub fn main() !void {
                                 // Show status while agent is working
                                 status_msg = "thinking...";
                                 compositor.composite(&layout);
-                                drawInputLine(&screen, &input_buf, input_len, status_msg);
+                                drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps);
                                 try screen.render(stdout_file);
 
                                 // Reset tool_call tracking for this turn
@@ -526,7 +540,7 @@ pub fn main() !void {
         {
             var draw_input_span = trace.span("draw_input");
             defer draw_input_span.end();
-            drawInputLine(&screen, &input_buf, input_len, status_msg);
+            drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps);
         }
         {
             var render_span = trace.span("render");
