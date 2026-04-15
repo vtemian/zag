@@ -1,21 +1,30 @@
-//! NodeRenderer: converts buffer nodes to display lines.
+//! NodeRenderer: converts buffer nodes to styled display lines.
 //!
 //! Provides default renderers for each node type and a registry that allows
-//! overriding renderers per node type (for plugin support). For now, renderers
-//! produce plain text lines; cell-grid output comes with libghostty integration.
+//! overriding renderers per node type (for plugin support). Renderers produce
+//! StyledLines — each line is a sequence of styled spans that the Compositor
+//! maps to screen cells.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
+const Theme = @import("Theme.zig");
 const Node = Buffer.Node;
 const NodeType = Buffer.NodeType;
+const StyledSpan = Theme.StyledSpan;
+const StyledLine = Theme.StyledLine;
 
 const NodeRenderer = @This();
 
 /// Function signature for a custom node renderer.
-/// Appends one or more display lines to `lines`. Each line is a separate
-/// allocation owned by the caller (via `allocator`).
-pub const RenderFn = *const fn (node: *const Node, lines: *std.ArrayList([]const u8), allocator: Allocator) anyerror!void;
+/// Appends one or more StyledLines to `lines`. Each line's spans are
+/// allocated via `allocator` and owned by the caller.
+pub const RenderFn = *const fn (
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+) anyerror!void;
 
 /// Maximum length for tool_result content before truncation.
 const max_result_display = 80;
@@ -55,19 +64,25 @@ pub fn register(self: *NodeRenderer, node_type_name: []const u8, render_fn: Rend
     try self.overrides.put(node_type_name, render_fn);
 }
 
-/// Render a node into display lines. Checks for a custom override first,
+/// Render a node into styled display lines. Checks for a custom override first,
 /// then falls back to the built-in default renderer for the node's type.
-pub fn render(self: *const NodeRenderer, node: *const Node, lines: *std.ArrayList([]const u8), allocator: Allocator) !void {
+pub fn render(
+    self: *const NodeRenderer,
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+) !void {
     // Check for custom override
     if (self.has_overrides) {
         const type_name = @tagName(node.node_type);
         if (self.overrides.get(type_name)) |custom_fn| {
-            return custom_fn(node, lines, allocator);
+            return custom_fn(node, lines, allocator, theme);
         }
     }
 
     // Built-in defaults
-    try renderDefault(node, lines, allocator);
+    try renderDefault(node, lines, allocator, theme);
 }
 
 /// Return the number of display lines a node produces (without allocating them).
@@ -87,65 +102,156 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     };
 }
 
-/// Built-in renderer: produces one or more lines per node using type-specific formatting.
+/// Create a StyledLine with a single span.
+fn singleSpanLine(allocator: Allocator, text: []const u8, style: Theme.CellStyle) !StyledLine {
+    const owned_text = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned_text);
+    const spans = try allocator.alloc(StyledSpan, 1);
+    spans[0] = .{ .text = owned_text, .style = style };
+    return .{ .spans = spans };
+}
+
+/// Create a StyledLine with two spans.
+fn twoSpanLine(
+    allocator: Allocator,
+    text1: []const u8,
+    style1: Theme.CellStyle,
+    text2: []const u8,
+    style2: Theme.CellStyle,
+) !StyledLine {
+    const owned1 = try allocator.dupe(u8, text1);
+    errdefer allocator.free(owned1);
+    const owned2 = try allocator.dupe(u8, text2);
+    errdefer allocator.free(owned2);
+    const spans = try allocator.alloc(StyledSpan, 2);
+    spans[0] = .{ .text = owned1, .style = style1 };
+    spans[1] = .{ .text = owned2, .style = style2 };
+    return .{ .spans = spans };
+}
+
+/// Create an empty StyledLine (no spans, used for blank gap lines).
+fn emptyLine(allocator: Allocator) !StyledLine {
+    const spans = try allocator.alloc(StyledSpan, 0);
+    return .{ .spans = spans };
+}
+
+/// Built-in renderer: produces one or more StyledLines per node using type-specific formatting.
 /// Multi-line content (containing \n) is split into separate display lines.
-fn renderDefault(node: *const Node, lines: *std.ArrayList([]const u8), allocator: Allocator) !void {
+fn renderDefault(
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+) !void {
     const content = node.content.items;
 
     switch (node.node_type) {
         .user_message => {
-            // Split on newlines, prefix first line with "> "
+            const style = theme.highlights.user_message;
             var first = true;
             var rest: []const u8 = content;
             while (rest.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, rest, '\n');
                 const segment = if (nl) |n| rest[0..n] else rest;
                 const line = if (first)
-                    try std.fmt.allocPrint(allocator, "> {s}", .{segment})
+                    try twoSpanLine(allocator, "> ", style, segment, style)
                 else
-                    try allocator.dupe(u8, segment);
+                    try singleSpanLine(allocator, segment, style);
                 try lines.append(allocator, line);
                 first = false;
                 rest = if (nl) |n| rest[n + 1 ..] else &.{};
             }
             return;
         },
-        .assistant_text, .status, .custom => {
-            // Split on newlines, each becomes a separate display line
+        .assistant_text => {
+            const style = theme.highlights.assistant_text;
             var rest: []const u8 = content;
             while (rest.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, rest, '\n');
                 const segment = if (nl) |n| rest[0..n] else rest;
-                try lines.append(allocator, try allocator.dupe(u8, segment));
+                try lines.append(allocator, try singleSpanLine(allocator, segment, style));
                 rest = if (nl) |n| rest[n + 1 ..] else &.{};
             }
             if (content.len == 0) {
-                try lines.append(allocator, try allocator.dupe(u8, ""));
+                try lines.append(allocator, try singleSpanLine(allocator, "", style));
+            }
+            return;
+        },
+        .status, .custom => {
+            const style = if (node.node_type == .status) theme.highlights.status else Theme.CellStyle{};
+            var rest: []const u8 = content;
+            while (rest.len > 0) {
+                const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                const segment = if (nl) |n| rest[0..n] else rest;
+                try lines.append(allocator, try singleSpanLine(allocator, segment, style));
+                rest = if (nl) |n| rest[n + 1 ..] else &.{};
+            }
+            if (content.len == 0) {
+                try lines.append(allocator, try singleSpanLine(allocator, "", style));
             }
             return;
         },
         .tool_call => {
-            const line = try std.fmt.allocPrint(allocator, "[tool] {s}", .{content});
-            try lines.append(allocator, line);
+            const style = theme.highlights.tool_call;
+            try lines.append(allocator, try twoSpanLine(allocator, "[tool] ", style, content, style));
             return;
         },
         .tool_result => {
+            const indent_count = theme.spacing.indent;
+            const indent_str = try allocator.alloc(u8, indent_count);
+            @memset(indent_str, ' ');
+            errdefer allocator.free(indent_str);
+
             const truncated = if (content.len > max_result_display) content[0..max_result_display] else content;
             const suffix: []const u8 = if (content.len > max_result_display) "..." else "";
-            const line = try std.fmt.allocPrint(allocator, "  {s}{s}", .{ truncated, suffix });
-            try lines.append(allocator, line);
+            const result_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ truncated, suffix });
+            errdefer allocator.free(result_text);
+
+            const style = theme.highlights.tool_result;
+            const spans = try allocator.alloc(StyledSpan, 2);
+            spans[0] = .{ .text = indent_str, .style = .{} };
+            spans[1] = .{ .text = result_text, .style = style };
+            try lines.append(allocator, .{ .spans = spans });
             return;
         },
         .err => {
-            const line = try std.fmt.allocPrint(allocator, "error: {s}", .{content});
-            try lines.append(allocator, line);
+            const style = theme.highlights.err;
+            try lines.append(allocator, try twoSpanLine(allocator, "error: ", style, content, style));
             return;
         },
         .separator => {
-            try lines.append(allocator, try allocator.dupe(u8, "---"));
+            const style = theme.highlights.status;
+            try lines.append(allocator, try singleSpanLine(allocator, "---", style));
             return;
         },
     }
+}
+
+/// Free a single StyledLine's allocated spans and text.
+fn freeStyledLine(line: StyledLine, allocator: Allocator) void {
+    for (line.spans) |span| allocator.free(span.text);
+    allocator.free(line.spans);
+}
+
+/// Free all StyledLines in a list, including their span text and span arrays.
+pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: Allocator) void {
+    for (lines.items) |line| {
+        freeStyledLine(line, allocator);
+    }
+    lines.deinit(allocator);
+}
+
+/// Concatenate all spans in a StyledLine into a single string (for testing).
+fn styledLineText(line: StyledLine, allocator: Allocator) ![]const u8 {
+    var total_len: usize = 0;
+    for (line.spans) |span| total_len += span.text.len;
+    const buf = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+    for (line.spans) |span| {
+        @memcpy(buf[offset .. offset + span.text.len], span.text);
+        offset += span.text.len;
+    }
+    return buf;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -168,15 +274,45 @@ test "renderDefault user_message" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
+    try renderDefault(&node, &lines, allocator, &theme);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqualStrings("> hello", lines.items[0]);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("> hello", text);
+}
+
+test "renderDefault user_message has two spans with user_message style" {
+    const allocator = std.testing.allocator;
+
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(allocator, "hello");
+    defer content.deinit(allocator);
+
+    const node = Node{
+        .id = 0,
+        .node_type = .user_message,
+        .content = content,
+        .children = .empty,
+    };
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
+
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const line = lines.items[0];
+    try std.testing.expectEqual(@as(usize, 2), line.spans.len);
+    try std.testing.expectEqualStrings("> ", line.spans[0].text);
+    try std.testing.expectEqualStrings("hello", line.spans[1].text);
+    // user_message style should be bold
+    try std.testing.expect(line.spans[0].style.bold);
+    try std.testing.expect(line.spans[1].style.bold);
 }
 
 test "renderDefault assistant_text" {
@@ -193,14 +329,17 @@ test "renderDefault assistant_text" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("I can help with that", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("I can help with that", text);
+    // assistant_text should have one span
+    try std.testing.expectEqual(@as(usize, 1), lines.items[0].spans.len);
 }
 
 test "renderDefault tool_call" {
@@ -217,14 +356,20 @@ test "renderDefault tool_call" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("[tool] bash", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("[tool] bash", text);
+
+    // Two spans: prefix and name, both with tool_call style
+    try std.testing.expectEqual(@as(usize, 2), lines.items[0].spans.len);
+    try std.testing.expectEqualStrings("[tool] ", lines.items[0].spans[0].text);
+    try std.testing.expectEqualStrings("bash", lines.items[0].spans[1].text);
 }
 
 test "renderDefault tool_result truncation" {
@@ -243,18 +388,22 @@ test "renderDefault tool_result truncation" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
+    try renderDefault(&node, &lines, allocator, &theme);
 
-    // "  " prefix (2) + 80 chars + "..." (3) = 85
-    try std.testing.expectEqual(@as(usize, 85), lines.items[0].len);
-    try std.testing.expect(std.mem.endsWith(u8, lines.items[0], "..."));
-    try std.testing.expect(std.mem.startsWith(u8, lines.items[0], "  "));
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+
+    // indent (2) + 80 chars + "..." (3) = 85
+    try std.testing.expectEqual(@as(usize, 85), text.len);
+    try std.testing.expect(std.mem.endsWith(u8, text, "..."));
+    try std.testing.expect(std.mem.startsWith(u8, text, "  "));
+
+    // Two spans: indent (unstyled) and result content
+    try std.testing.expectEqual(@as(usize, 2), lines.items[0].spans.len);
 }
 
 test "renderDefault tool_result short content not truncated" {
@@ -271,14 +420,15 @@ test "renderDefault tool_result short content not truncated" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("  ok", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("  ok", text);
 }
 
 test "renderDefault err" {
@@ -295,14 +445,19 @@ test "renderDefault err" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("error: something failed", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("error: something failed", text);
+
+    // err style should be bold
+    try std.testing.expect(lines.items[0].spans[0].style.bold);
+    try std.testing.expect(lines.items[0].spans[1].style.bold);
 }
 
 test "renderDefault separator" {
@@ -318,14 +473,17 @@ test "renderDefault separator" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("---", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("---", text);
+    // Separator uses status style (dim)
+    try std.testing.expect(lines.items[0].spans[0].style.dim);
 }
 
 test "renderDefault status" {
@@ -342,14 +500,16 @@ test "renderDefault status" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("tokens: 1500 in, 200 out", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("tokens: 1500 in, 200 out", text);
+    try std.testing.expect(lines.items[0].spans[0].style.dim);
 }
 
 test "renderDefault custom" {
@@ -366,14 +526,48 @@ test "renderDefault custom" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("plugin output", lines.items[0]);
+    try renderDefault(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("plugin output", text);
+}
+
+test "renderDefault multiline assistant_text" {
+    const allocator = std.testing.allocator;
+
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(allocator, "line one\nline two\nline three");
+    defer content.deinit(allocator);
+
+    const node = Node{
+        .id = 0,
+        .node_type = .assistant_text,
+        .content = content,
+        .children = .empty,
+    };
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
+
+    try renderDefault(&node, &lines, allocator, &theme);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+
+    const t1 = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(t1);
+    const t2 = try styledLineText(lines.items[1], allocator);
+    defer allocator.free(t2);
+    const t3 = try styledLineText(lines.items[2], allocator);
+    defer allocator.free(t3);
+
+    try std.testing.expectEqualStrings("line one", t1);
+    try std.testing.expectEqualStrings("line two", t2);
+    try std.testing.expectEqualStrings("line three", t3);
 }
 
 test "custom override replaces default renderer" {
@@ -383,10 +577,19 @@ test "custom override replaces default renderer" {
     defer renderer.deinit();
 
     const custom_render = struct {
-        fn render(node: *const Node, lines: *std.ArrayList([]const u8), alloc: Allocator) !void {
+        fn render(
+            node: *const Node,
+            lines: *std.ArrayList(StyledLine),
+            alloc: Allocator,
+            theme: *const Theme,
+        ) !void {
             _ = node;
-            const line = try alloc.dupe(u8, "CUSTOM RENDERED");
-            try lines.append(alloc, line);
+            _ = theme;
+            const text = try alloc.dupe(u8, "CUSTOM RENDERED");
+            errdefer alloc.free(text);
+            const spans = try alloc.alloc(StyledSpan, 1);
+            spans[0] = .{ .text = text, .style = .{} };
+            try lines.append(alloc, .{ .spans = spans });
         }
     }.render;
 
@@ -403,14 +606,15 @@ test "custom override replaces default renderer" {
         .children = .empty,
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer freeStyledLines(&lines, allocator);
 
-    try renderer.render(&node, &lines, allocator);
-    try std.testing.expectEqualStrings("CUSTOM RENDERED", lines.items[0]);
+    try renderer.render(&node, &lines, allocator, &theme);
+
+    const text = try styledLineText(lines.items[0], allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("CUSTOM RENDERED", text);
 }
 
 test "lineCountForNode returns 1 for all types" {
