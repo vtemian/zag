@@ -14,6 +14,8 @@ const NodeType = Buffer.NodeType;
 const StyledSpan = Theme.StyledSpan;
 const StyledLine = Theme.StyledLine;
 
+const MarkdownParser = @import("MarkdownParser.zig");
+
 const NodeRenderer = @This();
 
 /// Function signature for a custom node renderer.
@@ -209,7 +211,7 @@ fn renderDefault(
             return;
         },
         .assistant_text => {
-            try splitAndAppend(lines, allocator, content, theme.highlights.assistant_text, null, null);
+            try MarkdownParser.parseLines(content, lines, allocator, theme);
             return;
         },
         .status, .custom => {
