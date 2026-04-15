@@ -1,7 +1,7 @@
-# Zag — Agent Development Environment
+# Zag: Agent Development Environment
 
 ## Project overview
-Zag is a composable agent development environment built in Zig. The window system is the platform — everything above primitives is a plugin. Modal interaction (vim-style), Lua extensibility (Neovim model).
+Zag is a composable agent development environment built in Zig. The window system is the platform; everything above primitives is a plugin. Modal interaction (vim-style), Lua extensibility (Neovim model).
 
 ## Build & run
 ```bash
@@ -16,14 +16,14 @@ Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
 ## Zig coding standards (learned from Ghostty)
 
 ### File naming
-- **PascalCase.zig** — when the file's primary export is a single named struct/type (e.g., `Parser.zig`, `Terminal.zig`, `Config.zig`)
-- **snake_case.zig** — for utility modules, helpers, or modules exporting multiple functions/types (e.g., `fastmem.zig`, `build_config.zig`)
+- **PascalCase.zig**: when the file's primary export is a single named struct/type (e.g., `Parser.zig`, `Terminal.zig`, `Config.zig`)
+- **snake_case.zig**: for utility modules, helpers, or modules exporting multiple functions/types (e.g., `fastmem.zig`, `build_config.zig`)
 
 ### Module organization
 - Package root files (e.g., `src/config.zig`) act as facades: re-export public items, keep internals private
 - `pub const` for exports, plain `const` for internal imports
 - Every package root includes: `test { @import("std").testing.refAllDecls(@This()); }`
-- Keep root entry points small — delegate to subsystem modules
+- Keep root entry points small. Delegate to subsystem modules
 
 ### Memory management
 - Always pair `alloc` with `errdefer` cleanup in init chains
@@ -62,7 +62,7 @@ Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
 ### Testing
 - Tests live inline in the same file as the code they test
 - Descriptive test names: `test "parse valid config"`, `test "edit non-existent file"`
-- Use `testing.allocator` in tests — it detects leaks
+- Use `testing.allocator` in tests. It detects leaks
 - Test error cases, not just happy paths
 - Module root test blocks: `test { @import("std").testing.refAllDecls(@This()); }`
 
@@ -81,7 +81,7 @@ Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
   ```
 
 ### Performance
-- `zig fmt` enforced — no manual formatting discussions
+- `zig fmt` enforced. No manual formatting discussions
 - Comptime feature gating for optional capabilities
 - Comment non-obvious memory layout decisions
 - `inline` only in measured hot paths, not speculatively
@@ -89,16 +89,16 @@ Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
 ### Control flow
 - Labeled blocks with `break` for complex value computation
 - `orelse` for optional unwrapping: `const x = optional orelse return null;`
-- Exhaustive switches — use `else => unreachable` only for truly impossible cases
+- Exhaustive switches. Use `else => unreachable` only for truly impossible cases
 
 ## What NOT to do
-- Don't use `std.debug.assert` in hot paths — it may not optimize away in ReleaseFast
-- Don't use `ArrayList.init(allocator)` — deprecated in Zig 0.15. Use `.empty` and pass allocator to methods
-- Don't create monolithic error types — combine small error sets with `||`
-- Don't separate tests into different files — tests live with the code they test
-- Don't add comments explaining what code does if the code is clear — comment why, not what
+- Don't use `std.debug.assert` in hot paths. It may not optimize away in ReleaseFast
+- Don't use `ArrayList.init(allocator)`. Deprecated in Zig 0.15. Use `.empty` and pass allocator to methods
+- Don't create monolithic error types. Combine small error sets with `||`
+- Don't separate tests into different files. Tests live with the code they test
+- Don't add comments explaining what code does if the code is clear. Comment why, not what
 - Don't use runtime dispatch when comptime selection works
-- Don't skip `errdefer` — every allocation in an init chain needs cleanup on failure
+- Don't skip `errdefer`. Every allocation in an init chain needs cleanup on failure
 
 ## Architecture
 ```
@@ -126,7 +126,7 @@ src/
 ```
 <subsystem>: <description>
 
-<optional why — not what>
+<optional why, not what>
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 ```

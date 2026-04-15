@@ -1,4 +1,4 @@
-# 006 — What to Take from pi-mono
+# 006. What to Take from pi-mono
 
 **Date:** 2026-04-14
 
@@ -15,11 +15,11 @@ Everything is an event. The agent lifecycle emits:
 - `message_start`, `message_update`, `message_end`
 - `tool_execution_start`, `tool_execution_update`, `tool_execution_end`
 
-Plugins subscribe to events. Events are synchronous — listeners can block turn progression when needed (e.g., for validation or UI updates). In Zig, this is a clean pattern with function pointers or a pub/sub registry.
+Plugins subscribe to events. Events are synchronous; listeners can block turn progression when needed (e.g., for validation or UI updates). In Zig, this is a clean pattern with function pointers or a pub/sub registry.
 
 ### Steering and follow-up queues
 Two separate message queues:
-- **Steering**: user interrupts during tool execution. Processed after current tools finish. Agent doesn't lose context — gets a new instruction mid-flight.
+- **Steering**: user interrupts during tool execution. Processed after current tools finish. Agent doesn't lose context; it gets a new instruction mid-flight.
 - **Follow-up**: messages queued for when the agent would naturally stop. Enables chaining prompts without waiting.
 
 Modes: "all" (drain entire queue at once) or "one-at-a-time" (process one per turn). This is more sophisticated than simple cancellation.
@@ -42,7 +42,7 @@ Parent/child references create a tree structure. You can:
 - Compact old messages (summarize to save context)
 - Store custom plugin state as entries
 
-Sessions are the data structure. Not a UI concept — the session tree plugin reads this structure and renders it.
+Sessions are the data structure. Not a UI concept. The session tree plugin reads this structure and renders it.
 
 ### Tool result splitting
 Tools return content in two channels:
@@ -74,10 +74,10 @@ zag.tool.register("read", {
 
 ### Plugins subscribe to lifecycle events
 Hooks into everything:
-- `session_start` — initialize plugin state
-- `tool_call` — intercept before/after tool execution
-- `agent_end` — cleanup
-- `input` — intercept user input
+- `session_start`: initialize plugin state
+- `tool_call`: intercept before/after tool execution
+- `agent_end`: cleanup
+- `input`: intercept user input
 
 Before/after hooks on tool calls enable:
 - Validation (block dangerous commands)
@@ -86,10 +86,10 @@ Before/after hooks on tool calls enable:
 - Custom rendering (format tool output for display)
 
 ### Plugins register commands and keybindings
-Slash commands (`/mycommand`) and keyboard shortcuts. In Zag, keybindings are vim-composable — plugins can register normal mode mappings, commands for command mode, etc.
+Slash commands (`/mycommand`) and keyboard shortcuts. In Zag, keybindings are vim-composable. Plugins can register normal mode mappings, commands for command mode, etc.
 
 ### Plugins persist state via custom session entries
-A plugin can write custom entries to the JSONL session log. State survives across restarts. No separate storage needed — the session is the database.
+A plugin can write custom entries to the JSONL session log. State survives across restarts. No separate storage needed; the session is the database.
 
 ### Plugins register model providers
 Dynamically add LLM providers, including OAuth flows. A plugin could add a custom provider (local Ollama, corporate proxy, experimental model) without touching core code.
@@ -102,10 +102,10 @@ Dynamically add LLM providers, including OAuth flows. A plugin could add a custo
 Under 1000 tokens. Frontier models already know what a coding agent is. Don't over-instruct. Add only what's proven necessary through testing. Mario's benchmarks show this performs competitively.
 
 ### Four core tools
-- `read` — file contents, images, capped at reasonable default
-- `write` — create or overwrite
-- `edit` — exact string replacement (oldText must match)
-- `bash` — execute with optional timeout
+- `read`: file contents, images, capped at reasonable default
+- `write`: create or overwrite
+- `edit`: exact string replacement (oldText must match)
+- `bash`: execute with optional timeout
 
 Optional read-only: grep, find, ls. Start here. Expand only when a real need is demonstrated. Plugins can add any tool.
 
@@ -123,7 +123,7 @@ Zag should support MCP (plugins can implement it), but the default philosophy sh
 - Token usage visible per turn
 
 ### File-based planning
-PLAN.md files instead of ephemeral in-memory plans. Persist across sessions. Enable sharing. Provide observability. The agent reads and updates a file — you can read it too.
+PLAN.md files instead of ephemeral in-memory plans. Persist across sessions. Enable sharing. Provide observability. The agent reads and updates a file. You can read it too.
 
 ### Honest security model
 Permission dialogs are theater once the agent has write + execute + network. Either sandbox at the OS level (Seatbelt/seccomp, learned from Codex) or embrace full access and tell the user to use containers. Don't pretend.
@@ -135,7 +135,7 @@ Even though Zag will be full-screen (not streaming like pi), the rendering techn
 - Components persist across frames, cache their rendered output
 - On update: render, compare to previous, only redraw changed regions
 - Wrap updates in synchronized output escape sequences (`CSI ?2026h`/`CSI ?2026l`) to prevent flicker
-- Store previous frame for diffing — negligible memory cost
+- Store previous frame for diffing, negligible memory cost
 
 This is dirty rectangle rendering for the terminal. Study pi-mono's implementation for the TUI phase.
 
@@ -144,13 +144,13 @@ This is dirty rectangle rendering for the terminal. Study pi-mono's implementati
 ## What NOT to take from pi
 
 ### Streaming TUI
-Mario chose streaming (append to scrollback) because pi is a chat interface. Zag needs composable windows — that requires full-screen. Different foundation, different choice. Both correct for their context.
+Mario chose streaming (append to scrollback) because pi is a chat interface. Zag needs composable windows, and that requires full-screen. Different foundation, different choice. Both correct for their context.
 
 ### No sub-agents
-Mario's position is principled ("black box within a black box"). But Zag's plugin architecture enables transparent sub-agents — a plugin can spawn an agent in a visible buffer. The user sees everything. This addresses Mario's observability concern while enabling parallel work.
+Mario's position is principled ("black box within a black box"). But Zag's plugin architecture enables transparent sub-agents. A plugin can spawn an agent in a visible buffer. The user sees everything. This addresses Mario's observability concern while enabling parallel work.
 
 ### TypeScript extensions
 pi uses TypeScript modules loaded via jiti. Zag uses Lua via LuaJIT. Same model (auto-discovered, project-local or global, can replace anything), different language. Lua is lighter and embeds cleanly in a Zig binary.
 
 ### No MCP ever
-Mario rejects MCP entirely. Zag should let plugins implement MCP support — but not pay the token cost by default. User choice, not dogma.
+Mario rejects MCP entirely. Zag should let plugins implement MCP support, but not pay the token cost by default. User choice, not dogma.
