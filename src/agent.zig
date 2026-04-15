@@ -183,7 +183,8 @@ pub fn runLoopStreaming(
     cancel: *AgentThread.CancelFlag,
 ) void {
     runLoopStreamingInner(messages, registry, provider, allocator, queue, cancel) catch |err| {
-        queue.push(.{ .err = @errorName(err) }) catch {};
+        const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
+        queue.push(.{ .err = duped_err }) catch {};
     };
     queue.push(.done) catch {};
 }
