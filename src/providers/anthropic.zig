@@ -68,7 +68,7 @@ pub const AnthropicProvider = struct {
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        // Open an incremental streaming connection — SSE events are read
+        // Open an incremental streaming connection. SSE events are read
         // and dispatched as tokens arrive from the network.
         const stream = try llm.StreamingResponse.create(api_url, body, &.{
             .{ .name = "x-api-key", .value = self.api_key },

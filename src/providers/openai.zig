@@ -76,7 +76,7 @@ pub const OpenAiProvider = struct {
         const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
         defer allocator.free(auth_value);
 
-        // Open an incremental streaming connection — SSE events are read
+        // Open an incremental streaming connection. SSE events are read
         // and dispatched as tokens arrive from the network.
         const stream = try llm.StreamingResponse.create(self.base_url, body, &.{
             .{ .name = "Authorization", .value = auth_value },
