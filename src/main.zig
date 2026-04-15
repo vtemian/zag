@@ -211,12 +211,11 @@ pub fn main() !void {
         if (build_options.metrics) .{ .inner = gpa.allocator() } else {};
     const allocator = if (build_options.metrics) counting.allocator() else gpa.allocator();
 
-    // Module-level buffer, renderer, and theme
+    // Module-level buffer and renderer
     buffer_alloc = allocator;
     buffer = try Buffer.init(allocator, 0, "session");
     defer buffer.deinit();
     node_renderer = NodeRenderer.initDefault();
-    theme = Theme.defaultTheme();
 
     // Initialize layout with the session buffer in the first tab
     layout = Layout.init(allocator);
