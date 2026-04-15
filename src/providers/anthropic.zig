@@ -68,16 +68,15 @@ pub const AnthropicProvider = struct {
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        // Fetch the complete SSE response body, then parse events from it.
-        // True incremental streaming requires deeper integration with the
-        // Zig 0.15 HTTP client's reader API (future improvement).
-        const response_bytes = try llm.httpPostJson(api_url, body, &.{
+        // Open an incremental streaming connection — SSE events are read
+        // and dispatched as tokens arrive from the network.
+        const stream = try llm.StreamingResponse.create(api_url, body, &.{
             .{ .name = "x-api-key", .value = self.api_key },
             .{ .name = "anthropic-version", .value = api_version },
         }, allocator);
-        defer allocator.free(response_bytes);
+        defer stream.destroy();
 
-        return parseSseResponse(response_bytes, allocator, on_event, cancel);
+        return parseSseStream(stream, allocator, on_event, cancel);
     }
 };
 
@@ -275,10 +274,10 @@ const StreamingBlock = struct {
     }
 };
 
-/// Parse SSE events from a complete response body (fetched in one go).
-/// Calls on_event for each event, then assembles the final LlmResponse.
-fn parseSseResponse(
-    response_bytes: []const u8,
+/// Read SSE events incrementally from a streaming HTTP connection.
+/// Calls on_event for each event as it arrives, then assembles the final LlmResponse.
+fn parseSseStream(
+    stream: *llm.StreamingResponse,
     allocator: Allocator,
     on_event: *const fn (event: llm.StreamEvent) void,
     cancel: *std.atomic.Value(bool),
@@ -293,49 +292,42 @@ fn parseSseResponse(
         blocks.deinit(allocator);
     }
 
-    // SSE parsing: walk through lines
+    // SSE parsing: read lines incrementally from the network
     var current_event_type: [128]u8 = undefined;
     var current_event_len: usize = 0;
     var current_data: std.ArrayList(u8) = .empty;
     defer current_data.deinit(allocator);
 
-    var line_start: usize = 0;
-    for (response_bytes, 0..) |byte, i| {
-        if (byte == '\n') {
-            const line = blk: {
-                var end = i;
-                if (end > line_start and response_bytes[end - 1] == '\r') end -= 1;
-                break :blk response_bytes[line_start..end];
-            };
-            line_start = i + 1;
+    while (true) {
+        if (cancel.load(.acquire)) break;
 
-            if (cancel.load(.acquire)) break;
+        const maybe_line = try stream.readLine();
+        const line = maybe_line orelse break;
 
-            if (line.len == 0) {
-                // Blank line = dispatch event
-                if (current_data.items.len > 0) {
-                    try processSseEvent(
-                        current_event_type[0..current_event_len],
-                        current_data.items,
-                        allocator,
-                        &blocks,
-                        &stop_reason,
-                        &input_tokens,
-                        &output_tokens,
-                        on_event,
-                    );
-                }
-                current_event_len = 0;
-                current_data.clearRetainingCapacity();
-            } else if (std.mem.startsWith(u8, line, "event: ")) {
-                const val = line["event: ".len..];
-                const copy_len = @min(val.len, current_event_type.len);
-                @memcpy(current_event_type[0..copy_len], val[0..copy_len]);
-                current_event_len = copy_len;
-            } else if (std.mem.startsWith(u8, line, "data: ")) {
-                const val = line["data: ".len..];
-                try current_data.appendSlice(allocator, val);
+        if (line.len == 0) {
+            // Blank line = dispatch event
+            if (current_data.items.len > 0) {
+                try processSseEvent(
+                    current_event_type[0..current_event_len],
+                    current_data.items,
+                    allocator,
+                    &blocks,
+                    &stop_reason,
+                    &input_tokens,
+                    &output_tokens,
+                    on_event,
+                );
             }
+            current_event_len = 0;
+            current_data.clearRetainingCapacity();
+        } else if (std.mem.startsWith(u8, line, "event: ")) {
+            const val = line["event: ".len..];
+            const copy_len = @min(val.len, current_event_type.len);
+            @memcpy(current_event_type[0..copy_len], val[0..copy_len]);
+            current_event_len = copy_len;
+        } else if (std.mem.startsWith(u8, line, "data: ")) {
+            const val = line["data: ".len..];
+            try current_data.appendSlice(allocator, val);
         }
     }
 

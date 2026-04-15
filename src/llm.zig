@@ -221,6 +221,146 @@ pub fn httpPostJson(
     return out.toOwnedSlice();
 }
 
+/// Owns an HTTP client + request for incremental SSE reading.
+/// Both providers share this plumbing; only the URL and extra headers differ.
+///
+/// Must be heap-allocated (create/destroy pattern) because the body reader
+/// holds a pointer into the internal transfer buffer.
+///
+/// After creation, call `readLine` repeatedly to read SSE lines one at a time.
+/// Each call returns a line (without trailing newline), or `null` at end of
+/// stream. The returned slice is valid until the next `readLine` call.
+pub const StreamingResponse = struct {
+    client: std.http.Client,
+    req: std.http.Client.Request,
+    body_reader: *std.Io.Reader,
+    /// Transfer buffer for the HTTP body reader. The body reader holds a
+    /// pointer into this buffer, which is why the struct must be pinned.
+    transfer_buf: [8192]u8,
+
+    /// Accumulates partial lines across network reads.
+    line_buf: std.ArrayList(u8),
+    /// Leftover bytes after a newline that belong to subsequent lines.
+    remainder: std.ArrayList(u8),
+    allocator: Allocator,
+
+    /// Open a streaming HTTP POST connection.
+    /// Caller must call `destroy` when done.
+    pub fn create(
+        url: []const u8,
+        body: []const u8,
+        extra_headers: []const std.http.Header,
+        allocator: Allocator,
+    ) !*StreamingResponse {
+        const self = try allocator.create(StreamingResponse);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .client = .{ .allocator = allocator },
+            .req = undefined,
+            .body_reader = undefined,
+            .transfer_buf = undefined,
+            .line_buf = .empty,
+            .remainder = .empty,
+            .allocator = allocator,
+        };
+        errdefer self.client.deinit();
+
+        const uri = std.Uri.parse(url) catch unreachable;
+
+        self.req = self.client.request(.POST, uri, .{
+            .extra_headers = extra_headers,
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+            },
+            .redirect_behavior = .unhandled,
+            .keep_alive = false,
+        }) catch return error.ApiError;
+        errdefer self.req.deinit();
+
+        // Send the request body.
+        self.req.transfer_encoding = .{ .content_length = body.len };
+        var bw = self.req.sendBodyUnflushed(&.{}) catch return error.ApiError;
+        bw.writer.writeAll(body) catch return error.ApiError;
+        bw.end() catch return error.ApiError;
+        (self.req.connection orelse return error.ApiError).flush() catch return error.ApiError;
+
+        // Receive response headers.
+        var redirect_buf: [0]u8 = .{};
+        var response = self.req.receiveHead(&redirect_buf) catch return error.ApiError;
+
+        if (response.head.status != .ok) return error.ApiError;
+
+        // Obtain the incremental body reader. The pointer into transfer_buf
+        // is stable because self is heap-allocated.
+        self.body_reader = response.reader(&self.transfer_buf);
+
+        return self;
+    }
+
+    pub fn destroy(self: *StreamingResponse) void {
+        const alloc = self.allocator;
+        self.line_buf.deinit(alloc);
+        self.remainder.deinit(alloc);
+        self.req.deinit();
+        self.client.deinit();
+        alloc.destroy(self);
+    }
+
+    /// Read the next line from the SSE stream (delimited by '\n').
+    /// Returns the line content without trailing '\n' or '\r\n', or
+    /// `null` when the stream has ended.
+    /// The returned slice is valid until the next `readLine` call.
+    pub fn readLine(self: *StreamingResponse) !?[]const u8 {
+        self.line_buf.clearRetainingCapacity();
+
+        // First, consume any leftover bytes from a previous read.
+        if (self.remainder.items.len > 0) {
+            if (std.mem.indexOfScalar(u8, self.remainder.items, '\n')) |nl_pos| {
+                try self.line_buf.appendSlice(self.allocator, self.remainder.items[0..nl_pos]);
+                // Shift remainder forward past the newline.
+                const after = self.remainder.items[nl_pos + 1 ..];
+                std.mem.copyForwards(u8, self.remainder.items[0..after.len], after);
+                self.remainder.shrinkRetainingCapacity(after.len);
+                return stripCr(self.line_buf.items);
+            }
+            // No newline in remainder; move it all to line_buf and continue reading.
+            try self.line_buf.appendSlice(self.allocator, self.remainder.items);
+            self.remainder.clearRetainingCapacity();
+        }
+
+        // Read from the network until we find a newline or hit end of stream.
+        while (true) {
+            var read_buf: [4096]u8 = undefined;
+            const n = self.body_reader.readSliceShort(&read_buf) catch
+                return error.ApiError;
+            if (n == 0) {
+                // End of stream.
+                if (self.line_buf.items.len > 0) return stripCr(self.line_buf.items);
+                return null;
+            }
+
+            const chunk = read_buf[0..n];
+            if (std.mem.indexOfScalar(u8, chunk, '\n')) |nl_pos| {
+                try self.line_buf.appendSlice(self.allocator, chunk[0..nl_pos]);
+                // Save everything after the newline for subsequent calls.
+                if (nl_pos + 1 < n) {
+                    try self.remainder.appendSlice(self.allocator, chunk[nl_pos + 1 .. n]);
+                }
+                return stripCr(self.line_buf.items);
+            }
+
+            // No newline yet; accumulate and keep reading.
+            try self.line_buf.appendSlice(self.allocator, chunk);
+        }
+    }
+
+    fn stripCr(line: []const u8) []const u8 {
+        if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+        return line;
+    }
+};
+
 // -- Tests -------------------------------------------------------------------
 
 test "Provider vtable call dispatches correctly" {
