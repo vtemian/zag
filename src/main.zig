@@ -15,6 +15,8 @@ const Buffer = @import("Buffer.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
+const trace = @import("Metrics.zig");
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.main);
 
@@ -180,7 +182,15 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+
+    // Initialize metrics system (no-op when disabled)
+    trace.init();
+
+    // When metrics are enabled, wrap the GPA with a counting allocator
+    // to track allocations per frame.
+    var counting: if (build_options.metrics) trace.CountingAllocator else void =
+        if (build_options.metrics) .{ .inner = gpa.allocator() } else {};
+    const allocator = if (build_options.metrics) counting.allocator() else gpa.allocator();
 
     // Module-level buffer and renderer
     buffer_alloc = allocator;
@@ -282,6 +292,21 @@ pub fn main() !void {
 
     // -- Event loop ----------------------------------------------------------
     while (running) {
+        trace.frameStart();
+        if (build_options.metrics) counting.resetFrame();
+
+        var frame_span = trace.span("frame");
+        defer {
+            frame_span.end();
+            if (build_options.metrics) {
+                trace.frameEndWithAllocs(
+                    counting.alloc_count,
+                    counting.alloc_bytes,
+                    counting.peak_bytes,
+                );
+            }
+        }
+
         // Check for terminal resize (SIGWINCH)
         if (term.checkResize()) |new_size| {
             try screen.resize(new_size.cols, new_size.rows);
@@ -292,7 +317,11 @@ pub fn main() !void {
         }
 
         // Poll for input
-        const maybe_event = input_mod.pollEvent(posix.STDIN_FILENO);
+        const maybe_event = blk: {
+            var poll_span = trace.span("poll");
+            defer poll_span.end();
+            break :blk input_mod.pollEvent(posix.STDIN_FILENO);
+        };
         if (maybe_event == null) {
             // No input available; sleep briefly to avoid busy-spinning
             posix.nanosleep(0, 10 * std.time.ns_per_ms);
@@ -372,6 +401,58 @@ pub fn main() !void {
                                 continue;
                             }
 
+                            // /perf: show aggregate performance stats
+                            if (std.mem.eql(u8, user_input, "/perf")) {
+                                input_len = 0;
+                                if (trace.enabled) {
+                                    const stats = trace.getStats();
+                                    var perf_buf: [512]u8 = undefined;
+
+                                    const header = std.fmt.bufPrint(&perf_buf, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
+                                    appendOutputText(header) catch {};
+
+                                    const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
+                                    const p99_ms = @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0;
+                                    const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
+                                    const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
+
+                                    const avg_line = std.fmt.bufPrint(&perf_buf, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
+                                    appendOutputText(avg_line) catch {};
+                                    const p99_line = std.fmt.bufPrint(&perf_buf, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
+                                    appendOutputText(p99_line) catch {};
+                                    const max_line = std.fmt.bufPrint(&perf_buf, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
+                                    appendOutputText(max_line) catch {};
+                                    const peak_line = std.fmt.bufPrint(&perf_buf, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
+                                    appendOutputText(peak_line) catch {};
+                                    const allocs_line = std.fmt.bufPrint(&perf_buf, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
+                                    appendOutputText(allocs_line) catch {};
+                                } else {
+                                    appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+                                }
+                                continue;
+                            }
+
+                            // /perf-dump: write Chrome Trace Event Format JSON
+                            if (std.mem.eql(u8, user_input, "/perf-dump")) {
+                                input_len = 0;
+                                if (trace.enabled) {
+                                    const count = trace.dump("zag-trace.json") catch |err| blk: {
+                                        var err_buf: [256]u8 = undefined;
+                                        const err_msg = std.fmt.bufPrint(&err_buf, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
+                                        appendOutputText(err_msg) catch {};
+                                        break :blk @as(usize, 0);
+                                    };
+                                    if (count > 0) {
+                                        var dump_buf: [256]u8 = undefined;
+                                        const dump_msg = std.fmt.bufPrint(&dump_buf, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
+                                        appendOutputText(dump_msg) catch {};
+                                    }
+                                } else {
+                                    appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+                                }
+                                continue;
+                            }
+
                             // Show user message in output
                             _ = try buffer.appendNode(null, .user_message, user_input);
 
@@ -428,9 +509,30 @@ pub fn main() !void {
         }
 
         // Redraw after every event
-        compositor.composite(&layout);
-        drawInputLine(&screen, &input_buf, input_len, status_msg);
-        try screen.render(stdout_file);
+        {
+            var composite_span = trace.span("composite");
+            defer composite_span.end();
+            compositor.composite(&layout);
+        }
+        {
+            var draw_input_span = trace.span("draw_input");
+            defer draw_input_span.end();
+            drawInputLine(&screen, &input_buf, input_len, status_msg);
+        }
+        {
+            var render_span = trace.span("render");
+            defer render_span.end();
+            try screen.render(stdout_file);
+        }
+    }
+
+    // Auto-dump trace on exit when metrics are enabled
+    if (trace.enabled) {
+        _ = trace.dump("zag-trace.json") catch |err| blk: {
+            log.warn("auto trace dump failed: {}", .{err});
+            break :blk @as(usize, 0);
+        };
+        log.info("trace written to ./zag-trace.json", .{});
     }
 }
 
@@ -465,6 +567,7 @@ test "imports compile" {
     _ = @import("NodeRenderer.zig");
     _ = @import("Layout.zig");
     _ = @import("Compositor.zig");
+    _ = @import("Metrics.zig");
 }
 
 test "inputAppendChar adds character" {

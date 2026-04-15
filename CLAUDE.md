@@ -5,10 +5,11 @@ Zag is a composable agent development environment built in Zig. The window syste
 
 ## Build & run
 ```bash
-zig build          # build
-zig build run      # run
-zig build test     # run tests
-zig fmt --check .  # check formatting
+zig build                    # build
+zig build run                # run
+zig build test               # run tests
+zig build -Dmetrics=true     # enable performance tracing
+zig fmt --check .            # check formatting
 ```
 
 Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
@@ -116,6 +117,7 @@ src/
   Buffer.zig        structured node tree for content
   NodeRenderer.zig  type-specific node rendering
   Layout.zig        binary tree window system (splits, tabs, focus)
+  Metrics.zig       span-based performance tracing (compile-time toggle)
   Compositor.zig    merges buffer content into screen grid
   Screen.zig        cell grid with dirty-rectangle ANSI renderer
   Terminal.zig      raw mode, alternate screen, input handling
