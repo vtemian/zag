@@ -214,27 +214,16 @@ fn runLoopStreamingInner(
         // Check cancel before each LLM call
         if (cancel.load(.acquire)) return;
 
-        // Use non-streaming call for now. The response arrives all at once,
-        // but the background thread keeps the TUI responsive.
-        // True token-by-token streaming requires fixing the HTTP reader
-        // lifetime issue in StreamingResponse.
-        const response = try provider.call(
+        // Stream the LLM response token by token. The on_event callback
+        // (streamEventToQueue) dupes strings and pushes them to the queue.
+        const response = try provider.callStreaming(
             system_prompt,
             messages.items,
             tool_defs,
             allocator,
+            &streamEventToQueue,
+            cancel,
         );
-
-        // Push the complete response text to the queue
-        for (response.content) |block| {
-            switch (block) {
-                .text => |t| {
-                    const duped = try allocator.dupe(u8, t.text);
-                    try queue.push(.{ .text_delta = duped });
-                },
-                else => {},
-            }
-        }
 
         // Add assistant message
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
