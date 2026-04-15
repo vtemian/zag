@@ -229,7 +229,8 @@ fn runLoopStreamingInner(
         {
             var info_buf: [128]u8 = undefined;
             const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
-            try queue.push(.{ .info = info_msg });
+            const duped_info = try allocator.dupe(u8, info_msg);
+            try queue.push(.{ .info = duped_info });
         }
 
         // Collect tool calls
@@ -255,12 +256,14 @@ fn runLoopStreamingInner(
             if (cancel.load(.acquire)) return;
 
             log.info("executing tool: {s}", .{tc.name});
-            try queue.push(.{ .tool_start = tc.name });
+            const duped_name = try allocator.dupe(u8, tc.name);
+            try queue.push(.{ .tool_start = duped_name });
 
             const result = try registry.execute(tc.name, tc.input_raw, allocator);
 
+            const duped_result = try allocator.dupe(u8, result.content);
             try queue.push(.{ .tool_result = .{
-                .content = result.content,
+                .content = duped_result,
                 .is_error = result.is_error,
             } });
 
