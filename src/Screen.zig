@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.screen);
+const trace = @import("Metrics.zig");
 
 const Screen = @This();
 
@@ -190,76 +191,92 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
 
     const writer = buf.writer(self.allocator);
 
-    // Begin synchronized output
-    try writer.writeAll("\x1b[?2026h");
+    // Diff the current grid against previous and generate ANSI sequences
+    var cells_changed: u32 = 0;
+    {
+        var diff_span = trace.span("diff_generate");
+        defer diff_span.endWithArgs(.{ .cells_changed = cells_changed });
 
-    var cursor_row: u16 = 0;
-    var cursor_col: u16 = 0;
-    var cursor_valid = false;
-    var last_style: ?Style = null;
-    var last_fg: ?Color = null;
-    var last_bg: ?Color = null;
+        // Begin synchronized output
+        try writer.writeAll("\x1b[?2026h");
 
-    for (0..self.height) |row_usize| {
-        const row: u16 = @intCast(row_usize);
-        for (0..self.width) |col_usize| {
-            const col: u16 = @intCast(col_usize);
-            const idx = row_usize * @as(usize, self.width) + col_usize;
+        var cursor_row: u16 = 0;
+        var cursor_col: u16 = 0;
+        var cursor_valid = false;
+        var last_style: ?Style = null;
+        var last_fg: ?Color = null;
+        var last_bg: ?Color = null;
 
-            const cur = self.current[idx];
-            const prev = self.previous[idx];
+        for (0..self.height) |row_usize| {
+            const row: u16 = @intCast(row_usize);
+            for (0..self.width) |col_usize| {
+                const col: u16 = @intCast(col_usize);
+                const idx = row_usize * @as(usize, self.width) + col_usize;
 
-            if (cellsEqual(cur, prev)) continue;
+                const cur = self.current[idx];
+                const prev = self.previous[idx];
 
-            // Move cursor if needed
-            if (!cursor_valid or cursor_row != row or cursor_col != col) {
-                // ANSI cursor positions are 1-indexed
-                try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
-                cursor_row = row;
-                cursor_col = col;
-                cursor_valid = true;
+                if (cellsEqual(cur, prev)) continue;
+                cells_changed += 1;
+
+                // Move cursor if needed
+                if (!cursor_valid or cursor_row != row or cursor_col != col) {
+                    // ANSI cursor positions are 1-indexed
+                    try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
+                    cursor_row = row;
+                    cursor_col = col;
+                    cursor_valid = true;
+                }
+
+                // Emit SGR if style or colors changed
+                if (!stylesEqual(last_style, cur.style) or
+                    !optColorsEqual(last_fg, cur.fg) or
+                    !optColorsEqual(last_bg, cur.bg))
+                {
+                    try writeSgr(writer, cur.style, cur.fg, cur.bg);
+                    last_style = cur.style;
+                    last_fg = cur.fg;
+                    last_bg = cur.bg;
+                }
+
+                // Write the codepoint as UTF-8, falling back to U+FFFD for invalid codepoints
+                var cp_buf: [4]u8 = undefined;
+                const cp_len = std.unicode.utf8Encode(cur.codepoint, &cp_buf) catch |err| blk: {
+                    log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cur.codepoint), err });
+                    // U+FFFD REPLACEMENT CHARACTER (0xEF 0xBF 0xBD)
+                    cp_buf[0] = 0xEF;
+                    cp_buf[1] = 0xBF;
+                    cp_buf[2] = 0xBD;
+                    break :blk 3;
+                };
+                try writer.writeAll(cp_buf[0..cp_len]);
+
+                cursor_col +|= 1;
             }
-
-            // Emit SGR if style or colors changed
-            if (!stylesEqual(last_style, cur.style) or
-                !optColorsEqual(last_fg, cur.fg) or
-                !optColorsEqual(last_bg, cur.bg))
-            {
-                try writeSgr(writer, cur.style, cur.fg, cur.bg);
-                last_style = cur.style;
-                last_fg = cur.fg;
-                last_bg = cur.bg;
-            }
-
-            // Write the codepoint as UTF-8, falling back to U+FFFD for invalid codepoints
-            var cp_buf: [4]u8 = undefined;
-            const cp_len = std.unicode.utf8Encode(cur.codepoint, &cp_buf) catch |err| blk: {
-                log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cur.codepoint), err });
-                // U+FFFD REPLACEMENT CHARACTER (0xEF 0xBF 0xBD)
-                cp_buf[0] = 0xEF;
-                cp_buf[1] = 0xBF;
-                cp_buf[2] = 0xBD;
-                break :blk 3;
-            };
-            try writer.writeAll(cp_buf[0..cp_len]);
-
-            cursor_col +|= 1;
         }
-    }
 
-    // Reset attributes after rendering
-    if (last_style != null or last_fg != null or last_bg != null) {
-        try writer.writeAll("\x1b[0m");
-    }
+        // Reset attributes after rendering
+        if (last_style != null or last_fg != null or last_bg != null) {
+            try writer.writeAll("\x1b[0m");
+        }
 
-    // End synchronized output
-    try writer.writeAll("\x1b[?2026l");
+        // End synchronized output
+        try writer.writeAll("\x1b[?2026l");
+    }
 
     // Single write to stdout
-    try file.writeAll(buf.items);
+    {
+        var write_span = trace.span("write");
+        defer write_span.endWithArgs(.{ .bytes = buf.items.len });
+        try file.writeAll(buf.items);
+    }
 
-    // Copy current → previous
-    @memcpy(self.previous, self.current);
+    // Copy current to previous for next frame's diff
+    {
+        var copy_span = trace.span("copy_frame");
+        defer copy_span.end();
+        @memcpy(self.previous, self.current);
+    }
 }
 
 /// Check if an optional style matches a concrete style.
