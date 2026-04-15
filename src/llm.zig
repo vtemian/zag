@@ -9,6 +9,7 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const anthropic = @import("providers/anthropic.zig");
+pub const openai = @import("providers/openai.zig");
 
 const log = std.log.scoped(.llm);
 
@@ -63,6 +64,69 @@ pub fn call(
     return ap.provider().call(system_prompt, messages, tool_definitions, allocator);
 }
 
+/// Parsed model string components.
+pub const ModelSpec = struct {
+    /// Provider name (e.g., "anthropic", "openai").
+    provider_name: []const u8,
+    /// Model identifier within the provider (e.g., "claude-sonnet-4-20250514").
+    model_id: []const u8,
+};
+
+/// Parse a "provider:model" string. If no colon is present, defaults to "anthropic".
+pub fn parseModelString(model_str: []const u8) ModelSpec {
+    if (std.mem.indexOfScalar(u8, model_str, ':')) |colon| {
+        return .{
+            .provider_name = model_str[0..colon],
+            .model_id = model_str[colon + 1 ..],
+        };
+    }
+    return .{
+        .provider_name = "anthropic",
+        .model_id = model_str,
+    };
+}
+
+/// Result of creating a provider. Holds the allocated state that must be freed.
+pub const ProviderResult = struct {
+    /// The provider interface to pass to agent.runLoop.
+    provider: Provider,
+    /// The allocated provider state. Must be destroyed when done.
+    state: *anyopaque,
+    /// The API key string, owned by this result.
+    api_key: []const u8,
+    /// Allocator used to create the state (for cleanup).
+    allocator: Allocator,
+
+    pub fn deinit(self: *ProviderResult) void {
+        self.allocator.free(self.api_key);
+        self.allocator.destroy(@as(*anthropic.AnthropicProvider, @ptrCast(@alignCast(self.state))));
+    }
+};
+
+/// Create a provider from a model string and environment variables.
+/// Reads API keys from ANTHROPIC_API_KEY based on provider prefix.
+pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResult {
+    const spec = parseModelString(model_str);
+
+    if (std.mem.eql(u8, spec.provider_name, "anthropic")) {
+        const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch
+            return error.MissingApiKey;
+        errdefer allocator.free(api_key);
+
+        const state = try allocator.create(anthropic.AnthropicProvider);
+        state.* = .{ .api_key = api_key, .model = spec.model_id };
+
+        return .{
+            .provider = state.provider(),
+            .state = state,
+            .api_key = api_key,
+            .allocator = allocator,
+        };
+    }
+
+    return error.UnknownProvider;
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test "Provider vtable call dispatches correctly" {
@@ -109,4 +173,28 @@ test "Provider vtable call dispatches correctly" {
 
     try std.testing.expectEqual(@as(u32, 1), test_impl.call_count);
     try std.testing.expectEqualStrings("test", p.vtable.name);
+}
+
+test "parseModelString splits provider and model" {
+    const result = parseModelString("anthropic:claude-sonnet-4-20250514");
+    try std.testing.expectEqualStrings("anthropic", result.provider_name);
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", result.model_id);
+}
+
+test "parseModelString defaults to anthropic when no prefix" {
+    const result = parseModelString("claude-sonnet-4-20250514");
+    try std.testing.expectEqualStrings("anthropic", result.provider_name);
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", result.model_id);
+}
+
+test "parseModelString handles openai prefix" {
+    const result = parseModelString("openai:gpt-4o");
+    try std.testing.expectEqualStrings("openai", result.provider_name);
+    try std.testing.expectEqualStrings("gpt-4o", result.model_id);
+}
+
+test "createProvider returns UnknownProvider for unsupported provider" {
+    const allocator = std.testing.allocator;
+    const result = createProvider("fakeprovider:some-model", allocator);
+    try std.testing.expectError(error.UnknownProvider, result);
 }
