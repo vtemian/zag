@@ -132,20 +132,56 @@ pub fn getCellConst(self: *const Screen, row: u16, col: u16) *const Cell {
     return &self.current[idx];
 }
 
-/// Write a string into the screen grid at (row, col), clipping to screen width.
-/// Returns the column after the last written character.
+/// Write a UTF-8 string into the screen grid at (row, col), clipping to screen width.
+/// Decodes multi-byte UTF-8 sequences into codepoints. Invalid sequences are
+/// replaced with U+FFFD. Returns the column after the last written character.
 pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Style, fg: Color) u16 {
     var c = col;
-    for (text) |byte| {
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    while (iter.nextCodepoint()) |cp| {
         if (c >= self.width) break;
         if (row >= self.height) break;
         const cell = self.getCell(row, c);
-        cell.codepoint = byte;
+        cell.codepoint = cp;
         cell.style = style;
         cell.fg = fg;
         c += 1;
     }
     return c;
+}
+
+/// Write a UTF-8 string with word wrapping within a rect.
+/// Returns the (row, col) position after the last written character.
+pub fn writeStrWrapped(
+    self: *Screen,
+    start_row: u16,
+    start_col: u16,
+    max_row: u16,
+    max_col: u16,
+    text: []const u8,
+    style: Style,
+    fg: Color,
+) struct { row: u16, col: u16 } {
+    var row = start_row;
+    var col = start_col;
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (row >= max_row) break;
+        if (col >= max_col) {
+            // Wrap to next line
+            row += 1;
+            col = start_col;
+            if (row >= max_row) break;
+        }
+        const cell = self.getCell(row, col);
+        cell.codepoint = cp;
+        cell.style = style;
+        cell.fg = fg;
+        col += 1;
+    }
+    return .{ .row = row, .col = col };
 }
 
 /// Fill the current grid with empty (space) cells.
