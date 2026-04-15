@@ -143,11 +143,25 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
     const content_max_col = rect.x + rect.width;
     const content_max_row = rect.y + rect.height;
 
+    // Apply scroll offset: show lines from the end minus scroll_offset
+    const total_lines = lines.items.len;
+    const visible_rows = content_max_row -| content_y;
+    const scroll = buf.scroll_offset;
+
+    const visible_end = if (total_lines > scroll)
+        total_lines - scroll
+    else
+        0;
+    const visible_start = if (visible_end > visible_rows)
+        visible_end - visible_rows
+    else
+        0;
+
     // Write styled lines: iterate spans, applying each span's style
     var cur_row = content_y;
     const default_fg = self.theme.colors.fg;
 
-    for (lines.items) |line| {
+    for (lines.items[visible_start..visible_end]) |line| {
         if (cur_row >= content_max_row) break;
         if (cur_row >= self.screen.height) break;
 
@@ -166,7 +180,6 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
             cur_row = pos.row;
             col = pos.col;
         }
-        // Move to next line after this content
         cur_row += 1;
     }
 }
