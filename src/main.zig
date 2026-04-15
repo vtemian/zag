@@ -619,6 +619,7 @@ test "imports compile" {
     _ = @import("Metrics.zig");
     _ = @import("Theme.zig");
     _ = @import("SseParser.zig");
+    _ = @import("AgentThread.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/openai.zig");
 }
