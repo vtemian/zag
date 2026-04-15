@@ -153,6 +153,19 @@ pub const StyledSpan = struct {
 pub const StyledLine = struct {
     /// Ordered spans composing this line.
     spans: []const StyledSpan,
+
+    /// Concatenate all span texts into a single owned string.
+    pub fn toText(self: StyledLine, allocator: std.mem.Allocator) ![]const u8 {
+        var total_len: usize = 0;
+        for (self.spans) |s| total_len += s.text.len;
+        const buf = try allocator.alloc(u8, total_len);
+        var offset: usize = 0;
+        for (self.spans) |s| {
+            @memcpy(buf[offset .. offset + s.text.len], s.text);
+            offset += s.text.len;
+        }
+        return buf;
+    }
 };
 
 /// Resolved colors and screen style, produced by resolve().

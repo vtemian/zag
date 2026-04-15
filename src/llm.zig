@@ -143,6 +143,40 @@ pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResu
     return error.UnknownProvider;
 }
 
+/// Send a JSON POST request and return the response body.
+/// Both providers share this HTTP plumbing; only the URL and extra headers differ.
+pub fn httpPostJson(
+    url: []const u8,
+    body: []const u8,
+    extra_headers: []const std.http.Header,
+    allocator: Allocator,
+) ![]const u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = std.Uri.parse(url) catch unreachable;
+
+    const result = client.fetch(.{
+        .location = .{ .uri = uri },
+        .method = .POST,
+        .payload = body,
+        .response_writer = &out.writer,
+        .extra_headers = extra_headers,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+        },
+    }) catch return error.ApiError;
+
+    if (result.status != .ok) {
+        out.deinit();
+        return error.ApiError;
+    }
+
+    return out.toOwnedSlice();
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test "Provider vtable call dispatches correctly" {

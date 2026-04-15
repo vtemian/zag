@@ -179,19 +179,6 @@ pub fn clear(self: *Buffer) void {
 
 // -- Tests -------------------------------------------------------------------
 
-/// Concatenate all spans in a StyledLine into a single string (for testing).
-fn concatSpans(allocator: Allocator, line: Theme.StyledLine) ![]const u8 {
-    var total_len: usize = 0;
-    for (line.spans) |span| total_len += span.text.len;
-    const buf = try allocator.alloc(u8, total_len);
-    var offset: usize = 0;
-    for (line.spans) |span| {
-        @memcpy(buf[offset .. offset + span.text.len], span.text);
-        offset += span.text.len;
-    }
-    return buf;
-}
-
 test {
     @import("std").testing.refAllDecls(@This());
 }
@@ -254,9 +241,9 @@ test "getVisibleLines returns rendered lines" {
     try std.testing.expect(lines.items.len >= 2);
 
     // Concatenate spans for comparison
-    const line0 = try concatSpans(allocator, lines.items[0]);
+    const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
-    const line1 = try concatSpans(allocator, lines.items[1]);
+    const line1 = try lines.items[1].toText(allocator);
     defer allocator.free(line1);
 
     try std.testing.expectEqualStrings("> hello", line0);
@@ -280,7 +267,7 @@ test "collapsed nodes hide children" {
 
     // Should have the tool_call line but not the tool_result child
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    const line0 = try concatSpans(allocator, lines.items[0]);
+    const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
     try std.testing.expectEqualStrings("[tool] read", line0);
 }

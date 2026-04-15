@@ -10,6 +10,9 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
 
+/// Maximum characters of tool result content shown in the preview log line.
+const max_tool_preview = 80;
+
 const system_prompt =
     \\You are an expert coding assistant operating inside zag, a coding agent harness.
     \\You help users by reading files, executing commands, editing code, and writing new files.
@@ -137,9 +140,8 @@ pub fn runLoop(
                 emit(.err, result.content);
             } else {
                 const preview = blk: {
-                    const max_preview = 80;
-                    if (result.content.len <= max_preview) break :blk result.content;
-                    break :blk result.content[0..max_preview];
+                    if (result.content.len <= max_tool_preview) break :blk result.content;
+                    break :blk result.content[0..max_tool_preview];
                 };
                 log.info("tool result: {s}...", .{preview});
                 emit(.tool_result, result.content);
@@ -164,6 +166,10 @@ pub fn runLoop(
             .content = try result_blocks.toOwnedSlice(allocator),
         });
     }
+}
+
+test {
+    @import("std").testing.refAllDecls(@This());
 }
 
 test "user message is appended with correct role and content" {
