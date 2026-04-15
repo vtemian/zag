@@ -122,6 +122,7 @@ src/
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   AgentThread.zig   background agent thread with event queue
   Buffer.zig        structured node tree for content
+  MarkdownParser.zig line-by-line markdown to StyledLine converter
   NodeRenderer.zig  type-specific node rendering
   Layout.zig        binary tree window system (splits, tabs, focus)
   Theme.zig         design system (colors, highlights, spacing, borders)

@@ -1,4 +1,4 @@
-//! Agent loop: drives the LLM call → tool execution → repeat cycle.
+//! Agent loop: drives the LLM call -> tool execution -> repeat cycle.
 //! Each turn sends the conversation to Claude, executes any requested tools,
 //! appends results, and loops until the model returns a text-only response.
 

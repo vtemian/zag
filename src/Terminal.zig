@@ -42,7 +42,7 @@ pub fn init() !Terminal {
 
     // 2. Configure raw mode
     var raw = original;
-    // Input flags: disable break signal, CR→NL, parity check, strip, flow control
+    // Input flags: disable break signal, CR->NL, parity check, strip, flow control
     raw.iflag.BRKINT = false;
     raw.iflag.ICRNL = false;
     raw.iflag.INPCK = false;

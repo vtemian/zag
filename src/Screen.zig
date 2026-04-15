@@ -219,7 +219,7 @@ fn colorsEqual(a: Color, b: Color) bool {
 /// Diff the current grid against the previous grid and write minimal ANSI
 /// escape sequences to the provided stdout file.
 ///
-/// **Mutates self**: copies current → previous after writing, so a
+/// **Mutates self**: copies current to previous after writing, so a
 /// subsequent render with no intervening cell changes produces no output.
 pub fn render(self: *Screen, file: std.fs.File) !void {
     var buf: std.ArrayList(u8) = .empty;

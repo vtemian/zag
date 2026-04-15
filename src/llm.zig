@@ -442,6 +442,10 @@ pub const StreamingResponse = struct {
 
 // -- Tests -------------------------------------------------------------------
 
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
 test "Provider vtable call dispatches correctly" {
     const allocator = std.testing.allocator;
 
