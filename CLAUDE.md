@@ -6,13 +6,16 @@ Zag is a composable agent development environment built in Zig. The window syste
 ## Build & run
 ```bash
 zig build                    # build
-zig build run                # run
+zig build run                # run (default: anthropic:claude-sonnet-4-20250514)
 zig build test               # run tests
 zig build -Dmetrics=true     # enable performance tracing
 zig fmt --check .            # check formatting
+
+ZAG_MODEL="openai:gpt-4o" zig build run                       # use OpenAI
+ZAG_MODEL="anthropic:claude-sonnet-4-20250514" zig build run   # use Claude (default)
 ```
 
-Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
+Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` depending on provider.
 
 ## Zig coding standards (learned from Ghostty)
 
@@ -106,13 +109,16 @@ Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
 src/
   main.zig          entry point, TUI event loop
   agent.zig         agent loop (LLM call, tool execution, repeat)
-  llm.zig           Claude API client (HTTP + JSON)
+  llm.zig           provider interface, model string parser, provider factory
   tools.zig         tool registry and dispatch
   tools/
     read.zig        read file contents
     write.zig       create/overwrite files
     edit.zig        exact text replacement
     bash.zig        shell command execution
+  providers/
+    anthropic.zig   Anthropic Messages API provider
+    openai.zig      OpenAI Chat Completions provider
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   Buffer.zig        structured node tree for content
   NodeRenderer.zig  type-specific node rendering
