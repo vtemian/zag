@@ -10,6 +10,7 @@ const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
+const trace = @import("Metrics.zig");
 
 const Compositor = @This();
 
@@ -23,23 +24,39 @@ renderer: *NodeRenderer,
 /// Composite the layout into the screen grid.
 /// Clears the screen, draws tab bar, buffer content, borders, and status line.
 pub fn composite(self: *Compositor, layout: *const Layout) void {
-    self.screen.clear();
+    {
+        var s = trace.span("clear");
+        defer s.end();
+        self.screen.clear();
+    }
 
     const tab_ptr = layout.getActiveTab();
     if (tab_ptr == null) return;
     const tab = tab_ptr.?;
 
-    // Draw tab bar (row 0)
-    self.drawTabBar(layout);
+    {
+        var s = trace.span("tab_bar");
+        defer s.end();
+        self.drawTabBar(layout);
+    }
 
-    // Draw buffer content for each visible leaf
-    self.drawLeaves(tab.root, tab.focused);
+    {
+        var s = trace.span("leaves");
+        defer s.end();
+        self.drawLeaves(tab.root, tab.focused);
+    }
 
-    // Draw borders between splits
-    self.drawBorders(tab.root);
+    {
+        var s = trace.span("borders");
+        defer s.end();
+        self.drawBorders(tab.root);
+    }
 
-    // Draw status line (last row)
-    self.drawStatusLine(tab);
+    {
+        var s = trace.span("status_line");
+        defer s.end();
+        self.drawStatusLine(tab);
+    }
 }
 
 /// Render the tab bar on row 0 with inverse-video styling.
@@ -105,7 +122,12 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
 
     const buf = leaf.buffer;
 
-    var lines = buf.getVisibleLines(self.allocator, self.renderer) catch return;
+    var visible_lines_span = trace.span("get_visible_lines");
+    var lines = buf.getVisibleLines(self.allocator, self.renderer) catch {
+        visible_lines_span.end();
+        return;
+    };
+    visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
     defer {
         for (lines.items) |line| self.allocator.free(line);
         lines.deinit(self.allocator);
@@ -193,6 +215,16 @@ fn drawStatusLine(self: *Compositor, tab: *const Layout.Tab) void {
     var info_buf: [64]u8 = undefined;
     const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
     _ = self.screen.writeStr(last_row, col, info, status_style, .default);
+
+    // When metrics are enabled, show the last frame time right-aligned
+    if (trace.enabled) {
+        const frame_us = trace.getLastFrameTimeUs();
+        const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
+        var time_buf: [16]u8 = undefined;
+        const time_str = std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
+        const time_col = self.screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
+        _ = self.screen.writeStr(last_row, time_col, time_str, status_style, .default);
+    }
 }
 
 // -- Tests -------------------------------------------------------------------
