@@ -27,9 +27,9 @@ pub const SpanEvent = struct {
     args_len: u8 = 0,
 };
 
-const RING_SIZE = 65536;
+const ring_size = 65536;
 
-var ring: [RING_SIZE]SpanEvent = undefined;
+var ring: [ring_size]SpanEvent = undefined;
 var ring_head: u64 = 0;
 
 /// Duration of the last completed frame span in microseconds.
@@ -56,7 +56,7 @@ fn usSinceStart() u64 {
 
 /// Record a completed span event into the ring buffer.
 fn recordEvent(ev: SpanEvent) void {
-    ring[ring_head % RING_SIZE] = ev;
+    ring[ring_head % ring_size] = ev;
     ring_head += 1;
 }
 
@@ -141,10 +141,10 @@ pub inline fn frameEndWithAllocs(allocs: u32, alloc_bytes: u64, cur_peak: u64) v
     // and capture its duration for the status bar.
     if (ring_head > 0) {
         var i: u64 = ring_head;
-        const limit = ring_head -| RING_SIZE;
+        const limit = ring_head -| ring_size;
         while (i > limit) {
             i -= 1;
-            const slot = &ring[i % RING_SIZE];
+            const slot = &ring[i % ring_size];
             const sname = slot.name[0..slot.name_len];
             if (std.mem.eql(u8, sname, "frame")) {
                 last_frame_dur_us = slot.dur_us;
@@ -195,16 +195,16 @@ pub fn getStats() Stats {
     if (!enabled) return zero;
 
     // Collect frame durations from the ring buffer
-    var frame_durs: [RING_SIZE]u64 = undefined;
+    var frame_durs: [ring_size]u64 = undefined;
     var frame_count: usize = 0;
 
-    const events_available = @min(ring_head, RING_SIZE);
+    const events_available = @min(ring_head, ring_size);
     const start_idx = ring_head -| events_available;
 
     for (start_idx..ring_head) |i| {
-        const slot = &ring[i % RING_SIZE];
+        const slot = &ring[i % ring_size];
         const sname = slot.name[0..slot.name_len];
-        if (std.mem.eql(u8, sname, "frame") and frame_count < RING_SIZE) {
+        if (std.mem.eql(u8, sname, "frame") and frame_count < ring_size) {
             frame_durs[frame_count] = slot.dur_us;
             frame_count += 1;
         }
@@ -256,13 +256,13 @@ pub fn dump(path: []const u8) !usize {
 
     try writer.writeAll("{\"traceEvents\":[\n");
 
-    const events_available = @min(ring_head, RING_SIZE);
+    const events_available = @min(ring_head, ring_size);
     const start_idx = ring_head -| events_available;
     var first = true;
     var count: usize = 0;
 
     for (start_idx..ring_head) |i| {
-        const slot = &ring[i % RING_SIZE];
+        const slot = &ring[i % ring_size];
         if (slot.name_len == 0) continue;
 
         if (!first) try writer.writeAll(",\n");
@@ -443,7 +443,7 @@ test "getStats computes correct aggregates" {
     for (0..5) |i| {
         const idx = ring_head;
         ring_head += 1;
-        const slot = &ring[idx % RING_SIZE];
+        const slot = &ring[idx % ring_size];
         slot.* = SpanEvent{};
         const name = "frame";
         @memcpy(slot.name[0..name.len], name);
@@ -537,12 +537,12 @@ test "ring buffer wraps around" {
     init();
     frameStart();
 
-    for (0..RING_SIZE + 10) |_| {
+    for (0..ring_size + 10) |_| {
         var s = span("wrap");
         s.end();
     }
 
-    try std.testing.expectEqual(@as(u64, RING_SIZE + 10), ring_head);
+    try std.testing.expectEqual(@as(u64, ring_size + 10), ring_head);
     // Oldest events overwritten but no crash
     const slot = &ring[0];
     try std.testing.expectEqualStrings("wrap", slot.name[0..slot.name_len]);

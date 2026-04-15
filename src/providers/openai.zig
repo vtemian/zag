@@ -7,7 +7,8 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
-const Provider = @import("../llm.zig").Provider;
+const llm = @import("../llm.zig");
+const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.openai);
@@ -46,7 +47,13 @@ pub const OpenAiProvider = struct {
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        const response_bytes = try httpPost(body, self.api_key, self.base_url, allocator);
+        // Build the Authorization header value: "Bearer {key}"
+        const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
+        defer allocator.free(auth_value);
+
+        const response_bytes = try llm.httpPostJson(self.base_url, body, &.{
+            .{ .name = "Authorization", .value = auth_value },
+        }, allocator);
         defer allocator.free(response_bytes);
 
         return parseResponse(response_bytes, allocator);
@@ -234,40 +241,6 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
     try w.writeAll("}");
 }
 
-/// Sends the JSON body as an HTTP POST to the OpenAI-compatible endpoint.
-fn httpPost(body: []const u8, api_key: []const u8, base_url: []const u8, allocator: Allocator) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
-
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const uri = std.Uri.parse(base_url) catch unreachable;
-
-    // Build the Authorization header value: "Bearer {key}"
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_value);
-
-    const result = client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = .POST,
-        .payload = body,
-        .response_writer = &out.writer,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_value },
-        },
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-        },
-    }) catch return error.ApiError;
-
-    if (result.status != .ok) {
-        out.deinit();
-        return error.ApiError;
-    }
-
-    return out.toOwnedSlice();
-}
-
 /// Parses a raw JSON response from OpenAI's Chat Completions API into a typed LlmResponse.
 /// Allocates content block strings that the caller must free.
 fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmResponse {
@@ -308,17 +281,7 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
 
     var blocks: std.ArrayList(types.ContentBlock) = .empty;
     errdefer {
-        for (blocks.items) |block| {
-            switch (block) {
-                .text => |t| allocator.free(t.text),
-                .tool_use => |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input_raw);
-                },
-                .tool_result => {},
-            }
-        }
+        for (blocks.items) |block| block.freeOwned(allocator);
         blocks.deinit(allocator);
     }
 

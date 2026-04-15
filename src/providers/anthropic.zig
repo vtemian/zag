@@ -5,7 +5,8 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
-const Provider = @import("../llm.zig").Provider;
+const llm = @import("../llm.zig");
+const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.anthropic);
@@ -43,7 +44,10 @@ pub const AnthropicProvider = struct {
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        const response_bytes = try httpPost(body, self.api_key, allocator);
+        const response_bytes = try llm.httpPostJson(api_url, body, &.{
+            .{ .name = "x-api-key", .value = self.api_key },
+            .{ .name = "anthropic-version", .value = api_version },
+        }, allocator);
         defer allocator.free(response_bytes);
 
         return parseResponse(response_bytes, allocator);
@@ -129,37 +133,6 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
     try w.writeAll("]}");
 }
 
-/// Sends the JSON body as an HTTP POST to the Anthropic API endpoint.
-fn httpPost(body: []const u8, api_key: []const u8, allocator: Allocator) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
-
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const uri = std.Uri.parse(api_url) catch unreachable;
-
-    const result = client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = .POST,
-        .payload = body,
-        .response_writer = &out.writer,
-        .extra_headers = &.{
-            .{ .name = "x-api-key", .value = api_key },
-            .{ .name = "anthropic-version", .value = api_version },
-        },
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-        },
-    }) catch return error.ApiError;
-
-    if (result.status != .ok) {
-        out.deinit();
-        return error.ApiError;
-    }
-
-    return out.toOwnedSlice();
-}
-
 /// Parses a raw JSON response from the Anthropic API into a typed LlmResponse.
 /// Allocates content block strings (text, id, name, input_raw) that the caller must free.
 pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmResponse {
@@ -191,17 +164,7 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     const content_array = root.get("content").?.array;
     var blocks: std.ArrayList(types.ContentBlock) = .empty;
     errdefer {
-        for (blocks.items) |block| {
-            switch (block) {
-                .text => |t| allocator.free(t.text),
-                .tool_use => |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input_raw);
-                },
-                .tool_result => {},
-            }
-        }
+        for (blocks.items) |block| block.freeOwned(allocator);
         blocks.deinit(allocator);
     }
 
@@ -242,6 +205,10 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
 }
 
 // -- Tests -------------------------------------------------------------------
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
 
 test "parseResponse parses text-only response" {
     const allocator = std.testing.allocator;

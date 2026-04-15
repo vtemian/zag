@@ -253,19 +253,6 @@ pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: Allocator) 
     lines.deinit(allocator);
 }
 
-/// Concatenate all spans in a StyledLine into a single string (for testing).
-fn styledLineText(line: StyledLine, allocator: Allocator) ![]const u8 {
-    var total_len: usize = 0;
-    for (line.spans) |span| total_len += span.text.len;
-    const buf = try allocator.alloc(u8, total_len);
-    var offset: usize = 0;
-    for (line.spans) |span| {
-        @memcpy(buf[offset .. offset + span.text.len], span.text);
-        offset += span.text.len;
-    }
-    return buf;
-}
-
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -293,7 +280,7 @@ test "renderDefault user_message" {
     try renderDefault(&node, &lines, allocator, &theme);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("> hello", text);
 }
@@ -347,7 +334,7 @@ test "renderDefault assistant_text" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("I can help with that", text);
     // assistant_text should have one span
@@ -374,7 +361,7 @@ test "renderDefault tool_call" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("[tool] bash", text);
 
@@ -406,7 +393,7 @@ test "renderDefault tool_result shows full content" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
 
     // indent (2) + full 120 chars = 122
@@ -437,7 +424,7 @@ test "renderDefault tool_result short content not truncated" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("  ok", text);
 }
@@ -462,7 +449,7 @@ test "renderDefault err" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("error: something failed", text);
 
@@ -490,7 +477,7 @@ test "renderDefault separator" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("---", text);
     // Separator uses status style (dim)
@@ -517,7 +504,7 @@ test "renderDefault status" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("tokens: 1500 in, 200 out", text);
     try std.testing.expect(lines.items[0].spans[0].style.dim);
@@ -543,7 +530,7 @@ test "renderDefault custom" {
 
     try renderDefault(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("plugin output", text);
 }
@@ -569,11 +556,11 @@ test "renderDefault multiline assistant_text" {
     try renderDefault(&node, &lines, allocator, &theme);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
 
-    const t1 = try styledLineText(lines.items[0], allocator);
+    const t1 = try lines.items[0].toText(allocator);
     defer allocator.free(t1);
-    const t2 = try styledLineText(lines.items[1], allocator);
+    const t2 = try lines.items[1].toText(allocator);
     defer allocator.free(t2);
-    const t3 = try styledLineText(lines.items[2], allocator);
+    const t3 = try lines.items[2].toText(allocator);
     defer allocator.free(t3);
 
     try std.testing.expectEqualStrings("line one", t1);
@@ -623,7 +610,7 @@ test "custom override replaces default renderer" {
 
     try renderer.render(&node, &lines, allocator, &theme);
 
-    const text = try styledLineText(lines.items[0], allocator);
+    const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("CUSTOM RENDERED", text);
 }

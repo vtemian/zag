@@ -41,6 +41,22 @@ pub const ContentBlock = union(enum) {
         input_raw: []const u8,
     };
 
+    /// Free all owned strings inside this content block.
+    pub fn freeOwned(self: ContentBlock, allocator: Allocator) void {
+        switch (self) {
+            .text => |t| allocator.free(t.text),
+            .tool_use => |tu| {
+                allocator.free(tu.id);
+                allocator.free(tu.name);
+                allocator.free(tu.input_raw);
+            },
+            .tool_result => |tr| {
+                allocator.free(tr.tool_use_id);
+                allocator.free(tr.content);
+            },
+        }
+    }
+
     /// The result of a tool execution, returned to the LLM.
     pub const ToolResultBlock = struct {
         /// The id of the ToolUse this result corresponds to.
@@ -62,20 +78,7 @@ pub const Message = struct {
     /// Free all owned strings inside this message's content blocks,
     /// then free the content slice itself.
     pub fn deinit(self: Message, allocator: Allocator) void {
-        for (self.content) |block| {
-            switch (block) {
-                .text => |t| allocator.free(t.text),
-                .tool_use => |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input_raw);
-                },
-                .tool_result => |tr| {
-                    allocator.free(tr.tool_use_id);
-                    allocator.free(tr.content);
-                },
-            }
-        }
+        for (self.content) |block| block.freeOwned(allocator);
         allocator.free(self.content);
     }
 };
@@ -139,17 +142,7 @@ pub const LlmResponse = struct {
 
     /// Free all owned allocations within content blocks, then the slice itself.
     pub fn deinit(self: LlmResponse, allocator: Allocator) void {
-        for (self.content) |block| {
-            switch (block) {
-                .text => |t| allocator.free(t.text),
-                .tool_use => |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input_raw);
-                },
-                .tool_result => {},
-            }
-        }
+        for (self.content) |block| block.freeOwned(allocator);
         allocator.free(self.content);
     }
 };
