@@ -387,19 +387,14 @@ fn parseSseStream(
         tool_calls.deinit(allocator);
     }
 
-    // Read SSE lines incrementally from the network
-    while (true) {
-        if (cancel.load(.acquire)) break;
+    var event_buf: [128]u8 = undefined;
+    var data_buf: std.ArrayList(u8) = .empty;
+    defer data_buf.deinit(allocator);
 
-        const maybe_line = try stream.readLine();
-        const line = maybe_line orelse break;
+    while (try stream.nextSseEvent(cancel, &event_buf, &data_buf)) |sse| {
+        if (std.mem.eql(u8, sse.data, "[DONE]")) break;
 
-        if (!std.mem.startsWith(u8, line, "data: ")) continue;
-        const data = line["data: ".len..];
-
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, sse.data, .{}) catch continue;
         defer parsed.deinit();
         const obj = parsed.value.object;
 
