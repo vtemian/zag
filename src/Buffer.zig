@@ -61,6 +61,8 @@ root_children: std.ArrayList(*Node),
 next_id: u32,
 /// Allocator used for all buffer and node allocations.
 allocator: Allocator,
+/// Scroll offset from the bottom (0 = scrolled to latest content).
+scroll_offset: u32 = 0,
 
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {

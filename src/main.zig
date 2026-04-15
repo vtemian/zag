@@ -581,8 +581,23 @@ pub fn main() !void {
                                     input_len = inputAppendChar(&input_buf, input_len, @intCast(ch));
                                 }
                             },
-                            .page_up, .page_down => {
-                                // Scrolling is now per-buffer via the compositor; no-op for now
+                            .page_up => {
+                                const leaf = layout.getFocusedLeaf();
+                                if (leaf) |l| {
+                                    const half_page = l.rect.height / 2;
+                                    l.buffer.scroll_offset +|= if (half_page > 0) half_page else 1;
+                                }
+                            },
+                            .page_down => {
+                                const leaf = layout.getFocusedLeaf();
+                                if (leaf) |l| {
+                                    const half_page = l.rect.height / 2;
+                                    if (l.buffer.scroll_offset > half_page) {
+                                        l.buffer.scroll_offset -= half_page;
+                                    } else {
+                                        l.buffer.scroll_offset = 0;
+                                    }
+                                }
                             },
                             else => {},
                         }
@@ -603,6 +618,9 @@ pub fn main() !void {
             const count = event_queue.drain(&event_buf);
 
             for (event_buf[0..count]) |agent_event| {
+                // Auto-scroll to bottom when new content arrives
+                buffer.scroll_offset = 0;
+
                 switch (agent_event) {
                     .text_delta => |text| {
                         defer allocator.free(text);
