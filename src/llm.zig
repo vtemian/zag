@@ -12,6 +12,22 @@ pub const openai = @import("providers/openai.zig");
 
 const log = std.log.scoped(.llm);
 
+/// Streaming event emitted by call_streaming for incremental response delivery.
+/// Defined here (rather than in AgentThread) so the provider VTable can reference
+/// it without creating a circular dependency.
+pub const StreamEvent = union(enum) {
+    /// Partial text from the LLM response.
+    text_delta: []const u8,
+    /// A tool call was started by the LLM (content is the tool name).
+    tool_start: []const u8,
+    /// Informational message (token counts, etc.).
+    info: []const u8,
+    /// Agent loop completed successfully.
+    done,
+    /// An error occurred.
+    err: []const u8,
+};
+
 /// Runtime-polymorphic LLM provider interface.
 /// Uses the ptr + vtable pattern (same as std.mem.Allocator).
 /// Each provider implements call() for its specific API format.
@@ -30,6 +46,20 @@ pub const Provider = struct {
             tool_definitions: []const types.ToolDefinition,
             allocator: Allocator,
         ) anyerror!types.LlmResponse,
+
+        /// Streaming variant: calls on_event for each SSE event.
+        /// Assembles and returns the final LlmResponse when stream ends.
+        /// Checks cancel flag periodically; returns partial response if cancelled.
+        call_streaming: *const fn (
+            ptr: *anyopaque,
+            system_prompt: []const u8,
+            messages: []const types.Message,
+            tool_definitions: []const types.ToolDefinition,
+            allocator: Allocator,
+            on_event: *const fn (event: StreamEvent) void,
+            cancel: *std.atomic.Value(bool),
+        ) anyerror!types.LlmResponse,
+
         /// Human-readable provider name (for logging and display).
         name: []const u8,
     };
@@ -43,6 +73,20 @@ pub const Provider = struct {
         allocator: Allocator,
     ) !types.LlmResponse {
         return self.vtable.call(self.ptr, system_prompt, messages, tool_definitions, allocator);
+    }
+
+    /// Streaming variant: sends a conversation and calls on_event for each incremental event.
+    /// Returns the fully assembled LlmResponse when the stream completes or is cancelled.
+    pub fn callStreaming(
+        self: Provider,
+        system_prompt: []const u8,
+        messages: []const types.Message,
+        tool_definitions: []const types.ToolDefinition,
+        allocator: Allocator,
+        on_event: *const fn (event: StreamEvent) void,
+        cancel: *std.atomic.Value(bool),
+    ) !types.LlmResponse {
+        return self.vtable.call_streaming(self.ptr, system_prompt, messages, tool_definitions, allocator, on_event, cancel);
     }
 };
 
@@ -187,6 +231,7 @@ test "Provider vtable call dispatches correctly" {
 
         const vtable: Provider.VTable = .{
             .call = callImpl,
+            .call_streaming = callStreamingImpl,
             .name = "test",
         };
 
@@ -210,6 +255,18 @@ test "Provider vtable call dispatches correctly" {
             };
         }
 
+        fn callStreamingImpl(
+            ptr: *anyopaque,
+            system_prompt: []const u8,
+            messages: []const types.Message,
+            tool_definitions: []const types.ToolDefinition,
+            alloc: Allocator,
+            _: *const fn (event: StreamEvent) void,
+            _: *std.atomic.Value(bool),
+        ) anyerror!types.LlmResponse {
+            return callImpl(ptr, system_prompt, messages, tool_definitions, alloc);
+        }
+
         fn provider(self: *@This()) Provider {
             return .{ .ptr = self, .vtable = &vtable };
         }
@@ -223,6 +280,77 @@ test "Provider vtable call dispatches correctly" {
 
     try std.testing.expectEqual(@as(u32, 1), test_impl.call_count);
     try std.testing.expectEqualStrings("test", p.vtable.name);
+}
+
+test "Provider callStreaming dispatches to vtable" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        var event_count: u32 = 0;
+        fn onEvent(_: StreamEvent) void {
+            event_count += 1;
+        }
+    };
+    Ctx.event_count = 0;
+
+    const TestStreamProvider = struct {
+        stream_count: u32 = 0,
+
+        const vtable: Provider.VTable = .{
+            .call = callImplUnused,
+            .call_streaming = callStreamingImpl,
+            .name = "test_stream",
+        };
+
+        fn callImplUnused(
+            _: *anyopaque,
+            _: []const u8,
+            _: []const types.Message,
+            _: []const types.ToolDefinition,
+            _: Allocator,
+        ) anyerror!types.LlmResponse {
+            unreachable;
+        }
+
+        fn callStreamingImpl(
+            ptr: *anyopaque,
+            _: []const u8,
+            _: []const types.Message,
+            _: []const types.ToolDefinition,
+            alloc: Allocator,
+            on_event: *const fn (event: StreamEvent) void,
+            _: *std.atomic.Value(bool),
+        ) anyerror!types.LlmResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_count += 1;
+            on_event(.{ .text_delta = "hello" });
+            on_event(.done);
+            const content = try alloc.alloc(types.ContentBlock, 1);
+            const text = try alloc.dupe(u8, "hello");
+            content[0] = .{ .text = .{ .text = text } };
+            return .{
+                .content = content,
+                .stop_reason = .end_turn,
+                .input_tokens = 5,
+                .output_tokens = 1,
+            };
+        }
+
+        fn provider(self: *@This()) Provider {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+    };
+
+    var test_impl: TestStreamProvider = .{};
+    const p = test_impl.provider();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const response = try p.callStreaming("system", &.{}, &.{}, allocator, &Ctx.onEvent, &cancel);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), test_impl.stream_count);
+    try std.testing.expectEqual(@as(u32, 2), Ctx.event_count);
+    try std.testing.expectEqualStrings("test_stream", p.vtable.name);
 }
 
 test "parseModelString splits provider and model" {

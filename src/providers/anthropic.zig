@@ -24,6 +24,7 @@ pub const AnthropicProvider = struct {
 
     const vtable: Provider.VTable = .{
         .call = callImpl,
+        .call_streaming = callStreamingImpl,
         .name = "anthropic",
     };
 
@@ -52,6 +53,32 @@ pub const AnthropicProvider = struct {
 
         return parseResponse(response_bytes, allocator);
     }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        system_prompt: []const u8,
+        messages: []const types.Message,
+        tool_definitions: []const types.ToolDefinition,
+        allocator: Allocator,
+        on_event: *const fn (event: llm.StreamEvent) void,
+        cancel: *std.atomic.Value(bool),
+    ) anyerror!types.LlmResponse {
+        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+
+        const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
+        defer allocator.free(body);
+
+        // Fetch the complete SSE response body, then parse events from it.
+        // True incremental streaming requires deeper integration with the
+        // Zig 0.15 HTTP client's reader API (future improvement).
+        const response_bytes = try llm.httpPostJson(api_url, body, &.{
+            .{ .name = "x-api-key", .value = self.api_key },
+            .{ .name = "anthropic-version", .value = api_version },
+        }, allocator);
+        defer allocator.free(response_bytes);
+
+        return parseSseResponse(response_bytes, allocator, on_event, cancel);
+    }
 };
 
 /// Serializes the system prompt, messages, and tool definitions into a JSON
@@ -63,6 +90,28 @@ pub fn buildRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
+    return buildRequestBodyInner(model, system_prompt, messages, tool_definitions, false, allocator);
+}
+
+/// Same as buildRequestBody but with "stream": true.
+pub fn buildStreamingRequestBody(
+    model: []const u8,
+    system_prompt: []const u8,
+    messages: []const types.Message,
+    tool_definitions: []const types.ToolDefinition,
+    allocator: Allocator,
+) ![]const u8 {
+    return buildRequestBodyInner(model, system_prompt, messages, tool_definitions, true, allocator);
+}
+
+fn buildRequestBodyInner(
+    model: []const u8,
+    system_prompt: []const u8,
+    messages: []const types.Message,
+    tool_definitions: []const types.ToolDefinition,
+    stream: bool,
+    allocator: Allocator,
+) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
     const w = &out.writer;
 
@@ -71,6 +120,11 @@ pub fn buildRequestBody(
     // model
     try w.print("\"model\":\"{s}\",", .{model});
     try w.print("\"max_tokens\":{d},", .{default_max_tokens});
+
+    // stream
+    if (stream) {
+        try w.writeAll("\"stream\":true,");
+    }
 
     // system
     try w.writeAll("\"system\":");
@@ -204,6 +258,220 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     };
 }
 
+/// State for accumulating a single content block during streaming.
+const StreamingBlock = struct {
+    block_type: enum { text, tool_use },
+    /// Accumulated text for text blocks or tool input JSON for tool_use blocks.
+    content: std.ArrayList(u8),
+    /// Tool use ID (only for tool_use blocks).
+    tool_id: []const u8,
+    /// Tool name (only for tool_use blocks).
+    tool_name: []const u8,
+
+    fn deinit(self: *StreamingBlock, alloc: Allocator) void {
+        self.content.deinit(alloc);
+        if (self.tool_id.len > 0) alloc.free(self.tool_id);
+        if (self.tool_name.len > 0) alloc.free(self.tool_name);
+    }
+};
+
+/// Parse SSE events from a complete response body (fetched in one go).
+/// Calls on_event for each event, then assembles the final LlmResponse.
+fn parseSseResponse(
+    response_bytes: []const u8,
+    allocator: Allocator,
+    on_event: *const fn (event: llm.StreamEvent) void,
+    cancel: *std.atomic.Value(bool),
+) !types.LlmResponse {
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    // SSE parsing: walk through lines
+    var current_event_type: [128]u8 = undefined;
+    var current_event_len: usize = 0;
+    var current_data: std.ArrayList(u8) = .empty;
+    defer current_data.deinit(allocator);
+
+    var line_start: usize = 0;
+    for (response_bytes, 0..) |byte, i| {
+        if (byte == '\n') {
+            const line = blk: {
+                var end = i;
+                if (end > line_start and response_bytes[end - 1] == '\r') end -= 1;
+                break :blk response_bytes[line_start..end];
+            };
+            line_start = i + 1;
+
+            if (cancel.load(.acquire)) break;
+
+            if (line.len == 0) {
+                // Blank line = dispatch event
+                if (current_data.items.len > 0) {
+                    try processSseEvent(
+                        current_event_type[0..current_event_len],
+                        current_data.items,
+                        allocator,
+                        &blocks,
+                        &stop_reason,
+                        &input_tokens,
+                        &output_tokens,
+                        on_event,
+                    );
+                }
+                current_event_len = 0;
+                current_data.clearRetainingCapacity();
+            } else if (std.mem.startsWith(u8, line, "event: ")) {
+                const val = line["event: ".len..];
+                const copy_len = @min(val.len, current_event_type.len);
+                @memcpy(current_event_type[0..copy_len], val[0..copy_len]);
+                current_event_len = copy_len;
+            } else if (std.mem.startsWith(u8, line, "data: ")) {
+                const val = line["data: ".len..];
+                try current_data.appendSlice(allocator, val);
+            }
+        }
+    }
+
+    // Assemble final LlmResponse
+    var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+    errdefer {
+        for (result_blocks.items) |block| block.freeOwned(allocator);
+        result_blocks.deinit(allocator);
+    }
+
+    for (blocks.items) |*b| {
+        switch (b.block_type) {
+            .text => {
+                const text = try allocator.dupe(u8, b.content.items);
+                errdefer allocator.free(text);
+                try result_blocks.append(allocator, .{ .text = .{ .text = text } });
+            },
+            .tool_use => {
+                const id = try allocator.dupe(u8, b.tool_id);
+                errdefer allocator.free(id);
+                const name = try allocator.dupe(u8, b.tool_name);
+                errdefer allocator.free(name);
+                const input_raw = try allocator.dupe(u8, b.content.items);
+                errdefer allocator.free(input_raw);
+                try result_blocks.append(allocator, .{ .tool_use = .{
+                    .id = id,
+                    .name = name,
+                    .input_raw = input_raw,
+                } });
+            },
+        }
+    }
+
+    return .{
+        .content = try result_blocks.toOwnedSlice(allocator),
+        .stop_reason = stop_reason,
+        .input_tokens = input_tokens,
+        .output_tokens = output_tokens,
+    };
+}
+
+/// Process a single dispatched SSE event by parsing its JSON data.
+pub fn processSseEvent(
+    event_type: []const u8,
+    data: []const u8,
+    allocator: Allocator,
+    blocks: *std.ArrayList(StreamingBlock),
+    stop_reason: *types.StopReason,
+    input_tokens: *u32,
+    output_tokens: *u32,
+    on_event: *const fn (event: llm.StreamEvent) void,
+) !void {
+    if (std.mem.eql(u8, event_type, "ping")) return;
+    if (std.mem.eql(u8, event_type, "message_stop")) return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| {
+        log.warn("SSE JSON parse error: {}", .{err});
+        return;
+    };
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    if (std.mem.eql(u8, event_type, "message_start")) {
+        if (obj.get("message")) |msg| {
+            if (msg.object.get("usage")) |usage_val| {
+                const usage = usage_val.object;
+                if (usage.get("input_tokens")) |it| input_tokens.* = @intCast(it.integer);
+                if (usage.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
+            }
+        }
+    } else if (std.mem.eql(u8, event_type, "content_block_start")) {
+        if (obj.get("content_block")) |cb| {
+            const cb_obj = cb.object;
+            const block_type_str = cb_obj.get("type").?.string;
+
+            if (std.mem.eql(u8, block_type_str, "text")) {
+                try blocks.append(allocator, .{
+                    .block_type = .text,
+                    .content = .empty,
+                    .tool_id = "",
+                    .tool_name = "",
+                });
+            } else if (std.mem.eql(u8, block_type_str, "tool_use")) {
+                const id = try allocator.dupe(u8, cb_obj.get("id").?.string);
+                errdefer allocator.free(id);
+                const name = try allocator.dupe(u8, cb_obj.get("name").?.string);
+                errdefer allocator.free(name);
+
+                on_event(.{ .tool_start = name });
+
+                try blocks.append(allocator, .{
+                    .block_type = .tool_use,
+                    .content = .empty,
+                    .tool_id = id,
+                    .tool_name = name,
+                });
+            }
+        }
+    } else if (std.mem.eql(u8, event_type, "content_block_delta")) {
+        if (obj.get("delta")) |delta| {
+            const delta_obj = delta.object;
+            const delta_type = delta_obj.get("type").?.string;
+
+            if (std.mem.eql(u8, delta_type, "text_delta")) {
+                const text = delta_obj.get("text").?.string;
+                if (blocks.items.len > 0) {
+                    const current = &blocks.items[blocks.items.len - 1];
+                    try current.content.appendSlice(allocator, text);
+                }
+                on_event(.{ .text_delta = text });
+            } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
+                const partial = delta_obj.get("partial_json").?.string;
+                if (blocks.items.len > 0) {
+                    const current = &blocks.items[blocks.items.len - 1];
+                    try current.content.appendSlice(allocator, partial);
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, event_type, "message_delta")) {
+        if (obj.get("delta")) |delta| {
+            if (delta.object.get("stop_reason")) |sr| {
+                if (std.mem.eql(u8, sr.string, "end_turn"))
+                    stop_reason.* = .end_turn
+                else if (std.mem.eql(u8, sr.string, "tool_use"))
+                    stop_reason.* = .tool_use
+                else if (std.mem.eql(u8, sr.string, "max_tokens"))
+                    stop_reason.* = .max_tokens;
+            }
+        }
+        if (obj.get("usage")) |usage_val| {
+            const usage = usage_val.object;
+            if (usage.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
+        }
+    }
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -274,7 +542,6 @@ test "parseResponse parses tool_use response" {
         .tool_use => |tu| {
             try std.testing.expectEqualStrings("toolu_abc", tu.id);
             try std.testing.expectEqualStrings("read", tu.name);
-            // Verify the input_raw contains the path
             try std.testing.expect(std.mem.indexOf(u8, tu.input_raw, "/tmp/test.txt") != null);
         },
         else => return error.TestUnexpectedResult,
@@ -299,7 +566,6 @@ test "writeMessage serializes tool_use content block" {
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
-    // Verify it's valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
@@ -457,19 +723,17 @@ test "buildRequestBody produces valid JSON" {
     const body = try buildRequestBody(model, "You are a helper.", &messages, &tool_defs, allocator);
     defer allocator.free(body);
 
-    // Verify the body is valid JSON by parsing it
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
     const root = parsed.value.object;
     try std.testing.expectEqualStrings(model, root.get("model").?.string);
     try std.testing.expectEqual(@as(i64, default_max_tokens), root.get("max_tokens").?.integer);
+    try std.testing.expect(root.get("stream") == null);
 
-    // Verify messages array exists with one entry
     const msgs = root.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 1), msgs.items.len);
 
-    // Verify tools array exists with one entry
     const tools = root.get("tools").?.array;
     try std.testing.expectEqual(@as(usize, 1), tools.items.len);
     try std.testing.expectEqualStrings("read", tools.items[0].object.get("name").?.string);
@@ -495,4 +759,169 @@ test "buildRequestBody uses provided model string" {
 
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("claude-opus-4-20250514", root.get("model").?.string);
+}
+
+test "buildStreamingRequestBody includes stream:true" {
+    const allocator = std.testing.allocator;
+
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBody("claude-sonnet-4-20250514", "system", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("stream").?.bool == true);
+}
+
+test "processSseEvent handles text_delta" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    try blocks.append(allocator, .{
+        .block_type = .text,
+        .content = .empty,
+        .tool_id = "",
+        .tool_name = "",
+    });
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    const Ctx = struct {
+        var text_delta_count: u32 = 0;
+        fn onEvent(event: llm.StreamEvent) void {
+            switch (event) {
+                .text_delta => text_delta_count += 1,
+                else => {},
+            }
+        }
+    };
+    Ctx.text_delta_count = 0;
+
+    const data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}";
+    try processSseEvent("content_block_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &Ctx.onEvent);
+
+    try std.testing.expectEqualStrings("Hello", blocks.items[0].content.items);
+    try std.testing.expectEqual(@as(u32, 1), Ctx.text_delta_count);
+}
+
+test "processSseEvent handles content_block_start for tool_use" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    const Ctx = struct {
+        var tool_start_count: u32 = 0;
+        fn onEvent(event: llm.StreamEvent) void {
+            switch (event) {
+                .tool_start => tool_start_count += 1,
+                else => {},
+            }
+        }
+    };
+    Ctx.tool_start_count = 0;
+
+    const data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"bash\",\"input\":{}}}";
+    try processSseEvent("content_block_start", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &Ctx.onEvent);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expectEqualStrings("toolu_123", blocks.items[0].tool_id);
+    try std.testing.expectEqualStrings("bash", blocks.items[0].tool_name);
+    try std.testing.expectEqual(@as(u32, 1), Ctx.tool_start_count);
+}
+
+test "processSseEvent handles message_delta with stop_reason" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer blocks.deinit(allocator);
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    const Ctx = struct {
+        fn onEvent(_: llm.StreamEvent) void {}
+    };
+
+    const data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":42}}";
+    try processSseEvent("message_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &Ctx.onEvent);
+
+    try std.testing.expectEqual(.tool_use, stop_reason);
+    try std.testing.expectEqual(@as(u32, 42), output_tokens);
+}
+
+test "processSseEvent skips ping events" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer blocks.deinit(allocator);
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    const Ctx = struct {
+        var called: bool = false;
+        fn onEvent(_: llm.StreamEvent) void {
+            called = true;
+        }
+    };
+    Ctx.called = false;
+
+    try processSseEvent("ping", "{}", allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &Ctx.onEvent);
+
+    try std.testing.expect(!Ctx.called);
+}
+
+test "processSseEvent accumulates input_json_delta for tool use" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    const id = try allocator.dupe(u8, "toolu_456");
+    const name = try allocator.dupe(u8, "read");
+    try blocks.append(allocator, .{
+        .block_type = .tool_use,
+        .content = .empty,
+        .tool_id = id,
+        .tool_name = name,
+    });
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    const Ctx = struct {
+        fn onEvent(_: llm.StreamEvent) void {}
+    };
+
+    const data1 = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pa\"}}";
+    try processSseEvent("content_block_delta", data1, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &Ctx.onEvent);
+
+    const data2 = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"th\\\":\\\"foo\\\"}\"}}";
+    try processSseEvent("content_block_delta", data2, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &Ctx.onEvent);
+
+    try std.testing.expectEqualStrings("{\"path\":\"foo\"}", blocks.items[0].content.items);
 }
