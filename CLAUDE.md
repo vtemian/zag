@@ -103,19 +103,23 @@ Requires: Zig 0.15+, `ANTHROPIC_API_KEY` env var for LLM calls.
 ## Architecture
 ```
 src/
-  main.zig      — entry point, stdin loop
-  agent.zig     — agent loop (LLM call → tool execution → repeat)
-  llm.zig       — Claude API client (HTTP + JSON)
-  tools.zig     — tool registry and dispatch
+  main.zig          entry point, TUI event loop
+  agent.zig         agent loop (LLM call, tool execution, repeat)
+  llm.zig           Claude API client (HTTP + JSON)
+  tools.zig         tool registry and dispatch
   tools/
-    read.zig    — read file contents
-    write.zig   — create/overwrite files
-    edit.zig    — exact text replacement
-    bash.zig    — shell command execution
-  types.zig     — Message, ContentBlock, ToolCall, ToolResult
-  Terminal.zig  — terminal control and raw mode handling
-  input.zig     — input event parsing and key mapping
-  Screen.zig    — screen buffer and rendering
+    read.zig        read file contents
+    write.zig       create/overwrite files
+    edit.zig        exact text replacement
+    bash.zig        shell command execution
+  types.zig         Message, ContentBlock, ToolCall, ToolResult
+  Buffer.zig        structured node tree for content
+  NodeRenderer.zig  type-specific node rendering
+  Layout.zig        binary tree window system (splits, tabs, focus)
+  Compositor.zig    merges buffer content into screen grid
+  Screen.zig        cell grid with dirty-rectangle ANSI renderer
+  Terminal.zig      raw mode, alternate screen, input handling
+  input.zig         keyboard and mouse event parsing
 ```
 
 ## Commit messages

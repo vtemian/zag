@@ -113,18 +113,6 @@ fn appendOutputText(text: []const u8) !void {
 // TUI rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Fill an entire row with a given character, style, fg, and bg.
-fn fillRow(screen: *Screen, row: u16, codepoint: u21, style: Screen.Style, fg: Screen.Color, bg: Screen.Color) void {
-    for (0..screen.width) |col_usize| {
-        const col: u16 = @intCast(col_usize);
-        const cell = screen.getCell(row, col);
-        cell.codepoint = codepoint;
-        cell.style = style;
-        cell.fg = fg;
-        cell.bg = bg;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Input buffer helpers (tested below)
 // ---------------------------------------------------------------------------
@@ -326,7 +314,9 @@ pub fn main() !void {
                                         log.warn("split failed: {}", .{err});
                                     };
                                     layout.recalculate(screen.width, screen.height);
-                                } else |_| {}
+                                } else |err| {
+                                    log.warn("split buffer creation failed: {}", .{err});
+                                }
                             },
                             's' => {
                                 // Split horizontal
@@ -335,7 +325,9 @@ pub fn main() !void {
                                         log.warn("split failed: {}", .{err});
                                     };
                                     layout.recalculate(screen.width, screen.height);
-                                } else |_| {}
+                                } else |err| {
+                                    log.warn("split buffer creation failed: {}", .{err});
+                                }
                             },
                             'q' => {
                                 // Close window
@@ -579,20 +571,4 @@ test "writeStr starts at offset column" {
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 2).codepoint);
     try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 3).codepoint);
     try std.testing.expectEqual(@as(u21, 'b'), screen.getCellConst(0, 4).codepoint);
-}
-
-test "fillRow fills entire row" {
-    const allocator = std.testing.allocator;
-    var screen = try Screen.init(allocator, 5, 2);
-    defer screen.deinit();
-
-    fillRow(&screen, 1, '#', .{ .bold = true }, .default, .default);
-
-    for (0..5) |col| {
-        const cell = screen.getCellConst(1, @intCast(col));
-        try std.testing.expectEqual(@as(u21, '#'), cell.codepoint);
-        try std.testing.expect(cell.style.bold);
-    }
-    // Row 0 should be untouched
-    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 0).codepoint);
 }
