@@ -89,11 +89,15 @@ pub const ToolResult = struct {
     content: []const u8,
     /// Whether the tool execution resulted in an error.
     is_error: bool = false,
+    /// Whether content is heap-allocated and must be freed by the caller.
+    /// Static error strings (from oomResult, parse errors) are not owned.
+    owned: bool = true,
 };
 
 /// Convenience constructor for a ToolResult indicating an out-of-memory error.
+/// Returns a static string that must NOT be freed.
 pub fn oomResult() ToolResult {
-    return .{ .content = "error: out of memory", .is_error = true };
+    return .{ .content = "error: out of memory", .is_error = true, .owned = false };
 }
 
 /// Metadata describing a tool that can be offered to the LLM.

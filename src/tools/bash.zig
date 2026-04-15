@@ -13,7 +13,7 @@ const BashInput = struct {
 /// Spawn `/bin/sh -c <command>`, collect output, and return stdout/stderr/exit code.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(BashInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input, expected { \"command\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"command\": \"...\" }", .is_error = true, .owned = false };
     };
     defer parsed.deinit();
     const input = parsed.value;
