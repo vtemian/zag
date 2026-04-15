@@ -5,12 +5,18 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const metrics_enabled = b.option(bool, "metrics", "Enable performance metrics") orelse false;
+
+    // Shared build options module for comptime feature flags
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "metrics", metrics_enabled);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("build_options", build_options.createModule());
 
     const exe = b.addExecutable(.{
         .name = "zag",
@@ -34,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addImport("build_options", build_options.createModule());
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
