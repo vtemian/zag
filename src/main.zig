@@ -432,11 +432,7 @@ pub fn main() !void {
                                 } else {
                                     appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
                                 }
-                                continue;
-                            }
-
-                            // /perf-dump: write Chrome Trace Event Format JSON
-                            if (std.mem.eql(u8, user_input, "/perf-dump")) {
+                            } else if (std.mem.eql(u8, user_input, "/perf-dump")) {
                                 input_len = 0;
                                 if (trace.enabled) {
                                     const count = trace.dump("zag-trace.json") catch |err| blk: {
@@ -453,38 +449,37 @@ pub fn main() !void {
                                 } else {
                                     appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
                                 }
-                                continue;
+                            } else {
+                                // Show user message in output
+                                _ = try buffer.appendNode(null, .user_message, user_input);
+
+                                // Clear input
+                                input_len = 0;
+
+                                // Show status while agent is working
+                                status_msg = "thinking...";
+                                compositor.composite(&layout);
+                                drawInputLine(&screen, &input_buf, input_len, status_msg);
+                                try screen.render(stdout_file);
+
+                                // Reset tool_call tracking for this turn
+                                last_tool_call = null;
+
+                                // Run agent loop (blocking), output captured via callback
+                                agent.runLoop(
+                                    user_input,
+                                    &messages,
+                                    &registry,
+                                    api_key,
+                                    allocator,
+                                    agentOutputCallback,
+                                ) catch |err| {
+                                    _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
+                                };
+
+                                // Clear status after agent completes
+                                status_msg = "";
                             }
-
-                            // Show user message in output
-                            _ = try buffer.appendNode(null, .user_message, user_input);
-
-                            // Clear input
-                            input_len = 0;
-
-                            // Show status while agent is working
-                            status_msg = "thinking...";
-                            compositor.composite(&layout);
-                            drawInputLine(&screen, &input_buf, input_len, status_msg);
-                            try screen.render(stdout_file);
-
-                            // Reset tool_call tracking for this turn
-                            last_tool_call = null;
-
-                            // Run agent loop (blocking), output captured via callback
-                            agent.runLoop(
-                                user_input,
-                                &messages,
-                                &registry,
-                                api_key,
-                                allocator,
-                                agentOutputCallback,
-                            ) catch |err| {
-                                _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
-                            };
-
-                            // Clear status after agent completes
-                            status_msg = "";
                         },
                         .backspace => {
                             input_len = inputDeleteBack(input_len);
