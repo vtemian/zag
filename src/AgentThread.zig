@@ -1,0 +1,182 @@
+//! Background agent thread with event queue for streaming.
+//!
+//! The agent loop runs on a background thread, pushing events
+//! (text deltas, tool calls, results) to a mutex-protected queue.
+//! The main thread drains the queue each frame for rendering.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const AgentThread = @This();
+
+/// An event produced by the agent loop for the main thread to consume.
+pub const AgentEvent = union(enum) {
+    /// Partial text from the LLM response.
+    text_delta: []const u8,
+    /// A tool call was decided by the LLM (payload is the tool name).
+    tool_start: []const u8,
+    /// Tool execution completed with output.
+    tool_result: ToolResultEvent,
+    /// Informational message (token counts, timing, etc.).
+    info: []const u8,
+    /// Agent loop completed successfully.
+    done,
+    /// An error occurred during agent execution.
+    err: []const u8,
+
+    /// Payload for a completed tool execution.
+    pub const ToolResultEvent = struct {
+        /// The tool's output text.
+        content: []const u8,
+        /// Whether the tool reported an error.
+        is_error: bool,
+    };
+};
+
+/// Thread-safe event queue using a mutex and an ArrayList.
+/// The agent thread pushes events; the main thread drains them.
+pub const EventQueue = struct {
+    /// Guards concurrent access to items.
+    mutex: std.Thread.Mutex = .{},
+    /// Backing storage for queued events.
+    items: std.ArrayList(AgentEvent),
+    /// Allocator for the backing list.
+    allocator: Allocator,
+
+    /// Create a new empty event queue.
+    pub fn init(allocator: Allocator) EventQueue {
+        return .{
+            .items = .empty,
+            .allocator = allocator,
+        };
+    }
+
+    /// Release backing storage. Caller must ensure no concurrent access.
+    pub fn deinit(self: *EventQueue) void {
+        self.items.deinit(self.allocator);
+    }
+
+    /// Push an event onto the queue. Thread-safe.
+    pub fn push(self: *EventQueue, event: AgentEvent) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.items.append(self.allocator, event);
+    }
+
+    /// Drain up to buf.len events into the provided buffer.
+    /// Returns the number of events copied. Thread-safe.
+    pub fn drain(self: *EventQueue, buf: []AgentEvent) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const count = @min(self.items.items.len, buf.len);
+        @memcpy(buf[0..count], self.items.items[0..count]);
+
+        // Remove drained items by shifting remaining to front
+        const remaining = self.items.items.len - count;
+        if (remaining > 0) {
+            std.mem.copyForwards(
+                AgentEvent,
+                self.items.items[0..remaining],
+                self.items.items[count..self.items.items.len],
+            );
+        }
+        self.items.items.len = remaining;
+
+        return count;
+    }
+};
+
+/// Cancel flag shared between main thread and agent thread.
+/// The main thread stores true to request cancellation;
+/// the agent thread loads to check.
+pub const CancelFlag = std.atomic.Value(bool);
+
+// -- Tests -------------------------------------------------------------------
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
+test "push and drain events" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.push(.{ .text_delta = "hello" });
+    try queue.push(.{ .text_delta = " world" });
+
+    var buf: [16]AgentEvent = undefined;
+    const count = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("hello", buf[0].text_delta);
+    try std.testing.expectEqualStrings(" world", buf[1].text_delta);
+}
+
+test "drain empty queue returns zero" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    var buf: [8]AgentEvent = undefined;
+    const count = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "push multiple drain all" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.push(.{ .text_delta = "a" });
+    try queue.push(.{ .tool_start = "bash" });
+    try queue.push(.{ .tool_result = .{ .content = "output", .is_error = false } });
+    try queue.push(.{ .info = "tokens: 42" });
+    try queue.push(.done);
+    try queue.push(.{ .err = "oops" });
+
+    var buf: [16]AgentEvent = undefined;
+    const count = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 6), count);
+
+    // Verify each variant
+    try std.testing.expectEqualStrings("a", buf[0].text_delta);
+    try std.testing.expectEqualStrings("bash", buf[1].tool_start);
+    try std.testing.expectEqualStrings("output", buf[2].tool_result.content);
+    try std.testing.expect(!buf[2].tool_result.is_error);
+    try std.testing.expectEqualStrings("tokens: 42", buf[3].info);
+    try std.testing.expectEqual(AgentEvent.done, buf[4]);
+    try std.testing.expectEqualStrings("oops", buf[5].err);
+}
+
+test "drain clears queue" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.push(.{ .text_delta = "first" });
+
+    var buf: [8]AgentEvent = undefined;
+    _ = queue.drain(&buf);
+
+    // Queue should be empty now
+    const count = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "drain with small buffer returns partial" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.push(.{ .text_delta = "a" });
+    try queue.push(.{ .text_delta = "b" });
+    try queue.push(.{ .text_delta = "c" });
+
+    // Only drain 2
+    var buf: [2]AgentEvent = undefined;
+    const count = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("a", buf[0].text_delta);
+    try std.testing.expectEqualStrings("b", buf[1].text_delta);
+
+    // Remaining 1 should still be there
+    const count2 = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), count2);
+    try std.testing.expectEqualStrings("c", buf[0].text_delta);
+}
