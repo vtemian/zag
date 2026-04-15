@@ -76,15 +76,14 @@ pub const OpenAiProvider = struct {
         const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
         defer allocator.free(auth_value);
 
-        // Fetch the complete SSE response body, then parse events from it.
-        // True incremental streaming requires deeper integration with the
-        // Zig 0.15 HTTP client's reader API (future improvement).
-        const response_bytes = try llm.httpPostJson(self.base_url, body, &.{
+        // Open an incremental streaming connection — SSE events are read
+        // and dispatched as tokens arrive from the network.
+        const stream = try llm.StreamingResponse.create(self.base_url, body, &.{
             .{ .name = "Authorization", .value = auth_value },
         }, allocator);
-        defer allocator.free(response_bytes);
+        defer stream.destroy();
 
-        return parseSseResponse(response_bytes, allocator, on_event, cancel);
+        return parseSseStream(stream, allocator, on_event, cancel);
     }
 };
 
@@ -369,9 +368,10 @@ const StreamingToolCall = struct {
     }
 };
 
-/// Parse SSE events from a complete OpenAI streaming response body.
-fn parseSseResponse(
-    response_bytes: []const u8,
+/// Read SSE events incrementally from a streaming HTTP connection.
+/// Calls on_event for each event as it arrives, then assembles the final LlmResponse.
+fn parseSseStream(
+    stream: *llm.StreamingResponse,
     allocator: Allocator,
     on_event: *const fn (event: llm.StreamEvent) void,
     cancel: *std.atomic.Value(bool),
@@ -387,92 +387,85 @@ fn parseSseResponse(
         tool_calls.deinit(allocator);
     }
 
-    // Parse SSE lines from complete body
-    var line_start: usize = 0;
-    for (response_bytes, 0..) |byte, i| {
-        if (byte == '\n') {
-            const line = blk: {
-                var end = i;
-                if (end > line_start and response_bytes[end - 1] == '\r') end -= 1;
-                break :blk response_bytes[line_start..end];
-            };
-            line_start = i + 1;
+    // Read SSE lines incrementally from the network
+    while (true) {
+        if (cancel.load(.acquire)) break;
 
-            if (cancel.load(.acquire)) break;
+        const maybe_line = try stream.readLine();
+        const line = maybe_line orelse break;
 
-            if (!std.mem.startsWith(u8, line, "data: ")) continue;
-            const data = line["data: ".len..];
+        if (!std.mem.startsWith(u8, line, "data: ")) continue;
+        const data = line["data: ".len..];
 
-            if (std.mem.eql(u8, data, "[DONE]")) break;
+        if (std.mem.eql(u8, data, "[DONE]")) break;
 
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch continue;
-            defer parsed.deinit();
-            const obj = parsed.value.object;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch continue;
+        defer parsed.deinit();
+        const obj = parsed.value.object;
 
-            const choices = obj.get("choices") orelse continue;
-            if (choices.array.items.len == 0) continue;
-            const choice = choices.array.items[0].object;
+        const choices = obj.get("choices") orelse continue;
+        if (choices.array.items.len == 0) continue;
+        const choice = choices.array.items[0].object;
 
-            // Check finish_reason
-            if (choice.get("finish_reason")) |fr| {
-                if (fr == .string) {
-                    if (std.mem.eql(u8, fr.string, "stop"))
-                        stop_reason = .end_turn
-                    else if (std.mem.eql(u8, fr.string, "tool_calls"))
-                        stop_reason = .tool_use
-                    else if (std.mem.eql(u8, fr.string, "length"))
-                        stop_reason = .max_tokens;
+        // Check finish_reason
+        if (choice.get("finish_reason")) |fr| {
+            if (fr == .string) {
+                if (std.mem.eql(u8, fr.string, "stop"))
+                    stop_reason = .end_turn
+                else if (std.mem.eql(u8, fr.string, "tool_calls"))
+                    stop_reason = .tool_use
+                else if (std.mem.eql(u8, fr.string, "length"))
+                    stop_reason = .max_tokens;
+            }
+        }
+
+        // Process delta
+        if (choice.get("delta")) |delta_val| {
+            const delta = delta_val.object;
+
+            if (delta.get("content")) |content_val| {
+                if (content_val == .string) {
+                    try text_content.appendSlice(allocator, content_val.string);
+                    on_event(.{ .text_delta = content_val.string });
                 }
             }
 
-            // Process delta
-            if (choice.get("delta")) |delta_val| {
-                const delta = delta_val.object;
+            if (delta.get("tool_calls")) |tc_val| {
+                for (tc_val.array.items) |tc_item| {
+                    const tc = tc_item.object;
+                    const index_val = tc.get("index") orelse continue;
+                    const index: usize = @intCast(index_val.integer);
 
-                if (delta.get("content")) |content_val| {
-                    if (content_val == .string) {
-                        try text_content.appendSlice(allocator, content_val.string);
-                        on_event(.{ .text_delta = content_val.string });
+                    while (tool_calls.items.len <= index) {
+                        try tool_calls.append(allocator, .{
+                            .id = .empty,
+                            .name = .empty,
+                            .arguments = .empty,
+                        });
                     }
-                }
 
-                if (delta.get("tool_calls")) |tc_val| {
-                    for (tc_val.array.items) |tc_item| {
-                        const tc = tc_item.object;
-                        const index_val = tc.get("index") orelse continue;
-                        const index: usize = @intCast(index_val.integer);
+                    var tool_call = &tool_calls.items[index];
 
-                        while (tool_calls.items.len <= index) {
-                            try tool_calls.append(allocator, .{
-                                .id = .empty,
-                                .name = .empty,
-                                .arguments = .empty,
-                            });
+                    if (tc.get("id")) |id_val| {
+                        if (id_val == .string) {
+                            try tool_call.id.appendSlice(allocator, id_val.string);
                         }
+                    }
 
-                        var tool_call = &tool_calls.items[index];
-
-                        if (tc.get("id")) |id_val| {
-                            if (id_val == .string) {
-                                try tool_call.id.appendSlice(allocator, id_val.string);
-                            }
-                        }
-
-                        if (tc.get("function")) |func_val| {
-                            const func = func_val.object;
-                            if (func.get("name")) |name_val| {
-                                if (name_val == .string) {
-                                    const was_empty = tool_call.name.items.len == 0;
-                                    try tool_call.name.appendSlice(allocator, name_val.string);
-                                    if (was_empty) {
-                                        on_event(.{ .tool_start = name_val.string });
-                                    }
+                    if (tc.get("function")) |func_val| {
+                        const func = func_val.object;
+                        if (func.get("name")) |name_val| {
+                            if (name_val == .string) {
+                                const was_empty = tool_call.name.items.len == 0;
+                                try tool_call.name.appendSlice(allocator, name_val.string);
+                                if (was_empty) {
+                                    on_event(.{ .tool_start = name_val.string });
                                 }
                             }
-                            if (func.get("arguments")) |args_val| {
-                                if (args_val == .string) {
-                                    try tool_call.arguments.appendSlice(allocator, args_val.string);
-                                }
+                        }
+                        if (func.get("arguments")) |args_val| {
+                            if (args_val == .string) {
+                                try tool_call.arguments.appendSlice(allocator, args_val.string);
                             }
                         }
                     }
