@@ -17,6 +17,7 @@ const NodeRenderer = @import("NodeRenderer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
+const AgentThread = @import("AgentThread.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
 
@@ -81,6 +82,24 @@ var extra_buffers: std.ArrayList(*Buffer) = .empty;
 
 /// Last tool_call node, used to parent tool_result nodes.
 var last_tool_call: ?*Buffer.Node = null;
+
+/// Handle for the background agent thread, if one is running.
+var agent_thread: ?std.Thread = null;
+
+/// Event queue shared between the agent thread and the main loop.
+var event_queue: AgentThread.EventQueue = undefined;
+
+/// Atomic flag for requesting agent thread cancellation.
+var cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false);
+
+/// The node that text deltas accumulate into during streaming.
+var current_assistant_node: ?*Buffer.Node = null;
+
+/// Frame counter for animating the status bar spinner.
+var spinner_frame: u8 = 0;
+
+/// Characters for the animated spinner.
+const spinner_chars = "|/-\\";
 
 /// State for Ctrl+W prefix key sequence.
 var awaiting_window_cmd: bool = false;
@@ -175,7 +194,11 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
 
     if (status_msg.len > 0) {
         const resolved = Theme.resolve(t.highlights.status, t);
-        _ = screen.writeStr(input_row, 0, status_msg, resolved.screen_style, resolved.fg);
+        const end_col = screen.writeStr(input_row, 0, status_msg, resolved.screen_style, resolved.fg);
+        // Append animated spinner when agent thread is active
+        if (agent_thread != null) {
+            _ = screen.writeStr(input_row, end_col + 1, spinner_chars[spinner_frame .. spinner_frame + 1], resolved.screen_style, resolved.fg);
+        }
     } else {
         const prompt_resolved = Theme.resolve(t.highlights.input_prompt, t);
         const text_resolved = Theme.resolve(t.highlights.input_text, t);
@@ -344,9 +367,13 @@ pub fn main() !void {
         }
 
         if (maybe_event == null and term.checkResize() == null) {
-            // No input, no resize; sleep briefly to avoid busy-spinning
-            posix.nanosleep(0, 10 * std.time.ns_per_ms);
-            continue;
+            if (agent_thread == null) {
+                // No input, no resize, no agent running; sleep to avoid busy-spinning
+                posix.nanosleep(0, 10 * std.time.ns_per_ms);
+                continue;
+            }
+            // Agent running but no input: brief sleep, then drain events and render
+            posix.nanosleep(0, 16 * std.time.ns_per_ms);
         }
 
         // Start frame timing (only for frames that do real work)
@@ -377,184 +404,240 @@ pub fn main() !void {
             }
         }
 
-        const event = maybe_event.?;
-        switch (event) {
-            .key => |k| {
-                // Handle Ctrl+W window command prefix
-                if (awaiting_window_cmd) {
-                    awaiting_window_cmd = false;
-                    switch (k.key) {
-                        .char => |ch| switch (ch) {
-                            'v' => {
-                                // Split vertical
-                                if (createSplitBuffer(allocator)) |new_buf| {
-                                    layout.splitVertical(0.5, new_buf) catch |err| {
-                                        log.warn("split failed: {}", .{err});
-                                    };
-                                    layout.recalculate(screen.width, screen.height);
-                                } else |err| {
-                                    log.warn("split buffer creation failed: {}", .{err});
-                                }
-                            },
-                            's' => {
-                                // Split horizontal
-                                if (createSplitBuffer(allocator)) |new_buf| {
-                                    layout.splitHorizontal(0.5, new_buf) catch |err| {
-                                        log.warn("split failed: {}", .{err});
-                                    };
-                                    layout.recalculate(screen.width, screen.height);
-                                } else |err| {
-                                    log.warn("split buffer creation failed: {}", .{err});
-                                }
-                            },
-                            'q' => {
-                                // Close window
-                                layout.closeWindow();
-                                layout.recalculate(screen.width, screen.height);
-                            },
-                            'h' => layout.focusDirection(.left),
-                            'j' => layout.focusDirection(.down),
-                            'k' => layout.focusDirection(.up),
-                            'l' => layout.focusDirection(.right),
-                            else => {},
-                        },
-                        else => {},
-                    }
-                } else {
-                    // Ctrl+C: exit
-                    if (k.modifiers.ctrl) {
+        if (maybe_event) |event|
+            switch (event) {
+                .key => |k| {
+                    // Handle Ctrl+W window command prefix
+                    if (awaiting_window_cmd) {
+                        awaiting_window_cmd = false;
                         switch (k.key) {
-                            .char => |ch| {
-                                if (ch == 'c') {
+                            .char => |ch| switch (ch) {
+                                'v' => {
+                                    // Split vertical
+                                    if (createSplitBuffer(allocator)) |new_buf| {
+                                        layout.splitVertical(0.5, new_buf) catch |err| {
+                                            log.warn("split failed: {}", .{err});
+                                        };
+                                        layout.recalculate(screen.width, screen.height);
+                                    } else |err| {
+                                        log.warn("split buffer creation failed: {}", .{err});
+                                    }
+                                },
+                                's' => {
+                                    // Split horizontal
+                                    if (createSplitBuffer(allocator)) |new_buf| {
+                                        layout.splitHorizontal(0.5, new_buf) catch |err| {
+                                            log.warn("split failed: {}", .{err});
+                                        };
+                                        layout.recalculate(screen.width, screen.height);
+                                    } else |err| {
+                                        log.warn("split buffer creation failed: {}", .{err});
+                                    }
+                                },
+                                'q' => {
+                                    // Close window
+                                    layout.closeWindow();
+                                    layout.recalculate(screen.width, screen.height);
+                                },
+                                'h' => layout.focusDirection(.left),
+                                'j' => layout.focusDirection(.down),
+                                'k' => layout.focusDirection(.up),
+                                'l' => layout.focusDirection(.right),
+                                else => {},
+                            },
+                            else => {},
+                        }
+                    } else {
+                        // Ctrl+C: cancel agent if running, otherwise exit
+                        if (k.modifiers.ctrl) {
+                            switch (k.key) {
+                                .char => |ch| {
+                                    if (ch == 'c') {
+                                        if (agent_thread != null) {
+                                            cancel_flag.store(true, .release);
+                                        } else {
+                                            running = false;
+                                        }
+                                        continue;
+                                    }
+                                    if (ch == 'w') {
+                                        awaiting_window_cmd = true;
+                                        continue;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+
+                        switch (k.key) {
+                            .enter => {
+                                if (input_len == 0) continue;
+
+                                const user_input = input_buf[0..input_len];
+
+                                // Check for /quit command
+                                if (std.mem.eql(u8, user_input, "/quit") or std.mem.eql(u8, user_input, "/q")) {
                                     running = false;
                                     continue;
                                 }
-                                if (ch == 'w') {
-                                    awaiting_window_cmd = true;
-                                    continue;
+
+                                // /perf: show aggregate performance stats
+                                if (std.mem.eql(u8, user_input, "/perf")) {
+                                    input_len = 0;
+                                    if (trace.enabled) {
+                                        const stats = trace.getStats();
+                                        var perf_buf: [512]u8 = undefined;
+
+                                        const header = std.fmt.bufPrint(&perf_buf, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
+                                        appendOutputText(header) catch {};
+
+                                        const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
+                                        const p99_ms = @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0;
+                                        const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
+                                        const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
+
+                                        const avg_line = std.fmt.bufPrint(&perf_buf, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
+                                        appendOutputText(avg_line) catch {};
+                                        const p99_line = std.fmt.bufPrint(&perf_buf, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
+                                        appendOutputText(p99_line) catch {};
+                                        const max_line = std.fmt.bufPrint(&perf_buf, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
+                                        appendOutputText(max_line) catch {};
+                                        const peak_line = std.fmt.bufPrint(&perf_buf, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
+                                        appendOutputText(peak_line) catch {};
+                                        const allocs_line = std.fmt.bufPrint(&perf_buf, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
+                                        appendOutputText(allocs_line) catch {};
+                                    } else {
+                                        appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+                                    }
+                                } else if (std.mem.eql(u8, user_input, "/perf-dump")) {
+                                    input_len = 0;
+                                    if (trace.enabled) {
+                                        const count = trace.dump("zag-trace.json") catch |err| blk: {
+                                            var err_buf: [256]u8 = undefined;
+                                            const err_msg = std.fmt.bufPrint(&err_buf, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
+                                            appendOutputText(err_msg) catch {};
+                                            break :blk @as(usize, 0);
+                                        };
+                                        if (count > 0) {
+                                            var dump_buf: [256]u8 = undefined;
+                                            const dump_msg = std.fmt.bufPrint(&dump_buf, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
+                                            appendOutputText(dump_msg) catch {};
+                                        }
+                                    } else {
+                                        appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+                                    }
+                                } else if (std.mem.eql(u8, user_input, "/model")) {
+                                    input_len = 0;
+                                    var model_cmd_buf: [128]u8 = undefined;
+                                    const model_info = std.fmt.bufPrint(&model_cmd_buf, "model: {s}", .{model_str}) catch "model: unknown";
+                                    appendOutputText(model_info) catch {};
+                                } else {
+                                    // Ignore if an agent is already running
+                                    if (agent_thread != null) continue;
+
+                                    // Append the user message to the conversation
+                                    // history before spawning the thread, because
+                                    // runLoopStreaming reads from messages directly.
+                                    const user_content = try allocator.alloc(types.ContentBlock, 1);
+                                    const duped_input = try allocator.dupe(u8, user_input);
+                                    user_content[0] = .{ .text = .{ .text = duped_input } };
+                                    try messages.append(allocator, .{ .role = .user, .content = user_content });
+
+                                    // Show user message in buffer
+                                    _ = try buffer.appendNode(null, .user_message, user_input);
+
+                                    // Clear input and reset streaming state
+                                    input_len = 0;
+                                    current_assistant_node = null;
+                                    last_tool_call = null;
+                                    cancel_flag.store(false, .release);
+
+                                    // Initialize event queue and spawn agent thread
+                                    event_queue = AgentThread.EventQueue.init(allocator);
+                                    agent_thread = AgentThread.spawn(
+                                        provider_result.provider,
+                                        &messages,
+                                        &registry,
+                                        allocator,
+                                        &event_queue,
+                                        &cancel_flag,
+                                    ) catch |err| blk: {
+                                        _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
+                                        event_queue.deinit();
+                                        break :blk null;
+                                    };
+
+                                    if (agent_thread != null) {
+                                        status_msg = "streaming...";
+                                    }
                                 }
+                            },
+                            .backspace => {
+                                input_len = inputDeleteBack(input_len);
+                            },
+                            .char => |ch| {
+                                // Only handle ASCII printable for now
+                                if (ch >= 0x20 and ch < 0x7f) {
+                                    input_len = inputAppendChar(&input_buf, input_len, @intCast(ch));
+                                }
+                            },
+                            .page_up, .page_down => {
+                                // Scrolling is now per-buffer via the compositor; no-op for now
                             },
                             else => {},
                         }
                     }
+                },
+                .mouse => {},
+                .resize => |sz| {
+                    try screen.resize(sz.cols, sz.rows);
+                    term.size = .{ .rows = sz.rows, .cols = sz.cols };
+                    layout.recalculate(sz.cols, sz.rows);
+                },
+                .none => {},
+            };
 
-                    switch (k.key) {
-                        .enter => {
-                            if (input_len == 0) continue;
+        // Drain agent events
+        if (agent_thread != null) {
+            var event_buf: [64]AgentThread.AgentEvent = undefined;
+            const count = event_queue.drain(&event_buf);
 
-                            const user_input = input_buf[0..input_len];
-
-                            // Check for /quit command
-                            if (std.mem.eql(u8, user_input, "/quit") or std.mem.eql(u8, user_input, "/q")) {
-                                running = false;
-                                continue;
-                            }
-
-                            // /perf: show aggregate performance stats
-                            if (std.mem.eql(u8, user_input, "/perf")) {
-                                input_len = 0;
-                                if (trace.enabled) {
-                                    const stats = trace.getStats();
-                                    var perf_buf: [512]u8 = undefined;
-
-                                    const header = std.fmt.bufPrint(&perf_buf, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
-                                    appendOutputText(header) catch {};
-
-                                    const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
-                                    const p99_ms = @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0;
-                                    const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
-                                    const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
-
-                                    const avg_line = std.fmt.bufPrint(&perf_buf, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
-                                    appendOutputText(avg_line) catch {};
-                                    const p99_line = std.fmt.bufPrint(&perf_buf, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
-                                    appendOutputText(p99_line) catch {};
-                                    const max_line = std.fmt.bufPrint(&perf_buf, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
-                                    appendOutputText(max_line) catch {};
-                                    const peak_line = std.fmt.bufPrint(&perf_buf, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
-                                    appendOutputText(peak_line) catch {};
-                                    const allocs_line = std.fmt.bufPrint(&perf_buf, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
-                                    appendOutputText(allocs_line) catch {};
-                                } else {
-                                    appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
-                                }
-                            } else if (std.mem.eql(u8, user_input, "/perf-dump")) {
-                                input_len = 0;
-                                if (trace.enabled) {
-                                    const count = trace.dump("zag-trace.json") catch |err| blk: {
-                                        var err_buf: [256]u8 = undefined;
-                                        const err_msg = std.fmt.bufPrint(&err_buf, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
-                                        appendOutputText(err_msg) catch {};
-                                        break :blk @as(usize, 0);
-                                    };
-                                    if (count > 0) {
-                                        var dump_buf: [256]u8 = undefined;
-                                        const dump_msg = std.fmt.bufPrint(&dump_buf, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
-                                        appendOutputText(dump_msg) catch {};
-                                    }
-                                } else {
-                                    appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
-                                }
-                            } else if (std.mem.eql(u8, user_input, "/model")) {
-                                input_len = 0;
-                                var model_cmd_buf: [128]u8 = undefined;
-                                const model_info = std.fmt.bufPrint(&model_cmd_buf, "model: {s}", .{model_str}) catch "model: unknown";
-                                appendOutputText(model_info) catch {};
-                            } else {
-                                // Show user message in output
-                                _ = try buffer.appendNode(null, .user_message, user_input);
-
-                                // Clear input
-                                input_len = 0;
-
-                                // Show status while agent is working
-                                status_msg = "thinking...";
-                                compositor.composite(&layout);
-                                drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps, &theme);
-                                try screen.render(stdout_file);
-
-                                // Reset tool_call tracking for this turn
-                                last_tool_call = null;
-
-                                // Run agent loop (blocking), output captured via callback
-                                agent.runLoop(
-                                    user_input,
-                                    &messages,
-                                    &registry,
-                                    provider_result.provider,
-                                    allocator,
-                                    agentOutputCallback,
-                                ) catch |err| {
-                                    _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
-                                };
-
-                                // Clear status after agent completes
-                                status_msg = "";
-                            }
-                        },
-                        .backspace => {
-                            input_len = inputDeleteBack(input_len);
-                        },
-                        .char => |ch| {
-                            // Only handle ASCII printable for now
-                            if (ch >= 0x20 and ch < 0x7f) {
-                                input_len = inputAppendChar(&input_buf, input_len, @intCast(ch));
-                            }
-                        },
-                        .page_up, .page_down => {
-                            // Scrolling is now per-buffer via the compositor; no-op for now
-                        },
-                        else => {},
-                    }
+            for (event_buf[0..count]) |agent_event| {
+                switch (agent_event) {
+                    .text_delta => |text| {
+                        if (current_assistant_node) |node| {
+                            buffer.appendToNode(node, text) catch {};
+                        } else {
+                            current_assistant_node = buffer.appendNode(null, .assistant_text, text) catch null;
+                        }
+                    },
+                    .tool_start => |name| {
+                        current_assistant_node = null;
+                        last_tool_call = buffer.appendNode(null, .tool_call, name) catch null;
+                    },
+                    .tool_result => |result| {
+                        _ = buffer.appendNode(last_tool_call, .tool_result, result.content) catch {};
+                    },
+                    .info => |text| {
+                        _ = buffer.appendNode(null, .status, text) catch {};
+                    },
+                    .done => {
+                        if (agent_thread) |t| t.join();
+                        agent_thread = null;
+                        event_queue.deinit();
+                        status_msg = "";
+                        current_assistant_node = null;
+                    },
+                    .err => |text| {
+                        _ = buffer.appendNode(null, .err, text) catch {};
+                    },
                 }
-            },
-            .mouse => {},
-            .resize => |sz| {
-                try screen.resize(sz.cols, sz.rows);
-                term.size = .{ .rows = sz.rows, .cols = sz.cols };
-                layout.recalculate(sz.cols, sz.rows);
-            },
-            .none => {},
+            }
+
+            // Animate spinner while agent is running
+            if (agent_thread != null) {
+                spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
+            }
         }
 
         // Redraw after every event
@@ -573,6 +656,14 @@ pub fn main() !void {
             defer render_span.end();
             try screen.render(stdout_file);
         }
+    }
+
+    // Cancel and join agent thread if still running on exit
+    if (agent_thread) |t| {
+        cancel_flag.store(true, .release);
+        t.join();
+        event_queue.deinit();
+        agent_thread = null;
     }
 
     // Auto-dump trace on exit when metrics are enabled
