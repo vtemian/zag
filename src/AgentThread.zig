@@ -6,6 +6,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const llm = @import("llm.zig");
+const types = @import("types.zig");
+const tools = @import("tools.zig");
+const agent = @import("agent.zig");
 
 const AgentThread = @This();
 
@@ -91,6 +95,39 @@ pub const EventQueue = struct {
 /// The main thread stores true to request cancellation;
 /// the agent thread loads to check.
 pub const CancelFlag = std.atomic.Value(bool);
+
+/// Spawn a background thread running the streaming agent loop.
+/// The thread calls agent.runLoopStreaming, pushing events to the queue.
+/// Returns the thread handle; the caller must join it when done.
+pub fn spawn(
+    provider: llm.Provider,
+    messages: *std.ArrayList(types.Message),
+    registry: *const tools.Registry,
+    allocator: Allocator,
+    queue: *EventQueue,
+    cancel: *CancelFlag,
+) !std.Thread {
+    return try std.Thread.spawn(.{}, threadMain, .{
+        provider,
+        messages,
+        registry,
+        allocator,
+        queue,
+        cancel,
+    });
+}
+
+/// Entry point for the background agent thread.
+fn threadMain(
+    provider: llm.Provider,
+    messages: *std.ArrayList(types.Message),
+    registry: *const tools.Registry,
+    allocator: Allocator,
+    queue: *EventQueue,
+    cancel: *CancelFlag,
+) void {
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel);
+}
 
 // -- Tests -------------------------------------------------------------------
 

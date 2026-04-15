@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const llm = @import("llm.zig");
 const tools_mod = @import("tools.zig");
+const AgentThread = @import("AgentThread.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -166,6 +167,139 @@ pub fn runLoop(
             .content = try result_blocks.toOwnedSlice(allocator),
         });
     }
+}
+
+/// Runs the streaming variant of the agent loop on a background thread.
+/// Same logic as runLoop but uses callStreaming for incremental delivery,
+/// pushes events to the provided queue, and checks the cancel flag
+/// before each tool execution. Catches all errors and pushes .err.
+/// Pushes .done when the loop finishes (whether by completion or cancel).
+pub fn runLoopStreaming(
+    messages: *std.ArrayList(types.Message),
+    registry: *const tools_mod.Registry,
+    provider: llm.Provider,
+    allocator: Allocator,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) void {
+    runLoopStreamingInner(messages, registry, provider, allocator, queue, cancel) catch |err| {
+        queue.push(.{ .err = @errorName(err) }) catch {};
+    };
+    queue.push(.done) catch {};
+}
+
+/// Inner implementation that can return errors. The outer function
+/// catches them and pushes .err to the queue.
+fn runLoopStreamingInner(
+    messages: *std.ArrayList(types.Message),
+    registry: *const tools_mod.Registry,
+    provider: llm.Provider,
+    allocator: Allocator,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) !void {
+    const tool_defs = try registry.definitions(allocator);
+    defer allocator.free(tool_defs);
+
+    thread_local_queue = queue;
+    defer {
+        thread_local_queue = null;
+    }
+
+    // Inner loop: call LLM, execute tools, repeat
+    while (true) {
+        // Check cancel before each LLM call
+        if (cancel.load(.acquire)) return;
+
+        const response = try provider.callStreaming(
+            system_prompt,
+            messages.items,
+            tool_defs,
+            allocator,
+            &streamEventToQueue,
+            cancel,
+        );
+
+        // Add assistant message
+        try messages.append(allocator, .{ .role = .assistant, .content = response.content });
+
+        // Emit token usage as info
+        {
+            var info_buf: [128]u8 = undefined;
+            const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
+            try queue.push(.{ .info = info_msg });
+        }
+
+        // Collect tool calls
+        var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
+        defer tool_calls.deinit(allocator);
+
+        for (response.content) |block| {
+            switch (block) {
+                .tool_use => |tu| try tool_calls.append(allocator, tu),
+                .text, .tool_result => {},
+            }
+        }
+
+        // No tool calls means we are done
+        if (tool_calls.items.len == 0) break;
+
+        // Execute tools and collect results
+        var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+        errdefer result_blocks.deinit(allocator);
+
+        for (tool_calls.items) |tc| {
+            // Check cancel before each tool
+            if (cancel.load(.acquire)) return;
+
+            log.info("executing tool: {s}", .{tc.name});
+            try queue.push(.{ .tool_start = tc.name });
+
+            const result = try registry.execute(tc.name, tc.input_raw, allocator);
+
+            try queue.push(.{ .tool_result = .{
+                .content = result.content,
+                .is_error = result.is_error,
+            } });
+
+            // Dupe content so the Message owns all strings
+            const owned_content = try allocator.dupe(u8, result.content);
+            errdefer allocator.free(owned_content);
+            const owned_id = try allocator.dupe(u8, tc.id);
+            errdefer allocator.free(owned_id);
+
+            try result_blocks.append(allocator, .{ .tool_result = .{
+                .tool_use_id = owned_id,
+                .content = owned_content,
+                .is_error = result.is_error,
+            } });
+        }
+
+        // Add tool results as a user message (Claude's format)
+        try messages.append(allocator, .{
+            .role = .user,
+            .content = try result_blocks.toOwnedSlice(allocator),
+        });
+    }
+}
+
+/// Thread-local queue pointer bridging the bare function-pointer callback
+/// required by callStreaming to the EventQueue. Set before each
+/// callStreaming invocation and cleared afterward.
+threadlocal var thread_local_queue: ?*AgentThread.EventQueue = null;
+
+/// Callback that converts a provider StreamEvent to an AgentEvent and
+/// pushes it to the thread-local EventQueue.
+fn streamEventToQueue(event: llm.StreamEvent) void {
+    const q = thread_local_queue orelse return;
+    const agent_event: AgentThread.AgentEvent = switch (event) {
+        .text_delta => |t| .{ .text_delta = t },
+        .tool_start => |t| .{ .tool_start = t },
+        .info => |t| .{ .info = t },
+        .done => .done,
+        .err => |t| .{ .err = t },
+    };
+    q.push(agent_event) catch {};
 }
 
 test {
