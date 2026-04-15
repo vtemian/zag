@@ -133,12 +133,26 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
         lines.deinit(self.allocator);
     }
 
-    for (lines.items, 0..) |line, row_off| {
-        if (row_off >= rect.height) break;
-        const screen_row = rect.y + @as(u16, @intCast(row_off));
-        if (screen_row >= self.screen.height) break;
+    // Write lines with wrapping within the rect boundaries
+    var cur_row = rect.y;
+    const max_row = rect.y + rect.height;
+    const max_col = rect.x + rect.width;
 
-        _ = self.screen.writeStr(screen_row, rect.x, line, .{}, .default);
+    for (lines.items) |line| {
+        if (cur_row >= max_row) break;
+        if (cur_row >= self.screen.height) break;
+
+        const pos = self.screen.writeStrWrapped(
+            cur_row,
+            rect.x,
+            max_row,
+            max_col,
+            line,
+            .{},
+            .default,
+        );
+        // Move to next line after this content
+        cur_row = pos.row + 1;
     }
 }
 
