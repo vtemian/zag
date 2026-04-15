@@ -62,8 +62,11 @@ fn recordEvent(ev: SpanEvent) void {
 
 /// Handle returned by span(). Call end() or endWithArgs() when the span is done.
 pub const SpanHandle = if (enabled) struct {
+    /// Microsecond timestamp when the span started.
     start_us: u64,
+    /// Fixed-size span name, copied from the comptime string.
     name: [32]u8,
+    /// Number of valid bytes in the name array.
     name_len: u8,
 
     /// End the span without metadata.
@@ -304,11 +307,17 @@ pub fn init() void {
 
 /// Wraps an allocator to count allocations and frees per frame.
 pub const CountingAllocator = struct {
+    /// The underlying allocator that does the real work.
     inner: std.mem.Allocator,
+    /// Number of allocations in the current frame.
     alloc_count: u32 = 0,
+    /// Total bytes allocated in the current frame.
     alloc_bytes: u64 = 0,
+    /// Number of frees in the current frame.
     free_count: u32 = 0,
+    /// High water mark for live bytes across the session.
     peak_bytes: u64 = 0,
+    /// Currently live bytes (allocs minus frees).
     current_bytes: u64 = 0,
 
     /// Return a std.mem.Allocator that routes through this counter.
