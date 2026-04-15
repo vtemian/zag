@@ -228,7 +228,10 @@ pub fn main() !void {
 
     // Conversation history
     var messages: std.ArrayList(types.Message) = .empty;
-    defer messages.deinit(allocator);
+    defer {
+        for (messages.items) |msg| msg.deinit(allocator);
+        messages.deinit(allocator);
+    }
 
     // -- Enter TUI mode ------------------------------------------------------
     var term = Terminal.init() catch |err| {
