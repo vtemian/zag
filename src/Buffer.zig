@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const NodeRenderer = @import("NodeRenderer.zig");
+const Theme = @import("Theme.zig");
 
 const Buffer = @This();
 
@@ -113,18 +114,17 @@ pub fn appendNode(self: *Buffer, parent: ?*Node, node_type: NodeType, content: [
     return node;
 }
 
-/// Walk the tree and return flat display lines for the current state.
-/// Collapsed nodes have their children skipped. Each line is a separate
-/// allocation owned by the caller.
-pub fn getVisibleLines(self: *const Buffer, allocator: Allocator, renderer: *const NodeRenderer) !std.ArrayList([]const u8) {
-    var lines: std.ArrayList([]const u8) = .empty;
+/// Walk the tree and return styled display lines for the current state.
+/// Collapsed nodes have their children skipped. Each line's spans are
+/// separate allocations owned by the caller.
+pub fn getVisibleLines(self: *const Buffer, allocator: Allocator, renderer: *const NodeRenderer, theme: *const Theme) !std.ArrayList(Theme.StyledLine) {
+    var lines: std.ArrayList(Theme.StyledLine) = .empty;
     errdefer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
+        NodeRenderer.freeStyledLines(&lines, allocator);
     }
 
     for (self.root_children.items) |node| {
-        try collectVisibleLines(node, allocator, renderer, &lines);
+        try collectVisibleLines(node, allocator, renderer, &lines, theme);
     }
 
     return lines;
@@ -135,13 +135,14 @@ fn collectVisibleLines(
     node: *const Node,
     allocator: Allocator,
     renderer: *const NodeRenderer,
-    lines: *std.ArrayList([]const u8),
+    lines: *std.ArrayList(Theme.StyledLine),
+    theme: *const Theme,
 ) !void {
-    try renderer.render(node, lines, allocator);
+    try renderer.render(node, lines, allocator, theme);
 
     if (!node.collapsed) {
         for (node.children.items) |child| {
-            try collectVisibleLines(child, allocator, renderer, lines);
+            try collectVisibleLines(child, allocator, renderer, lines, theme);
         }
     }
 }
@@ -177,6 +178,19 @@ pub fn clear(self: *Buffer) void {
 }
 
 // -- Tests -------------------------------------------------------------------
+
+/// Concatenate all spans in a StyledLine into a single string (for testing).
+fn concatSpans(allocator: Allocator, line: Theme.StyledLine) ![]const u8 {
+    var total_len: usize = 0;
+    for (line.spans) |span| total_len += span.text.len;
+    const buf = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+    for (line.spans) |span| {
+        @memcpy(buf[offset .. offset + span.text.len], span.text);
+        offset += span.text.len;
+    }
+    return buf;
+}
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -232,16 +246,21 @@ test "getVisibleLines returns rendered lines" {
     _ = try buf.appendNode(null, .separator, "");
 
     var renderer = NodeRenderer.initDefault();
+    const theme = Theme.defaultTheme();
 
-    var lines = try buf.getVisibleLines(allocator, &renderer);
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    var lines = try buf.getVisibleLines(allocator, &renderer, &theme);
+    defer NodeRenderer.freeStyledLines(&lines, allocator);
 
     try std.testing.expect(lines.items.len >= 2);
-    try std.testing.expectEqualStrings("> hello", lines.items[0]);
-    try std.testing.expectEqualStrings("---", lines.items[1]);
+
+    // Concatenate spans for comparison
+    const line0 = try concatSpans(allocator, lines.items[0]);
+    defer allocator.free(line0);
+    const line1 = try concatSpans(allocator, lines.items[1]);
+    defer allocator.free(line1);
+
+    try std.testing.expectEqualStrings("> hello", line0);
+    try std.testing.expectEqualStrings("---", line1);
 }
 
 test "collapsed nodes hide children" {
@@ -254,16 +273,16 @@ test "collapsed nodes hide children" {
     parent.collapsed = true;
 
     var renderer = NodeRenderer.initDefault();
+    const theme = Theme.defaultTheme();
 
-    var lines = try buf.getVisibleLines(allocator, &renderer);
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
+    var lines = try buf.getVisibleLines(allocator, &renderer, &theme);
+    defer NodeRenderer.freeStyledLines(&lines, allocator);
 
     // Should have the tool_call line but not the tool_result child
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqualStrings("[tool] read", lines.items[0]);
+    const line0 = try concatSpans(allocator, lines.items[0]);
+    defer allocator.free(line0);
+    try std.testing.expectEqualStrings("[tool] read", line0);
 }
 
 test "clear removes all nodes" {

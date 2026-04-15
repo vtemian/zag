@@ -15,6 +15,7 @@ const Buffer = @import("Buffer.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
+const Theme = @import("Theme.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
 
@@ -66,9 +67,10 @@ var buffer: Buffer = undefined;
 var node_renderer: NodeRenderer = undefined;
 var buffer_alloc: std.mem.Allocator = undefined;
 
-/// Layout and compositor, initialized in main().
+/// Layout, compositor, and theme, initialized in main().
 var layout: Layout = undefined;
 var compositor: Compositor = undefined;
+var theme: Theme = undefined;
 
 /// Counter for creating new buffers when splitting windows.
 var next_buffer_id: u32 = 1;
@@ -265,11 +267,15 @@ pub fn main() !void {
     var screen = try Screen.init(allocator, term.size.cols, term.size.rows);
     defer screen.deinit();
 
+    // Initialize theme
+    theme = Theme.defaultTheme();
+
     // Initialize compositor
     compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
         .renderer = &node_renderer,
+        .theme = &theme,
     };
 
     const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
@@ -591,6 +597,7 @@ test "imports compile" {
     _ = @import("Layout.zig");
     _ = @import("Compositor.zig");
     _ = @import("Metrics.zig");
+    _ = @import("Theme.zig");
 }
 
 test "inputAppendChar adds character" {
