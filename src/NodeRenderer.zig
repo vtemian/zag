@@ -74,30 +74,78 @@ pub fn render(self: *const NodeRenderer, node: *const Node, lines: *std.ArrayLis
 pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     return switch (node.node_type) {
         .separator => 1,
-        .custom, .user_message, .assistant_text, .tool_call, .tool_result, .status, .err => 1,
+        .tool_call, .tool_result, .err => 1,
+        .user_message, .assistant_text, .status, .custom => blk: {
+            // Count newlines to determine line count
+            const content = node.content.items;
+            var count: usize = 1;
+            for (content) |c| {
+                if (c == '\n') count += 1;
+            }
+            break :blk count;
+        },
     };
 }
 
-/// Built-in renderer: produces one line per node using type-specific formatting.
+/// Built-in renderer: produces one or more lines per node using type-specific formatting.
+/// Multi-line content (containing \n) is split into separate display lines.
 fn renderDefault(node: *const Node, lines: *std.ArrayList([]const u8), allocator: Allocator) !void {
     const content = node.content.items;
 
-    const line = switch (node.node_type) {
-        .user_message => try std.fmt.allocPrint(allocator, "> {s}", .{content}),
-        .assistant_text => try allocator.dupe(u8, content),
-        .tool_call => try std.fmt.allocPrint(allocator, "[tool] {s}", .{content}),
-        .tool_result => blk: {
+    switch (node.node_type) {
+        .user_message => {
+            // Split on newlines, prefix first line with "> "
+            var first = true;
+            var rest: []const u8 = content;
+            while (rest.len > 0) {
+                const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                const segment = if (nl) |n| rest[0..n] else rest;
+                const line = if (first)
+                    try std.fmt.allocPrint(allocator, "> {s}", .{segment})
+                else
+                    try allocator.dupe(u8, segment);
+                try lines.append(allocator, line);
+                first = false;
+                rest = if (nl) |n| rest[n + 1 ..] else &.{};
+            }
+            return;
+        },
+        .assistant_text, .status, .custom => {
+            // Split on newlines, each becomes a separate display line
+            var rest: []const u8 = content;
+            while (rest.len > 0) {
+                const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                const segment = if (nl) |n| rest[0..n] else rest;
+                try lines.append(allocator, try allocator.dupe(u8, segment));
+                rest = if (nl) |n| rest[n + 1 ..] else &.{};
+            }
+            if (content.len == 0) {
+                try lines.append(allocator, try allocator.dupe(u8, ""));
+            }
+            return;
+        },
+        .tool_call => {
+            const line = try std.fmt.allocPrint(allocator, "[tool] {s}", .{content});
+            try lines.append(allocator, line);
+            return;
+        },
+        .tool_result => {
             const truncated = if (content.len > max_result_display) content[0..max_result_display] else content;
             const suffix: []const u8 = if (content.len > max_result_display) "..." else "";
-            break :blk try std.fmt.allocPrint(allocator, "  {s}{s}", .{ truncated, suffix });
+            const line = try std.fmt.allocPrint(allocator, "  {s}{s}", .{ truncated, suffix });
+            try lines.append(allocator, line);
+            return;
         },
-        .status => try allocator.dupe(u8, content),
-        .err => try std.fmt.allocPrint(allocator, "error: {s}", .{content}),
-        .separator => try allocator.dupe(u8, "---"),
-        .custom => try allocator.dupe(u8, content),
-    };
-
-    try lines.append(allocator, line);
+        .err => {
+            const line = try std.fmt.allocPrint(allocator, "error: {s}", .{content});
+            try lines.append(allocator, line);
+            return;
+        },
+        .separator => {
+            try lines.append(allocator, try allocator.dupe(u8, "---"));
+            return;
+        },
+    }
 }
 
 // -- Tests -------------------------------------------------------------------
