@@ -16,7 +16,7 @@ const EditInput = struct {
 /// Replace a unique occurrence of old_text with new_text in the given file.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(EditInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input, expected { \"path\": \"...\", \"old_text\": \"...\", \"new_text\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"path\": \"...\", \"old_text\": \"...\", \"new_text\": \"...\" }", .is_error = true, .owned = false };
     };
     defer parsed.deinit();
     const input = parsed.value;
@@ -29,7 +29,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 
     // Guard against underflow when old_text is longer than file content
     if (input.old_text.len > content.len) {
-        return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true };
+        return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
     }
 
     // Count occurrences
@@ -45,7 +45,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     }
 
     if (count == 0) {
-        return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true };
+        return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
     }
 
     if (count > 1) {

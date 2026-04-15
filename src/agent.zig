@@ -274,6 +274,7 @@ fn runLoopStreamingInner(
             try queue.push(.{ .tool_start = duped_name });
 
             const result = try registry.execute(tc.name, tc.input_raw, allocator);
+            defer if (result.owned) allocator.free(result.content);
 
             const duped_result = try allocator.dupe(u8, result.content);
             try queue.push(.{ .tool_result = .{

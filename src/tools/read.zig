@@ -15,7 +15,7 @@ const ReadInput = struct {
 /// Read a file from disk. Returns the text content, truncated to max_lines if the file is long.
 pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
     const parsed = std.json.parseFromSlice(ReadInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input, expected { \"path\": \"...\" }", .is_error = true };
+        return .{ .content = "error: invalid input, expected { \"path\": \"...\" }", .is_error = true, .owned = false };
     };
     defer parsed.deinit();
     const input = parsed.value;
