@@ -118,9 +118,9 @@ fn drawLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const
 
 /// Draw the content of a single buffer into its rect on the screen.
 ///
-/// Renders the buffer's node tree to display lines via the NodeRenderer,
-/// then writes those lines into the screen grid at the leaf's rect position.
-/// Applies padding_h and padding_v from the theme spacing.
+/// Renders the buffer's node tree to styled display lines via the
+/// NodeRenderer, then writes each span into the screen grid with its
+/// resolved style. Applies padding_h and padding_v from the theme spacing.
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
     const rect = leaf.rect;
     if (rect.width == 0 or rect.height == 0) return;
@@ -143,27 +143,28 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
     const content_max_col = rect.x + rect.width;
     const content_max_row = rect.y + rect.height;
 
-    // Write styled lines: iterate spans, resolve each span's style
+    // Write styled lines: iterate spans, applying each span's style
     var cur_row = content_y;
+    const default_fg = self.theme.colors.fg;
 
     for (lines.items) |line| {
         if (cur_row >= content_max_row) break;
         if (cur_row >= self.screen.height) break;
 
         var col = content_x;
-        for (line.spans) |styled_span| {
-            const resolved = Theme.resolve(styled_span.style, self.theme);
+        for (line.spans) |s| {
+            const resolved = Theme.resolve(s.style, self.theme);
             const pos = self.screen.writeStrWrapped(
                 cur_row,
                 col,
                 content_max_row,
                 content_max_col,
-                styled_span.text,
+                s.text,
                 resolved.screen_style,
-                resolved.fg,
+                if (s.style.fg != null) resolved.fg else default_fg,
             );
-            col = pos.col;
             cur_row = pos.row;
+            col = pos.col;
         }
         // Move to next line after this content
         cur_row += 1;
@@ -434,7 +435,7 @@ test "composite draws vertical split border from theme" {
     try std.testing.expectEqual(theme.borders.vertical, border_cell.codepoint);
 }
 
-test "composite draws horizontal split border from theme" {
+test "composite draws horizontal split border" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 12);
     defer screen.deinit();
@@ -470,7 +471,6 @@ test "composite draws horizontal split border from theme" {
     const first_rect = tab.root.split.first.leaf.rect;
     const border_row = first_rect.y + first_rect.height;
 
-    // Border character should come from theme.borders.horizontal
     const border_cell = screen.getCellConst(border_row, first_rect.x);
     try std.testing.expectEqual(theme.borders.horizontal, border_cell.codepoint);
 }

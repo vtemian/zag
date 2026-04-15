@@ -157,7 +157,8 @@ fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
 }
 
 /// Draw the input/status line on the last row, overwriting the compositor's status line.
-fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8, fps: u32) void {
+/// Uses the theme's input_prompt, input_text, and status highlight groups.
+fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8, fps: u32, t: *const Theme) void {
     if (screen.height == 0) return;
     const input_row = screen.height - 1;
 
@@ -172,11 +173,13 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
     }
 
     if (status_msg.len > 0) {
-        const status_style = Screen.Style{ .dim = true };
-        _ = screen.writeStr(input_row, 0, status_msg, status_style, .{ .palette = 3 });
+        const resolved = Theme.resolve(t.highlights.status, t);
+        _ = screen.writeStr(input_row, 0, status_msg, resolved.screen_style, resolved.fg);
     } else {
-        const c = screen.writeStr(input_row, 0, "> ", .{ .bold = true }, .{ .palette = 2 });
-        _ = screen.writeStr(input_row, c, input_buf_ptr[0..input_len], .{}, .default);
+        const prompt_resolved = Theme.resolve(t.highlights.input_prompt, t);
+        const text_resolved = Theme.resolve(t.highlights.input_text, t);
+        const c = screen.writeStr(input_row, 0, "> ", prompt_resolved.screen_style, prompt_resolved.fg);
+        _ = screen.writeStr(input_row, c, input_buf_ptr[0..input_len], text_resolved.screen_style, text_resolved.fg);
     }
 
     // Show render time and FPS right-aligned when metrics are enabled
@@ -188,9 +191,9 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
             std.fmt.bufPrint(&time_buf, "{d:.1}ms {d}fps", .{ frame_ms, fps }) catch return
         else
             std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
-        const dim_style = Screen.Style{ .dim = true };
+        const status_resolved = Theme.resolve(t.highlights.status, t);
         const time_col = screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
-        _ = screen.writeStr(input_row, time_col, time_str, dim_style, .{ .palette = 3 });
+        _ = screen.writeStr(input_row, time_col, time_str, status_resolved.screen_style, status_resolved.fg);
     }
 }
 
@@ -208,11 +211,12 @@ pub fn main() !void {
         if (build_options.metrics) .{ .inner = gpa.allocator() } else {};
     const allocator = if (build_options.metrics) counting.allocator() else gpa.allocator();
 
-    // Module-level buffer and renderer
+    // Module-level buffer, renderer, and theme
     buffer_alloc = allocator;
     buffer = try Buffer.init(allocator, 0, "session");
     defer buffer.deinit();
     node_renderer = NodeRenderer.initDefault();
+    theme = Theme.defaultTheme();
 
     // Initialize layout with the session buffer in the first tab
     layout = Layout.init(allocator);
@@ -315,7 +319,7 @@ pub fn main() !void {
 
     // -- Initial render ------------------------------------------------------
     compositor.composite(&layout);
-    drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps);
+    drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps, &theme);
     try screen.render(stdout_file);
 
     while (running) {
@@ -490,7 +494,7 @@ pub fn main() !void {
                                 // Show status while agent is working
                                 status_msg = "thinking...";
                                 compositor.composite(&layout);
-                                drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps);
+                                drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps, &theme);
                                 try screen.render(stdout_file);
 
                                 // Reset tool_call tracking for this turn
@@ -546,7 +550,7 @@ pub fn main() !void {
         {
             var draw_input_span = trace.span("draw_input");
             defer draw_input_span.end();
-            drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps);
+            drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps, &theme);
         }
         {
             var render_span = trace.span("render");
