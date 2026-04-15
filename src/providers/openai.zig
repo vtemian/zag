@@ -27,6 +27,7 @@ pub const OpenAiProvider = struct {
 
     const vtable: Provider.VTable = .{
         .call = callImpl,
+        .call_streaming = callStreamingImpl,
         .name = "openai",
     };
 
@@ -47,7 +48,6 @@ pub const OpenAiProvider = struct {
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        // Build the Authorization header value: "Bearer {key}"
         const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
         defer allocator.free(auth_value);
 
@@ -57,6 +57,34 @@ pub const OpenAiProvider = struct {
         defer allocator.free(response_bytes);
 
         return parseResponse(response_bytes, allocator);
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        system_prompt: []const u8,
+        messages: []const types.Message,
+        tool_definitions: []const types.ToolDefinition,
+        allocator: Allocator,
+        on_event: *const fn (event: llm.StreamEvent) void,
+        cancel: *std.atomic.Value(bool),
+    ) anyerror!types.LlmResponse {
+        const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
+
+        const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
+        defer allocator.free(body);
+
+        const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
+        defer allocator.free(auth_value);
+
+        // Fetch the complete SSE response body, then parse events from it.
+        // True incremental streaming requires deeper integration with the
+        // Zig 0.15 HTTP client's reader API (future improvement).
+        const response_bytes = try llm.httpPostJson(self.base_url, body, &.{
+            .{ .name = "Authorization", .value = auth_value },
+        }, allocator);
+        defer allocator.free(response_bytes);
+
+        return parseSseResponse(response_bytes, allocator, on_event, cancel);
     }
 };
 
@@ -69,6 +97,28 @@ fn buildRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
+    return buildRequestBodyInner(model, system_prompt, messages, tool_definitions, false, allocator);
+}
+
+/// Same as buildRequestBody but with "stream": true.
+fn buildStreamingRequestBody(
+    model: []const u8,
+    system_prompt: []const u8,
+    messages: []const types.Message,
+    tool_definitions: []const types.ToolDefinition,
+    allocator: Allocator,
+) ![]const u8 {
+    return buildRequestBodyInner(model, system_prompt, messages, tool_definitions, true, allocator);
+}
+
+fn buildRequestBodyInner(
+    model: []const u8,
+    system_prompt: []const u8,
+    messages: []const types.Message,
+    tool_definitions: []const types.ToolDefinition,
+    stream: bool,
+    allocator: Allocator,
+) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
     const w = &out.writer;
 
@@ -77,6 +127,11 @@ fn buildRequestBody(
     // model
     try w.print("\"model\":\"{s}\",", .{model});
     try w.print("\"max_tokens\":{d},", .{default_max_tokens});
+
+    // stream
+    if (stream) {
+        try w.writeAll("\"stream\":true,");
+    }
 
     // messages: system prompt as first message, then conversation
     try w.writeAll("\"messages\":[");
@@ -112,16 +167,7 @@ fn buildRequestBody(
 }
 
 /// Writes a single message in OpenAI format.
-///
-/// Handles the format conversion from Zag's internal content blocks:
-/// - ContentBlock.text on user/assistant -> "content" string field
-/// - ContentBlock.tool_use on assistant -> "tool_calls" array
-/// - ContentBlock.tool_result -> separate "role":"tool" messages
-///
-/// A single Zag message with tool_results produces multiple OpenAI messages
-/// (one per tool result), so this may write more than one JSON object.
 fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
-    // Categorize content blocks
     var has_text = false;
     var has_tool_use = false;
     var has_tool_result = false;
@@ -134,7 +180,6 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
         }
     }
 
-    // Tool results: each becomes a separate {"role":"tool",...} message
     if (has_tool_result) {
         var first = true;
         for (msg.content) |block| {
@@ -154,14 +199,11 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
         return;
     }
 
-    // Assistant message with tool calls
     if (has_tool_use) {
         try w.writeAll("{\"role\":\"assistant\"");
 
-        // Include text content if present alongside tool calls
         if (has_text) {
             try w.writeAll(",\"content\":");
-            // Concatenate all text blocks
             var first_text = true;
             for (msg.content) |block| {
                 switch (block) {
@@ -194,7 +236,6 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
         return;
     }
 
-    // Plain user or assistant message with text content
     const role_str = switch (msg.role) {
         .user => "user",
         .assistant => "assistant",
@@ -202,19 +243,16 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
 
     try w.print("{{\"role\":\"{s}\",\"content\":", .{role_str});
 
-    // Concatenate text blocks into a single string
     if (msg.content.len == 1) {
         switch (msg.content[0]) {
             .text => |t| try std.json.Stringify.value(t.text, .{}, w),
             else => try w.writeAll("\"\""),
         }
     } else {
-        // Multiple text blocks: concatenate
         try w.writeAll("\"");
         for (msg.content) |block| {
             switch (block) {
                 .text => |t| {
-                    // Write text with JSON escaping (but inside an already-opened string)
                     for (t.text) |c| {
                         switch (c) {
                             '"' => try w.writeAll("\\\""),
@@ -242,20 +280,17 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
 }
 
 /// Parses a raw JSON response from OpenAI's Chat Completions API into a typed LlmResponse.
-/// Allocates content block strings that the caller must free.
 fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmResponse {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
 
-    // Parse choices[0]
     const choices = root.get("choices") orelse return error.MalformedResponse;
     const choices_array = choices.array;
     if (choices_array.items.len == 0) return error.MalformedResponse;
 
     const choice = choices_array.items[0].object;
 
-    // Parse finish_reason: "stop" -> .end_turn, "tool_calls" -> .tool_use, "length" -> .max_tokens
     const stop_reason: types.StopReason = blk: {
         const fr = choice.get("finish_reason") orelse break :blk .end_turn;
         if (fr == .string) {
@@ -266,7 +301,6 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         break :blk .end_turn;
     };
 
-    // Parse usage
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
     if (root.get("usage")) |usage_val| {
@@ -275,7 +309,6 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         if (usage.get("completion_tokens")) |ct| output_tokens = @intCast(ct.integer);
     }
 
-    // Parse content blocks from message
     const message = choice.get("message") orelse return error.MalformedResponse;
     const msg_obj = message.object;
 
@@ -285,7 +318,6 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         blocks.deinit(allocator);
     }
 
-    // Text content: choices[0].message.content (string or null)
     if (msg_obj.get("content")) |content_val| {
         if (content_val == .string) {
             const text = try allocator.dupe(u8, content_val.string);
@@ -294,7 +326,6 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         }
     }
 
-    // Tool calls: choices[0].message.tool_calls array
     if (msg_obj.get("tool_calls")) |tc_val| {
         for (tc_val.array.items) |tc_item| {
             const tc = tc_item.object;
@@ -305,7 +336,6 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
             const name = try allocator.dupe(u8, func.get("name").?.string);
             errdefer allocator.free(name);
 
-            // arguments is a JSON string in OpenAI's format
             const args_str = func.get("arguments").?.string;
             const input_raw = try allocator.dupe(u8, args_str);
             errdefer allocator.free(input_raw);
@@ -323,6 +353,166 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         .stop_reason = stop_reason,
         .input_tokens = input_tokens,
         .output_tokens = output_tokens,
+    };
+}
+
+/// State for accumulating a tool call during OpenAI streaming.
+const StreamingToolCall = struct {
+    id: std.ArrayList(u8),
+    name: std.ArrayList(u8),
+    arguments: std.ArrayList(u8),
+
+    fn deinit(self: *StreamingToolCall, alloc: Allocator) void {
+        self.id.deinit(alloc);
+        self.name.deinit(alloc);
+        self.arguments.deinit(alloc);
+    }
+};
+
+/// Parse SSE events from a complete OpenAI streaming response body.
+fn parseSseResponse(
+    response_bytes: []const u8,
+    allocator: Allocator,
+    on_event: *const fn (event: llm.StreamEvent) void,
+    cancel: *std.atomic.Value(bool),
+) !types.LlmResponse {
+    var stop_reason: types.StopReason = .end_turn;
+
+    var text_content: std.ArrayList(u8) = .empty;
+    defer text_content.deinit(allocator);
+
+    var tool_calls: std.ArrayList(StreamingToolCall) = .empty;
+    defer {
+        for (tool_calls.items) |*tc| tc.deinit(allocator);
+        tool_calls.deinit(allocator);
+    }
+
+    // Parse SSE lines from complete body
+    var line_start: usize = 0;
+    for (response_bytes, 0..) |byte, i| {
+        if (byte == '\n') {
+            const line = blk: {
+                var end = i;
+                if (end > line_start and response_bytes[end - 1] == '\r') end -= 1;
+                break :blk response_bytes[line_start..end];
+            };
+            line_start = i + 1;
+
+            if (cancel.load(.acquire)) break;
+
+            if (!std.mem.startsWith(u8, line, "data: ")) continue;
+            const data = line["data: ".len..];
+
+            if (std.mem.eql(u8, data, "[DONE]")) break;
+
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch continue;
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+
+            const choices = obj.get("choices") orelse continue;
+            if (choices.array.items.len == 0) continue;
+            const choice = choices.array.items[0].object;
+
+            // Check finish_reason
+            if (choice.get("finish_reason")) |fr| {
+                if (fr == .string) {
+                    if (std.mem.eql(u8, fr.string, "stop"))
+                        stop_reason = .end_turn
+                    else if (std.mem.eql(u8, fr.string, "tool_calls"))
+                        stop_reason = .tool_use
+                    else if (std.mem.eql(u8, fr.string, "length"))
+                        stop_reason = .max_tokens;
+                }
+            }
+
+            // Process delta
+            if (choice.get("delta")) |delta_val| {
+                const delta = delta_val.object;
+
+                if (delta.get("content")) |content_val| {
+                    if (content_val == .string) {
+                        try text_content.appendSlice(allocator, content_val.string);
+                        on_event(.{ .text_delta = content_val.string });
+                    }
+                }
+
+                if (delta.get("tool_calls")) |tc_val| {
+                    for (tc_val.array.items) |tc_item| {
+                        const tc = tc_item.object;
+                        const index_val = tc.get("index") orelse continue;
+                        const index: usize = @intCast(index_val.integer);
+
+                        while (tool_calls.items.len <= index) {
+                            try tool_calls.append(allocator, .{
+                                .id = .empty,
+                                .name = .empty,
+                                .arguments = .empty,
+                            });
+                        }
+
+                        var tool_call = &tool_calls.items[index];
+
+                        if (tc.get("id")) |id_val| {
+                            if (id_val == .string) {
+                                try tool_call.id.appendSlice(allocator, id_val.string);
+                            }
+                        }
+
+                        if (tc.get("function")) |func_val| {
+                            const func = func_val.object;
+                            if (func.get("name")) |name_val| {
+                                if (name_val == .string) {
+                                    const was_empty = tool_call.name.items.len == 0;
+                                    try tool_call.name.appendSlice(allocator, name_val.string);
+                                    if (was_empty) {
+                                        on_event(.{ .tool_start = name_val.string });
+                                    }
+                                }
+                            }
+                            if (func.get("arguments")) |args_val| {
+                                if (args_val == .string) {
+                                    try tool_call.arguments.appendSlice(allocator, args_val.string);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Assemble final LlmResponse
+    var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+    errdefer {
+        for (result_blocks.items) |block| block.freeOwned(allocator);
+        result_blocks.deinit(allocator);
+    }
+
+    if (text_content.items.len > 0) {
+        const text = try allocator.dupe(u8, text_content.items);
+        errdefer allocator.free(text);
+        try result_blocks.append(allocator, .{ .text = .{ .text = text } });
+    }
+
+    for (tool_calls.items) |*tc| {
+        const id = try allocator.dupe(u8, tc.id.items);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, tc.name.items);
+        errdefer allocator.free(name);
+        const input_raw = try allocator.dupe(u8, tc.arguments.items);
+        errdefer allocator.free(input_raw);
+        try result_blocks.append(allocator, .{ .tool_use = .{
+            .id = id,
+            .name = name,
+            .input_raw = input_raw,
+        } });
+    }
+
+    return .{
+        .content = try result_blocks.toOwnedSlice(allocator),
+        .stop_reason = stop_reason,
+        .input_tokens = 0,
+        .output_tokens = 0,
     };
 }
 
@@ -354,17 +544,14 @@ test "buildRequestBody produces valid JSON with system as first message" {
     const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, allocator);
     defer allocator.free(body);
 
-    // Verify the body is valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
     const root = parsed.value.object;
-
-    // Model and max_tokens
     try std.testing.expectEqualStrings("gpt-4o", root.get("model").?.string);
     try std.testing.expectEqual(@as(i64, default_max_tokens), root.get("max_tokens").?.integer);
+    try std.testing.expect(root.get("stream") == null);
 
-    // Messages: first should be system, second should be user
     const msgs = root.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 2), msgs.items.len);
     try std.testing.expectEqualStrings("system", msgs.items[0].object.get("role").?.string);
@@ -374,9 +561,7 @@ test "buildRequestBody produces valid JSON with system as first message" {
 
 test "buildRequestBody formats tools with function wrapper" {
     const allocator = std.testing.allocator;
-
     const messages = [_]types.Message{};
-
     const tool_defs = [_]types.ToolDefinition{
         .{
             .name = "bash",
@@ -402,7 +587,6 @@ test "buildRequestBody formats tools with function wrapper" {
     try std.testing.expectEqualStrings("bash", func.get("name").?.string);
     try std.testing.expectEqualStrings("Run a command", func.get("description").?.string);
 
-    // parameters should be the parsed schema object
     const params = func.get("parameters").?.object;
     try std.testing.expectEqualStrings("object", params.get("type").?.string);
 }
@@ -419,8 +603,21 @@ test "buildRequestBody omits tools when none provided" {
     defer parsed.deinit();
 
     const root = parsed.value.object;
-    // tools key should not be present
     try std.testing.expect(root.get("tools") == null);
+}
+
+test "buildStreamingRequestBody includes stream:true" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("stream").?.bool == true);
 }
 
 test "parseResponse parses text-only response" {
@@ -512,41 +709,29 @@ test "parseResponse parses tool_calls response" {
 test "parseResponse maps finish_reason correctly" {
     const allocator = std.testing.allocator;
 
-    // Test "stop" -> .end_turn
     {
-        const json =
-            \\{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
-        ;
+        const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
         const r = try parseResponse(json, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.end_turn, r.stop_reason);
     }
 
-    // Test "length" -> .max_tokens
     {
-        const json =
-            \\{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
-        ;
+        const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
         const r = try parseResponse(json, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.max_tokens, r.stop_reason);
     }
 
-    // Test "tool_calls" -> .tool_use
     {
-        const json =
-            \\{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
-        ;
+        const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
         const r = try parseResponse(json, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.tool_use, r.stop_reason);
     }
 
-    // Test unknown -> .end_turn
     {
-        const json =
-            \\{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"something_new"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
-        ;
+        const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"something_new\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
         const r = try parseResponse(json, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.end_turn, r.stop_reason);
@@ -555,14 +740,9 @@ test "parseResponse maps finish_reason correctly" {
 
 test "parseResponse handles missing usage gracefully" {
     const allocator = std.testing.allocator;
-
-    const json =
-        \\{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
-    ;
-
+    const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
     const response = try parseResponse(json, allocator);
     defer response.deinit(allocator);
-
     try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
 }
@@ -575,9 +755,7 @@ test "parseResponse returns error for malformed JSON" {
 
 test "parseResponse returns error for empty choices" {
     const allocator = std.testing.allocator;
-    const json =
-        \\{"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0}}
-    ;
+    const json = "{\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}";
     const result = parseResponse(json, allocator);
     try std.testing.expectError(error.MalformedResponse, result);
 }
@@ -645,17 +823,13 @@ test "writeMessage handles tool_use content blocks" {
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
-    // Verify it's valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
-
-    // content should be null (no text blocks)
     try std.testing.expect(root.get("content").? == .null);
 
-    // tool_calls array
     const tc = root.get("tool_calls").?.array;
     try std.testing.expectEqual(@as(usize, 1), tc.items.len);
     try std.testing.expectEqualStrings("call_001", tc.items[0].object.get("id").?.string);
@@ -688,7 +862,6 @@ test "writeMessage handles tool_result content blocks" {
     const json_str = try out.toOwnedSlice();
     defer allocator.free(json_str);
 
-    // The output is two comma-separated JSON objects, so wrap in array to parse
     const wrapped = try std.fmt.allocPrint(allocator, "[{s}]", .{json_str});
     defer allocator.free(wrapped);
 
@@ -698,13 +871,11 @@ test "writeMessage handles tool_result content blocks" {
     const arr = parsed.value.array;
     try std.testing.expectEqual(@as(usize, 2), arr.items.len);
 
-    // First tool result
     const first = arr.items[0].object;
     try std.testing.expectEqualStrings("tool", first.get("role").?.string);
     try std.testing.expectEqualStrings("call_001", first.get("tool_call_id").?.string);
     try std.testing.expectEqualStrings("file contents here", first.get("content").?.string);
 
-    // Second tool result
     const second = arr.items[1].object;
     try std.testing.expectEqualStrings("tool", second.get("role").?.string);
     try std.testing.expectEqualStrings("call_002", second.get("tool_call_id").?.string);
