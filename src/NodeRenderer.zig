@@ -135,6 +135,66 @@ fn emptyLine(allocator: Allocator) !StyledLine {
     return .{ .spans = spans };
 }
 
+/// Split content on newlines and append one StyledLine per segment.
+/// If prefix is provided, the first line gets a two-span layout (prefix + segment).
+/// Subsequent lines and all lines without a prefix get single-span layout.
+/// If content is empty, appends one empty line.
+fn splitAndAppend(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    content: []const u8,
+    style: Theme.CellStyle,
+    prefix: ?[]const u8,
+    prefix_style: ?Theme.CellStyle,
+) !void {
+    var first = true;
+    var rest: []const u8 = content;
+    while (rest.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const segment = if (nl) |n| rest[0..n] else rest;
+        const line = if (first and prefix != null)
+            try twoSpanLine(allocator, prefix.?, prefix_style.?, segment, style)
+        else
+            try singleSpanLine(allocator, segment, style);
+        try lines.append(allocator, line);
+        first = false;
+        rest = if (nl) |n| rest[n + 1 ..] else &.{};
+    }
+    if (content.len == 0) {
+        try lines.append(allocator, try singleSpanLine(allocator, "", style));
+    }
+}
+
+/// Split content on newlines, prepending an indent string to each line.
+fn splitAndAppendIndented(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    content: []const u8,
+    style: Theme.CellStyle,
+    indent_count: u16,
+) !void {
+    var rest: []const u8 = content;
+    while (rest.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const segment = if (nl) |n| rest[0..n] else rest;
+
+        const indent_str = try allocator.alloc(u8, indent_count);
+        @memset(indent_str, ' ');
+
+        const owned_seg = try allocator.dupe(u8, segment);
+        errdefer allocator.free(owned_seg);
+        const spans = try allocator.alloc(StyledSpan, 2);
+        spans[0] = .{ .text = indent_str, .style = .{} };
+        spans[1] = .{ .text = owned_seg, .style = style };
+        try lines.append(allocator, .{ .spans = spans });
+
+        rest = if (nl) |n| rest[n + 1 ..] else &.{};
+    }
+    if (content.len == 0) {
+        try lines.append(allocator, try singleSpanLine(allocator, "", style));
+    }
+}
+
 /// Built-in renderer: produces one or more StyledLines per node using type-specific formatting.
 /// Multi-line content (containing \n) is split into separate display lines.
 fn renderDefault(
@@ -148,47 +208,16 @@ fn renderDefault(
     switch (node.node_type) {
         .user_message => {
             const style = theme.highlights.user_message;
-            var first = true;
-            var rest: []const u8 = content;
-            while (rest.len > 0) {
-                const nl = std.mem.indexOfScalar(u8, rest, '\n');
-                const segment = if (nl) |n| rest[0..n] else rest;
-                const line = if (first)
-                    try twoSpanLine(allocator, "> ", style, segment, style)
-                else
-                    try singleSpanLine(allocator, segment, style);
-                try lines.append(allocator, line);
-                first = false;
-                rest = if (nl) |n| rest[n + 1 ..] else &.{};
-            }
+            try splitAndAppend(lines, allocator, content, style, "> ", style);
             return;
         },
         .assistant_text => {
-            const style = theme.highlights.assistant_text;
-            var rest: []const u8 = content;
-            while (rest.len > 0) {
-                const nl = std.mem.indexOfScalar(u8, rest, '\n');
-                const segment = if (nl) |n| rest[0..n] else rest;
-                try lines.append(allocator, try singleSpanLine(allocator, segment, style));
-                rest = if (nl) |n| rest[n + 1 ..] else &.{};
-            }
-            if (content.len == 0) {
-                try lines.append(allocator, try singleSpanLine(allocator, "", style));
-            }
+            try splitAndAppend(lines, allocator, content, theme.highlights.assistant_text, null, null);
             return;
         },
         .status, .custom => {
             const style = if (node.node_type == .status) theme.highlights.status else Theme.CellStyle{};
-            var rest: []const u8 = content;
-            while (rest.len > 0) {
-                const nl = std.mem.indexOfScalar(u8, rest, '\n');
-                const segment = if (nl) |n| rest[0..n] else rest;
-                try lines.append(allocator, try singleSpanLine(allocator, segment, style));
-                rest = if (nl) |n| rest[n + 1 ..] else &.{};
-            }
-            if (content.len == 0) {
-                try lines.append(allocator, try singleSpanLine(allocator, "", style));
-            }
+            try splitAndAppend(lines, allocator, content, style, null, null);
             return;
         },
         .tool_call => {
@@ -197,21 +226,7 @@ fn renderDefault(
             return;
         },
         .tool_result => {
-            const indent_count = theme.spacing.indent;
-            const indent_str = try allocator.alloc(u8, indent_count);
-            @memset(indent_str, ' ');
-            errdefer allocator.free(indent_str);
-
-            const truncated = if (content.len > max_result_display) content[0..max_result_display] else content;
-            const suffix: []const u8 = if (content.len > max_result_display) "..." else "";
-            const result_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ truncated, suffix });
-            errdefer allocator.free(result_text);
-
-            const style = theme.highlights.tool_result;
-            const spans = try allocator.alloc(StyledSpan, 2);
-            spans[0] = .{ .text = indent_str, .style = .{} };
-            spans[1] = .{ .text = result_text, .style = style };
-            try lines.append(allocator, .{ .spans = spans });
+            try splitAndAppendIndented(lines, allocator, content, theme.highlights.tool_result, theme.spacing.indent);
             return;
         },
         .err => {
@@ -372,10 +387,10 @@ test "renderDefault tool_call" {
     try std.testing.expectEqualStrings("bash", lines.items[0].spans[1].text);
 }
 
-test "renderDefault tool_result truncation" {
+test "renderDefault tool_result shows full content" {
     const allocator = std.testing.allocator;
 
-    // Content longer than 80 chars
+    // Content longer than 80 chars, no longer truncated
     const long_text = "a" ** 120;
     var content: std.ArrayList(u8) = .empty;
     try content.appendSlice(allocator, long_text);
@@ -397,9 +412,8 @@ test "renderDefault tool_result truncation" {
     const text = try styledLineText(lines.items[0], allocator);
     defer allocator.free(text);
 
-    // indent (2) + 80 chars + "..." (3) = 85
-    try std.testing.expectEqual(@as(usize, 85), text.len);
-    try std.testing.expect(std.mem.endsWith(u8, text, "..."));
+    // indent (2) + full 120 chars = 122
+    try std.testing.expectEqual(@as(usize, 122), text.len);
     try std.testing.expect(std.mem.startsWith(u8, text, "  "));
 
     // Two spans: indent (unstyled) and result content
