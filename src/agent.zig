@@ -62,7 +62,7 @@ pub fn runLoop(
     user_text: []const u8,
     messages: *std.ArrayList(types.Message),
     registry: *const tools_mod.Registry,
-    api_key: []const u8,
+    provider: llm.Provider,
     allocator: Allocator,
     on_output: ?OutputCallback,
 ) !void {
@@ -80,12 +80,10 @@ pub fn runLoop(
 
     // Inner loop: call LLM, execute tools, repeat
     while (true) {
-        // Call Claude
-        const response = llm.call(
+        const response = provider.call(
             system_prompt,
             messages.items,
             tool_defs,
-            api_key,
             allocator,
         ) catch |err| {
             log.err("LLM call failed: {s}", .{@errorName(err)});

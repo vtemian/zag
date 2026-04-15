@@ -1,8 +1,7 @@
 //! LLM provider interface and routing.
 //!
 //! Defines the runtime-polymorphic Provider interface that all LLM backends
-//! implement, plus the backward-compatible `call` function for the current
-//! Anthropic-only agent loop.
+//! implement, plus the model string parser and provider factory.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -46,23 +45,6 @@ pub const Provider = struct {
         return self.vtable.call(self.ptr, system_prompt, messages, tool_definitions, allocator);
     }
 };
-
-/// Backward-compatible convenience function.
-/// Calls the Anthropic provider directly with the default model.
-/// Will be removed once agent.zig switches to the Provider interface.
-pub fn call(
-    system_prompt: []const u8,
-    messages: []const types.Message,
-    tool_definitions: []const types.ToolDefinition,
-    api_key: []const u8,
-    allocator: Allocator,
-) !types.LlmResponse {
-    var ap: anthropic.AnthropicProvider = .{
-        .api_key = api_key,
-        .model = "claude-sonnet-4-20250514",
-    };
-    return ap.provider().call(system_prompt, messages, tool_definitions, allocator);
-}
 
 /// Parsed model string components.
 pub const ModelSpec = struct {
