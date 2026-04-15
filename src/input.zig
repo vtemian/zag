@@ -58,7 +58,7 @@ pub const KeyEvent = struct {
         delete,
         /// Insert key.
         insert,
-        /// Function key (F1–F24).
+        /// Function key (F1 to F24).
         function: u8,
     };
 
@@ -148,7 +148,7 @@ pub fn parseBytes(buf: []const u8) ?Event {
         return Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } };
     }
 
-    // Ctrl+key combinations (0x01–0x1a, excluding special cases)
+    // Ctrl+key combinations (0x01 to 0x1a, excluding special cases)
     if (first >= 0x01 and first <= 0x1a) {
         return switch (first) {
             0x09 => Event{ .key = .{ .key = .tab, .modifiers = KeyEvent.no_modifiers } },

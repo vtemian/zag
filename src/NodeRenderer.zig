@@ -2,7 +2,7 @@
 //!
 //! Provides default renderers for each node type and a registry that allows
 //! overriding renderers per node type (for plugin support). Renderers produce
-//! StyledLines — each line is a sequence of styled spans that the Compositor
+//! StyledLines: each line is a sequence of styled spans that the Compositor
 //! maps to screen cells.
 
 const std = @import("std");
@@ -25,9 +25,6 @@ pub const RenderFn = *const fn (
     allocator: Allocator,
     theme: *const Theme,
 ) anyerror!void;
-
-/// Maximum length for tool_result content before truncation.
-const max_result_display = 80;
 
 /// Custom renderer overrides keyed by node type name.
 overrides: std.StringHashMap(RenderFn),
