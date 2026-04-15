@@ -91,6 +91,9 @@ pub const Tool = struct {
     execute: *const fn (input_raw: []const u8, allocator: Allocator) anyerror!ToolResult,
 };
 
+/// Maximum file size in bytes that tools will read into memory (10 MB).
+pub const max_file_bytes = 10 * 1024 * 1024;
+
 /// Why the LLM stopped generating.
 pub const StopReason = enum {
     /// The model naturally finished its turn.

@@ -7,8 +7,6 @@ const std = @import("std");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
 
-const max_file_bytes = 10 * 1024 * 1024;
-
 const EditInput = struct {
     path: []const u8,
     old_text: []const u8,
@@ -23,7 +21,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
     defer parsed.deinit();
     const input = parsed.value;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, input.path, max_file_bytes) catch |err| {
+    const content = std.fs.cwd().readFileAlloc(allocator, input.path, types.max_file_bytes) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
