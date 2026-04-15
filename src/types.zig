@@ -71,11 +71,8 @@ pub const Message = struct {
                     allocator.free(tu.input_raw);
                 },
                 .tool_result => |tr| {
-                    // tool_result content may be a string literal (not heap allocated)
-                    // or a heap-allocated string. We only free heap-allocated ones.
-                    // For safety, we skip freeing here since tool results may point
-                    // to static error strings or allocator-owned strings managed elsewhere.
-                    _ = tr;
+                    allocator.free(tr.tool_use_id);
+                    allocator.free(tr.content);
                 },
             }
         }

@@ -147,9 +147,15 @@ pub fn runLoop(
                 emit(.tool_result, result.content);
             }
 
+            // Dupe content so the Message owns all strings and can free them
+            const owned_content = try allocator.dupe(u8, result.content);
+            errdefer allocator.free(owned_content);
+            const owned_id = try allocator.dupe(u8, tc.id);
+            errdefer allocator.free(owned_id);
+
             try result_blocks.append(allocator, .{ .tool_result = .{
-                .tool_use_id = tc.id,
-                .content = result.content,
+                .tool_use_id = owned_id,
+                .content = owned_content,
                 .is_error = result.is_error,
             } });
         }
