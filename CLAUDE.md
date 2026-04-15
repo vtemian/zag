@@ -120,6 +120,8 @@ src/
     anthropic.zig   Anthropic Messages API provider
     openai.zig      OpenAI Chat Completions provider
   types.zig         Message, ContentBlock, ToolCall, ToolResult
+  SseParser.zig     SSE event parser for streaming HTTP responses
+  AgentThread.zig   background agent thread with event queue
   Buffer.zig        structured node tree for content
   NodeRenderer.zig  type-specific node rendering
   Layout.zig        binary tree window system (splits, tabs, focus)
