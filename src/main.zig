@@ -176,6 +176,17 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
         const c = screen.writeStr(input_row, 0, "> ", .{ .bold = true }, .{ .palette = 2 });
         _ = screen.writeStr(input_row, c, input_buf_ptr[0..input_len], .{}, .default);
     }
+
+    // Show frame time right-aligned on the input line when metrics are enabled
+    if (trace.enabled) {
+        const frame_us = trace.getLastFrameTimeUs();
+        const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
+        var time_buf: [16]u8 = undefined;
+        const time_str = std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
+        const dim_style = Screen.Style{ .dim = true };
+        const time_col = screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
+        _ = screen.writeStr(input_row, time_col, time_str, dim_style, .{ .palette = 3 });
+    }
 }
 
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
