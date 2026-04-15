@@ -300,11 +300,21 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         try writer.writeAll("\x1b[?2026l");
     }
 
-    // Single write to stdout
+    // Single write to stdout, retrying on WouldBlock
     {
         var write_span = trace.span("write");
         defer write_span.endWithArgs(.{ .bytes = buf.items.len });
-        try file.writeAll(buf.items);
+        var written: usize = 0;
+        while (written < buf.items.len) {
+            written += file.write(buf.items[written..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    // Output buffer full; brief pause then retry
+                    std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     // Copy current to previous for next frame's diff

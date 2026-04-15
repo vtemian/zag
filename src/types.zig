@@ -58,6 +58,29 @@ pub const Message = struct {
     role: Role,
     /// The content blocks that make up this message.
     content: []const ContentBlock,
+
+    /// Free all owned strings inside this message's content blocks,
+    /// then free the content slice itself.
+    pub fn deinit(self: Message, allocator: Allocator) void {
+        for (self.content) |block| {
+            switch (block) {
+                .text => |t| allocator.free(t.text),
+                .tool_use => |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input_raw);
+                },
+                .tool_result => |tr| {
+                    // tool_result content may be a string literal (not heap allocated)
+                    // or a heap-allocated string. We only free heap-allocated ones.
+                    // For safety, we skip freeing here since tool results may point
+                    // to static error strings or allocator-owned strings managed elsewhere.
+                    _ = tr;
+                },
+            }
+        }
+        allocator.free(self.content);
+    }
 };
 
 /// The output of a tool execution, before it is wrapped into a ContentBlock.
