@@ -6,6 +6,7 @@
 const std = @import("std");
 const posix = std.posix;
 const agent = @import("agent.zig");
+const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 const input_mod = @import("input.zig");
@@ -232,14 +233,20 @@ pub fn main() !void {
         extra_buffers.deinit(allocator);
     }
 
-    // Get API key
-    const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch {
-        // Can't use TUI yet; print to stderr and exit
+    // Read model string and create provider
+    const model_str = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
+        try allocator.dupe(u8, "anthropic:claude-sonnet-4-20250514");
+    defer allocator.free(model_str);
+
+    var provider_result = llm.createProvider(model_str, allocator) catch |err| {
         const stderr = std.fs.File.stderr();
-        stderr.writeAll("error: ANTHROPIC_API_KEY not set\n") catch {};
+        var err_buf: [256]u8 = undefined;
+        var w = stderr.writer(&err_buf);
+        w.interface.print("error: failed to create provider: {s}\n", .{@errorName(err)}) catch {};
+        w.interface.flush() catch {};
         return;
     };
-    defer allocator.free(api_key);
+    defer provider_result.deinit();
 
     // Initialize tool registry
     var registry = try tools.createDefaultRegistry(allocator);
@@ -297,11 +304,16 @@ pub fn main() !void {
 
     // Welcome message
     try appendOutputText("Welcome to zag - a composable agent environment");
+    {
+        var model_msg_buf: [128]u8 = undefined;
+        const model_msg = std.fmt.bufPrint(&model_msg_buf, "model: {s}", .{model_str}) catch "model: unknown";
+        try appendOutputText(model_msg);
+    }
     try appendOutputText("cwd: ");
     try appendOutputText(cwd);
     try appendOutputText("");
-    try appendOutputText("Type a message and press Enter to chat with Claude.");
-    try appendOutputText("Ctrl+C or /quit to exit. Ctrl+W then v/s/q/h/j/k/l for windows.");
+    try appendOutputText("Type a message and press Enter. Ctrl+C or /quit to exit.");
+    try appendOutputText("Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.");
     try appendOutputText("");
 
     // -- Input state ---------------------------------------------------------
@@ -483,6 +495,11 @@ pub fn main() !void {
                                 } else {
                                     appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
                                 }
+                            } else if (std.mem.eql(u8, user_input, "/model")) {
+                                input_len = 0;
+                                var model_cmd_buf: [128]u8 = undefined;
+                                const model_info = std.fmt.bufPrint(&model_cmd_buf, "model: {s}", .{model_str}) catch "model: unknown";
+                                appendOutputText(model_info) catch {};
                             } else {
                                 // Show user message in output
                                 _ = try buffer.appendNode(null, .user_message, user_input);
@@ -504,7 +521,7 @@ pub fn main() !void {
                                     user_input,
                                     &messages,
                                     &registry,
-                                    api_key,
+                                    provider_result.provider,
                                     allocator,
                                     agentOutputCallback,
                                 ) catch |err| {
