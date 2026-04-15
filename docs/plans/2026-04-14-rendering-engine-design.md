@@ -1,4 +1,4 @@
-# Rendering Engine — Implementation Plan
+# Rendering Engine: Implementation Plan
 
 **Date:** 2026-04-14
 
@@ -39,7 +39,7 @@ Get a full-screen TUI running with raw input and clean rendering.
 
 ### 1.1 Terminal state management
 
-Create `src/terminal.zig` — manages raw mode, alternate screen, cleanup.
+Create `src/terminal.zig`. Manages raw mode, alternate screen, cleanup.
 
 ```zig
 pub const Terminal = struct {
@@ -65,7 +65,7 @@ pub const Terminal = struct {
 
 ### 1.2 Input handling
 
-Create `src/input.zig` — parse keyboard and mouse events from raw stdin.
+Create `src/input.zig`. Parse keyboard and mouse events from raw stdin.
 
 ```zig
 pub const Event = union(enum) {
@@ -107,7 +107,7 @@ pub fn pollEvent(stdin: std.fs.File) ?Event { ... }
 
 ### 1.3 Screen grid and ANSI renderer
 
-Create `src/Screen.zig` — the cell grid and dirty-rectangle ANSI renderer.
+Create `src/Screen.zig`. The cell grid and dirty-rectangle ANSI renderer.
 
 ```zig
 pub const Cell = struct {
@@ -168,7 +168,7 @@ pub const Screen = struct {
 
 ### 2.1 Node tree data structure
 
-Create `src/Buffer.zig` — structured content, not flat lines.
+Create `src/Buffer.zig`. Structured content, not flat lines.
 
 ```zig
 pub const NodeType = enum {
@@ -237,7 +237,7 @@ pub const Buffer = struct {
 
 ### 2.2 Node renderers
 
-Create `src/NodeRenderer.zig` — converts nodes to styled text for libghostty-vt.
+Create `src/NodeRenderer.zig`. Converts nodes to styled text for libghostty-vt.
 
 ```zig
 pub const RenderFn = *const fn (node: *const Node, writer: anytype) anyerror!void;
@@ -260,7 +260,7 @@ pub const NodeRendererRegistry = struct {
 
 ### 2.3 libghostty-vt integration
 
-Create `src/VtBuffer.zig` — wraps a Buffer with a libghostty-vt terminal instance.
+Create `src/VtBuffer.zig`. Wraps a Buffer with a libghostty-vt terminal instance.
 
 ```zig
 const ghostty = @cImport(@cInclude("ghostty/vt.h"));
@@ -298,7 +298,7 @@ pub const VtBuffer = struct {
 
 ### 3.1 Layout tree
 
-Create `src/Layout.zig` — binary tree of splits and leaves.
+Create `src/Layout.zig`. Binary tree of splits and leaves.
 
 ```zig
 pub const SplitDirection = enum { horizontal, vertical };
@@ -366,7 +366,7 @@ pub const Layout = struct {
 
 ### 3.2 Compositor
 
-Create `src/Compositor.zig` — merges VtBuffer cell grids into the Screen grid.
+Create `src/Compositor.zig`. Merges VtBuffer cell grids into the Screen grid.
 
 ```zig
 pub const Compositor = struct {
@@ -439,8 +439,8 @@ pub fn loadPlugins(lua: *Lua, path: []const u8) !void {
 ```
 
 **Plugin directories:**
-- `~/.config/zag/plugins/` — user plugins
-- `.zag/plugins/` — project-local plugins
+- `~/.config/zag/plugins/`: user plugins
+- `.zag/plugins/`: project-local plugins
 
 ### 4.3 Lua-side API wrapper
 
@@ -593,4 +593,4 @@ end)
 zag.map("n", "<C-n>", "/sessions")  -- Ctrl+N in normal mode
 ```
 
-This is the session tree from shuvcode — but as a Lua plugin, not built into the core.
+This is the session tree from shuvcode, but as a Lua plugin, not built into the core.

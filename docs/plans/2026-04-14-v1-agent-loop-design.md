@@ -13,9 +13,9 @@ Prove that Zig can talk to Claude, call tools, and loop. No window system, no pl
 Two-level nested loop (from pi-mono):
 
 ```
-OUTER LOOP (follow-ups — v1: single pass, no follow-ups):
+OUTER LOOP (follow-ups, v1: single pass, no follow-ups):
 
-  INNER LOOP (steering + tools — v1: no steering):
+  INNER LOOP (steering + tools, v1: no steering):
   
     1. Call Claude with full context (system prompt + messages + tools)
     2. Parse response
@@ -61,17 +61,17 @@ ToolResult = { tool_use_id, content (text) }
 
 ```
 src/
-  main.zig      — entry point, stdin loop
-  agent.zig     — the loop, context management
-  llm.zig       — HTTP + JSON, Claude API
-  tools.zig     — registry, dispatch
+  main.zig      entry point, stdin loop
+  agent.zig     the loop, context management
+  llm.zig       HTTP + JSON, Claude API
+  tools.zig     registry, dispatch
   tools/
     read.zig
     write.zig
     edit.zig
     bash.zig
-  types.zig     — Message, ContentBlock, ToolCall, ToolResult
-build.zig       — Zig build configuration
+  types.zig     Message, ContentBlock, ToolCall, ToolResult
+build.zig       Zig build configuration
 ```
 
 ## What's NOT in v1

@@ -1,4 +1,4 @@
-# 005 — Lessons from Competitors
+# 005. Lessons from Competitors
 
 **Date:** 2026-04-14
 
@@ -9,13 +9,13 @@ What I learned studying every major agent harness. Organized by topic, not by pr
 ## Rendering & UI
 
 **Warp: GPU rendering produces taste you can feel.**
-Custom rendering framework (Metal/Vulkan), hybrid immediate/retained mode. 90% faster scrolling than iTerm2. Treating the terminal as a graphics application — not wrapping xterm — is what makes it feel fundamentally different. Zag should aspire to this quality, even if it starts with a TUI.
+Custom rendering framework (Metal/Vulkan), hybrid immediate/retained mode. 90% faster scrolling than iTerm2. Treating the terminal as a graphics application, not wrapping xterm, is what makes it feel fundamentally different. Zag should aspire to this quality, even if it starts with a TUI.
 
 **Warp: Blocks make output structural.**
 Every command and its output is a discrete, navigable unit. Not scrollback soup. For Zag, agent interactions (prompt → response → tool calls → results) are natural blocks. A plugin could render these as navigable units.
 
 **Warp: Kill the readline.**
-Warp replaced traditional line editing with an IDE-like input editor — text selection, cursor positioning, syntax highlighting. Zag starts from vim-style modal input, which is an even more radical rethinking of input.
+Warp replaced traditional line editing with an IDE-like input editor: text selection, cursor positioning, syntax highlighting. Zag starts from vim-style modal input, which is an even more radical rethinking of input.
 
 **Zed: GPUI proves custom rendering frameworks are worth it.**
 120 FPS, sub-1 second startup, 40-50% less memory than VS Code. Hybrid immediate/retained mode. The investment in a custom framework pays off in feel.
@@ -49,7 +49,7 @@ Append-only log with parent/child references. Enables branching (fork a session)
 Thin TUI client ↔ HTTP+SSE server ↔ AI backend. Clean separation enables multiple frontends. The agent loop shouldn't be coupled to the UI.
 
 **OpenCode: Multi-agent with different access policies.**
-Build agent (full access), plan agent (read-only), general subagent (complex searches), explore subagent (codebase navigation). Not one agent doing everything — specialized agents for specialized tasks. Plugins should define custom agents.
+Build agent (full access), plan agent (read-only), general subagent (complex searches), explore subagent (codebase navigation). Not one agent doing everything; specialized agents for specialized tasks. Plugins should define custom agents.
 
 **Amp: Multi-model orchestration.**
 Right model for right subtask. Claude Opus for main work, GPT-5.4 for reasoning oracle, Gemini for code review. Different models have different strengths. Worth supporting.
@@ -65,10 +65,10 @@ Break code into functions, classes, logical blocks (not arbitrary chunks). Build
 ## Extension & Plugin Systems
 
 **pi-mono: Extensions that replace built-ins.**
-Plugins can override read, bash, edit, write tools entirely. Core provides defaults, plugins provide overrides. The right model — nothing is sacred, everything is swappable.
+Plugins can override read, bash, edit, write tools entirely. Core provides defaults, plugins provide overrides. The right model: nothing is sacred, everything is swappable.
 
 **pi-mono: Extensions can render custom TUI components.**
-Only pi-mono achieves this in the agent space. Plugins aren't limited to backend functionality. They can provide UI. Zag takes this further — the window system makes UI extensibility the default.
+Only pi-mono achieves this in the agent space. Plugins aren't limited to backend functionality. They can provide UI. Zag takes this further. The window system makes UI extensibility the default.
 
 **Claude Code: Skills as markdown files.**
 Low-friction extensibility. A skill is just a markdown file with frontmatter. Easy to write, easy to share, easy to understand. 2,400+ in the ecosystem. Zag could support something similar for agent instructions/recipes.
@@ -77,13 +77,13 @@ Low-friction extensibility. A skill is just a markdown file with frontmatter. Ea
 Editor-agnostic protocol for agents. Multiple agents (Claude, Gemini, Codex) plug in through the same interface. Worth studying for Zag's plugin-defined agents.
 
 **OpenCode: Plugins limited to backend = death of UI ecosystem.**
-Tools, commands, events — but no persistent UI panels. No splits, no sidebars. This is the architectural ceiling I hit. The exact thing Zag solves.
+Tools, commands, events, but no persistent UI panels. No splits, no sidebars. This is the architectural ceiling I hit. The exact thing Zag solves.
 
 **Warp: No extensibility at all.**
 Beautiful product, zero plugin ecosystem. The NERDTree for Warp will never exist. Taste without openness is a gilded cage.
 
 **Aider: Zero extensibility, still 43k stars.**
-Proves that a focused, well-executed tool without plugins can succeed. But also proves the ceiling — people built AiderDesk as a GUI wrapper because they couldn't extend Aider itself.
+Proves that a focused, well-executed tool without plugins can succeed. But also proves the ceiling. People built AiderDesk as a GUI wrapper because they couldn't extend Aider itself.
 
 ---
 
@@ -93,10 +93,10 @@ Proves that a focused, well-executed tool without plugins can succeed. But also 
 Extract definitions/references across 100+ languages using tree-sitter parsers. Graph-rank to fit the most relevant context into the token budget. Language-agnostic codebase understanding. Tree-sitter has C bindings Zig can call directly.
 
 **OpenCode: LSP integration for real code intelligence.**
-Diagnostics, hover info, go-to-definition, find references, autocomplete — for 20+ languages out of the box. Real understanding, not text pattern matching. Plugins should be able to use LSP data.
+Diagnostics, hover info, go-to-definition, find references, autocomplete for 20+ languages out of the box. Real understanding, not text pattern matching. Plugins should be able to use LSP data.
 
 **Claude Code: 1M token context with auto-compaction.**
-When context gets large, summarize old messages via the LLM and replace them. Keeps long sessions alive. But compaction can lose nuance — tradeoff.
+When context gets large, summarize old messages via the LLM and replace them. Keeps long sessions alive. But compaction can lose nuance. Tradeoff.
 
 **Copilot: 8k context is useless.**
 For real projects with real dependencies, 8k tokens is nothing. Don't ship with a context ceiling that makes the tool impractical.
@@ -137,7 +137,7 @@ Cursor 3 demoted VS Code to an escape hatch. The agent management console is the
 ## Features worth noting
 
 **Warp: Full Terminal Use (PTY-level agent access).**
-Agents see the live terminal buffer, write to the PTY, respond to prompts. Can run interactive apps (REPLs, debuggers, database shells). Since Zag owns the rendering, agents could access buffer structure directly — even more powerful.
+Agents see the live terminal buffer, write to the PTY, respond to prompts. Can run interactive apps (REPLs, debuggers, database shells). Since Zag owns the rendering, agents could access buffer structure directly, even more powerful.
 
 **Warp: Secret redaction.**
 Auto-redacts passwords, IPs, secrets from terminal output. Small feature, high trust impact.

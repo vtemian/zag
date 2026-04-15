@@ -1,4 +1,4 @@
-# 002 — Competitive Landscape
+# 002. Competitive Landscape
 
 **Date:** 2026-04-14
 
@@ -32,16 +32,16 @@ All share the same fundamental loop: **User → LLM → Tool Call → Execute �
 
 | Agent | Loop Design | State Management | Context Strategy |
 |-------|------------|-----------------|-----------------|
-| Claude Code | Message array, ~88 LOC core | JSONL sessions | 1M token window, auto-compaction |
+| Claude Code | Message array, ~88 LOC core | JSONL sessions | 1M token window, auto compaction |
 | Cursor | Autonomous planner + executor | Per-session, persistent "mission control" | 272k tokens, codebase indexing |
 | Zed | Core-integrated, CRDT buffers | CRDT-based collaborative state | Per-model (up to 1M) |
 | Warp | Oz orchestration platform | Session-based | Per-model |
-| Codex CLI | Request-response via Responses API | Stateless (supports ZDR), local transcripts | Prompt caching, auto-compaction |
+| Codex CLI | Request-response via Responses API | Stateless (supports ZDR), local transcripts | Prompt caching, auto compaction |
 | Aider | Python loop in base_coder.py | Git-centric (every change = commit) | Repo map via tree-sitter |
 | Droid | Multi-agent decomposition | Plan-based with step tracking | HyperCode graph + ByteRank retrieval |
 | Copilot | Three-layer (local, proxy, LLM) | Per-surface, no cross-surface state | ~8k tokens (limited) |
 | Amp | Multi-model orchestration | Threads (cloud-stored on Sourcegraph) | 300k+ input context |
-| pi-mono | Event-driven, steering/follow-up queues | JSONL append-only, tree-structured | Auto-compaction via LLM summary |
+| pi-mono | Event-driven, steering/follow-up queues | JSONL append-only, tree-structured | Auto compaction via LLM summary |
 | OpenCode | Client-server (TUI ↔ HTTP+SSE) | SQLite via Drizzle ORM | Model-aware compaction |
 
 ### Tool Execution
@@ -57,8 +57,8 @@ All share the same fundamental loop: **User → LLM → Tool Call → Execute �
 | Droid | Multi-agent subtasks | Approval dialogs | DroidShield |
 | Copilot | Up to fleet subagents (CLI) | Per-action in agent mode | Cloud agent: Actions sandbox |
 | Amp | Subagent delegation | Guidance system (allow/reject/ask) | Unknown |
-| pi-mono | Sequential or parallel modes | Before/after tool hooks | None built-in |
-| OpenCode | Subagents (general, explore) | Per-agent tool access policies | None built-in |
+| pi-mono | Sequential or parallel modes | Before/after tool hooks | None built in |
+| OpenCode | Subagents (general, explore) | Per-agent tool access policies | None built in |
 
 ---
 
@@ -98,7 +98,7 @@ All share the same fundamental loop: **User → LLM → Tool Call → Execute �
 | pi-mono | Full TS extension system | TypeScript | Custom TUI components via extensions |
 | OpenCode | Plugins (tools, commands, events) | JS/TS | **No persistent UI panels** |
 
-**Critical finding: Only pi-mono lets extensions render custom UI. Everyone else — including OpenCode — limits plugins to backend functionality. Nobody provides composable window primitives that plugins can populate.**
+**Critical finding: Only pi-mono lets extensions render custom UI. Everyone else, including OpenCode, limits plugins to backend functionality. Nobody provides composable window primitives that plugins can populate.**
 
 ---
 
@@ -108,14 +108,14 @@ All share the same fundamental loop: **User → LLM → Tool Call → Execute �
 Open-source terminal coding agent by Anomaly (ex-SST). 143k stars, 850+ contributors. Built by neovim users and creators of terminal.shop. MIT licensed.
 
 ### Architecture (the interesting part)
-- **OpenTUI** — their terminal UI library has a **Zig core** (~28% Zig, ~68% TypeScript)
+- **OpenTUI**: their terminal UI library has a **Zig core** (~28% Zig, ~68% TypeScript)
 - SolidJS reconciler on top of the Zig rendering primitives
 - 60 FPS with dirty rectangle optimization
 - Client-server split: thin TUI client ↔ HTTP+SSE server ↔ AI backend
 - SQLite for session persistence (via Drizzle ORM)
 
 ### The architectural limitation I hit
-- **Single-view routing** — one view owns the entire screen
+- **Single-view routing**: one view owns the entire screen
 - Route-based navigation replaces everything
 - Plugins can register tools, commands, emit events
 - **Plugins CANNOT render persistent UI panels**
@@ -139,23 +139,23 @@ Open-source terminal coding agent by Anomaly (ex-SST). 143k stars, 850+ contribu
 
 ---
 
-## Amp vs pi-mono (corrected — these are separate projects)
+## Amp vs pi-mono (corrected, these are separate projects)
 
 ### Amp (Sourcegraph)
 - Commercial product by Sourcegraph
 - Multi-model orchestration (Claude Opus for main, GPT-5.4 for oracle, Gemini for review)
 - Three modes: Smart (unconstrained), Rush (fast/cheap), Deep (extended thinking)
 - Oracle tool for second opinions from a different model
-- **Best TUI on the market** — custom flicker-free framework, exceptional polish
+- **Best TUI on the market**: custom flicker-free framework, exceptional polish
 - Threads stored on Sourcegraph servers (privacy concern)
 - No project-scoped MCP config (global GUI only, can't version with codebase)
 
 ### pi-mono (Mario Zechner)
 - Independent open-source toolkit
 - Radical minimalism: <1000 token system prompt, 4 core tools
-- **Best extension system** — TS plugins can replace built-in tools entirely, render custom TUI components
+- **Best extension system**: TS plugins can replace built-in tools entirely, render custom TUI components
 - Event-driven architecture with steering queues (interrupt mid-execution)
-- JSONL sessions with tree structure — branching, bookmarks, compaction
+- JSONL sessions with tree structure: branching, bookmarks, compaction
 - 20+ LLM providers with mid-conversation switching
 - Extensions can add custom UI, register model providers, fork sessions
 
@@ -227,7 +227,7 @@ Open-source terminal coding agent by Anomaly (ex-SST). 143k stars, 850+ contribu
 
 ---
 
-## Gaps in the Market — Where Zag Fits
+## Gaps in the Market: Where Zag Fits
 
 ### 1. No one does modal interaction
 Every single agent uses a chat/REPL model. None offer vim-style modes (normal, insert, command), composable keybindings, or operator+motion patterns.
@@ -236,7 +236,7 @@ Every single agent uses a chat/REPL model. None offer vim-style modes (normal, i
 Every agent has a fixed layout. OpenCode's single-view routing is the norm. Nobody provides split/tab/buffer primitives that plugins populate. This is the core architectural problem I identified in anomalyco/opencode#6521.
 
 ### 3. No scriptable extensibility in a native binary
-pi-mono lets TS extensions render UI — but it's TypeScript, not native. Nobody embeds a real scripting language (Lua) with deep API access in a compiled binary. Neovim's model doesn't exist in the agent space.
+pi-mono lets TS extensions render UI, but it's TypeScript, not native. Nobody embeds a real scripting language (Lua) with deep API access in a compiled binary. Neovim's model doesn't exist in the agent space.
 
 ### 4. No one builds on libghostty
 Everyone either builds their own terminal handling (Warp, Zed, OpenTUI) or wraps existing libraries (Ink, prompt-toolkit). libghostty-vt is battle-tested, SIMD-optimized, and unused in the agent space.
