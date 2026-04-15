@@ -96,15 +96,27 @@ pub const ProviderResult = struct {
     api_key: []const u8,
     /// Allocator used to create the state (for cleanup).
     allocator: Allocator,
+    /// Type-erased cleanup function for the concrete provider state.
+    destroy_fn: *const fn (*anyopaque, Allocator) void,
 
     pub fn deinit(self: *ProviderResult) void {
         self.allocator.free(self.api_key);
-        self.allocator.destroy(@as(*anthropic.AnthropicProvider, @ptrCast(@alignCast(self.state))));
+        self.destroy_fn(self.state, self.allocator);
+    }
+
+    fn destroyAnthropicState(state: *anyopaque, alloc: Allocator) void {
+        alloc.destroy(@as(*anthropic.AnthropicProvider, @ptrCast(@alignCast(state))));
+    }
+
+    fn destroyOpenAiState(state: *anyopaque, alloc: Allocator) void {
+        const p: *openai.OpenAiProvider = @ptrCast(@alignCast(state));
+        alloc.free(p.base_url);
+        alloc.destroy(p);
     }
 };
 
 /// Create a provider from a model string and environment variables.
-/// Reads API keys from ANTHROPIC_API_KEY based on provider prefix.
+/// Reads API keys from ANTHROPIC_API_KEY or OPENAI_API_KEY based on provider prefix.
 pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResult {
     const spec = parseModelString(model_str);
 
@@ -121,6 +133,28 @@ pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResu
             .state = state,
             .api_key = api_key,
             .allocator = allocator,
+            .destroy_fn = ProviderResult.destroyAnthropicState,
+        };
+    }
+
+    if (std.mem.eql(u8, spec.provider_name, "openai")) {
+        const api_key = std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch
+            return error.MissingApiKey;
+        errdefer allocator.free(api_key);
+
+        const base_url = std.process.getEnvVarOwned(allocator, "OPENAI_API_BASE") catch
+            try allocator.dupe(u8, "https://api.openai.com/v1/chat/completions");
+        errdefer allocator.free(base_url);
+
+        const state = try allocator.create(openai.OpenAiProvider);
+        state.* = .{ .api_key = api_key, .model = spec.model_id, .base_url = base_url };
+
+        return .{
+            .provider = state.provider(),
+            .state = state,
+            .api_key = api_key,
+            .allocator = allocator,
+            .destroy_fn = ProviderResult.destroyOpenAiState,
         };
     }
 
