@@ -167,6 +167,12 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer) !usize {
     return count;
 }
 
+/// Append text to an existing node's content.
+/// Used for streaming: text deltas accumulate into one node.
+pub fn appendToNode(self: *Buffer, node: *Node, text: []const u8) !void {
+    try node.content.appendSlice(self.allocator, text);
+}
+
 /// Remove all nodes from the buffer, freeing their memory.
 pub fn clear(self: *Buffer) void {
     for (self.root_children.items) |node| {
@@ -284,6 +290,17 @@ test "clear removes all nodes" {
     buf.clear();
     try std.testing.expectEqual(@as(usize, 0), buf.root_children.items.len);
     try std.testing.expectEqual(@as(u32, 0), buf.next_id);
+}
+
+test "appendToNode grows existing content" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator, 0, "test");
+    defer buf.deinit();
+
+    const node = try buf.appendNode(null, .assistant_text, "Hello");
+    try buf.appendToNode(node, " world");
+
+    try std.testing.expectEqualStrings("Hello world", node.content.items);
 }
 
 test "lineCount counts visible lines" {
