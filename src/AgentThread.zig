@@ -121,6 +121,8 @@ pub fn spawn(
 }
 
 /// Entry point for the background agent thread.
+/// Runs the agent loop and guarantees .done is always pushed to the queue,
+/// converting any errors into .err events.
 fn threadMain(
     provider: llm.Provider,
     messages: *std.ArrayList(types.Message),
@@ -131,7 +133,11 @@ fn threadMain(
     lua_engine: ?*LuaEngine.LuaEngine,
 ) void {
     if (lua_engine) |eng| eng.activate();
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel);
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel) catch |err| {
+        const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
+        queue.push(.{ .err = duped_err }) catch {};
+    };
+    queue.push(.done) catch {};
 }
 
 // -- Tests -------------------------------------------------------------------
