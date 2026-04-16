@@ -718,3 +718,29 @@ test "render emits palette background color SGR sequences" {
     // Should contain the palette background SGR: 48;5;42
     try std.testing.expect(std.mem.indexOf(u8, output, "48;5;42") != null);
 }
+
+test "writeStr clips to screen width" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 5, 1);
+    defer screen.deinit();
+
+    const end_col = screen.writeStr(0, 0, "hello world", .{}, .default);
+
+    // Should clip at width 5
+    try std.testing.expectEqual(@as(u16, 5), end_col);
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'o'), screen.getCellConst(0, 4).codepoint);
+}
+
+test "writeStr starts at offset column" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 10, 1);
+    defer screen.deinit();
+
+    const end_col = screen.writeStr(0, 3, "ab", .{}, .default);
+
+    try std.testing.expectEqual(@as(u16, 5), end_col);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), screen.getCellConst(0, 4).codepoint);
+}
