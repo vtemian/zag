@@ -194,6 +194,21 @@ pub fn clear(self: *Screen) void {
     @memset(self.current, empty_cell);
 }
 
+/// Clear a rectangular region of the current grid to empty cells.
+/// Coordinates that extend past screen bounds are clipped.
+pub fn clearRect(self: *Screen, y: u16, x: u16, width: u16, height: u16) void {
+    const max_row = @min(y +| height, self.height);
+    const max_col = @min(x +| width, self.width);
+    var row = y;
+    while (row < max_row) : (row += 1) {
+        var col = x;
+        while (col < max_col) : (col += 1) {
+            const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
+            self.current[idx] = empty_cell;
+        }
+    }
+}
+
 /// Compare two cells field by field.
 fn cellsEqual(a: Cell, b: Cell) bool {
     if (a.codepoint != b.codepoint) return false;
@@ -730,6 +745,57 @@ test "writeStr clips to screen width" {
     try std.testing.expectEqual(@as(u16, 5), end_col);
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'o'), screen.getCellConst(0, 4).codepoint);
+}
+
+test "clearRect clears only the specified region" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 10, 5);
+    defer screen.deinit();
+
+    // Fill entire grid with 'X'
+    for (screen.current) |*cell| {
+        cell.codepoint = 'X';
+    }
+
+    // Clear a 3x2 rect starting at (1, 2)
+    screen.clearRect(1, 2, 3, 2);
+
+    // Cells inside the rect should be empty
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 4).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 4).codepoint);
+
+    // Cells outside the rect should still be 'X'
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(0, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(1, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(1, 5).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(3, 2).codepoint);
+}
+
+test "clearRect clips to screen bounds" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 5, 3);
+    defer screen.deinit();
+
+    for (screen.current) |*cell| {
+        cell.codepoint = 'X';
+    }
+
+    // Rect extends past screen edge — should not crash
+    screen.clearRect(2, 3, 10, 10);
+
+    // Inside bounds: cleared
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 4).codepoint);
+
+    // Outside the rect: untouched
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(2, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getCellConst(1, 3).codepoint);
 }
 
 test "writeStr starts at offset column" {
