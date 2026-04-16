@@ -92,98 +92,80 @@ pub const LuaEngine = struct {
     }
 
     fn zagToolFnInner(lua: *Lua) !i32 {
-        // Argument must be a table
         if (!lua.isTable(1)) {
             log.err("zag.tool() expects a table argument", .{});
             return error.LuaError;
         }
 
-        // Read name
+        // Retrieve engine pointer from registry first (needed for allocator)
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.err("zag.tool(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        // Read name (Lua string, borrowed from VM)
         _ = lua.getField(1, "name");
         const name_raw = lua.toString(-1) catch {
             log.err("zag.tool(): 'name' field must be a string", .{});
+            lua.pop(1);
             return error.LuaError;
         };
         lua.pop(1);
 
-        // Read description
+        // Read description (Lua string, borrowed from VM)
         _ = lua.getField(1, "description");
         const desc_raw = lua.toString(-1) catch {
             log.err("zag.tool(): 'description' field must be a string", .{});
+            lua.pop(1);
             return error.LuaError;
         };
         lua.pop(1);
 
-        // Read input_schema (a Lua table), convert to JSON
+        // Read input_schema table and serialize to JSON
         _ = lua.getField(1, "input_schema");
         if (!lua.isTable(-1)) {
             log.err("zag.tool(): 'input_schema' field must be a table", .{});
             lua.pop(1);
             return error.LuaError;
         }
-
-        // Retrieve engine pointer from registry
-        _ = lua.getField(zlua.registry_index, "_zag_engine");
-        const ptr = lua.toPointer(-1) catch {
-            log.err("zag.tool(): could not retrieve engine pointer", .{});
-            return error.LuaError;
-        };
-        lua.pop(1);
-        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
-
-        // input_schema is at stack top (-1) again after popping engine ptr... no, we need to manage stack.
-        // After getField(1, "input_schema") pushed the table, then we pushed registry field and popped it.
-        // So input_schema table is now at -1.
+        // input_schema table is at -1
         const schema_json = luaTableToJson(lua, -1, engine.allocator) catch |err| {
             log.err("zag.tool(): failed to serialize input_schema: {}", .{err});
             lua.pop(1);
-            return error.LuaError;
+            return err;
         };
-        lua.pop(1); // pop input_schema table
+        lua.pop(1);
         errdefer engine.allocator.free(schema_json);
 
-        // Read execute function, store as ref
+        // Read execute function and store as registry reference
         _ = lua.getField(1, "execute");
         if (!lua.isFunction(-1)) {
             log.err("zag.tool(): 'execute' field must be a function", .{});
             lua.pop(1);
-            engine.allocator.free(schema_json);
             return error.LuaError;
         }
         const func_ref = lua.ref(zlua.registry_index) catch {
             log.err("zag.tool(): failed to create function reference", .{});
-            engine.allocator.free(schema_json);
             return error.LuaError;
         };
         errdefer lua.unref(zlua.registry_index, func_ref);
 
-        // Dupe strings into engine allocator
-        const name = engine.allocator.dupe(u8, name_raw) catch {
-            engine.allocator.free(schema_json);
-            lua.unref(zlua.registry_index, func_ref);
-            return error.OutOfMemory;
-        };
+        // Dupe borrowed Lua strings into engine allocator
+        const name = try engine.allocator.dupe(u8, name_raw);
         errdefer engine.allocator.free(name);
 
-        const description = engine.allocator.dupe(u8, desc_raw) catch {
-            engine.allocator.free(schema_json);
-            engine.allocator.free(name);
-            lua.unref(zlua.registry_index, func_ref);
-            return error.OutOfMemory;
-        };
+        const description = try engine.allocator.dupe(u8, desc_raw);
+        errdefer engine.allocator.free(description);
 
-        engine.tools.append(engine.allocator, .{
+        try engine.tools.append(engine.allocator, .{
             .name = name,
             .description = description,
             .input_schema_json = schema_json,
             .func_ref = func_ref,
-        }) catch {
-            engine.allocator.free(name);
-            engine.allocator.free(description);
-            engine.allocator.free(schema_json);
-            lua.unref(zlua.registry_index, func_ref);
-            return error.OutOfMemory;
-        };
+        });
 
         log.info("registered Lua tool: {s}", .{name});
         return 0;
@@ -293,7 +275,8 @@ pub const LuaEngine = struct {
     // -- Tool execution --------------------------------------------------------
 
     /// Execute a Lua tool by name with raw JSON input. Returns a ToolResult.
-    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8) types.ToolResult {
+    /// The caller's allocator is used for result content so ownership is clean.
+    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8, allocator: Allocator) types.ToolResult {
         const tool = self.findTool(name) orelse return .{
             .content = "error: unknown lua tool",
             .is_error = true,
@@ -307,16 +290,15 @@ pub const LuaEngine = struct {
         pushJsonAsTable(self.lua, input_json, self.allocator) catch |err| {
             log.err("executeTool: failed to parse input JSON: {}", .{err});
             self.lua.pop(1); // pop the function
-            const msg = std.fmt.allocPrint(self.allocator, "error: invalid input JSON: {}", .{err}) catch
+            const msg = std.fmt.allocPrint(allocator, "error: invalid input JSON: {}", .{err}) catch
                 return .{ .content = "error: invalid input JSON", .is_error = true, .owned = false };
             return .{ .content = msg, .is_error = true };
         };
 
         // pcall(fn, input_table) -> result_string or nil,err
         self.lua.protectedCall(.{ .args = 1, .results = 2 }) catch {
-            // Lua runtime error: error message is on stack
             const err_msg = self.lua.toString(-1) catch "unknown Lua error";
-            const owned_msg = self.allocator.dupe(u8, err_msg) catch {
+            const owned_msg = allocator.dupe(u8, err_msg) catch {
                 self.lua.pop(1);
                 return .{ .content = "error: Lua runtime error (OOM copying message)", .is_error = true, .owned = false };
             };
@@ -326,9 +308,8 @@ pub const LuaEngine = struct {
 
         // Check return convention: string OR nil,err_string
         if (self.lua.isNoneOrNil(-2)) {
-            // nil, err_message convention
             const err_msg = self.lua.toString(-1) catch "unknown error from Lua tool";
-            const owned = self.allocator.dupe(u8, err_msg) catch {
+            const owned = allocator.dupe(u8, err_msg) catch {
                 self.lua.pop(2);
                 return .{ .content = "error: OOM copying Lua error", .is_error = true, .owned = false };
             };
@@ -341,7 +322,7 @@ pub const LuaEngine = struct {
             self.lua.pop(2);
             return .{ .content = "error: Lua tool returned non-string", .is_error = true, .owned = false };
         };
-        const owned_result = self.allocator.dupe(u8, result_str) catch {
+        const owned_result = allocator.dupe(u8, result_str) catch {
             self.lua.pop(2);
             return .{ .content = "error: OOM copying Lua result", .is_error = true, .owned = false };
         };
@@ -417,15 +398,12 @@ pub const LuaEngine = struct {
     }
 
     /// Load and execute a Lua config file, collecting any `zag.tool()` calls it makes.
+    /// Caller is responsible for logging on error (keeps test output pristine).
     pub fn loadConfig(self: *LuaEngine, path: []const u8) !void {
         self.storeSelfPointer();
         const path_z = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_z);
-        self.lua.doFile(path_z) catch |err| {
-            log.warn("failed to load Lua config '{s}': {}", .{ path, err });
-            return err;
-        };
-        log.info("loaded Lua config: {s}", .{path});
+        try self.lua.doFile(path_z);
     }
 
     /// Adjust package.path so that `require` can find modules in the given directory.
@@ -461,8 +439,7 @@ fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!types.To
         .is_error = true,
         .owned = false,
     };
-    _ = allocator; // engine uses its own allocator
-    return engine.executeTool(tool_name, input_raw);
+    return engine.executeTool(tool_name, input_raw, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -558,7 +535,7 @@ test "executeTool calls Lua function and returns result" {
         \\})
     );
 
-    const result = engine.executeTool("echo", "{\"message\": \"hi\"}");
+    const result = engine.executeTool("echo", "{\"message\": \"hi\"}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("echo: hi", result.content);
@@ -580,7 +557,7 @@ test "executeTool handles Lua runtime errors" {
         \\})
     );
 
-    const result = engine.executeTool("crasher", "{}");
+    const result = engine.executeTool("crasher", "{}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "intentional crash") != null);
@@ -602,7 +579,7 @@ test "executeTool handles nil,err return convention" {
         \\})
     );
 
-    const result = engine.executeTool("failsoft", "{}");
+    const result = engine.executeTool("failsoft", "{}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("something went wrong", result.content);
@@ -612,7 +589,7 @@ test "executeTool returns error for unknown tool" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
-    const result = engine.executeTool("nonexistent", "{}");
+    const result = engine.executeTool("nonexistent", "{}", std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: unknown lua tool", result.content);
     try std.testing.expect(!result.owned);
