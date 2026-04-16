@@ -279,21 +279,45 @@ pub const StreamingResponse = struct {
             },
             .redirect_behavior = .unhandled,
             .keep_alive = false,
-        }) catch return error.ApiError;
+        }) catch |err| {
+            log.err("streaming: request creation failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        };
         errdefer self.req.deinit();
 
         // Send the request body.
         self.req.transfer_encoding = .{ .content_length = body.len };
-        var bw = self.req.sendBodyUnflushed(&.{}) catch return error.ApiError;
-        bw.writer.writeAll(body) catch return error.ApiError;
-        bw.end() catch return error.ApiError;
-        (self.req.connection orelse return error.ApiError).flush() catch return error.ApiError;
+        var bw = self.req.sendBodyUnflushed(&.{}) catch |err| {
+            log.err("streaming: sendBodyUnflushed failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        };
+        bw.writer.writeAll(body) catch |err| {
+            log.err("streaming: body write failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        };
+        bw.end() catch |err| {
+            log.err("streaming: body end failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        };
+        (self.req.connection orelse {
+            log.err("streaming: no connection after body send", .{});
+            return error.ApiError;
+        }).flush() catch |err| {
+            log.err("streaming: flush failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        };
 
         // Receive response headers.
         var redirect_buf: [0]u8 = .{};
-        var response = self.req.receiveHead(&redirect_buf) catch return error.ApiError;
+        var response = self.req.receiveHead(&redirect_buf) catch |err| {
+            log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        };
 
-        if (response.head.status != .ok) return error.ApiError;
+        if (response.head.status != .ok) {
+            log.err("streaming: HTTP status {d}", .{@intFromEnum(response.head.status)});
+            return error.ApiError;
+        }
 
         // Obtain the incremental body reader. The pointer into transfer_buf
         // is stable because self is heap-allocated.
