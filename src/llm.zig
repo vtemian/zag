@@ -28,6 +28,86 @@ pub const StreamEvent = union(enum) {
     err: []const u8,
 };
 
+/// Wire format for request/response serialization.
+pub const Serializer = enum {
+    /// Anthropic Messages API format.
+    anthropic,
+    /// OpenAI Chat Completions API format (also used by OpenRouter, Groq, Ollama, etc.).
+    openai,
+};
+
+/// Per-endpoint behavior overrides within a serializer family.
+/// Empty now. Fields added when real provider differences surface.
+pub const Compat = struct {};
+
+/// Everything needed to talk to a specific LLM endpoint.
+pub const Endpoint = struct {
+    /// Human-readable name (e.g., "openrouter", "ollama").
+    name: []const u8,
+    /// Which wire format this endpoint speaks.
+    serializer: Serializer,
+    /// Full URL for chat completions.
+    url: []const u8,
+    /// Env var holding the API key. Null if no auth needed.
+    key_env: ?[]const u8,
+    /// How to send the API key in HTTP headers.
+    auth: Auth,
+    /// Additional HTTP headers sent with every request.
+    headers: []const Header,
+    /// Provider-specific behavior overrides.
+    compat: Compat,
+
+    pub const Auth = enum { x_api_key, bearer, none };
+    pub const Header = struct { name: []const u8, value: []const u8 };
+
+    /// Deep-copy all strings onto the heap. Caller must call free().
+    pub fn dupe(self: Endpoint, allocator: Allocator) !Endpoint {
+        const name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(name);
+        const url = try allocator.dupe(u8, self.url);
+        errdefer allocator.free(url);
+        const key_env = if (self.key_env) |k| try allocator.dupe(u8, k) else null;
+        errdefer if (key_env) |k| allocator.free(k);
+
+        const headers = try allocator.alloc(Header, self.headers.len);
+        errdefer allocator.free(headers);
+        var initialized: usize = 0;
+        errdefer for (headers[0..initialized]) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        };
+        for (self.headers, 0..) |h, i| {
+            headers[i] = .{
+                .name = try allocator.dupe(u8, h.name),
+                .value = try allocator.dupe(u8, h.value),
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .name = name,
+            .serializer = self.serializer,
+            .url = url,
+            .key_env = key_env,
+            .auth = self.auth,
+            .headers = headers,
+            .compat = self.compat,
+        };
+    }
+
+    /// Free all heap-allocated strings. Pair with dupe().
+    pub fn free(self: Endpoint, allocator: Allocator) void {
+        for (self.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(self.headers);
+        if (self.key_env) |k| allocator.free(k);
+        allocator.free(self.url);
+        allocator.free(self.name);
+    }
+};
+
 /// Runtime-polymorphic LLM provider interface.
 /// Uses the ptr + vtable pattern (same as std.mem.Allocator).
 /// Each provider implements call() for its specific API format.
@@ -98,12 +178,12 @@ pub const ModelSpec = struct {
     model_id: []const u8,
 };
 
-/// Parse a "provider:model" string. If no colon is present, defaults to "anthropic".
+/// Parse a "provider/model" string. If no slash is present, defaults to "anthropic".
 pub fn parseModelString(model_str: []const u8) ModelSpec {
-    if (std.mem.indexOfScalar(u8, model_str, ':')) |colon| {
+    if (std.mem.indexOfScalar(u8, model_str, '/')) |slash| {
         return .{
-            .provider_name = model_str[0..colon],
-            .model_id = model_str[colon + 1 ..],
+            .provider_name = model_str[0..slash],
+            .model_id = model_str[slash + 1 ..],
         };
     }
     return .{
@@ -131,11 +211,11 @@ pub const ProviderResult = struct {
     }
 
     fn destroyAnthropicState(state: *anyopaque, alloc: Allocator) void {
-        alloc.destroy(@as(*anthropic.AnthropicProvider, @ptrCast(@alignCast(state))));
+        alloc.destroy(@as(*anthropic.AnthropicSerializer, @ptrCast(@alignCast(state))));
     }
 
     fn destroyOpenAiState(state: *anyopaque, alloc: Allocator) void {
-        const p: *openai.OpenAiProvider = @ptrCast(@alignCast(state));
+        const p: *openai.OpenAiSerializer = @ptrCast(@alignCast(state));
         alloc.free(p.base_url);
         alloc.destroy(p);
     }
@@ -151,7 +231,7 @@ pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResu
             return error.MissingApiKey;
         errdefer allocator.free(api_key);
 
-        const state = try allocator.create(anthropic.AnthropicProvider);
+        const state = try allocator.create(anthropic.AnthropicSerializer);
         state.* = .{ .api_key = api_key, .model = spec.model_id };
 
         return .{
@@ -172,7 +252,7 @@ pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResu
             try allocator.dupe(u8, "https://api.openai.com/v1/chat/completions");
         errdefer allocator.free(base_url);
 
-        const state = try allocator.create(openai.OpenAiProvider);
+        const state = try allocator.create(openai.OpenAiSerializer);
         state.* = .{ .api_key = api_key, .model = spec.model_id, .base_url = base_url };
 
         return .{
@@ -512,6 +592,56 @@ pub const ResponseBuilder = struct {
 
 // -- Tests -------------------------------------------------------------------
 
+test "Endpoint.dupe creates independent copy" {
+    const allocator = std.testing.allocator;
+
+    const original = Endpoint{
+        .name = "test",
+        .serializer = .openai,
+        .url = "https://example.com",
+        .key_env = "TEST_KEY",
+        .auth = .bearer,
+        .headers = &.{.{ .name = "X-Custom", .value = "val" }},
+        .compat = .{},
+    };
+
+    const duped = try original.dupe(allocator);
+    defer duped.free(allocator);
+
+    try std.testing.expectEqualStrings("test", duped.name);
+    try std.testing.expectEqualStrings("https://example.com", duped.url);
+    try std.testing.expectEqualStrings("TEST_KEY", duped.key_env.?);
+    try std.testing.expectEqual(Serializer.openai, duped.serializer);
+    try std.testing.expectEqual(Endpoint.Auth.bearer, duped.auth);
+    try std.testing.expectEqual(@as(usize, 1), duped.headers.len);
+    try std.testing.expectEqualStrings("X-Custom", duped.headers[0].name);
+    try std.testing.expectEqualStrings("val", duped.headers[0].value);
+
+    // Verify independence: pointers must differ
+    try std.testing.expect(original.name.ptr != duped.name.ptr);
+    try std.testing.expect(original.url.ptr != duped.url.ptr);
+}
+
+test "Endpoint.dupe handles null key_env" {
+    const allocator = std.testing.allocator;
+
+    const original = Endpoint{
+        .name = "ollama",
+        .serializer = .openai,
+        .url = "http://localhost:11434/v1/chat/completions",
+        .key_env = null,
+        .auth = .none,
+        .headers = &.{},
+        .compat = .{},
+    };
+
+    const duped = try original.dupe(allocator);
+    defer duped.free(allocator);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), duped.key_env);
+    try std.testing.expectEqual(@as(usize, 0), duped.headers.len);
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
@@ -647,7 +777,7 @@ test "Provider callStreaming dispatches to vtable" {
 }
 
 test "parseModelString splits provider and model" {
-    const result = parseModelString("anthropic:claude-sonnet-4-20250514");
+    const result = parseModelString("anthropic/claude-sonnet-4-20250514");
     try std.testing.expectEqualStrings("anthropic", result.provider_name);
     try std.testing.expectEqualStrings("claude-sonnet-4-20250514", result.model_id);
 }
@@ -659,14 +789,20 @@ test "parseModelString defaults to anthropic when no prefix" {
 }
 
 test "parseModelString handles openai prefix" {
-    const result = parseModelString("openai:gpt-4o");
+    const result = parseModelString("openai/gpt-4o");
     try std.testing.expectEqualStrings("openai", result.provider_name);
     try std.testing.expectEqualStrings("gpt-4o", result.model_id);
 }
 
+test "parseModelString handles nested slashes for openrouter" {
+    const result = parseModelString("openrouter/anthropic/claude-sonnet-4");
+    try std.testing.expectEqualStrings("openrouter", result.provider_name);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", result.model_id);
+}
+
 test "createProvider returns UnknownProvider for unsupported provider" {
     const allocator = std.testing.allocator;
-    const result = createProvider("fakeprovider:some-model", allocator);
+    const result = createProvider("fakeprovider/some-model", allocator);
     try std.testing.expectError(error.UnknownProvider, result);
 }
 
