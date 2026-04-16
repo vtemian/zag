@@ -48,15 +48,36 @@ pub const Node = struct {
     collapsed: bool = false,
     /// Back-pointer to the parent node, null for root children.
     parent: ?*Node = null,
+    /// Incremented on every content mutation. Cache checks this against stored version.
+    content_version: u32 = 0,
+    /// Cached rendered lines for this node. Null means not yet cached.
+    cached_lines: ?[]Theme.StyledLine = null,
+    /// The content_version at which cached_lines was computed.
+    cached_version: u32 = 0,
 
     /// Release all memory owned by this node and its descendants.
     pub fn deinit(self: *Node, allocator: Allocator) void {
+        self.clearCache(allocator);
         for (self.children.items) |child| {
             child.deinit(allocator);
             allocator.destroy(child);
         }
         self.children.deinit(allocator);
         self.content.deinit(allocator);
+    }
+
+    /// Free cached lines if present.
+    pub fn clearCache(self: *Node, allocator: Allocator) void {
+        if (self.cached_lines) |cached| {
+            for (cached) |line| line.deinit(allocator);
+            allocator.free(cached);
+            self.cached_lines = null;
+        }
+    }
+
+    /// Mark this node's content as changed, invalidating any cache.
+    pub fn markDirty(self: *Node) void {
+        self.content_version +%= 1;
     }
 };
 
@@ -68,6 +89,8 @@ name: []const u8,
 root_children: std.ArrayList(*Node),
 /// Monotonically increasing counter for assigning node IDs.
 next_id: u32,
+/// Incremented when nodes are added or removed from the tree.
+tree_version: u32 = 0,
 /// Allocator used for all buffer and node allocations.
 allocator: Allocator,
 /// Scroll offset from the bottom (0 = scrolled to latest content).
@@ -142,6 +165,7 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
         .parent = parent,
     };
     self.next_id += 1;
+    self.tree_version +%= 1;
 
     if (parent) |p| {
         try p.children.append(self.allocator, node);
@@ -177,7 +201,7 @@ pub fn getVisibleLines(
 }
 
 /// Recursive helper: render a node and its non-collapsed children,
-/// respecting the skip/max_lines window.
+/// respecting the skip/max_lines window. Uses per-node cache when available.
 fn collectVisibleLines(
     node: *const Node,
     allocator: Allocator,
@@ -191,45 +215,77 @@ fn collectVisibleLines(
 ) !void {
     if (collected.* >= max_lines) return;
 
-    // Estimate this node's line count to decide if we can skip it entirely
     const node_lines = renderer.lineCountForNode(node);
 
     if (skipped.* + node_lines <= skip) {
         // Entire node falls before the visible window; skip without rendering
         skipped.* += node_lines;
     } else {
-        // Node overlaps the visible window; render it
-        const before = lines.items.len;
-        try renderer.render(node, lines, allocator, theme);
-        const produced = lines.items.len - before;
+        // Cache is a transparent optimization; constCast is safe here
+        const node_mut = @as(*Node, @constCast(node));
 
-        // Trim lines that fall before the skip window
-        const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
-        if (skip_from_node > 0 and skip_from_node < produced) {
-            // Free the skipped lines
-            for (lines.items[before .. before + skip_from_node]) |line| line.deinit(allocator);
-            // Shift remaining lines down
-            const remaining = produced - skip_from_node;
-            std.mem.copyForwards(
-                Theme.StyledLine,
-                lines.items[before .. before + remaining],
-                lines.items[before + skip_from_node .. before + produced],
-            );
-            lines.shrinkRetainingCapacity(before + remaining);
-        } else if (skip_from_node >= produced) {
-            // Entire node output is before the window; free and remove
-            for (lines.items[before..]) |line| line.deinit(allocator);
-            lines.shrinkRetainingCapacity(before);
-        }
+        if (node_mut.cached_lines != null and node_mut.cached_version == node.content_version) {
+            // Cache hit: clone cached lines into the output (caller owns these copies)
+            const cached = node_mut.cached_lines.?;
+            const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
+            const available = if (skip_from_node < cached.len) cached.len - skip_from_node else 0;
+            const take = @min(available, max_lines - collected.*);
 
-        skipped.* += node_lines;
-        collected.* = lines.items.len;
+            for (cached[skip_from_node .. skip_from_node + take]) |cached_line| {
+                const spans_copy = try allocator.alloc(Theme.StyledSpan, cached_line.spans.len);
+                errdefer allocator.free(spans_copy);
+                for (cached_line.spans, 0..) |span, i| {
+                    const text_copy = try allocator.dupe(u8, span.text);
+                    spans_copy[i] = .{ .text = text_copy, .style = span.style };
+                }
+                try lines.append(allocator, .{ .spans = spans_copy });
+            }
 
-        // Trim if we've exceeded max_lines
-        if (collected.* > max_lines) {
-            for (lines.items[max_lines..]) |line| line.deinit(allocator);
-            lines.shrinkRetainingCapacity(max_lines);
-            collected.* = max_lines;
+            skipped.* += node_lines;
+            collected.* = lines.items.len;
+        } else {
+            // Cache miss: render, then store a copy in the cache
+            const before = lines.items.len;
+            try renderer.render(node, lines, allocator, theme);
+            const produced = lines.items.len - before;
+
+            // Build cache: clone the rendered lines into node-owned storage
+            node_mut.clearCache(allocator);
+            const cache_copy = try allocator.alloc(Theme.StyledLine, produced);
+            for (lines.items[before .. before + produced], 0..) |line, i| {
+                const spans_copy = try allocator.alloc(Theme.StyledSpan, line.spans.len);
+                for (line.spans, 0..) |span, j| {
+                    spans_copy[j] = .{ .text = try allocator.dupe(u8, span.text), .style = span.style };
+                }
+                cache_copy[i] = .{ .spans = spans_copy };
+            }
+            node_mut.cached_lines = cache_copy;
+            node_mut.cached_version = node.content_version;
+
+            // Apply skip/limit trimming to the output lines
+            const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
+            if (skip_from_node > 0 and skip_from_node < produced) {
+                for (lines.items[before .. before + skip_from_node]) |line| line.deinit(allocator);
+                const remaining = produced - skip_from_node;
+                std.mem.copyForwards(
+                    Theme.StyledLine,
+                    lines.items[before .. before + remaining],
+                    lines.items[before + skip_from_node .. before + produced],
+                );
+                lines.shrinkRetainingCapacity(before + remaining);
+            } else if (skip_from_node >= produced) {
+                for (lines.items[before..]) |line| line.deinit(allocator);
+                lines.shrinkRetainingCapacity(before);
+            }
+
+            skipped.* += node_lines;
+            collected.* = lines.items.len;
+
+            if (collected.* > max_lines) {
+                for (lines.items[max_lines..]) |line| line.deinit(allocator);
+                lines.shrinkRetainingCapacity(max_lines);
+                collected.* = max_lines;
+            }
         }
     }
 
@@ -265,6 +321,7 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer) !usize {
 /// Used for streaming: text deltas accumulate into one node.
 pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !void {
     try node.content.appendSlice(self.allocator, text);
+    node.markDirty();
 }
 
 /// Populate the node tree from loaded JSONL entries.
@@ -370,6 +427,7 @@ pub fn clear(self: *ConversationBuffer) void {
     }
     self.root_children.clearRetainingCapacity();
     self.next_id = 0;
+    self.tree_version +%= 1;
 }
 
 /// Persist an event to the session JSONL file, if a session is attached.
@@ -539,6 +597,75 @@ pub fn shutdown(self: *ConversationBuffer) void {
         self.event_queue.deinit();
         self.queue_active = false;
     }
+}
+
+/// Generate a short session name via LLM and apply it to the session.
+pub fn autoNameSession(self: *ConversationBuffer, provider: llm.Provider, allocator: Allocator) void {
+    const sh = self.session_handle orelse return;
+    if (sh.meta.name_len > 0 or self.messages.items.len < 2) return;
+
+    const summary = self.generateSessionName(provider, allocator) catch |err| {
+        log.warn("auto-name failed: {}", .{err});
+        return;
+    };
+    defer allocator.free(summary);
+
+    sh.rename(summary) catch |err| {
+        log.warn("session rename failed: {}", .{err});
+    };
+}
+
+/// Send a minimal LLM request to summarize a conversation in 3-5 words.
+fn generateSessionName(self: *const ConversationBuffer, provider: llm.Provider, allocator: Allocator) ![]const u8 {
+    const msgs = self.messages.items;
+    if (msgs.len < 2) return error.InsufficientMessages;
+
+    const user_text = extractFirstText(msgs[0]) orelse return error.NoUserText;
+    const assistant_full = extractFirstText(msgs[1]) orelse return error.NoAssistantText;
+    const assistant_text = assistant_full[0..@min(assistant_full.len, 200)];
+
+    const user_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(user_content);
+    user_content[0] = .{ .text = .{ .text = user_text } };
+
+    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(assistant_content);
+    assistant_content[0] = .{ .text = .{ .text = assistant_text } };
+
+    var summary_msgs = [_]types.Message{
+        .{ .role = .user, .content = user_content },
+        .{ .role = .assistant, .content = assistant_content },
+    };
+
+    const response = try provider.call(
+        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
+        &summary_msgs,
+        &.{},
+        allocator,
+    );
+    defer response.deinit(allocator);
+
+    allocator.free(user_content);
+    allocator.free(assistant_content);
+
+    for (response.content) |block| {
+        switch (block) {
+            .text => |t| return try allocator.dupe(u8, t.text),
+            else => {},
+        }
+    }
+
+    return error.NoResponseText;
+}
+
+fn extractFirstText(msg: types.Message) ?[]const u8 {
+    for (msg.content) |block| {
+        switch (block) {
+            .text => |t| return t.text,
+            else => {},
+        }
+    }
+    return null;
 }
 
 pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle, allocator: Allocator) !void {
@@ -725,4 +852,102 @@ test "buffer interface returns line count" {
     // user_message "hello" = 1 line, separator = 1 line, user_message "line1\nline2" = 2 lines
     const count = try b.lineCount();
     try std.testing.expectEqual(@as(usize, 4), count);
+}
+
+test "getVisibleLines returns consistent results when content unchanged" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+    _ = try cb.appendNode(null, .assistant_text, "world");
+
+    const theme = Theme.defaultTheme();
+
+    // First call
+    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    defer Theme.freeStyledLines(&lines1, allocator);
+
+    const text1 = try lines1.items[0].toText(allocator);
+    defer allocator.free(text1);
+
+    // Second call (should use cache)
+    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    defer Theme.freeStyledLines(&lines2, allocator);
+
+    const text2 = try lines2.items[0].toText(allocator);
+    defer allocator.free(text2);
+
+    try std.testing.expectEqualStrings(text1, text2);
+    try std.testing.expectEqual(lines1.items.len, lines2.items.len);
+}
+
+test "getVisibleLines reflects new content after appendToNode" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    defer cb.deinit();
+
+    const node = try cb.appendNode(null, .user_message, "hello");
+
+    const theme = Theme.defaultTheme();
+
+    // Populate cache
+    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    Theme.freeStyledLines(&lines1, allocator);
+
+    // Mutate: append to node
+    try cb.appendToNode(node, " world");
+
+    // Cache should be invalidated for this node
+    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    defer Theme.freeStyledLines(&lines2, allocator);
+
+    const text = try lines2.items[0].toText(allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("> hello world", text);
+}
+
+test "getVisibleLines reflects new nodes after appendNode" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "append-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "first");
+
+    const theme = Theme.defaultTheme();
+
+    // Populate cache
+    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    const lines1_len = lines1.items.len;
+    Theme.freeStyledLines(&lines1, allocator);
+    try std.testing.expectEqual(@as(usize, 1), lines1_len);
+
+    // Add new node
+    _ = try cb.appendNode(null, .user_message, "second");
+
+    // Should include both nodes
+    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    defer Theme.freeStyledLines(&lines2, allocator);
+    try std.testing.expectEqual(@as(usize, 2), lines2.items.len);
+}
+
+test "clear invalidates line cache" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+
+    const theme = Theme.defaultTheme();
+
+    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    const lines1_len = lines1.items.len;
+    Theme.freeStyledLines(&lines1, allocator);
+    try std.testing.expectEqual(@as(usize, 1), lines1_len);
+
+    cb.clear();
+
+    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    defer Theme.freeStyledLines(&lines2, allocator);
+    try std.testing.expectEqual(@as(usize, 0), lines2.items.len);
 }

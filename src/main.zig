@@ -7,7 +7,6 @@ const std = @import("std");
 const posix = std.posix;
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
-const types = @import("types.zig");
 const input_mod = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
@@ -119,14 +118,6 @@ var awaiting_window_cmd: bool = false;
 fn appendOutputText(text: []const u8) !void {
     _ = try buffer.appendNode(null, .status, text);
 }
-
-// ---------------------------------------------------------------------------
-// TUI rendering helpers
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Input buffer helpers (tested below)
-// ---------------------------------------------------------------------------
 
 /// Maximum number of bytes the user can type on the input line.
 const MAX_INPUT = 4096;
@@ -322,11 +313,7 @@ fn handleKey(
 /// Drain a buffer's agent events and auto-name its session on first completion.
 fn drainBuffer(buf: *ConversationBuffer, prov: *llm.ProviderResult, allocator: std.mem.Allocator) void {
     if (buf.drainEvents(allocator)) {
-        if (buf.session_handle) |sh| {
-            if (sh.meta.name_len == 0 and buf.messages.items.len >= 2) {
-                autoNameSession(sh, buf, prov.provider, allocator);
-            }
-        }
+        buf.autoNameSession(prov.provider, allocator);
     }
 }
 
@@ -348,25 +335,22 @@ fn handleCommand(input: []const u8, model_id: []const u8) CommandResult {
         if (trace.enabled) {
             const stats = trace.getStats();
             var scratch: [512]u8 = undefined;
-
-            const header = std.fmt.bufPrint(&scratch, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
-            appendOutputText(header) catch {};
-
-            const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
-            const p99_ms = @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0;
-            const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
-            const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
-
-            const avg_line = std.fmt.bufPrint(&scratch, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
-            appendOutputText(avg_line) catch {};
-            const p99_line = std.fmt.bufPrint(&scratch, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
-            appendOutputText(p99_line) catch {};
-            const max_line = std.fmt.bufPrint(&scratch, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
-            appendOutputText(max_line) catch {};
-            const peak_line = std.fmt.bufPrint(&scratch, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
-            appendOutputText(peak_line) catch {};
-            const allocs_line = std.fmt.bufPrint(&scratch, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
-            appendOutputText(allocs_line) catch {};
+            const msg = std.fmt.bufPrint(&scratch,
+                \\Performance (last {d} frames):
+                \\  avg frame:       {d:.1}ms
+                \\  p99 frame:       {d:.1}ms
+                \\  max frame:       {d:.1}ms
+                \\  peak memory:     {d:.1}MB
+                \\  avg allocs/frame: {d:.1}
+            , .{
+                stats.frame_count,
+                @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0,
+                @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0,
+                @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0,
+                @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
+                stats.avg_allocs_per_frame,
+            }) catch "Performance: error formatting";
+            appendOutputText(msg) catch {};
         } else {
             appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
         }
@@ -421,81 +405,6 @@ fn doSplit(direction: Layout.SplitDirection, session_mgr: *?Session.SessionManag
     }
     layout.recalculate(width, height);
 }
-
-/// Generate a short session name via a cheap LLM call and apply it.
-/// Runs synchronously. Brief block acceptable for v1.
-fn autoNameSession(sh: *Session.SessionHandle, buf: *ConversationBuffer, provider: llm.Provider, allocator: std.mem.Allocator) void {
-    const summary = generateSessionName(provider, buf, allocator) catch |err| {
-        log.warn("auto-name failed: {}", .{err});
-        return;
-    };
-    defer allocator.free(summary);
-
-    sh.rename(summary) catch |err| {
-        log.warn("session rename failed: {}", .{err});
-    };
-}
-
-/// Send a minimal LLM request to summarize a conversation in 3-5 words.
-fn generateSessionName(provider: llm.Provider, buf: *const ConversationBuffer, allocator: std.mem.Allocator) ![]const u8 {
-    const msgs = buf.messages.items;
-    if (msgs.len < 2) return error.InsufficientMessages;
-
-    // Extract first user message text
-    const user_text = extractFirstText(msgs[0]) orelse return error.NoUserText;
-
-    // Extract first assistant response text, truncated to 200 chars
-    const assistant_full = extractFirstText(msgs[1]) orelse return error.NoAssistantText;
-    const assistant_text = assistant_full[0..@min(assistant_full.len, 200)];
-
-    // Build a minimal 2-message conversation for the naming call
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = user_text } };
-
-    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(assistant_content);
-    assistant_content[0] = .{ .text = .{ .text = assistant_text } };
-
-    var summary_msgs = [_]types.Message{
-        .{ .role = .user, .content = user_content },
-        .{ .role = .assistant, .content = assistant_content },
-    };
-
-    const response = try provider.call(
-        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        &summary_msgs,
-        &.{},
-        allocator,
-    );
-    defer response.deinit(allocator);
-
-    // Don't free the content slices: they point into buf.messages, not owned by us
-    allocator.free(user_content);
-    allocator.free(assistant_content);
-
-    // Extract response text
-    for (response.content) |block| {
-        switch (block) {
-            .text => |t| return try allocator.dupe(u8, t.text),
-            else => {},
-        }
-    }
-
-    return error.NoResponseText;
-}
-
-/// Extract the first text content from a message, or null if none.
-fn extractFirstText(msg: types.Message) ?[]const u8 {
-    for (msg.content) |block| {
-        switch (block) {
-            .text => |t| return t.text,
-            else => {},
-        }
-    }
-    return null;
-}
-
 
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
 pub fn main() !void {
@@ -745,9 +654,9 @@ pub fn main() !void {
                 term.size = .{ .rows = sz.rows, .cols = sz.cols };
                 layout.recalculate(sz.cols, sz.rows);
             } else {
-                const action = handleKey: {
+                const action = dispatch: {
                     switch (event) {
-                        .key => |k| break :handleKey handleKey(
+                        .key => |k| break :dispatch handleKey(
                             k,
                             &input_buf,
                             &input_len,
@@ -759,7 +668,7 @@ pub fn main() !void {
                             allocator,
                             if (lua_engine) |*eng| eng else null,
                         ),
-                        else => break :handleKey Action.none,
+                        else => break :dispatch Action.none,
                     }
                 };
                 if (action == .quit) running = false;
