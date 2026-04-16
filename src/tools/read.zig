@@ -54,6 +54,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 pub const definition = types.ToolDefinition{
     .name = "read",
     .description = "Read the contents of a file. Returns the text content, truncated to max_lines (default 2000).",
+    .prompt_snippet = "Read file contents (truncated to 2000 lines by default)",
     .input_schema_json =
     \\{
     \\  "type": "object",

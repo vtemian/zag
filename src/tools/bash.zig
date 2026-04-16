@@ -59,6 +59,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 pub const definition = types.ToolDefinition{
     .name = "bash",
     .description = "Execute a shell command via /bin/sh -c. Returns stdout, stderr, and exit code.",
+    .prompt_snippet = "Execute shell commands (30s timeout by default)",
     .input_schema_json =
     \\{
     \\  "type": "object",

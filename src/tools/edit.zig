@@ -81,6 +81,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 pub const definition = types.ToolDefinition{
     .name = "edit",
     .description = "Replace text in an existing file. old_text must match exactly once. If it matches zero or multiple times, an error is returned.",
+    .prompt_snippet = "Replace exact text in existing files (old_text must match once)",
     .input_schema_json =
     \\{
     \\  "type": "object",
