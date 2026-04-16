@@ -6,19 +6,21 @@ Zag is a composable agent development environment built in Zig. The window syste
 ## Build & run
 ```bash
 zig build                    # build
-zig build run                # run (default: anthropic:claude-sonnet-4-20250514)
+zig build run                # run (default: anthropic/claude-sonnet-4-20250514)
 zig build test               # run tests
 zig build -Dmetrics=true     # enable performance tracing
 zig fmt --check .            # check formatting
 
-ZAG_MODEL="openai:gpt-4o" zig build run                       # use OpenAI
-ZAG_MODEL="anthropic:claude-sonnet-4-20250514" zig build run   # use Claude (default)
+ZAG_MODEL="openai/gpt-4o" zig build run                            # use OpenAI
+ZAG_MODEL="anthropic/claude-sonnet-4-20250514" zig build run        # use Claude (default)
+ZAG_MODEL="openrouter/anthropic/claude-sonnet-4" zig build run      # use OpenRouter
+ZAG_MODEL="ollama/llama3" zig build run                             # use local Ollama
 
 zig build run -- --session=<id>   # resume specific session
 zig build run -- --last           # resume most recent session
 ```
 
-Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` depending on provider.
+Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, etc. depending on provider.
 
 ## Zig coding standards (learned from Ghostty)
 
