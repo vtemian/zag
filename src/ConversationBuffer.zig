@@ -152,33 +152,91 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
     return node;
 }
 
-/// Walk the tree and return styled display lines for the current state.
-/// Collapsed nodes have their children skipped. Each line's spans are
-/// separate allocations owned by the caller (free via Theme.freeStyledLines).
-pub fn getVisibleLines(self: *const ConversationBuffer, allocator: Allocator, theme: *const Theme) !std.ArrayList(Theme.StyledLine) {
+/// Walk the tree and return styled display lines for the visible range.
+/// `skip` lines are omitted from the top; at most `max_lines` are returned.
+/// Nodes that fall entirely outside the range are not rendered.
+pub fn getVisibleLines(
+    self: *const ConversationBuffer,
+    allocator: Allocator,
+    theme: *const Theme,
+    skip: usize,
+    max_lines: usize,
+) !std.ArrayList(Theme.StyledLine) {
     var lines: std.ArrayList(Theme.StyledLine) = .empty;
     errdefer Theme.freeStyledLines(&lines, allocator);
 
+    var skipped: usize = 0;
+    var collected: usize = 0;
+
     for (self.root_children.items) |node| {
-        try collectVisibleLines(node, allocator, &self.renderer, &lines, theme);
+        if (collected >= max_lines) break;
+        try collectVisibleLines(node, allocator, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
     }
 
     return lines;
 }
 
-/// Recursive helper: render a node and its non-collapsed children.
+/// Recursive helper: render a node and its non-collapsed children,
+/// respecting the skip/max_lines window.
 fn collectVisibleLines(
     node: *const Node,
     allocator: Allocator,
     renderer: *const NodeRenderer,
     lines: *std.ArrayList(Theme.StyledLine),
     theme: *const Theme,
+    skip: usize,
+    max_lines: usize,
+    skipped: *usize,
+    collected: *usize,
 ) !void {
-    try renderer.render(node, lines, allocator, theme);
+    if (collected.* >= max_lines) return;
+
+    // Estimate this node's line count to decide if we can skip it entirely
+    const node_lines = renderer.lineCountForNode(node);
+
+    if (skipped.* + node_lines <= skip) {
+        // Entire node falls before the visible window; skip without rendering
+        skipped.* += node_lines;
+    } else {
+        // Node overlaps the visible window; render it
+        const before = lines.items.len;
+        try renderer.render(node, lines, allocator, theme);
+        const produced = lines.items.len - before;
+
+        // Trim lines that fall before the skip window
+        const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
+        if (skip_from_node > 0 and skip_from_node < produced) {
+            // Free the skipped lines
+            for (lines.items[before .. before + skip_from_node]) |line| line.deinit(allocator);
+            // Shift remaining lines down
+            const remaining = produced - skip_from_node;
+            std.mem.copyForwards(
+                Theme.StyledLine,
+                lines.items[before .. before + remaining],
+                lines.items[before + skip_from_node .. before + produced],
+            );
+            lines.shrinkRetainingCapacity(before + remaining);
+        } else if (skip_from_node >= produced) {
+            // Entire node output is before the window; free and remove
+            for (lines.items[before..]) |line| line.deinit(allocator);
+            lines.shrinkRetainingCapacity(before);
+        }
+
+        skipped.* += node_lines;
+        collected.* = lines.items.len;
+
+        // Trim if we've exceeded max_lines
+        if (collected.* > max_lines) {
+            for (lines.items[max_lines..]) |line| line.deinit(allocator);
+            lines.shrinkRetainingCapacity(max_lines);
+            collected.* = max_lines;
+        }
+    }
 
     if (!node.collapsed) {
         for (node.children.items) |child| {
-            try collectVisibleLines(child, allocator, renderer, lines, theme);
+            if (collected.* >= max_lines) return;
+            try collectVisibleLines(child, allocator, renderer, lines, theme, skip, max_lines, skipped, collected);
         }
     }
 }
@@ -521,9 +579,9 @@ const vtable: Buffer.VTable = .{
     .lineCount = bufLineCount,
 };
 
-fn bufGetVisibleLines(ptr: *anyopaque, allocator: Allocator, theme: *const Theme) anyerror!std.ArrayList(Theme.StyledLine) {
+fn bufGetVisibleLines(ptr: *anyopaque, allocator: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.getVisibleLines(allocator, theme);
+    return self.getVisibleLines(allocator, theme, skip, max_lines);
 }
 
 fn bufGetName(ptr: *anyopaque) []const u8 {
@@ -591,7 +649,7 @@ test "getVisibleLines returns rendered lines" {
     _ = try cb.appendNode(null, .separator, "");
 
     const theme = Theme.defaultTheme();
-    var lines = try cb.getVisibleLines(allocator, &theme);
+    var lines = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
     defer Theme.freeStyledLines(&lines, allocator);
 
     try std.testing.expect(lines.items.len >= 2);
@@ -623,6 +681,35 @@ test "fromBuffer roundtrips correctly" {
     const b = cb.buf();
     const recovered = ConversationBuffer.fromBuffer(b);
     try std.testing.expectEqual(&cb, recovered);
+}
+
+test "getVisibleLines with range skips off-screen nodes" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "range-test");
+    defer cb.deinit();
+
+    // Create 5 single-line nodes
+    _ = try cb.appendNode(null, .user_message, "line0");
+    _ = try cb.appendNode(null, .user_message, "line1");
+    _ = try cb.appendNode(null, .user_message, "line2");
+    _ = try cb.appendNode(null, .user_message, "line3");
+    _ = try cb.appendNode(null, .user_message, "line4");
+
+    const theme = Theme.defaultTheme();
+
+    // Request only lines 1..3 (skip line0, take 2, skip line3+line4)
+    var lines = try cb.getVisibleLines(allocator, &theme, 1, 2);
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+
+    const text0 = try lines.items[0].toText(allocator);
+    defer allocator.free(text0);
+    try std.testing.expectEqualStrings("> line1", text0);
+
+    const text1 = try lines.items[1].toText(allocator);
+    defer allocator.free(text1);
+    try std.testing.expectEqualStrings("> line2", text1);
 }
 
 test "buffer interface returns line count" {
