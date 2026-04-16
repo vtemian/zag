@@ -13,6 +13,9 @@ zig fmt --check .            # check formatting
 
 ZAG_MODEL="openai:gpt-4o" zig build run                       # use OpenAI
 ZAG_MODEL="anthropic:claude-sonnet-4-20250514" zig build run   # use Claude (default)
+
+zig build run -- --session=<id>   # resume specific session
+zig build run -- --last           # resume most recent session
 ```
 
 Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` depending on provider.
@@ -121,6 +124,7 @@ src/
     openai.zig      OpenAI Chat Completions provider
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   AgentThread.zig   background agent thread with event queue
+  Session.zig       JSONL session persistence and management
   Buffer.zig        structured node tree for content
   MarkdownParser.zig line-by-line markdown to StyledLine converter
   NodeRenderer.zig  type-specific node rendering
