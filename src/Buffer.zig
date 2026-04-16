@@ -40,6 +40,12 @@ pub const VTable = struct {
 
     /// Return the total number of display lines in the buffer.
     lineCount: *const fn (ptr: *anyopaque) anyerror!usize,
+
+    /// Whether the buffer has visual changes since the last clear.
+    isDirty: *const fn (ptr: *anyopaque) bool,
+
+    /// Clear the dirty flag after compositing.
+    clearDirty: *const fn (ptr: *anyopaque) void,
 };
 
 /// Render the buffer's content to styled display lines.
@@ -72,6 +78,16 @@ pub fn lineCount(self: Buffer) !usize {
     return self.vtable.lineCount(self.ptr);
 }
 
+/// Whether the buffer has uncommitted visual changes.
+pub fn isDirty(self: Buffer) bool {
+    return self.vtable.isDirty(self.ptr);
+}
+
+/// Clear the dirty flag after compositing the buffer.
+pub fn clearDirty(self: Buffer) void {
+    self.vtable.clearDirty(self.ptr);
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -94,6 +110,14 @@ test "Buffer vtable dispatches correctly" {
                 fn f(_: *anyopaque) anyerror!usize {
                     return 0;
                 }
+            }.f),
+            .isDirty = @ptrCast(&struct {
+                fn f(_: *anyopaque) bool {
+                    return false;
+                }
+            }.f),
+            .clearDirty = @ptrCast(&struct {
+                fn f(_: *anyopaque) void {}
             }.f),
         };
 

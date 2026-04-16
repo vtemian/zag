@@ -93,6 +93,9 @@ next_id: u32,
 allocator: Allocator,
 /// Scroll offset from the bottom (0 = scrolled to latest content).
 scroll_offset: u32 = 0,
+/// Whether the buffer has visual changes since the last composite.
+/// Set on content/structure mutations, cleared by the compositor.
+render_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 
@@ -163,6 +166,7 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
         .parent = parent,
     };
     self.next_id += 1;
+    self.render_dirty = true;
 
     if (parent) |p| {
         try p.children.append(self.allocator, node);
@@ -328,6 +332,7 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer) !usize {
 pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !void {
     try node.content.appendSlice(self.allocator, text);
     node.markDirty();
+    self.render_dirty = true;
 }
 
 /// Populate the node tree from loaded JSONL entries.
@@ -347,6 +352,7 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .session_start, .session_rename => {},
         }
     }
+    self.render_dirty = true;
 }
 
 /// Reconstruct the LLM message history from loaded entries.
@@ -433,6 +439,7 @@ pub fn clear(self: *ConversationBuffer) void {
     }
     self.root_children.clearRetainingCapacity();
     self.next_id = 0;
+    self.render_dirty = true;
 }
 
 /// Persist an event to the session JSONL file, if a session is attached.
@@ -709,6 +716,8 @@ const vtable: Buffer.VTable = .{
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
     .lineCount = bufLineCount,
+    .isDirty = bufIsDirty,
+    .clearDirty = bufClearDirty,
 };
 
 fn bufGetVisibleLines(ptr: *anyopaque, allocator: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
@@ -733,12 +742,24 @@ fn bufGetScrollOffset(ptr: *anyopaque) u32 {
 
 fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    if (self.scroll_offset == offset) return;
     self.scroll_offset = offset;
+    self.render_dirty = true;
 }
 
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
     return self.lineCount();
+}
+
+fn bufIsDirty(ptr: *anyopaque) bool {
+    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return self.render_dirty;
+}
+
+fn bufClearDirty(ptr: *anyopaque) void {
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    self.render_dirty = false;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -955,4 +976,71 @@ test "clear invalidates line cache" {
     var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
     defer Theme.freeStyledLines(&lines2, allocator);
     try std.testing.expectEqual(@as(usize, 0), lines2.items.len);
+}
+
+test "buffer starts clean" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    defer cb.deinit();
+
+    const b = cb.buf();
+    try std.testing.expect(!b.isDirty());
+}
+
+test "appendNode marks buffer dirty" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+    const b = cb.buf();
+    try std.testing.expect(b.isDirty());
+}
+
+test "clearDirty resets the flag" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+    var b = cb.buf();
+    try std.testing.expect(b.isDirty());
+
+    b.clearDirty();
+    try std.testing.expect(!b.isDirty());
+}
+
+test "appendToNode marks buffer dirty" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    defer cb.deinit();
+
+    const node = try cb.appendNode(null, .user_message, "hello");
+    var b = cb.buf();
+    b.clearDirty();
+
+    try cb.appendToNode(node, " world");
+    try std.testing.expect(b.isDirty());
+}
+
+test "setScrollOffset marks dirty only when value changes" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    defer cb.deinit();
+
+    var b = cb.buf();
+
+    // Setting to same value (0) should not mark dirty
+    b.setScrollOffset(0);
+    try std.testing.expect(!b.isDirty());
+
+    // Setting to different value should mark dirty
+    b.setScrollOffset(5);
+    try std.testing.expect(b.isDirty());
+
+    b.clearDirty();
+
+    // Setting back to 5 should not mark dirty
+    b.setScrollOffset(5);
+    try std.testing.expect(!b.isDirty());
 }
