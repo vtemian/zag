@@ -114,7 +114,7 @@ Dependencies: ziglua (Lua 5.4, compiled from source).
 - Don't add comments explaining what code does if the code is clear. Comment why, not what
 - Don't use runtime dispatch when comptime selection works
 - Don't skip `errdefer`. Every allocation in an init chain needs cleanup on failure
-- Don't put type names in variable names (`model_str`, `perf_buf`, `err_buf`). Name by domain role, not storage type. The type system carries type info; names carry semantic info.
+- Don't put type names in variable names (`model_str`, `perf_buf`, `err_buf`, `provider_result`). Name by domain role, not storage type. The type system carries type info; names carry semantic info.
 
 ## Architecture
 ```
