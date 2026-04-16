@@ -122,6 +122,97 @@ pub const HookRequest = struct {
     }
 };
 
+pub const Hook = struct {
+    id: u32,
+    kind: EventKind,
+    /// Pattern string owned by the registry.
+    pattern: ?[]const u8,
+    /// Lua registry ref for the callback function.
+    lua_ref: i32,
+};
+
+/// Ordered list of registered hooks. Iteration order = registration order.
+/// Not thread-safe; caller (main thread) must hold whatever lock the
+/// LuaEngine exposes.
+pub const Registry = struct {
+    allocator: Allocator,
+    hooks: std.ArrayList(Hook),
+    next_id: u32,
+
+    pub fn init(allocator: Allocator) Registry {
+        return .{
+            .allocator = allocator,
+            .hooks = .empty,
+            .next_id = 1,
+        };
+    }
+
+    pub fn deinit(self: *Registry) void {
+        for (self.hooks.items) |h| {
+            if (h.pattern) |p| self.allocator.free(p);
+        }
+        self.hooks.deinit(self.allocator);
+    }
+
+    /// Register a hook. Returns its id (for later unregister).
+    /// `pattern`, if non-null, is duped into the registry.
+    pub fn register(
+        self: *Registry,
+        kind: EventKind,
+        pattern: ?[]const u8,
+        lua_ref: i32,
+    ) !u32 {
+        const dup_pattern: ?[]const u8 = if (pattern) |p| try self.allocator.dupe(u8, p) else null;
+        errdefer if (dup_pattern) |p| self.allocator.free(p);
+
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.hooks.append(self.allocator, .{
+            .id = id,
+            .kind = kind,
+            .pattern = dup_pattern,
+            .lua_ref = lua_ref,
+        });
+        return id;
+    }
+
+    /// Remove a hook by id. Returns true if found.
+    pub fn unregister(self: *Registry, id: u32) bool {
+        for (self.hooks.items, 0..) |h, i| {
+            if (h.id == id) {
+                if (h.pattern) |p| self.allocator.free(p);
+                _ = self.hooks.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Iterator over hooks matching (kind, key). For events without
+    /// a pattern dimension (e.g. TurnStart), pass key = "".
+    pub fn iterMatching(self: *Registry, kind: EventKind, key: []const u8) Iter {
+        return .{ .registry = self, .kind = kind, .key = key, .i = 0 };
+    }
+
+    pub const Iter = struct {
+        registry: *Registry,
+        kind: EventKind,
+        key: []const u8,
+        i: usize,
+
+        pub fn next(self: *Iter) ?*const Hook {
+            while (self.i < self.registry.hooks.items.len) {
+                const h = &self.registry.hooks.items[self.i];
+                self.i += 1;
+                if (h.kind != self.kind) continue;
+                if (!matchesPattern(h.pattern, self.key)) continue;
+                return h;
+            }
+            return null;
+        }
+    };
+};
+
 test {
     _ = @import("std").testing.refAllDecls(@This());
 }
@@ -159,4 +250,29 @@ test "HookRequest carries payload and signals done" {
 test "HookPayload kind() returns the union tag" {
     const p: HookPayload = .{ .agent_done = {} };
     try std.testing.expectEqual(EventKind.agent_done, p.kind());
+}
+
+test "Registry registers, iterates, and unregisters" {
+    var r = Hooks.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const id1 = try r.register(.tool_pre, "bash", 101);
+    const id2 = try r.register(.tool_pre, null, 102);
+    const id3 = try r.register(.tool_post, "read", 103);
+
+    var matched = std.ArrayList(i32).empty;
+    defer matched.deinit(std.testing.allocator);
+
+    var it = r.iterMatching(.tool_pre, "bash");
+    while (it.next()) |h| try matched.append(std.testing.allocator, h.lua_ref);
+    try std.testing.expectEqualSlices(i32, &.{ 101, 102 }, matched.items);
+
+    try std.testing.expect(r.unregister(id1));
+    matched.clearRetainingCapacity();
+    var it2 = r.iterMatching(.tool_pre, "bash");
+    while (it2.next()) |h| try matched.append(std.testing.allocator, h.lua_ref);
+    try std.testing.expectEqualSlices(i32, &.{102}, matched.items);
+
+    _ = id2;
+    _ = id3;
 }
