@@ -28,6 +28,10 @@ pub const AgentEvent = union(enum) {
     done,
     /// An error occurred during agent execution.
     err: []const u8,
+    /// Discard the in-progress assistant text node so a subsequent
+    /// text_delta starts a fresh render. Used when a partial stream
+    /// is replaced by a non-streaming fallback response.
+    reset_assistant_text,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
