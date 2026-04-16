@@ -59,6 +59,8 @@ current: []Cell,
 previous: []Cell,
 /// Allocator used for grid memory.
 allocator: Allocator,
+/// Persistent output buffer reused across render() calls.
+render_buf: std.ArrayList(u8),
 
 const empty_cell = Cell{};
 
@@ -83,11 +85,13 @@ pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
         .current = current,
         .previous = previous,
         .allocator = allocator,
+        .render_buf = .empty,
     };
 }
 
 /// Release grid memory.
 pub fn deinit(self: *Screen) void {
+    self.render_buf.deinit(self.allocator);
     self.allocator.free(self.current);
     self.allocator.free(self.previous);
 }
@@ -110,6 +114,7 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
     self.previous = new_previous;
     self.width = width;
     self.height = height;
+    self.render_buf.clearRetainingCapacity();
 }
 
 /// Get a mutable pointer to a cell in the current grid.
@@ -222,10 +227,9 @@ fn colorsEqual(a: Color, b: Color) bool {
 /// **Mutates self**: copies current to previous after writing, so a
 /// subsequent render with no intervening cell changes produces no output.
 pub fn render(self: *Screen, file: std.fs.File) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(self.allocator);
+    self.render_buf.clearRetainingCapacity();
 
-    const writer = buf.writer(self.allocator);
+    const writer = self.render_buf.writer(self.allocator);
 
     // Diff the current grid against previous and generate ANSI sequences
     var cells_changed: u32 = 0;
@@ -303,10 +307,10 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
     // Single write to stdout, retrying on WouldBlock
     {
         var write_span = trace.span("write");
-        defer write_span.endWithArgs(.{ .bytes = buf.items.len });
+        defer write_span.endWithArgs(.{ .bytes = self.render_buf.items.len });
         var written: usize = 0;
-        while (written < buf.items.len) {
-            written += file.write(buf.items[written..]) catch |err| switch (err) {
+        while (written < self.render_buf.items.len) {
+            written += file.write(self.render_buf.items[written..]) catch |err| switch (err) {
                 error.WouldBlock => {
                     // Output buffer full; brief pause then retry
                     std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
@@ -655,6 +659,41 @@ test "render emits RGB background color SGR sequences" {
 
     // Should contain the RGB background SGR: 48;2;255;128;0
     try std.testing.expect(std.mem.indexOf(u8, output, "48;2;255;128;0") != null);
+}
+
+test "render reuses output buffer across frames" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 5, 2);
+    defer screen.deinit();
+
+    // Frame 1: write 'A'
+    screen.getCell(0, 0).codepoint = 'A';
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [8192]u8 = undefined;
+        const output = try readPipe(read_end, &scratch);
+        try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
+    }
+
+    // Frame 2: write 'B' at a different cell
+    screen.getCell(1, 0).codepoint = 'B';
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [8192]u8 = undefined;
+        const output = try readPipe(read_end, &scratch);
+        // Frame 2 should only contain 'B', not 'A' (A is now in previous)
+        try std.testing.expect(std.mem.indexOf(u8, output, "B") != null);
+    }
 }
 
 test "render emits palette background color SGR sequences" {
