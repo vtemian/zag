@@ -80,7 +80,7 @@ var next_buffer_id: u32 = 1;
 /// Extra buffers created by splits, tracked for cleanup.
 var extra_buffers: std.ArrayList(*Buffer) = .empty;
 
-/// Last tool_call node, used to parent tool_result nodes.
+/// Last tool_call node, used to parent tool_result nodes (legacy callback path).
 var last_tool_call: ?*Buffer.Node = null;
 
 /// Handle for the background agent thread, if one is running.
@@ -91,9 +91,6 @@ var event_queue: AgentThread.EventQueue = undefined;
 
 /// Atomic flag for requesting agent thread cancellation.
 var cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false);
-
-/// The node that text deltas accumulate into during streaming.
-var current_assistant_node: ?*Buffer.Node = null;
 
 /// Frame counter for animating the status bar spinner.
 var spinner_frame: u8 = 0;
@@ -274,13 +271,6 @@ pub fn main() !void {
     // Initialize tool registry
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
-
-    // Conversation history
-    var messages: std.ArrayList(types.Message) = .empty;
-    defer {
-        for (messages.items) |msg| msg.deinit(allocator);
-        messages.deinit(allocator);
-    }
 
     // -- Enter TUI mode ------------------------------------------------------
     var term = Terminal.init() catch |err| {
@@ -535,34 +525,36 @@ pub fn main() !void {
                                     // Ignore if an agent is already running
                                     if (agent_thread != null) continue;
 
+                                    const active_buf = if (layout.getFocusedLeaf()) |l| l.buffer else &buffer;
+
                                     // Append the user message to the conversation
                                     // history before spawning the thread, because
                                     // runLoopStreaming reads from messages directly.
                                     const user_content = try allocator.alloc(types.ContentBlock, 1);
                                     const duped_input = try allocator.dupe(u8, user_input);
                                     user_content[0] = .{ .text = .{ .text = duped_input } };
-                                    try messages.append(allocator, .{ .role = .user, .content = user_content });
+                                    try active_buf.messages.append(allocator, .{ .role = .user, .content = user_content });
 
                                     // Show user message in buffer
-                                    _ = try buffer.appendNode(null, .user_message, user_input);
+                                    _ = try active_buf.appendNode(null, .user_message, user_input);
 
                                     // Clear input and reset streaming state
                                     input_len = 0;
-                                    current_assistant_node = null;
-                                    last_tool_call = null;
+                                    active_buf.current_assistant_node = null;
+                                    active_buf.last_tool_call = null;
                                     cancel_flag.store(false, .release);
 
                                     // Initialize event queue and spawn agent thread
                                     event_queue = AgentThread.EventQueue.init(allocator);
                                     agent_thread = AgentThread.spawn(
                                         provider_result.provider,
-                                        &messages,
+                                        &active_buf.messages,
                                         &registry,
                                         allocator,
                                         &event_queue,
                                         &cancel_flag,
                                     ) catch |err| blk: {
-                                        _ = buffer.appendNode(null, .err, @errorName(err)) catch {};
+                                        _ = active_buf.appendNode(null, .err, @errorName(err)) catch {};
                                         event_queue.deinit();
                                         break :blk null;
                                     };
@@ -612,47 +604,48 @@ pub fn main() !void {
                 .none => {},
             };
 
-        // Drain agent events
+        // Drain agent events into the focused buffer
         if (agent_thread != null) {
+            const active_buf = if (layout.getFocusedLeaf()) |l| l.buffer else &buffer;
             var event_buf: [64]AgentThread.AgentEvent = undefined;
             const count = event_queue.drain(&event_buf);
 
             for (event_buf[0..count]) |agent_event| {
                 // Auto-scroll to bottom when new content arrives
-                buffer.scroll_offset = 0;
+                active_buf.scroll_offset = 0;
 
                 switch (agent_event) {
                     .text_delta => |text| {
                         defer allocator.free(text);
-                        if (current_assistant_node) |node| {
-                            buffer.appendToNode(node, text) catch {};
+                        if (active_buf.current_assistant_node) |node| {
+                            active_buf.appendToNode(node, text) catch {};
                         } else {
-                            current_assistant_node = buffer.appendNode(null, .assistant_text, text) catch null;
+                            active_buf.current_assistant_node = active_buf.appendNode(null, .assistant_text, text) catch null;
                         }
                     },
                     .tool_start => |name| {
                         defer allocator.free(name);
-                        current_assistant_node = null;
-                        last_tool_call = buffer.appendNode(null, .tool_call, name) catch null;
+                        active_buf.current_assistant_node = null;
+                        active_buf.last_tool_call = active_buf.appendNode(null, .tool_call, name) catch null;
                     },
                     .tool_result => |result| {
                         defer allocator.free(result.content);
-                        _ = buffer.appendNode(last_tool_call, .tool_result, result.content) catch {};
+                        _ = active_buf.appendNode(active_buf.last_tool_call, .tool_result, result.content) catch {};
                     },
                     .info => |text| {
                         defer allocator.free(text);
-                        _ = buffer.appendNode(null, .status, text) catch {};
+                        _ = active_buf.appendNode(null, .status, text) catch {};
                     },
                     .done => {
                         if (agent_thread) |t| t.join();
                         agent_thread = null;
                         event_queue.deinit();
                         status_msg = "";
-                        current_assistant_node = null;
+                        active_buf.current_assistant_node = null;
                     },
                     .err => |text| {
                         defer allocator.free(text);
-                        _ = buffer.appendNode(null, .err, text) catch {};
+                        _ = active_buf.appendNode(null, .err, text) catch {};
                     },
                 }
             }
@@ -734,6 +727,7 @@ test "imports compile" {
     _ = @import("Theme.zig");
     _ = @import("AgentThread.zig");
     _ = @import("MarkdownParser.zig");
+    _ = @import("Session.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/openai.zig");
 }

@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
+const types = @import("types.zig");
 
 const Buffer = @This();
 
@@ -64,6 +65,16 @@ allocator: Allocator,
 /// Scroll offset from the bottom (0 = scrolled to latest content).
 scroll_offset: u32 = 0,
 
+/// Conversation history for LLM calls. Each buffer maintains its own.
+/// Thread-safety: the agent thread only appends to this list, and the
+/// main thread only reads it for display. As long as the main thread
+/// does not modify messages while the agent is running, this is safe.
+messages: std.ArrayList(types.Message) = .empty,
+/// Last tool_call node (for parenting tool_result nodes).
+last_tool_call: ?*Node = null,
+/// Current assistant text node being streamed to.
+current_assistant_node: ?*Node = null,
+
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
     const owned_name = try allocator.dupe(u8, name);
@@ -78,13 +89,15 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
     };
 }
 
-/// Release all memory owned by this buffer: nodes, name, and lists.
+/// Release all memory owned by this buffer: nodes, name, messages, and lists.
 pub fn deinit(self: *Buffer) void {
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
         self.allocator.destroy(node);
     }
     self.root_children.deinit(self.allocator);
+    for (self.messages.items) |msg| msg.deinit(self.allocator);
+    self.messages.deinit(self.allocator);
     self.allocator.free(self.name);
 }
 
