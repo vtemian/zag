@@ -8,6 +8,11 @@ const std = @import("std");
 const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 
+/// Thread-local name of the tool currently being executed.
+/// Set by Registry.execute() before calling the tool function,
+/// allowing stateless function pointers to identify themselves.
+pub threadlocal var current_tool_name: ?[]const u8 = null;
+
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
@@ -53,6 +58,8 @@ pub const Registry = struct {
             .content = "error: unknown tool",
             .is_error = true,
         };
+        current_tool_name = name;
+        defer current_tool_name = null;
         return tool.execute(input_raw, allocator);
     }
 };
@@ -119,6 +126,23 @@ test "createDefaultRegistry has all tools" {
     try std.testing.expect(registry.get("write") != null);
     try std.testing.expect(registry.get("edit") != null);
     try std.testing.expect(registry.get("bash") != null);
+}
+
+test "execute sets current_tool_name during execution" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(bash_tool.tool);
+
+    // Before execution, should be null
+    try std.testing.expect(current_tool_name == null);
+
+    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator);
+    defer allocator.free(result.content);
+
+    // After execution, should be cleared
+    try std.testing.expect(current_tool_name == null);
 }
 
 test {
