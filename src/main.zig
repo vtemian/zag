@@ -463,6 +463,7 @@ pub fn main() !void {
         std.posix.close(wake_write);
     }
     buffer.wake_fd = wake_write;
+    Terminal.setWakeFd(wake_write);
 
     // Initialize layout with the session buffer as root
     layout = Layout.init(allocator);
