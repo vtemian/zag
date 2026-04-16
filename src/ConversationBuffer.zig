@@ -307,6 +307,25 @@ pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
     };
 }
 
+/// Restore buffer state from a persisted session: load the node tree,
+/// rebuild the LLM message history, and update the buffer name from meta.
+pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle, allocator: Allocator) !void {
+    const session_id = sh.id[0..sh.id_len];
+    const entries = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (entries) |entry| Session.freeEntry(entry, allocator);
+        allocator.free(entries);
+    }
+
+    try self.loadFromEntries(entries);
+    try self.rebuildMessages(entries, allocator);
+
+    if (sh.meta.name_len > 0) {
+        allocator.free(self.name);
+        self.name = try allocator.dupe(u8, sh.meta.nameSlice());
+    }
+}
+
 // -- Buffer interface --------------------------------------------------------
 
 /// Create a Buffer interface from this ConversationBuffer.

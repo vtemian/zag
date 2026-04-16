@@ -515,33 +515,12 @@ pub fn main() !void {
         buffer.session_handle = &(session_handle.?);
     }
 
-    // Load entries from resumed session into buffer
+    // Restore buffer state from resumed session
     if (resume_id != null) {
         if (session_handle) |*sh| {
-            const session_id = sh.id[0..sh.id_len];
-            const entries = Session.loadEntries(session_id, allocator) catch |err| blk: {
-                log.warn("failed to load session entries: {}", .{err});
-                break :blk &[_]Session.Entry{};
+            buffer.restoreFromSession(sh, allocator) catch |err| {
+                log.warn("session restore failed: {}", .{err});
             };
-            defer {
-                for (entries) |entry| Session.freeEntry(entry, allocator);
-                allocator.free(entries);
-            }
-
-            if (entries.len > 0) {
-                buffer.loadFromEntries(entries) catch |err| {
-                    log.warn("failed to populate buffer from entries: {}", .{err});
-                };
-                buffer.rebuildMessages(entries, allocator) catch |err| {
-                    log.warn("failed to rebuild messages: {}", .{err});
-                };
-
-                // Update buffer name from session meta
-                if (sh.meta.name_len > 0) {
-                    allocator.free(buffer.name);
-                    buffer.name = allocator.dupe(u8, sh.meta.nameSlice()) catch buffer.name;
-                }
-            }
         }
     }
 
