@@ -410,8 +410,9 @@ pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry
             },
             .tool_call => {
                 try self.flushToolResultMessage(&tool_result_blocks, allocator);
-                var scratch: [16]u8 = undefined;
-                const synthetic_id = std.fmt.bufPrint(&scratch, "synth_{d}", .{tool_id_counter}) catch unreachable;
+                // Widened to [32]u8 so "synth_" + up to maxInt(u32) always fits.
+                var scratch: [32]u8 = undefined;
+                const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{tool_id_counter});
                 tool_id_counter += 1;
                 const duped_id = try allocator.dupe(u8, synthetic_id);
                 const duped_name = try allocator.dupe(u8, entry.tool_name);
@@ -1138,6 +1139,18 @@ test "resetCurrentAssistantText is a no-op when nothing is in progress" {
 
     try std.testing.expect(cb.current_assistant_node == null);
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+}
+
+test "synthetic id scratch fits maxInt(u32)" {
+    // Compile-time guard: the scratch buffer in rebuildHistoryFromEntries must
+    // hold "synth_" plus the widest possible u32 counter value without
+    // overflowing. Widening the buffer without updating this probe would let
+    // the invariant silently erode.
+    comptime {
+        const max_counter: u64 = std.math.maxInt(u32);
+        var probe: [32]u8 = undefined;
+        _ = std.fmt.bufPrint(&probe, "synth_{d}", .{max_counter}) catch @compileError("synth buffer too small");
+    }
 }
 
 test "text_delta after reset starts a fresh assistant node" {

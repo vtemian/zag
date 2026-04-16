@@ -620,7 +620,10 @@ test "parallel execution is faster than sequential" {
         .{ .id = "call_3", .name = "echo_slow", .input_raw = "{}" },
     };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = std.time.Timer.start() catch |err| {
+        std.debug.print("skipping benchmark: no monotonic clock ({s})\n", .{@errorName(err)});
+        return;
+    };
     const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel);
     const elapsed_ns = timer.read();
     defer freeToolResults(blocks, allocator);
