@@ -1,7 +1,12 @@
 .{
     .name = .zag,
     .version = "0.1.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zlua = .{
+            .url = "https://github.com/natecraddock/ziglua/archive/refs/tags/0.6.0.tar.gz",
+            .hash = "zlua-0.1.0-hGRpCww-BQCx3cX6zbKWfTgOx6B7Peo4P17RK2hm7-xV",
+        },
+    },
     .fingerprint = 0x9179a895b492806,
     .paths = .{
         "build.zig",
