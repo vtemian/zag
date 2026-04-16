@@ -99,6 +99,7 @@ fn callLlm(
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
 ) !types.LlmResponse {
+    thread_local_stream_text_count = 0;
     return provider.callStreaming(
         prompt,
         messages,
@@ -109,7 +110,14 @@ fn callLlm(
     ) catch |streaming_err| {
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
         const fallback = try provider.call(prompt, messages, tool_defs, allocator);
-        // Push text to queue since streaming callback didn't fire
+        // If streaming already rendered partial text, discard it so the
+        // full fallback response doesn't appear concatenated to the partial.
+        if (thread_local_stream_text_count > 0) {
+            queue.push(.reset_assistant_text) catch |err| {
+                log.warn("failed to reset partial stream: {s}", .{@errorName(err)});
+            };
+        }
+        // Push text to queue since streaming callback didn't fire (or was reset)
         for (fallback.content) |block| {
             switch (block) {
                 .text => |t| {
@@ -352,6 +360,10 @@ fn executeToolsSingle(
 /// callStreaming invocation and cleared afterward.
 threadlocal var thread_local_queue: ?*AgentThread.EventQueue = null;
 threadlocal var thread_local_allocator: ?Allocator = null;
+/// Count of text_delta events fired during the current streaming call.
+/// Reset at the start of each callLlm and read on streaming failure to
+/// decide whether the fallback must reset the in-progress assistant node.
+threadlocal var thread_local_stream_text_count: u32 = 0;
 
 /// Callback that converts a provider StreamEvent to an AgentEvent and
 /// pushes it to the thread-local EventQueue. String data is duped because
@@ -361,7 +373,11 @@ fn streamEventToQueue(event: llm.StreamEvent) void {
     const q = thread_local_queue orelse return;
     const alloc = thread_local_allocator orelse return;
     const agent_event: AgentThread.AgentEvent = switch (event) {
-        .text_delta => |t| .{ .text_delta = alloc.dupe(u8, t) catch return },
+        .text_delta => |t| blk: {
+            const duped = alloc.dupe(u8, t) catch return;
+            thread_local_stream_text_count += 1;
+            break :blk .{ .text_delta = duped };
+        },
         .tool_start => |t| .{ .tool_start = .{ .name = alloc.dupe(u8, t) catch return } },
         .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
         .done => .done,
@@ -503,7 +519,7 @@ fn drainAndFreeQueue(queue: *AgentThread.EventQueue, allocator: Allocator) void 
                 },
                 .info => |s| allocator.free(s),
                 .err => |s| allocator.free(s),
-                .done => {},
+                .done, .reset_assistant_text => {},
             }
         }
     }

@@ -343,6 +343,24 @@ pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !v
     self.render_dirty = true;
 }
 
+/// Discard the in-progress assistant text node. Used when a partial
+/// streamed response is being replaced by a non-streaming fallback:
+/// the UI rebuilds from a clean state when the next text_delta arrives.
+pub fn resetCurrentAssistantText(self: *ConversationBuffer) void {
+    const node = self.current_assistant_node orelse return;
+    self.current_assistant_node = null;
+
+    for (self.root_children.items, 0..) |child, i| {
+        if (child == node) {
+            _ = self.root_children.orderedRemove(i);
+            break;
+        }
+    }
+    node.deinit(self.allocator);
+    self.allocator.destroy(node);
+    self.render_dirty = true;
+}
+
 /// Populate the node tree from loaded JSONL entries.
 pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry) !void {
     for (entries) |entry| {
@@ -530,6 +548,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
         .done => {
             self.current_assistant_node = null;
         },
+        .reset_assistant_text => self.resetCurrentAssistantText(),
         .err => |text| {
             defer allocator.free(text);
             _ = self.appendNode(null, .err, text) catch {};
@@ -1088,4 +1107,56 @@ test "setScrollOffset marks dirty only when value changes" {
     // Setting back to 5 should not mark dirty
     b.setScrollOffset(5);
     try std.testing.expect(!b.isDirty());
+}
+
+test "resetCurrentAssistantText removes the in-progress node" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hi");
+    const partial = try cb.appendNode(null, .assistant_text, "partial ");
+    cb.current_assistant_node = partial;
+
+    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+
+    cb.resetCurrentAssistantText();
+
+    try std.testing.expect(cb.current_assistant_node == null);
+    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
+}
+
+test "resetCurrentAssistantText is a no-op when nothing is in progress" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hi");
+
+    cb.resetCurrentAssistantText();
+
+    try std.testing.expect(cb.current_assistant_node == null);
+    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+}
+
+test "text_delta after reset starts a fresh assistant node" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow");
+    defer cb.deinit();
+
+    // Simulate a partial stream: two text deltas append to one node.
+    cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
+    cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "wor") }, allocator);
+    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+    try std.testing.expectEqualStrings("Hello wor", cb.root_children.items[0].content.items);
+
+    // Fallback: reset, then push the full response.
+    cb.handleAgentEvent(.reset_assistant_text, allocator);
+    try std.testing.expectEqual(@as(usize, 0), cb.root_children.items.len);
+    try std.testing.expect(cb.current_assistant_node == null);
+
+    cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
+    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+    try std.testing.expectEqualStrings("Hello world", cb.root_children.items[0].content.items);
 }
