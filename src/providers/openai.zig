@@ -311,48 +311,29 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
     const message = choice.get("message") orelse return error.MalformedResponse;
     const msg_obj = message.object;
 
-    var blocks: std.ArrayList(types.ContentBlock) = .empty;
-    errdefer {
-        for (blocks.items) |block| block.freeOwned(allocator);
-        blocks.deinit(allocator);
-    }
+    var builder: llm.ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
 
     if (msg_obj.get("content")) |content_val| {
         if (content_val == .string) {
-            const text = try allocator.dupe(u8, content_val.string);
-            errdefer allocator.free(text);
-            try blocks.append(allocator, .{ .text = .{ .text = text } });
+            try builder.addText(content_val.string, allocator);
         }
     }
 
     if (msg_obj.get("tool_calls")) |tc_val| {
         for (tc_val.array.items) |tc_item| {
             const tc = tc_item.object;
-            const id = try allocator.dupe(u8, tc.get("id").?.string);
-            errdefer allocator.free(id);
-
             const func = tc.get("function").?.object;
-            const name = try allocator.dupe(u8, func.get("name").?.string);
-            errdefer allocator.free(name);
-
-            const args_str = func.get("arguments").?.string;
-            const input_raw = try allocator.dupe(u8, args_str);
-            errdefer allocator.free(input_raw);
-
-            try blocks.append(allocator, .{ .tool_use = .{
-                .id = id,
-                .name = name,
-                .input_raw = input_raw,
-            } });
+            try builder.addToolUse(
+                tc.get("id").?.string,
+                func.get("name").?.string,
+                func.get("arguments").?.string,
+                allocator,
+            );
         }
     }
 
-    return .{
-        .content = try blocks.toOwnedSlice(allocator),
-        .stop_reason = stop_reason,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-    };
+    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
 }
 
 /// State for accumulating a tool call during OpenAI streaming.
@@ -470,38 +451,18 @@ fn parseSseStream(
     }
 
     // Assemble final LlmResponse
-    var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-    errdefer {
-        for (result_blocks.items) |block| block.freeOwned(allocator);
-        result_blocks.deinit(allocator);
-    }
+    var builder: llm.ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
 
     if (text_content.items.len > 0) {
-        const text = try allocator.dupe(u8, text_content.items);
-        errdefer allocator.free(text);
-        try result_blocks.append(allocator, .{ .text = .{ .text = text } });
+        try builder.addText(text_content.items, allocator);
     }
 
     for (tool_calls.items) |*tc| {
-        const id = try allocator.dupe(u8, tc.id.items);
-        errdefer allocator.free(id);
-        const name = try allocator.dupe(u8, tc.name.items);
-        errdefer allocator.free(name);
-        const input_raw = try allocator.dupe(u8, tc.arguments.items);
-        errdefer allocator.free(input_raw);
-        try result_blocks.append(allocator, .{ .tool_use = .{
-            .id = id,
-            .name = name,
-            .input_raw = input_raw,
-        } });
+        try builder.addToolUse(tc.id.items, tc.name.items, tc.arguments.items, allocator);
     }
 
-    return .{
-        .content = try result_blocks.toOwnedSlice(allocator),
-        .stop_reason = stop_reason,
-        .input_tokens = 0,
-        .output_tokens = 0,
-    };
+    return builder.finish(stop_reason, 0, 0, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------
