@@ -516,12 +516,10 @@ pub fn main() !void {
     }
 
     // Restore buffer state from resumed session
-    if (resume_id != null) {
-        if (session_handle) |*sh| {
-            buffer.restoreFromSession(sh, allocator) catch |err| {
-                log.warn("session restore failed: {}", .{err});
-            };
-        }
+    if (resume_id != null and session_handle != null) {
+        buffer.restoreFromSession(&session_handle.?, allocator) catch |err| {
+            log.warn("session restore failed: {}", .{err});
+        };
     }
 
     // -- Enter TUI mode ------------------------------------------------------
