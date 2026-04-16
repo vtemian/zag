@@ -56,7 +56,7 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
         {
             var s = trace.span("leaves");
             defer s.end();
-            self.drawAllLeaves(root, focused);
+            self.drawAllLeaves(root);
         }
         {
             var s = trace.span("borders");
@@ -69,7 +69,7 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
         {
             var s = trace.span("leaves");
             defer s.end();
-            self.drawDirtyLeaves(root, focused);
+            self.drawDirtyLeaves(root);
         }
     }
 
@@ -87,22 +87,22 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
 }
 
 /// Draw content for all leaves (used on layout change / full redraw).
-fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
+fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
             self.drawBufferContent(&leaf);
             leaf.buffer.clearDirty();
         },
         .split => |split| {
-            self.drawAllLeaves(split.first, focused);
-            self.drawAllLeaves(split.second, focused);
+            self.drawAllLeaves(split.first);
+            self.drawAllLeaves(split.second);
         },
     }
 }
 
 /// Draw content only for leaves whose buffer is dirty.
 /// Clears the leaf rect before redrawing to remove stale content.
-fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
+fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
             if (leaf.buffer.isDirty()) {
@@ -112,8 +112,8 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *
             }
         },
         .split => |split| {
-            self.drawDirtyLeaves(split.first, focused);
-            self.drawDirtyLeaves(split.second, focused);
+            self.drawDirtyLeaves(split.first);
+            self.drawDirtyLeaves(split.second);
         },
     }
 }
