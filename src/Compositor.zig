@@ -100,25 +100,17 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
 
     const buf = leaf.buffer;
 
-    var visible_lines_span = trace.span("get_visible_lines");
-    var lines = buf.getVisibleLines(self.allocator, self.theme) catch {
-        visible_lines_span.end();
-        return;
-    };
-    visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
-    defer Theme.freeStyledLines(&lines, self.allocator);
-
-    // Apply theme spacing for content offset within the rect
+    // Compute visible window dimensions
     const pad_h = self.theme.spacing.padding_h;
     const pad_v = self.theme.spacing.padding_v;
     const content_x = rect.x +| pad_h;
     const content_y = rect.y +| pad_v;
     const content_max_col = rect.x + rect.width;
     const content_max_row = rect.y + rect.height;
-
-    // Apply scroll offset: show lines from the end minus scroll_offset
-    const total_lines = lines.items.len;
     const visible_rows = content_max_row -| content_y;
+
+    // Compute skip/max_lines from scroll offset and total line count
+    const total_lines = buf.lineCount() catch return;
     const scroll = buf.getScrollOffset();
 
     const visible_end = if (total_lines > scroll)
@@ -129,12 +121,22 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
         visible_end - visible_rows
     else
         0;
+    const lines_needed = visible_end - visible_start;
 
-    // Write styled lines: iterate spans, applying each span's style
+    // Request only the visible range from the buffer
+    var visible_lines_span = trace.span("get_visible_lines");
+    var lines = buf.getVisibleLines(self.allocator, self.theme, visible_start, lines_needed) catch {
+        visible_lines_span.end();
+        return;
+    };
+    visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
+    defer Theme.freeStyledLines(&lines, self.allocator);
+
+    // Write styled lines to screen
     var cur_row = content_y;
     const default_fg = self.theme.colors.fg;
 
-    for (lines.items[visible_start..visible_end]) |line| {
+    for (lines.items) |line| {
         if (cur_row >= content_max_row) break;
         if (cur_row >= self.screen.height) break;
 

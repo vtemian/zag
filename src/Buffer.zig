@@ -17,10 +17,13 @@ vtable: *const VTable,
 
 pub const VTable = struct {
     /// Render the buffer content to styled display lines.
+    /// `skip` lines are skipped from the top; `max_lines` limits how many are returned.
     getVisibleLines: *const fn (
         ptr: *anyopaque,
         allocator: Allocator,
         theme: *const Theme,
+        skip: usize,
+        max_lines: usize,
     ) anyerror!std.ArrayList(Theme.StyledLine),
 
     /// Return the human-readable buffer name.
@@ -40,8 +43,8 @@ pub const VTable = struct {
 };
 
 /// Render the buffer's content to styled display lines.
-pub fn getVisibleLines(self: Buffer, allocator: Allocator, theme: *const Theme) !std.ArrayList(Theme.StyledLine) {
-    return self.vtable.getVisibleLines(self.ptr, allocator, theme);
+pub fn getVisibleLines(self: Buffer, allocator: Allocator, theme: *const Theme, skip: usize, max_lines: usize) !std.ArrayList(Theme.StyledLine) {
+    return self.vtable.getVisibleLines(self.ptr, allocator, theme, skip, max_lines);
 }
 
 /// Return the buffer's human-readable name.
@@ -94,7 +97,7 @@ test "Buffer vtable dispatches correctly" {
             }.f),
         };
 
-        fn getVisibleLinesImpl(_: *anyopaque, _: Allocator, _: *const Theme) anyerror!std.ArrayList(Theme.StyledLine) {
+        fn getVisibleLinesImpl(_: *anyopaque, _: Allocator, _: *const Theme, _: usize, _: usize) anyerror!std.ArrayList(Theme.StyledLine) {
             return .empty;
         }
         fn getNameImpl(ptr: *anyopaque) []const u8 {
