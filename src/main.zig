@@ -201,6 +201,129 @@ fn initSession(session_mgr: *?Session.SessionManager, resume_id: ?[]const u8, mo
     };
 }
 
+/// Action returned from event handling to the main loop.
+const Action = enum { none, quit, redraw };
+
+/// Handle a keyboard event. Returns the action for the main loop.
+fn handleKey(
+    k: input_mod.KeyEvent,
+    input_buf: []u8,
+    input_len: *usize,
+    screen_w: u16,
+    screen_h: u16,
+    prov: *llm.ProviderResult,
+    registry: *const tools.Registry,
+    session_mgr: *?Session.SessionManager,
+    allocator: std.mem.Allocator,
+    lua_eng: ?*LuaEngine,
+) Action {
+    // Ctrl+W prefix mode
+    if (awaiting_window_cmd) {
+        awaiting_window_cmd = false;
+        switch (k.key) {
+            .char => |ch| switch (ch) {
+                'v' => doSplit(.vertical, session_mgr, prov.model_id, allocator, screen_w, screen_h),
+                's' => doSplit(.horizontal, session_mgr, prov.model_id, allocator, screen_w, screen_h),
+                'q' => {
+                    layout.closeWindow();
+                    layout.recalculate(screen_w, screen_h);
+                },
+                'h' => layout.focusDirection(.left),
+                'j' => layout.focusDirection(.down),
+                'k' => layout.focusDirection(.up),
+                'l' => layout.focusDirection(.right),
+                else => {},
+            },
+            else => {},
+        }
+        return .redraw;
+    }
+
+    // Ctrl shortcuts
+    if (k.modifiers.ctrl) {
+        switch (k.key) {
+            .char => |ch| {
+                if (ch == 'c') {
+                    const focused = getFocusedConversation();
+                    if (focused.isAgentRunning()) {
+                        focused.cancelAgent();
+                    } else {
+                        return .quit;
+                    }
+                    return .none;
+                }
+                if (ch == 'w') {
+                    awaiting_window_cmd = true;
+                    return .none;
+                }
+            },
+            else => {},
+        }
+    }
+
+    switch (k.key) {
+        .enter => {
+            if (input_len.* == 0) return .none;
+
+            const user_input = input_buf[0..input_len.*];
+
+            switch (handleCommand(user_input, prov.model_id)) {
+                .quit => return .quit,
+                .handled => {
+                    input_len.* = 0;
+                    return .redraw;
+                },
+                .not_a_command => {
+                    const focused = getFocusedConversation();
+                    if (focused.isAgentRunning()) return .none;
+
+                    focused.submitInput(
+                        user_input,
+                        prov.provider,
+                        registry,
+                        allocator,
+                        lua_eng,
+                    ) catch |err| {
+                        log.warn("submit failed: {}", .{err});
+                        return .none;
+                    };
+                    input_len.* = 0;
+                    return .redraw;
+                },
+            }
+        },
+        .backspace => {
+            input_len.* = inputDeleteBack(input_len.*);
+        },
+        .char => |ch| {
+            if (ch >= 0x20 and ch < 0x7f) {
+                input_len.* = inputAppendChar(input_buf, input_len.*, @intCast(ch));
+            }
+        },
+        .page_up => {
+            if (layout.getFocusedLeaf()) |l| {
+                const half = l.rect.height / 2;
+                const cur = l.buffer.getScrollOffset();
+                l.buffer.setScrollOffset(cur +| if (half > 0) half else 1);
+            }
+        },
+        .page_down => {
+            if (layout.getFocusedLeaf()) |l| {
+                const half = l.rect.height / 2;
+                const cur = l.buffer.getScrollOffset();
+                l.buffer.setScrollOffset(if (cur > half) cur - half else 0);
+            }
+        },
+        else => {},
+    }
+    return .redraw;
+}
+
+/// Get the focused buffer as a ConversationBuffer.
+fn getFocusedConversation() *ConversationBuffer {
+    return if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+}
+
 /// Result of handling a slash command.
 const CommandResult = enum { handled, quit, not_a_command };
 
@@ -603,125 +726,34 @@ pub fn main() !void {
             }
         }
 
-        if (maybe_event) |event|
-            switch (event) {
-                .key => |k| {
-                    // Handle Ctrl+W window command prefix
-                    if (awaiting_window_cmd) {
-                        awaiting_window_cmd = false;
-                        switch (k.key) {
-                            .char => |ch| switch (ch) {
-                                'v' => doSplit(.vertical, &session_mgr, provider.model_id, allocator, screen.width, screen.height),
-                                's' => doSplit(.horizontal, &session_mgr, provider.model_id, allocator, screen.width, screen.height),
-                                'q' => {
-                                    // Close window
-                                    layout.closeWindow();
-                                    layout.recalculate(screen.width, screen.height);
-                                },
-                                'h' => layout.focusDirection(.left),
-                                'j' => layout.focusDirection(.down),
-                                'k' => layout.focusDirection(.up),
-                                'l' => layout.focusDirection(.right),
-                                else => {},
-                            },
-                            else => {},
-                        }
-                    } else {
-                        // Ctrl+C: cancel agent if running, otherwise exit
-                        if (k.modifiers.ctrl) {
-                            switch (k.key) {
-                                .char => |ch| {
-                                    if (ch == 'c') {
-                                        const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-                                        if (focused.isAgentRunning()) {
-                                            focused.cancelAgent();
-                                        } else {
-                                            running = false;
-                                        }
-                                        continue;
-                                    }
-                                    if (ch == 'w') {
-                                        awaiting_window_cmd = true;
-                                        continue;
-                                    }
-                                },
-                                else => {},
-                            }
-                        }
-
-                        switch (k.key) {
-                            .enter => {
-                                if (input_len == 0) continue;
-
-                                const user_input = input_buf[0..input_len];
-
-                                switch (handleCommand(user_input, provider.model_id)) {
-                                    .quit => {
-                                        running = false;
-                                        continue;
-                                    },
-                                    .handled => {
-                                        input_len = 0;
-                                    },
-                                    .not_a_command => {
-                                        const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-                                        if (focused.isAgentRunning()) continue;
-
-                                        focused.submitInput(
-                                            user_input,
-                                            provider.provider,
-                                            &registry,
-                                            allocator,
-                                            if (lua_engine) |*eng| eng else null,
-                                        ) catch |err| {
-                                            log.warn("submit failed: {}", .{err});
-                                            continue;
-                                        };
-                                        input_len = 0;
-                                    },
-                                }
-                            },
-                            .backspace => {
-                                input_len = inputDeleteBack(input_len);
-                            },
-                            .char => |ch| {
-                                // Only handle ASCII printable for now
-                                if (ch >= 0x20 and ch < 0x7f) {
-                                    input_len = inputAppendChar(&input_buf, input_len, @intCast(ch));
-                                }
-                            },
-                            .page_up => {
-                                const leaf = layout.getFocusedLeaf();
-                                if (leaf) |l| {
-                                    const half_page = l.rect.height / 2;
-                                    const cur = l.buffer.getScrollOffset();
-                                    l.buffer.setScrollOffset(cur +| if (half_page > 0) half_page else 1);
-                                }
-                            },
-                            .page_down => {
-                                const leaf = layout.getFocusedLeaf();
-                                if (leaf) |l| {
-                                    const half_page = l.rect.height / 2;
-                                    const cur = l.buffer.getScrollOffset();
-                                    if (cur > half_page) {
-                                        l.buffer.setScrollOffset(cur - half_page);
-                                    } else {
-                                        l.buffer.setScrollOffset(0);
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
+        if (maybe_event) |event| {
+            // Resize needs screen/term locals, handle inline
+            if (event == .resize) {
+                const sz = event.resize;
+                try screen.resize(sz.cols, sz.rows);
+                term.size = .{ .rows = sz.rows, .cols = sz.cols };
+                layout.recalculate(sz.cols, sz.rows);
+            } else {
+                const action = handleKey: {
+                    switch (event) {
+                        .key => |k| break :handleKey handleKey(
+                            k,
+                            &input_buf,
+                            &input_len,
+                            screen.width,
+                            screen.height,
+                            &provider,
+                            &registry,
+                            &session_mgr,
+                            allocator,
+                            if (lua_engine) |*eng| eng else null,
+                        ),
+                        else => break :handleKey Action.none,
                     }
-                },
-                .mouse => {},
-                .resize => |sz| {
-                    try screen.resize(sz.cols, sz.rows);
-                    term.size = .{ .rows = sz.rows, .cols = sz.cols };
-                    layout.recalculate(sz.cols, sz.rows);
-                },
-                .none => {},
-            };
+                };
+                if (action == .quit) running = false;
+            }
+        }
 
         // Drain agent events from the focused buffer
         {
