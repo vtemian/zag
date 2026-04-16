@@ -438,23 +438,8 @@ pub fn main() !void {
         extra_panes.deinit(allocator);
     }
 
-    // Read model string and create provider
-    const model_id = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
-        try allocator.dupe(u8, "anthropic/claude-sonnet-4-20250514");
-    defer allocator.free(model_id);
-
-    // Initialize endpoint registry
-    var endpoint_registry = llm.Registry.init(allocator) catch {
-        const stderr = std.fs.File.stderr();
-        var scratch: [256]u8 = undefined;
-        var w = stderr.writer(&scratch);
-        w.interface.print("error: failed to initialize endpoint registry\n", .{}) catch {};
-        w.interface.flush() catch {};
-        return;
-    };
-    defer endpoint_registry.deinit();
-
-    var provider_result = llm.createProvider(&endpoint_registry, model_id, allocator) catch |err| {
+    // Create LLM provider from ZAG_MODEL env var
+    var provider_result = llm.createProviderFromEnv(allocator) catch |err| {
         const stderr = std.fs.File.stderr();
         var scratch: [256]u8 = undefined;
         var w = stderr.writer(&scratch);
@@ -533,7 +518,7 @@ pub fn main() !void {
         if (session_mgr) |*mgr| {
             break :blk mgr.loadSession(id) catch |err| inner: {
                 log.warn("session load failed, starting new: {}", .{err});
-                break :inner mgr.createSession(model_id) catch |err2| {
+                break :inner mgr.createSession(provider_result.model_id) catch |err2| {
                     log.warn("session creation fallback failed: {}", .{err2});
                     break :inner null;
                 };
@@ -541,7 +526,7 @@ pub fn main() !void {
         }
         break :blk null;
     } else if (session_mgr) |*mgr|
-        mgr.createSession(model_id) catch |err| blk: {
+        mgr.createSession(provider_result.model_id) catch |err| blk: {
             log.warn("session creation failed: {}", .{err});
             break :blk null;
         }
@@ -631,7 +616,7 @@ pub fn main() !void {
         try appendOutputText("Welcome to zag - a composable agent environment");
         {
             var scratch: [128]u8 = undefined;
-            const model_msg = std.fmt.bufPrint(&scratch, "model: {s}", .{model_id}) catch "model: unknown";
+            const model_msg = std.fmt.bufPrint(&scratch, "model: {s}", .{provider_result.model_id}) catch "model: unknown";
             try appendOutputText(model_msg);
         }
         try appendOutputText("cwd: ");
@@ -728,8 +713,8 @@ pub fn main() !void {
                         awaiting_window_cmd = false;
                         switch (k.key) {
                             .char => |ch| switch (ch) {
-                                'v' => doSplit(.vertical, &session_mgr, model_id, allocator, screen.width, screen.height),
-                                's' => doSplit(.horizontal, &session_mgr, model_id, allocator, screen.width, screen.height),
+                                'v' => doSplit(.vertical, &session_mgr, provider_result.model_id, allocator, screen.width, screen.height),
+                                's' => doSplit(.horizontal, &session_mgr, provider_result.model_id, allocator, screen.width, screen.height),
                                 'q' => {
                                     // Close window
                                     layout.closeWindow();
@@ -771,7 +756,7 @@ pub fn main() !void {
 
                                 const user_input = input_buf[0..input_len];
 
-                                switch (handleCommand(user_input, model_id)) {
+                                switch (handleCommand(user_input, provider_result.model_id)) {
                                     .quit => {
                                         running = false;
                                         continue;

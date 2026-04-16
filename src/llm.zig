@@ -325,14 +325,19 @@ pub fn parseModelString(model: []const u8) ModelSpec {
     };
 }
 
-/// Result of creating a provider. Holds the allocated state that must be freed.
+/// Result of creating a provider. Owns all resources needed for LLM calls.
+/// A single deinit() frees everything: provider state, API key, model string, registry.
 pub const ProviderResult = struct {
     /// The provider interface to pass to agent.runLoop.
     provider: Provider,
+    /// The full "provider/model" string (e.g., "anthropic/claude-sonnet-4-20250514").
+    model_id: []const u8,
     /// The allocated provider state. Must be destroyed when done.
     state: *anyopaque,
     /// The API key string, owned by this result.
     api_key: []const u8,
+    /// Endpoint registry (owned, freed on deinit).
+    registry: Registry,
     /// Allocator used to create the state (for cleanup).
     allocator: Allocator,
     /// Which serializer was used (needed for type-correct destroy).
@@ -340,6 +345,8 @@ pub const ProviderResult = struct {
 
     pub fn deinit(self: *ProviderResult) void {
         self.allocator.free(self.api_key);
+        self.allocator.free(self.model_id);
+        self.registry.deinit();
         switch (self.serializer) {
             .anthropic => {
                 self.allocator.destroy(@as(*anthropic.AnthropicSerializer, @ptrCast(@alignCast(self.state))));
@@ -351,9 +358,24 @@ pub const ProviderResult = struct {
     }
 };
 
-/// Create a provider from a model string, looking up the endpoint in the registry.
-pub fn createProvider(registry: *const Registry, model: []const u8, allocator: Allocator) !ProviderResult {
-    const spec = parseModelString(model);
+/// Create a provider from the ZAG_MODEL environment variable.
+/// Reads the model string, initializes the endpoint registry, looks up the
+/// provider, and returns everything bundled in a single ProviderResult.
+pub fn createProviderFromEnv(allocator: Allocator) !ProviderResult {
+    const model_id = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
+        try allocator.dupe(u8, "anthropic/claude-sonnet-4-20250514");
+    errdefer allocator.free(model_id);
+
+    var registry = try Registry.init(allocator);
+    errdefer registry.deinit();
+
+    return createProviderWithRegistry(model_id, registry, allocator);
+}
+
+/// Create a provider from an explicit model string and registry.
+/// Takes ownership of both model_id and registry on success.
+fn createProviderWithRegistry(model_id: []const u8, registry: Registry, allocator: Allocator) !ProviderResult {
+    const spec = parseModelString(model_id);
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
@@ -369,8 +391,10 @@ pub fn createProvider(registry: *const Registry, model: []const u8, allocator: A
             state.* = .{ .endpoint = endpoint, .api_key = api_key, .model = spec.model_id };
             return .{
                 .provider = state.provider(),
+                .model_id = model_id,
                 .state = state,
                 .api_key = api_key,
+                .registry = registry,
                 .allocator = allocator,
                 .serializer = .anthropic,
             };
@@ -380,8 +404,10 @@ pub fn createProvider(registry: *const Registry, model: []const u8, allocator: A
             state.* = .{ .endpoint = endpoint, .api_key = api_key, .model = spec.model_id };
             return .{
                 .provider = state.provider(),
+                .model_id = model_id,
                 .state = state,
                 .api_key = api_key,
+                .registry = registry,
                 .allocator = allocator,
                 .serializer = .openai,
             };
@@ -922,11 +948,14 @@ test "parseModelString handles nested slashes for openrouter" {
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", result.model_id);
 }
 
-test "createProvider returns UnknownProvider for unsupported provider" {
+test "createProviderWithRegistry returns UnknownProvider for unsupported provider" {
     const allocator = std.testing.allocator;
+    const model = try allocator.dupe(u8, "fakeprovider/some-model");
     var registry = try Registry.init(allocator);
+    const result = createProviderWithRegistry(model, registry, allocator);
+    // On error, ownership stays with us
+    defer allocator.free(model);
     defer registry.deinit();
-    const result = createProvider(&registry, "fakeprovider/some-model", allocator);
     try std.testing.expectError(error.UnknownProvider, result);
 }
 
