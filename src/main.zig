@@ -112,9 +112,6 @@ var spinner_frame: u8 = 0;
 /// Characters for the animated spinner.
 const spinner_chars = "|/-\\";
 
-/// State for Ctrl+W prefix key sequence.
-var awaiting_window_cmd: bool = false;
-
 /// Shared context threaded through event handlers.
 const AppContext = struct {
     /// LLM provider for model calls and model ID lookups.
@@ -155,6 +152,17 @@ fn inputAppendChar(buf: []u8, len: usize, char: u8) usize {
 fn inputDeleteBack(len: usize) usize {
     if (len == 0) return 0;
     return len - 1;
+}
+
+/// Delete the last word from the input buffer (Ctrl+W / readline behavior).
+/// Skips trailing spaces, then deletes back to the previous space or start.
+fn inputDeleteWord(buf: []const u8, len: usize) usize {
+    var i = len;
+    // Skip trailing spaces
+    while (i > 0 and buf[i - 1] == ' ') i -= 1;
+    // Delete back to previous space
+    while (i > 0 and buf[i - 1] != ' ') i -= 1;
+    return i;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,11 +230,14 @@ fn handleKey(
     input_len: *usize,
     ctx: *const AppContext,
 ) Action {
-    // Ctrl+W prefix mode
-    if (awaiting_window_cmd) {
-        awaiting_window_cmd = false;
+    // Alt+key: window management (i3-style)
+    if (k.modifiers.alt) {
         switch (k.key) {
             .char => |ch| switch (ch) {
+                'h' => layout.focusDirection(.left),
+                'j' => layout.focusDirection(.down),
+                'k' => layout.focusDirection(.up),
+                'l' => layout.focusDirection(.right),
                 'v' => doSplit(.vertical, ctx),
                 's' => doSplit(.horizontal, ctx),
                 'q' => {
@@ -234,10 +245,6 @@ fn handleKey(
                     layout.recalculate(ctx.screen_width, ctx.screen_height);
                     compositor.layout_dirty = true;
                 },
-                'h' => layout.focusDirection(.left),
-                'j' => layout.focusDirection(.down),
-                'k' => layout.focusDirection(.up),
-                'l' => layout.focusDirection(.right),
                 else => {},
             },
             else => {},
@@ -259,8 +266,8 @@ fn handleKey(
                     return .none;
                 }
                 if (ch == 'w') {
-                    awaiting_window_cmd = true;
-                    return .none;
+                    input_len.* = inputDeleteWord(input_buf, input_len.*);
+                    return .redraw;
                 }
             },
             else => {},
@@ -563,7 +570,7 @@ pub fn main() !void {
             \\cwd: {s}
             \\
             \\Type a message and press Enter. Ctrl+C or /quit to exit.
-            \\Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.
+            \\Alt+h/j/k/l focus, Alt+v/s split, Alt+q close. /model to show model.
         , .{ provider.model_id, cwd }) catch "Welcome to zag";
         try appendOutputText(welcome);
     } else {
@@ -584,7 +591,6 @@ pub fn main() !void {
     var input_buf: [MAX_INPUT]u8 = undefined;
     var input_len: usize = 0;
     var running = true;
-    awaiting_window_cmd = false;
 
     // FPS tracking: count frames rendered per second
     var fps_timer = std.time.Instant.now() catch null;
@@ -809,6 +815,26 @@ test "inputDeleteBack removes last character" {
 
 test "inputDeleteBack on empty returns zero" {
     try std.testing.expectEqual(@as(usize, 0), inputDeleteBack(0));
+}
+
+test "inputDeleteWord removes last word" {
+    var buf = [_]u8{ 'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l' };
+    try std.testing.expectEqual(@as(usize, 6), inputDeleteWord(&buf, 10));
+}
+
+test "inputDeleteWord skips trailing spaces" {
+    var buf = [_]u8{ 'h', 'e', 'l', 'l', 'o', ' ', ' ', 0, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 7));
+}
+
+test "inputDeleteWord on single word clears all" {
+    var buf = [_]u8{ 'h', 'e', 'l', 'l', 'o' };
+    try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 5));
+}
+
+test "inputDeleteWord on empty returns zero" {
+    var buf: [10]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 0));
 }
 
 test "appendOutputText creates a status node" {
