@@ -11,6 +11,7 @@ const types = @import("types.zig");
 const tools = @import("tools.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig");
+const Hooks = @import("Hooks.zig");
 
 const AgentThread = @This();
 
@@ -32,6 +33,9 @@ pub const AgentEvent = union(enum) {
     /// text_delta starts a fresh render. Used when a partial stream
     /// is replaced by a non-streaming fallback response.
     reset_assistant_text,
+    /// Round-trip request: agent asks main thread to run Lua hooks
+    /// for this payload. Agent waits on `request.done` after pushing.
+    hook_request: *Hooks.HookRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -243,4 +247,21 @@ test "drain with small buffer returns partial" {
     const count2 = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 1), count2);
     try std.testing.expectEqualStrings("c", buf[0].text_delta);
+}
+
+test "push and drain hook_request event" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    var payload: Hooks.HookPayload = .{ .agent_done = {} };
+    var req = Hooks.HookRequest.init(&payload);
+
+    try queue.push(.{ .hook_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(
+        Hooks.EventKind.agent_done,
+        buf[0].hook_request.payload.kind(),
+    );
 }
