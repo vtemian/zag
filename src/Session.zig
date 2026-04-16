@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const types = @import("types.zig");
 
 const Session = @This();
 
@@ -427,27 +428,8 @@ fn serializeEntry(entry: Entry, buf: []u8) ![]const u8 {
     return stream.getWritten();
 }
 
-/// Write a JSON-escaped string (with quotes) to any writer.
-fn writeJsonString(w: anytype, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try w.print("\\u{x:0>4}", .{@as(u16, c)});
-                } else {
-                    try w.writeByte(c);
-                }
-            },
-        }
-    }
-    try w.writeByte('"');
-}
+/// Delegate to the shared JSON string escaping utility.
+const writeJsonString = types.writeJsonString;
 
 /// Parse a single JSONL line into an Entry. Allocates string fields.
 fn parseEntry(line: []const u8, allocator: Allocator) !Entry {

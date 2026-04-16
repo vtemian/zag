@@ -251,24 +251,7 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
         try w.writeAll("\"");
         for (msg.content) |block| {
             switch (block) {
-                .text => |t| {
-                    for (t.text) |c| {
-                        switch (c) {
-                            '"' => try w.writeAll("\\\""),
-                            '\\' => try w.writeAll("\\\\"),
-                            '\n' => try w.writeAll("\\n"),
-                            '\r' => try w.writeAll("\\r"),
-                            '\t' => try w.writeAll("\\t"),
-                            else => {
-                                if (c < 0x20) {
-                                    try w.print("\\u{x:0>4}", .{c});
-                                } else {
-                                    try w.writeByte(c);
-                                }
-                            },
-                        }
-                    }
-                },
+                .text => |t| try types.writeJsonStringContents(w, t.text),
                 else => {},
             }
         }
