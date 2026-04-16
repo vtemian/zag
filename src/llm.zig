@@ -492,6 +492,9 @@ pub const StreamingResponse = struct {
             .extra_headers = extra_headers,
             .headers = .{
                 .content_type = .{ .override = "application/json" },
+                // SSE streams must not be compressed; the line-based parser
+                // reads raw bytes and would choke on gzip.
+                .accept_encoding = .omit,
             },
             .redirect_behavior = .unhandled,
             .keep_alive = false,
@@ -530,21 +533,8 @@ pub const StreamingResponse = struct {
             return error.ApiError;
         };
 
-        const status = @intFromEnum(response.head.status);
-        log.info("streaming: HTTP status {d}, transfer={s}, content_length={?d}", .{
-            status,
-            @tagName(response.head.transfer_encoding),
-            response.head.content_length,
-        });
-
         if (response.head.status != .ok) {
-            // Read error body for diagnostics
-            var err_body: [2048]u8 = undefined;
-            const reader = response.reader(&self.transfer_buf);
-            const err_n = reader.readSliceShort(&err_body) catch 0;
-            if (err_n > 0) {
-                log.err("streaming: HTTP {d} body: {s}", .{ status, err_body[0..err_n] });
-            }
+            log.err("streaming: HTTP status {d}", .{@intFromEnum(response.head.status)});
             return error.ApiError;
         }
 
@@ -589,15 +579,11 @@ pub const StreamingResponse = struct {
         // Read from the network until we find a newline or hit end of stream.
         while (true) {
             var chunk: [4096]u8 = undefined;
-            const n = self.body_reader.readSliceShort(&chunk) catch |err| {
-                log.err("readLine: readSliceShort error: {s}", .{@errorName(err)});
+            const n = self.body_reader.readSliceShort(&chunk) catch
                 return error.ApiError;
-            };
             if (n == 0) {
-                if (self.pending_line.items.len > 0) {
-                    log.warn("readLine: end of stream, returning final line ({d} bytes): '{s}'", .{ self.pending_line.items.len, self.pending_line.items });
-                    return stripCr(self.pending_line.items);
-                }
+                // End of stream.
+                if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
                 return null;
             }
 
@@ -659,8 +645,6 @@ pub const StreamingResponse = struct {
                 }
                 return null;
             };
-
-            log.info("SSE line ({d} bytes): '{s}'", .{ line.len, line[0..@min(line.len, 200)] });
 
             if (line.len == 0) {
                 // Blank line: dispatch event if we have data
