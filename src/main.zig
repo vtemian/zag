@@ -244,10 +244,10 @@ pub fn main() !void {
     defer buffer.deinit();
     node_renderer = NodeRenderer.initDefault();
 
-    // Initialize layout with the session buffer in the first tab
+    // Initialize layout with the session buffer as root
     layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("session", &buffer);
+    try layout.setRoot(&buffer);
 
     // Extra buffers created by splits
     extra_buffers = .empty;
