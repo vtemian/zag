@@ -90,12 +90,16 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
         .separator => 1,
         .tool_call, .err => 1,
         .user_message, .assistant_text, .tool_result, .status, .custom => blk: {
-            // Count newlines to determine line count
+            // Count newlines to determine line count.
+            // splitAndAppend skips the trailing empty segment after a final '\n',
+            // so we subtract 1 when content ends with a newline.
             const content = node.content.items;
+            if (content.len == 0) break :blk 1;
             var count: usize = 1;
             for (content) |c| {
                 if (c == '\n') count += 1;
             }
+            if (content[content.len - 1] == '\n') count -= 1;
             break :blk count;
         },
     };
