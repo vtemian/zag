@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions API provider.
+//! OpenAI Chat Completions API serializer.
 //!
 //! Implements the LLM provider for OpenAI-compatible models via the
 //! Chat Completions API (https://api.openai.com/v1/chat/completions).
@@ -16,8 +16,8 @@ const log = std.log.scoped(.openai);
 const default_base_url = "https://api.openai.com/v1/chat/completions";
 const default_max_tokens = 8192;
 
-/// OpenAI Chat Completions provider state.
-pub const OpenAiProvider = struct {
+/// OpenAI Chat Completions serializer state.
+pub const OpenAiSerializer = struct {
     /// API key for Bearer authentication.
     api_key: []const u8,
     /// Model identifier (e.g., "gpt-4o", "gpt-4o-mini").
@@ -32,7 +32,7 @@ pub const OpenAiProvider = struct {
     };
 
     /// Create a Provider interface from this OpenAI provider.
-    pub fn provider(self: *OpenAiProvider) Provider {
+    pub fn provider(self: *OpenAiSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -43,7 +43,7 @@ pub const OpenAiProvider = struct {
         tool_definitions: []const types.ToolDefinition,
         allocator: Allocator,
     ) anyerror!types.LlmResponse {
-        const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
+        const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
 
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
@@ -68,7 +68,7 @@ pub const OpenAiProvider = struct {
         on_event: *const fn (event: llm.StreamEvent) void,
         cancel: *std.atomic.Value(bool),
     ) anyerror!types.LlmResponse {
-        const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
+        const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
 
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
