@@ -27,12 +27,12 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
         return .{ .content = msg, .is_error = true };
     };
 
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    defer stdout_buf.deinit(allocator);
-    var stderr_buf: std.ArrayList(u8) = .empty;
-    defer stderr_buf.deinit(allocator);
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
 
-    child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024) catch |err| {
+    child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024) catch |err| {
         _ = child.kill() catch {};
         const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
@@ -48,7 +48,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
         else => 1,
     };
 
-    const msg = std.fmt.allocPrint(allocator, "exit code: {d}\n\nstdout:\n{s}\nstderr:\n{s}", .{ exit_code, stdout_buf.items, stderr_buf.items }) catch return types.oomResult();
+    const msg = std.fmt.allocPrint(allocator, "exit code: {d}\n\nstdout:\n{s}\nstderr:\n{s}", .{ exit_code, stdout.items, stderr.items }) catch return types.oomResult();
     return .{
         .content = msg,
         .is_error = exit_code != 0,
@@ -59,7 +59,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 pub const definition = types.ToolDefinition{
     .name = "bash",
     .description = "Execute a shell command via /bin/sh -c. Returns stdout, stderr, and exit code.",
-    .prompt_snippet = "Execute shell commands (30s timeout by default)",
+    .prompt_snippet = "Execute shell commands",
     .input_schema_json =
     \\{
     \\  "type": "object",

@@ -36,10 +36,6 @@ pub const Serializer = enum {
     openai,
 };
 
-/// Per-endpoint behavior overrides within a serializer family.
-/// Empty now. Fields added when real provider differences surface.
-pub const Compat = struct {};
-
 /// Everything needed to talk to a specific LLM endpoint.
 pub const Endpoint = struct {
     /// Human-readable name (e.g., "openrouter", "ollama").
@@ -54,8 +50,6 @@ pub const Endpoint = struct {
     auth: Auth,
     /// Additional HTTP headers sent with every request.
     headers: []const Header,
-    /// Provider-specific behavior overrides.
-    compat: Compat,
 
     /// How the API key is sent in HTTP headers.
     pub const Auth = enum {
@@ -106,7 +100,6 @@ pub const Endpoint = struct {
             .key_env = key_env,
             .auth = self.auth,
             .headers = headers,
-            .compat = self.compat,
         };
     }
 
@@ -131,7 +124,6 @@ const builtin_endpoints = [_]Endpoint{
         .key_env = "ANTHROPIC_API_KEY",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
-        .compat = .{},
     },
     .{
         .name = "openai",
@@ -140,7 +132,6 @@ const builtin_endpoints = [_]Endpoint{
         .key_env = "OPENAI_API_KEY",
         .auth = .bearer,
         .headers = &.{},
-        .compat = .{},
     },
     .{
         .name = "openrouter",
@@ -149,7 +140,6 @@ const builtin_endpoints = [_]Endpoint{
         .key_env = "OPENROUTER_API_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
-        .compat = .{},
     },
     .{
         .name = "groq",
@@ -158,7 +148,6 @@ const builtin_endpoints = [_]Endpoint{
         .key_env = "GROQ_API_KEY",
         .auth = .bearer,
         .headers = &.{},
-        .compat = .{},
     },
     .{
         .name = "ollama",
@@ -167,7 +156,6 @@ const builtin_endpoints = [_]Endpoint{
         .key_env = null,
         .auth = .none,
         .headers = &.{},
-        .compat = .{},
     },
 };
 
@@ -470,7 +458,7 @@ pub const StreamingResponse = struct {
     transfer_buf: [8192]u8,
 
     /// Accumulates partial lines across network reads.
-    line_buf: std.ArrayList(u8),
+    pending_line: std.ArrayList(u8),
     /// Leftover bytes after a newline that belong to subsequent lines.
     remainder: std.ArrayList(u8),
     /// Backing allocator used for all owned resources.
@@ -492,7 +480,7 @@ pub const StreamingResponse = struct {
             .req = undefined,
             .body_reader = undefined,
             .transfer_buf = undefined,
-            .line_buf = .empty,
+            .pending_line = .empty,
             .remainder = .empty,
             .allocator = allocator,
         };
@@ -556,7 +544,7 @@ pub const StreamingResponse = struct {
 
     pub fn destroy(self: *StreamingResponse) void {
         const alloc = self.allocator;
-        self.line_buf.deinit(alloc);
+        self.pending_line.deinit(alloc);
         self.remainder.deinit(alloc);
         self.req.deinit();
         self.client.deinit();
@@ -568,46 +556,46 @@ pub const StreamingResponse = struct {
     /// `null` when the stream has ended.
     /// The returned slice is valid until the next `readLine` call.
     pub fn readLine(self: *StreamingResponse) !?[]const u8 {
-        self.line_buf.clearRetainingCapacity();
+        self.pending_line.clearRetainingCapacity();
 
         // First, consume any leftover bytes from a previous read.
         if (self.remainder.items.len > 0) {
             if (std.mem.indexOfScalar(u8, self.remainder.items, '\n')) |nl_pos| {
-                try self.line_buf.appendSlice(self.allocator, self.remainder.items[0..nl_pos]);
+                try self.pending_line.appendSlice(self.allocator, self.remainder.items[0..nl_pos]);
                 // Shift remainder forward past the newline.
                 const after = self.remainder.items[nl_pos + 1 ..];
                 std.mem.copyForwards(u8, self.remainder.items[0..after.len], after);
                 self.remainder.shrinkRetainingCapacity(after.len);
-                return stripCr(self.line_buf.items);
+                return stripCr(self.pending_line.items);
             }
-            // No newline in remainder; move it all to line_buf and continue reading.
-            try self.line_buf.appendSlice(self.allocator, self.remainder.items);
+            // No newline in remainder; move it all to pending_line and continue reading.
+            try self.pending_line.appendSlice(self.allocator, self.remainder.items);
             self.remainder.clearRetainingCapacity();
         }
 
         // Read from the network until we find a newline or hit end of stream.
         while (true) {
-            var read_buf: [4096]u8 = undefined;
-            const n = self.body_reader.readSliceShort(&read_buf) catch
+            var chunk: [4096]u8 = undefined;
+            const n = self.body_reader.readSliceShort(&chunk) catch
                 return error.ApiError;
             if (n == 0) {
                 // End of stream.
-                if (self.line_buf.items.len > 0) return stripCr(self.line_buf.items);
+                if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
                 return null;
             }
 
-            const chunk = read_buf[0..n];
-            if (std.mem.indexOfScalar(u8, chunk, '\n')) |nl_pos| {
-                try self.line_buf.appendSlice(self.allocator, chunk[0..nl_pos]);
+            const received = chunk[0..n];
+            if (std.mem.indexOfScalar(u8, received, '\n')) |nl_pos| {
+                try self.pending_line.appendSlice(self.allocator, received[0..nl_pos]);
                 // Save everything after the newline for subsequent calls.
                 if (nl_pos + 1 < n) {
-                    try self.remainder.appendSlice(self.allocator, chunk[nl_pos + 1 .. n]);
+                    try self.remainder.appendSlice(self.allocator, received[nl_pos + 1 .. n]);
                 }
-                return stripCr(self.line_buf.items);
+                return stripCr(self.pending_line.items);
             }
 
             // No newline yet; accumulate and keep reading.
-            try self.line_buf.appendSlice(self.allocator, chunk);
+            try self.pending_line.appendSlice(self.allocator, received);
         }
     }
 
@@ -629,16 +617,16 @@ pub const StreamingResponse = struct {
     /// blank line. Skips comment lines (including pings). Checks the cancel
     /// flag between lines. Returns null at end of stream or cancellation.
     ///
-    /// The returned slices point into `event_buf` and `data_buf` and are
+    /// The returned slices point into `event_buf` and `event_data` and are
     /// valid until the next call.
     pub fn nextSseEvent(
         self: *StreamingResponse,
         cancel: *std.atomic.Value(bool),
         event_buf: *[128]u8,
-        data_buf: *std.ArrayList(u8),
+        event_data: *std.ArrayList(u8),
     ) !?SseEvent {
         var event_len: usize = 0;
-        data_buf.clearRetainingCapacity();
+        event_data.clearRetainingCapacity();
 
         while (true) {
             if (cancel.load(.acquire)) return null;
@@ -646,10 +634,10 @@ pub const StreamingResponse = struct {
             const maybe_line = try self.readLine();
             const line = maybe_line orelse {
                 // End of stream: return a final event if data accumulated
-                if (data_buf.items.len > 0) {
+                if (event_data.items.len > 0) {
                     return SseEvent{
                         .event_type = event_buf[0..event_len],
-                        .data = data_buf.items,
+                        .data = event_data.items,
                     };
                 }
                 return null;
@@ -657,10 +645,10 @@ pub const StreamingResponse = struct {
 
             if (line.len == 0) {
                 // Blank line: dispatch event if we have data
-                if (data_buf.items.len > 0) {
+                if (event_data.items.len > 0) {
                     return SseEvent{
                         .event_type = event_buf[0..event_len],
-                        .data = data_buf.items,
+                        .data = event_data.items,
                     };
                 }
                 // No data accumulated, reset and keep reading
@@ -683,10 +671,10 @@ pub const StreamingResponse = struct {
                 event_len = copy_len;
             } else if (std.mem.startsWith(u8, line, "data: ")) {
                 const val = line["data: ".len..];
-                try data_buf.appendSlice(self.allocator, val);
+                try event_data.appendSlice(self.allocator, val);
             } else if (std.mem.startsWith(u8, line, "data:")) {
                 const val = line["data:".len..];
-                try data_buf.appendSlice(self.allocator, val);
+                try event_data.appendSlice(self.allocator, val);
             }
         }
     }
@@ -750,7 +738,6 @@ test "Endpoint.dupe creates independent copy" {
         .key_env = "TEST_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
-        .compat = .{},
     };
 
     const duped = try original.dupe(allocator);
@@ -780,7 +767,6 @@ test "Endpoint.dupe handles null key_env" {
         .key_env = null,
         .auth = .none,
         .headers = &.{},
-        .compat = .{},
     };
 
     const duped = try original.dupe(allocator);
@@ -1057,7 +1043,6 @@ test "buildHeaders creates correct auth for bearer endpoint" {
         .key_env = "TEST_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
-        .compat = .{},
     };
     var headers = try buildHeaders(&endpoint, "sk-test-key", allocator);
     defer freeHeaders(&endpoint, &headers, allocator);
@@ -1076,7 +1061,6 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
         .key_env = "TEST_KEY",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
-        .compat = .{},
     };
     var headers = try buildHeaders(&endpoint, "sk-ant-key", allocator);
     defer freeHeaders(&endpoint, &headers, allocator);
@@ -1095,7 +1079,6 @@ test "buildHeaders handles no-auth endpoint" {
         .key_env = null,
         .auth = .none,
         .headers = &.{},
-        .compat = .{},
     };
     var headers = try buildHeaders(&endpoint, "", allocator);
     defer freeHeaders(&endpoint, &headers, allocator);

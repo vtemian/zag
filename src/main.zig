@@ -77,8 +77,8 @@ fn tuiLogHandler(
     } else {
         // Before TUI is active, write to stderr normally
         const stderr = std.fs.File.stderr();
-        var stderr_buf: [256]u8 = undefined;
-        var w = stderr.writer(&stderr_buf);
+        var stderr_scratch: [256]u8 = undefined;
+        var w = stderr.writer(&stderr_scratch);
         w.interface.print(scope_prefix ++ format ++ "\n", args) catch {};
         w.interface.flush() catch {};
     }
@@ -97,7 +97,9 @@ var next_buffer_id: u32 = 1;
 
 /// A split pane's owned resources: buffer and optional session.
 const SplitPane = struct {
+    /// The conversation buffer for this pane.
     buffer: *ConversationBuffer,
+    /// Session handle for persistence, or null if persistence is unavailable.
     session: ?*Session.SessionHandle,
 };
 
@@ -115,12 +117,19 @@ var awaiting_window_cmd: bool = false;
 
 /// Shared context threaded through event handlers.
 const AppContext = struct {
+    /// LLM provider for model calls and model ID lookups.
     provider: *llm.ProviderResult,
+    /// Tool registry for dispatching tool calls.
     registry: *const tools.Registry,
+    /// Session manager for persistence (optional, may be null).
     session_mgr: *?Session.SessionManager,
+    /// Heap allocator for runtime allocations.
     allocator: std.mem.Allocator,
+    /// Lua plugin engine, or null if Lua init failed.
     lua_engine: ?*LuaEngine,
+    /// Current terminal width in columns.
     screen_width: u16,
+    /// Current terminal height in rows.
     screen_height: u16,
 };
 

@@ -367,12 +367,12 @@ pub const LuaEngine = struct {
             self.lua.pop(2);
             return .{ .content = "error: Lua tool returned non-string", .is_error = true, .owned = false };
         };
-        const owned_result = allocator.dupe(u8, result) catch {
+        const output = allocator.dupe(u8, result) catch {
             self.lua.pop(2);
             return .{ .content = "error: OOM copying Lua result", .is_error = true, .owned = false };
         };
         self.lua.pop(2);
-        return .{ .content = owned_result, .is_error = false };
+        return .{ .content = output, .is_error = false };
     }
 
     // -- JSON to Lua table conversion ------------------------------------------

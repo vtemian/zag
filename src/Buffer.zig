@@ -96,8 +96,8 @@ test {
 
 test "Buffer vtable dispatches correctly" {
     const TestBuffer = struct {
-        name_str: []const u8 = "test",
-        id_val: u32 = 42,
+        name: []const u8 = "test",
+        id: u32 = 42,
         scroll: u32 = 0,
 
         const vt: VTable = .{
@@ -126,11 +126,11 @@ test "Buffer vtable dispatches correctly" {
         }
         fn getNameImpl(ptr: *anyopaque) []const u8 {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
-            return self.name_str;
+            return self.name;
         }
         fn getIdImpl(ptr: *anyopaque) u32 {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
-            return self.id_val;
+            return self.id;
         }
         fn getScrollOffsetImpl(ptr: *anyopaque) u32 {
             const self: *const @This() = @ptrCast(@alignCast(ptr));

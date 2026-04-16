@@ -89,11 +89,11 @@ pub const SpanHandle = if (enabled) struct {
         ev.ts_us = self.start_us;
         ev.dur_us = now -| self.start_us;
 
-        var args_buf: [96]u8 = undefined;
-        const args_str = std.fmt.bufPrint(&args_buf, "{}", .{args}) catch "";
-        ev.args_len = @intCast(args_str.len);
-        if (args_str.len > 0) {
-            @memcpy(ev.args[0..args_str.len], args_str);
+        var args_scratch: [96]u8 = undefined;
+        const args_formatted = std.fmt.bufPrint(&args_scratch, "{}", .{args}) catch "";
+        ev.args_len = @intCast(args_formatted.len);
+        if (args_formatted.len > 0) {
+            @memcpy(ev.args[0..args_formatted.len], args_formatted);
         }
         recordEvent(ev);
     }
@@ -149,8 +149,8 @@ pub inline fn frameEndWithAllocs(allocs: u32, alloc_bytes: u64, cur_peak: u64) v
             if (std.mem.eql(u8, sname, "frame")) {
                 last_frame_dur_us = slot.dur_us;
                 // Write allocation metadata into the span's args
-                var args_buf: [96]u8 = undefined;
-                const written = std.fmt.bufPrint(&args_buf, "{{\"allocs\":{d},\"alloc_bytes\":{d}}}", .{ allocs, alloc_bytes }) catch break;
+                var args_scratch: [96]u8 = undefined;
+                const written = std.fmt.bufPrint(&args_scratch, "{{\"allocs\":{d},\"alloc_bytes\":{d}}}", .{ allocs, alloc_bytes }) catch break;
                 @memcpy(slot.args[0..written.len], written);
                 slot.args_len = @intCast(written.len);
                 break;
@@ -480,9 +480,9 @@ test "dump writes valid JSON" {
     // Read and verify basic structure
     const file = try std.fs.cwd().openFile(tmp_path, .{});
     defer file.close();
-    var read_buf: [8192]u8 = undefined;
-    const len = try file.readAll(&read_buf);
-    const content = read_buf[0..len];
+    var trace_scratch: [8192]u8 = undefined;
+    const len = try file.readAll(&trace_scratch);
+    const content = trace_scratch[0..len];
 
     try std.testing.expect(std.mem.startsWith(u8, content, "{\"traceEvents\":"));
     try std.testing.expect(std.mem.indexOf(u8, content, "\"test_dump\"") != null);

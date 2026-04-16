@@ -786,7 +786,7 @@ test "clearRect clips to screen bounds" {
         cell.codepoint = 'X';
     }
 
-    // Rect extends past screen edge — should not crash
+    // Rect extends past screen edge, should not crash
     screen.clearRect(2, 3, 10, 10);
 
     // Inside bounds: cleared

@@ -269,10 +269,10 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
     if (trace.enabled) {
         const frame_us = trace.getLastFrameTimeUs();
         const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
-        var time_buf: [16]u8 = undefined;
-        const time_str = std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
-        const time_col = self.screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
-        _ = self.screen.writeStr(last_row, time_col, time_str, resolved.screen_style, resolved.fg);
+        var time_scratch: [16]u8 = undefined;
+        const time_label = std.fmt.bufPrint(&time_scratch, "{d:.1}ms", .{frame_ms}) catch return;
+        const time_col = self.screen.width -| @as(u16, @intCast(time_label.len)) -| 1;
+        _ = self.screen.writeStr(last_row, time_col, time_label, resolved.screen_style, resolved.fg);
     }
 }
 

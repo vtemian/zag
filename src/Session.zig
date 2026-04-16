@@ -296,8 +296,8 @@ pub const SessionHandle = struct {
             return e;
         };
 
-        var write_buf: [256]u8 = undefined;
-        var w = self.file.writer(&write_buf);
+        var write_scratch: [256]u8 = undefined;
+        var w = self.file.writer(&write_scratch);
         w.interface.writeAll(json) catch |e| {
             log.err("failed to write entry: {}", .{e});
             return e;
@@ -437,12 +437,12 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
     defer parsed.deinit();
     const obj = parsed.value.object;
 
-    const type_str = if (obj.get("type")) |v| switch (v) {
+    const entry_kind = if (obj.get("type")) |v| switch (v) {
         .string => |s| s,
         else => return error.InvalidEntryType,
     } else return error.MissingType;
 
-    const entry_type = EntryType.fromSlice(type_str) orelse return error.UnknownEntryType;
+    const entry_type = EntryType.fromSlice(entry_kind) orelse return error.UnknownEntryType;
 
     const content = if (obj.get("content")) |v| switch (v) {
         .string => |s| try allocator.dupe(u8, s),
@@ -508,8 +508,8 @@ fn writeMetaFile(path: []const u8, meta: *const Meta) !void {
     const cwd = std.fs.cwd();
     const file = try cwd.createFile(path, .{ .truncate = true });
     defer file.close();
-    var file_write_buf: [256]u8 = undefined;
-    var file_w = file.writer(&file_write_buf);
+    var write_scratch: [256]u8 = undefined;
+    var file_w = file.writer(&write_scratch);
     try file_w.interface.writeAll(json);
     try file_w.interface.flush();
 }
@@ -679,8 +679,8 @@ test "create, append, and load round-trip" {
     };
 
     var buf: [8192]u8 = undefined;
-    var fw_buf: [256]u8 = undefined;
-    var fw = file.writer(&fw_buf);
+    var write_scratch: [256]u8 = undefined;
+    var fw = file.writer(&write_scratch);
     for (entries_to_write) |entry| {
         const json = try serializeEntry(entry, &buf);
         try fw.interface.writeAll(json);

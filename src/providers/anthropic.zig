@@ -153,12 +153,12 @@ fn buildRequestBodyInner(
 
 /// Writes a single message (role + content blocks) as JSON into the writer.
 fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
-    const role_str = switch (msg.role) {
+    const role = switch (msg.role) {
         .user => "user",
         .assistant => "assistant",
     };
 
-    try w.print("{{\"role\":\"{s}\",\"content\":[", .{role_str});
+    try w.print("{{\"role\":\"{s}\",\"content\":[", .{role});
 
     for (msg.content, 0..) |block, i| {
         if (i > 0) try w.writeAll(",");
@@ -192,12 +192,12 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     const root = parsed.value.object;
 
     // Parse stop_reason
-    const stop_reason_str = root.get("stop_reason").?.string;
-    const stop_reason: types.StopReason = if (std.mem.eql(u8, stop_reason_str, "end_turn"))
+    const stop_reason_value = root.get("stop_reason").?.string;
+    const stop_reason: types.StopReason = if (std.mem.eql(u8, stop_reason_value, "end_turn"))
         .end_turn
-    else if (std.mem.eql(u8, stop_reason_str, "tool_use"))
+    else if (std.mem.eql(u8, stop_reason_value, "tool_use"))
         .tool_use
-    else if (std.mem.eql(u8, stop_reason_str, "max_tokens"))
+    else if (std.mem.eql(u8, stop_reason_value, "max_tokens"))
         .max_tokens
     else
         .end_turn;
@@ -205,10 +205,10 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     // Parse usage
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
-    if (root.get("usage")) |usage_val| {
-        const usage = usage_val.object;
-        if (usage.get("input_tokens")) |it| input_tokens = @intCast(it.integer);
-        if (usage.get("output_tokens")) |ot| output_tokens = @intCast(ot.integer);
+    if (root.get("usage")) |usage| {
+        const usage_obj = usage.object;
+        if (usage_obj.get("input_tokens")) |it| input_tokens = @intCast(it.integer);
+        if (usage_obj.get("output_tokens")) |ot| output_tokens = @intCast(ot.integer);
     }
 
     // Parse content blocks
@@ -272,10 +272,10 @@ fn parseSseStream(
     }
 
     var event_buf: [128]u8 = undefined;
-    var data_buf: std.ArrayList(u8) = .empty;
-    defer data_buf.deinit(allocator);
+    var event_data: std.ArrayList(u8) = .empty;
+    defer event_data.deinit(allocator);
 
-    while (try stream.nextSseEvent(cancel, &event_buf, &data_buf)) |sse| {
+    while (try stream.nextSseEvent(cancel, &event_buf, &event_data)) |sse| {
         try processSseEvent(
             sse.event_type,
             sse.data,
@@ -325,25 +325,25 @@ pub fn processSseEvent(
 
     if (std.mem.eql(u8, event_type, "message_start")) {
         if (obj.get("message")) |msg| {
-            if (msg.object.get("usage")) |usage_val| {
-                const usage = usage_val.object;
-                if (usage.get("input_tokens")) |it| input_tokens.* = @intCast(it.integer);
-                if (usage.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
+            if (msg.object.get("usage")) |usage| {
+                const usage_obj = usage.object;
+                if (usage_obj.get("input_tokens")) |it| input_tokens.* = @intCast(it.integer);
+                if (usage_obj.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
             }
         }
     } else if (std.mem.eql(u8, event_type, "content_block_start")) {
         if (obj.get("content_block")) |cb| {
             const cb_obj = cb.object;
-            const block_type_str = cb_obj.get("type").?.string;
+            const block_kind = cb_obj.get("type").?.string;
 
-            if (std.mem.eql(u8, block_type_str, "text")) {
+            if (std.mem.eql(u8, block_kind, "text")) {
                 try blocks.append(allocator, .{
                     .block_type = .text,
                     .content = .empty,
                     .tool_id = "",
                     .tool_name = "",
                 });
-            } else if (std.mem.eql(u8, block_type_str, "tool_use")) {
+            } else if (std.mem.eql(u8, block_kind, "tool_use")) {
                 const id = try allocator.dupe(u8, cb_obj.get("id").?.string);
                 errdefer allocator.free(id);
                 const name = try allocator.dupe(u8, cb_obj.get("name").?.string);
@@ -390,9 +390,9 @@ pub fn processSseEvent(
                     stop_reason.* = .max_tokens;
             }
         }
-        if (obj.get("usage")) |usage_val| {
-            const usage = usage_val.object;
-            if (usage.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
+        if (obj.get("usage")) |usage| {
+            const usage_obj = usage.object;
+            if (usage_obj.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
         }
     }
 }
