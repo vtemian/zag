@@ -89,8 +89,6 @@ name: []const u8,
 root_children: std.ArrayList(*Node),
 /// Monotonically increasing counter for assigning node IDs.
 next_id: u32,
-/// Incremented when nodes are added or removed from the tree.
-tree_version: u32 = 0,
 /// Allocator used for all buffer and node allocations.
 allocator: Allocator,
 /// Scroll offset from the bottom (0 = scrolled to latest content).
@@ -165,7 +163,6 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
         .parent = parent,
     };
     self.next_id += 1;
-    self.tree_version +%= 1;
 
     if (parent) |p| {
         try p.children.append(self.allocator, node);
@@ -436,7 +433,6 @@ pub fn clear(self: *ConversationBuffer) void {
     }
     self.root_children.clearRetainingCapacity();
     self.next_id = 0;
-    self.tree_version +%= 1;
 }
 
 /// Persist an event to the session JSONL file, if a session is attached.
