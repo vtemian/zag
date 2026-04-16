@@ -41,6 +41,12 @@ pub const LuaEngine = struct {
     tools: std.ArrayList(LuaTool),
     /// Hook registry, populated by `zag.hook()` calls from Lua.
     hook_registry: Hooks.Registry,
+    /// Set by `applyHookReturn` when a hook returns `{ cancel = true }`.
+    /// Consumed and reset by `takeCancel()` after fireHook returns.
+    pending_cancel: bool = false,
+    /// Optional reason string allocated via `self.allocator`. Owned by
+    /// the caller of `takeCancel()` once handed off.
+    pending_cancel_reason: ?[]const u8 = null,
 
     /// Create a new LuaEngine, initializing the VM, loading user config,
     /// and collecting tool definitions. Silently skips if no config exists.
@@ -103,6 +109,7 @@ pub const LuaEngine = struct {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
         self.hook_registry.deinit();
+        if (self.pending_cancel_reason) |r| self.allocator.free(r);
         self.lua.deinit();
     }
 
@@ -281,6 +288,205 @@ pub const LuaEngine = struct {
         const id = try engine.hook_registry.register(kind, pattern, cb_ref);
         lua.pushInteger(@intCast(id));
         return 1;
+    }
+
+    // -- Hook dispatch ---------------------------------------------------------
+
+    /// Fire all hooks matching the payload's event kind.
+    /// Called from the main thread (the only thread permitted to touch Lua).
+    /// Mutates `payload` in place if a hook returns a rewrite.
+    /// A hook that raises is logged and skipped; subsequent hooks still run.
+    pub fn fireHook(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
+        const pattern_key = hookPatternKey(payload.*);
+
+        var it = self.hook_registry.iterMatching(payload.kind(), pattern_key);
+        while (it.next()) |hook| {
+            // Stack: [fn]
+            _ = self.lua.rawGetIndex(zlua.registry_index, hook.lua_ref);
+            // Stack: [fn, payload_table]
+            self.pushPayloadAsTable(payload.*) catch |err| {
+                log.warn("hook payload marshalling failed for {s}: {}", .{ @tagName(payload.kind()), err });
+                self.lua.pop(1); // pop fn
+                continue;
+            };
+            // Call: 1 arg (payload table), up to 1 return (rewrite table or nil).
+            self.lua.protectedCall(.{ .args = 1, .results = 1 }) catch |err| {
+                const msg = self.lua.toString(-1) catch "<unprintable>";
+                log.warn("hook for {s} raised: {} ({s})", .{ @tagName(payload.kind()), err, msg });
+                self.lua.pop(1); // pop error message
+                continue;
+            };
+            // Stack: [return_value]. If it's a table, apply rewrite.
+            if (self.lua.isTable(-1)) {
+                self.applyHookReturn(payload) catch |err| {
+                    log.warn("hook return for {s} failed to apply: {}", .{ @tagName(payload.kind()), err });
+                };
+            }
+            self.lua.pop(1); // pop return value
+        }
+    }
+
+    /// Key used for pattern matching against a hook's pattern.
+    /// ToolPre/ToolPost use the tool name; all other events use "".
+    fn hookPatternKey(payload: Hooks.HookPayload) []const u8 {
+        return switch (payload) {
+            .tool_pre => |p| p.name,
+            .tool_post => |p| p.name,
+            else => "",
+        };
+    }
+
+    /// Push the payload as a Lua table onto the stack.
+    /// The table is a fresh Lua table; strings are copied into the VM.
+    fn pushPayloadAsTable(self: *LuaEngine, payload: Hooks.HookPayload) !void {
+        self.lua.newTable();
+        switch (payload) {
+            .tool_pre => |p| {
+                self.setTableString("name", p.name);
+                self.setTableString("call_id", p.call_id);
+                // args: decode JSON into a Lua table when possible; fall
+                // back to empty table so hooks can always index evt.args.
+                try self.setTableJsonField("args", p.args_json);
+            },
+            .tool_post => |p| {
+                self.setTableString("name", p.name);
+                self.setTableString("call_id", p.call_id);
+                self.setTableString("content", p.content);
+                self.setTableBool("is_error", p.is_error);
+                self.setTableInt("duration_ms", @intCast(p.duration_ms));
+            },
+            .turn_start => |p| {
+                self.setTableInt("turn_num", @intCast(p.turn_num));
+                self.setTableInt("message_count", @intCast(p.message_count));
+            },
+            .turn_end => |p| {
+                self.setTableInt("turn_num", @intCast(p.turn_num));
+                self.setTableString("stop_reason", p.stop_reason);
+                self.setTableInt("input_tokens", @intCast(p.input_tokens));
+                self.setTableInt("output_tokens", @intCast(p.output_tokens));
+            },
+            .user_message_pre => |p| self.setTableString("text", p.text),
+            .user_message_post => |p| self.setTableString("text", p.text),
+            .text_delta => |p| self.setTableString("text", p.text),
+            .agent_done => {},
+            .agent_err => |p| self.setTableString("message", p.message),
+        }
+    }
+
+    /// Push `value` as a Lua string and assign it to `key` on the table
+    /// currently at the top of the stack. Stack delta: 0.
+    fn setTableString(self: *LuaEngine, comptime key: [:0]const u8, value: []const u8) void {
+        _ = self.lua.pushString(value);
+        self.lua.setField(-2, key);
+    }
+
+    fn setTableBool(self: *LuaEngine, comptime key: [:0]const u8, value: bool) void {
+        self.lua.pushBoolean(value);
+        self.lua.setField(-2, key);
+    }
+
+    fn setTableInt(self: *LuaEngine, comptime key: [:0]const u8, value: i64) void {
+        self.lua.pushInteger(value);
+        self.lua.setField(-2, key);
+    }
+
+    /// Decode `json_text` as JSON and assign the resulting Lua value to
+    /// `key` on the table at the top of the stack. If the JSON does not
+    /// parse, assign an empty table so hooks never see a nil args field.
+    fn setTableJsonField(self: *LuaEngine, comptime key: [:0]const u8, json_text: []const u8) !void {
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            self.allocator,
+            json_text,
+            .{},
+        ) catch {
+            self.lua.newTable();
+            self.lua.setField(-2, key);
+            return;
+        };
+        defer parsed.deinit();
+        pushJsonValue(self.lua, parsed.value);
+        self.lua.setField(-2, key);
+    }
+
+    /// Read the return table (top of stack) from a hook callback and
+    /// apply its fields to the payload. The table is NOT popped here;
+    /// the caller pops it after this returns.
+    ///
+    /// Stack discipline: on entry and exit, the return table sits at
+    /// the top of the stack. Every `getField` is paired with `pop(1)`.
+    fn applyHookReturn(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
+        // Stack: [..., ret_table]
+        // Check `cancel` first. If set, short-circuit rewrite handling.
+        _ = self.lua.getField(-1, "cancel");
+        const cancel = self.lua.isBoolean(-1) and self.lua.toBoolean(-1);
+        self.lua.pop(1);
+
+        if (cancel) {
+            self.pending_cancel = true;
+            _ = self.lua.getField(-1, "reason");
+            if (self.lua.isString(-1)) {
+                if (self.lua.toString(-1)) |reason_raw| {
+                    // Free any previously stored reason before overwriting.
+                    if (self.pending_cancel_reason) |old| self.allocator.free(old);
+                    self.pending_cancel_reason = self.allocator.dupe(u8, reason_raw) catch null;
+                } else |_| {}
+            }
+            self.lua.pop(1);
+            return;
+        }
+
+        switch (payload.*) {
+            .tool_pre => |*p| {
+                _ = self.lua.getField(-1, "args");
+                if (self.lua.isTable(-1)) {
+                    // luaTableToJson is a static helper on LuaEngine.
+                    const rewrite = try luaTableToJson(self.lua, -1, self.allocator);
+                    if (p.args_rewrite) |old| self.allocator.free(old);
+                    p.args_rewrite = rewrite;
+                }
+                self.lua.pop(1);
+            },
+            .user_message_pre => |*p| {
+                _ = self.lua.getField(-1, "text");
+                if (self.lua.isString(-1)) {
+                    if (self.lua.toString(-1)) |t| {
+                        const rewrite = try self.allocator.dupe(u8, t);
+                        if (p.text_rewrite) |old| self.allocator.free(old);
+                        p.text_rewrite = rewrite;
+                    } else |_| {}
+                }
+                self.lua.pop(1);
+            },
+            .tool_post => |*p| {
+                _ = self.lua.getField(-1, "content");
+                if (self.lua.isString(-1)) {
+                    if (self.lua.toString(-1)) |c| {
+                        const rewrite = try self.allocator.dupe(u8, c);
+                        if (p.content_rewrite) |old| self.allocator.free(old);
+                        p.content_rewrite = rewrite;
+                    } else |_| {}
+                }
+                self.lua.pop(1);
+                _ = self.lua.getField(-1, "is_error");
+                if (self.lua.isBoolean(-1)) {
+                    p.is_error_rewrite = self.lua.toBoolean(-1);
+                }
+                self.lua.pop(1);
+            },
+            else => {},
+        }
+    }
+
+    /// Read-and-reset the pending cancel state set by a veto hook. The
+    /// returned slice (if non-null) is allocated via `self.allocator`
+    /// and owned by the caller.
+    pub fn takeCancel(self: *LuaEngine) ?[]const u8 {
+        if (!self.pending_cancel) return null;
+        self.pending_cancel = false;
+        const reason = self.pending_cancel_reason;
+        self.pending_cancel_reason = null;
+        return reason;
     }
 
     // -- JSON serialization from Lua values ------------------------------------
@@ -785,6 +991,26 @@ test "zag.hook registers a hook" {
         engine.hook_registry.hooks.items[0].pattern.?,
     );
     try std.testing.expect(engine.hook_registry.hooks.items[1].pattern == null);
+}
+
+test "fireHook invokes Lua callback for matching event" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.hook_fired_for = nil
+        \\zag.hook("TurnStart", function(evt)
+        \\  _G.hook_fired_for = evt.turn_num
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 42, .message_count = 3 } };
+    try engine.fireHook(&payload);
+
+    _ = engine.lua.getGlobal("hook_fired_for") catch {};
+    try std.testing.expectEqual(@as(i64, 42), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
 }
 
 test "end-to-end: config file to registry execution" {
