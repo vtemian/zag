@@ -446,40 +446,19 @@ pub fn main() !void {
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
 
+    // Initialize Lua plugin engine (loads ~/.config/zag/config.lua if present)
+    var lua_engine: ?LuaEngine = LuaEngine.init(allocator) catch |err| blk: {
+        log.warn("lua init failed, plugins disabled: {}", .{err});
+        break :blk null;
+    };
+    defer if (lua_engine) |*eng| eng.deinit();
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    // Register Lua-defined tools into the tool registry
+    if (lua_engine) |*eng| {
+        eng.registerTools(&registry) catch |err| {
+            log.warn("failed to register lua tools: {}", .{err});
+        };
+    }
 
     // Parse CLI args to decide startup mode
     const startup_mode = parseStartupArgs(allocator) catch .new_session;

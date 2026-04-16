@@ -37,7 +37,8 @@ pub const LuaEngine = struct {
     /// Tools registered via `zag.tool()` calls in Lua.
     tools: std.ArrayList(LuaTool),
 
-    /// Create a new LuaEngine, initializing the VM and injecting the `zag` global.
+    /// Create a new LuaEngine, initializing the VM, loading user config,
+    /// and collecting tool definitions. Silently skips if no config exists.
     pub fn init(allocator: Allocator) !LuaEngine {
         const lua = try Lua.init(allocator);
         errdefer lua.deinit();
@@ -46,10 +47,39 @@ pub const LuaEngine = struct {
 
         injectZagGlobal(lua);
 
-        return LuaEngine{
+        var self = LuaEngine{
             .lua = lua,
             .allocator = allocator,
             .tools = .empty,
+        };
+
+        self.loadUserConfig();
+
+        return self;
+    }
+
+    /// Resolve ~/.config/zag paths, set plugin search path, load config.lua.
+    /// All failures are logged and swallowed; missing config is not an error.
+    fn loadUserConfig(self: *LuaEngine) void {
+        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
+        defer self.allocator.free(home);
+
+        // Set plugin search path so require() finds ~/.config/zag/lua/*.lua
+        const lua_dir = std.fmt.allocPrint(self.allocator, "{s}/.config/zag/lua", .{home}) catch return;
+        defer self.allocator.free(lua_dir);
+        self.setPluginPath(lua_dir) catch |err| {
+            log.warn("failed to set lua plugin path: {}", .{err});
+        };
+
+        // Load config.lua (collects zag.tool() calls)
+        const config_path = std.fmt.allocPrint(self.allocator, "{s}/.config/zag/config.lua", .{home}) catch return;
+        defer self.allocator.free(config_path);
+        self.storeSelfPointer();
+        self.loadConfig(config_path) catch |err| {
+            switch (err) {
+                error.LuaFile => {},
+                else => log.warn("config.lua error: {}", .{err}),
+            }
         };
     }
 
