@@ -18,8 +18,8 @@ const AgentThread = @This();
 pub const AgentEvent = union(enum) {
     /// Partial text from the LLM response.
     text_delta: []const u8,
-    /// A tool call was decided by the LLM (payload is the tool name).
-    tool_start: []const u8,
+    /// A tool call was decided by the LLM.
+    tool_start: ToolStartEvent,
     /// Tool execution completed with output.
     tool_result: ToolResultEvent,
     /// Informational message (token counts, timing, etc.).
@@ -29,12 +29,24 @@ pub const AgentEvent = union(enum) {
     /// An error occurred during agent execution.
     err: []const u8,
 
+    /// Payload for a tool call start event.
+    pub const ToolStartEvent = struct {
+        /// The registered tool name.
+        name: []const u8,
+        /// Correlation ID matching this start to its result.
+        /// Null for streaming preview events (before execution).
+        call_id: ?[]const u8 = null,
+    };
+
     /// Payload for a completed tool execution.
     pub const ToolResultEvent = struct {
         /// The tool's output text.
         content: []const u8,
         /// Whether the tool reported an error.
         is_error: bool,
+        /// Correlation ID matching this result to its tool_start.
+        /// Null when correlation is not needed (single tool).
+        call_id: ?[]const u8 = null,
     };
 };
 
@@ -174,7 +186,7 @@ test "push multiple drain all" {
     defer queue.deinit();
 
     try queue.push(.{ .text_delta = "a" });
-    try queue.push(.{ .tool_start = "bash" });
+    try queue.push(.{ .tool_start = .{ .name = "bash" } });
     try queue.push(.{ .tool_result = .{ .content = "output", .is_error = false } });
     try queue.push(.{ .info = "tokens: 42" });
     try queue.push(.done);
@@ -186,7 +198,7 @@ test "push multiple drain all" {
 
     // Verify each variant
     try std.testing.expectEqualStrings("a", buf[0].text_delta);
-    try std.testing.expectEqualStrings("bash", buf[1].tool_start);
+    try std.testing.expectEqualStrings("bash", buf[1].tool_start.name);
     try std.testing.expectEqualStrings("output", buf[2].tool_result.content);
     try std.testing.expect(!buf[2].tool_result.is_error);
     try std.testing.expectEqualStrings("tokens: 42", buf[3].info);
