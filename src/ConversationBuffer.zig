@@ -465,9 +465,14 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
         .text_delta => |text| {
             defer allocator.free(text);
             if (self.current_assistant_node) |node| {
-                self.appendToNode(node, text) catch {};
+                self.appendToNode(node, text) catch |err| {
+                    log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
+                };
             } else {
-                self.current_assistant_node = self.appendNode(null, .assistant_text, text) catch null;
+                self.current_assistant_node = self.appendNode(null, .assistant_text, text) catch |err| blk: {
+                    log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
             }
             self.persistEvent(.{
                 .entry_type = .assistant_text,
