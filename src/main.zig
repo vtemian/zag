@@ -7,7 +7,7 @@ const std = @import("std");
 const posix = std.posix;
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
-const input_mod = @import("input.zig");
+const input = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
@@ -71,14 +71,14 @@ fn tuiLogHandler(
 
     if (tui_active) {
         // Capture into output buffer. Format into a stack buffer.
-        var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, scope_prefix ++ format, args) catch return;
+        var scratch: [4096]u8 = undefined;
+        const msg = std.fmt.bufPrint(&scratch, scope_prefix ++ format, args) catch return;
         appendOutputText(msg) catch {};
     } else {
         // Before TUI is active, write to stderr normally
         const stderr = std.fs.File.stderr();
-        var buf: [256]u8 = undefined;
-        var w = stderr.writer(&buf);
+        var stderr_buf: [256]u8 = undefined;
+        var w = stderr.writer(&stderr_buf);
         w.interface.print(scope_prefix ++ format ++ "\n", args) catch {};
         w.interface.flush() catch {};
     }
@@ -197,7 +197,7 @@ const Action = enum { none, quit, redraw };
 
 /// Handle a keyboard event. Returns the action for the main loop.
 fn handleKey(
-    k: input_mod.KeyEvent,
+    k: input.KeyEvent,
     input_buf: []u8,
     input_len: *usize,
     screen_w: u16,
@@ -326,12 +326,12 @@ fn getFocusedConversation() *ConversationBuffer {
 const CommandResult = enum { handled, quit, not_a_command };
 
 /// Try to handle input as a slash command. Returns .not_a_command if it isn't one.
-fn handleCommand(input: []const u8, model_id: []const u8) CommandResult {
-    if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q")) {
+fn handleCommand(command: []const u8, model_id: []const u8) CommandResult {
+    if (std.mem.eql(u8, command, "/quit") or std.mem.eql(u8, command, "/q")) {
         return .quit;
     }
 
-    if (std.mem.eql(u8, input, "/perf")) {
+    if (std.mem.eql(u8, command, "/perf")) {
         if (trace.enabled) {
             const stats = trace.getStats();
             var scratch: [512]u8 = undefined;
@@ -357,7 +357,7 @@ fn handleCommand(input: []const u8, model_id: []const u8) CommandResult {
         return .handled;
     }
 
-    if (std.mem.eql(u8, input, "/perf-dump")) {
+    if (std.mem.eql(u8, command, "/perf-dump")) {
         if (trace.enabled) {
             const count = trace.dump("zag-trace.json") catch |err| blk: {
                 var scratch: [256]u8 = undefined;
@@ -376,7 +376,7 @@ fn handleCommand(input: []const u8, model_id: []const u8) CommandResult {
         return .handled;
     }
 
-    if (std.mem.eql(u8, input, "/model")) {
+    if (std.mem.eql(u8, command, "/model")) {
         var scratch: [128]u8 = undefined;
         const model_info = std.fmt.bufPrint(&scratch, "model: {s}", .{model_id}) catch "model: unknown";
         appendOutputText(model_info) catch {};
@@ -597,7 +597,7 @@ pub fn main() !void {
 
     while (running) {
         // Poll for input (outside frame span, so sleep doesn't count)
-        const maybe_event = input_mod.pollEvent(posix.STDIN_FILENO);
+        const maybe_event = input.pollEvent(posix.STDIN_FILENO);
 
         // Check for terminal resize (SIGWINCH)
         const resized = term.checkResize();
@@ -654,22 +654,20 @@ pub fn main() !void {
                 term.size = .{ .rows = sz.rows, .cols = sz.cols };
                 layout.recalculate(sz.cols, sz.rows);
             } else {
-                const action = dispatch: {
-                    switch (event) {
-                        .key => |k| break :dispatch handleKey(
-                            k,
-                            &input_buf,
-                            &input_len,
-                            screen.width,
-                            screen.height,
-                            &provider,
-                            &registry,
-                            &session_mgr,
-                            allocator,
-                            if (lua_engine) |*eng| eng else null,
-                        ),
-                        else => break :dispatch Action.none,
-                    }
+                const action = switch (event) {
+                    .key => |k| handleKey(
+                        k,
+                        &input_buf,
+                        &input_len,
+                        screen.width,
+                        screen.height,
+                        &provider,
+                        &registry,
+                        &session_mgr,
+                        allocator,
+                        if (lua_engine) |*eng| eng else null,
+                    ),
+                    else => Action.none,
                 };
                 if (action == .quit) running = false;
             }
