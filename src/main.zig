@@ -81,6 +81,9 @@ var next_buffer_id: u32 = 1;
 /// Extra buffers created by splits, tracked for cleanup.
 var extra_buffers: std.ArrayList(*Buffer) = .empty;
 
+/// Heap-allocated session handles for split buffers, tracked for cleanup.
+var extra_session_handles: std.ArrayList(*Session.SessionHandle) = .empty;
+
 /// Last tool_call node, used to parent tool_result nodes (legacy callback path).
 var last_tool_call: ?*Buffer.Node = null;
 
@@ -174,6 +177,29 @@ fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
     return buf;
 }
 
+/// Create a new session and attach it to a buffer. The session handle is
+/// heap-allocated and tracked in extra_session_handles for cleanup.
+/// Failures are logged but not propagated — the buffer works without persistence.
+fn attachSessionToBuffer(buf: *Buffer, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) void {
+    const mgr = &(session_mgr.* orelse return);
+    const sh = allocator.create(Session.SessionHandle) catch {
+        log.warn("failed to allocate session handle for split", .{});
+        return;
+    };
+    sh.* = mgr.createSession(model) catch |err| {
+        log.warn("session creation failed for split: {}", .{err});
+        allocator.destroy(sh);
+        return;
+    };
+    extra_session_handles.append(allocator, sh) catch {
+        sh.close();
+        allocator.destroy(sh);
+        log.warn("failed to track session handle for split", .{});
+        return;
+    };
+    buf.session_handle = sh;
+}
+
 /// Draw the input/status line on the last row, overwriting the compositor's status line.
 /// Uses the theme's input_prompt, input_text, and status highlight groups.
 fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8, fps: u32, t: *const Theme) void {
@@ -257,6 +283,16 @@ pub fn main() !void {
             allocator.destroy(buf);
         }
         extra_buffers.deinit(allocator);
+    }
+
+    // Session handles for split buffers
+    extra_session_handles = .empty;
+    defer {
+        for (extra_session_handles.items) |sh| {
+            sh.close();
+            allocator.destroy(sh);
+        }
+        extra_session_handles.deinit(allocator);
     }
 
     // Read model string and create provider
@@ -428,8 +464,9 @@ pub fn main() !void {
                         switch (k.key) {
                             .char => |ch| switch (ch) {
                                 'v' => {
-                                    // Split vertical
+                                    // Split vertical — new buffer gets its own session
                                     if (createSplitBuffer(allocator)) |new_buf| {
+                                        attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
                                         layout.splitVertical(0.5, new_buf) catch |err| {
                                             log.warn("split failed: {}", .{err});
                                         };
@@ -439,8 +476,9 @@ pub fn main() !void {
                                     }
                                 },
                                 's' => {
-                                    // Split horizontal
+                                    // Split horizontal — new buffer gets its own session
                                     if (createSplitBuffer(allocator)) |new_buf| {
+                                        attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
                                         layout.splitHorizontal(0.5, new_buf) catch |err| {
                                             log.warn("split failed: {}", .{err});
                                         };
