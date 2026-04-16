@@ -568,7 +568,10 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
     var finished = false;
 
     for (drain[0..count]) |event| {
-        self.scroll_offset = 0;
+        if (self.scroll_offset != 0) {
+            self.scroll_offset = 0;
+            self.render_dirty = true;
+        }
         self.handleAgentEvent(event, allocator);
 
         if (event == .done) {
