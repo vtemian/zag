@@ -1,8 +1,8 @@
 //! Compositor: merges buffer content into a Screen grid via the layout tree.
 //!
-//! Reads visible lines from each buffer leaf in the active tab and writes them
-//! into the Screen at each leaf's rect position. Draws tab bar, split borders,
-//! and a status line. All styling reads from the Theme.
+//! Reads visible lines from each buffer leaf in the layout and writes them
+//! into the Screen at each leaf's rect position. Draws split borders and a
+//! status line. All styling reads from the Theme.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,7 +25,7 @@ renderer: *NodeRenderer,
 theme: *const Theme,
 
 /// Composite the layout into the screen grid.
-/// Clears the screen, draws tab bar, buffer content, borders, and status line.
+/// Clears the screen, draws buffer content, borders, and status line.
 pub fn composite(self: *Compositor, layout: *const Layout) void {
     {
         var s = trace.span("clear");
@@ -33,70 +33,25 @@ pub fn composite(self: *Compositor, layout: *const Layout) void {
         self.screen.clear();
     }
 
-    const tab_ptr = layout.getActiveTab();
-    if (tab_ptr == null) return;
-    const tab = tab_ptr.?;
-
-    {
-        var s = trace.span("tab_bar");
-        defer s.end();
-        self.drawTabBar(layout);
-    }
+    const root = layout.root orelse return;
+    const focused = layout.focused orelse root;
 
     {
         var s = trace.span("leaves");
         defer s.end();
-        self.drawLeaves(tab.root, tab.focused);
+        self.drawLeaves(root, focused);
     }
 
     {
         var s = trace.span("borders");
         defer s.end();
-        self.drawBorders(tab.root);
+        self.drawBorders(root);
     }
 
     {
         var s = trace.span("status_line");
         defer s.end();
-        self.drawStatusLine(tab);
-    }
-}
-
-/// Render the tab bar on row 0 using theme highlight groups.
-fn drawTabBar(self: *Compositor, layout: *const Layout) void {
-    const inactive_resolved = Theme.resolve(self.theme.highlights.tab_inactive, self.theme);
-
-    // Fill entire row with inactive tab style
-    for (0..self.screen.width) |col| {
-        const cell = self.screen.getCell(0, @intCast(col));
-        cell.codepoint = ' ';
-        cell.style = inactive_resolved.screen_style;
-        cell.fg = inactive_resolved.fg;
-        cell.bg = inactive_resolved.bg;
-    }
-
-    var col: u16 = 1;
-    for (layout.tabs.items, 0..) |tab, idx| {
-        const is_active = idx == layout.active_tab;
-        const hl = if (is_active) self.theme.highlights.tab_active else self.theme.highlights.tab_inactive;
-        const resolved = Theme.resolve(hl, self.theme);
-
-        // Tab indicator
-        if (is_active) {
-            col = self.screen.writeStr(0, col, "[", resolved.screen_style, resolved.fg);
-        } else {
-            col = self.screen.writeStr(0, col, " ", resolved.screen_style, resolved.fg);
-        }
-
-        col = self.screen.writeStr(0, col, tab.name, resolved.screen_style, resolved.fg);
-
-        if (is_active) {
-            col = self.screen.writeStr(0, col, "]", resolved.screen_style, resolved.fg);
-        } else {
-            col = self.screen.writeStr(0, col, " ", resolved.screen_style, resolved.fg);
-        }
-
-        col = self.screen.writeStr(0, col, " ", inactive_resolved.screen_style, inactive_resolved.fg);
+        self.drawStatusLine(focused);
     }
 }
 
@@ -233,7 +188,7 @@ fn drawBorders(self: *Compositor, node: *const Layout.LayoutNode) void {
 }
 
 /// Draw the status line on the last row using the theme status_line highlight.
-fn drawStatusLine(self: *Compositor, tab: *const Layout.Tab) void {
+fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
     const last_row = self.screen.height - 1;
     const resolved = Theme.resolve(self.theme.highlights.status_line, self.theme);
 
@@ -247,7 +202,7 @@ fn drawStatusLine(self: *Compositor, tab: *const Layout.Tab) void {
     }
 
     // Show focused buffer name
-    const leaf = switch (tab.focused.*) {
+    const leaf = switch (focused.*) {
         .leaf => |l| l,
         .split => return,
     };
@@ -301,44 +256,6 @@ test "composite with empty layout does not crash" {
     compositor.composite(&layout);
 }
 
-test "composite draws tab bar on row 0" {
-    const allocator = std.testing.allocator;
-    var screen = try Screen.init(allocator, 40, 10);
-    defer screen.deinit();
-
-    var renderer = NodeRenderer.initDefault();
-    defer renderer.deinit();
-
-    const theme = Theme.defaultTheme();
-
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .renderer = &renderer,
-        .theme = &theme,
-    };
-
-    var buf = try Buffer.init(allocator, 0, "session");
-    defer buf.deinit();
-
-    var layout = Layout.init(allocator);
-    defer layout.deinit();
-    _ = try layout.addTab("session", &buf);
-    layout.recalculate(40, 10);
-
-    compositor.composite(&layout);
-
-    // Tab name should appear somewhere in row 0
-    var found_s = false;
-    for (0..40) |col| {
-        if (screen.getCellConst(0, @intCast(col)).codepoint == 's') {
-            found_s = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_s);
-}
-
 test "composite writes buffer content at leaf rect with padding" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
@@ -362,17 +279,18 @@ test "composite writes buffer content at leaf rect with padding" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("test", &buf);
+    try layout.setRoot(&buf);
     layout.recalculate(40, 10);
 
     compositor.composite(&layout);
 
     // The rendered line for user_message "hello" is "> hello"
     // With default padding_h=1, it starts at col 1 instead of col 0
+    // Content starts at row 0 (no tab bar)
     const pad_h = theme.spacing.padding_h;
-    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(1, pad_h).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, pad_h + 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, pad_h + 2).codepoint);
+    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(0, pad_h).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, pad_h + 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, pad_h + 2).codepoint);
 }
 
 test "composite draws status line on last row" {
@@ -397,7 +315,7 @@ test "composite draws status line on last row" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("mybuf", &buf);
+    try layout.setRoot(&buf);
     layout.recalculate(40, 10);
 
     compositor.composite(&layout);
@@ -431,7 +349,7 @@ test "composite draws vertical split border from theme" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("split", &buf1);
+    try layout.setRoot(&buf1);
     layout.recalculate(40, 10);
     try layout.splitVertical(0.5, &buf2);
     layout.recalculate(40, 10);
@@ -439,8 +357,8 @@ test "composite draws vertical split border from theme" {
     compositor.composite(&layout);
 
     // The border column should be at the boundary between first and second leaves
-    const tab = layout.getActiveTab().?;
-    const first_rect = tab.root.split.first.leaf.rect;
+    const root = layout.root.?;
+    const first_rect = root.split.first.leaf.rect;
     const border_col = first_rect.x + first_rect.width;
 
     // Border character should come from theme.borders.vertical
@@ -472,7 +390,7 @@ test "composite draws horizontal split border" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    _ = try layout.addTab("split", &buf1);
+    try layout.setRoot(&buf1);
     layout.recalculate(40, 12);
     try layout.splitHorizontal(0.5, &buf2);
     layout.recalculate(40, 12);
@@ -480,8 +398,8 @@ test "composite draws horizontal split border" {
     compositor.composite(&layout);
 
     // The border row should be between the two halves
-    const tab = layout.getActiveTab().?;
-    const first_rect = tab.root.split.first.leaf.rect;
+    const root = layout.root.?;
+    const first_rect = root.split.first.leaf.rect;
     const border_row = first_rect.y + first_rect.height;
 
     const border_cell = screen.getCellConst(border_row, first_rect.x);
