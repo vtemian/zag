@@ -223,6 +223,7 @@ fn handleKey(
                 'q' => {
                     layout.closeWindow();
                     layout.recalculate(ctx.screen_width, ctx.screen_height);
+                    compositor.layout_dirty = true;
                 },
                 'h' => layout.focusDirection(.left),
                 'j' => layout.focusDirection(.down),
@@ -403,6 +404,7 @@ fn doSplit(direction: Layout.SplitDirection, ctx: *const AppContext) void {
         return;
     };
     layout.recalculate(ctx.screen_width, ctx.screen_height);
+    compositor.layout_dirty = true;
 }
 
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
@@ -671,12 +673,25 @@ pub fn main() !void {
         for (extra_panes.items) |pane| {
             drainBuffer(pane.buffer, &provider, allocator);
         }
-        // Update spinner and redraw
-        const focused = getFocusedConversation();
-        const agent_running = focused.isAgentRunning();
-        if (agent_running) {
+
+        // Check if any buffer has pending visual changes
+        const any_dirty = buffer.render_dirty or for (extra_panes.items) |pane| {
+            if (pane.buffer.render_dirty) break true;
+        } else false;
+
+        // Spinner ticks only when actual events arrive
+        if (any_dirty) {
             spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
         }
+
+        // Skip composite+render when nothing visual changed
+        const frame_dirty = any_dirty or compositor.layout_dirty or
+            (maybe_event != null and maybe_event.? != .mouse);
+
+        if (!frame_dirty) continue;
+
+        const focused = getFocusedConversation();
+        const agent_running = focused.isAgentRunning();
         const status = if (agent_running) blk: {
             const info = focused.lastInfo();
             break :blk if (info.len > 0) info else "streaming...";
@@ -711,6 +726,7 @@ pub fn main() !void {
 fn handleResize(screen: *Screen, ctx: *AppContext, cols: u16, rows: u16) !void {
     try screen.resize(cols, rows);
     layout.recalculate(cols, rows);
+    compositor.layout_dirty = true;
     ctx.screen_width = cols;
     ctx.screen_height = rows;
 }
