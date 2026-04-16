@@ -113,8 +113,14 @@ fn callLlm(
         for (fallback.content) |block| {
             switch (block) {
                 .text => |t| {
-                    const duped = allocator.dupe(u8, t.text) catch continue;
-                    queue.push(.{ .text_delta = duped }) catch {};
+                    const duped = allocator.dupe(u8, t.text) catch |err| {
+                        log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
+                        continue;
+                    };
+                    queue.push(.{ .text_delta = duped }) catch |err| {
+                        allocator.free(duped);
+                        log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
+                    };
                 },
                 else => {},
             }

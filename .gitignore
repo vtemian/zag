@@ -5,3 +5,4 @@ zig-out/
 zag-trace.json
 .worktrees/
 .claude/
+/test_*
