@@ -114,7 +114,7 @@ Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_
 src/
   main.zig          entry point, TUI event loop
   agent.zig         agent loop (LLM call, tool execution, repeat)
-  llm.zig           provider interface, model string parser, provider factory
+  llm.zig           provider interface, endpoint registry, model string parser
   tools.zig         tool registry and dispatch
   tools/
     read.zig        read file contents
@@ -122,8 +122,8 @@ src/
     edit.zig        exact text replacement
     bash.zig        shell command execution
   providers/
-    anthropic.zig   Anthropic Messages API provider
-    openai.zig      OpenAI Chat Completions provider
+    anthropic.zig   Anthropic Messages API serializer
+    openai.zig      OpenAI Chat Completions serializer
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   AgentThread.zig   background agent thread with event queue
   Session.zig       JSONL session persistence and management

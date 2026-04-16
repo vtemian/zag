@@ -57,8 +57,23 @@ pub const Endpoint = struct {
     /// Provider-specific behavior overrides.
     compat: Compat,
 
-    pub const Auth = enum { x_api_key, bearer, none };
-    pub const Header = struct { name: []const u8, value: []const u8 };
+    /// How the API key is sent in HTTP headers.
+    pub const Auth = enum {
+        /// Anthropic-style: `x-api-key: <key>`.
+        x_api_key,
+        /// Bearer token: `Authorization: Bearer <key>`.
+        bearer,
+        /// No authentication (e.g., local Ollama).
+        none,
+    };
+
+    /// A static HTTP header sent with every request to this endpoint.
+    pub const Header = struct {
+        /// Header field name.
+        name: []const u8,
+        /// Header field value.
+        value: []const u8,
+    };
 
     /// Deep-copy all strings onto the heap. Caller must call free().
     pub fn dupe(self: Endpoint, allocator: Allocator) !Endpoint {
@@ -158,7 +173,9 @@ const builtin_endpoints = [_]Endpoint{
 
 /// Runtime registry of LLM endpoints. Seeded with built-ins, extensible at runtime.
 pub const Registry = struct {
+    /// All registered endpoints (built-in and runtime-added).
     endpoints: std.ArrayList(Endpoint),
+    /// Backing allocator for endpoint storage.
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) !Registry {
