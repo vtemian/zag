@@ -1103,3 +1103,46 @@ test "fireHook applies args rewrite" {
     defer std.testing.allocator.free(payload.tool_pre.args_rewrite.?);
     try std.testing.expect(std.mem.indexOf(u8, payload.tool_pre.args_rewrite.?, "echo safe") != null);
 }
+
+test "UserMessagePre can veto submission" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.hook("UserMessagePre", function(evt)
+        \\  if evt.text:match("^/secret") then
+        \\    return { cancel = true, reason = "blocked" }
+        \\  end
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .user_message_pre = .{
+        .text = "/secret thing",
+        .text_rewrite = null,
+    } };
+    try engine.fireHook(&payload);
+    const reason = engine.takeCancel();
+    try std.testing.expect(reason != null);
+    defer std.testing.allocator.free(reason.?);
+    try std.testing.expectEqualStrings("blocked", reason.?);
+}
+
+test "UserMessagePre can rewrite text" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.hook("UserMessagePre", function(evt)
+        \\  return { text = "expanded: " .. evt.text }
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .user_message_pre = .{
+        .text = "hi",
+        .text_rewrite = null,
+    } };
+    try engine.fireHook(&payload);
+    try std.testing.expect(payload.user_message_pre.text_rewrite != null);
+    defer std.testing.allocator.free(payload.user_message_pre.text_rewrite.?);
+    try std.testing.expectEqualStrings("expanded: hi", payload.user_message_pre.text_rewrite.?);
+}

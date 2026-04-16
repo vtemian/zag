@@ -591,22 +591,49 @@ pub fn submitInput(
     allocator: Allocator,
     lua_eng: ?*LuaEngine,
 ) !void {
+    // Fire UserMessagePre synchronously: hooks may veto or rewrite the text
+    // before it enters the conversation history. `working_text` is the
+    // effective text used for the rest of submitInput; if a rewrite fires
+    // the freshly allocated slice is tracked in `text_rewrite_owned` and
+    // freed on return (including the cancel early-return, which can't own
+    // a rewrite since the veto path returns before rewrite handling).
+    var working_text: []const u8 = text;
+    var text_rewrite_owned: ?[]const u8 = null;
+    defer if (text_rewrite_owned) |t| allocator.free(t);
+
+    if (lua_eng) |eng| {
+        var payload: Hooks.HookPayload = .{ .user_message_pre = .{
+            .text = text,
+            .text_rewrite = null,
+        } };
+        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+        if (eng.takeCancel()) |reason| {
+            defer allocator.free(reason);
+            _ = try self.appendNode(null, .err, reason);
+            return;
+        }
+        if (payload.user_message_pre.text_rewrite) |rewritten| {
+            working_text = rewritten;
+            text_rewrite_owned = rewritten;
+        }
+    }
+
     // Append user message to conversation history
     const content = try allocator.alloc(types.ContentBlock, 1);
-    const duped = try allocator.dupe(u8, text);
+    const duped = try allocator.dupe(u8, working_text);
     content[0] = .{ .text = .{ .text = duped } };
     try self.messages.append(allocator, .{ .role = .user, .content = content });
 
     if (lua_eng) |eng| {
-        var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = text } };
+        var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
         eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
     }
 
-    _ = try self.appendNode(null, .user_message, text);
+    _ = try self.appendNode(null, .user_message, working_text);
 
     self.persistEvent(.{
         .entry_type = .user_message,
-        .content = text,
+        .content = working_text,
         .timestamp = std.time.milliTimestamp(),
     });
 
