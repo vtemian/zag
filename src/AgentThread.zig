@@ -36,6 +36,9 @@ pub const AgentEvent = union(enum) {
     /// Round-trip request: agent asks main thread to run Lua hooks
     /// for this payload. Agent waits on `request.done` after pushing.
     hook_request: *Hooks.HookRequest,
+    /// Round-trip request: a worker/agent thread asks main to execute
+    /// a Lua-defined tool and write the result back.
+    lua_tool_request: *Hooks.LuaToolRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -264,4 +267,26 @@ test "push and drain hook_request event" {
         Hooks.EventKind.agent_done,
         buf[0].hook_request.payload.kind(),
     );
+}
+
+test "push and drain lua_tool_request event" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "hello",
+        .input_raw = "{}",
+        .allocator = std.testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+
+    try queue.push(.{ .lua_tool_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("hello", buf[0].lua_tool_request.tool_name);
 }

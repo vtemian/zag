@@ -558,7 +558,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 .timestamp = std.time.milliTimestamp(),
             });
         },
-        .hook_request => {
+        .hook_request, .lua_tool_request => {
             // Dispatched by the main-thread drain loop; not handled here.
         },
     }

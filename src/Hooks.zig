@@ -122,6 +122,23 @@ pub const HookRequest = struct {
     }
 };
 
+/// Request to run a Lua tool on the main thread from any other
+/// thread. Fields before `done` are inputs, owned by the caller.
+/// Fields after `done` are outputs, written by main thread.
+pub const LuaToolRequest = struct {
+    // inputs
+    tool_name: []const u8,
+    input_raw: []const u8,
+    allocator: Allocator,
+    done: std.Thread.ResetEvent,
+    // outputs (main thread writes before signalling done)
+    result_content: ?[]const u8,
+    result_is_error: bool,
+    result_owned: bool,
+    /// If set, tool execution failed; caller surfaces as an error.
+    error_name: ?[]const u8,
+};
+
 pub const Hook = struct {
     id: u32,
     kind: EventKind,
