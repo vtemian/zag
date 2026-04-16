@@ -22,9 +22,23 @@ allocator: Allocator,
 /// Design system for colors, highlights, spacing, and borders.
 theme: *const Theme,
 
+/// Input state needed by the compositor to draw the input/status line.
+pub const InputState = struct {
+    /// Current input text (slice of the input buffer).
+    text: []const u8,
+    /// Status message to show instead of input (empty = show input prompt).
+    status: []const u8,
+    /// Whether the agent is currently running (shows spinner).
+    agent_running: bool,
+    /// Current spinner frame index.
+    spinner_frame: u8,
+    /// Current FPS (shown when metrics enabled).
+    fps: u32,
+};
+
 /// Composite the layout into the screen grid.
-/// Clears the screen, draws buffer content, borders, and status line.
-pub fn composite(self: *Compositor, layout: *const Layout) void {
+/// Clears the screen, draws buffer content, borders, status line, and input line.
+pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) void {
     {
         var s = trace.span("clear");
         defer s.end();
@@ -50,6 +64,12 @@ pub fn composite(self: *Compositor, layout: *const Layout) void {
         var s = trace.span("status_line");
         defer s.end();
         self.drawStatusLine(focused);
+    }
+
+    {
+        var s = trace.span("input_line");
+        defer s.end();
+        self.drawInputLine(input);
     }
 }
 
@@ -225,6 +245,49 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
     }
 }
 
+/// Draw the input/status line on the last row, overwriting the status line.
+fn drawInputLine(self: *Compositor, input: InputState) void {
+    if (self.screen.height == 0) return;
+    const row = self.screen.height - 1;
+
+    // Clear the row
+    for (0..self.screen.width) |col| {
+        const cell = self.screen.getCell(row, @intCast(col));
+        cell.codepoint = ' ';
+        cell.style = .{};
+        cell.fg = .default;
+        cell.bg = .default;
+    }
+
+    if (input.status.len > 0) {
+        const resolved = Theme.resolve(self.theme.highlights.status, self.theme);
+        const end_col = self.screen.writeStr(row, 0, input.status, resolved.screen_style, resolved.fg);
+        if (input.agent_running) {
+            const spinner = "|/-\\";
+            _ = self.screen.writeStr(row, end_col + 1, spinner[input.spinner_frame .. input.spinner_frame + 1], resolved.screen_style, resolved.fg);
+        }
+    } else {
+        const prompt = Theme.resolve(self.theme.highlights.input_prompt, self.theme);
+        const text = Theme.resolve(self.theme.highlights.input_text, self.theme);
+        const c = self.screen.writeStr(row, 0, "> ", prompt.screen_style, prompt.fg);
+        _ = self.screen.writeStr(row, c, input.text, text.screen_style, text.fg);
+    }
+
+    // Show render time and FPS right-aligned when metrics are enabled
+    if (trace.enabled) {
+        const frame_us = trace.getLastFrameTimeUs();
+        const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
+        var scratch: [32]u8 = undefined;
+        const time_text = if (input.fps > 0)
+            std.fmt.bufPrint(&scratch, "{d:.1}ms {d}fps", .{ frame_ms, input.fps }) catch return
+        else
+            std.fmt.bufPrint(&scratch, "{d:.1}ms", .{frame_ms}) catch return;
+        const resolved = Theme.resolve(self.theme.highlights.status, self.theme);
+        const col = self.screen.width -| @as(u16, @intCast(time_text.len)) -| 1;
+        _ = self.screen.writeStr(row, col, time_text, resolved.screen_style, resolved.fg);
+    }
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -247,7 +310,7 @@ test "composite with empty layout does not crash" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    compositor.composite(&layout);
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
 }
 
 test "composite writes buffer content at leaf rect with padding" {
@@ -272,7 +335,7 @@ test "composite writes buffer content at leaf rect with padding" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout);
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(0, pad_h).codepoint);
@@ -301,10 +364,11 @@ test "composite draws status line on last row" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout);
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
 
-    try std.testing.expectEqual(@as(u21, 'm'), screen.getCellConst(9, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'y'), screen.getCellConst(9, 2).codepoint);
+    // Last row shows input prompt (overwrites status line)
+    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(9, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(9, 1).codepoint);
 }
 
 test "composite draws vertical split border from theme" {
@@ -332,7 +396,7 @@ test "composite draws vertical split border from theme" {
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout);
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
 
     const root = layout.root.?;
     const first_rect = root.split.first.leaf.rect;
@@ -367,7 +431,7 @@ test "composite draws horizontal split border" {
     try layout.splitHorizontal(0.5, cb2.buf());
     layout.recalculate(40, 12);
 
-    compositor.composite(&layout);
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
 
     const root = layout.root.?;
     const first_rect = root.split.first.leaf.rect;

@@ -372,50 +372,6 @@ fn extractFirstText(msg: types.Message) ?[]const u8 {
     return null;
 }
 
-/// Draw the input/status line on the last row, overwriting the compositor's status line.
-/// Uses the theme's input_prompt, input_text, and status highlight groups.
-fn drawInputLine(screen: *Screen, input: []const u8, input_len: usize, status_msg: []const u8, fps: u32, t: *const Theme) void {
-    if (screen.height == 0) return;
-    const input_row = screen.height - 1;
-
-    // Clear the row first
-    for (0..screen.width) |col_usize| {
-        const col: u16 = @intCast(col_usize);
-        const cell = screen.getCell(input_row, col);
-        cell.codepoint = ' ';
-        cell.style = .{};
-        cell.fg = .default;
-        cell.bg = .default;
-    }
-
-    if (status_msg.len > 0) {
-        const resolved = Theme.resolve(t.highlights.status, t);
-        const end_col = screen.writeStr(input_row, 0, status_msg, resolved.screen_style, resolved.fg);
-        // Append animated spinner when agent thread is active
-        if (agent_thread != null) {
-            _ = screen.writeStr(input_row, end_col + 1, spinner_chars[spinner_frame .. spinner_frame + 1], resolved.screen_style, resolved.fg);
-        }
-    } else {
-        const prompt_resolved = Theme.resolve(t.highlights.input_prompt, t);
-        const text_resolved = Theme.resolve(t.highlights.input_text, t);
-        const c = screen.writeStr(input_row, 0, "> ", prompt_resolved.screen_style, prompt_resolved.fg);
-        _ = screen.writeStr(input_row, c, input[0..input_len], text_resolved.screen_style, text_resolved.fg);
-    }
-
-    // Show render time and FPS right-aligned when metrics are enabled
-    if (trace.enabled) {
-        const frame_us = trace.getLastFrameTimeUs();
-        const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
-        var scratch: [32]u8 = undefined;
-        const time_str = if (fps > 0)
-            std.fmt.bufPrint(&scratch, "{d:.1}ms {d}fps", .{ frame_ms, fps }) catch return
-        else
-            std.fmt.bufPrint(&scratch, "{d:.1}ms", .{frame_ms}) catch return;
-        const status_resolved = Theme.resolve(t.highlights.status, t);
-        const time_col = screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
-        _ = screen.writeStr(input_row, time_col, time_str, status_resolved.screen_style, status_resolved.fg);
-    }
-}
 
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
 pub fn main() !void {
@@ -598,8 +554,13 @@ pub fn main() !void {
     var current_fps: u32 = 0;
 
     // -- Initial render ------------------------------------------------------
-    compositor.composite(&layout);
-    drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps, &theme);
+    compositor.composite(&layout, .{
+        .text = input_buf[0..input_len],
+        .status = status_msg,
+        .agent_running = agent_thread != null,
+        .spinner_frame = spinner_frame,
+        .fps = current_fps,
+    });
     try screen.render(stdout_file);
 
     while (running) {
@@ -882,22 +843,15 @@ pub fn main() !void {
             }
         }
 
-        // Redraw after every event
-        {
-            var composite_span = trace.span("composite");
-            defer composite_span.end();
-            compositor.composite(&layout);
-        }
-        {
-            var draw_input_span = trace.span("draw_input");
-            defer draw_input_span.end();
-            drawInputLine(&screen, &input_buf, input_len, status_msg, current_fps, &theme);
-        }
-        {
-            var render_span = trace.span("render");
-            defer render_span.end();
-            try screen.render(stdout_file);
-        }
+        // Redraw
+        compositor.composite(&layout, .{
+            .text = input_buf[0..input_len],
+            .status = status_msg,
+            .agent_running = agent_thread != null,
+            .spinner_frame = spinner_frame,
+            .fps = current_fps,
+        });
+        try screen.render(stdout_file);
     }
 
     // Cancel and join agent thread if still running on exit
