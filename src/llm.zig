@@ -530,8 +530,21 @@ pub const StreamingResponse = struct {
             return error.ApiError;
         };
 
+        const status = @intFromEnum(response.head.status);
+        log.info("streaming: HTTP status {d}, transfer={s}, content_length={?d}", .{
+            status,
+            @tagName(response.head.transfer_encoding),
+            response.head.content_length,
+        });
+
         if (response.head.status != .ok) {
-            log.err("streaming: HTTP status {d}", .{@intFromEnum(response.head.status)});
+            // Read error body for diagnostics
+            var err_body: [2048]u8 = undefined;
+            const reader = response.reader(&self.transfer_buf);
+            const err_n = reader.readSliceShort(&err_body) catch 0;
+            if (err_n > 0) {
+                log.err("streaming: HTTP {d} body: {s}", .{ status, err_body[0..err_n] });
+            }
             return error.ApiError;
         }
 
@@ -576,10 +589,12 @@ pub const StreamingResponse = struct {
         // Read from the network until we find a newline or hit end of stream.
         while (true) {
             var chunk: [4096]u8 = undefined;
-            const n = self.body_reader.readSliceShort(&chunk) catch
+            const n = self.body_reader.readSliceShort(&chunk) catch |err| {
+                log.err("readLine: readSliceShort error: {s}", .{@errorName(err)});
                 return error.ApiError;
+            };
             if (n == 0) {
-                // End of stream.
+                log.warn("readLine: 0 bytes (end of stream), pending_line={d}", .{self.pending_line.items.len});
                 if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
                 return null;
             }
