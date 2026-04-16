@@ -456,20 +456,11 @@ fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!types.To
         .is_error = true,
         .owned = false,
     };
-    // current_tool_name is added by another branch; guard with @hasDecl
-    // so this file compiles before that branch is merged.
-    const tool_name = if (@hasDecl(tools_mod, "current_tool_name"))
-        tools_mod.current_tool_name orelse return .{
-            .content = "error: no current tool name",
-            .is_error = true,
-            .owned = false,
-        }
-    else
-        return .{
-            .content = "error: current_tool_name not yet available in tools.zig",
-            .is_error = true,
-            .owned = false,
-        };
+    const tool_name = tools_mod.current_tool_name orelse return .{
+        .content = "error: no current tool name",
+        .is_error = true,
+        .owned = false,
+    };
     _ = allocator; // engine uses its own allocator
     return engine.executeTool(tool_name, input_raw);
 }
@@ -725,9 +716,8 @@ test "end-to-end: config file to registry execution" {
     defer registry.deinit();
     try engine.registerTools(&registry);
 
-    // Execute via engine directly (not through registry, since luaToolExecute
-    // depends on tools_mod.current_tool_name which another agent is adding)
-    const result = engine.executeTool("adder", "{\"a\": 3, \"b\": 4}");
+    // Execute through the full registry path (luaToolExecute -> active_engine -> executeTool)
+    const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("7", result.content);
