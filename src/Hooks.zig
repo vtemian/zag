@@ -54,6 +54,74 @@ pub fn matchesPattern(pattern: ?[]const u8, key: []const u8) bool {
     return false;
 }
 
+/// A payload carried through the hook system. Each variant holds the
+/// data a hook callback receives, plus (for pre-hooks with rewrite
+/// semantics) nullable `*_rewrite` fields the main thread can populate
+/// when a Lua hook returns a replacement.
+pub const HookPayload = union(EventKind) {
+    tool_pre: struct {
+        name: []const u8,
+        call_id: []const u8,
+        /// JSON serialization of the tool args. Read-only.
+        args_json: []const u8,
+        /// If a hook rewrites args, main thread allocates a new JSON
+        /// string here using the request's arena allocator.
+        args_rewrite: ?[]const u8,
+    },
+    tool_post: struct {
+        name: []const u8,
+        call_id: []const u8,
+        content: []const u8,
+        is_error: bool,
+        duration_ms: u64,
+        /// Rewrite slots, main thread owns if set.
+        content_rewrite: ?[]const u8,
+        is_error_rewrite: ?bool,
+    },
+    turn_start: struct { turn_num: u32, message_count: usize },
+    turn_end: struct {
+        turn_num: u32,
+        stop_reason: []const u8,
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    user_message_pre: struct {
+        text: []const u8,
+        /// Rewrite slot.
+        text_rewrite: ?[]const u8,
+    },
+    user_message_post: struct { text: []const u8 },
+    text_delta: struct { text: []const u8 },
+    agent_done: void,
+    agent_err: struct { message: []const u8 },
+
+    pub fn kind(self: HookPayload) EventKind {
+        return std.meta.activeTag(self);
+    }
+};
+
+/// Round-trip request pushed by the agent thread (or a worker
+/// sub-thread) onto the event queue. The main thread drains it,
+/// runs Lua hooks, mutates the payload in place, sets `cancelled`
+/// if any hook returned `{ cancel = true }`, and signals `done`.
+pub const HookRequest = struct {
+    payload: *HookPayload,
+    done: std.Thread.ResetEvent,
+    cancelled: bool,
+    /// If cancelled, the (optional) reason string. Owned by the
+    /// main thread (duped from Lua); caller frees after reading.
+    cancel_reason: ?[]const u8,
+
+    pub fn init(payload: *HookPayload) HookRequest {
+        return .{
+            .payload = payload,
+            .done = .{},
+            .cancelled = false,
+            .cancel_reason = null,
+        };
+    }
+};
+
 test {
     _ = @import("std").testing.refAllDecls(@This());
 }
@@ -72,4 +140,23 @@ test "parseEventName maps all nine strings" {
     try std.testing.expectEqual(Hooks.EventKind.tool_pre, Hooks.parseEventName("ToolPre").?);
     try std.testing.expectEqual(Hooks.EventKind.agent_err, Hooks.parseEventName("AgentErr").?);
     try std.testing.expect(Hooks.parseEventName("Nope") == null);
+}
+
+test "HookRequest carries payload and signals done" {
+    var payload: HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "id-1",
+        .args_json = "{\"command\":\"ls\"}",
+        .args_rewrite = null,
+    } };
+    var req = HookRequest.init(&payload);
+    try std.testing.expect(!req.cancelled);
+    req.done.set();
+    req.done.wait();
+    try std.testing.expect(!req.cancelled);
+}
+
+test "HookPayload kind() returns the union tag" {
+    const p: HookPayload = .{ .agent_done = {} };
+    try std.testing.expectEqual(EventKind.agent_done, p.kind());
 }
