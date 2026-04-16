@@ -319,6 +319,17 @@ fn handleKey(
     return .redraw;
 }
 
+/// Drain a buffer's agent events and auto-name its session on first completion.
+fn drainBuffer(buf: *ConversationBuffer, prov: *llm.ProviderResult, allocator: std.mem.Allocator) void {
+    if (buf.drainEvents(allocator)) {
+        if (buf.session_handle) |sh| {
+            if (sh.meta.name_len == 0 and buf.messages.items.len >= 2) {
+                autoNameSession(sh, buf, prov.provider, allocator);
+            }
+        }
+    }
+}
+
 /// Get the focused buffer as a ConversationBuffer.
 fn getFocusedConversation() *ConversationBuffer {
     return if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
@@ -755,20 +766,13 @@ pub fn main() !void {
             }
         }
 
-        // Drain agent events from the focused buffer
-        {
-            const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-            if (focused.drainEvents(allocator)) {
-                // Agent just finished
-                if (focused.session_handle) |sh| {
-                    if (sh.meta.name_len == 0 and focused.messages.items.len >= 2) {
-                        autoNameSession(sh, focused, provider.provider, allocator);
-                    }
-                }
-            }
-            if (focused.isAgentRunning()) {
-                spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
-            }
+        // Drain agent events from all buffers
+        drainBuffer(&buffer, &provider, allocator);
+        for (extra_panes.items) |pane| {
+            drainBuffer(pane.buffer, &provider, allocator);
+        }
+        if (getFocusedConversation().isAgentRunning()) {
+            spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
         }
 
         // Redraw
