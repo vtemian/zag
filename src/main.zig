@@ -190,6 +190,27 @@ fn attachSession(cb: *ConversationBuffer, session_mgr: *?Session.SessionManager,
     return h;
 }
 
+/// Resolve the session for this run: load an existing one or create a new one.
+/// Returns null if persistence is unavailable or all attempts fail.
+fn initSession(session_mgr: *?Session.SessionManager, resume_id: ?[]const u8, model_id: []const u8) ?Session.SessionHandle {
+    const mgr = &(session_mgr.* orelse return null);
+
+    if (resume_id) |id| {
+        return mgr.loadSession(id) catch |err| {
+            log.warn("session load failed, starting new: {}", .{err});
+            return mgr.createSession(model_id) catch |err2| {
+                log.warn("session creation fallback failed: {}", .{err2});
+                return null;
+            };
+        };
+    }
+
+    return mgr.createSession(model_id) catch |err| {
+        log.warn("session creation failed: {}", .{err});
+        return null;
+    };
+}
+
 /// Result of handling a slash command.
 const CommandResult = enum { handled, quit, not_a_command };
 
@@ -486,24 +507,7 @@ pub fn main() !void {
     };
 
     // Create or load session
-    var session_handle: ?Session.SessionHandle = if (resume_id) |id| blk: {
-        if (session_mgr) |*mgr| {
-            break :blk mgr.loadSession(id) catch |err| inner: {
-                log.warn("session load failed, starting new: {}", .{err});
-                break :inner mgr.createSession(provider.model_id) catch |err2| {
-                    log.warn("session creation fallback failed: {}", .{err2});
-                    break :inner null;
-                };
-            };
-        }
-        break :blk null;
-    } else if (session_mgr) |*mgr|
-        mgr.createSession(provider.model_id) catch |err| blk: {
-            log.warn("session creation failed: {}", .{err});
-            break :blk null;
-        }
-    else
-        null;
+    var session_handle = initSession(&session_mgr, resume_id, provider.model_id);
     defer if (session_handle) |*sh| sh.close();
 
     // Attach session to the initial buffer
