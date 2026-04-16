@@ -4,3 +4,4 @@ zig-out/
 .zag/
 zag-trace.json
 .worktrees/
+.claude/
