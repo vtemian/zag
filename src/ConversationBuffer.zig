@@ -636,7 +636,16 @@ fn generateSessionName(self: *const ConversationBuffer, provider: llm.Provider, 
     if (msgs.len < 2) return error.InsufficientMessages;
 
     const user_text = extractFirstText(msgs[0]) orelse return error.NoUserText;
-    const assistant_full = extractFirstText(msgs[1]) orelse return error.NoAssistantText;
+    // The second message may be tool_use-only (no text). Scan forward to find
+    // the first assistant message with a text block.
+    const assistant_full = blk: {
+        for (msgs[1..]) |msg| {
+            if (msg.role == .assistant) {
+                if (extractFirstText(msg)) |text| break :blk text;
+            }
+        }
+        return error.NoAssistantText;
+    };
     const assistant_text = assistant_full[0..@min(assistant_full.len, 200)];
 
     const user_content = try allocator.alloc(types.ContentBlock, 1);
