@@ -1,4 +1,4 @@
-//! Anthropic Messages API provider.
+//! Anthropic Messages API serializer.
 //!
 //! Implements the LLM Provider interface for Claude models via
 //! the Anthropic Messages API (https://api.anthropic.com/v1/messages).
@@ -15,8 +15,8 @@ const api_url = "https://api.anthropic.com/v1/messages";
 const api_version = "2023-06-01";
 const default_max_tokens = 8192;
 
-/// Anthropic provider state.
-pub const AnthropicProvider = struct {
+/// Anthropic serializer state.
+pub const AnthropicSerializer = struct {
     /// API key for authentication.
     api_key: []const u8,
     /// Model identifier (e.g., "claude-sonnet-4-20250514").
@@ -29,7 +29,7 @@ pub const AnthropicProvider = struct {
     };
 
     /// Create a Provider interface from this Anthropic provider.
-    pub fn provider(self: *AnthropicProvider) Provider {
+    pub fn provider(self: *AnthropicSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -40,7 +40,7 @@ pub const AnthropicProvider = struct {
         tool_definitions: []const types.ToolDefinition,
         allocator: Allocator,
     ) anyerror!types.LlmResponse {
-        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
@@ -63,7 +63,7 @@ pub const AnthropicProvider = struct {
         on_event: *const fn (event: llm.StreamEvent) void,
         cancel: *std.atomic.Value(bool),
     ) anyerror!types.LlmResponse {
-        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
