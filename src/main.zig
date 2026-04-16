@@ -16,7 +16,6 @@ const ConversationBuffer = @import("ConversationBuffer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
-const AgentThread = @import("AgentThread.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const trace = @import("Metrics.zig");
@@ -105,15 +104,6 @@ const SplitPane = struct {
 
 /// Extra panes created by splits, tracked for cleanup.
 var extra_panes: std.ArrayList(SplitPane) = .empty;
-
-/// Handle for the background agent thread, if one is running.
-var agent_thread: ?std.Thread = null;
-
-/// Event queue shared between the agent thread and the main loop.
-var event_queue: AgentThread.EventQueue = undefined;
-
-/// Atomic flag for requesting agent thread cancellation.
-var cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false);
 
 /// Frame counter for animating the status bar spinner.
 var spinner_frame: u8 = 0;
@@ -545,7 +535,6 @@ pub fn main() !void {
     var input_buf: [MAX_INPUT]u8 = undefined;
     var input_len: usize = 0;
     var running = true;
-    var status_msg: []const u8 = "";
     awaiting_window_cmd = false;
 
     // FPS tracking: count frames rendered per second
@@ -556,10 +545,10 @@ pub fn main() !void {
     // -- Initial render ------------------------------------------------------
     compositor.composite(&layout, .{
         .text = input_buf[0..input_len],
-        .status = status_msg,
-        .agent_running = agent_thread != null,
-        .spinner_frame = spinner_frame,
-        .fps = current_fps,
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
     });
     try screen.render(stdout_file);
 
@@ -575,12 +564,14 @@ pub fn main() !void {
         }
 
         if (maybe_event == null and resized == null) {
-            if (agent_thread == null) {
-                // No input, no resize, no agent running; sleep to avoid busy-spinning
+            const any_running = buffer.isAgentRunning() or for (extra_panes.items) |pane| {
+                if (pane.buffer.isAgentRunning()) break true;
+            } else false;
+
+            if (!any_running) {
                 posix.nanosleep(0, 10 * std.time.ns_per_ms);
                 continue;
             }
-            // Agent running but no input: brief sleep, then drain events and render
             posix.nanosleep(0, 16 * std.time.ns_per_ms);
         }
 
@@ -641,8 +632,9 @@ pub fn main() !void {
                             switch (k.key) {
                                 .char => |ch| {
                                     if (ch == 'c') {
-                                        if (agent_thread != null) {
-                                            cancel_flag.store(true, .release);
+                                        const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+                                        if (focused.isAgentRunning()) {
+                                            focused.cancelAgent();
                                         } else {
                                             running = false;
                                         }
@@ -672,47 +664,20 @@ pub fn main() !void {
                                         input_len = 0;
                                     },
                                     .not_a_command => {
-                                        // Ignore if an agent is already running
-                                        if (agent_thread != null) continue;
+                                        const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+                                        if (focused.isAgentRunning()) continue;
 
-                                        const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-
-                                        const user_content = try allocator.alloc(types.ContentBlock, 1);
-                                        const duped_input = try allocator.dupe(u8, user_input);
-                                        user_content[0] = .{ .text = .{ .text = duped_input } };
-                                        try active_buf.messages.append(allocator, .{ .role = .user, .content = user_content });
-
-                                        _ = try active_buf.appendNode(null, .user_message, user_input);
-
-                                        active_buf.persistEvent(.{
-                                            .entry_type = .user_message,
-                                            .content = user_input,
-                                            .timestamp = std.time.milliTimestamp(),
-                                        });
-
-                                        input_len = 0;
-                                        active_buf.current_assistant_node = null;
-                                        active_buf.last_tool_call = null;
-                                        cancel_flag.store(false, .release);
-
-                                        event_queue = AgentThread.EventQueue.init(allocator);
-                                        agent_thread = AgentThread.spawn(
+                                        focused.submitInput(
+                                            user_input,
                                             provider.provider,
-                                            &active_buf.messages,
                                             &registry,
                                             allocator,
-                                            &event_queue,
-                                            &cancel_flag,
                                             if (lua_engine) |*eng| eng else null,
-                                        ) catch |err| blk: {
-                                            _ = active_buf.appendNode(null, .err, @errorName(err)) catch {};
-                                            event_queue.deinit();
-                                            break :blk null;
+                                        ) catch |err| {
+                                            log.warn("submit failed: {}", .{err});
+                                            continue;
                                         };
-
-                                        if (agent_thread != null) {
-                                            status_msg = "streaming...";
-                                        }
+                                        input_len = 0;
                                     },
                                 }
                             },
@@ -758,52 +723,40 @@ pub fn main() !void {
                 .none => {},
             };
 
-        // Drain agent events into the focused buffer
-        if (agent_thread != null) {
-            const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-            var drain_buf: [64]AgentThread.AgentEvent = undefined;
-            const count = event_queue.drain(&drain_buf);
-
-            for (drain_buf[0..count]) |agent_event| {
-                active_buf.scroll_offset = 0;
-                active_buf.handleAgentEvent(agent_event, allocator);
-
-                if (agent_event == .done) {
-                    if (agent_thread) |t| t.join();
-                    agent_thread = null;
-                    event_queue.deinit();
-                    status_msg = "";
-
-                    if (active_buf.session_handle) |sh| {
-                        if (sh.meta.name_len == 0 and active_buf.messages.items.len >= 2) {
-                            autoNameSession(sh, active_buf, provider.provider, allocator);
-                        }
+        // Drain agent events from the focused buffer
+        {
+            const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+            if (focused.drainEvents(allocator)) {
+                // Agent just finished
+                if (focused.session_handle) |sh| {
+                    if (sh.meta.name_len == 0 and focused.messages.items.len >= 2) {
+                        autoNameSession(sh, focused, provider.provider, allocator);
                     }
                 }
             }
-
-            if (agent_thread != null) {
+            if (focused.isAgentRunning()) {
                 spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
             }
         }
 
         // Redraw
-        compositor.composite(&layout, .{
-            .text = input_buf[0..input_len],
-            .status = status_msg,
-            .agent_running = agent_thread != null,
-            .spinner_frame = spinner_frame,
-            .fps = current_fps,
-        });
+        {
+            const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+            compositor.composite(&layout, .{
+                .text = input_buf[0..input_len],
+                .status = if (focused.isAgentRunning()) "streaming..." else "",
+                .agent_running = focused.isAgentRunning(),
+                .spinner_frame = spinner_frame,
+                .fps = current_fps,
+            });
+        }
         try screen.render(stdout_file);
     }
 
-    // Cancel and join agent thread if still running on exit
-    if (agent_thread) |t| {
-        cancel_flag.store(true, .release);
-        t.join();
-        event_queue.deinit();
-        agent_thread = null;
+    // Shutdown all agent threads before cleanup
+    buffer.shutdown();
+    for (extra_panes.items) |pane| {
+        pane.buffer.shutdown();
     }
 
     // Auto-dump trace on exit when metrics are enabled

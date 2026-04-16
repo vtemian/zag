@@ -12,6 +12,9 @@ const Theme = @import("Theme.zig");
 const types = @import("types.zig");
 const Session = @import("Session.zig");
 const AgentThread = @import("AgentThread.zig");
+const llm = @import("llm.zig");
+const tools_mod = @import("tools.zig");
+const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 
 const ConversationBuffer = @This();
 
@@ -80,6 +83,14 @@ last_tool_call: ?*Node = null,
 current_assistant_node: ?*Node = null,
 /// Open session file for persistence (null if unsaved buffer).
 session_handle: ?*Session.SessionHandle = null,
+/// Background agent thread, if one is running for this buffer.
+agent_thread: ?std.Thread = null,
+/// Event queue for agent-to-main communication.
+event_queue: AgentThread.EventQueue = undefined,
+/// Atomic flag for requesting agent thread cancellation.
+cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false),
+/// Whether the event queue has been initialized (needs deinit).
+queue_active: bool = false,
 
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
@@ -370,6 +381,101 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
 
 /// Restore buffer state from a persisted session: load the node tree,
 /// rebuild the LLM message history, and update the buffer name from meta.
+/// Submit user input: append to message history, create node, persist, spawn agent.
+pub fn submitInput(
+    self: *ConversationBuffer,
+    text: []const u8,
+    provider: llm.Provider,
+    registry: *const tools_mod.Registry,
+    allocator: Allocator,
+    lua_eng: ?*LuaEngine,
+) !void {
+    // Append user message to conversation history
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    const duped = try allocator.dupe(u8, text);
+    content[0] = .{ .text = .{ .text = duped } };
+    try self.messages.append(allocator, .{ .role = .user, .content = content });
+
+    _ = try self.appendNode(null, .user_message, text);
+
+    self.persistEvent(.{
+        .entry_type = .user_message,
+        .content = text,
+        .timestamp = std.time.milliTimestamp(),
+    });
+
+    // Reset streaming state and spawn agent thread
+    self.current_assistant_node = null;
+    self.last_tool_call = null;
+    self.cancel_flag.store(false, .release);
+
+    self.event_queue = AgentThread.EventQueue.init(allocator);
+    self.queue_active = true;
+
+    self.agent_thread = AgentThread.spawn(
+        provider,
+        &self.messages,
+        registry,
+        allocator,
+        &self.event_queue,
+        &self.cancel_flag,
+        lua_eng,
+    ) catch |err| {
+        _ = self.appendNode(null, .err, @errorName(err)) catch {};
+        self.event_queue.deinit();
+        self.queue_active = false;
+        self.agent_thread = null;
+        return err;
+    };
+}
+
+/// Drain pending agent events. Returns true if the agent finished this frame.
+pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
+    if (self.agent_thread == null) return false;
+
+    var drain: [64]AgentThread.AgentEvent = undefined;
+    const count = self.event_queue.drain(&drain);
+    var finished = false;
+
+    for (drain[0..count]) |event| {
+        self.scroll_offset = 0;
+        self.handleAgentEvent(event, allocator);
+
+        if (event == .done) {
+            if (self.agent_thread) |t| t.join();
+            self.agent_thread = null;
+            self.event_queue.deinit();
+            self.queue_active = false;
+            finished = true;
+        }
+    }
+
+    return finished;
+}
+
+/// Whether an agent is currently running for this buffer.
+pub fn isAgentRunning(self: *const ConversationBuffer) bool {
+    return self.agent_thread != null;
+}
+
+/// Request cancellation of the running agent.
+pub fn cancelAgent(self: *ConversationBuffer) void {
+    self.cancel_flag.store(true, .release);
+}
+
+/// Cancel and join the agent thread if running. Call before deinit.
+pub fn shutdown(self: *ConversationBuffer) void {
+    if (self.agent_thread) |t| {
+        self.cancel_flag.store(true, .release);
+        t.join();
+        self.agent_thread = null;
+    }
+    if (self.queue_active) {
+        self.event_queue.deinit();
+        self.queue_active = false;
+    }
+}
+
 pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle, allocator: Allocator) !void {
     const session_id = sh.id[0..sh.id_len];
     const entries = try Session.loadEntries(session_id, allocator);
