@@ -11,6 +11,7 @@ const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const types = @import("types.zig");
 const Session = @import("Session.zig");
+const AgentThread = @import("AgentThread.zig");
 
 const ConversationBuffer = @This();
 
@@ -305,6 +306,66 @@ pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
     sh.appendEntry(entry) catch |err| {
         log.warn("session persist failed: {}", .{err});
     };
+}
+
+/// Process a single agent event: update the node tree and persist to session.
+pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent, allocator: Allocator) void {
+    switch (event) {
+        .text_delta => |text| {
+            defer allocator.free(text);
+            if (self.current_assistant_node) |node| {
+                self.appendToNode(node, text) catch {};
+            } else {
+                self.current_assistant_node = self.appendNode(null, .assistant_text, text) catch null;
+            }
+            self.persistEvent(.{
+                .entry_type = .assistant_text,
+                .content = text,
+                .timestamp = std.time.milliTimestamp(),
+            });
+        },
+        .tool_start => |name| {
+            defer allocator.free(name);
+            self.current_assistant_node = null;
+            self.last_tool_call = self.appendNode(null, .tool_call, name) catch null;
+            self.persistEvent(.{
+                .entry_type = .tool_call,
+                .tool_name = name,
+                .timestamp = std.time.milliTimestamp(),
+            });
+        },
+        .tool_result => |result| {
+            defer allocator.free(result.content);
+            _ = self.appendNode(self.last_tool_call, .tool_result, result.content) catch {};
+            self.persistEvent(.{
+                .entry_type = .tool_result,
+                .content = result.content,
+                .is_error = result.is_error,
+                .timestamp = std.time.milliTimestamp(),
+            });
+        },
+        .info => |text| {
+            defer allocator.free(text);
+            _ = self.appendNode(null, .status, text) catch {};
+            self.persistEvent(.{
+                .entry_type = .info,
+                .content = text,
+                .timestamp = std.time.milliTimestamp(),
+            });
+        },
+        .done => {
+            self.current_assistant_node = null;
+        },
+        .err => |text| {
+            defer allocator.free(text);
+            _ = self.appendNode(null, .err, text) catch {};
+            self.persistEvent(.{
+                .entry_type = .err,
+                .content = text,
+                .timestamp = std.time.milliTimestamp(),
+            });
+        },
+    }
 }
 
 /// Restore buffer state from a persisted session: load the node tree,
