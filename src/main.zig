@@ -978,6 +978,7 @@ test "imports compile" {
     _ = @import("Session.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/openai.zig");
+    _ = @import("LuaEngine.zig");
 }
 
 test "inputAppendChar adds character" {
