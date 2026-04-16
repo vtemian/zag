@@ -620,7 +620,7 @@ pub fn autoNameSession(self: *ConversationBuffer, provider: llm.Provider, alloca
     if (sh.meta.name_len > 0 or self.messages.items.len < 2) return;
 
     const summary = self.generateSessionName(provider, allocator) catch |err| {
-        log.warn("auto-name failed: {}", .{err});
+        log.debug("auto-name failed: {}", .{err});
         return;
     };
     defer allocator.free(summary);
@@ -642,17 +642,6 @@ fn generateSessionName(self: *const ConversationBuffer, provider: llm.Provider, 
         for (msgs[1..]) |msg| {
             if (msg.role == .assistant) {
                 if (extractFirstText(msg)) |text| break :blk text;
-            }
-        }
-        log.warn("auto-name: {d} messages, no assistant text found", .{msgs.len});
-        for (msgs, 0..) |msg, i| {
-            log.warn("  msg[{d}]: role={s}, blocks={d}", .{
-                i,
-                @tagName(msg.role),
-                msg.content.len,
-            });
-            for (msg.content, 0..) |block, j| {
-                log.warn("    block[{d}]: {s}", .{ j, @tagName(block) });
             }
         }
         return error.NoAssistantText;
