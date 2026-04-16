@@ -271,11 +271,11 @@ fn parseSseStream(
         blocks.deinit(allocator);
     }
 
-    var event_buf: [128]u8 = undefined;
-    var event_data: std.ArrayList(u8) = .empty;
-    defer event_data.deinit(allocator);
+    var scratch: [128]u8 = undefined;
+    var sse_data: std.ArrayList(u8) = .empty;
+    defer sse_data.deinit(allocator);
 
-    while (try stream.nextSseEvent(cancel, &event_buf, &event_data)) |sse| {
+    while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
         try processSseEvent(
             sse.event_type,
             sse.data,
