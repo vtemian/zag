@@ -63,6 +63,10 @@ pub const EventQueue = struct {
     items: std.ArrayList(AgentEvent),
     /// Allocator for the backing list.
     allocator: Allocator,
+    /// Count of events that failed to push due to allocation failure.
+    /// Surfaced in the UI so a stalled queue never silently diverges from
+    /// the agent's actual progress.
+    dropped: std.atomic.Value(u64) = .{ .raw = 0 },
 
     /// Create a new empty event queue.
     pub fn init(allocator: Allocator) EventQueue {
@@ -82,6 +86,16 @@ pub const EventQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.items.append(self.allocator, event);
+    }
+
+    /// Best-effort push: bumps `dropped` on failure instead of returning the
+    /// error. Use at call sites that have nowhere useful to propagate the
+    /// error (background threads, streaming callbacks) so the loss is at
+    /// least observable through the counter.
+    pub fn tryPush(self: *EventQueue, event: AgentEvent) void {
+        self.push(event) catch {
+            _ = self.dropped.fetchAdd(1, .monotonic);
+        };
     }
 
     /// Drain up to buf.len events into the provided buffer.
@@ -151,9 +165,9 @@ fn threadMain(
     if (lua_engine) |eng| eng.activate();
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel) catch |err| {
         const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
-        queue.push(.{ .err = duped_err }) catch {};
+        queue.tryPush(.{ .err = duped_err });
     };
-    queue.push(.done) catch {};
+    queue.tryPush(.done);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -243,4 +257,18 @@ test "drain with small buffer returns partial" {
     const count2 = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 1), count2);
     try std.testing.expectEqualStrings("c", buf[0].text_delta);
+}
+
+test "EventQueue.tryPush increments dropped on allocation failure" {
+    // Force every allocation to fail so push() returns OutOfMemory and the
+    // counter observes the drop instead of the caller swallowing it.
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var queue = EventQueue.init(fa.allocator());
+    defer queue.deinit();
+
+    queue.tryPush(.{ .info = "x" });
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
+
+    queue.tryPush(.done);
+    try std.testing.expectEqual(@as(u64, 2), queue.dropped.load(.acquire));
 }

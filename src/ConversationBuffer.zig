@@ -507,7 +507,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
             // If we have a call_id, store in the map for result correlation
             if (ev.call_id) |id| {
                 if (node) |n| {
-                    self.pending_tool_calls.put(id, n) catch {};
+                    self.pending_tool_calls.put(id, n) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
                 } else {
                     allocator.free(id);
                 }
@@ -531,7 +531,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 }
                 break :blk self.last_tool_call;
             } else self.last_tool_call;
-            _ = self.appendNode(parent, .tool_result, result.content) catch {};
+            _ = self.appendNode(parent, .tool_result, result.content) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
             self.persistEvent(.{
                 .entry_type = .tool_result,
                 .content = result.content,
@@ -552,7 +552,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
         .reset_assistant_text => self.resetCurrentAssistantText(),
         .err => |text| {
             defer allocator.free(text);
-            _ = self.appendNode(null, .err, text) catch {};
+            _ = self.appendNode(null, .err, text) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
             self.persistEvent(.{
                 .entry_type = .err,
                 .content = text,
@@ -604,7 +604,7 @@ pub fn submitInput(
         &self.cancel_flag,
         lua_eng,
     ) catch |err| {
-        _ = self.appendNode(null, .err, @errorName(err)) catch {};
+        _ = self.appendNode(null, .err, @errorName(err)) catch |append_err| log.warn("dropped event: {s}", .{@errorName(append_err)});
         self.event_queue.deinit();
         self.queue_active = false;
         self.agent_thread = null;

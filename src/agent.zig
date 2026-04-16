@@ -383,7 +383,7 @@ fn streamEventToQueue(event: llm.StreamEvent) void {
         .done => .done,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
     };
-    q.push(agent_event) catch {};
+    q.tryPush(agent_event);
 }
 
 test {
