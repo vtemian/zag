@@ -32,6 +32,19 @@ size: Size,
 /// sets must live at a fixed address visible to both the handler and `checkResize`.
 var resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
+/// Optional wake fd written by the SIGWINCH handler to break poll() out of its
+/// wait. Set from main.zig after the pipe is created. A negative value means
+/// unset. Must be async-signal-safe to write from the handler, so the handler
+/// uses the raw syscall (not std.posix.write, which touches errno).
+var wake_fd: posix.fd_t = -1;
+
+/// Configure the SIGWINCH handler to write 1 byte to `fd` on resize. Must be
+/// called before the handler fires to have any effect; safe to call multiple
+/// times.
+pub fn setWakeFd(fd: posix.fd_t) void {
+    wake_fd = fd;
+}
+
 /// Enter raw mode, alternate screen buffer, hide cursor, enable synchronized
 /// output and mouse tracking. Returns a Terminal that must be cleaned up via `deinit`.
 pub fn init() !Terminal {
@@ -180,6 +193,18 @@ fn handleSigwinch(sig: i32, info: *const posix.siginfo_t, ctx: ?*anyopaque) call
     _ = info;
     _ = ctx;
     resize_pending.store(true, .release);
+    // Async-signal-safe wake: raw syscall, not std.posix.write (which touches
+    // errno). Pipe is non-blocking; any error (EAGAIN on a full pipe means a
+    // wake is already pending) is ignored.
+    const fd = wake_fd;
+    if (fd >= 0) {
+        const byte: [1]u8 = .{1};
+        if (comptime @import("builtin").os.tag == .linux) {
+            _ = std.os.linux.write(fd, &byte, 1);
+        } else {
+            _ = std.c.write(fd, &byte, 1);
+        }
+    }
 }
 
 // -- Tests -------------------------------------------------------------------
