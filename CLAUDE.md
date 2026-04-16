@@ -6,19 +6,21 @@ Zag is a composable agent development environment built in Zig. The window syste
 ## Build & run
 ```bash
 zig build                    # build
-zig build run                # run (default: anthropic:claude-sonnet-4-20250514)
+zig build run                # run (default: anthropic/claude-sonnet-4-20250514)
 zig build test               # run tests
 zig build -Dmetrics=true     # enable performance tracing
 zig fmt --check .            # check formatting
 
-ZAG_MODEL="openai:gpt-4o" zig build run                       # use OpenAI
-ZAG_MODEL="anthropic:claude-sonnet-4-20250514" zig build run   # use Claude (default)
+ZAG_MODEL="openai/gpt-4o" zig build run                            # use OpenAI
+ZAG_MODEL="anthropic/claude-sonnet-4-20250514" zig build run        # use Claude (default)
+ZAG_MODEL="openrouter/anthropic/claude-sonnet-4" zig build run      # use OpenRouter
+ZAG_MODEL="ollama/llama3" zig build run                             # use local Ollama
 
 zig build run -- --session=<id>   # resume specific session
 zig build run -- --last           # resume most recent session
 ```
 
-Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` depending on provider.
+Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, etc. depending on provider.
 
 Dependencies: ziglua (Lua 5.4, compiled from source).
 
@@ -118,7 +120,7 @@ Dependencies: ziglua (Lua 5.4, compiled from source).
 src/
   main.zig          entry point, TUI event loop
   agent.zig         agent loop (LLM call, tool execution, repeat)
-  llm.zig           provider interface, model string parser, provider factory
+  llm.zig           provider interface, endpoint registry, model string parser
   tools.zig         tool registry and dispatch
   tools/
     read.zig        read file contents
@@ -126,8 +128,8 @@ src/
     edit.zig        exact text replacement
     bash.zig        shell command execution
   providers/
-    anthropic.zig   Anthropic Messages API provider
-    openai.zig      OpenAI Chat Completions provider
+    anthropic.zig   Anthropic Messages API serializer
+    openai.zig      OpenAI Chat Completions serializer
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   AgentThread.zig   background agent thread with event queue
   Session.zig       JSONL session persistence and management
