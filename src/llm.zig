@@ -425,7 +425,7 @@ pub fn httpPostJson(
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const uri = std.Uri.parse(url) catch unreachable;
+    const uri = std.Uri.parse(url) catch return error.InvalidUri;
 
     const result = client.fetch(.{
         .location = .{ .uri = uri },
@@ -495,7 +495,7 @@ pub const StreamingResponse = struct {
         };
         errdefer self.client.deinit();
 
-        const uri = std.Uri.parse(url) catch unreachable;
+        const uri = std.Uri.parse(url) catch return error.InvalidUri;
 
         self.req = self.client.request(.POST, uri, .{
             .extra_headers = extra_headers,
@@ -1144,6 +1144,21 @@ test "readLine caps pending_line at MAX_SSE_LINE" {
     defer sr.remainder.deinit(allocator);
 
     try std.testing.expectError(error.SseLineTooLong, sr.readLine());
+}
+
+test "StreamingResponse.create returns InvalidUri on malformed endpoint" {
+    // A malformed URL must surface as a real error instead of panicking.
+    // `create` allocates before parsing, so a failure here also exercises
+    // the errdefer cleanup for the heap struct.
+    const allocator = std.testing.allocator;
+    const result = StreamingResponse.create("not a url", "", &.{}, allocator);
+    try std.testing.expectError(error.InvalidUri, result);
+}
+
+test "httpPostJson returns InvalidUri on malformed endpoint" {
+    const allocator = std.testing.allocator;
+    const result = httpPostJson("not a url", "", &.{}, allocator);
+    try std.testing.expectError(error.InvalidUri, result);
 }
 
 test "nextSseEvent caps event_data at MAX_SSE_EVENT_DATA" {
