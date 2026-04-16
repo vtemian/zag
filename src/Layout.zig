@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
+const ConversationBuffer = @import("ConversationBuffer.zig");
 
 const Layout = @This();
 
@@ -43,7 +44,7 @@ pub const LayoutNode = union(enum) {
 
     pub const Leaf = struct {
         /// The Buffer displayed in this window pane.
-        buffer: *Buffer,
+        buffer: Buffer,
         /// Screen rectangle for this pane, computed by recalculate().
         rect: Rect,
     };
@@ -88,7 +89,7 @@ pub fn deinit(self: *Layout) void {
 }
 
 /// Set a single buffer as the root leaf. Replaces any existing tree.
-pub fn setRoot(self: *Layout, buf: *Buffer) !void {
+pub fn setRoot(self: *Layout, buf: Buffer) !void {
     if (self.root) |old| self.destroyNode(old);
 
     const leaf = try self.allocator.create(LayoutNode);
@@ -102,12 +103,12 @@ pub fn setRoot(self: *Layout, buf: *Buffer) !void {
 }
 
 /// Split the focused window vertically (left/right).
-pub fn splitVertical(self: *Layout, ratio: f32, new_buffer: *Buffer) !void {
+pub fn splitVertical(self: *Layout, ratio: f32, new_buffer: Buffer) !void {
     try self.splitFocused(.vertical, ratio, new_buffer);
 }
 
 /// Split the focused window horizontally (top/bottom).
-pub fn splitHorizontal(self: *Layout, ratio: f32, new_buffer: *Buffer) !void {
+pub fn splitHorizontal(self: *Layout, ratio: f32, new_buffer: Buffer) !void {
     try self.splitFocused(.horizontal, ratio, new_buffer);
 }
 
@@ -224,7 +225,7 @@ pub fn visibleLeaves(self: *const Layout, out: []*LayoutNode, out_len: *usize) v
 // ---- Internal helpers -------------------------------------------------------
 
 /// Split the focused leaf into a split node with the existing leaf and a new one.
-fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer: *Buffer) !void {
+fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer: Buffer) !void {
     const r = self.root orelse return error.NoRoot;
     const f = self.focused orelse return error.NoRoot;
 
@@ -438,15 +439,15 @@ test "setRoot creates a single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf = try Buffer.init(allocator, 0, "test");
-    defer buf.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
 
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
 
     try std.testing.expect(layout.root != null);
     try std.testing.expectEqual(layout.root, layout.focused);
     try std.testing.expect(layout.root.?.* == .leaf);
-    try std.testing.expectEqual(&buf, layout.root.?.leaf.buffer);
+    try std.testing.expectEqualStrings("test", layout.root.?.leaf.buffer.getName());
 }
 
 test "recalculate sets leaf rect with status row reserved" {
@@ -454,14 +455,13 @@ test "recalculate sets leaf rect with status row reserved" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf = try Buffer.init(allocator, 0, "test");
-    defer buf.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
 
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
     layout.recalculate(80, 24);
 
     const leaf = layout.getFocusedLeaf().?;
-    // Content starts at row 0, height = 23 (row 23 = status line)
     try std.testing.expectEqual(@as(u16, 0), leaf.rect.x);
     try std.testing.expectEqual(@as(u16, 0), leaf.rect.y);
     try std.testing.expectEqual(@as(u16, 80), leaf.rect.width);
@@ -473,33 +473,28 @@ test "vertical split divides width with border" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "buf1");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "buf2");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
 
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
-    // Root should now be a split
     const r = layout.root.?;
     try std.testing.expect(r.* == .split);
-
     const split = r.split;
     try std.testing.expectEqual(SplitDirection.vertical, split.direction);
 
-    // With width=80, usable=79 (minus 1 for border), first gets floor(79*0.5)=39
     const first = split.first.leaf;
     const second = split.second.leaf;
     try std.testing.expectEqual(@as(u16, 0), first.rect.x);
     try std.testing.expectEqual(@as(u16, 39), first.rect.width);
-    // Second starts after first + 1 border col
     try std.testing.expectEqual(@as(u16, 40), second.rect.x);
     try std.testing.expectEqual(@as(u16, 40), second.rect.width);
-    // Heights should be the same (23 = 24 - 1 status row)
     try std.testing.expectEqual(@as(u16, 23), first.rect.height);
     try std.testing.expectEqual(@as(u16, 23), second.rect.height);
 }
@@ -509,15 +504,15 @@ test "horizontal split divides height with border" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "buf1");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "buf2");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
 
-    try layout.splitHorizontal(0.5, &buf2);
+    try layout.splitHorizontal(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
     const r = layout.root.?;
@@ -526,13 +521,10 @@ test "horizontal split divides height with border" {
 
     const first = split.first.leaf;
     const second = split.second.leaf;
-    // Content height = 23, usable = 22 (minus 1 for border), first gets floor(22*0.5)=11
     try std.testing.expectEqual(@as(u16, 0), first.rect.y);
     try std.testing.expectEqual(@as(u16, 11), first.rect.height);
-    // Second starts after first + 1 border row
     try std.testing.expectEqual(@as(u16, 12), second.rect.y);
     try std.testing.expectEqual(@as(u16, 11), second.rect.height);
-    // Widths should be the same
     try std.testing.expectEqual(@as(u16, 80), first.rect.width);
     try std.testing.expectEqual(@as(u16, 80), second.rect.width);
 }
@@ -542,29 +534,23 @@ test "focus navigation between vertical splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "left");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "right");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
-    // Focus should be on first (left) leaf
-    const left_buf = layout.getFocusedLeaf().?.buffer;
-    try std.testing.expectEqual(&buf1, left_buf);
+    try std.testing.expectEqualStrings("left", layout.getFocusedLeaf().?.buffer.getName());
 
-    // Navigate right
     layout.focusDirection(.right);
-    const right_buf = layout.getFocusedLeaf().?.buffer;
-    try std.testing.expectEqual(&buf2, right_buf);
+    try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
 
-    // Navigate left
     layout.focusDirection(.left);
-    const back_buf = layout.getFocusedLeaf().?.buffer;
-    try std.testing.expectEqual(&buf1, back_buf);
+    try std.testing.expectEqualStrings("left", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "focus navigation between horizontal splits" {
@@ -572,21 +558,21 @@ test "focus navigation between horizontal splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "top");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "bottom");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
-    try layout.splitHorizontal(0.5, &buf2);
+    try layout.splitHorizontal(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
     layout.focusDirection(.down);
-    try std.testing.expectEqual(&buf2, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqualStrings("bottom", layout.getFocusedLeaf().?.buffer.getName());
 
     layout.focusDirection(.up);
-    try std.testing.expectEqual(&buf1, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqualStrings("top", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "closeWindow removes focused pane" {
@@ -594,26 +580,23 @@ test "closeWindow removes focused pane" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "left");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "right");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
-    // Focus right pane
     layout.focusDirection(.right);
-    try std.testing.expectEqual(&buf2, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
 
-    // Close the right pane
     layout.closeWindow();
 
-    // Root should be a leaf again, focused on buf1
     try std.testing.expect(layout.root.?.* == .leaf);
-    try std.testing.expectEqual(&buf1, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqualStrings("left", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "closeWindow is no-op on single leaf" {
@@ -621,12 +604,11 @@ test "closeWindow is no-op on single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf = try Buffer.init(allocator, 0, "only");
-    defer buf.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "only");
+    defer cb.deinit();
 
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
 
-    // Should not crash or change anything
     layout.closeWindow();
     try std.testing.expect(layout.root.?.* == .leaf);
 }
@@ -636,14 +618,14 @@ test "visibleLeaves returns all leaves" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "buf1");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "buf2");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, cb2.buf());
 
     var leaves: [16]*LayoutNode = undefined;
     var count: usize = 0;
@@ -657,12 +639,11 @@ test "recalculate with tiny screen is safe" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf = try Buffer.init(allocator, 0, "test");
-    defer buf.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
 
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
 
-    // Screen too small, should not crash
     layout.recalculate(5, 1);
     layout.recalculate(0, 0);
     layout.recalculate(1, 2);
@@ -673,19 +654,18 @@ test "focus direction no-op when no neighbor exists" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf = try Buffer.init(allocator, 0, "only");
-    defer buf.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "only");
+    defer cb.deinit();
 
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
     layout.recalculate(80, 24);
 
-    // Navigating in any direction should be a no-op
     layout.focusDirection(.right);
     layout.focusDirection(.left);
     layout.focusDirection(.up);
     layout.focusDirection(.down);
 
-    try std.testing.expectEqual(&buf, layout.getFocusedLeaf().?.buffer);
+    try std.testing.expectEqualStrings("only", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "setRoot replaces existing tree" {
@@ -693,14 +673,14 @@ test "setRoot replaces existing tree" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var buf1 = try Buffer.init(allocator, 0, "first");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "second");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "first");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "second");
+    defer cb2.deinit();
 
-    try layout.setRoot(&buf1);
-    try std.testing.expectEqual(&buf1, layout.root.?.leaf.buffer);
+    try layout.setRoot(cb1.buf());
+    try std.testing.expectEqualStrings("first", layout.root.?.leaf.buffer.getName());
 
-    try layout.setRoot(&buf2);
-    try std.testing.expectEqual(&buf2, layout.root.?.leaf.buffer);
+    try layout.setRoot(cb2.buf());
+    try std.testing.expectEqualStrings("second", layout.root.?.leaf.buffer.getName());
 }

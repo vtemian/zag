@@ -17,7 +17,7 @@ const CellStyle = Theme.CellStyle;
 /// Splits `text` on newlines, recognizes block-level constructs (code fences,
 /// headings, lists, horizontal rules) and inline formatting (bold, italic,
 /// inline code, links). Each produced StyledLine has its span text duped via
-/// `allocator`; the caller frees via `NodeRenderer.freeStyledLines`.
+/// `allocator`; the caller frees via `Theme.freeStyledLines`.
 pub fn parseLines(
     text: []const u8,
     lines: *std.ArrayList(StyledLine),
@@ -25,7 +25,7 @@ pub fn parseLines(
     theme: *const Theme,
 ) !void {
     if (text.len == 0) {
-        try lines.append(allocator, try emptyStyledLine(allocator));
+        try lines.append(allocator, try Theme.emptyStyledLine(allocator));
         return;
     }
 
@@ -40,25 +40,25 @@ pub fn parseLines(
         // Code fence toggle
         if (isCodeFence(line)) {
             in_code_block = !in_code_block;
-            try lines.append(allocator, try singleSpanLine(allocator, "", theme.highlights.md_code_block));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, "", theme.highlights.md_code_block));
             continue;
         }
 
         // Inside code block: emit verbatim with code_block style
         if (in_code_block) {
-            try lines.append(allocator, try singleSpanLine(allocator, line, theme.highlights.md_code_block));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, line, theme.highlights.md_code_block));
             continue;
         }
 
         // Heading: 1-6 '#' followed by space
         if (parseHeading(line)) |content| {
-            try lines.append(allocator, try singleSpanLine(allocator, content, theme.highlights.md_heading));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, content, theme.highlights.md_heading));
             continue;
         }
 
         // Horizontal rule: 3+ identical chars from {-, *, _}
         if (isHorizontalRule(line)) {
-            try lines.append(allocator, try singleSpanLine(allocator, line, theme.highlights.md_hr));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, line, theme.highlights.md_hr));
             continue;
         }
 
@@ -147,21 +147,6 @@ fn parseNumberedList(line: []const u8) ?[]const u8 {
 // Line constructors
 // ---------------------------------------------------------------------------
 
-/// Create a StyledLine with zero spans.
-fn emptyStyledLine(allocator: Allocator) !StyledLine {
-    const spans = try allocator.alloc(StyledSpan, 0);
-    return .{ .spans = spans };
-}
-
-/// Create a StyledLine with a single span.
-fn singleSpanLine(allocator: Allocator, text: []const u8, style: CellStyle) !StyledLine {
-    const owned = try allocator.dupe(u8, text);
-    errdefer allocator.free(owned);
-    const spans = try allocator.alloc(StyledSpan, 1);
-    spans[0] = .{ .text = owned, .style = style };
-    return .{ .spans = spans };
-}
-
 /// Create a list line: bullet/number span + inline-parsed content.
 fn listLine(
     allocator: Allocator,
@@ -193,7 +178,7 @@ fn listLine(
 /// Returns a StyledLine with one or more spans.
 fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !StyledLine {
     if (line.len == 0) {
-        return emptyStyledLine(allocator);
+        return Theme.emptyStyledLine(allocator);
     }
 
     // Collect spans into a dynamic list, then convert to a slice
@@ -271,7 +256,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
     }
 
     if (span_list.items.len == 0) {
-        return emptyStyledLine(allocator);
+        return Theme.emptyStyledLine(allocator);
     }
 
     // Move the span list contents into an owned slice
@@ -377,19 +362,11 @@ fn expectSpanUnderline(spans: []const StyledSpan, index: usize) !void {
     try std.testing.expect(spans[index].style.underline);
 }
 
-fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: Allocator) void {
-    for (lines.items) |line| {
-        for (line.spans) |span| allocator.free(span.text);
-        allocator.free(line.spans);
-    }
-    lines.deinit(allocator);
-}
-
 test "plain text produces one span per line with default style" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("hello world", &lines, allocator, &theme);
 
@@ -405,7 +382,7 @@ test "heading produces heading-styled span" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("# Heading", &lines, allocator, &theme);
 
@@ -418,7 +395,7 @@ test "bold text produces bold span and default span" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("**bold** text", &lines, allocator, &theme);
 
@@ -434,7 +411,7 @@ test "inline code produces code_inline span and default spans" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("`code` in text", &lines, allocator, &theme);
 
@@ -450,7 +427,7 @@ test "code block applies code_block style to all lines between fences" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("```\nfoo\nbar\n```", &lines, allocator, &theme);
 
@@ -471,7 +448,7 @@ test "bullet list produces bullet span and text span" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("- bullet item", &lines, allocator, &theme);
 
@@ -485,7 +462,7 @@ test "numbered list produces number span and text span" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("1. numbered", &lines, allocator, &theme);
 
@@ -499,7 +476,7 @@ test "horizontal rule produces hr-styled span" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("---", &lines, allocator, &theme);
 
@@ -513,7 +490,7 @@ test "link produces link-styled span with text only" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("[click here](https://example.com)", &lines, allocator, &theme);
 
@@ -527,7 +504,7 @@ test "italic produces italic span" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("*italic*", &lines, allocator, &theme);
 
@@ -541,7 +518,7 @@ test "mixed bold italic and code produces correct spans" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("**bold** and *italic* and `code`", &lines, allocator, &theme);
 
@@ -562,7 +539,7 @@ test "empty content produces empty line" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("", &lines, allocator, &theme);
 
@@ -574,7 +551,7 @@ test "unclosed bold treats markers as literal" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("**bold", &lines, allocator, &theme);
 
@@ -590,7 +567,7 @@ test "code block prevents inline parsing inside" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("```\n**not bold**\n```", &lines, allocator, &theme);
 
@@ -607,7 +584,7 @@ test "multiple heading levels" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("## Sub heading", &lines, allocator, &theme);
 
@@ -620,7 +597,7 @@ test "asterisk bullet not confused with bold" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("* list item", &lines, allocator, &theme);
 
@@ -634,7 +611,7 @@ test "multiline with mixed types" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("# Title\nplain text\n- bullet", &lines, allocator, &theme);
 
@@ -652,7 +629,7 @@ test "code fence with language tag" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("```zig\nconst x = 1;\n```", &lines, allocator, &theme);
 
@@ -668,7 +645,7 @@ test "horizontal rule variants" {
     const variants = [_][]const u8{ "---", "***", "___", "----", "- - -" };
     for (variants) |variant| {
         var lines: std.ArrayList(StyledLine) = .empty;
-        defer freeStyledLines(&lines, allocator);
+        defer Theme.freeStyledLines(&lines, allocator);
 
         try parseLines(variant, &lines, allocator, &theme);
         try std.testing.expectEqual(@as(usize, 1), lines.items.len);
@@ -681,7 +658,7 @@ test "link inside text" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try parseLines("see [docs](http://x.com) here", &lines, allocator, &theme);
 

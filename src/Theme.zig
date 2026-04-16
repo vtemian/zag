@@ -166,7 +166,34 @@ pub const StyledLine = struct {
         }
         return buf;
     }
+
+    /// Free all memory owned by this styled line: span text and span array.
+    pub fn deinit(self: StyledLine, allocator: std.mem.Allocator) void {
+        for (self.spans) |span| allocator.free(span.text);
+        allocator.free(self.spans);
+    }
 };
+
+/// Free all StyledLines in a list, including their span text and span arrays.
+pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: std.mem.Allocator) void {
+    for (lines.items) |line| line.deinit(allocator);
+    lines.deinit(allocator);
+}
+
+/// Create a StyledLine with a single span. Text is duped; caller owns the result.
+pub fn singleSpanLine(allocator: std.mem.Allocator, text: []const u8, style: CellStyle) !StyledLine {
+    const owned = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned);
+    const spans = try allocator.alloc(StyledSpan, 1);
+    spans[0] = .{ .text = owned, .style = style };
+    return .{ .spans = spans };
+}
+
+/// Create a StyledLine with no spans (blank line).
+pub fn emptyStyledLine(allocator: std.mem.Allocator) !StyledLine {
+    const spans = try allocator.alloc(StyledSpan, 0);
+    return .{ .spans = spans };
+}
 
 /// Resolved colors and screen style, produced by resolve().
 pub const ResolvedStyle = struct {

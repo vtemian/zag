@@ -7,10 +7,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Buffer = @import("Buffer.zig");
+const ConversationBuffer = @import("ConversationBuffer.zig");
 const Theme = @import("Theme.zig");
-const Node = Buffer.Node;
-const NodeType = Buffer.NodeType;
+const Node = ConversationBuffer.Node;
+const NodeType = ConversationBuffer.NodeType;
 const StyledSpan = Theme.StyledSpan;
 const StyledLine = Theme.StyledLine;
 
@@ -101,15 +101,6 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     };
 }
 
-/// Create a StyledLine with a single span.
-fn singleSpanLine(allocator: Allocator, text: []const u8, style: Theme.CellStyle) !StyledLine {
-    const owned_text = try allocator.dupe(u8, text);
-    errdefer allocator.free(owned_text);
-    const spans = try allocator.alloc(StyledSpan, 1);
-    spans[0] = .{ .text = owned_text, .style = style };
-    return .{ .spans = spans };
-}
-
 /// Create a StyledLine with two spans.
 fn twoSpanLine(
     allocator: Allocator,
@@ -128,11 +119,6 @@ fn twoSpanLine(
     return .{ .spans = spans };
 }
 
-/// Create an empty StyledLine (no spans, used for blank gap lines).
-fn emptyLine(allocator: Allocator) !StyledLine {
-    const spans = try allocator.alloc(StyledSpan, 0);
-    return .{ .spans = spans };
-}
 
 /// Split content on newlines and append one StyledLine per segment.
 /// If prefix is provided, the first line gets a two-span layout (prefix + segment).
@@ -154,13 +140,13 @@ fn splitAndAppend(
         const line = if (first and prefix != null)
             try twoSpanLine(allocator, prefix.?, prefix_style.?, segment, style)
         else
-            try singleSpanLine(allocator, segment, style);
+            try Theme.singleSpanLine(allocator, segment, style);
         try lines.append(allocator, line);
         first = false;
         rest = if (nl) |n| rest[n + 1 ..] else &.{};
     }
     if (content.len == 0) {
-        try lines.append(allocator, try singleSpanLine(allocator, "", style));
+        try lines.append(allocator, try Theme.singleSpanLine(allocator, "", style));
     }
 }
 
@@ -190,7 +176,7 @@ fn splitAndAppendIndented(
         rest = if (nl) |n| rest[n + 1 ..] else &.{};
     }
     if (content.len == 0) {
-        try lines.append(allocator, try singleSpanLine(allocator, "", style));
+        try lines.append(allocator, try Theme.singleSpanLine(allocator, "", style));
     }
 }
 
@@ -235,25 +221,12 @@ fn renderDefault(
         },
         .separator => {
             const style = theme.highlights.status;
-            try lines.append(allocator, try singleSpanLine(allocator, "---", style));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, "---", style));
             return;
         },
     }
 }
 
-/// Free a single StyledLine's allocated spans and text.
-fn freeStyledLine(line: StyledLine, allocator: Allocator) void {
-    for (line.spans) |span| allocator.free(span.text);
-    allocator.free(line.spans);
-}
-
-/// Free all StyledLines in a list, including their span text and span arrays.
-pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: Allocator) void {
-    for (lines.items) |line| {
-        freeStyledLine(line, allocator);
-    }
-    lines.deinit(allocator);
-}
 
 // -- Tests -------------------------------------------------------------------
 
@@ -277,7 +250,7 @@ test "renderDefault user_message" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
@@ -303,7 +276,7 @@ test "renderDefault user_message has two spans with user_message style" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -332,7 +305,7 @@ test "renderDefault assistant_text" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -359,7 +332,7 @@ test "renderDefault tool_call" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -391,7 +364,7 @@ test "renderDefault tool_result shows full content" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -422,7 +395,7 @@ test "renderDefault tool_result short content not truncated" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -447,7 +420,7 @@ test "renderDefault err" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -475,7 +448,7 @@ test "renderDefault separator" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -502,7 +475,7 @@ test "renderDefault status" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -528,7 +501,7 @@ test "renderDefault custom" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
 
@@ -553,7 +526,7 @@ test "renderDefault multiline assistant_text" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderDefault(&node, &lines, allocator, &theme);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
@@ -608,7 +581,7 @@ test "custom override replaces default renderer" {
 
     const theme = Theme.defaultTheme();
     var lines: std.ArrayList(StyledLine) = .empty;
-    defer freeStyledLines(&lines, allocator);
+    defer Theme.freeStyledLines(&lines, allocator);
 
     try renderer.render(&node, &lines, allocator, &theme);
 
