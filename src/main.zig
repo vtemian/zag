@@ -742,9 +742,13 @@ pub fn main() !void {
         // Redraw
         {
             const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+            const status = if (focused.isAgentRunning()) blk: {
+                const info = focused.lastInfo();
+                break :blk if (info.len > 0) info else "streaming...";
+            } else "";
             compositor.composite(&layout, .{
                 .text = input_buf[0..input_len],
-                .status = if (focused.isAgentRunning()) "streaming..." else "",
+                .status = status,
                 .agent_running = focused.isAgentRunning(),
                 .spinner_frame = spinner_frame,
                 .fps = current_fps,

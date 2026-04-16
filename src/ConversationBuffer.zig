@@ -81,6 +81,10 @@ messages: std.ArrayList(types.Message) = .empty,
 last_tool_call: ?*Node = null,
 /// Current assistant text node being streamed to.
 current_assistant_node: ?*Node = null,
+/// Last info message (token counts) for status bar display.
+last_info: [128]u8 = .{0} ** 128,
+/// Length of the last info message.
+last_info_len: u8 = 0,
 /// Open session file for persistence (null if unsaved buffer).
 session_handle: ?*Session.SessionHandle = null,
 /// Background agent thread, if one is running for this buffer.
@@ -357,12 +361,10 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
         },
         .info => |text| {
             defer allocator.free(text);
-            _ = self.appendNode(null, .status, text) catch {};
-            self.persistEvent(.{
-                .entry_type = .info,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            });
+            // Store for status bar display, not as a conversation node
+            const len = @min(text.len, self.last_info.len);
+            @memcpy(self.last_info[0..len], text[0..len]);
+            self.last_info_len = @intCast(len);
         },
         .done => {
             self.current_assistant_node = null;
@@ -456,6 +458,11 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
 /// Whether an agent is currently running for this buffer.
 pub fn isAgentRunning(self: *const ConversationBuffer) bool {
     return self.agent_thread != null;
+}
+
+/// Return the last info/status message (e.g., token counts) for status bar display.
+pub fn lastInfo(self: *const ConversationBuffer) []const u8 {
+    return self.last_info[0..self.last_info_len];
 }
 
 /// Request cancellation of the running agent.
