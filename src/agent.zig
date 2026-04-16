@@ -519,7 +519,7 @@ fn drainAndFreeQueue(queue: *AgentThread.EventQueue, allocator: Allocator) void 
                 },
                 .info => |s| allocator.free(s),
                 .err => |s| allocator.free(s),
-                .done, .reset_assistant_text => {},
+                .done, .reset_assistant_text, .hook_request => {},
             }
         }
     }
