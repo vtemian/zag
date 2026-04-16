@@ -34,6 +34,9 @@ pub const VTable = struct {
 
     /// Set the scroll offset.
     setScrollOffset: *const fn (ptr: *anyopaque, offset: u32) void,
+
+    /// Return the total number of display lines in the buffer.
+    lineCount: *const fn (ptr: *anyopaque) anyerror!usize,
 };
 
 /// Render the buffer's content to styled display lines.
@@ -61,6 +64,11 @@ pub fn setScrollOffset(self: Buffer, offset: u32) void {
     self.vtable.setScrollOffset(self.ptr, offset);
 }
 
+/// Return the total number of display lines.
+pub fn lineCount(self: Buffer) !usize {
+    return self.vtable.lineCount(self.ptr);
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -79,6 +87,11 @@ test "Buffer vtable dispatches correctly" {
             .getId = getIdImpl,
             .getScrollOffset = getScrollOffsetImpl,
             .setScrollOffset = setScrollOffsetImpl,
+            .lineCount = @ptrCast(&struct {
+                fn f(_: *anyopaque) anyerror!usize {
+                    return 0;
+                }
+            }.f),
         };
 
         fn getVisibleLinesImpl(_: *anyopaque, _: Allocator, _: *const Theme) anyerror!std.ArrayList(Theme.StyledLine) {
