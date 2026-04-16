@@ -73,103 +73,117 @@ pub fn runLoopStreaming(
         thread_local_allocator = null;
     }
 
-    // Inner loop: call LLM, execute tools, repeat
     while (true) {
-        // Check cancel before each LLM call
         if (cancel.load(.acquire)) return;
 
-        // Try streaming, fall back to non-streaming on error.
-        const response = provider.callStreaming(
-            prompt,
-            messages.items,
-            tool_defs,
-            allocator,
-            &streamEventToQueue,
-            cancel,
-        ) catch |streaming_err| blk: {
-            log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
-            const fallback = try provider.call(
-                prompt,
-                messages.items,
-                tool_defs,
-                allocator,
-            );
-            // Push text to queue since streaming callback didn't fire
-            for (fallback.content) |block| {
-                switch (block) {
-                    .text => |t| {
-                        const duped = allocator.dupe(u8, t.text) catch continue;
-                        queue.push(.{ .text_delta = duped }) catch {};
-                    },
-                    else => {},
-                }
-            }
-            break :blk fallback;
-        };
-
-        // Add assistant message
-        log.info("appending assistant message: {d} blocks", .{response.content.len});
+        const response = try callLlm(provider, prompt, messages.items, tool_defs, allocator, queue, cancel);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
+        try emitTokenUsage(response, allocator, queue);
 
-        // Emit token usage as info
-        var info_buf: [128]u8 = undefined;
-        const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
-        const duped_info = try allocator.dupe(u8, info_msg);
-        try queue.push(.{ .info = duped_info });
+        const tool_calls = try collectToolCalls(response.content, allocator);
+        defer allocator.free(tool_calls);
+        if (tool_calls.len == 0) break;
 
-        // Collect tool calls
-        var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
-        defer tool_calls.deinit(allocator);
+        const results = try executeTools(tool_calls, registry, allocator, queue, cancel);
+        try messages.append(allocator, .{ .role = .user, .content = results });
+    }
+}
 
-        for (response.content) |block| {
+/// Call the LLM with streaming, falling back to non-streaming on error.
+fn callLlm(
+    provider: llm.Provider,
+    prompt: []const u8,
+    messages: []const types.Message,
+    tool_defs: []const types.ToolDefinition,
+    allocator: Allocator,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) !types.LlmResponse {
+    return provider.callStreaming(
+        prompt,
+        messages,
+        tool_defs,
+        allocator,
+        &streamEventToQueue,
+        cancel,
+    ) catch |streaming_err| {
+        log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
+        const fallback = try provider.call(prompt, messages, tool_defs, allocator);
+        // Push text to queue since streaming callback didn't fire
+        for (fallback.content) |block| {
             switch (block) {
-                .tool_use => |tu| try tool_calls.append(allocator, tu),
-                .text, .tool_result => {},
+                .text => |t| {
+                    const duped = allocator.dupe(u8, t.text) catch continue;
+                    queue.push(.{ .text_delta = duped }) catch {};
+                },
+                else => {},
             }
         }
+        return fallback;
+    };
+}
 
-        // No tool calls means we are done
-        if (tool_calls.items.len == 0) break;
+/// Push token usage info to the UI queue.
+fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *AgentThread.EventQueue) !void {
+    var scratch: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
+    try queue.push(.{ .info = try allocator.dupe(u8, msg) });
+}
 
-        // Execute tools and collect results
-        var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-        errdefer result_blocks.deinit(allocator);
-
-        for (tool_calls.items) |tc| {
-            // Check cancel before each tool
-            if (cancel.load(.acquire)) return;
-
-            log.info("executing tool: {s}", .{tc.name});
-            try queue.push(.{ .tool_start = try allocator.dupe(u8, tc.name) });
-
-            const result = try registry.execute(tc.name, tc.input_raw, allocator);
-            defer if (result.owned) allocator.free(result.content);
-
-            // Push to UI queue (queue consumer frees)
-            try queue.push(.{ .tool_result = .{
-                .content = try allocator.dupe(u8, result.content),
-                .is_error = result.is_error,
-            } });
-
-            // Separate copy for conversation history (Message owns these)
-            const msg_content = try allocator.dupe(u8, result.content);
-            errdefer allocator.free(msg_content);
-            const msg_id = try allocator.dupe(u8, tc.id);
-            errdefer allocator.free(msg_id);
-
-            try result_blocks.append(allocator, .{ .tool_result = .{
-                .tool_use_id = msg_id,
-                .content = msg_content,
-                .is_error = result.is_error,
-            } });
+/// Extract tool_use blocks from a response into an owned slice.
+fn collectToolCalls(content: []const types.ContentBlock, allocator: Allocator) ![]const types.ContentBlock.ToolUse {
+    var calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
+    defer calls.deinit(allocator);
+    for (content) |block| {
+        switch (block) {
+            .tool_use => |tu| try calls.append(allocator, tu),
+            .text, .tool_result => {},
         }
-
-        // Add tool results as a user message (Claude's format)
-        try messages.append(allocator, .{
-            .role = .user,
-            .content = try result_blocks.toOwnedSlice(allocator),
-        });
     }
+    return calls.toOwnedSlice(allocator);
+}
+
+/// Execute each tool call, pushing events to the queue, and return
+/// an owned content block slice for the conversation history.
+fn executeTools(
+    tool_calls: []const types.ContentBlock.ToolUse,
+    registry: *const tools.Registry,
+    allocator: Allocator,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) ![]types.ContentBlock {
+    var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+    errdefer result_blocks.deinit(allocator);
+
+    for (tool_calls) |tc| {
+        if (cancel.load(.acquire)) return error.Cancelled;
+
+        log.info("executing tool: {s}", .{tc.name});
+        try queue.push(.{ .tool_start = try allocator.dupe(u8, tc.name) });
+
+        const result = try registry.execute(tc.name, tc.input_raw, allocator);
+        defer if (result.owned) allocator.free(result.content);
+
+        // Push to UI queue (queue consumer frees)
+        try queue.push(.{ .tool_result = .{
+            .content = try allocator.dupe(u8, result.content),
+            .is_error = result.is_error,
+        } });
+
+        // Separate copy for conversation history (Message owns these)
+        const msg_content = try allocator.dupe(u8, result.content);
+        errdefer allocator.free(msg_content);
+        const msg_id = try allocator.dupe(u8, tc.id);
+        errdefer allocator.free(msg_id);
+
+        try result_blocks.append(allocator, .{ .tool_result = .{
+            .tool_use_id = msg_id,
+            .content = msg_content,
+            .is_error = result.is_error,
+        } });
+    }
+
+    return result_blocks.toOwnedSlice(allocator);
 }
 
 /// Thread-local queue pointer bridging the bare function-pointer callback
