@@ -21,6 +21,9 @@ screen: *Screen,
 allocator: Allocator,
 /// Design system for colors, highlights, spacing, and borders.
 theme: *const Theme,
+/// Whether the layout changed (resize/split/close) and borders need redrawing.
+/// The caller sets this; composite clears it.
+layout_dirty: bool = true,
 
 /// Input state needed by the compositor to draw the input/status line.
 pub const InputState = struct {
@@ -37,35 +40,45 @@ pub const InputState = struct {
 };
 
 /// Composite the layout into the screen grid.
-/// Clears the screen, draws buffer content, borders, status line, and input line.
+/// Only redraws leaves whose buffer is dirty. Always redraws the input/status row.
+/// On layout changes (layout_dirty), clears the full screen and redraws everything.
 pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) void {
-    {
-        var s = trace.span("clear");
-        defer s.end();
-        self.screen.clear();
-    }
-
     const root = layout.root orelse return;
     const focused = layout.focused orelse root;
 
-    {
-        var s = trace.span("leaves");
-        defer s.end();
-        self.drawLeaves(root, focused);
+    if (self.layout_dirty) {
+        // Layout changed: full clear and redraw everything
+        {
+            var s = trace.span("clear");
+            defer s.end();
+            self.screen.clear();
+        }
+        {
+            var s = trace.span("leaves");
+            defer s.end();
+            self.drawAllLeaves(root, focused);
+        }
+        {
+            var s = trace.span("borders");
+            defer s.end();
+            self.drawBorders(root);
+        }
+        self.layout_dirty = false;
+    } else {
+        // Layout stable: only redraw dirty leaves
+        {
+            var s = trace.span("leaves");
+            defer s.end();
+            self.drawDirtyLeaves(root, focused);
+        }
     }
 
-    {
-        var s = trace.span("borders");
-        defer s.end();
-        self.drawBorders(root);
-    }
-
+    // Input/status line: always redraw (one row, cheap)
     {
         var s = trace.span("status_line");
         defer s.end();
         self.drawStatusLine(focused);
     }
-
     {
         var s = trace.span("input_line");
         defer s.end();
@@ -73,18 +86,34 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
     }
 }
 
-/// Recursively draw buffer content for all leaf nodes.
-fn drawLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
+/// Draw content for all leaves (used on layout change / full redraw).
+fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
             self.drawBufferContent(&leaf);
-            if (focused == node) {
-                // Could highlight focused window border differently in future
+            leaf.buffer.clearDirty();
+        },
+        .split => |split| {
+            self.drawAllLeaves(split.first, focused);
+            self.drawAllLeaves(split.second, focused);
+        },
+    }
+}
+
+/// Draw content only for leaves whose buffer is dirty.
+/// Clears the leaf rect before redrawing to remove stale content.
+fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
+    switch (node.*) {
+        .leaf => |leaf| {
+            if (leaf.buffer.isDirty()) {
+                self.screen.clearRect(leaf.rect.y, leaf.rect.x, leaf.rect.width, leaf.rect.height);
+                self.drawBufferContent(&leaf);
+                leaf.buffer.clearDirty();
             }
         },
         .split => |split| {
-            self.drawLeaves(split.first, focused);
-            self.drawLeaves(split.second, focused);
+            self.drawDirtyLeaves(split.first, focused);
+            self.drawDirtyLeaves(split.second, focused);
         },
     }
 }
@@ -307,6 +336,7 @@ test "composite with empty layout does not crash" {
         .screen = &screen,
         .allocator = allocator,
         .theme = &theme,
+        .layout_dirty = true,
     };
 
     var layout = Layout.init(allocator);
@@ -326,6 +356,7 @@ test "composite writes buffer content at leaf rect with padding" {
         .screen = &screen,
         .allocator = allocator,
         .theme = &theme,
+        .layout_dirty = true,
     };
 
     var cb = try ConversationBuffer.init(allocator, 0, "test");
@@ -356,6 +387,7 @@ test "composite draws status line on last row" {
         .screen = &screen,
         .allocator = allocator,
         .theme = &theme,
+        .layout_dirty = true,
     };
 
     var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
@@ -384,6 +416,7 @@ test "composite draws vertical split border from theme" {
         .screen = &screen,
         .allocator = allocator,
         .theme = &theme,
+        .layout_dirty = true,
     };
 
     var cb1 = try ConversationBuffer.init(allocator, 0, "left");
@@ -419,6 +452,7 @@ test "composite draws horizontal split border" {
         .screen = &screen,
         .allocator = allocator,
         .theme = &theme,
+        .layout_dirty = true,
     };
 
     var cb1 = try ConversationBuffer.init(allocator, 0, "top");
@@ -441,4 +475,43 @@ test "composite draws horizontal split border" {
 
     const border_cell = screen.getCellConst(border_row, first_rect.x);
     try std.testing.expectEqual(theme.borders.horizontal, border_cell.codepoint);
+}
+
+test "composite skips clean buffer leaves" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 10);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hello");
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 10);
+
+    // First composite: buffer is dirty, content should appear
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+
+    const pad_h = theme.spacing.padding_h;
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, pad_h + 2).codepoint);
+
+    // Manually overwrite a cell to detect if the leaf is redrawn
+    screen.getCell(0, pad_h + 2).codepoint = 'Z';
+
+    // Second composite: buffer is clean (clearDirty was called), so leaf is skipped
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+
+    // The 'Z' should persist because the clean leaf was not redrawn
+    try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(0, pad_h + 2).codepoint);
 }
