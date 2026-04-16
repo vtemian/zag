@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const posix = std.posix;
-const agent = @import("agent.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
@@ -86,12 +85,6 @@ fn tuiLogHandler(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Buffer: structured node tree for agent output. Written by the agent
-// output callback and read by the render loop. Since the agent runs
-// synchronously on the same thread, no mutex is needed.
-// ---------------------------------------------------------------------------
-
 /// Module-level buffer, initialized in main().
 var buffer: ConversationBuffer = undefined;
 
@@ -103,14 +96,14 @@ var theme: Theme = undefined;
 /// Counter for creating new buffers when splitting windows.
 var next_buffer_id: u32 = 1;
 
-/// Extra buffers created by splits, tracked for cleanup.
-var extra_buffers: std.ArrayList(*ConversationBuffer) = .empty;
+/// A split pane's owned resources: buffer and optional session.
+const SplitPane = struct {
+    buffer: *ConversationBuffer,
+    session: ?*Session.SessionHandle,
+};
 
-/// Heap-allocated session handles for split buffers, tracked for cleanup.
-var extra_session_handles: std.ArrayList(*Session.SessionHandle) = .empty;
-
-/// Last tool_call node, used to parent tool_result nodes (legacy callback path).
-var last_tool_call: ?*ConversationBuffer.Node = null;
+/// Extra panes created by splits, tracked for cleanup.
+var extra_panes: std.ArrayList(SplitPane) = .empty;
 
 /// Handle for the background agent thread, if one is running.
 var agent_thread: ?std.Thread = null;
@@ -129,29 +122,6 @@ const spinner_chars = "|/-\\";
 
 /// State for Ctrl+W prefix key sequence.
 var awaiting_window_cmd: bool = false;
-
-/// Typed callback passed to agent.runLoop. Creates nodes in the buffer.
-fn agentOutputCallback(content_type: agent.ContentType, text: []const u8) void {
-    const node_type: ConversationBuffer.NodeType = switch (content_type) {
-        .assistant_text => .assistant_text,
-        .tool_call => .tool_call,
-        .tool_result => .tool_result,
-        .info => .status,
-        .err => .err,
-    };
-
-    const parent: ?*ConversationBuffer.Node = if (content_type == .tool_result) last_tool_call else null;
-
-    const node = buffer.appendNode(parent, node_type, text) catch |err| {
-        log.warn("output capture failed: {}", .{err});
-        return;
-    };
-
-    // Track the last tool_call so tool_results can be parented to it
-    if (content_type == .tool_call) {
-        last_tool_call = node;
-    }
-}
 
 /// Append a plain text line to the buffer as a status node.
 /// Used for welcome messages and non-agent output.
@@ -189,40 +159,121 @@ fn inputDeleteBack(len: usize) usize {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Create a new empty buffer and track it for cleanup.
-fn createSplitBuffer(allocator: std.mem.Allocator) !*ConversationBuffer {
-    const buf = try allocator.create(ConversationBuffer);
-    errdefer allocator.destroy(buf);
+/// Create a new split pane: buffer + optional session, tracked for cleanup.
+fn createSplitPane(session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) !*ConversationBuffer {
+    const cb = try allocator.create(ConversationBuffer);
+    errdefer allocator.destroy(cb);
 
-    buf.* = try ConversationBuffer.init(allocator, next_buffer_id, "scratch");
-    errdefer buf.deinit();
+    cb.* = try ConversationBuffer.init(allocator, next_buffer_id, "scratch");
+    errdefer cb.deinit();
 
     next_buffer_id += 1;
-    try extra_buffers.append(allocator, buf);
-    return buf;
+
+    // Attach session if persistence is available
+    const sh = attachSession(cb, session_mgr, model, allocator);
+
+    try extra_panes.append(allocator, .{ .buffer = cb, .session = sh });
+    return cb;
 }
 
-/// Create a new session and attach it to a buffer. The session handle is
-/// heap-allocated and tracked in extra_session_handles for cleanup.
-/// Failures are logged but not propagated; the buffer works without persistence.
-fn attachSessionToBuffer(buf: *ConversationBuffer, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) void {
-    const mgr = &(session_mgr.* orelse return);
-    const sh = allocator.create(Session.SessionHandle) catch {
-        log.warn("failed to allocate session handle for split", .{});
-        return;
-    };
-    sh.* = mgr.createSession(model) catch |err| {
+/// Try to create and attach a session to a buffer. Returns the handle or null.
+fn attachSession(cb: *ConversationBuffer, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) ?*Session.SessionHandle {
+    const mgr = &(session_mgr.* orelse return null);
+    const h = allocator.create(Session.SessionHandle) catch return null;
+    h.* = mgr.createSession(model) catch |err| {
         log.warn("session creation failed for split: {}", .{err});
-        allocator.destroy(sh);
+        allocator.destroy(h);
+        return null;
+    };
+    cb.session_handle = h;
+    return h;
+}
+
+/// Result of handling a slash command.
+const CommandResult = enum { handled, quit, not_a_command };
+
+/// Try to handle input as a slash command. Returns .not_a_command if it isn't one.
+fn handleCommand(input: []const u8, model_str: []const u8) CommandResult {
+    if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q")) {
+        return .quit;
+    }
+
+    if (std.mem.eql(u8, input, "/perf")) {
+        if (trace.enabled) {
+            const stats = trace.getStats();
+            var perf_buf: [512]u8 = undefined;
+
+            const header = std.fmt.bufPrint(&perf_buf, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
+            appendOutputText(header) catch {};
+
+            const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
+            const p99_ms = @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0;
+            const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
+            const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
+
+            const avg_line = std.fmt.bufPrint(&perf_buf, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
+            appendOutputText(avg_line) catch {};
+            const p99_line = std.fmt.bufPrint(&perf_buf, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
+            appendOutputText(p99_line) catch {};
+            const max_line = std.fmt.bufPrint(&perf_buf, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
+            appendOutputText(max_line) catch {};
+            const peak_line = std.fmt.bufPrint(&perf_buf, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
+            appendOutputText(peak_line) catch {};
+            const allocs_line = std.fmt.bufPrint(&perf_buf, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
+            appendOutputText(allocs_line) catch {};
+        } else {
+            appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+        }
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, input, "/perf-dump")) {
+        if (trace.enabled) {
+            const count = trace.dump("zag-trace.json") catch |err| blk: {
+                var err_buf: [256]u8 = undefined;
+                const err_msg = std.fmt.bufPrint(&err_buf, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
+                appendOutputText(err_msg) catch {};
+                break :blk @as(usize, 0);
+            };
+            if (count > 0) {
+                var dump_buf: [256]u8 = undefined;
+                const dump_msg = std.fmt.bufPrint(&dump_buf, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
+                appendOutputText(dump_msg) catch {};
+            }
+        } else {
+            appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+        }
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, input, "/model")) {
+        var model_cmd_buf: [128]u8 = undefined;
+        const model_info = std.fmt.bufPrint(&model_cmd_buf, "model: {s}", .{model_str}) catch "model: unknown";
+        appendOutputText(model_info) catch {};
+        return .handled;
+    }
+
+    return .not_a_command;
+}
+
+/// Split the focused window, creating a new pane with its own session.
+fn doSplit(direction: Layout.SplitDirection, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator, width: u16, height: u16) void {
+    const new_buf = createSplitPane(session_mgr, model, allocator) catch |err| {
+        log.warn("split pane creation failed: {}", .{err});
         return;
     };
-    extra_session_handles.append(allocator, sh) catch {
-        sh.close();
-        allocator.destroy(sh);
-        log.warn("failed to track session handle for split", .{});
-        return;
-    };
-    buf.session_handle = sh;
+    const b = new_buf.buf();
+    switch (direction) {
+        .vertical => layout.splitVertical(0.5, b) catch |err| {
+            log.warn("split failed: {}", .{err});
+            return;
+        },
+        .horizontal => layout.splitHorizontal(0.5, b) catch |err| {
+            log.warn("split failed: {}", .{err});
+            return;
+        },
+    }
+    layout.recalculate(width, height);
 }
 
 /// Generate a short session name via a cheap LLM call and apply it.
@@ -372,26 +423,18 @@ pub fn main() !void {
     defer layout.deinit();
     try layout.setRoot(buffer.buf());
 
-    // Extra buffers created by splits.
-    // NOTE: extra_session_handles defer must come AFTER extra_buffers defer so
-    // that session handles close before their buffers are deinitialized (LIFO).
-    extra_buffers = .empty;
+    // Extra panes created by splits
+    extra_panes = .empty;
     defer {
-        for (extra_buffers.items) |buf| {
-            buf.deinit();
-            allocator.destroy(buf);
+        for (extra_panes.items) |pane| {
+            if (pane.session) |sh| {
+                sh.close();
+                allocator.destroy(sh);
+            }
+            pane.buffer.deinit();
+            allocator.destroy(pane.buffer);
         }
-        extra_buffers.deinit(allocator);
-    }
-
-    // Session handles for split buffers (closed before extra_buffers via LIFO)
-    extra_session_handles = .empty;
-    defer {
-        for (extra_session_handles.items) |sh| {
-            sh.close();
-            allocator.destroy(sh);
-        }
-        extra_session_handles.deinit(allocator);
+        extra_panes.deinit(allocator);
     }
 
     // Read model string and create provider
@@ -586,12 +629,13 @@ pub fn main() !void {
         const maybe_event = input_mod.pollEvent(posix.STDIN_FILENO);
 
         // Check for terminal resize (SIGWINCH)
-        if (term.checkResize()) |new_size| {
+        const resized = term.checkResize();
+        if (resized) |new_size| {
             try screen.resize(new_size.cols, new_size.rows);
             layout.recalculate(new_size.cols, new_size.rows);
         }
 
-        if (maybe_event == null and term.checkResize() == null) {
+        if (maybe_event == null and resized == null) {
             if (agent_thread == null) {
                 // No input, no resize, no agent running; sleep to avoid busy-spinning
                 posix.nanosleep(0, 10 * std.time.ns_per_ms);
@@ -637,30 +681,8 @@ pub fn main() !void {
                         awaiting_window_cmd = false;
                         switch (k.key) {
                             .char => |ch| switch (ch) {
-                                'v' => {
-                                    // Split vertical: new buffer gets its own session
-                                    if (createSplitBuffer(allocator)) |new_buf| {
-                                        attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
-                                        layout.splitVertical(0.5, new_buf.buf()) catch |err| {
-                                            log.warn("split failed: {}", .{err});
-                                        };
-                                        layout.recalculate(screen.width, screen.height);
-                                    } else |err| {
-                                        log.warn("split buffer creation failed: {}", .{err});
-                                    }
-                                },
-                                's' => {
-                                    // Split horizontal: new buffer gets its own session
-                                    if (createSplitBuffer(allocator)) |new_buf| {
-                                        attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
-                                        layout.splitHorizontal(0.5, new_buf.buf()) catch |err| {
-                                            log.warn("split failed: {}", .{err});
-                                        };
-                                        layout.recalculate(screen.width, screen.height);
-                                    } else |err| {
-                                        log.warn("split buffer creation failed: {}", .{err});
-                                    }
-                                },
+                                'v' => doSplit(.vertical, &session_mgr, model_str, allocator, screen.width, screen.height),
+                                's' => doSplit(.horizontal, &session_mgr, model_str, allocator, screen.width, screen.height),
                                 'q' => {
                                     // Close window
                                     layout.closeWindow();
@@ -702,109 +724,56 @@ pub fn main() !void {
 
                                 const user_input = input_buf[0..input_len];
 
-                                // Check for /quit command
-                                if (std.mem.eql(u8, user_input, "/quit") or std.mem.eql(u8, user_input, "/q")) {
-                                    running = false;
-                                    continue;
-                                }
+                                switch (handleCommand(user_input, model_str)) {
+                                    .quit => {
+                                        running = false;
+                                        continue;
+                                    },
+                                    .handled => {
+                                        input_len = 0;
+                                    },
+                                    .not_a_command => {
+                                        // Ignore if an agent is already running
+                                        if (agent_thread != null) continue;
 
-                                // /perf: show aggregate performance stats
-                                if (std.mem.eql(u8, user_input, "/perf")) {
-                                    input_len = 0;
-                                    if (trace.enabled) {
-                                        const stats = trace.getStats();
-                                        var perf_buf: [512]u8 = undefined;
+                                        const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
 
-                                        const header = std.fmt.bufPrint(&perf_buf, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
-                                        appendOutputText(header) catch {};
+                                        const user_content = try allocator.alloc(types.ContentBlock, 1);
+                                        const duped_input = try allocator.dupe(u8, user_input);
+                                        user_content[0] = .{ .text = .{ .text = duped_input } };
+                                        try active_buf.messages.append(allocator, .{ .role = .user, .content = user_content });
 
-                                        const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
-                                        const p99_ms = @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0;
-                                        const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
-                                        const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
+                                        _ = try active_buf.appendNode(null, .user_message, user_input);
 
-                                        const avg_line = std.fmt.bufPrint(&perf_buf, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
-                                        appendOutputText(avg_line) catch {};
-                                        const p99_line = std.fmt.bufPrint(&perf_buf, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
-                                        appendOutputText(p99_line) catch {};
-                                        const max_line = std.fmt.bufPrint(&perf_buf, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
-                                        appendOutputText(max_line) catch {};
-                                        const peak_line = std.fmt.bufPrint(&perf_buf, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
-                                        appendOutputText(peak_line) catch {};
-                                        const allocs_line = std.fmt.bufPrint(&perf_buf, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
-                                        appendOutputText(allocs_line) catch {};
-                                    } else {
-                                        appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
-                                    }
-                                } else if (std.mem.eql(u8, user_input, "/perf-dump")) {
-                                    input_len = 0;
-                                    if (trace.enabled) {
-                                        const count = trace.dump("zag-trace.json") catch |err| blk: {
-                                            var err_buf: [256]u8 = undefined;
-                                            const err_msg = std.fmt.bufPrint(&err_buf, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
-                                            appendOutputText(err_msg) catch {};
-                                            break :blk @as(usize, 0);
+                                        active_buf.persistEvent(.{
+                                            .entry_type = .user_message,
+                                            .content = user_input,
+                                            .timestamp = std.time.milliTimestamp(),
+                                        });
+
+                                        input_len = 0;
+                                        active_buf.current_assistant_node = null;
+                                        active_buf.last_tool_call = null;
+                                        cancel_flag.store(false, .release);
+
+                                        event_queue = AgentThread.EventQueue.init(allocator);
+                                        agent_thread = AgentThread.spawn(
+                                            provider_result.provider,
+                                            &active_buf.messages,
+                                            &registry,
+                                            allocator,
+                                            &event_queue,
+                                            &cancel_flag,
+                                        ) catch |err| blk: {
+                                            _ = active_buf.appendNode(null, .err, @errorName(err)) catch {};
+                                            event_queue.deinit();
+                                            break :blk null;
                                         };
-                                        if (count > 0) {
-                                            var dump_buf: [256]u8 = undefined;
-                                            const dump_msg = std.fmt.bufPrint(&dump_buf, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
-                                            appendOutputText(dump_msg) catch {};
+
+                                        if (agent_thread != null) {
+                                            status_msg = "streaming...";
                                         }
-                                    } else {
-                                        appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
-                                    }
-                                } else if (std.mem.eql(u8, user_input, "/model")) {
-                                    input_len = 0;
-                                    var model_cmd_buf: [128]u8 = undefined;
-                                    const model_info = std.fmt.bufPrint(&model_cmd_buf, "model: {s}", .{model_str}) catch "model: unknown";
-                                    appendOutputText(model_info) catch {};
-                                } else {
-                                    // Ignore if an agent is already running
-                                    if (agent_thread != null) continue;
-
-                                    const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-
-                                    // Append the user message to the conversation
-                                    // history before spawning the thread, because
-                                    // runLoopStreaming reads from messages directly.
-                                    const user_content = try allocator.alloc(types.ContentBlock, 1);
-                                    const duped_input = try allocator.dupe(u8, user_input);
-                                    user_content[0] = .{ .text = .{ .text = duped_input } };
-                                    try active_buf.messages.append(allocator, .{ .role = .user, .content = user_content });
-
-                                    // Show user message in buffer
-                                    _ = try active_buf.appendNode(null, .user_message, user_input);
-
-                                    active_buf.persistEvent(.{
-                                        .entry_type = .user_message,
-                                        .content = user_input,
-                                        .timestamp = std.time.milliTimestamp(),
-                                    });
-
-                                    // Clear input and reset streaming state
-                                    input_len = 0;
-                                    active_buf.current_assistant_node = null;
-                                    active_buf.last_tool_call = null;
-                                    cancel_flag.store(false, .release);
-
-                                    // Initialize event queue and spawn agent thread
-                                    event_queue = AgentThread.EventQueue.init(allocator);
-                                    agent_thread = AgentThread.spawn(
-                                        provider_result.provider,
-                                        &active_buf.messages,
-                                        &registry,
-                                        allocator,
-                                        &event_queue,
-                                        &cancel_flag,
-                                    ) catch |err| blk: {
-                                        _ = active_buf.appendNode(null, .err, @errorName(err)) catch {};
-                                        event_queue.deinit();
-                                        break :blk null;
-                                    };
-
-                                    if (agent_thread != null) {
-                                        status_msg = "streaming...";
-                                    }
+                                    },
                                 }
                             },
                             .backspace => {
@@ -1050,39 +1019,6 @@ test "appendOutputText creates a status node" {
     try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, buffer.root_children.items[0].node_type);
     try std.testing.expectEqualStrings("hello world", buffer.root_children.items[0].content.items);
-}
-
-test "agentOutputCallback creates typed nodes" {
-    const allocator = std.testing.allocator;
-    buffer = try ConversationBuffer.init(allocator, 0, "test");
-    last_tool_call = null;
-    defer buffer.deinit();
-
-    agentOutputCallback(.assistant_text, "hello");
-    agentOutputCallback(.tool_call, "bash");
-    agentOutputCallback(.tool_result, "output");
-
-    try std.testing.expectEqual(@as(usize, 2), buffer.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, buffer.root_children.items[0].node_type);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.tool_call, buffer.root_children.items[1].node_type);
-
-    // tool_result should be a child of the tool_call node
-    const tc_node = buffer.root_children.items[1];
-    try std.testing.expectEqual(@as(usize, 1), tc_node.children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.tool_result, tc_node.children.items[0].node_type);
-}
-
-test "agentOutputCallback err node at root" {
-    const allocator = std.testing.allocator;
-    buffer = try ConversationBuffer.init(allocator, 0, "test");
-    defer buffer.deinit();
-    last_tool_call = null;
-
-    agentOutputCallback(.err, "something broke");
-
-    try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.err, buffer.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("something broke", buffer.root_children.items[0].content.items);
 }
 
 test "writeStr clips to screen width" {
