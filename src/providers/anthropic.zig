@@ -215,46 +215,27 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
 
     // Parse content blocks
     const content_array = root.get("content").?.array;
-    var blocks: std.ArrayList(types.ContentBlock) = .empty;
-    errdefer {
-        for (blocks.items) |block| block.freeOwned(allocator);
-        blocks.deinit(allocator);
-    }
+    var builder: llm.ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
 
     for (content_array.items) |item| {
         const obj = item.object;
         const block_type = obj.get("type").?.string;
 
         if (std.mem.eql(u8, block_type, "text")) {
-            const text = try allocator.dupe(u8, obj.get("text").?.string);
-            errdefer allocator.free(text);
-            try blocks.append(allocator, .{ .text = .{ .text = text } });
+            try builder.addText(obj.get("text").?.string, allocator);
         } else if (std.mem.eql(u8, block_type, "tool_use")) {
-            const id = try allocator.dupe(u8, obj.get("id").?.string);
-            errdefer allocator.free(id);
-            const name = try allocator.dupe(u8, obj.get("name").?.string);
-            errdefer allocator.free(name);
-
             // Serialize the input object back to JSON string
             var input_out: std.io.Writer.Allocating = .init(allocator);
             try std.json.Stringify.value(obj.get("input").?, .{}, &input_out.writer);
             const input_raw = try input_out.toOwnedSlice();
-            errdefer allocator.free(input_raw);
+            defer allocator.free(input_raw);
 
-            try blocks.append(allocator, .{ .tool_use = .{
-                .id = id,
-                .name = name,
-                .input_raw = input_raw,
-            } });
+            try builder.addToolUse(obj.get("id").?.string, obj.get("name").?.string, input_raw, allocator);
         }
     }
 
-    return .{
-        .content = try blocks.toOwnedSlice(allocator),
-        .stop_reason = stop_reason,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-    };
+    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
 }
 
 /// State for accumulating a single content block during streaming.
@@ -310,41 +291,17 @@ fn parseSseStream(
     }
 
     // Assemble final LlmResponse
-    var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-    errdefer {
-        for (result_blocks.items) |block| block.freeOwned(allocator);
-        result_blocks.deinit(allocator);
-    }
+    var builder: llm.ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
 
     for (blocks.items) |*b| {
         switch (b.block_type) {
-            .text => {
-                const text = try allocator.dupe(u8, b.content.items);
-                errdefer allocator.free(text);
-                try result_blocks.append(allocator, .{ .text = .{ .text = text } });
-            },
-            .tool_use => {
-                const id = try allocator.dupe(u8, b.tool_id);
-                errdefer allocator.free(id);
-                const name = try allocator.dupe(u8, b.tool_name);
-                errdefer allocator.free(name);
-                const input_raw = try allocator.dupe(u8, b.content.items);
-                errdefer allocator.free(input_raw);
-                try result_blocks.append(allocator, .{ .tool_use = .{
-                    .id = id,
-                    .name = name,
-                    .input_raw = input_raw,
-                } });
-            },
+            .text => try builder.addText(b.content.items, allocator),
+            .tool_use => try builder.addToolUse(b.tool_id, b.tool_name, b.content.items, allocator),
         }
     }
 
-    return .{
-        .content = try result_blocks.toOwnedSlice(allocator),
-        .stop_reason = stop_reason,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-    };
+    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.

@@ -440,6 +440,52 @@ pub const StreamingResponse = struct {
     }
 };
 
+/// Accumulates content blocks and assembles an LlmResponse.
+/// Dupes all strings so the response owns its memory.
+/// Caller must call deinit() on error, or finish() to produce the response.
+pub const ResponseBuilder = struct {
+    blocks: std.ArrayList(types.ContentBlock) = .empty,
+
+    /// Add a text content block. Dupes the text string.
+    pub fn addText(self: *ResponseBuilder, text: []const u8, allocator: Allocator) !void {
+        const duped = try allocator.dupe(u8, text);
+        errdefer allocator.free(duped);
+        try self.blocks.append(allocator, .{ .text = .{ .text = duped } });
+    }
+
+    /// Add a tool_use content block. Dupes id, name, and input_raw.
+    pub fn addToolUse(self: *ResponseBuilder, id: []const u8, name: []const u8, input_raw: []const u8, allocator: Allocator) !void {
+        const duped_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(duped_id);
+        const duped_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(duped_name);
+        const duped_input = try allocator.dupe(u8, input_raw);
+        errdefer allocator.free(duped_input);
+        try self.blocks.append(allocator, .{ .tool_use = .{
+            .id = duped_id,
+            .name = duped_name,
+            .input_raw = duped_input,
+        } });
+    }
+
+    /// Consume the builder and return the final LlmResponse.
+    /// After this call the builder is empty and should not be used.
+    pub fn finish(self: *ResponseBuilder, stop_reason: types.StopReason, input_tokens: u32, output_tokens: u32, allocator: Allocator) !types.LlmResponse {
+        return .{
+            .content = try self.blocks.toOwnedSlice(allocator),
+            .stop_reason = stop_reason,
+            .input_tokens = input_tokens,
+            .output_tokens = output_tokens,
+        };
+    }
+
+    /// Free all accumulated blocks. Use on error paths when finish() won't be called.
+    pub fn deinit(self: *ResponseBuilder, allocator: Allocator) void {
+        for (self.blocks.items) |block| block.freeOwned(allocator);
+        self.blocks.deinit(allocator);
+    }
+};
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -600,6 +646,59 @@ test "createProvider returns UnknownProvider for unsupported provider" {
     try std.testing.expectError(error.UnknownProvider, result);
 }
 
-// ResponseBuilder tests removed: the type was part of the streaming
-// implementation which needs debugging. Will be restored when
-// callStreaming is fixed.
+test "ResponseBuilder assembles text and tool_use blocks" {
+    const allocator = std.testing.allocator;
+
+    var builder: ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
+
+    try builder.addText("Hello, world!", allocator);
+    try builder.addToolUse("toolu_1", "read", "{\"path\":\"/tmp\"}", allocator);
+    try builder.addText("Done.", allocator);
+
+    const response = try builder.finish(.tool_use, 10, 20, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), response.content.len);
+    try std.testing.expectEqual(.tool_use, response.stop_reason);
+    try std.testing.expectEqual(@as(u32, 10), response.input_tokens);
+    try std.testing.expectEqual(@as(u32, 20), response.output_tokens);
+
+    switch (response.content[0]) {
+        .text => |t| try std.testing.expectEqualStrings("Hello, world!", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (response.content[1]) {
+        .tool_use => |tu| {
+            try std.testing.expectEqualStrings("toolu_1", tu.id);
+            try std.testing.expectEqualStrings("read", tu.name);
+            try std.testing.expectEqualStrings("{\"path\":\"/tmp\"}", tu.input_raw);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (response.content[2]) {
+        .text => |t| try std.testing.expectEqualStrings("Done.", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ResponseBuilder empty finish returns no content" {
+    const allocator = std.testing.allocator;
+
+    var builder: ResponseBuilder = .{};
+    const response = try builder.finish(.end_turn, 0, 0, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), response.content.len);
+    try std.testing.expectEqual(.end_turn, response.stop_reason);
+}
+
+test "ResponseBuilder deinit cleans up on error" {
+    const allocator = std.testing.allocator;
+
+    var builder: ResponseBuilder = .{};
+    try builder.addText("leaked?", allocator);
+    try builder.addToolUse("id", "name", "input", allocator);
+    // Simulate error path: deinit without finish
+    builder.deinit(allocator);
+}
