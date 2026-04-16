@@ -113,6 +113,17 @@ const spinner_chars = "|/-\\";
 /// State for Ctrl+W prefix key sequence.
 var awaiting_window_cmd: bool = false;
 
+/// Shared context threaded through event handlers.
+const AppContext = struct {
+    provider: *llm.ProviderResult,
+    registry: *const tools.Registry,
+    session_mgr: *?Session.SessionManager,
+    allocator: std.mem.Allocator,
+    lua_engine: ?*LuaEngine,
+    screen_width: u16,
+    screen_height: u16,
+};
+
 /// Append a plain text line to the buffer as a status node.
 /// Used for welcome messages and non-agent output.
 fn appendOutputText(text: []const u8) !void {
@@ -200,24 +211,18 @@ fn handleKey(
     k: input.KeyEvent,
     input_buf: []u8,
     input_len: *usize,
-    screen_w: u16,
-    screen_h: u16,
-    prov: *llm.ProviderResult,
-    registry: *const tools.Registry,
-    session_mgr: *?Session.SessionManager,
-    allocator: std.mem.Allocator,
-    lua_eng: ?*LuaEngine,
+    ctx: *const AppContext,
 ) Action {
     // Ctrl+W prefix mode
     if (awaiting_window_cmd) {
         awaiting_window_cmd = false;
         switch (k.key) {
             .char => |ch| switch (ch) {
-                'v' => doSplit(.vertical, session_mgr, prov.model_id, allocator, screen_w, screen_h),
-                's' => doSplit(.horizontal, session_mgr, prov.model_id, allocator, screen_w, screen_h),
+                'v' => doSplit(.vertical, ctx),
+                's' => doSplit(.horizontal, ctx),
                 'q' => {
                     layout.closeWindow();
-                    layout.recalculate(screen_w, screen_h);
+                    layout.recalculate(ctx.screen_width, ctx.screen_height);
                 },
                 'h' => layout.focusDirection(.left),
                 'j' => layout.focusDirection(.down),
@@ -258,7 +263,7 @@ fn handleKey(
 
             const user_input = input_buf[0..input_len.*];
 
-            switch (handleCommand(user_input, prov.model_id)) {
+            switch (handleCommand(user_input, ctx.provider.model_id)) {
                 .quit => return .quit,
                 .handled => {
                     input_len.* = 0;
@@ -270,10 +275,10 @@ fn handleKey(
 
                     focused.submitInput(
                         user_input,
-                        prov.provider,
-                        registry,
-                        allocator,
-                        lua_eng,
+                        ctx.provider.provider,
+                        ctx.registry,
+                        ctx.allocator,
+                        ctx.lua_engine,
                     ) catch |err| {
                         log.warn("submit failed: {}", .{err});
                         return .none;
@@ -331,8 +336,13 @@ fn handleCommand(command: []const u8, model_id: []const u8) CommandResult {
         return .quit;
     }
 
-    if (std.mem.eql(u8, command, "/perf")) {
-        if (trace.enabled) {
+    if (std.mem.eql(u8, command, "/perf") or std.mem.eql(u8, command, "/perf-dump")) {
+        if (!trace.enabled) {
+            appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
+            return .handled;
+        }
+
+        if (std.mem.eql(u8, command, "/perf")) {
             const stats = trace.getStats();
             var scratch: [512]u8 = undefined;
             const msg = std.fmt.bufPrint(&scratch,
@@ -352,13 +362,6 @@ fn handleCommand(command: []const u8, model_id: []const u8) CommandResult {
             }) catch "Performance: error formatting";
             appendOutputText(msg) catch {};
         } else {
-            appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
-        }
-        return .handled;
-    }
-
-    if (std.mem.eql(u8, command, "/perf-dump")) {
-        if (trace.enabled) {
             const count = trace.dump("zag-trace.json") catch |err| blk: {
                 var scratch: [256]u8 = undefined;
                 const err_msg = std.fmt.bufPrint(&scratch, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
@@ -370,8 +373,6 @@ fn handleCommand(command: []const u8, model_id: []const u8) CommandResult {
                 const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
                 appendOutputText(dump_msg) catch {};
             }
-        } else {
-            appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
         }
         return .handled;
     }
@@ -387,23 +388,21 @@ fn handleCommand(command: []const u8, model_id: []const u8) CommandResult {
 }
 
 /// Split the focused window, creating a new pane with its own session.
-fn doSplit(direction: Layout.SplitDirection, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator, width: u16, height: u16) void {
-    const new_buf = createSplitPane(session_mgr, model, allocator) catch |err| {
+fn doSplit(direction: Layout.SplitDirection, ctx: *const AppContext) void {
+    const new_buf = createSplitPane(ctx.session_mgr, ctx.provider.model_id, ctx.allocator) catch |err| {
         log.warn("split pane creation failed: {}", .{err});
         return;
     };
     const b = new_buf.buf();
-    switch (direction) {
-        .vertical => layout.splitVertical(0.5, b) catch |err| {
-            log.warn("split failed: {}", .{err});
-            return;
-        },
-        .horizontal => layout.splitHorizontal(0.5, b) catch |err| {
-            log.warn("split failed: {}", .{err});
-            return;
-        },
-    }
-    layout.recalculate(width, height);
+    const split = switch (direction) {
+        .vertical => layout.splitVertical(0.5, b),
+        .horizontal => layout.splitHorizontal(0.5, b),
+    };
+    split catch |err| {
+        log.warn("split failed: {}", .{err});
+        return;
+    };
+    layout.recalculate(ctx.screen_width, ctx.screen_height);
 }
 
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
@@ -499,16 +498,14 @@ pub fn main() !void {
     var session_handle = initSession(&session_mgr, resume_id, provider.model_id);
     defer if (session_handle) |*sh| sh.close();
 
-    // Attach session to the initial buffer
-    if (session_handle != null) {
-        buffer.session_handle = &(session_handle.?);
-    }
-
-    // Restore buffer state from resumed session
-    if (resume_id != null and session_handle != null) {
-        buffer.restoreFromSession(&session_handle.?, allocator) catch |err| {
-            log.warn("session restore failed: {}", .{err});
-        };
+    // Attach session to the initial buffer and restore state for resumed sessions
+    if (session_handle) |*sh| {
+        buffer.session_handle = sh;
+        if (resume_id != null) {
+            buffer.restoreFromSession(sh, allocator) catch |err| {
+                log.warn("session restore failed: {}", .{err});
+            };
+        }
     }
 
     // -- Enter TUI mode ------------------------------------------------------
@@ -585,6 +582,17 @@ pub fn main() !void {
     var fps_frame_count: u32 = 0;
     var current_fps: u32 = 0;
 
+    // -- App context for event handlers ----------------------------------------
+    var ctx = AppContext{
+        .provider = &provider,
+        .registry = &registry,
+        .session_mgr = &session_mgr,
+        .allocator = allocator,
+        .lua_engine = if (lua_engine) |*eng| eng else null,
+        .screen_width = screen.width,
+        .screen_height = screen.height,
+    };
+
     // -- Initial render ------------------------------------------------------
     compositor.composite(&layout, .{
         .text = input_buf[0..input_len],
@@ -604,6 +612,8 @@ pub fn main() !void {
         if (resized) |new_size| {
             try screen.resize(new_size.cols, new_size.rows);
             layout.recalculate(new_size.cols, new_size.rows);
+            ctx.screen_width = new_size.cols;
+            ctx.screen_height = new_size.rows;
         }
 
         if (maybe_event == null and resized == null) {
@@ -653,20 +663,11 @@ pub fn main() !void {
                 try screen.resize(sz.cols, sz.rows);
                 term.size = .{ .rows = sz.rows, .cols = sz.cols };
                 layout.recalculate(sz.cols, sz.rows);
+                ctx.screen_width = sz.cols;
+                ctx.screen_height = sz.rows;
             } else {
                 const action = switch (event) {
-                    .key => |k| handleKey(
-                        k,
-                        &input_buf,
-                        &input_len,
-                        screen.width,
-                        screen.height,
-                        &provider,
-                        &registry,
-                        &session_mgr,
-                        allocator,
-                        if (lua_engine) |*eng| eng else null,
-                    ),
+                    .key => |k| handleKey(k, &input_buf, &input_len, &ctx),
                     else => Action.none,
                 };
                 if (action == .quit) running = false;
@@ -684,7 +685,7 @@ pub fn main() !void {
 
         // Redraw
         {
-            const focused = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
+            const focused = getFocusedConversation();
             const status = if (focused.isAgentRunning()) blk: {
                 const info = focused.lastInfo();
                 break :blk if (info.len > 0) info else "streaming...";
@@ -797,30 +798,4 @@ test "appendOutputText creates a status node" {
     try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, buffer.root_children.items[0].node_type);
     try std.testing.expectEqualStrings("hello world", buffer.root_children.items[0].content.items);
-}
-
-test "writeStr clips to screen width" {
-    const allocator = std.testing.allocator;
-    var screen = try Screen.init(allocator, 5, 1);
-    defer screen.deinit();
-
-    const end_col = screen.writeStr(0, 0, "hello world", .{}, .default);
-
-    // Should clip at width 5
-    try std.testing.expectEqual(@as(u16, 5), end_col);
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'o'), screen.getCellConst(0, 4).codepoint);
-}
-
-test "writeStr starts at offset column" {
-    const allocator = std.testing.allocator;
-    var screen = try Screen.init(allocator, 10, 1);
-    defer screen.deinit();
-
-    const end_col = screen.writeStr(0, 3, "ab", .{}, .default);
-
-    try std.testing.expectEqual(@as(u16, 5), end_col);
-    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 2).codepoint);
-    try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 3).codepoint);
-    try std.testing.expectEqual(@as(u21, 'b'), screen.getCellConst(0, 4).codepoint);
 }
