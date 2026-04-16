@@ -11,15 +11,14 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
 
-const system_prompt =
+const system_prompt_prefix =
     \\You are an expert coding assistant operating inside zag, a coding agent harness.
     \\You help users by reading files, executing commands, editing code, and writing new files.
     \\
     \\Available tools:
-    \\- read: Read file contents (truncated to 2000 lines by default)
-    \\- write: Create or overwrite files
-    \\- edit: Replace exact text in existing files (old_text must match once)
-    \\- bash: Execute shell commands (30s timeout by default)
+;
+
+const system_prompt_suffix =
     \\
     \\Guidelines:
     \\- Use bash for file operations like ls, rg, find
@@ -27,6 +26,26 @@ const system_prompt =
     \\- Show file paths clearly
     \\- Prefer editing over rewriting entire files
 ;
+
+/// Build the system prompt with tool descriptions from the registry.
+fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, system_prompt_prefix);
+
+    var it = registry.tools.valueIterator();
+    while (it.next()) |tool| {
+        try buf.appendSlice(allocator, "\n- ");
+        try buf.appendSlice(allocator, tool.definition.name);
+        try buf.appendSlice(allocator, ": ");
+        try buf.appendSlice(allocator, tool.definition.description);
+    }
+
+    try buf.appendSlice(allocator, system_prompt_suffix);
+
+    return buf.toOwnedSlice(allocator);
+}
 
 /// Runs the agent loop on a background thread using streaming.
 /// Pushes events to the provided queue and checks the cancel flag
@@ -60,6 +79,9 @@ fn runLoopStreamingInner(
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
 
+    const prompt = try buildSystemPrompt(registry, allocator);
+    defer allocator.free(prompt);
+
     thread_local_queue = queue;
     thread_local_allocator = allocator;
     defer {
@@ -74,7 +96,7 @@ fn runLoopStreamingInner(
 
         // Try streaming, fall back to non-streaming on error.
         const response = provider.callStreaming(
-            system_prompt,
+            prompt,
             messages.items,
             tool_defs,
             allocator,
@@ -83,7 +105,7 @@ fn runLoopStreamingInner(
         ) catch |streaming_err| blk: {
             log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
             const fallback = try provider.call(
-                system_prompt,
+                prompt,
                 messages.items,
                 tool_defs,
                 allocator,
