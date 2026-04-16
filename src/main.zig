@@ -17,6 +17,7 @@ const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
 const AgentThread = @import("AgentThread.zig");
+const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
@@ -456,6 +457,41 @@ pub fn main() !void {
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
 
+    // Initialize Lua plugin engine
+    var lua_engine: ?LuaEngine = blk: {
+        var eng = LuaEngine.init(allocator) catch |err| {
+            log.warn("lua init failed, plugins disabled: {}", .{err});
+            break :blk null;
+        };
+
+        // Set plugin search path to ~/.config/zag/lua/
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk eng;
+        defer allocator.free(home);
+        const lua_dir = std.fmt.allocPrint(allocator, "{s}/.config/zag/lua", .{home}) catch break :blk eng;
+        defer allocator.free(lua_dir);
+        eng.setPluginPath(lua_dir) catch |err| {
+            log.warn("failed to set lua plugin path: {}", .{err});
+        };
+
+        // Load config.lua
+        const config_path = std.fmt.allocPrint(allocator, "{s}/.config/zag/config.lua", .{home}) catch break :blk eng;
+        defer allocator.free(config_path);
+        eng.loadConfig(config_path) catch |err| {
+            switch (err) {
+                error.LuaFile => {}, // No config file, that's fine
+                else => log.warn("config.lua error, continuing without plugins: {}", .{err}),
+            }
+        };
+
+        // Register Lua tools into the registry
+        eng.registerTools(&registry) catch |err| {
+            log.warn("failed to register lua tools: {}", .{err});
+        };
+
+        break :blk eng;
+    };
+    defer if (lua_engine) |*eng| eng.deinit();
+
     // Parse CLI args to decide startup mode
     const startup_mode = parseStartupArgs(allocator) catch .new_session;
 
@@ -764,6 +800,7 @@ pub fn main() !void {
                                             allocator,
                                             &event_queue,
                                             &cancel_flag,
+                                            if (lua_engine) |*eng| eng else null,
                                         ) catch |err| blk: {
                                             _ = active_buf.appendNode(null, .err, @errorName(err)) catch {};
                                             event_queue.deinit();
@@ -978,6 +1015,7 @@ test "imports compile" {
     _ = @import("Session.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/openai.zig");
+    _ = @import("LuaEngine.zig");
 }
 
 test "inputAppendChar adds character" {
