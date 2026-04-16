@@ -18,6 +18,7 @@ const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
 const AgentThread = @import("AgentThread.zig");
+const Session = @import("Session.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
 
@@ -228,9 +229,14 @@ pub fn main() !void {
 
     // When metrics are enabled, wrap the GPA with a counting allocator
     // to track allocations per frame.
-    var counting: if (build_options.metrics) trace.CountingAllocator else void =
-        if (build_options.metrics) .{ .inner = gpa.allocator() } else {};
-    const allocator = if (build_options.metrics) counting.allocator() else gpa.allocator();
+    var counting = if (build_options.metrics)
+        trace.CountingAllocator{ .inner = gpa.allocator() }
+    else {};
+
+    const allocator = if (build_options.metrics)
+        counting.allocator()
+    else
+        gpa.allocator();
 
     // Module-level buffer and renderer
     buffer_alloc = allocator;
@@ -271,6 +277,25 @@ pub fn main() !void {
     // Initialize tool registry
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
+
+    // Initialize session persistence
+    var session_mgr = Session.SessionManager.init(allocator) catch |err| blk: {
+        log.warn("session init failed, persistence disabled: {}", .{err});
+        break :blk null;
+    };
+    var session_handle: ?Session.SessionHandle = if (session_mgr) |*mgr|
+        mgr.createSession(model_str) catch |err| blk: {
+            log.warn("session creation failed: {}", .{err});
+            break :blk null;
+        }
+    else
+        null;
+    defer if (session_handle) |*sh| sh.close();
+
+    // Attach session to the initial buffer
+    if (session_handle != null) {
+        buffer.session_handle = &(session_handle.?);
+    }
 
     // -- Enter TUI mode ------------------------------------------------------
     var term = Terminal.init() catch |err| {
@@ -538,6 +563,15 @@ pub fn main() !void {
                                     // Show user message in buffer
                                     _ = try active_buf.appendNode(null, .user_message, user_input);
 
+                                    // Persist user message to session JSONL
+                                    if (active_buf.session_handle) |sh| {
+                                        sh.appendEntry(.{
+                                            .entry_type = .user_message,
+                                            .content = user_input,
+                                            .timestamp = std.time.milliTimestamp(),
+                                        }) catch {};
+                                    }
+
                                     // Clear input and reset streaming state
                                     input_len = 0;
                                     active_buf.current_assistant_node = null;
@@ -622,19 +656,48 @@ pub fn main() !void {
                         } else {
                             active_buf.current_assistant_node = active_buf.appendNode(null, .assistant_text, text) catch null;
                         }
+                        if (active_buf.session_handle) |sh| {
+                            sh.appendEntry(.{
+                                .entry_type = .assistant_text,
+                                .content = text,
+                                .timestamp = std.time.milliTimestamp(),
+                            }) catch {};
+                        }
                     },
                     .tool_start => |name| {
                         defer allocator.free(name);
                         active_buf.current_assistant_node = null;
                         active_buf.last_tool_call = active_buf.appendNode(null, .tool_call, name) catch null;
+                        if (active_buf.session_handle) |sh| {
+                            sh.appendEntry(.{
+                                .entry_type = .tool_call,
+                                .tool_name = name,
+                                .timestamp = std.time.milliTimestamp(),
+                            }) catch {};
+                        }
                     },
                     .tool_result => |result| {
                         defer allocator.free(result.content);
                         _ = active_buf.appendNode(active_buf.last_tool_call, .tool_result, result.content) catch {};
+                        if (active_buf.session_handle) |sh| {
+                            sh.appendEntry(.{
+                                .entry_type = .tool_result,
+                                .content = result.content,
+                                .is_error = result.is_error,
+                                .timestamp = std.time.milliTimestamp(),
+                            }) catch {};
+                        }
                     },
                     .info => |text| {
                         defer allocator.free(text);
                         _ = active_buf.appendNode(null, .status, text) catch {};
+                        if (active_buf.session_handle) |sh| {
+                            sh.appendEntry(.{
+                                .entry_type = .info,
+                                .content = text,
+                                .timestamp = std.time.milliTimestamp(),
+                            }) catch {};
+                        }
                     },
                     .done => {
                         if (agent_thread) |t| t.join();
@@ -646,6 +709,13 @@ pub fn main() !void {
                     .err => |text| {
                         defer allocator.free(text);
                         _ = active_buf.appendNode(null, .err, text) catch {};
+                        if (active_buf.session_handle) |sh| {
+                            sh.appendEntry(.{
+                                .entry_type = .err,
+                                .content = text,
+                                .timestamp = std.time.milliTimestamp(),
+                            }) catch {};
+                        }
                     },
                 }
             }
