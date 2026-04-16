@@ -10,6 +10,7 @@ const llm = @import("llm.zig");
 const types = @import("types.zig");
 const tools = @import("tools.zig");
 const agent = @import("agent.zig");
+const LuaEngineModule = @import("LuaEngine.zig");
 
 const AgentThread = @This();
 
@@ -106,6 +107,7 @@ pub fn spawn(
     allocator: Allocator,
     queue: *EventQueue,
     cancel: *CancelFlag,
+    lua_engine: ?*LuaEngineModule.LuaEngine,
 ) !std.Thread {
     return try std.Thread.spawn(.{}, threadMain, .{
         provider,
@@ -114,6 +116,7 @@ pub fn spawn(
         allocator,
         queue,
         cancel,
+        lua_engine,
     });
 }
 
@@ -125,7 +128,9 @@ fn threadMain(
     allocator: Allocator,
     queue: *EventQueue,
     cancel: *CancelFlag,
+    lua_engine: ?*LuaEngineModule.LuaEngine,
 ) void {
+    if (lua_engine) |eng| eng.activate();
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel);
 }
 

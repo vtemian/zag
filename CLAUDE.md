@@ -20,6 +20,12 @@ zig build run -- --last           # resume most recent session
 
 Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` depending on provider.
 
+Dependencies: ziglua (Lua 5.4, compiled from source).
+
+# Plugin config
+~/.config/zag/config.lua     # User configuration (optional)
+~/.config/zag/lua/           # Plugin modules loaded via require()
+
 ## Zig coding standards (learned from Ghostty)
 
 ### File naming
@@ -125,6 +131,7 @@ src/
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   AgentThread.zig   background agent thread with event queue
   Session.zig       JSONL session persistence and management
+  LuaEngine.zig     Lua plugin engine (config loading, tool bridging)
   Buffer.zig        runtime-polymorphic buffer interface (ptr+vtable)
   ConversationBuffer.zig  conversation buffer (node tree, session, messages)
   MarkdownParser.zig line-by-line markdown to StyledLine converter
