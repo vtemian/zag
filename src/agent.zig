@@ -165,64 +165,71 @@ const ToolCallContext = struct {
     results: []ToolCallResult,
 };
 
-/// Thread entry point for parallel tool execution. Returns void
-/// because Zig thread functions cannot propagate errors. All errors
-/// are caught internally and written as error results to the slot.
-fn executeOneToolCall(ctx: *const ToolCallContext) void {
-    if (ctx.cancel.load(.acquire)) {
-        ctx.results[ctx.index] = .{ .content = "error: cancelled", .is_error = true };
-        return;
+/// Run one tool call's full pipeline: check cancel, push tool_start,
+/// execute the tool, push tool_result. Tool execution errors are captured
+/// as error results; infrastructure failures (cancel, OOM, queue push)
+/// are returned as errors for the caller to handle.
+fn runToolStep(
+    tc: types.ContentBlock.ToolUse,
+    registry: *const tools.Registry,
+    allocator: Allocator,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) !ToolCallResult {
+    if (cancel.load(.acquire)) return error.Cancelled;
+
+    log.info("executing tool: {s}", .{tc.name});
+
+    {
+        const start_name = try allocator.dupe(u8, tc.name);
+        errdefer allocator.free(start_name);
+        const start_id = try allocator.dupe(u8, tc.id);
+        errdefer allocator.free(start_id);
+        try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
     }
 
-    const name_dupe = ctx.allocator.dupe(u8, ctx.tool_call.name) catch {
-        ctx.results[ctx.index] = .{ .content = "error: out of memory", .is_error = true };
-        return;
+    const step: ToolCallResult = blk: {
+        if (registry.execute(tc.name, tc.input_raw, allocator)) |ok| {
+            break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
+        } else |err| {
+            const msg = try std.fmt.allocPrint(allocator, "error: tool execution failed: {s}", .{@errorName(err)});
+            break :blk .{ .content = msg, .is_error = true, .owned = true };
+        }
     };
-    const start_id = ctx.allocator.dupe(u8, ctx.tool_call.id) catch {
-        ctx.allocator.free(name_dupe);
-        ctx.results[ctx.index] = .{ .content = "error: out of memory", .is_error = true };
-        return;
-    };
-    ctx.queue.push(.{ .tool_start = .{ .name = name_dupe, .call_id = start_id } }) catch {};
+    errdefer if (step.owned) allocator.free(step.content);
 
-    const result = ctx.registry.execute(ctx.tool_call.name, ctx.tool_call.input_raw, ctx.allocator) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "error: tool execution failed: {s}", .{@errorName(err)}) catch {
-            ctx.results[ctx.index] = .{ .content = "error: tool execution failed", .is_error = true };
-            return;
-        };
-        ctx.results[ctx.index] = .{ .content = msg, .is_error = true, .owned = true };
-        // Push error to queue
-        const q_dupe = ctx.allocator.dupe(u8, msg) catch return;
-        const err_id = ctx.allocator.dupe(u8, ctx.tool_call.id) catch return;
-        ctx.queue.push(.{ .tool_result = .{ .content = q_dupe, .is_error = true, .call_id = err_id } }) catch {};
-        return;
-    };
+    const result_content = try allocator.dupe(u8, step.content);
+    errdefer allocator.free(result_content);
+    const result_id = try allocator.dupe(u8, tc.id);
+    errdefer allocator.free(result_id);
+    try queue.push(.{ .tool_result = .{
+        .content = result_content,
+        .is_error = step.is_error,
+        .call_id = result_id,
+    } });
 
-    // Push to UI queue (queue consumer frees)
-    const q_content = ctx.allocator.dupe(u8, result.content) catch {
-        ctx.results[ctx.index] = .{
-            .content = result.content,
-            .is_error = result.is_error,
-            .owned = result.owned,
-        };
-        return;
-    };
-    const result_id = ctx.allocator.dupe(u8, ctx.tool_call.id) catch {
-        ctx.allocator.free(q_content);
-        ctx.results[ctx.index] = .{
-            .content = result.content,
-            .is_error = result.is_error,
-            .owned = result.owned,
-        };
-        return;
-    };
-    ctx.queue.push(.{ .tool_result = .{ .content = q_content, .is_error = result.is_error, .call_id = result_id } }) catch {};
+    return step;
+}
 
-    ctx.results[ctx.index] = .{
-        .content = result.content,
-        .is_error = result.is_error,
-        .owned = result.owned,
+/// Thread entry point for parallel tool execution. Returns void because
+/// Zig thread functions cannot propagate errors; infrastructure failures
+/// are captured as error results so the turn can still complete.
+fn executeOneToolCall(ctx: *const ToolCallContext) void {
+    const step = runToolStep(
+        ctx.tool_call,
+        ctx.registry,
+        ctx.allocator,
+        ctx.queue,
+        ctx.cancel,
+    ) catch |err| {
+        const msg = switch (err) {
+            error.Cancelled => "error: cancelled",
+            error.OutOfMemory => "error: out of memory",
+        };
+        ctx.results[ctx.index] = .{ .content = msg, .is_error = true };
+        return;
     };
+    ctx.results[ctx.index] = step;
 }
 
 /// Execute each tool call, pushing events to the queue, and return
@@ -316,26 +323,11 @@ fn executeToolsSingle(
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
 ) ![]types.ContentBlock {
-    if (cancel.load(.acquire)) return error.Cancelled;
+    const step = try runToolStep(tc, registry, allocator, queue, cancel);
+    defer if (step.owned) allocator.free(step.content);
 
-    log.info("executing tool: {s}", .{tc.name});
-    try queue.push(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, tc.name),
-        .call_id = try allocator.dupe(u8, tc.id),
-    } });
-
-    const result = try registry.execute(tc.name, tc.input_raw, allocator);
-    defer if (result.owned) allocator.free(result.content);
-
-    // Push to UI queue (queue consumer frees)
-    try queue.push(.{ .tool_result = .{
-        .content = try allocator.dupe(u8, result.content),
-        .is_error = result.is_error,
-        .call_id = try allocator.dupe(u8, tc.id),
-    } });
-
-    // Separate copy for conversation history (Message owns these)
-    const msg_content = try allocator.dupe(u8, result.content);
+    // Separate copy for conversation history (Message owns these).
+    const msg_content = try allocator.dupe(u8, step.content);
     errdefer allocator.free(msg_content);
     const msg_id = try allocator.dupe(u8, tc.id);
     errdefer allocator.free(msg_id);
@@ -344,9 +336,8 @@ fn executeToolsSingle(
     result_blocks[0] = .{ .tool_result = .{
         .tool_use_id = msg_id,
         .content = msg_content,
-        .is_error = result.is_error,
+        .is_error = step.is_error,
     } };
-
     return result_blocks;
 }
 
