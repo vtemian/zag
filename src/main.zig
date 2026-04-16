@@ -439,7 +439,7 @@ pub fn main() !void {
     }
 
     // Create LLM provider from ZAG_MODEL env var
-    var provider_result = llm.createProviderFromEnv(allocator) catch |err| {
+    var provider = llm.createProviderFromEnv(allocator) catch |err| {
         const stderr = std.fs.File.stderr();
         var scratch: [256]u8 = undefined;
         var w = stderr.writer(&scratch);
@@ -447,7 +447,7 @@ pub fn main() !void {
         w.interface.flush() catch {};
         return;
     };
-    defer provider_result.deinit();
+    defer provider.deinit();
 
     // Initialize tool registry
     var registry = try tools.createDefaultRegistry(allocator);
@@ -518,7 +518,7 @@ pub fn main() !void {
         if (session_mgr) |*mgr| {
             break :blk mgr.loadSession(id) catch |err| inner: {
                 log.warn("session load failed, starting new: {}", .{err});
-                break :inner mgr.createSession(provider_result.model_id) catch |err2| {
+                break :inner mgr.createSession(provider.model_id) catch |err2| {
                     log.warn("session creation fallback failed: {}", .{err2});
                     break :inner null;
                 };
@@ -526,7 +526,7 @@ pub fn main() !void {
         }
         break :blk null;
     } else if (session_mgr) |*mgr|
-        mgr.createSession(provider_result.model_id) catch |err| blk: {
+        mgr.createSession(provider.model_id) catch |err| blk: {
             log.warn("session creation failed: {}", .{err});
             break :blk null;
         }
@@ -616,7 +616,7 @@ pub fn main() !void {
         try appendOutputText("Welcome to zag - a composable agent environment");
         {
             var scratch: [128]u8 = undefined;
-            const model_msg = std.fmt.bufPrint(&scratch, "model: {s}", .{provider_result.model_id}) catch "model: unknown";
+            const model_msg = std.fmt.bufPrint(&scratch, "model: {s}", .{provider.model_id}) catch "model: unknown";
             try appendOutputText(model_msg);
         }
         try appendOutputText("cwd: ");
@@ -713,8 +713,8 @@ pub fn main() !void {
                         awaiting_window_cmd = false;
                         switch (k.key) {
                             .char => |ch| switch (ch) {
-                                'v' => doSplit(.vertical, &session_mgr, provider_result.model_id, allocator, screen.width, screen.height),
-                                's' => doSplit(.horizontal, &session_mgr, provider_result.model_id, allocator, screen.width, screen.height),
+                                'v' => doSplit(.vertical, &session_mgr, provider.model_id, allocator, screen.width, screen.height),
+                                's' => doSplit(.horizontal, &session_mgr, provider.model_id, allocator, screen.width, screen.height),
                                 'q' => {
                                     // Close window
                                     layout.closeWindow();
@@ -756,7 +756,7 @@ pub fn main() !void {
 
                                 const user_input = input_buf[0..input_len];
 
-                                switch (handleCommand(user_input, provider_result.model_id)) {
+                                switch (handleCommand(user_input, provider.model_id)) {
                                     .quit => {
                                         running = false;
                                         continue;
@@ -790,7 +790,7 @@ pub fn main() !void {
 
                                         event_queue = AgentThread.EventQueue.init(allocator);
                                         agent_thread = AgentThread.spawn(
-                                            provider_result.provider,
+                                            provider.provider,
                                             &active_buf.messages,
                                             &registry,
                                             allocator,
@@ -914,7 +914,7 @@ pub fn main() !void {
                         // Auto-name session after first exchange
                         if (active_buf.session_handle) |sh| {
                             if (sh.meta.name_len == 0 and active_buf.messages.items.len >= 2) {
-                                autoNameSession(sh, active_buf, provider_result.provider, allocator);
+                                autoNameSession(sh, active_buf, provider.provider, allocator);
                             }
                         }
                     },
