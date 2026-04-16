@@ -518,6 +518,7 @@ const vtable: Buffer.VTable = .{
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
+    .lineCount = bufLineCount,
 };
 
 fn bufGetVisibleLines(ptr: *anyopaque, allocator: Allocator, theme: *const Theme) anyerror!std.ArrayList(Theme.StyledLine) {
@@ -543,6 +544,11 @@ fn bufGetScrollOffset(ptr: *anyopaque) u32 {
 fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     self.scroll_offset = offset;
+}
+
+fn bufLineCount(ptr: *anyopaque) anyerror!usize {
+    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return self.lineCount();
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -617,4 +623,19 @@ test "fromBuffer roundtrips correctly" {
     const b = cb.buf();
     const recovered = ConversationBuffer.fromBuffer(b);
     try std.testing.expectEqual(&cb, recovered);
+}
+
+test "buffer interface returns line count" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "lc-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+    _ = try cb.appendNode(null, .separator, "");
+    _ = try cb.appendNode(null, .user_message, "line1\nline2");
+
+    const b = cb.buf();
+    // user_message "hello" = 1 line, separator = 1 line, user_message "line1\nline2" = 2 lines
+    const count = try b.lineCount();
+    try std.testing.expectEqual(@as(usize, 4), count);
 }
