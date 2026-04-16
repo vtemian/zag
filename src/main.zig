@@ -439,10 +439,21 @@ pub fn main() !void {
 
     // Read model string and create provider
     const model_str = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
-        try allocator.dupe(u8, "anthropic:claude-sonnet-4-20250514");
+        try allocator.dupe(u8, "anthropic/claude-sonnet-4-20250514");
     defer allocator.free(model_str);
 
-    var provider_result = llm.createProvider(model_str, allocator) catch |err| {
+    // Initialize endpoint registry
+    var endpoint_registry = llm.Registry.init(allocator) catch {
+        const stderr = std.fs.File.stderr();
+        var err_buf: [256]u8 = undefined;
+        var w = stderr.writer(&err_buf);
+        w.interface.print("error: failed to initialize endpoint registry\n", .{}) catch {};
+        w.interface.flush() catch {};
+        return;
+    };
+    defer endpoint_registry.deinit();
+
+    var provider_result = llm.createProvider(&endpoint_registry, model_str, allocator) catch |err| {
         const stderr = std.fs.File.stderr();
         var err_buf: [256]u8 = undefined;
         var w = stderr.writer(&err_buf);
