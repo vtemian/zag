@@ -761,83 +761,27 @@ pub fn main() !void {
         // Drain agent events into the focused buffer
         if (agent_thread != null) {
             const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
-            var event_buf: [64]AgentThread.AgentEvent = undefined;
-            const count = event_queue.drain(&event_buf);
+            var drain_buf: [64]AgentThread.AgentEvent = undefined;
+            const count = event_queue.drain(&drain_buf);
 
-            for (event_buf[0..count]) |agent_event| {
-                // Auto-scroll to bottom when new content arrives
+            for (drain_buf[0..count]) |agent_event| {
                 active_buf.scroll_offset = 0;
+                active_buf.handleAgentEvent(agent_event, allocator);
 
-                switch (agent_event) {
-                    .text_delta => |text| {
-                        defer allocator.free(text);
-                        if (active_buf.current_assistant_node) |node| {
-                            active_buf.appendToNode(node, text) catch {};
-                        } else {
-                            active_buf.current_assistant_node = active_buf.appendNode(null, .assistant_text, text) catch null;
-                        }
-                        active_buf.persistEvent(.{
-                            .entry_type = .assistant_text,
-                            .content = text,
-                            .timestamp = std.time.milliTimestamp(),
-                        });
-                    },
-                    .tool_start => |name| {
-                        defer allocator.free(name);
-                        active_buf.current_assistant_node = null;
-                        active_buf.last_tool_call = active_buf.appendNode(null, .tool_call, name) catch null;
-                        active_buf.persistEvent(.{
-                            .entry_type = .tool_call,
-                            .tool_name = name,
-                            .timestamp = std.time.milliTimestamp(),
-                        });
-                    },
-                    .tool_result => |result| {
-                        defer allocator.free(result.content);
-                        _ = active_buf.appendNode(active_buf.last_tool_call, .tool_result, result.content) catch {};
-                        active_buf.persistEvent(.{
-                            .entry_type = .tool_result,
-                            .content = result.content,
-                            .is_error = result.is_error,
-                            .timestamp = std.time.milliTimestamp(),
-                        });
-                    },
-                    .info => |text| {
-                        defer allocator.free(text);
-                        _ = active_buf.appendNode(null, .status, text) catch {};
-                        active_buf.persistEvent(.{
-                            .entry_type = .info,
-                            .content = text,
-                            .timestamp = std.time.milliTimestamp(),
-                        });
-                    },
-                    .done => {
-                        if (agent_thread) |t| t.join();
-                        agent_thread = null;
-                        event_queue.deinit();
-                        status_msg = "";
-                        active_buf.current_assistant_node = null;
+                if (agent_event == .done) {
+                    if (agent_thread) |t| t.join();
+                    agent_thread = null;
+                    event_queue.deinit();
+                    status_msg = "";
 
-                        // Auto-name session after first exchange
-                        if (active_buf.session_handle) |sh| {
-                            if (sh.meta.name_len == 0 and active_buf.messages.items.len >= 2) {
-                                autoNameSession(sh, active_buf, provider.provider, allocator);
-                            }
+                    if (active_buf.session_handle) |sh| {
+                        if (sh.meta.name_len == 0 and active_buf.messages.items.len >= 2) {
+                            autoNameSession(sh, active_buf, provider.provider, allocator);
                         }
-                    },
-                    .err => |text| {
-                        defer allocator.free(text);
-                        _ = active_buf.appendNode(null, .err, text) catch {};
-                        active_buf.persistEvent(.{
-                            .entry_type = .err,
-                            .content = text,
-                            .timestamp = std.time.milliTimestamp(),
-                        });
-                    },
+                    }
                 }
             }
 
-            // Animate spinner while agent is running
             if (agent_thread != null) {
                 spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
             }
