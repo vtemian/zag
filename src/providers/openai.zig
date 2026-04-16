@@ -13,17 +13,16 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.openai);
 
-const default_base_url = "https://api.openai.com/v1/chat/completions";
 const default_max_tokens = 8192;
 
 /// OpenAI Chat Completions serializer state.
 pub const OpenAiSerializer = struct {
+    /// Endpoint connection details (URL, auth, headers).
+    endpoint: *const llm.Endpoint,
     /// API key for Bearer authentication.
     api_key: []const u8,
     /// Model identifier (e.g., "gpt-4o", "gpt-4o-mini").
     model: []const u8,
-    /// API endpoint URL. Defaults to OpenAI's endpoint; override for compatible APIs.
-    base_url: []const u8,
 
     const vtable: Provider.VTable = .{
         .call = callImpl,
@@ -31,7 +30,6 @@ pub const OpenAiSerializer = struct {
         .name = "openai",
     };
 
-    /// Create a Provider interface from this OpenAI provider.
     pub fn provider(self: *OpenAiSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -48,12 +46,10 @@ pub const OpenAiSerializer = struct {
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
-        defer allocator.free(auth_value);
+        var headers = try llm.buildHeaders(self.endpoint, self.api_key, allocator);
+        defer llm.freeHeaders(self.endpoint, &headers, allocator);
 
-        const response_bytes = try llm.httpPostJson(self.base_url, body, &.{
-            .{ .name = "Authorization", .value = auth_value },
-        }, allocator);
+        const response_bytes = try llm.httpPostJson(self.endpoint.url, body, headers.items, allocator);
         defer allocator.free(response_bytes);
 
         return parseResponse(response_bytes, allocator);
@@ -73,14 +69,10 @@ pub const OpenAiSerializer = struct {
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.api_key});
-        defer allocator.free(auth_value);
+        var headers = try llm.buildHeaders(self.endpoint, self.api_key, allocator);
+        defer llm.freeHeaders(self.endpoint, &headers, allocator);
 
-        // Open an incremental streaming connection. SSE events are read
-        // and dispatched as tokens arrive from the network.
-        const stream = try llm.StreamingResponse.create(self.base_url, body, &.{
-            .{ .name = "Authorization", .value = auth_value },
-        }, allocator);
+        const stream = try llm.StreamingResponse.create(self.endpoint.url, body, headers.items, allocator);
         defer stream.destroy();
 
         return parseSseStream(stream, allocator, on_event, cancel);

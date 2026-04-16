@@ -11,12 +11,12 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.anthropic);
 
-const api_url = "https://api.anthropic.com/v1/messages";
-const api_version = "2023-06-01";
 const default_max_tokens = 8192;
 
 /// Anthropic serializer state.
 pub const AnthropicSerializer = struct {
+    /// Endpoint connection details (URL, auth, headers).
+    endpoint: *const llm.Endpoint,
     /// API key for authentication.
     api_key: []const u8,
     /// Model identifier (e.g., "claude-sonnet-4-20250514").
@@ -28,7 +28,6 @@ pub const AnthropicSerializer = struct {
         .name = "anthropic",
     };
 
-    /// Create a Provider interface from this Anthropic provider.
     pub fn provider(self: *AnthropicSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -45,10 +44,10 @@ pub const AnthropicSerializer = struct {
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        const response_bytes = try llm.httpPostJson(api_url, body, &.{
-            .{ .name = "x-api-key", .value = self.api_key },
-            .{ .name = "anthropic-version", .value = api_version },
-        }, allocator);
+        var headers = try llm.buildHeaders(self.endpoint, self.api_key, allocator);
+        defer llm.freeHeaders(self.endpoint, &headers, allocator);
+
+        const response_bytes = try llm.httpPostJson(self.endpoint.url, body, headers.items, allocator);
         defer allocator.free(response_bytes);
 
         return parseResponse(response_bytes, allocator);
@@ -68,12 +67,10 @@ pub const AnthropicSerializer = struct {
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
         defer allocator.free(body);
 
-        // Open an incremental streaming connection. SSE events are read
-        // and dispatched as tokens arrive from the network.
-        const stream = try llm.StreamingResponse.create(api_url, body, &.{
-            .{ .name = "x-api-key", .value = self.api_key },
-            .{ .name = "anthropic-version", .value = api_version },
-        }, allocator);
+        var headers = try llm.buildHeaders(self.endpoint, self.api_key, allocator);
+        defer llm.freeHeaders(self.endpoint, &headers, allocator);
+
+        const stream = try llm.StreamingResponse.create(self.endpoint.url, body, headers.items, allocator);
         defer stream.destroy();
 
         return parseSseStream(stream, allocator, on_event, cancel);
