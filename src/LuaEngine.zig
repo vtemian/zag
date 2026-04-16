@@ -1056,3 +1056,50 @@ test "end-to-end: config file to registry execution" {
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("7", result.content);
 }
+
+test "fireHook applies veto" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", { pattern = "bash" }, function(evt)
+        \\  return { cancel = true, reason = "no rm" }
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "id1",
+        .args_json = "{\"command\":\"rm -rf /\"}",
+        .args_rewrite = null,
+    } };
+    try engine.fireHook(&payload);
+    const reason = engine.takeCancel();
+    try std.testing.expect(reason != null);
+    defer std.testing.allocator.free(reason.?);
+    try std.testing.expectEqualStrings("no rm", reason.?);
+}
+
+test "fireHook applies args rewrite" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", function(evt)
+        \\  return { args = { command = "echo safe" } }
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "id1",
+        .args_json = "{\"command\":\"ls\"}",
+        .args_rewrite = null,
+    } };
+    try engine.fireHook(&payload);
+    try std.testing.expect(payload.tool_pre.args_rewrite != null);
+    defer std.testing.allocator.free(payload.tool_pre.args_rewrite.?);
+    try std.testing.expect(std.mem.indexOf(u8, payload.tool_pre.args_rewrite.?, "echo safe") != null);
+}
