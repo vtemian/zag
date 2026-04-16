@@ -42,6 +42,7 @@ pub fn parseEventName(name: []const u8) ?EventKind {
 /// Match a pattern against an event-specific key (typically a tool name).
 /// - null or "*": always matches
 /// - "a,b,c": matches any comma-separated item (trimmed of spaces)
+/// - "" (empty string): matches nothing
 /// - otherwise: exact match
 pub fn matchesPattern(pattern: ?[]const u8, key: []const u8) bool {
     const p = pattern orelse return true;
@@ -64,8 +65,10 @@ pub const HookPayload = union(EventKind) {
         call_id: []const u8,
         /// JSON serialization of the tool args. Read-only.
         args_json: []const u8,
-        /// If a hook rewrites args, main thread allocates a new JSON
-        /// string here using the request's arena allocator.
+        /// Rewrite slot. If a hook returns `{ args = ... }`, the main
+        /// thread populates this with a freshly allocated JSON string
+        /// using the Registry allocator. The caller of `fireHook` takes
+        /// ownership and must free after use.
         args_rewrite: ?[]const u8,
     },
     tool_post: struct {
@@ -74,7 +77,8 @@ pub const HookPayload = union(EventKind) {
         content: []const u8,
         is_error: bool,
         duration_ms: u64,
-        /// Rewrite slots, main thread owns if set.
+        /// Rewrite slots. If set, populated by main thread using the
+        /// Registry allocator; caller of `fireHook` owns and frees.
         content_rewrite: ?[]const u8,
         is_error_rewrite: ?bool,
     },
@@ -87,7 +91,8 @@ pub const HookPayload = union(EventKind) {
     },
     user_message_pre: struct {
         text: []const u8,
-        /// Rewrite slot.
+        /// Rewrite slot. Populated by main thread using the Registry
+        /// allocator; caller of `fireHook` owns and frees.
         text_rewrite: ?[]const u8,
     },
     user_message_post: struct { text: []const u8 },
@@ -108,8 +113,9 @@ pub const HookRequest = struct {
     payload: *HookPayload,
     done: std.Thread.ResetEvent,
     cancelled: bool,
-    /// If cancelled, the (optional) reason string. Owned by the
-    /// main thread (duped from Lua); caller frees after reading.
+    /// If cancelled, the (optional) reason string. Written by the main
+    /// thread before `done` is signalled; the thread that pushed the
+    /// request owns it and must free after `done.wait()` returns.
     cancel_reason: ?[]const u8,
 
     pub fn init(payload: *HookPayload) HookRequest {
@@ -194,6 +200,9 @@ pub const Registry = struct {
     }
 
     /// Remove a hook by id. Returns true if found.
+    /// Does not unref the `lua_ref`. Lua callers should call
+    /// `lua.unref(registry_index, hook.lua_ref)` before invoking this,
+    /// otherwise the Lua callback leaks in the VM registry.
     pub fn unregister(self: *Registry, id: u32) bool {
         for (self.hooks.items, 0..) |h, i| {
             if (h.id == id) {
