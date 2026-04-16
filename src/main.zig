@@ -431,6 +431,19 @@ fn doSplit(direction: Layout.SplitDirection, ctx: *const AppContext) void {
     compositor.layout_dirty = true;
 }
 
+/// Drain all pending bytes from the wake pipe. Called after poll() returns
+/// so a single wake-up corresponds to one main loop iteration regardless
+/// of how many bytes are queued.
+fn drainWakePipe(fd: std.posix.fd_t) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        _ = std.posix.read(fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return,
+        };
+    }
+}
+
 /// Top-level entry: initializes TUI, reads API key, runs the event loop.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -638,25 +651,28 @@ pub fn main() !void {
     try screen.render(stdout_file);
 
     while (running) {
-        // Poll for input (outside frame span, so sleep doesn't count)
+        // Block until stdin or the wake pipe has data. The wake pipe is
+        // written by agent threads on every EventQueue.push and by the
+        // SIGWINCH handler on terminal resize, so poll() returns exactly
+        // when there is real work to do. EINTR is retried internally.
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake_read, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        _ = std.posix.poll(&fds, -1) catch {};
+
+        // Drain stale wake bytes so one wake equals one frame regardless
+        // of how many events were pushed between polls.
+        if (fds[1].revents & std.posix.POLL.IN != 0) {
+            drainWakePipe(wake_read);
+        }
+
         const maybe_event = input.pollEvent(posix.STDIN_FILENO);
 
         // Check for terminal resize (SIGWINCH)
         const resized = term.checkResize();
         if (resized) |new_size| {
             try handleResize(&screen, &ctx, new_size.cols, new_size.rows);
-        }
-
-        if (maybe_event == null and resized == null) {
-            const any_running = buffer.isAgentRunning() or for (extra_panes.items) |pane| {
-                if (pane.buffer.isAgentRunning()) break true;
-            } else false;
-
-            if (!any_running) {
-                posix.nanosleep(0, 10 * std.time.ns_per_ms);
-                continue;
-            }
-            posix.nanosleep(0, 2 * std.time.ns_per_ms);
         }
 
         // Start frame timing (only for frames that do real work)
