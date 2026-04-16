@@ -182,6 +182,7 @@ fn createSplitPane(session_mgr: *?Session.SessionManager, model: []const u8, all
 
     cb.* = try ConversationBuffer.init(allocator, next_buffer_id, "scratch");
     errdefer cb.deinit();
+    std.debug.assert(wake_write >= 0);
     cb.wake_fd = wake_write;
 
     next_buffer_id += 1;
