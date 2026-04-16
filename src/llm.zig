@@ -12,6 +12,15 @@ pub const openai = @import("providers/openai.zig");
 
 const log = std.log.scoped(.llm);
 
+/// Hard cap on a single SSE line. Defends against hostile or broken endpoints
+/// that stream bytes without a newline, which would otherwise grow
+/// `pending_line` until the agent OOMs.
+const MAX_SSE_LINE: usize = 1 * 1024 * 1024; // 1 MiB
+
+/// Hard cap on the accumulated "data:" payload of a single SSE event, summed
+/// across all data lines before the dispatching blank line.
+const MAX_SSE_EVENT_DATA: usize = 4 * 1024 * 1024; // 4 MiB
+
 /// Streaming event emitted by call_streaming for incremental response delivery.
 /// Defined here (rather than in AgentThread) so the provider VTable can reference
 /// it without creating a circular dependency.
@@ -564,7 +573,7 @@ pub const StreamingResponse = struct {
         // First, consume any leftover bytes from a previous read.
         if (self.remainder.items.len > 0) {
             if (std.mem.indexOfScalar(u8, self.remainder.items, '\n')) |nl_pos| {
-                try self.pending_line.appendSlice(self.allocator, self.remainder.items[0..nl_pos]);
+                try self.appendToPendingLine(self.remainder.items[0..nl_pos]);
                 // Shift remainder forward past the newline.
                 const after = self.remainder.items[nl_pos + 1 ..];
                 std.mem.copyForwards(u8, self.remainder.items[0..after.len], after);
@@ -572,7 +581,7 @@ pub const StreamingResponse = struct {
                 return stripCr(self.pending_line.items);
             }
             // No newline in remainder; move it all to pending_line and continue reading.
-            try self.pending_line.appendSlice(self.allocator, self.remainder.items);
+            try self.appendToPendingLine(self.remainder.items);
             self.remainder.clearRetainingCapacity();
         }
 
@@ -589,17 +598,32 @@ pub const StreamingResponse = struct {
 
             const received = chunk[0..n];
             if (std.mem.indexOfScalar(u8, received, '\n')) |nl_pos| {
-                try self.pending_line.appendSlice(self.allocator, received[0..nl_pos]);
+                try self.appendToPendingLine(received[0..nl_pos]);
                 // Save everything after the newline for subsequent calls.
+                // Bounded by chunk.len (4096), but we bounds-check for shape
+                // consistency with the pending_line path.
                 if (nl_pos + 1 < n) {
+                    if (self.remainder.items.len + (n - nl_pos - 1) > MAX_SSE_LINE) {
+                        return error.SseLineTooLong;
+                    }
                     try self.remainder.appendSlice(self.allocator, received[nl_pos + 1 .. n]);
                 }
                 return stripCr(self.pending_line.items);
             }
 
             // No newline yet; accumulate and keep reading.
-            try self.pending_line.appendSlice(self.allocator, received);
+            try self.appendToPendingLine(received);
         }
+    }
+
+    /// Append bytes to `pending_line` with a hard cap. Returns SseLineTooLong
+    /// when the next append would push the line past MAX_SSE_LINE, which
+    /// defends against endpoints that stream bytes without a newline.
+    fn appendToPendingLine(self: *StreamingResponse, bytes: []const u8) !void {
+        if (self.pending_line.items.len + bytes.len > MAX_SSE_LINE) {
+            return error.SseLineTooLong;
+        }
+        try self.pending_line.appendSlice(self.allocator, bytes);
     }
 
     fn stripCr(line: []const u8) []const u8 {
@@ -674,9 +698,15 @@ pub const StreamingResponse = struct {
                 event_len = copy_len;
             } else if (std.mem.startsWith(u8, line, "data: ")) {
                 const val = line["data: ".len..];
+                if (event_data.items.len + val.len > MAX_SSE_EVENT_DATA) {
+                    return error.SseEventDataTooLarge;
+                }
                 try event_data.appendSlice(self.allocator, val);
             } else if (std.mem.startsWith(u8, line, "data:")) {
                 const val = line["data:".len..];
+                if (event_data.items.len + val.len > MAX_SSE_EVENT_DATA) {
+                    return error.SseEventDataTooLarge;
+                }
                 try event_data.appendSlice(self.allocator, val);
             }
         }
@@ -1086,4 +1116,80 @@ test "buildHeaders handles no-auth endpoint" {
     var headers = try buildHeaders(&endpoint, "", allocator);
     defer freeHeaders(&endpoint, &headers, allocator);
     try std.testing.expectEqual(@as(usize, 0), headers.items.len);
+}
+
+test "readLine caps pending_line at MAX_SSE_LINE" {
+    const allocator = std.testing.allocator;
+
+    // Unterminated line larger than the cap: a hostile endpoint that never
+    // sends '\n' would otherwise make pending_line grow without bound.
+    const hostile = try allocator.alloc(u8, MAX_SSE_LINE + 1024);
+    defer allocator.free(hostile);
+    @memset(hostile, 'x');
+
+    var fake = std.Io.Reader.fixed(hostile);
+
+    // Other StreamingResponse fields stay undefined because readLine only
+    // touches pending_line, remainder, body_reader, and allocator.
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    try std.testing.expectError(error.SseLineTooLong, sr.readLine());
+}
+
+test "nextSseEvent caps event_data at MAX_SSE_EVENT_DATA" {
+    const allocator = std.testing.allocator;
+
+    // Build a stream of many short "data:" lines that collectively exceed the
+    // event-data cap. Each line is well under MAX_SSE_LINE, but summed across
+    // them the accumulated data blows past MAX_SSE_EVENT_DATA.
+    const chunk_payload_len: usize = 4000;
+    const line_count: usize = (MAX_SSE_EVENT_DATA / chunk_payload_len) + 2;
+    const line_len = "data: ".len + chunk_payload_len + 1; // +1 for '\n'
+
+    const stream = try allocator.alloc(u8, line_count * line_len);
+    defer allocator.free(stream);
+
+    var cursor: usize = 0;
+    for (0..line_count) |_| {
+        @memcpy(stream[cursor .. cursor + "data: ".len], "data: ");
+        cursor += "data: ".len;
+        @memset(stream[cursor .. cursor + chunk_payload_len], 'y');
+        cursor += chunk_payload_len;
+        stream[cursor] = '\n';
+        cursor += 1;
+    }
+
+    var fake = std.Io.Reader.fixed(stream);
+
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var event_buf: [128]u8 = undefined;
+    var event_data: std.ArrayList(u8) = .empty;
+    defer event_data.deinit(allocator);
+
+    try std.testing.expectError(
+        error.SseEventDataTooLarge,
+        sr.nextSseEvent(&cancel, &event_buf, &event_data),
+    );
 }
