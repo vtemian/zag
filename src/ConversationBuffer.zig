@@ -15,6 +15,7 @@ const AgentThread = @import("AgentThread.zig");
 const llm = @import("llm.zig");
 const tools_mod = @import("tools.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const Hooks = @import("Hooks.zig");
 
 const ConversationBuffer = @This();
 
@@ -485,6 +486,10 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
+            if (self.lua_engine) |eng| {
+                var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text } };
+                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+            }
             if (self.current_assistant_node) |node| {
                 self.appendToNode(node, text) catch |err| {
                     log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
@@ -549,11 +554,19 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
             self.last_info_len = @intCast(len);
         },
         .done => {
+            if (self.lua_engine) |eng| {
+                var payload: Hooks.HookPayload = .{ .agent_done = {} };
+                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+            }
             self.current_assistant_node = null;
         },
         .reset_assistant_text => self.resetCurrentAssistantText(),
         .err => |text| {
             defer allocator.free(text);
+            if (self.lua_engine) |eng| {
+                var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
+                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+            }
             _ = self.appendNode(null, .err, text) catch {};
             self.persistEvent(.{
                 .entry_type = .err,
@@ -583,6 +596,11 @@ pub fn submitInput(
     const duped = try allocator.dupe(u8, text);
     content[0] = .{ .text = .{ .text = duped } };
     try self.messages.append(allocator, .{ .role = .user, .content = content });
+
+    if (lua_eng) |eng| {
+        var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = text } };
+        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+    }
 
     _ = try self.appendNode(null, .user_message, text);
 
@@ -1202,7 +1220,6 @@ test "text_delta after reset starts a fresh assistant node" {
 }
 
 test "dispatchHookRequests fires Lua hook and signals done" {
-    const Hooks = @import("Hooks.zig");
     const alloc = std.testing.allocator;
 
     var engine = try LuaEngine.init(alloc);
@@ -1225,5 +1242,26 @@ test "dispatchHookRequests fires Lua hook and signals done" {
     try std.testing.expect(req.done.isSet());
     _ = try engine.lua.getGlobal("last_turn");
     try std.testing.expectEqual(@as(i64, 7), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "text_delta fires post-hook with text" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.last_delta = nil
+        \\zag.hook("TextDelta", { enabled = true }, function(evt)
+        \\  _G.last_delta = evt.text
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = "chunk!" } };
+    try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("last_delta");
+    try std.testing.expectEqualStrings("chunk!", try engine.lua.toString(-1));
     engine.lua.pop(1);
 }
