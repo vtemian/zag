@@ -63,6 +63,9 @@ pub const EventQueue = struct {
     items: std.ArrayList(AgentEvent),
     /// Allocator for the backing list.
     allocator: Allocator,
+    /// Optional file descriptor to write 1 byte to after a successful push.
+    /// Used by the main loop to wake from poll() when new events arrive.
+    wake_fd: ?std.posix.fd_t = null,
 
     /// Create a new empty event queue.
     pub fn init(allocator: Allocator) EventQueue {
@@ -82,6 +85,12 @@ pub const EventQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.items.append(self.allocator, event);
+        // Signal the wake pipe if one is configured. Ignore errors: a full
+        // pipe means a wake is already pending, and any other error is
+        // non-fatal for event delivery.
+        if (self.wake_fd) |fd| {
+            _ = std.posix.write(fd, &[_]u8{1}) catch {};
+        }
     }
 
     /// Drain up to buf.len events into the provided buffer.
@@ -243,4 +252,38 @@ test "drain with small buffer returns partial" {
     const count2 = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 1), count2);
     try std.testing.expectEqualStrings("c", buf[0].text_delta);
+}
+
+test "push writes to wake_fd when set" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+
+    queue.wake_fd = fds[1];
+
+    try queue.push(.{ .text_delta = "hi" });
+
+    // Reading should yield 1 byte
+    var buf: [16]u8 = undefined;
+    const n = try std.posix.read(fds[0], &buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+
+    // Drain consumes the event
+    var drain_buf: [4]AgentEvent = undefined;
+    const count = queue.drain(&drain_buf);
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "push with null wake_fd skips the write" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+    // wake_fd defaults to null
+    try queue.push(.{ .text_delta = "hi" });
+
+    var buf: [4]AgentEvent = undefined;
+    const count = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
