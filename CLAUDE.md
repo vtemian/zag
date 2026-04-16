@@ -125,10 +125,11 @@ src/
   types.zig         Message, ContentBlock, ToolCall, ToolResult
   AgentThread.zig   background agent thread with event queue
   Session.zig       JSONL session persistence and management
-  Buffer.zig        structured node tree for content
+  Buffer.zig        runtime-polymorphic buffer interface (ptr+vtable)
+  ConversationBuffer.zig  conversation buffer (node tree, session, messages)
   MarkdownParser.zig line-by-line markdown to StyledLine converter
-  NodeRenderer.zig  type-specific node rendering
-  Layout.zig        binary tree window system (splits, tabs, focus)
+  NodeRenderer.zig  type-specific node rendering for ConversationBuffer
+  Layout.zig        binary tree window system (splits, focus)
   Theme.zig         design system (colors, highlights, spacing, borders)
   Metrics.zig       span-based performance tracing (compile-time toggle)
   Compositor.zig    merges buffer content into screen grid

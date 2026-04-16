@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
-const NodeRenderer = @import("NodeRenderer.zig");
+const ConversationBuffer = @import("ConversationBuffer.zig");
 const Theme = @import("Theme.zig");
 const trace = @import("Metrics.zig");
 
@@ -19,8 +19,6 @@ const Compositor = @This();
 screen: *Screen,
 /// Allocator for temporary allocations during compositing.
 allocator: Allocator,
-/// Renderer used to convert buffer nodes to display lines.
-renderer: *NodeRenderer,
 /// Design system for colors, highlights, spacing, and borders.
 theme: *const Theme,
 
@@ -83,12 +81,12 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
     const buf = leaf.buffer;
 
     var visible_lines_span = trace.span("get_visible_lines");
-    var lines = buf.getVisibleLines(self.allocator, self.renderer, self.theme) catch {
+    var lines = buf.getVisibleLines(self.allocator, self.theme) catch {
         visible_lines_span.end();
         return;
     };
     visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
-    defer NodeRenderer.freeStyledLines(&lines, self.allocator);
+    defer Theme.freeStyledLines(&lines, self.allocator);
 
     // Apply theme spacing for content offset within the rect
     const pad_h = self.theme.spacing.padding_h;
@@ -101,7 +99,7 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
     // Apply scroll offset: show lines from the end minus scroll_offset
     const total_lines = lines.items.len;
     const visible_rows = content_max_row -| content_y;
-    const scroll = buf.scroll_offset;
+    const scroll = buf.getScrollOffset();
 
     const visible_end = if (total_lines > scroll)
         total_lines - scroll
@@ -208,7 +206,7 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
     };
 
     var col: u16 = 1;
-    col = self.screen.writeStr(last_row, col, leaf.buffer.name, resolved.screen_style, resolved.fg);
+    col = self.screen.writeStr(last_row, col, leaf.buffer.getName(), resolved.screen_style, resolved.fg);
     col = self.screen.writeStr(last_row, col, " | ", resolved.screen_style, resolved.fg);
 
     // Show pane rect info
@@ -238,15 +236,11 @@ test "composite with empty layout does not crash" {
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
 
-    var renderer = NodeRenderer.initDefault();
-    defer renderer.deinit();
-
     const theme = Theme.defaultTheme();
 
     var compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
-        .renderer = &renderer,
         .theme = &theme,
     };
 
@@ -261,32 +255,25 @@ test "composite writes buffer content at leaf rect with padding" {
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
 
-    var renderer = NodeRenderer.initDefault();
-    defer renderer.deinit();
-
     const theme = Theme.defaultTheme();
 
     var compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
-        .renderer = &renderer,
         .theme = &theme,
     };
 
-    var buf = try Buffer.init(allocator, 0, "test");
-    defer buf.deinit();
-    _ = try buf.appendNode(null, .user_message, "hello");
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hello");
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
     compositor.composite(&layout);
 
-    // The rendered line for user_message "hello" is "> hello"
-    // With default padding_h=1, it starts at col 1 instead of col 0
-    // Content starts at row 0 (no tab bar)
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(0, pad_h).codepoint);
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, pad_h + 1).codepoint);
@@ -298,29 +285,24 @@ test "composite draws status line on last row" {
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
 
-    var renderer = NodeRenderer.initDefault();
-    defer renderer.deinit();
-
     const theme = Theme.defaultTheme();
 
     var compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
-        .renderer = &renderer,
         .theme = &theme,
     };
 
-    var buf = try Buffer.init(allocator, 0, "mybuf");
-    defer buf.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    defer cb.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(&buf);
+    try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
     compositor.composite(&layout);
 
-    // Buffer name "mybuf" should appear on the status line (row 9)
     try std.testing.expectEqual(@as(u21, 'm'), screen.getCellConst(9, 1).codepoint);
     try std.testing.expectEqual(@as(u21, 'y'), screen.getCellConst(9, 2).codepoint);
 }
@@ -330,38 +312,32 @@ test "composite draws vertical split border from theme" {
     var screen = try Screen.init(allocator, 40, 10);
     defer screen.deinit();
 
-    var renderer = NodeRenderer.initDefault();
-    defer renderer.deinit();
-
     const theme = Theme.defaultTheme();
 
     var compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
-        .renderer = &renderer,
         .theme = &theme,
     };
 
-    var buf1 = try Buffer.init(allocator, 0, "left");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "right");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    defer cb2.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(40, 10);
-    try layout.splitVertical(0.5, &buf2);
+    try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(40, 10);
 
     compositor.composite(&layout);
 
-    // The border column should be at the boundary between first and second leaves
     const root = layout.root.?;
     const first_rect = root.split.first.leaf.rect;
     const border_col = first_rect.x + first_rect.width;
 
-    // Border character should come from theme.borders.vertical
     const border_cell = screen.getCellConst(first_rect.y, border_col);
     try std.testing.expectEqual(theme.borders.vertical, border_cell.codepoint);
 }
@@ -371,33 +347,28 @@ test "composite draws horizontal split border" {
     var screen = try Screen.init(allocator, 40, 12);
     defer screen.deinit();
 
-    var renderer = NodeRenderer.initDefault();
-    defer renderer.deinit();
-
     const theme = Theme.defaultTheme();
 
     var compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
-        .renderer = &renderer,
         .theme = &theme,
     };
 
-    var buf1 = try Buffer.init(allocator, 0, "top");
-    defer buf1.deinit();
-    var buf2 = try Buffer.init(allocator, 1, "bottom");
-    defer buf2.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
+    defer cb2.deinit();
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(&buf1);
+    try layout.setRoot(cb1.buf());
     layout.recalculate(40, 12);
-    try layout.splitHorizontal(0.5, &buf2);
+    try layout.splitHorizontal(0.5, cb2.buf());
     layout.recalculate(40, 12);
 
     compositor.composite(&layout);
 
-    // The border row should be between the two halves
     const root = layout.root.?;
     const first_rect = root.split.first.leaf.rect;
     const border_row = first_rect.y + first_rect.height;

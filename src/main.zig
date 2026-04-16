@@ -13,7 +13,7 @@ const input_mod = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
-const NodeRenderer = @import("NodeRenderer.zig");
+const ConversationBuffer = @import("ConversationBuffer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
@@ -92,10 +92,8 @@ fn tuiLogHandler(
 // synchronously on the same thread, no mutex is needed.
 // ---------------------------------------------------------------------------
 
-/// Module-level buffer and renderer, initialized in main().
-var buffer: Buffer = undefined;
-var node_renderer: NodeRenderer = undefined;
-var buffer_alloc: std.mem.Allocator = undefined;
+/// Module-level buffer, initialized in main().
+var buffer: ConversationBuffer = undefined;
 
 /// Layout, compositor, and theme, initialized in main().
 var layout: Layout = undefined;
@@ -106,13 +104,13 @@ var theme: Theme = undefined;
 var next_buffer_id: u32 = 1;
 
 /// Extra buffers created by splits, tracked for cleanup.
-var extra_buffers: std.ArrayList(*Buffer) = .empty;
+var extra_buffers: std.ArrayList(*ConversationBuffer) = .empty;
 
 /// Heap-allocated session handles for split buffers, tracked for cleanup.
 var extra_session_handles: std.ArrayList(*Session.SessionHandle) = .empty;
 
 /// Last tool_call node, used to parent tool_result nodes (legacy callback path).
-var last_tool_call: ?*Buffer.Node = null;
+var last_tool_call: ?*ConversationBuffer.Node = null;
 
 /// Handle for the background agent thread, if one is running.
 var agent_thread: ?std.Thread = null;
@@ -134,7 +132,7 @@ var awaiting_window_cmd: bool = false;
 
 /// Typed callback passed to agent.runLoop. Creates nodes in the buffer.
 fn agentOutputCallback(content_type: agent.ContentType, text: []const u8) void {
-    const node_type: Buffer.NodeType = switch (content_type) {
+    const node_type: ConversationBuffer.NodeType = switch (content_type) {
         .assistant_text => .assistant_text,
         .tool_call => .tool_call,
         .tool_result => .tool_result,
@@ -142,7 +140,7 @@ fn agentOutputCallback(content_type: agent.ContentType, text: []const u8) void {
         .err => .err,
     };
 
-    const parent: ?*Buffer.Node = if (content_type == .tool_result) last_tool_call else null;
+    const parent: ?*ConversationBuffer.Node = if (content_type == .tool_result) last_tool_call else null;
 
     const node = buffer.appendNode(parent, node_type, text) catch |err| {
         log.warn("output capture failed: {}", .{err});
@@ -192,11 +190,11 @@ fn inputDeleteBack(len: usize) usize {
 // ---------------------------------------------------------------------------
 
 /// Create a new empty buffer and track it for cleanup.
-fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
-    const buf = try allocator.create(Buffer);
+fn createSplitBuffer(allocator: std.mem.Allocator) !*ConversationBuffer {
+    const buf = try allocator.create(ConversationBuffer);
     errdefer allocator.destroy(buf);
 
-    buf.* = try Buffer.init(allocator, next_buffer_id, "scratch");
+    buf.* = try ConversationBuffer.init(allocator, next_buffer_id, "scratch");
     errdefer buf.deinit();
 
     next_buffer_id += 1;
@@ -207,7 +205,7 @@ fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
 /// Create a new session and attach it to a buffer. The session handle is
 /// heap-allocated and tracked in extra_session_handles for cleanup.
 /// Failures are logged but not propagated; the buffer works without persistence.
-fn attachSessionToBuffer(buf: *Buffer, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) void {
+fn attachSessionToBuffer(buf: *ConversationBuffer, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) void {
     const mgr = &(session_mgr.* orelse return);
     const sh = allocator.create(Session.SessionHandle) catch {
         log.warn("failed to allocate session handle for split", .{});
@@ -229,7 +227,7 @@ fn attachSessionToBuffer(buf: *Buffer, session_mgr: *?Session.SessionManager, mo
 
 /// Generate a short session name via a cheap LLM call and apply it.
 /// Runs synchronously. Brief block acceptable for v1.
-fn autoNameSession(sh: *Session.SessionHandle, buf: *Buffer, provider: llm.Provider, allocator: std.mem.Allocator) void {
+fn autoNameSession(sh: *Session.SessionHandle, buf: *ConversationBuffer, provider: llm.Provider, allocator: std.mem.Allocator) void {
     const summary = generateSessionName(provider, buf, allocator) catch |err| {
         log.warn("auto-name failed: {}", .{err});
         return;
@@ -242,7 +240,7 @@ fn autoNameSession(sh: *Session.SessionHandle, buf: *Buffer, provider: llm.Provi
 }
 
 /// Send a minimal LLM request to summarize a conversation in 3-5 words.
-fn generateSessionName(provider: llm.Provider, buf: *const Buffer, allocator: std.mem.Allocator) ![]const u8 {
+fn generateSessionName(provider: llm.Provider, buf: *const ConversationBuffer, allocator: std.mem.Allocator) ![]const u8 {
     const msgs = buf.messages.items;
     if (msgs.len < 2) return error.InsufficientMessages;
 
@@ -365,16 +363,14 @@ pub fn main() !void {
     else
         gpa.allocator();
 
-    // Module-level buffer and renderer
-    buffer_alloc = allocator;
-    buffer = try Buffer.init(allocator, 0, "session");
+    // Module-level buffer
+    buffer = try ConversationBuffer.init(allocator, 0, "session");
     defer buffer.deinit();
-    node_renderer = NodeRenderer.initDefault();
 
     // Initialize layout with the session buffer as root
     layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(&buffer);
+    try layout.setRoot(buffer.buf());
 
     // Extra buffers created by splits.
     // NOTE: extra_session_handles defer must come AFTER extra_buffers defer so
@@ -523,7 +519,6 @@ pub fn main() !void {
     compositor = Compositor{
         .screen = &screen,
         .allocator = allocator,
-        .renderer = &node_renderer,
         .theme = &theme,
     };
 
@@ -646,7 +641,7 @@ pub fn main() !void {
                                     // Split vertical: new buffer gets its own session
                                     if (createSplitBuffer(allocator)) |new_buf| {
                                         attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
-                                        layout.splitVertical(0.5, new_buf) catch |err| {
+                                        layout.splitVertical(0.5, new_buf.buf()) catch |err| {
                                             log.warn("split failed: {}", .{err});
                                         };
                                         layout.recalculate(screen.width, screen.height);
@@ -658,7 +653,7 @@ pub fn main() !void {
                                     // Split horizontal: new buffer gets its own session
                                     if (createSplitBuffer(allocator)) |new_buf| {
                                         attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
-                                        layout.splitHorizontal(0.5, new_buf) catch |err| {
+                                        layout.splitHorizontal(0.5, new_buf.buf()) catch |err| {
                                             log.warn("split failed: {}", .{err});
                                         };
                                         layout.recalculate(screen.width, screen.height);
@@ -767,7 +762,7 @@ pub fn main() !void {
                                     // Ignore if an agent is already running
                                     if (agent_thread != null) continue;
 
-                                    const active_buf = if (layout.getFocusedLeaf()) |l| l.buffer else &buffer;
+                                    const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
 
                                     // Append the user message to the conversation
                                     // history before spawning the thread, because
@@ -780,14 +775,11 @@ pub fn main() !void {
                                     // Show user message in buffer
                                     _ = try active_buf.appendNode(null, .user_message, user_input);
 
-                                    // Persist user message to session JSONL
-                                    if (active_buf.session_handle) |sh| {
-                                        sh.appendEntry(.{
-                                            .entry_type = .user_message,
-                                            .content = user_input,
-                                            .timestamp = std.time.milliTimestamp(),
-                                        }) catch {};
-                                    }
+                                    active_buf.persistEvent(.{
+                                        .entry_type = .user_message,
+                                        .content = user_input,
+                                        .timestamp = std.time.milliTimestamp(),
+                                    });
 
                                     // Clear input and reset streaming state
                                     input_len = 0;
@@ -828,17 +820,19 @@ pub fn main() !void {
                                 const leaf = layout.getFocusedLeaf();
                                 if (leaf) |l| {
                                     const half_page = l.rect.height / 2;
-                                    l.buffer.scroll_offset +|= if (half_page > 0) half_page else 1;
+                                    const cur = l.buffer.getScrollOffset();
+                                    l.buffer.setScrollOffset(cur +| if (half_page > 0) half_page else 1);
                                 }
                             },
                             .page_down => {
                                 const leaf = layout.getFocusedLeaf();
                                 if (leaf) |l| {
                                     const half_page = l.rect.height / 2;
-                                    if (l.buffer.scroll_offset > half_page) {
-                                        l.buffer.scroll_offset -= half_page;
+                                    const cur = l.buffer.getScrollOffset();
+                                    if (cur > half_page) {
+                                        l.buffer.setScrollOffset(cur - half_page);
                                     } else {
-                                        l.buffer.scroll_offset = 0;
+                                        l.buffer.setScrollOffset(0);
                                     }
                                 }
                             },
@@ -857,7 +851,7 @@ pub fn main() !void {
 
         // Drain agent events into the focused buffer
         if (agent_thread != null) {
-            const active_buf = if (layout.getFocusedLeaf()) |l| l.buffer else &buffer;
+            const active_buf: *ConversationBuffer = if (layout.getFocusedLeaf()) |l| ConversationBuffer.fromBuffer(l.buffer) else &buffer;
             var event_buf: [64]AgentThread.AgentEvent = undefined;
             const count = event_queue.drain(&event_buf);
 
@@ -873,48 +867,40 @@ pub fn main() !void {
                         } else {
                             active_buf.current_assistant_node = active_buf.appendNode(null, .assistant_text, text) catch null;
                         }
-                        if (active_buf.session_handle) |sh| {
-                            sh.appendEntry(.{
-                                .entry_type = .assistant_text,
-                                .content = text,
-                                .timestamp = std.time.milliTimestamp(),
-                            }) catch {};
-                        }
+                        active_buf.persistEvent(.{
+                            .entry_type = .assistant_text,
+                            .content = text,
+                            .timestamp = std.time.milliTimestamp(),
+                        });
                     },
                     .tool_start => |name| {
                         defer allocator.free(name);
                         active_buf.current_assistant_node = null;
                         active_buf.last_tool_call = active_buf.appendNode(null, .tool_call, name) catch null;
-                        if (active_buf.session_handle) |sh| {
-                            sh.appendEntry(.{
-                                .entry_type = .tool_call,
-                                .tool_name = name,
-                                .timestamp = std.time.milliTimestamp(),
-                            }) catch {};
-                        }
+                        active_buf.persistEvent(.{
+                            .entry_type = .tool_call,
+                            .tool_name = name,
+                            .timestamp = std.time.milliTimestamp(),
+                        });
                     },
                     .tool_result => |result| {
                         defer allocator.free(result.content);
                         _ = active_buf.appendNode(active_buf.last_tool_call, .tool_result, result.content) catch {};
-                        if (active_buf.session_handle) |sh| {
-                            sh.appendEntry(.{
-                                .entry_type = .tool_result,
-                                .content = result.content,
-                                .is_error = result.is_error,
-                                .timestamp = std.time.milliTimestamp(),
-                            }) catch {};
-                        }
+                        active_buf.persistEvent(.{
+                            .entry_type = .tool_result,
+                            .content = result.content,
+                            .is_error = result.is_error,
+                            .timestamp = std.time.milliTimestamp(),
+                        });
                     },
                     .info => |text| {
                         defer allocator.free(text);
                         _ = active_buf.appendNode(null, .status, text) catch {};
-                        if (active_buf.session_handle) |sh| {
-                            sh.appendEntry(.{
-                                .entry_type = .info,
-                                .content = text,
-                                .timestamp = std.time.milliTimestamp(),
-                            }) catch {};
-                        }
+                        active_buf.persistEvent(.{
+                            .entry_type = .info,
+                            .content = text,
+                            .timestamp = std.time.milliTimestamp(),
+                        });
                     },
                     .done => {
                         if (agent_thread) |t| t.join();
@@ -933,13 +919,11 @@ pub fn main() !void {
                     .err => |text| {
                         defer allocator.free(text);
                         _ = active_buf.appendNode(null, .err, text) catch {};
-                        if (active_buf.session_handle) |sh| {
-                            sh.appendEntry(.{
-                                .entry_type = .err,
-                                .content = text,
-                                .timestamp = std.time.milliTimestamp(),
-                            }) catch {};
-                        }
+                        active_buf.persistEvent(.{
+                            .entry_type = .err,
+                            .content = text,
+                            .timestamp = std.time.milliTimestamp(),
+                        });
                     },
                 }
             }
@@ -1014,6 +998,7 @@ test "imports compile" {
     _ = @import("input.zig");
     _ = @import("Terminal.zig");
     _ = @import("Buffer.zig");
+    _ = @import("ConversationBuffer.zig");
     _ = @import("NodeRenderer.zig");
     _ = @import("Layout.zig");
     _ = @import("Compositor.zig");
@@ -1057,23 +1042,19 @@ test "inputDeleteBack on empty returns zero" {
 
 test "appendOutputText creates a status node" {
     const allocator = std.testing.allocator;
-    buffer_alloc = allocator;
-    buffer = try Buffer.init(allocator, 0, "test");
-    node_renderer = NodeRenderer.initDefault();
+    buffer = try ConversationBuffer.init(allocator, 0, "test");
     defer buffer.deinit();
 
     try appendOutputText("hello world");
 
     try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
-    try std.testing.expectEqual(Buffer.NodeType.status, buffer.root_children.items[0].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.status, buffer.root_children.items[0].node_type);
     try std.testing.expectEqualStrings("hello world", buffer.root_children.items[0].content.items);
 }
 
 test "agentOutputCallback creates typed nodes" {
     const allocator = std.testing.allocator;
-    buffer_alloc = allocator;
-    buffer = try Buffer.init(allocator, 0, "test");
-    node_renderer = NodeRenderer.initDefault();
+    buffer = try ConversationBuffer.init(allocator, 0, "test");
     last_tool_call = null;
     defer buffer.deinit();
 
@@ -1082,27 +1063,25 @@ test "agentOutputCallback creates typed nodes" {
     agentOutputCallback(.tool_result, "output");
 
     try std.testing.expectEqual(@as(usize, 2), buffer.root_children.items.len);
-    try std.testing.expectEqual(Buffer.NodeType.assistant_text, buffer.root_children.items[0].node_type);
-    try std.testing.expectEqual(Buffer.NodeType.tool_call, buffer.root_children.items[1].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, buffer.root_children.items[0].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.tool_call, buffer.root_children.items[1].node_type);
 
     // tool_result should be a child of the tool_call node
     const tc_node = buffer.root_children.items[1];
     try std.testing.expectEqual(@as(usize, 1), tc_node.children.items.len);
-    try std.testing.expectEqual(Buffer.NodeType.tool_result, tc_node.children.items[0].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.tool_result, tc_node.children.items[0].node_type);
 }
 
 test "agentOutputCallback err node at root" {
     const allocator = std.testing.allocator;
-    buffer_alloc = allocator;
-    buffer = try Buffer.init(allocator, 0, "test");
-    node_renderer = NodeRenderer.initDefault();
+    buffer = try ConversationBuffer.init(allocator, 0, "test");
     defer buffer.deinit();
     last_tool_call = null;
 
     agentOutputCallback(.err, "something broke");
 
     try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
-    try std.testing.expectEqual(Buffer.NodeType.err, buffer.root_children.items[0].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.err, buffer.root_children.items[0].node_type);
     try std.testing.expectEqualStrings("something broke", buffer.root_children.items[0].content.items);
 }
 
