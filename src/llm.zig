@@ -108,6 +108,112 @@ pub const Endpoint = struct {
     }
 };
 
+const builtin_endpoints = [_]Endpoint{
+    .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://api.anthropic.com/v1/messages",
+        .key_env = "ANTHROPIC_API_KEY",
+        .auth = .x_api_key,
+        .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
+        .compat = .{},
+    },
+    .{
+        .name = "openai",
+        .serializer = .openai,
+        .url = "https://api.openai.com/v1/chat/completions",
+        .key_env = "OPENAI_API_KEY",
+        .auth = .bearer,
+        .headers = &.{},
+        .compat = .{},
+    },
+    .{
+        .name = "openrouter",
+        .serializer = .openai,
+        .url = "https://openrouter.ai/api/v1/chat/completions",
+        .key_env = "OPENROUTER_API_KEY",
+        .auth = .bearer,
+        .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
+        .compat = .{},
+    },
+    .{
+        .name = "groq",
+        .serializer = .openai,
+        .url = "https://api.groq.com/openai/v1/chat/completions",
+        .key_env = "GROQ_API_KEY",
+        .auth = .bearer,
+        .headers = &.{},
+        .compat = .{},
+    },
+    .{
+        .name = "ollama",
+        .serializer = .openai,
+        .url = "http://localhost:11434/v1/chat/completions",
+        .key_env = null,
+        .auth = .none,
+        .headers = &.{},
+        .compat = .{},
+    },
+};
+
+/// Runtime registry of LLM endpoints. Seeded with built-ins, extensible at runtime.
+pub const Registry = struct {
+    endpoints: std.ArrayList(Endpoint),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) !Registry {
+        var self = Registry{ .endpoints = .empty, .allocator = allocator };
+        errdefer self.deinit();
+        for (&builtin_endpoints) |*ep| {
+            try self.endpoints.append(allocator, try ep.dupe(allocator));
+        }
+        return self;
+    }
+
+    /// Find an endpoint by name. Returns null if not found.
+    pub fn find(self: *const Registry, name: []const u8) ?*const Endpoint {
+        for (self.endpoints.items) |*ep| {
+            if (std.mem.eql(u8, ep.name, name)) return ep;
+        }
+        return null;
+    }
+
+    pub fn deinit(self: *Registry) void {
+        for (self.endpoints.items) |ep| ep.free(self.allocator);
+        self.endpoints.deinit(self.allocator);
+    }
+};
+
+/// Build HTTP headers from an endpoint's auth config and extra headers.
+/// Caller must call freeHeaders() when done.
+pub fn buildHeaders(endpoint: *const Endpoint, api_key: []const u8, allocator: Allocator) !std.ArrayList(std.http.Header) {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    errdefer headers.deinit(allocator);
+
+    switch (endpoint.auth) {
+        .x_api_key => try headers.append(allocator, .{ .name = "x-api-key", .value = api_key }),
+        .bearer => {
+            const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+            try headers.append(allocator, .{ .name = "Authorization", .value = auth_value });
+        },
+        .none => {},
+    }
+
+    for (endpoint.headers) |h| {
+        try headers.append(allocator, .{ .name = h.name, .value = h.value });
+    }
+
+    return headers;
+}
+
+/// Free headers built by buildHeaders(). Only Bearer auth allocates a header value.
+pub fn freeHeaders(endpoint: *const Endpoint, headers: *std.ArrayList(std.http.Header), allocator: Allocator) void {
+    if (endpoint.auth == .bearer and headers.items.len > 0) {
+        allocator.free(headers.items[0].value);
+    }
+    headers.deinit(allocator);
+}
+
 /// Runtime-polymorphic LLM provider interface.
 /// Uses the ptr + vtable pattern (same as std.mem.Allocator).
 /// Each provider implements call() for its specific API format.
@@ -202,69 +308,58 @@ pub const ProviderResult = struct {
     api_key: []const u8,
     /// Allocator used to create the state (for cleanup).
     allocator: Allocator,
-    /// Type-erased cleanup function for the concrete provider state.
-    destroy_fn: *const fn (*anyopaque, Allocator) void,
+    /// Which serializer was used (needed for type-correct destroy).
+    serializer: Serializer,
 
     pub fn deinit(self: *ProviderResult) void {
         self.allocator.free(self.api_key);
-        self.destroy_fn(self.state, self.allocator);
-    }
-
-    fn destroyAnthropicState(state: *anyopaque, alloc: Allocator) void {
-        alloc.destroy(@as(*anthropic.AnthropicSerializer, @ptrCast(@alignCast(state))));
-    }
-
-    fn destroyOpenAiState(state: *anyopaque, alloc: Allocator) void {
-        const p: *openai.OpenAiSerializer = @ptrCast(@alignCast(state));
-        alloc.free(p.base_url);
-        alloc.destroy(p);
+        switch (self.serializer) {
+            .anthropic => {
+                self.allocator.destroy(@as(*anthropic.AnthropicSerializer, @ptrCast(@alignCast(self.state))));
+            },
+            .openai => {
+                self.allocator.destroy(@as(*openai.OpenAiSerializer, @ptrCast(@alignCast(self.state))));
+            },
+        }
     }
 };
 
-/// Create a provider from a model string and environment variables.
-/// Reads API keys from ANTHROPIC_API_KEY or OPENAI_API_KEY based on provider prefix.
-pub fn createProvider(model_str: []const u8, allocator: Allocator) !ProviderResult {
+/// Create a provider from a model string, looking up the endpoint in the registry.
+pub fn createProvider(registry: *const Registry, model_str: []const u8, allocator: Allocator) !ProviderResult {
     const spec = parseModelString(model_str);
+    const endpoint = registry.find(spec.provider_name) orelse
+        return error.UnknownProvider;
 
-    if (std.mem.eql(u8, spec.provider_name, "anthropic")) {
-        const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch
-            return error.MissingApiKey;
-        errdefer allocator.free(api_key);
+    const api_key = if (endpoint.key_env) |env|
+        std.process.getEnvVarOwned(allocator, env) catch return error.MissingApiKey
+    else
+        try allocator.dupe(u8, "");
+    errdefer allocator.free(api_key);
 
-        const state = try allocator.create(anthropic.AnthropicSerializer);
-        state.* = .{ .api_key = api_key, .model = spec.model_id };
-
-        return .{
-            .provider = state.provider(),
-            .state = state,
-            .api_key = api_key,
-            .allocator = allocator,
-            .destroy_fn = ProviderResult.destroyAnthropicState,
-        };
+    switch (endpoint.serializer) {
+        .anthropic => {
+            const state = try allocator.create(anthropic.AnthropicSerializer);
+            state.* = .{ .endpoint = endpoint, .api_key = api_key, .model = spec.model_id };
+            return .{
+                .provider = state.provider(),
+                .state = state,
+                .api_key = api_key,
+                .allocator = allocator,
+                .serializer = .anthropic,
+            };
+        },
+        .openai => {
+            const state = try allocator.create(openai.OpenAiSerializer);
+            state.* = .{ .endpoint = endpoint, .api_key = api_key, .model = spec.model_id };
+            return .{
+                .provider = state.provider(),
+                .state = state,
+                .api_key = api_key,
+                .allocator = allocator,
+                .serializer = .openai,
+            };
+        },
     }
-
-    if (std.mem.eql(u8, spec.provider_name, "openai")) {
-        const api_key = std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch
-            return error.MissingApiKey;
-        errdefer allocator.free(api_key);
-
-        const base_url = std.process.getEnvVarOwned(allocator, "OPENAI_API_BASE") catch
-            try allocator.dupe(u8, "https://api.openai.com/v1/chat/completions");
-        errdefer allocator.free(base_url);
-
-        const state = try allocator.create(openai.OpenAiSerializer);
-        state.* = .{ .api_key = api_key, .model = spec.model_id, .base_url = base_url };
-
-        return .{
-            .provider = state.provider(),
-            .state = state,
-            .api_key = api_key,
-            .allocator = allocator,
-            .destroy_fn = ProviderResult.destroyOpenAiState,
-        };
-    }
-
-    return error.UnknownProvider;
 }
 
 /// Send a JSON POST request and return the response body.
@@ -802,7 +897,9 @@ test "parseModelString handles nested slashes for openrouter" {
 
 test "createProvider returns UnknownProvider for unsupported provider" {
     const allocator = std.testing.allocator;
-    const result = createProvider("fakeprovider/some-model", allocator);
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
+    const result = createProvider(&registry, "fakeprovider/some-model", allocator);
     try std.testing.expectError(error.UnknownProvider, result);
 }
 
@@ -861,4 +958,90 @@ test "ResponseBuilder deinit cleans up on error" {
     try builder.addToolUse("id", "name", "input", allocator);
     // Simulate error path: deinit without finish
     builder.deinit(allocator);
+}
+
+test "Registry initializes with built-in endpoints" {
+    const allocator = std.testing.allocator;
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
+
+    const anth = registry.find("anthropic");
+    try std.testing.expect(anth != null);
+    try std.testing.expectEqual(Serializer.anthropic, anth.?.serializer);
+
+    const oai = registry.find("openai");
+    try std.testing.expect(oai != null);
+    try std.testing.expectEqual(Serializer.openai, oai.?.serializer);
+
+    const or_ep = registry.find("openrouter");
+    try std.testing.expect(or_ep != null);
+    try std.testing.expectEqual(Serializer.openai, or_ep.?.serializer);
+
+    const ollama = registry.find("ollama");
+    try std.testing.expect(ollama != null);
+    try std.testing.expectEqual(Endpoint.Auth.none, ollama.?.auth);
+    try std.testing.expectEqual(@as(?[]const u8, null), ollama.?.key_env);
+
+    try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("unknown"));
+}
+
+test "Registry find returns null for unknown endpoint" {
+    const allocator = std.testing.allocator;
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("nonexistent"));
+}
+
+test "buildHeaders creates correct auth for bearer endpoint" {
+    const allocator = std.testing.allocator;
+    const endpoint = Endpoint{
+        .name = "test",
+        .serializer = .openai,
+        .url = "https://example.com",
+        .key_env = "TEST_KEY",
+        .auth = .bearer,
+        .headers = &.{.{ .name = "X-Custom", .value = "val" }},
+        .compat = .{},
+    };
+    var headers = try buildHeaders(&endpoint, "sk-test-key", allocator);
+    defer freeHeaders(&endpoint, &headers, allocator);
+    try std.testing.expectEqual(@as(usize, 2), headers.items.len);
+    try std.testing.expectEqualStrings("Authorization", headers.items[0].name);
+    try std.testing.expect(std.mem.startsWith(u8, headers.items[0].value, "Bearer "));
+    try std.testing.expectEqualStrings("X-Custom", headers.items[1].name);
+}
+
+test "buildHeaders creates correct auth for x_api_key endpoint" {
+    const allocator = std.testing.allocator;
+    const endpoint = Endpoint{
+        .name = "test",
+        .serializer = .anthropic,
+        .url = "https://example.com",
+        .key_env = "TEST_KEY",
+        .auth = .x_api_key,
+        .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
+        .compat = .{},
+    };
+    var headers = try buildHeaders(&endpoint, "sk-ant-key", allocator);
+    defer freeHeaders(&endpoint, &headers, allocator);
+    try std.testing.expectEqual(@as(usize, 2), headers.items.len);
+    try std.testing.expectEqualStrings("x-api-key", headers.items[0].name);
+    try std.testing.expectEqualStrings("sk-ant-key", headers.items[0].value);
+    try std.testing.expectEqualStrings("anthropic-version", headers.items[1].name);
+}
+
+test "buildHeaders handles no-auth endpoint" {
+    const allocator = std.testing.allocator;
+    const endpoint = Endpoint{
+        .name = "ollama",
+        .serializer = .openai,
+        .url = "http://localhost:11434/v1/chat/completions",
+        .key_env = null,
+        .auth = .none,
+        .headers = &.{},
+        .compat = .{},
+    };
+    var headers = try buildHeaders(&endpoint, "", allocator);
+    defer freeHeaders(&endpoint, &headers, allocator);
+    try std.testing.expectEqual(@as(usize, 0), headers.items.len);
 }
