@@ -48,28 +48,11 @@ fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]c
     return buf.toOwnedSlice(allocator);
 }
 
-/// Runs the agent loop on a background thread using streaming.
-/// Pushes events to the provided queue and checks the cancel flag
-/// before each LLM call and tool execution. Catches all errors and
-/// pushes .err. Pushes .done when the loop finishes.
+/// Runs the streaming agent loop: call LLM, execute tools, repeat until
+/// the model produces a text-only response or the cancel flag is set.
+/// Pushes events to the queue for UI updates. Returns errors to the caller
+/// (AgentThread handles the error boundary and .done signal).
 pub fn runLoopStreaming(
-    messages: *std.ArrayList(types.Message),
-    registry: *const tools.Registry,
-    provider: llm.Provider,
-    allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
-) void {
-    runLoopStreamingInner(messages, registry, provider, allocator, queue, cancel) catch |err| {
-        const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
-        queue.push(.{ .err = duped_err }) catch {};
-    };
-    queue.push(.done) catch {};
-}
-
-/// Inner implementation that can return errors. The outer function
-/// catches them and pushes .err to the queue.
-fn runLoopStreamingInner(
     messages: *std.ArrayList(types.Message),
     registry: *const tools.Registry,
     provider: llm.Provider,
@@ -125,6 +108,7 @@ fn runLoopStreamingInner(
         };
 
         // Add assistant message
+        log.info("appending assistant message: {d} blocks", .{response.content.len});
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
         // Emit token usage as info
