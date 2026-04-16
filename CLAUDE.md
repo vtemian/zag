@@ -22,7 +22,7 @@ Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` depending on pr
 
 Dependencies: ziglua (Lua 5.4, compiled from source).
 
-# Plugin config
+## Plugin config
 ~/.config/zag/config.lua     # User configuration (optional)
 ~/.config/zag/lua/           # Plugin modules loaded via require()
 

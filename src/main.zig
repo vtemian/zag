@@ -469,7 +469,9 @@ pub fn main() !void {
         defer allocator.free(home);
         const lua_dir = std.fmt.allocPrint(allocator, "{s}/.config/zag/lua", .{home}) catch break :blk eng;
         defer allocator.free(lua_dir);
-        eng.setPluginPath(lua_dir) catch {};
+        eng.setPluginPath(lua_dir) catch |err| {
+            log.warn("failed to set lua plugin path: {}", .{err});
+        };
 
         // Load config.lua
         const config_path = std.fmt.allocPrint(allocator, "{s}/.config/zag/config.lua", .{home}) catch break :blk eng;
