@@ -40,6 +40,36 @@ test "zero-width joiner and variation selector are width 0" {
     try testing.expectEqual(@as(u2, 0), codepointWidth(0xFE0F));
 }
 
+test "CJK unified ideograph range boundaries" {
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x4E00)); // first CJK unified
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x9FFF)); // last CJK unified
+}
+
+test "Hangul syllable range boundaries" {
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0xD7A3)); // last Hangul syllable
+    try testing.expectEqual(@as(u2, 1), codepointWidth(0xD7A4)); // just past the block
+}
+
+test "Hangul Jamo start of range" {
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x1100));
+}
+
+test "emoji skin-tone modifiers are width 2" {
+    // Skin-tone modifiers form ZWJ sequences with an emoji. On their own the
+    // current table reports them as width 2; terminals vary wildly.
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x1F3FB));
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x1F3FC));
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x1F3FD));
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x1F3FE));
+    try testing.expectEqual(@as(u2, 2), codepointWidth(0x1F3FF));
+}
+
+test "regional indicator symbol letters pin current behaviour" {
+    // TODO: regional indicators form flags as pairs; a proper implementation
+    // reports width 2 for a grouped pair and width 1 (or 0) for singletons.
+    try testing.expectEqual(@as(u2, 1), codepointWidth(0x1F1E6));
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
