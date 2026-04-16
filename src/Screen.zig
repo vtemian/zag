@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.screen);
 const trace = @import("Metrics.zig");
+const width_mod = @import("width.zig");
 
 const Screen = @This();
 
@@ -47,6 +48,10 @@ pub const Cell = struct {
     bg: Color = .default,
     /// Text style (bold, italic, etc.).
     style: Style = .{},
+    /// True when this cell is the second half of a wide character. Render
+    /// must skip continuation cells; overwriting a wide char requires
+    /// clearing both halves.
+    continuation: bool = false,
 };
 
 /// Width of the screen in columns.
@@ -145,13 +150,23 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
     while (iter.nextCodepoint()) |cp| {
-        if (c >= self.width) break;
         if (row >= self.height) break;
+        const w = width_mod.codepointWidth(cp);
+        if (w == 0) continue; // zero-width: do not consume a cell
+        if (c + w > self.width) break; // wide char doesn't fit — stop
         const cell = self.getCell(row, c);
         cell.codepoint = cp;
         cell.style = style;
         cell.fg = fg;
-        c += 1;
+        cell.continuation = false;
+        if (w == 2) {
+            const cont = self.getCell(row, c + 1);
+            cont.codepoint = ' ';
+            cont.style = style;
+            cont.fg = fg;
+            cont.continuation = true;
+        }
+        c += w;
     }
     return c;
 }
@@ -174,17 +189,27 @@ pub fn writeStrWrapped(
     var iter = view.iterator();
     while (iter.nextCodepoint()) |cp| {
         if (row >= max_row) break;
-        if (col >= max_col) {
-            // Wrap to next line
+        const w = width_mod.codepointWidth(cp);
+        if (w == 0) continue;
+        if (col + w > max_col) {
             row += 1;
             col = start_col;
             if (row >= max_row) break;
+            if (col + w > max_col) break; // still won't fit — give up
         }
         const cell = self.getCell(row, col);
         cell.codepoint = cp;
         cell.style = style;
         cell.fg = fg;
-        col += 1;
+        cell.continuation = false;
+        if (w == 2) {
+            const cont = self.getCell(row, col + 1);
+            cont.codepoint = ' ';
+            cont.style = style;
+            cont.fg = fg;
+            cont.continuation = true;
+        }
+        col += w;
     }
     return .{ .row = row, .col = col };
 }
@@ -272,6 +297,8 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                 const prev = self.previous[idx];
 
                 if (cellsEqual(cur, prev)) continue;
+                // Skip continuation cells — they're painted by their primary cell
+                if (cur.continuation) continue;
                 cells_changed += 1;
 
                 // Move cursor if needed
@@ -306,7 +333,7 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                 };
                 try writer.writeAll(encoded[0..len]);
 
-                cursor_col +|= 1;
+                cursor_col +|= width_mod.codepointWidth(cur.codepoint);
             }
         }
 
@@ -809,4 +836,33 @@ test "writeStr starts at offset column" {
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 2).codepoint);
     try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 3).codepoint);
     try std.testing.expectEqual(@as(u21, 'b'), screen.getCellConst(0, 4).codepoint);
+}
+
+test "writeStr advances by 2 columns for CJK" {
+    var screen = try Screen.init(std.testing.allocator, 10, 1);
+    defer screen.deinit();
+    const end_col = screen.writeStr(0, 0, "中A", .{}, .default);
+    try std.testing.expectEqual(@as(u16, 3), end_col);
+    try std.testing.expect(screen.getCell(0, 0).codepoint == 0x4E2D);
+    try std.testing.expect(screen.getCell(0, 1).continuation);
+    try std.testing.expect(screen.getCell(0, 2).codepoint == 'A');
+}
+
+test "writeStr does not advance for combining marks" {
+    var screen = try Screen.init(std.testing.allocator, 4, 1);
+    defer screen.deinit();
+    // 'a' + combining acute (U+0301) + 'b'
+    const end_col = screen.writeStr(0, 0, "a\u{0301}b", .{}, .default);
+    try std.testing.expectEqual(@as(u16, 2), end_col);
+    try std.testing.expect(screen.getCell(0, 0).codepoint == 'a');
+    try std.testing.expect(screen.getCell(0, 1).codepoint == 'b');
+}
+
+test "writeStr skips wide char that would overflow the row" {
+    var screen = try Screen.init(std.testing.allocator, 3, 1);
+    defer screen.deinit();
+    // Two wide chars: col 0-1 fits, col 2 does NOT (would need col 2 + 3)
+    const end_col = screen.writeStr(0, 0, "中中", .{}, .default);
+    try std.testing.expectEqual(@as(u16, 2), end_col);
+    try std.testing.expect(screen.getCell(0, 2).codepoint == ' '); // untouched
 }
