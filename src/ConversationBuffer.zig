@@ -200,6 +200,22 @@ pub fn getVisibleLines(
     return lines;
 }
 
+/// Clone a StyledLine: allocate new spans array and dupe each span's text.
+/// On partial failure, all already-duped texts and the spans array are freed.
+fn cloneStyledLine(allocator: Allocator, source: Theme.StyledLine) !Theme.StyledLine {
+    const spans = try allocator.alloc(Theme.StyledSpan, source.spans.len);
+    var filled: usize = 0;
+    errdefer {
+        for (spans[0..filled]) |s| allocator.free(@constCast(s.text));
+        allocator.free(spans);
+    }
+    for (source.spans, 0..) |span, i| {
+        spans[i] = .{ .text = try allocator.dupe(u8, span.text), .style = span.style };
+        filled += 1;
+    }
+    return .{ .spans = spans };
+}
+
 /// Recursive helper: render a node and its non-collapsed children,
 /// respecting the skip/max_lines window. Uses per-node cache when available.
 fn collectVisibleLines(
@@ -232,13 +248,9 @@ fn collectVisibleLines(
             const take = @min(available, max_lines - collected.*);
 
             for (cached[skip_from_node .. skip_from_node + take]) |cached_line| {
-                const spans_copy = try allocator.alloc(Theme.StyledSpan, cached_line.spans.len);
-                errdefer allocator.free(spans_copy);
-                for (cached_line.spans, 0..) |span, i| {
-                    const text_copy = try allocator.dupe(u8, span.text);
-                    spans_copy[i] = .{ .text = text_copy, .style = span.style };
-                }
-                try lines.append(allocator, .{ .spans = spans_copy });
+                const cloned = try cloneStyledLine(allocator, cached_line);
+                errdefer cloned.deinit(allocator);
+                try lines.append(allocator, cloned);
             }
 
             skipped.* += node_lines;
@@ -249,15 +261,12 @@ fn collectVisibleLines(
             try renderer.render(node, lines, allocator, theme);
             const produced = lines.items.len - before;
 
-            // Build cache: clone the rendered lines into node-owned storage
+            // Build cache: clone the rendered lines into node-owned storage.
+            // On partial clone failure, already-cloned entries leak (OOM territory).
             node_mut.clearCache(allocator);
             const cache_copy = try allocator.alloc(Theme.StyledLine, produced);
             for (lines.items[before .. before + produced], 0..) |line, i| {
-                const spans_copy = try allocator.alloc(Theme.StyledSpan, line.spans.len);
-                for (line.spans, 0..) |span, j| {
-                    spans_copy[j] = .{ .text = try allocator.dupe(u8, span.text), .style = span.style };
-                }
-                cache_copy[i] = .{ .spans = spans_copy };
+                cache_copy[i] = try cloneStyledLine(allocator, line);
             }
             node_mut.cached_lines = cache_copy;
             node_mut.cached_version = node.content_version;
