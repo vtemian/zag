@@ -7,6 +7,7 @@ const std = @import("std");
 const zlua = @import("zlua");
 const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
+const Hooks = @import("Hooks.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -38,6 +39,8 @@ pub const LuaEngine = struct {
     allocator: Allocator,
     /// Tools registered via `zag.tool()` calls in Lua.
     tools: std.ArrayList(LuaTool),
+    /// Hook registry, populated by `zag.hook()` calls from Lua.
+    hook_registry: Hooks.Registry,
 
     /// Create a new LuaEngine, initializing the VM, loading user config,
     /// and collecting tool definitions. Silently skips if no config exists.
@@ -53,6 +56,7 @@ pub const LuaEngine = struct {
             .lua = lua,
             .allocator = allocator,
             .tools = .empty,
+            .hook_registry = Hooks.Registry.init(allocator),
         };
 
         self.loadUserConfig();
@@ -95,6 +99,10 @@ pub const LuaEngine = struct {
             if (tool.prompt_snippet) |s| self.allocator.free(s);
         }
         self.tools.deinit(self.allocator);
+        for (self.hook_registry.hooks.items) |h| {
+            self.lua.unref(zlua.registry_index, h.lua_ref);
+        }
+        self.hook_registry.deinit();
         self.lua.deinit();
     }
 
@@ -104,6 +112,8 @@ pub const LuaEngine = struct {
         lua.newTable();
         lua.pushFunction(zlua.wrap(zagToolFn));
         lua.setField(-2, "tool");
+        lua.pushFunction(zlua.wrap(zagHookFn));
+        lua.setField(-2, "hook");
         lua.setGlobal("zag");
     }
 
@@ -214,6 +224,63 @@ pub const LuaEngine = struct {
 
         log.info("registered Lua tool: {s}", .{name});
         return 0;
+    }
+
+    /// Zig function backing `zag.hook(event_name, opts?, fn)`.
+    /// Accepts either (event_name, fn) or (event_name, opts_table, fn).
+    fn zagHookFn(lua: *Lua) !i32 {
+        return zagHookFnInner(lua) catch |err| {
+            log.err("zag.hook() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagHookFnInner(lua: *Lua) !i32 {
+        const event_raw = lua.toString(1) catch {
+            log.err("zag.hook(): first argument must be event name string", .{});
+            return error.LuaError;
+        };
+        const kind = Hooks.parseEventName(event_raw) orelse {
+            log.err("zag.hook(): unknown event '{s}'", .{event_raw});
+            return error.LuaError;
+        };
+
+        // (name, fn) or (name, opts, fn)
+        const fn_index: i32 = if (lua.isFunction(2)) 2 else 3;
+        var pattern: ?[]const u8 = null;
+
+        if (fn_index == 3) {
+            if (!lua.isTable(2)) {
+                log.err("zag.hook(): second argument must be options table or function", .{});
+                return error.LuaError;
+            }
+            _ = lua.getField(2, "pattern");
+            if (lua.isString(-1)) {
+                pattern = lua.toString(-1) catch null;
+            }
+            lua.pop(1);
+        }
+
+        if (!lua.isFunction(fn_index)) {
+            log.err("zag.hook(): last argument must be a function", .{});
+            return error.LuaError;
+        }
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.err("zag.hook(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        lua.pushValue(fn_index);
+        const cb_ref = try lua.ref(zlua.registry_index);
+        errdefer lua.unref(zlua.registry_index, cb_ref);
+
+        const id = try engine.hook_registry.register(kind, pattern, cb_ref);
+        lua.pushInteger(@intCast(id));
+        return 1;
     }
 
     // -- JSON serialization from Lua values ------------------------------------
@@ -700,6 +767,24 @@ test "loadConfig with nonexistent file returns error" {
         error.LuaFile,
         engine.loadConfig("/tmp/zag_nonexistent_config_12345.lua"),
     );
+}
+
+test "zag.hook registers a hook" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", { pattern = "bash" }, function(evt) end)
+        \\zag.hook("TurnEnd", function(evt) end)
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), engine.hook_registry.hooks.items.len);
+    try std.testing.expectEqualStrings(
+        "bash",
+        engine.hook_registry.hooks.items[0].pattern.?,
+    );
+    try std.testing.expect(engine.hook_registry.hooks.items[1].pattern == null);
 }
 
 test "end-to-end: config file to registry execution" {
