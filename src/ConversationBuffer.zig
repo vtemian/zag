@@ -101,7 +101,10 @@ renderer: NodeRenderer,
 
 /// Conversation history for LLM calls. Each buffer maintains its own.
 messages: std.ArrayList(types.Message) = .empty,
-/// Last tool_call node (for parenting tool_result nodes).
+/// Pending tool_call nodes keyed by call_id, for parenting tool_result nodes.
+/// Supports parallel tool execution where events interleave.
+pending_tool_calls: std.StringHashMap(*Node) = undefined,
+/// Fallback for tool_start events without a call_id (streaming previews).
 last_tool_call: ?*Node = null,
 /// Current assistant text node being streamed to.
 current_assistant_node: ?*Node = null,
@@ -132,6 +135,7 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
         .next_id = 0,
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
+        .pending_tool_calls = std.StringHashMap(*Node).init(allocator),
     };
 }
 
@@ -145,6 +149,10 @@ pub fn deinit(self: *ConversationBuffer) void {
     self.root_children.deinit(self.allocator);
     for (self.messages.items) |msg| msg.deinit(self.allocator);
     self.messages.deinit(self.allocator);
+    // Free owned call_id keys in the pending map
+    var key_it = self.pending_tool_calls.keyIterator();
+    while (key_it.next()) |key| self.allocator.free(@constCast(key.*));
+    self.pending_tool_calls.deinit();
     self.allocator.free(self.name);
 }
 
@@ -467,19 +475,39 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 .timestamp = std.time.milliTimestamp(),
             });
         },
-        .tool_start => |name| {
-            defer allocator.free(name);
+        .tool_start => |ev| {
+            defer allocator.free(ev.name);
             self.current_assistant_node = null;
-            self.last_tool_call = self.appendNode(null, .tool_call, name) catch null;
+            const node = self.appendNode(null, .tool_call, ev.name) catch null;
+            self.last_tool_call = node;
+            // If we have a call_id, store in the map for result correlation
+            if (ev.call_id) |id| {
+                if (node) |n| {
+                    self.pending_tool_calls.put(id, n) catch {};
+                } else {
+                    allocator.free(id);
+                }
+            }
             self.persistEvent(.{
                 .entry_type = .tool_call,
-                .tool_name = name,
+                .tool_name = ev.name,
                 .timestamp = std.time.milliTimestamp(),
             });
         },
         .tool_result => |result| {
             defer allocator.free(result.content);
-            _ = self.appendNode(self.last_tool_call, .tool_result, result.content) catch {};
+            // Find the parent tool_call node: by call_id if available, else fallback
+            const parent = if (result.call_id) |id| blk: {
+                const removed = self.pending_tool_calls.fetchRemove(id);
+                // Free both the lookup key (from tool_result) and stored key (from tool_start)
+                allocator.free(id);
+                if (removed) |kv| {
+                    allocator.free(@constCast(kv.key));
+                    break :blk kv.value;
+                }
+                break :blk self.last_tool_call;
+            } else self.last_tool_call;
+            _ = self.appendNode(parent, .tool_result, result.content) catch {};
             self.persistEvent(.{
                 .entry_type = .tool_result,
                 .content = result.content,
