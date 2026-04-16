@@ -214,26 +214,34 @@ fn runLoopStreamingInner(
         // Check cancel before each LLM call
         if (cancel.load(.acquire)) return;
 
-        // Non-streaming call on the background thread. Response arrives
-        // all at once but the TUI stays responsive. True token streaming
-        // has an HTTP reader issue to debug separately.
-        const response = try provider.call(
+        // Try streaming, fall back to non-streaming on error.
+        const response = provider.callStreaming(
             system_prompt,
             messages.items,
             tool_defs,
             allocator,
-        );
-
-        // Push complete response text to the queue
-        for (response.content) |block| {
-            switch (block) {
-                .text => |t| {
-                    const duped = try allocator.dupe(u8, t.text);
-                    try queue.push(.{ .text_delta = duped });
-                },
-                else => {},
+            &streamEventToQueue,
+            cancel,
+        ) catch |streaming_err| blk: {
+            log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
+            const fallback = try provider.call(
+                system_prompt,
+                messages.items,
+                tool_defs,
+                allocator,
+            );
+            // Push text to queue since streaming callback didn't fire
+            for (fallback.content) |block| {
+                switch (block) {
+                    .text => |t| {
+                        const duped = allocator.dupe(u8, t.text) catch continue;
+                        queue.push(.{ .text_delta = duped }) catch {};
+                    },
+                    else => {},
+                }
             }
-        }
+            break :blk fallback;
+        };
 
         // Add assistant message
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
