@@ -5,14 +5,11 @@
 const std = @import("std");
 const types = @import("types.zig");
 const llm = @import("llm.zig");
-const tools_mod = @import("tools.zig");
+const tools = @import("tools.zig");
 const AgentThread = @import("AgentThread.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
-
-/// Maximum characters of tool result content shown in the preview log line.
-const max_tool_preview = 80;
 
 const system_prompt =
     \\You are an expert coding assistant operating inside zag, a coding agent harness.
@@ -31,152 +28,13 @@ const system_prompt =
     \\- Prefer editing over rewriting entire files
 ;
 
-/// Semantic type of content emitted by the agent loop.
-pub const ContentType = enum {
-    /// LLM text response.
-    assistant_text,
-    /// Tool being executed (content is the tool name).
-    tool_call,
-    /// Result returned from a tool execution.
-    tool_result,
-    /// Informational diagnostic (e.g. token counts).
-    info,
-    /// An error occurred during agent execution.
-    err,
-};
-
-/// Callback that receives typed output from the agent loop.
-/// Called once per content block, tool status, or diagnostic line.
-pub const OutputCallback = *const fn (content_type: ContentType, text: []const u8) void;
-
-/// Default output callback: writes text to stdout (used by non-TUI mode).
-fn stdoutCallback(content_type: ContentType, text: []const u8) void {
-    _ = content_type;
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll(text) catch {};
-}
-
-/// Runs the agent loop for a single user turn. Appends the user message,
-/// then repeatedly calls the LLM and executes tool requests until the model
-/// produces a text-only response with no tool calls.
-///
-/// The `on_output` callback receives each text block and tool status line
-/// for display. Pass `null` to use the default stdout writer.
-pub fn runLoop(
-    user_text: []const u8,
-    messages: *std.ArrayList(types.Message),
-    registry: *const tools_mod.Registry,
-    provider: llm.Provider,
-    allocator: Allocator,
-    on_output: ?OutputCallback,
-) !void {
-    const emit = on_output orelse stdoutCallback;
-    // Add user message
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    const duped = try allocator.dupe(u8, user_text);
-    errdefer allocator.free(duped);
-    user_content[0] = .{ .text = .{ .text = duped } };
-    try messages.append(allocator, .{ .role = .user, .content = user_content });
-
-    const tool_defs = try registry.definitions(allocator);
-    defer allocator.free(tool_defs);
-
-    // Inner loop: call LLM, execute tools, repeat
-    while (true) {
-        const response = provider.call(
-            system_prompt,
-            messages.items,
-            tool_defs,
-            allocator,
-        ) catch |err| {
-            log.err("LLM call failed: {s}", .{@errorName(err)});
-            emit(.err, @errorName(err));
-            return;
-        };
-
-        // Add assistant message
-        try messages.append(allocator, .{ .role = .assistant, .content = response.content });
-
-        log.info("tokens in: {d}, out: {d}", .{ response.input_tokens, response.output_tokens });
-
-        // Emit token usage as info
-        {
-            var info_buf: [128]u8 = undefined;
-            const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
-            emit(.info, info_msg);
-        }
-
-        // Collect tool calls and text
-        var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
-        defer tool_calls.deinit(allocator);
-
-        for (response.content) |block| {
-            switch (block) {
-                .text => |t| {
-                    emit(.assistant_text, t.text);
-                },
-                .tool_use => |tu| {
-                    try tool_calls.append(allocator, tu);
-                },
-                .tool_result => {},
-            }
-        }
-
-        // No tool calls; we're done
-        if (tool_calls.items.len == 0) break;
-
-        // Execute tools and collect results
-        var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-        errdefer result_blocks.deinit(allocator);
-
-        for (tool_calls.items) |tc| {
-            log.info("executing tool: {s}", .{tc.name});
-            emit(.tool_call, tc.name);
-
-            const result = try registry.execute(tc.name, tc.input_raw, allocator);
-
-            if (result.is_error) {
-                log.info("tool error: {s}", .{result.content});
-                emit(.err, result.content);
-            } else {
-                const preview = blk: {
-                    if (result.content.len <= max_tool_preview) break :blk result.content;
-                    break :blk result.content[0..max_tool_preview];
-                };
-                log.info("tool result: {s}...", .{preview});
-                emit(.tool_result, result.content);
-            }
-
-            // Dupe content so the Message owns all strings and can free them
-            const owned_content = try allocator.dupe(u8, result.content);
-            errdefer allocator.free(owned_content);
-            const owned_id = try allocator.dupe(u8, tc.id);
-            errdefer allocator.free(owned_id);
-
-            try result_blocks.append(allocator, .{ .tool_result = .{
-                .tool_use_id = owned_id,
-                .content = owned_content,
-                .is_error = result.is_error,
-            } });
-        }
-
-        // Add tool results as a user message (Claude's format)
-        try messages.append(allocator, .{
-            .role = .user,
-            .content = try result_blocks.toOwnedSlice(allocator),
-        });
-    }
-}
-
-/// Runs the streaming variant of the agent loop on a background thread.
-/// Same logic as runLoop but uses callStreaming for incremental delivery,
-/// pushes events to the provided queue, and checks the cancel flag
-/// before each tool execution. Catches all errors and pushes .err.
-/// Pushes .done when the loop finishes (whether by completion or cancel).
+/// Runs the agent loop on a background thread using streaming.
+/// Pushes events to the provided queue and checks the cancel flag
+/// before each LLM call and tool execution. Catches all errors and
+/// pushes .err. Pushes .done when the loop finishes.
 pub fn runLoopStreaming(
     messages: *std.ArrayList(types.Message),
-    registry: *const tools_mod.Registry,
+    registry: *const tools.Registry,
     provider: llm.Provider,
     allocator: Allocator,
     queue: *AgentThread.EventQueue,
@@ -193,7 +51,7 @@ pub fn runLoopStreaming(
 /// catches them and pushes .err to the queue.
 fn runLoopStreamingInner(
     messages: *std.ArrayList(types.Message),
-    registry: *const tools_mod.Registry,
+    registry: *const tools.Registry,
     provider: llm.Provider,
     allocator: Allocator,
     queue: *AgentThread.EventQueue,
@@ -247,12 +105,10 @@ fn runLoopStreamingInner(
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
         // Emit token usage as info
-        {
-            var info_buf: [128]u8 = undefined;
-            const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
-            const duped_info = try allocator.dupe(u8, info_msg);
-            try queue.push(.{ .info = duped_info });
-        }
+        var info_buf: [128]u8 = undefined;
+        const info_msg = std.fmt.bufPrint(&info_buf, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
+        const duped_info = try allocator.dupe(u8, info_msg);
+        try queue.push(.{ .info = duped_info });
 
         // Collect tool calls
         var tool_calls: std.ArrayList(types.ContentBlock.ToolUse) = .empty;
@@ -277,27 +133,26 @@ fn runLoopStreamingInner(
             if (cancel.load(.acquire)) return;
 
             log.info("executing tool: {s}", .{tc.name});
-            const duped_name = try allocator.dupe(u8, tc.name);
-            try queue.push(.{ .tool_start = duped_name });
+            try queue.push(.{ .tool_start = try allocator.dupe(u8, tc.name) });
 
             const result = try registry.execute(tc.name, tc.input_raw, allocator);
             defer if (result.owned) allocator.free(result.content);
 
-            const duped_result = try allocator.dupe(u8, result.content);
+            // Push to UI queue (queue consumer frees)
             try queue.push(.{ .tool_result = .{
-                .content = duped_result,
+                .content = try allocator.dupe(u8, result.content),
                 .is_error = result.is_error,
             } });
 
-            // Dupe content so the Message owns all strings
-            const owned_content = try allocator.dupe(u8, result.content);
-            errdefer allocator.free(owned_content);
-            const owned_id = try allocator.dupe(u8, tc.id);
-            errdefer allocator.free(owned_id);
+            // Separate copy for conversation history (Message owns these)
+            const msg_content = try allocator.dupe(u8, result.content);
+            errdefer allocator.free(msg_content);
+            const msg_id = try allocator.dupe(u8, tc.id);
+            errdefer allocator.free(msg_id);
 
             try result_blocks.append(allocator, .{ .tool_result = .{
-                .tool_use_id = owned_id,
-                .content = owned_content,
+                .tool_use_id = msg_id,
+                .content = msg_content,
                 .is_error = result.is_error,
             } });
         }
