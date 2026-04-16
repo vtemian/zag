@@ -539,19 +539,33 @@ pub fn main() !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
 
-    // Welcome message
-    try appendOutputText("Welcome to zag - a composable agent environment");
-    {
-        var model_msg_buf: [128]u8 = undefined;
-        const model_msg = std.fmt.bufPrint(&model_msg_buf, "model: {s}", .{model_str}) catch "model: unknown";
-        try appendOutputText(model_msg);
+    // Welcome message (only for new sessions — resumed sessions show their history)
+    if (resume_id == null) {
+        try appendOutputText("Welcome to zag - a composable agent environment");
+        {
+            var model_msg_buf: [128]u8 = undefined;
+            const model_msg = std.fmt.bufPrint(&model_msg_buf, "model: {s}", .{model_str}) catch "model: unknown";
+            try appendOutputText(model_msg);
+        }
+        try appendOutputText("cwd: ");
+        try appendOutputText(cwd);
+        try appendOutputText("");
+        try appendOutputText("Type a message and press Enter. Ctrl+C or /quit to exit.");
+        try appendOutputText("Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.");
+        try appendOutputText("");
+    } else {
+        // Show a brief resume notice
+        if (session_handle) |*sh| {
+            var resume_buf: [256]u8 = undefined;
+            const resume_msg = std.fmt.bufPrint(
+                &resume_buf,
+                "Resumed session {s} ({d} messages)",
+                .{ sh.id[0..sh.id_len], sh.meta.message_count },
+            ) catch "Resumed session";
+            try appendOutputText(resume_msg);
+            try appendOutputText("");
+        }
     }
-    try appendOutputText("cwd: ");
-    try appendOutputText(cwd);
-    try appendOutputText("");
-    try appendOutputText("Type a message and press Enter. Ctrl+C or /quit to exit.");
-    try appendOutputText("Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.");
-    try appendOutputText("");
 
     // -- Input state ---------------------------------------------------------
     var input_buf: [MAX_INPUT]u8 = undefined;
