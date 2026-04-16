@@ -122,6 +122,9 @@ event_queue: AgentThread.EventQueue = undefined,
 cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false),
 /// Whether the event queue has been initialized (needs deinit).
 queue_active: bool = false,
+/// Wake fd for the main loop. Copied into EventQueue at submit time so
+/// agent threads can wake the poll() in main.zig.
+wake_fd: ?std.posix.fd_t = null,
 
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
@@ -592,6 +595,7 @@ pub fn submitInput(
     self.cancel_flag.store(false, .release);
 
     self.event_queue = AgentThread.EventQueue.init(allocator);
+    self.event_queue.wake_fd = self.wake_fd;
     self.queue_active = true;
 
     self.agent_thread = AgentThread.spawn(

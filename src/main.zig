@@ -182,6 +182,7 @@ fn createSplitPane(session_mgr: *?Session.SessionManager, model: []const u8, all
 
     cb.* = try ConversationBuffer.init(allocator, next_buffer_id, "scratch");
     errdefer cb.deinit();
+    cb.wake_fd = wake_write;
 
     next_buffer_id += 1;
 
@@ -460,6 +461,7 @@ pub fn main() !void {
         std.posix.close(wake_read);
         std.posix.close(wake_write);
     }
+    buffer.wake_fd = wake_write;
 
     // Initialize layout with the session buffer as root
     layout = Layout.init(allocator);
