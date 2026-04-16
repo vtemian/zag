@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const types = @import("types.zig");
+const Session = @import("Session.zig");
 
 const Buffer = @This();
 
@@ -74,6 +75,8 @@ messages: std.ArrayList(types.Message) = .empty,
 last_tool_call: ?*Node = null,
 /// Current assistant text node being streamed to.
 current_assistant_node: ?*Node = null,
+/// Open session file for persistence (null if unsaved buffer).
+session_handle: ?*Session.SessionHandle = null,
 
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
@@ -90,6 +93,7 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
 }
 
 /// Release all memory owned by this buffer: nodes, name, messages, and lists.
+/// The session_handle is NOT closed here — the owner (main or split creator) closes it.
 pub fn deinit(self: *Buffer) void {
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
