@@ -24,6 +24,33 @@ const build_options = @import("build_options");
 
 const log = std.log.scoped(.main);
 
+/// How to initialize the session on startup.
+const StartupMode = union(enum) {
+    /// Create a fresh session (default).
+    new_session,
+    /// Resume a specific session by its hex ID.
+    resume_session: []const u8,
+    /// Resume the most recently updated session.
+    resume_last,
+};
+
+/// Parse CLI arguments to determine startup mode.
+/// Recognizes --session=<id> and --last. Everything else is ignored.
+fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
+    var iter = try std.process.argsWithAllocator(allocator);
+    defer iter.deinit();
+    _ = iter.next(); // skip argv[0]
+
+    while (iter.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--session=")) {
+            return .{ .resume_session = arg["--session=".len..] };
+        } else if (std.mem.eql(u8, arg, "--last")) {
+            return .resume_last;
+        }
+    }
+    return .new_session;
+}
+
 /// Override the default std.log handler to suppress all log output in TUI mode.
 /// In TUI mode, writing to stderr corrupts the alternate screen buffer.
 /// Log messages are captured into the output line buffer instead.
@@ -200,6 +227,80 @@ fn attachSessionToBuffer(buf: *Buffer, session_mgr: *?Session.SessionManager, mo
     buf.session_handle = sh;
 }
 
+/// Generate a short session name via a cheap LLM call and apply it.
+/// Runs synchronously — brief block acceptable for v1.
+fn autoNameSession(sh: *Session.SessionHandle, buf: *Buffer, provider: llm.Provider, allocator: std.mem.Allocator) void {
+    const summary = generateSessionName(provider, buf, allocator) catch |err| {
+        log.warn("auto-name failed: {}", .{err});
+        return;
+    };
+    defer allocator.free(summary);
+
+    sh.rename(summary) catch |err| {
+        log.warn("session rename failed: {}", .{err});
+    };
+}
+
+/// Send a minimal LLM request to summarize a conversation in 3-5 words.
+fn generateSessionName(provider: llm.Provider, buf: *const Buffer, allocator: std.mem.Allocator) ![]const u8 {
+    const msgs = buf.messages.items;
+    if (msgs.len < 2) return error.InsufficientMessages;
+
+    // Extract first user message text
+    const user_text = extractFirstText(msgs[0]) orelse return error.NoUserText;
+
+    // Extract first assistant response text, truncated to 200 chars
+    const assistant_full = extractFirstText(msgs[1]) orelse return error.NoAssistantText;
+    const assistant_text = assistant_full[0..@min(assistant_full.len, 200)];
+
+    // Build a minimal 2-message conversation for the naming call
+    const user_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(user_content);
+    user_content[0] = .{ .text = .{ .text = user_text } };
+
+    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(assistant_content);
+    assistant_content[0] = .{ .text = .{ .text = assistant_text } };
+
+    var summary_msgs = [_]types.Message{
+        .{ .role = .user, .content = user_content },
+        .{ .role = .assistant, .content = assistant_content },
+    };
+
+    const response = try provider.call(
+        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
+        &summary_msgs,
+        &.{},
+        allocator,
+    );
+    defer response.deinit(allocator);
+
+    // Don't free the content slices — they point into buf.messages, not owned by us
+    allocator.free(user_content);
+    allocator.free(assistant_content);
+
+    // Extract response text
+    for (response.content) |block| {
+        switch (block) {
+            .text => |t| return try allocator.dupe(u8, t.text),
+            else => {},
+        }
+    }
+
+    return error.NoResponseText;
+}
+
+/// Extract the first text content from a message, or null if none.
+fn extractFirstText(msg: types.Message) ?[]const u8 {
+    for (msg.content) |block| {
+        switch (block) {
+            .text => |t| return t.text,
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// Draw the input/status line on the last row, overwriting the compositor's status line.
 /// Uses the theme's input_prompt, input_text, and status highlight groups.
 fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8, fps: u32, t: *const Theme) void {
@@ -314,12 +415,44 @@ pub fn main() !void {
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
 
+    // Parse CLI args to decide startup mode
+    const startup_mode = parseStartupArgs(allocator) catch .new_session;
+
     // Initialize session persistence
     var session_mgr = Session.SessionManager.init(allocator) catch |err| blk: {
         log.warn("session init failed, persistence disabled: {}", .{err});
         break :blk null;
     };
-    var session_handle: ?Session.SessionHandle = if (session_mgr) |*mgr|
+
+    // Resolve session ID for resume modes
+    var resolved_last_id: ?[]const u8 = null;
+    defer if (resolved_last_id) |id| allocator.free(id);
+
+    const resume_id: ?[]const u8 = switch (startup_mode) {
+        .new_session => null,
+        .resume_session => |id| id,
+        .resume_last => blk: {
+            if (session_mgr) |*mgr| {
+                resolved_last_id = mgr.findLastSession() catch null;
+                break :blk resolved_last_id;
+            }
+            break :blk null;
+        },
+    };
+
+    // Create or load session
+    var session_handle: ?Session.SessionHandle = if (resume_id) |id| blk: {
+        if (session_mgr) |*mgr| {
+            break :blk mgr.loadSession(id) catch |err| inner: {
+                log.warn("session load failed, starting new: {}", .{err});
+                break :inner mgr.createSession(model_str) catch |err2| {
+                    log.warn("session creation fallback failed: {}", .{err2});
+                    break :inner null;
+                };
+            };
+        }
+        break :blk null;
+    } else if (session_mgr) |*mgr|
         mgr.createSession(model_str) catch |err| blk: {
             log.warn("session creation failed: {}", .{err});
             break :blk null;
@@ -331,6 +464,36 @@ pub fn main() !void {
     // Attach session to the initial buffer
     if (session_handle != null) {
         buffer.session_handle = &(session_handle.?);
+    }
+
+    // Load entries from resumed session into buffer
+    if (resume_id != null) {
+        if (session_handle) |*sh| {
+            const session_id = sh.id[0..sh.id_len];
+            const entries = Session.loadEntries(session_id, allocator) catch |err| blk: {
+                log.warn("failed to load session entries: {}", .{err});
+                break :blk &[_]Session.Entry{};
+            };
+            defer {
+                for (entries) |entry| Session.freeEntry(entry, allocator);
+                allocator.free(entries);
+            }
+
+            if (entries.len > 0) {
+                buffer.loadFromEntries(entries) catch |err| {
+                    log.warn("failed to populate buffer from entries: {}", .{err});
+                };
+                buffer.rebuildMessages(entries, allocator) catch |err| {
+                    log.warn("failed to rebuild messages: {}", .{err});
+                };
+
+                // Update buffer name from session meta
+                if (sh.meta.name_len > 0) {
+                    allocator.free(buffer.name);
+                    buffer.name = allocator.dupe(u8, sh.meta.nameSlice()) catch buffer.name;
+                }
+            }
+        }
     }
 
     // -- Enter TUI mode ------------------------------------------------------
@@ -743,6 +906,13 @@ pub fn main() !void {
                         event_queue.deinit();
                         status_msg = "";
                         active_buf.current_assistant_node = null;
+
+                        // Auto-name session after first exchange
+                        if (active_buf.session_handle) |sh| {
+                            if (sh.meta.name_len == 0 and active_buf.messages.items.len >= 2) {
+                                autoNameSession(sh, active_buf, provider_result.provider, allocator);
+                            }
+                        }
                     },
                     .err => |text| {
                         defer allocator.free(text);
