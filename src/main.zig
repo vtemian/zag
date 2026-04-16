@@ -559,18 +559,18 @@ pub fn main() !void {
 
     // Welcome message (only for new sessions, resumed sessions show their history)
     if (resume_id == null) {
-        try appendOutputText("Welcome to zag - a composable agent environment");
         {
-            var scratch: [128]u8 = undefined;
-            const model_msg = std.fmt.bufPrint(&scratch, "model: {s}", .{provider.model_id}) catch "model: unknown";
-            try appendOutputText(model_msg);
+            var scratch: [512]u8 = undefined;
+            const welcome = std.fmt.bufPrint(&scratch,
+                \\Welcome to zag - a composable agent environment
+                \\model: {s}
+                \\cwd: {s}
+                \\
+                \\Type a message and press Enter. Ctrl+C or /quit to exit.
+                \\Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.
+            , .{ provider.model_id, cwd }) catch "Welcome to zag";
+            try appendOutputText(welcome);
         }
-        try appendOutputText("cwd: ");
-        try appendOutputText(cwd);
-        try appendOutputText("");
-        try appendOutputText("Type a message and press Enter. Ctrl+C or /quit to exit.");
-        try appendOutputText("Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.");
-        try appendOutputText("");
     } else {
         // Show a brief resume notice
         if (session_handle) |*sh| {
