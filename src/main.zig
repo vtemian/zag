@@ -194,7 +194,7 @@ fn attachSession(cb: *ConversationBuffer, session_mgr: *?Session.SessionManager,
 const CommandResult = enum { handled, quit, not_a_command };
 
 /// Try to handle input as a slash command. Returns .not_a_command if it isn't one.
-fn handleCommand(input: []const u8, model_str: []const u8) CommandResult {
+fn handleCommand(input: []const u8, model_id: []const u8) CommandResult {
     if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q")) {
         return .quit;
     }
@@ -202,9 +202,9 @@ fn handleCommand(input: []const u8, model_str: []const u8) CommandResult {
     if (std.mem.eql(u8, input, "/perf")) {
         if (trace.enabled) {
             const stats = trace.getStats();
-            var perf_buf: [512]u8 = undefined;
+            var scratch: [512]u8 = undefined;
 
-            const header = std.fmt.bufPrint(&perf_buf, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
+            const header = std.fmt.bufPrint(&scratch, "Performance (last {d} frames):", .{stats.frame_count}) catch "Performance:";
             appendOutputText(header) catch {};
 
             const avg_ms = @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0;
@@ -212,15 +212,15 @@ fn handleCommand(input: []const u8, model_str: []const u8) CommandResult {
             const max_ms = @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0;
             const peak_mb = @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0);
 
-            const avg_line = std.fmt.bufPrint(&perf_buf, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
+            const avg_line = std.fmt.bufPrint(&scratch, "  avg frame:       {d:.1}ms", .{avg_ms}) catch "";
             appendOutputText(avg_line) catch {};
-            const p99_line = std.fmt.bufPrint(&perf_buf, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
+            const p99_line = std.fmt.bufPrint(&scratch, "  p99 frame:       {d:.1}ms", .{p99_ms}) catch "";
             appendOutputText(p99_line) catch {};
-            const max_line = std.fmt.bufPrint(&perf_buf, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
+            const max_line = std.fmt.bufPrint(&scratch, "  max frame:       {d:.1}ms", .{max_ms}) catch "";
             appendOutputText(max_line) catch {};
-            const peak_line = std.fmt.bufPrint(&perf_buf, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
+            const peak_line = std.fmt.bufPrint(&scratch, "  peak memory:     {d:.1}MB", .{peak_mb}) catch "";
             appendOutputText(peak_line) catch {};
-            const allocs_line = std.fmt.bufPrint(&perf_buf, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
+            const allocs_line = std.fmt.bufPrint(&scratch, "  avg allocs/frame: {d:.1}", .{stats.avg_allocs_per_frame}) catch "";
             appendOutputText(allocs_line) catch {};
         } else {
             appendOutputText("metrics not enabled (build with -Dmetrics=true)") catch {};
@@ -231,14 +231,14 @@ fn handleCommand(input: []const u8, model_str: []const u8) CommandResult {
     if (std.mem.eql(u8, input, "/perf-dump")) {
         if (trace.enabled) {
             const count = trace.dump("zag-trace.json") catch |err| blk: {
-                var err_buf: [256]u8 = undefined;
-                const err_msg = std.fmt.bufPrint(&err_buf, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
+                var scratch: [256]u8 = undefined;
+                const err_msg = std.fmt.bufPrint(&scratch, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
                 appendOutputText(err_msg) catch {};
                 break :blk @as(usize, 0);
             };
             if (count > 0) {
-                var dump_buf: [256]u8 = undefined;
-                const dump_msg = std.fmt.bufPrint(&dump_buf, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
+                var scratch: [256]u8 = undefined;
+                const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
                 appendOutputText(dump_msg) catch {};
             }
         } else {
@@ -248,8 +248,8 @@ fn handleCommand(input: []const u8, model_str: []const u8) CommandResult {
     }
 
     if (std.mem.eql(u8, input, "/model")) {
-        var model_cmd_buf: [128]u8 = undefined;
-        const model_info = std.fmt.bufPrint(&model_cmd_buf, "model: {s}", .{model_str}) catch "model: unknown";
+        var scratch: [128]u8 = undefined;
+        const model_info = std.fmt.bufPrint(&scratch, "model: {s}", .{model_id}) catch "model: unknown";
         appendOutputText(model_info) catch {};
         return .handled;
     }
@@ -353,7 +353,7 @@ fn extractFirstText(msg: types.Message) ?[]const u8 {
 
 /// Draw the input/status line on the last row, overwriting the compositor's status line.
 /// Uses the theme's input_prompt, input_text, and status highlight groups.
-fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, status_msg: []const u8, fps: u32, t: *const Theme) void {
+fn drawInputLine(screen: *Screen, input: []const u8, input_len: usize, status_msg: []const u8, fps: u32, t: *const Theme) void {
     if (screen.height == 0) return;
     const input_row = screen.height - 1;
 
@@ -378,18 +378,18 @@ fn drawInputLine(screen: *Screen, input_buf_ptr: []const u8, input_len: usize, s
         const prompt_resolved = Theme.resolve(t.highlights.input_prompt, t);
         const text_resolved = Theme.resolve(t.highlights.input_text, t);
         const c = screen.writeStr(input_row, 0, "> ", prompt_resolved.screen_style, prompt_resolved.fg);
-        _ = screen.writeStr(input_row, c, input_buf_ptr[0..input_len], text_resolved.screen_style, text_resolved.fg);
+        _ = screen.writeStr(input_row, c, input[0..input_len], text_resolved.screen_style, text_resolved.fg);
     }
 
     // Show render time and FPS right-aligned when metrics are enabled
     if (trace.enabled) {
         const frame_us = trace.getLastFrameTimeUs();
         const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
-        var time_buf: [32]u8 = undefined;
+        var scratch: [32]u8 = undefined;
         const time_str = if (fps > 0)
-            std.fmt.bufPrint(&time_buf, "{d:.1}ms {d}fps", .{ frame_ms, fps }) catch return
+            std.fmt.bufPrint(&scratch, "{d:.1}ms {d}fps", .{ frame_ms, fps }) catch return
         else
-            std.fmt.bufPrint(&time_buf, "{d:.1}ms", .{frame_ms}) catch return;
+            std.fmt.bufPrint(&scratch, "{d:.1}ms", .{frame_ms}) catch return;
         const status_resolved = Theme.resolve(t.highlights.status, t);
         const time_col = screen.width -| @as(u16, @intCast(time_str.len)) -| 1;
         _ = screen.writeStr(input_row, time_col, time_str, status_resolved.screen_style, status_resolved.fg);
@@ -439,25 +439,25 @@ pub fn main() !void {
     }
 
     // Read model string and create provider
-    const model_str = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
+    const model_id = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
         try allocator.dupe(u8, "anthropic/claude-sonnet-4-20250514");
-    defer allocator.free(model_str);
+    defer allocator.free(model_id);
 
     // Initialize endpoint registry
     var endpoint_registry = llm.Registry.init(allocator) catch {
         const stderr = std.fs.File.stderr();
-        var err_buf: [256]u8 = undefined;
-        var w = stderr.writer(&err_buf);
+        var scratch: [256]u8 = undefined;
+        var w = stderr.writer(&scratch);
         w.interface.print("error: failed to initialize endpoint registry\n", .{}) catch {};
         w.interface.flush() catch {};
         return;
     };
     defer endpoint_registry.deinit();
 
-    var provider_result = llm.createProvider(&endpoint_registry, model_str, allocator) catch |err| {
+    var provider_result = llm.createProvider(&endpoint_registry, model_id, allocator) catch |err| {
         const stderr = std.fs.File.stderr();
-        var err_buf: [256]u8 = undefined;
-        var w = stderr.writer(&err_buf);
+        var scratch: [256]u8 = undefined;
+        var w = stderr.writer(&scratch);
         w.interface.print("error: failed to create provider: {s}\n", .{@errorName(err)}) catch {};
         w.interface.flush() catch {};
         return;
@@ -533,7 +533,7 @@ pub fn main() !void {
         if (session_mgr) |*mgr| {
             break :blk mgr.loadSession(id) catch |err| inner: {
                 log.warn("session load failed, starting new: {}", .{err});
-                break :inner mgr.createSession(model_str) catch |err2| {
+                break :inner mgr.createSession(model_id) catch |err2| {
                     log.warn("session creation fallback failed: {}", .{err2});
                     break :inner null;
                 };
@@ -541,7 +541,7 @@ pub fn main() !void {
         }
         break :blk null;
     } else if (session_mgr) |*mgr|
-        mgr.createSession(model_str) catch |err| blk: {
+        mgr.createSession(model_id) catch |err| blk: {
             log.warn("session creation failed: {}", .{err});
             break :blk null;
         }
@@ -630,8 +630,8 @@ pub fn main() !void {
     if (resume_id == null) {
         try appendOutputText("Welcome to zag - a composable agent environment");
         {
-            var model_msg_buf: [128]u8 = undefined;
-            const model_msg = std.fmt.bufPrint(&model_msg_buf, "model: {s}", .{model_str}) catch "model: unknown";
+            var scratch: [128]u8 = undefined;
+            const model_msg = std.fmt.bufPrint(&scratch, "model: {s}", .{model_id}) catch "model: unknown";
             try appendOutputText(model_msg);
         }
         try appendOutputText("cwd: ");
@@ -643,9 +643,9 @@ pub fn main() !void {
     } else {
         // Show a brief resume notice
         if (session_handle) |*sh| {
-            var resume_buf: [256]u8 = undefined;
+            var scratch: [256]u8 = undefined;
             const resume_msg = std.fmt.bufPrint(
-                &resume_buf,
+                &scratch,
                 "Resumed session {s} ({d} messages)",
                 .{ sh.id[0..sh.id_len], sh.meta.message_count },
             ) catch "Resumed session";
@@ -728,8 +728,8 @@ pub fn main() !void {
                         awaiting_window_cmd = false;
                         switch (k.key) {
                             .char => |ch| switch (ch) {
-                                'v' => doSplit(.vertical, &session_mgr, model_str, allocator, screen.width, screen.height),
-                                's' => doSplit(.horizontal, &session_mgr, model_str, allocator, screen.width, screen.height),
+                                'v' => doSplit(.vertical, &session_mgr, model_id, allocator, screen.width, screen.height),
+                                's' => doSplit(.horizontal, &session_mgr, model_id, allocator, screen.width, screen.height),
                                 'q' => {
                                     // Close window
                                     layout.closeWindow();
@@ -771,7 +771,7 @@ pub fn main() !void {
 
                                 const user_input = input_buf[0..input_len];
 
-                                switch (handleCommand(user_input, model_str)) {
+                                switch (handleCommand(user_input, model_id)) {
                                     .quit => {
                                         running = false;
                                         continue;

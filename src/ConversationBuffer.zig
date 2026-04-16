@@ -114,14 +114,14 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
     const node = try self.allocator.create(Node);
     errdefer self.allocator.destroy(node);
 
-    var content_list: std.ArrayList(u8) = .empty;
-    try content_list.appendSlice(self.allocator, content);
-    errdefer content_list.deinit(self.allocator);
+    var items: std.ArrayList(u8) = .empty;
+    try items.appendSlice(self.allocator, content);
+    errdefer items.deinit(self.allocator);
 
     node.* = .{
         .id = self.next_id,
         .node_type = node_type,
-        .content = content_list,
+        .content = items,
         .children = .empty,
         .parent = parent,
     };
@@ -241,10 +241,10 @@ pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry
             },
             .tool_call => {
                 try self.flushToolResultMessage(&tool_result_blocks, allocator);
-                var id_buf: [16]u8 = undefined;
-                const id_str = std.fmt.bufPrint(&id_buf, "synth_{d}", .{tool_id_counter}) catch unreachable;
+                var scratch: [16]u8 = undefined;
+                const synthetic_id = std.fmt.bufPrint(&scratch, "synth_{d}", .{tool_id_counter}) catch unreachable;
                 tool_id_counter += 1;
-                const duped_id = try allocator.dupe(u8, id_str);
+                const duped_id = try allocator.dupe(u8, synthetic_id);
                 const duped_name = try allocator.dupe(u8, entry.tool_name);
                 const duped_input = try allocator.dupe(u8, if (entry.tool_input.len > 0) entry.tool_input else "{}");
                 try assistant_blocks.append(allocator, .{ .tool_use = .{
@@ -253,7 +253,7 @@ pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry
                     .input_raw = duped_input,
                 } });
                 if (last_tool_use_id) |prev_id| allocator.free(prev_id);
-                last_tool_use_id = try allocator.dupe(u8, id_str);
+                last_tool_use_id = try allocator.dupe(u8, synthetic_id);
             },
             .tool_result => {
                 try self.flushAssistantMessage(&assistant_blocks, allocator);

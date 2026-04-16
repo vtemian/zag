@@ -276,16 +276,16 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                 }
 
                 // Write the codepoint as UTF-8, falling back to U+FFFD for invalid codepoints
-                var cp_buf: [4]u8 = undefined;
-                const cp_len = std.unicode.utf8Encode(cur.codepoint, &cp_buf) catch |err| blk: {
+                var encoded: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cur.codepoint, &encoded) catch |err| blk: {
                     log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cur.codepoint), err });
                     // U+FFFD REPLACEMENT CHARACTER (0xEF 0xBF 0xBD)
-                    cp_buf[0] = 0xEF;
-                    cp_buf[1] = 0xBF;
-                    cp_buf[2] = 0xBD;
+                    encoded[0] = 0xEF;
+                    encoded[1] = 0xBF;
+                    encoded[2] = 0xBD;
                     break :blk 3;
                 };
-                try writer.writeAll(cp_buf[0..cp_len]);
+                try writer.writeAll(encoded[0..len]);
 
                 cursor_col +|= 1;
             }
@@ -465,8 +465,8 @@ test "render with no changes produces only sync markers" {
     write_end.close();
 
     // Read what was written using raw posix read
-    var pipe_buf: [8192]u8 = undefined;
-    const output = try readPipe(read_end, &pipe_buf);
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
 
     // Should contain only the sync markers, no SGR or cursor movement
     try std.testing.expectEqualStrings("\x1b[?2026h\x1b[?2026l", output);
@@ -491,8 +491,8 @@ test "render emits output for changed cells" {
     try screen.render(write_end);
     write_end.close();
 
-    var pipe_buf: [8192]u8 = undefined;
-    const output = try readPipe(read_end, &pipe_buf);
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
 
     // Should start with sync begin
     try std.testing.expect(std.mem.startsWith(u8, output, "\x1b[?2026h"));
@@ -553,8 +553,8 @@ test "second render with no new changes produces only sync markers" {
         try screen.render(write_end);
         write_end.close();
 
-        var pipe_buf: [8192]u8 = undefined;
-        const output = try readPipe(read_end, &pipe_buf);
+        var scratch: [8192]u8 = undefined;
+        const output = try readPipe(read_end, &scratch);
         try std.testing.expectEqualStrings("\x1b[?2026h\x1b[?2026l", output);
     }
 }
@@ -625,8 +625,8 @@ test "render encodes non-ASCII multi-byte UTF-8 codepoints" {
     try screen.render(write_end);
     write_end.close();
 
-    var pipe_buf: [8192]u8 = undefined;
-    const output = try readPipe(read_end, &pipe_buf);
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
 
     // Verify each multi-byte sequence appears in the output
     try std.testing.expect(std.mem.indexOf(u8, output, "\xC3\xA9") != null);
@@ -650,8 +650,8 @@ test "render emits RGB background color SGR sequences" {
     try screen.render(write_end);
     write_end.close();
 
-    var pipe_buf: [8192]u8 = undefined;
-    const output = try readPipe(read_end, &pipe_buf);
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
 
     // Should contain the RGB background SGR: 48;2;255;128;0
     try std.testing.expect(std.mem.indexOf(u8, output, "48;2;255;128;0") != null);
@@ -673,8 +673,8 @@ test "render emits palette background color SGR sequences" {
     try screen.render(write_end);
     write_end.close();
 
-    var pipe_buf: [8192]u8 = undefined;
-    const output = try readPipe(read_end, &pipe_buf);
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
 
     // Should contain the palette background SGR: 48;5;42
     try std.testing.expect(std.mem.indexOf(u8, output, "48;5;42") != null);

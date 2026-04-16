@@ -163,13 +163,13 @@ fn splitAndAppendIndented(
         const nl = std.mem.indexOfScalar(u8, rest, '\n');
         const segment = if (nl) |n| rest[0..n] else rest;
 
-        const indent_str = try allocator.alloc(u8, indent_count);
-        @memset(indent_str, ' ');
+        const padding = try allocator.alloc(u8, indent_count);
+        @memset(padding, ' ');
 
         const owned_seg = try allocator.dupe(u8, segment);
         errdefer allocator.free(owned_seg);
         const spans = try allocator.alloc(StyledSpan, 2);
-        spans[0] = .{ .text = indent_str, .style = .{} };
+        spans[0] = .{ .text = padding, .style = .{} };
         spans[1] = .{ .text = owned_seg, .style = style };
         try lines.append(allocator, .{ .spans = spans });
 
