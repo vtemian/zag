@@ -328,7 +328,7 @@ pub fn parseModelString(model: []const u8) ModelSpec {
 /// Result of creating a provider. Owns all resources needed for LLM calls.
 /// A single deinit() frees everything: provider state, API key, model string, registry.
 pub const ProviderResult = struct {
-    /// The provider interface to pass to agent.runLoop.
+    /// The provider interface for agent loop LLM calls.
     provider: Provider,
     /// The full "provider/model" string (e.g., "anthropic/claude-sonnet-4-20250514").
     model_id: []const u8,
