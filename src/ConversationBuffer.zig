@@ -122,6 +122,9 @@ event_queue: AgentThread.EventQueue = undefined,
 cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false),
 /// Whether the event queue has been initialized (needs deinit).
 queue_active: bool = false,
+/// Pointer to the shared Lua engine, if any. Used by the main-thread
+/// drain loop to service `hook_request` events pushed by the agent.
+lua_engine: ?*LuaEngine = null,
 
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
@@ -596,6 +599,7 @@ pub fn submitInput(
 
     self.event_queue = AgentThread.EventQueue.init(allocator);
     self.queue_active = true;
+    self.lua_engine = lua_eng;
 
     self.agent_thread = AgentThread.spawn(
         provider,
@@ -614,9 +618,42 @@ pub fn submitInput(
     };
 }
 
+/// Pull any hook_request events out of the queue and service them on the
+/// main thread (the only thread allowed to touch Lua). Non-hook events are
+/// compacted back into the queue in their original order. Called before the
+/// normal drain loop so pre-hook vetos round-trip with minimal latency.
+pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine) void {
+    const eng = engine orelse return;
+    queue.mutex.lock();
+    defer queue.mutex.unlock();
+
+    var write: usize = 0;
+    for (queue.items.items) |ev| {
+        switch (ev) {
+            .hook_request => |req| {
+                eng.fireHook(req.payload) catch |err| {
+                    log.warn("hook dispatch failed: {}", .{err});
+                };
+                if (eng.takeCancel()) |reason| {
+                    req.cancelled = true;
+                    req.cancel_reason = reason;
+                }
+                req.done.set();
+            },
+            else => {
+                queue.items.items[write] = ev;
+                write += 1;
+            },
+        }
+    }
+    queue.items.items.len = write;
+}
+
 /// Drain pending agent events. Returns true if the agent finished this frame.
 pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
     if (self.agent_thread == null) return false;
+
+    dispatchHookRequests(&self.event_queue, self.lua_engine);
 
     var drain: [64]AgentThread.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
@@ -1162,4 +1199,31 @@ test "text_delta after reset starts a fresh assistant node" {
     cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
     try std.testing.expectEqualStrings("Hello world", cb.root_children.items[0].content.items);
+}
+
+test "dispatchHookRequests fires Lua hook and signals done" {
+    const Hooks = @import("Hooks.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.last_turn = nil
+        \\zag.hook("TurnStart", function(evt) _G.last_turn = evt.turn_num end)
+    );
+
+    var queue = AgentThread.EventQueue.init(alloc);
+    defer queue.deinit();
+
+    var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 7, .message_count = 1 } };
+    var req = Hooks.HookRequest.init(&payload);
+    try queue.push(.{ .hook_request = &req });
+
+    dispatchHookRequests(&queue, &engine);
+
+    try std.testing.expect(req.done.isSet());
+    _ = try engine.lua.getGlobal("last_turn");
+    try std.testing.expectEqual(@as(i64, 7), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
 }
