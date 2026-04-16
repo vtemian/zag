@@ -631,7 +631,7 @@ pub fn main() !void {
                 posix.nanosleep(0, 10 * std.time.ns_per_ms);
                 continue;
             }
-            posix.nanosleep(0, 16 * std.time.ns_per_ms);
+            posix.nanosleep(0, 2 * std.time.ns_per_ms);
         }
 
         // Start frame timing (only for frames that do real work)
