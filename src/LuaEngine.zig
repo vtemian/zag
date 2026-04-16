@@ -198,15 +198,15 @@ pub const LuaEngine = struct {
             },
             .number => {
                 // Try integer first
-                const int_val = lua.toInteger(abs_index) catch {
-                    const num_val = lua.toNumber(abs_index) catch {
+                const integer = lua.toInteger(abs_index) catch {
+                    const number = lua.toNumber(abs_index) catch {
                         try writer.writeAll("null");
                         return;
                     };
-                    try writer.print("{d}", .{num_val});
+                    try writer.print("{d}", .{number});
                     return;
                 };
-                try writer.print("{d}", .{int_val});
+                try writer.print("{d}", .{integer});
             },
             .string => {
                 const str = lua.toString(abs_index) catch {
@@ -318,11 +318,11 @@ pub const LuaEngine = struct {
         }
 
         // Success: first return value is the result string
-        const result_str = self.lua.toString(-2) catch {
+        const result = self.lua.toString(-2) catch {
             self.lua.pop(2);
             return .{ .content = "error: Lua tool returned non-string", .is_error = true, .owned = false };
         };
-        const owned_result = allocator.dupe(u8, result_str) catch {
+        const owned_result = allocator.dupe(u8, result) catch {
             self.lua.pop(2);
             return .{ .content = "error: OOM copying Lua result", .is_error = true, .owned = false };
         };
@@ -333,8 +333,8 @@ pub const LuaEngine = struct {
     // -- JSON to Lua table conversion ------------------------------------------
 
     /// Parse a JSON string and push it onto the Lua stack as a table.
-    fn pushJsonAsTable(lua: *Lua, json_str: []const u8, allocator: Allocator) !void {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    fn pushJsonAsTable(lua: *Lua, raw_json: []const u8, allocator: Allocator) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
         defer parsed.deinit();
         pushJsonValue(lua, parsed.value);
     }

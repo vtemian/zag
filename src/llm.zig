@@ -312,16 +312,16 @@ pub const ModelSpec = struct {
 };
 
 /// Parse a "provider/model" string. If no slash is present, defaults to "anthropic".
-pub fn parseModelString(model_str: []const u8) ModelSpec {
-    if (std.mem.indexOfScalar(u8, model_str, '/')) |slash| {
+pub fn parseModelString(model: []const u8) ModelSpec {
+    if (std.mem.indexOfScalar(u8, model, '/')) |slash| {
         return .{
-            .provider_name = model_str[0..slash],
-            .model_id = model_str[slash + 1 ..],
+            .provider_name = model[0..slash],
+            .model_id = model[slash + 1 ..],
         };
     }
     return .{
         .provider_name = "anthropic",
-        .model_id = model_str,
+        .model_id = model,
     };
 }
 
@@ -352,8 +352,8 @@ pub const ProviderResult = struct {
 };
 
 /// Create a provider from a model string, looking up the endpoint in the registry.
-pub fn createProvider(registry: *const Registry, model_str: []const u8, allocator: Allocator) !ProviderResult {
-    const spec = parseModelString(model_str);
+pub fn createProvider(registry: *const Registry, model: []const u8, allocator: Allocator) !ProviderResult {
+    const spec = parseModelString(model);
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
