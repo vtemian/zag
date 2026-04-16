@@ -123,7 +123,6 @@ fn twoSpanLine(
     return .{ .spans = spans };
 }
 
-
 /// Split content on newlines and append one StyledLine per segment.
 /// If prefix is provided, the first line gets a two-span layout (prefix + segment).
 /// Subsequent lines and all lines without a prefix get single-span layout.
@@ -230,7 +229,6 @@ fn renderDefault(
         },
     }
 }
-
 
 // -- Tests -------------------------------------------------------------------
 
