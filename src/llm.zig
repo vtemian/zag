@@ -165,7 +165,9 @@ pub const Registry = struct {
         var self = Registry{ .endpoints = .empty, .allocator = allocator };
         errdefer self.deinit();
         for (&builtin_endpoints) |*ep| {
-            try self.endpoints.append(allocator, try ep.dupe(allocator));
+            const duped = try ep.dupe(allocator);
+            errdefer duped.free(allocator);
+            try self.endpoints.append(allocator, duped);
         }
         return self;
     }
@@ -178,6 +180,7 @@ pub const Registry = struct {
         return null;
     }
 
+    /// Release all heap-owned endpoints and backing storage.
     pub fn deinit(self: *Registry) void {
         for (self.endpoints.items) |ep| ep.free(self.allocator);
         self.endpoints.deinit(self.allocator);
@@ -185,15 +188,21 @@ pub const Registry = struct {
 };
 
 /// Build HTTP headers from an endpoint's auth config and extra headers.
-/// Caller must call freeHeaders() when done.
+/// The auth header value is always heap-allocated so freeHeaders() can
+/// free it uniformly. Caller must call freeHeaders() when done.
 pub fn buildHeaders(endpoint: *const Endpoint, api_key: []const u8, allocator: Allocator) !std.ArrayList(std.http.Header) {
     var headers: std.ArrayList(std.http.Header) = .empty;
     errdefer headers.deinit(allocator);
 
     switch (endpoint.auth) {
-        .x_api_key => try headers.append(allocator, .{ .name = "x-api-key", .value = api_key }),
+        .x_api_key => {
+            const duped_key = try allocator.dupe(u8, api_key);
+            errdefer allocator.free(duped_key);
+            try headers.append(allocator, .{ .name = "x-api-key", .value = duped_key });
+        },
         .bearer => {
             const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+            errdefer allocator.free(auth_value);
             try headers.append(allocator, .{ .name = "Authorization", .value = auth_value });
         },
         .none => {},
@@ -206,9 +215,10 @@ pub fn buildHeaders(endpoint: *const Endpoint, api_key: []const u8, allocator: A
     return headers;
 }
 
-/// Free headers built by buildHeaders(). Only Bearer auth allocates a header value.
+/// Free headers built by buildHeaders(). The first header's value is always
+/// heap-allocated (auth header) and must be freed.
 pub fn freeHeaders(endpoint: *const Endpoint, headers: *std.ArrayList(std.http.Header), allocator: Allocator) void {
-    if (endpoint.auth == .bearer and headers.items.len > 0) {
+    if (endpoint.auth != .none and headers.items.len > 0) {
         allocator.free(headers.items[0].value);
     }
     headers.deinit(allocator);
