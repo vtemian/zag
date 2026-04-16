@@ -28,6 +28,7 @@ pub const AnthropicSerializer = struct {
         .name = "anthropic",
     };
 
+    /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *AnthropicSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
     }

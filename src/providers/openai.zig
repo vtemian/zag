@@ -30,6 +30,7 @@ pub const OpenAiSerializer = struct {
         .name = "openai",
     };
 
+    /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *OpenAiSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
     }
