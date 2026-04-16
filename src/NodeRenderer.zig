@@ -88,8 +88,8 @@ pub fn render(
 pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     return switch (node.node_type) {
         .separator => 1,
-        .tool_call, .tool_result, .err => 1,
-        .user_message, .assistant_text, .status, .custom => blk: {
+        .tool_call, .err => 1,
+        .user_message, .assistant_text, .tool_result, .status, .custom => blk: {
             // Count newlines to determine line count
             const content = node.content.items;
             var count: usize = 1;
