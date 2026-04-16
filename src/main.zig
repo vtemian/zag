@@ -87,6 +87,12 @@ fn tuiLogHandler(
 /// Module-level buffer, initialized in main().
 var buffer: ConversationBuffer = undefined;
 
+/// Wake pipe for event-driven main loop. `wake_read` is polled by the main
+/// thread; `wake_write` is written (1 byte) by agent threads after pushing
+/// to an EventQueue and by the SIGWINCH handler. Both fds are O_NONBLOCK.
+var wake_read: std.posix.fd_t = -1;
+var wake_write: std.posix.fd_t = -1;
+
 /// Layout, compositor, and theme, initialized in main().
 var layout: Layout = undefined;
 var compositor: Compositor = undefined;
@@ -445,6 +451,15 @@ pub fn main() !void {
     // Module-level buffer
     buffer = try ConversationBuffer.init(allocator, 0, "session");
     defer buffer.deinit();
+
+    // Create wake pipe (non-blocking, close-on-exec)
+    const wake_fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    wake_read = wake_fds[0];
+    wake_write = wake_fds[1];
+    defer {
+        std.posix.close(wake_read);
+        std.posix.close(wake_write);
+    }
 
     // Initialize layout with the session buffer as root
     layout = Layout.init(allocator);
