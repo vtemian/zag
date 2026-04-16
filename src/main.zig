@@ -545,18 +545,16 @@ pub fn main() !void {
 
     // Welcome message (only for new sessions, resumed sessions show their history)
     if (resume_id == null) {
-        {
-            var scratch: [512]u8 = undefined;
-            const welcome = std.fmt.bufPrint(&scratch,
-                \\Welcome to zag - a composable agent environment
-                \\model: {s}
-                \\cwd: {s}
-                \\
-                \\Type a message and press Enter. Ctrl+C or /quit to exit.
-                \\Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.
-            , .{ provider.model_id, cwd }) catch "Welcome to zag";
-            try appendOutputText(welcome);
-        }
+        var scratch: [512]u8 = undefined;
+        const welcome = std.fmt.bufPrint(&scratch,
+            \\Welcome to zag - a composable agent environment
+            \\model: {s}
+            \\cwd: {s}
+            \\
+            \\Type a message and press Enter. Ctrl+C or /quit to exit.
+            \\Ctrl+W then v/s/q/h/j/k/l for windows. /model to show model.
+        , .{ provider.model_id, cwd }) catch "Welcome to zag";
+        try appendOutputText(welcome);
     } else {
         // Show a brief resume notice
         if (session_handle) |*sh| {
@@ -610,10 +608,7 @@ pub fn main() !void {
         // Check for terminal resize (SIGWINCH)
         const resized = term.checkResize();
         if (resized) |new_size| {
-            try screen.resize(new_size.cols, new_size.rows);
-            layout.recalculate(new_size.cols, new_size.rows);
-            ctx.screen_width = new_size.cols;
-            ctx.screen_height = new_size.rows;
+            try handleResize(&screen, &ctx, new_size.cols, new_size.rows);
         }
 
         if (maybe_event == null and resized == null) {
@@ -660,11 +655,8 @@ pub fn main() !void {
             // Resize needs screen/term locals, handle inline
             if (event == .resize) {
                 const sz = event.resize;
-                try screen.resize(sz.cols, sz.rows);
                 term.size = .{ .rows = sz.rows, .cols = sz.cols };
-                layout.recalculate(sz.cols, sz.rows);
-                ctx.screen_width = sz.cols;
-                ctx.screen_height = sz.rows;
+                try handleResize(&screen, &ctx, sz.cols, sz.rows);
             } else {
                 const action = switch (event) {
                     .key => |k| handleKey(k, &input_buf, &input_len, &ctx),
@@ -679,25 +671,23 @@ pub fn main() !void {
         for (extra_panes.items) |pane| {
             drainBuffer(pane.buffer, &provider, allocator);
         }
-        if (getFocusedConversation().isAgentRunning()) {
+        // Update spinner and redraw
+        const focused = getFocusedConversation();
+        const agent_running = focused.isAgentRunning();
+        if (agent_running) {
             spinner_frame = (spinner_frame +% 1) % @as(u8, spinner_chars.len);
         }
-
-        // Redraw
-        {
-            const focused = getFocusedConversation();
-            const status = if (focused.isAgentRunning()) blk: {
-                const info = focused.lastInfo();
-                break :blk if (info.len > 0) info else "streaming...";
-            } else "";
-            compositor.composite(&layout, .{
-                .text = input_buf[0..input_len],
-                .status = status,
-                .agent_running = focused.isAgentRunning(),
-                .spinner_frame = spinner_frame,
-                .fps = current_fps,
-            });
-        }
+        const status = if (agent_running) blk: {
+            const info = focused.lastInfo();
+            break :blk if (info.len > 0) info else "streaming...";
+        } else "";
+        compositor.composite(&layout, .{
+            .text = input_buf[0..input_len],
+            .status = status,
+            .agent_running = agent_running,
+            .spinner_frame = spinner_frame,
+            .fps = current_fps,
+        });
         try screen.render(stdout_file);
     }
 
@@ -715,6 +705,14 @@ pub fn main() !void {
         };
         log.info("trace written to ./zag-trace.json", .{});
     }
+}
+
+/// Resize screen and layout, keeping context dimensions in sync.
+fn handleResize(screen: *Screen, ctx: *AppContext, cols: u16, rows: u16) !void {
+    try screen.resize(cols, rows);
+    layout.recalculate(cols, rows);
+    ctx.screen_width = cols;
+    ctx.screen_height = rows;
 }
 
 /// Set a file descriptor to non-blocking mode.
