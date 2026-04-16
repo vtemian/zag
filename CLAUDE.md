@@ -102,9 +102,10 @@ Dependencies: ziglua (Lua 5.4, compiled from source).
 - `inline` only in measured hot paths, not speculatively
 
 ### Control flow
-- Labeled blocks with `break` for complex value computation
+- Labeled blocks with `break` for simple value computation only. If a labeled block has nested labeled blocks, error fallbacks, or more than ~5 lines, extract it into a function with early returns instead.
 - `orelse` for optional unwrapping: `const x = optional orelse return null;`
 - Exhaustive switches. Use `else => unreachable` only for truly impossible cases
+- Prefer flat control flow: early returns over nested if/else, functions over inline complexity
 
 ## What NOT to do
 - Don't use `std.debug.assert` in hot paths. It may not optimize away in ReleaseFast
