@@ -104,10 +104,13 @@ pub fn oomResult() ToolResult {
 pub const ToolDefinition = struct {
     /// The unique name the LLM uses to invoke this tool.
     name: []const u8,
-    /// A human-readable description of what the tool does.
+    /// A human-readable description of what the tool does (sent via API tool schema).
     description: []const u8,
     /// Raw JSON schema string describing the tool's expected input.
     input_schema_json: []const u8,
+    /// Short one-line summary for the system prompt. Tools without a snippet
+    /// are omitted from the prompt's "Available tools" list.
+    prompt_snippet: ?[]const u8 = null,
 };
 
 /// A fully wired tool: its definition plus the function that executes it.

@@ -23,6 +23,8 @@ pub const LuaTool = struct {
     description: []const u8,
     /// JSON schema string for the tool input (owned, heap-allocated).
     input_schema_json: []const u8,
+    /// Short one-line summary for the system prompt (owned, heap-allocated).
+    prompt_snippet: ?[]const u8 = null,
     /// Lua registry reference to the execute function.
     func_ref: i32,
 };
@@ -90,6 +92,7 @@ pub const LuaEngine = struct {
             self.allocator.free(tool.name);
             self.allocator.free(tool.description);
             self.allocator.free(tool.input_schema_json);
+            if (tool.prompt_snippet) |s| self.allocator.free(s);
         }
         self.tools.deinit(self.allocator);
         self.lua.deinit();
@@ -154,6 +157,14 @@ pub const LuaEngine = struct {
         };
         lua.pop(1);
 
+        // Read optional prompt_snippet (Lua string, borrowed from VM)
+        _ = lua.getField(1, "prompt_snippet");
+        const snippet_raw: ?[]const u8 = if (lua.isString(-1))
+            lua.toString(-1) catch null
+        else
+            null;
+        lua.pop(1);
+
         // Read input_schema table and serialize to JSON
         _ = lua.getField(1, "input_schema");
         if (!lua.isTable(-1)) {
@@ -190,10 +201,14 @@ pub const LuaEngine = struct {
         const description = try engine.allocator.dupe(u8, desc_raw);
         errdefer engine.allocator.free(description);
 
+        const snippet = if (snippet_raw) |s| try engine.allocator.dupe(u8, s) else null;
+        errdefer if (snippet) |s| engine.allocator.free(s);
+
         try engine.tools.append(engine.allocator, .{
             .name = name,
             .description = description,
             .input_schema_json = schema_json,
+            .prompt_snippet = snippet,
             .func_ref = func_ref,
         });
 
@@ -416,6 +431,7 @@ pub const LuaEngine = struct {
                     .name = tool.name,
                     .description = tool.description,
                     .input_schema_json = tool.input_schema_json,
+                    .prompt_snippet = tool.prompt_snippet,
                 },
                 .execute = &luaToolExecute,
             });

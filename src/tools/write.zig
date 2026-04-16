@@ -56,6 +56,7 @@ pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolR
 pub const definition = types.ToolDefinition{
     .name = "write",
     .description = "Create or overwrite a file with the given content. Creates parent directories if needed.",
+    .prompt_snippet = "Create or overwrite files",
     .input_schema_json =
     \\{
     \\  "type": "object",

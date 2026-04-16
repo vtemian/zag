@@ -36,10 +36,11 @@ fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]c
 
     var it = registry.tools.valueIterator();
     while (it.next()) |tool| {
+        const snippet = tool.definition.prompt_snippet orelse continue;
         try buf.appendSlice(allocator, "\n- ");
         try buf.appendSlice(allocator, tool.definition.name);
         try buf.appendSlice(allocator, ": ");
-        try buf.appendSlice(allocator, tool.definition.description);
+        try buf.appendSlice(allocator, snippet);
     }
 
     try buf.appendSlice(allocator, system_prompt_suffix);
