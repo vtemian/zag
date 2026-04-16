@@ -206,7 +206,7 @@ fn createSplitBuffer(allocator: std.mem.Allocator) !*Buffer {
 
 /// Create a new session and attach it to a buffer. The session handle is
 /// heap-allocated and tracked in extra_session_handles for cleanup.
-/// Failures are logged but not propagated — the buffer works without persistence.
+/// Failures are logged but not propagated; the buffer works without persistence.
 fn attachSessionToBuffer(buf: *Buffer, session_mgr: *?Session.SessionManager, model: []const u8, allocator: std.mem.Allocator) void {
     const mgr = &(session_mgr.* orelse return);
     const sh = allocator.create(Session.SessionHandle) catch {
@@ -228,7 +228,7 @@ fn attachSessionToBuffer(buf: *Buffer, session_mgr: *?Session.SessionManager, mo
 }
 
 /// Generate a short session name via a cheap LLM call and apply it.
-/// Runs synchronously — brief block acceptable for v1.
+/// Runs synchronously. Brief block acceptable for v1.
 fn autoNameSession(sh: *Session.SessionHandle, buf: *Buffer, provider: llm.Provider, allocator: std.mem.Allocator) void {
     const summary = generateSessionName(provider, buf, allocator) catch |err| {
         log.warn("auto-name failed: {}", .{err});
@@ -275,7 +275,7 @@ fn generateSessionName(provider: llm.Provider, buf: *const Buffer, allocator: st
     );
     defer response.deinit(allocator);
 
-    // Don't free the content slices — they point into buf.messages, not owned by us
+    // Don't free the content slices: they point into buf.messages, not owned by us
     allocator.free(user_content);
     allocator.free(assistant_content);
 
@@ -376,7 +376,9 @@ pub fn main() !void {
     defer layout.deinit();
     try layout.setRoot(&buffer);
 
-    // Extra buffers created by splits
+    // Extra buffers created by splits.
+    // NOTE: extra_session_handles defer must come AFTER extra_buffers defer so
+    // that session handles close before their buffers are deinitialized (LIFO).
     extra_buffers = .empty;
     defer {
         for (extra_buffers.items) |buf| {
@@ -386,7 +388,7 @@ pub fn main() !void {
         extra_buffers.deinit(allocator);
     }
 
-    // Session handles for split buffers
+    // Session handles for split buffers (closed before extra_buffers via LIFO)
     extra_session_handles = .empty;
     defer {
         for (extra_session_handles.items) |sh| {
@@ -539,7 +541,7 @@ pub fn main() !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
 
-    // Welcome message (only for new sessions — resumed sessions show their history)
+    // Welcome message (only for new sessions, resumed sessions show their history)
     if (resume_id == null) {
         try appendOutputText("Welcome to zag - a composable agent environment");
         {
@@ -641,7 +643,7 @@ pub fn main() !void {
                         switch (k.key) {
                             .char => |ch| switch (ch) {
                                 'v' => {
-                                    // Split vertical — new buffer gets its own session
+                                    // Split vertical: new buffer gets its own session
                                     if (createSplitBuffer(allocator)) |new_buf| {
                                         attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
                                         layout.splitVertical(0.5, new_buf) catch |err| {
@@ -653,7 +655,7 @@ pub fn main() !void {
                                     }
                                 },
                                 's' => {
-                                    // Split horizontal — new buffer gets its own session
+                                    // Split horizontal: new buffer gets its own session
                                     if (createSplitBuffer(allocator)) |new_buf| {
                                         attachSessionToBuffer(new_buf, &session_mgr, model_str, allocator);
                                         layout.splitHorizontal(0.5, new_buf) catch |err| {

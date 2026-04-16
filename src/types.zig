@@ -151,6 +151,35 @@ pub const LlmResponse = struct {
     }
 };
 
+/// Write JSON-escaped characters (without surrounding quotes) to any writer.
+/// Escapes backslashes, double quotes, newlines, tabs, carriage returns,
+/// and other control characters below 0x20.
+pub fn writeJsonStringContents(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try w.print("\\u{x:0>4}", .{@as(u16, c)});
+                } else {
+                    try w.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
+/// Write a JSON-escaped string (with surrounding quotes) to any writer.
+pub fn writeJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    try writeJsonStringContents(w, s);
+    try w.writeByte('"');
+}
+
 // -- Tests ------------------------------------------------------------------
 
 test {
@@ -197,6 +226,37 @@ test "ToolResult defaults is_error to false" {
 test "ToolResultBlock defaults is_error to false" {
     const block = ContentBlock.ToolResultBlock{ .tool_use_id = "id1", .content = "done" };
     try std.testing.expectEqual(false, block.is_error);
+}
+
+test "writeJsonString escapes special characters" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const w = stream.writer();
+
+    try writeJsonString(w, "hello \"world\"\nline2\\end\ttab\r");
+    const result = stream.getWritten();
+    try std.testing.expectEqualStrings("\"hello \\\"world\\\"\\nline2\\\\end\\ttab\\r\"", result);
+}
+
+test "writeJsonStringContents omits surrounding quotes" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const w = stream.writer();
+
+    try writeJsonStringContents(w, "no quotes");
+    const result = stream.getWritten();
+    try std.testing.expectEqualStrings("no quotes", result);
+}
+
+test "writeJsonString escapes control characters below 0x20" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const w = stream.writer();
+
+    // 0x01 should become \u0001
+    try writeJsonString(w, &[_]u8{0x01});
+    const result = stream.getWritten();
+    try std.testing.expectEqualStrings("\"\\u0001\"", result);
 }
 
 test "LlmResponse defaults token counts to zero" {

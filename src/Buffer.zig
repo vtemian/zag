@@ -93,7 +93,7 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !Buffer {
 }
 
 /// Release all memory owned by this buffer: nodes, name, messages, and lists.
-/// The session_handle is NOT closed here — the owner (main or split creator) closes it.
+/// The session_handle is NOT closed here; the owner (main or split creator) closes it.
 pub fn deinit(self: *Buffer) void {
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
