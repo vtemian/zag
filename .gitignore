@@ -3,3 +3,4 @@ zig-out/
 .idea/
 .zag/
 zag-trace.json
+.worktrees/
