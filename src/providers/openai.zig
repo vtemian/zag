@@ -228,12 +228,12 @@ fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
         return;
     }
 
-    const role_str = switch (msg.role) {
+    const role = switch (msg.role) {
         .user => "user",
         .assistant => "assistant",
     };
 
-    try w.print("{{\"role\":\"{s}\",\"content\":", .{role_str});
+    try w.print("{{\"role\":\"{s}\",\"content\":", .{role});
 
     if (msg.content.len == 1) {
         switch (msg.content[0]) {
@@ -278,30 +278,27 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
 
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
-    if (root.get("usage")) |usage_val| {
-        const usage = usage_val.object;
-        if (usage.get("prompt_tokens")) |pt| input_tokens = @intCast(pt.integer);
-        if (usage.get("completion_tokens")) |ct| output_tokens = @intCast(ct.integer);
+    if (root.get("usage")) |usage| {
+        if (usage.object.get("prompt_tokens")) |pt| input_tokens = @intCast(pt.integer);
+        if (usage.object.get("completion_tokens")) |ct| output_tokens = @intCast(ct.integer);
     }
 
     const message = choice.get("message") orelse return error.MalformedResponse;
-    const msg_obj = message.object;
 
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
 
-    if (msg_obj.get("content")) |content_val| {
-        if (content_val == .string) {
-            try builder.addText(content_val.string, allocator);
+    if (message.object.get("content")) |content| {
+        if (content == .string) {
+            try builder.addText(content.string, allocator);
         }
     }
 
-    if (msg_obj.get("tool_calls")) |tc_val| {
-        for (tc_val.array.items) |tc_item| {
-            const tc = tc_item.object;
-            const func = tc.get("function").?.object;
+    if (message.object.get("tool_calls")) |tc| {
+        for (tc.array.items) |tc_item| {
+            const func = tc_item.object.get("function").?.object;
             try builder.addToolUse(
-                tc.get("id").?.string,
+                tc_item.object.get("id").?.string,
                 func.get("name").?.string,
                 func.get("arguments").?.string,
                 allocator,
@@ -345,10 +342,10 @@ fn parseSseStream(
     }
 
     var event_buf: [128]u8 = undefined;
-    var data_buf: std.ArrayList(u8) = .empty;
-    defer data_buf.deinit(allocator);
+    var event_data: std.ArrayList(u8) = .empty;
+    defer event_data.deinit(allocator);
 
-    while (try stream.nextSseEvent(cancel, &event_buf, &data_buf)) |sse| {
+    while (try stream.nextSseEvent(cancel, &event_buf, &event_data)) |sse| {
         if (std.mem.eql(u8, sse.data, "[DONE]")) break;
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, sse.data, .{}) catch continue;
@@ -372,21 +369,18 @@ fn parseSseStream(
         }
 
         // Process delta
-        if (choice.get("delta")) |delta_val| {
-            const delta = delta_val.object;
-
-            if (delta.get("content")) |content_val| {
-                if (content_val == .string) {
-                    try text_content.appendSlice(allocator, content_val.string);
-                    on_event(.{ .text_delta = content_val.string });
+        if (choice.get("delta")) |delta| {
+            if (delta.object.get("content")) |content| {
+                if (content == .string) {
+                    try text_content.appendSlice(allocator, content.string);
+                    on_event(.{ .text_delta = content.string });
                 }
             }
 
-            if (delta.get("tool_calls")) |tc_val| {
-                for (tc_val.array.items) |tc_item| {
-                    const tc = tc_item.object;
-                    const index_val = tc.get("index") orelse continue;
-                    const index: usize = @intCast(index_val.integer);
+            if (delta.object.get("tool_calls")) |tc| {
+                for (tc.array.items) |tc_item| {
+                    const index_raw = tc_item.object.get("index") orelse continue;
+                    const index: usize = @intCast(index_raw.integer);
 
                     while (tool_calls.items.len <= index) {
                         try tool_calls.append(allocator, .{
@@ -398,26 +392,25 @@ fn parseSseStream(
 
                     var tool_call = &tool_calls.items[index];
 
-                    if (tc.get("id")) |id_val| {
-                        if (id_val == .string) {
-                            try tool_call.id.appendSlice(allocator, id_val.string);
+                    if (tc_item.object.get("id")) |id| {
+                        if (id == .string) {
+                            try tool_call.id.appendSlice(allocator, id.string);
                         }
                     }
 
-                    if (tc.get("function")) |func_val| {
-                        const func = func_val.object;
-                        if (func.get("name")) |name_val| {
-                            if (name_val == .string) {
+                    if (tc_item.object.get("function")) |func| {
+                        if (func.object.get("name")) |name| {
+                            if (name == .string) {
                                 const was_empty = tool_call.name.items.len == 0;
-                                try tool_call.name.appendSlice(allocator, name_val.string);
+                                try tool_call.name.appendSlice(allocator, name.string);
                                 if (was_empty) {
-                                    on_event(.{ .tool_start = name_val.string });
+                                    on_event(.{ .tool_start = name.string });
                                 }
                             }
                         }
-                        if (func.get("arguments")) |args_val| {
-                            if (args_val == .string) {
-                                try tool_call.arguments.appendSlice(allocator, args_val.string);
+                        if (func.object.get("arguments")) |args| {
+                            if (args == .string) {
+                                try tool_call.arguments.appendSlice(allocator, args.string);
                             }
                         }
                     }
@@ -784,10 +777,10 @@ test "writeMessage handles tool_result content blocks" {
 
     var out: std.io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, &out.writer);
-    const json_str = try out.toOwnedSlice();
-    defer allocator.free(json_str);
+    const payload = try out.toOwnedSlice();
+    defer allocator.free(payload);
 
-    const wrapped = try std.fmt.allocPrint(allocator, "[{s}]", .{json_str});
+    const wrapped = try std.fmt.allocPrint(allocator, "[{s}]", .{payload});
     defer allocator.free(wrapped);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wrapped, .{});

@@ -136,8 +136,8 @@ pub fn closeWindow(self: *Layout) void {
     }
 
     // Otherwise, find the grandparent and replace the parent pointer with the sibling
-    const grand_result = findParentSplit(r, parent) orelse return;
-    const grandparent = grand_result.parent;
+    const grandparent_result = findParentSplit(r, parent) orelse return;
+    const grandparent = grandparent_result.parent;
     if (grandparent.split.first == parent) {
         grandparent.split.first = sibling;
     } else {
