@@ -439,54 +439,47 @@ pub fn main() !void {
     }
 
     // Create LLM provider from ZAG_MODEL env var
-    var provider = llm.createProviderFromEnv(allocator) catch |err| {
-        const stderr = std.fs.File.stderr();
-        var scratch: [256]u8 = undefined;
-        var w = stderr.writer(&scratch);
-        w.interface.print("error: failed to create provider: {s}\n", .{@errorName(err)}) catch {};
-        w.interface.flush() catch {};
-        return;
-    };
+    var provider = try llm.createProviderFromEnv(allocator);
     defer provider.deinit();
 
     // Initialize tool registry
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
 
-    // Initialize Lua plugin engine
-    var lua_engine: ?LuaEngine = blk: {
-        var eng = LuaEngine.init(allocator) catch |err| {
-            log.warn("lua init failed, plugins disabled: {}", .{err});
-            break :blk null;
-        };
 
-        // Set plugin search path to ~/.config/zag/lua/
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk eng;
-        defer allocator.free(home);
-        const lua_dir = std.fmt.allocPrint(allocator, "{s}/.config/zag/lua", .{home}) catch break :blk eng;
-        defer allocator.free(lua_dir);
-        eng.setPluginPath(lua_dir) catch |err| {
-            log.warn("failed to set lua plugin path: {}", .{err});
-        };
 
-        // Load config.lua
-        const config_path = std.fmt.allocPrint(allocator, "{s}/.config/zag/config.lua", .{home}) catch break :blk eng;
-        defer allocator.free(config_path);
-        eng.loadConfig(config_path) catch |err| {
-            switch (err) {
-                error.LuaFile => {}, // No config file, that's fine
-                else => log.warn("config.lua error, continuing without plugins: {}", .{err}),
-            }
-        };
 
-        // Register Lua tools into the registry
-        eng.registerTools(&registry) catch |err| {
-            log.warn("failed to register lua tools: {}", .{err});
-        };
 
-        break :blk eng;
-    };
-    defer if (lua_engine) |*eng| eng.deinit();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     // Parse CLI args to decide startup mode
     const startup_mode = parseStartupArgs(allocator) catch .new_session;
@@ -570,14 +563,7 @@ pub fn main() !void {
     }
 
     // -- Enter TUI mode ------------------------------------------------------
-    var term = Terminal.init() catch |err| {
-        const stderr = std.fs.File.stderr();
-        var buf: [256]u8 = undefined;
-        var w = stderr.writer(&buf);
-        w.interface.print("error: failed to initialize terminal: {}\n", .{err}) catch {};
-        w.interface.flush() catch {};
-        return;
-    };
+    var term = try Terminal.init();
     tui_active = true;
     defer {
         tui_active = false;
