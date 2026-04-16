@@ -275,7 +275,11 @@ fn parseSseStream(
     var sse_data: std.ArrayList(u8) = .empty;
     defer sse_data.deinit(allocator);
 
+    log.info("SSE stream starting, cancel={}", .{cancel.load(.acquire)});
+
+    var event_count: u32 = 0;
     while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
+        event_count += 1;
         try processSseEvent(
             sse.event_type,
             sse.data,
@@ -286,6 +290,11 @@ fn parseSseStream(
             &output_tokens,
             on_event,
         );
+    }
+
+    log.info("SSE stream ended: {d} events, {d} blocks", .{ event_count, blocks.items.len });
+    for (blocks.items, 0..) |*b, i| {
+        log.info("  block[{d}]: type={s}, content_len={d}", .{ i, @tagName(b.block_type), b.content.items.len });
     }
 
     // Assemble final LlmResponse

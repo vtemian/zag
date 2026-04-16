@@ -594,8 +594,10 @@ pub const StreamingResponse = struct {
                 return error.ApiError;
             };
             if (n == 0) {
-                log.warn("readLine: 0 bytes (end of stream), pending_line={d}", .{self.pending_line.items.len});
-                if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
+                if (self.pending_line.items.len > 0) {
+                    log.warn("readLine: end of stream, returning final line ({d} bytes): '{s}'", .{ self.pending_line.items.len, self.pending_line.items });
+                    return stripCr(self.pending_line.items);
+                }
                 return null;
             }
 
@@ -657,6 +659,8 @@ pub const StreamingResponse = struct {
                 }
                 return null;
             };
+
+            log.info("SSE line ({d} bytes): '{s}'", .{ line.len, line[0..@min(line.len, 200)] });
 
             if (line.len == 0) {
                 // Blank line: dispatch event if we have data
