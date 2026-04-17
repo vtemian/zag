@@ -334,24 +334,6 @@ pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !v
     self.render_dirty = true;
 }
 
-/// Discard the in-progress assistant text node. Used when a partial
-/// streamed response is being replaced by a non-streaming fallback:
-/// the UI rebuilds from a clean state when the next text_delta arrives.
-pub fn resetCurrentAssistantText(self: *ConversationBuffer) void {
-    const node = self.runner.current_assistant_node orelse return;
-    self.runner.current_assistant_node = null;
-
-    for (self.root_children.items, 0..) |child, i| {
-        if (child == node) {
-            _ = self.root_children.orderedRemove(i);
-            break;
-        }
-    }
-    node.deinit(self.allocator);
-    self.allocator.destroy(node);
-    self.render_dirty = true;
-}
-
 /// Populate the node tree from loaded JSONL entries.
 pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry) !void {
     for (entries) |entry| {
@@ -381,108 +363,6 @@ pub fn clear(self: *ConversationBuffer) void {
     self.root_children.clearRetainingCapacity();
     self.next_id = 0;
     self.render_dirty = true;
-}
-
-/// Process a single agent event: update the node tree and persist to session.
-pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEvent, allocator: Allocator) void {
-    switch (event) {
-        .text_delta => |text| {
-            defer allocator.free(text);
-            if (self.runner.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text } };
-                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
-            }
-            if (self.runner.current_assistant_node) |node| {
-                self.appendToNode(node, text) catch |err| {
-                    log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
-                };
-            } else {
-                self.runner.current_assistant_node = self.appendNode(null, .assistant_text, text) catch |err| blk: {
-                    log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
-                    break :blk null;
-                };
-            }
-            self.session.persistEvent(.{
-                .entry_type = .assistant_text,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            });
-        },
-        .tool_start => |ev| {
-            defer allocator.free(ev.name);
-            self.runner.current_assistant_node = null;
-            const node = self.appendNode(null, .tool_call, ev.name) catch null;
-            self.runner.last_tool_call = node;
-            // If we have a call_id, store in the map for result correlation
-            if (ev.call_id) |id| {
-                if (node) |n| {
-                    self.runner.pending_tool_calls.put(id, n) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
-                } else {
-                    allocator.free(id);
-                }
-            }
-            self.session.persistEvent(.{
-                .entry_type = .tool_call,
-                .tool_name = ev.name,
-                .timestamp = std.time.milliTimestamp(),
-            });
-        },
-        .tool_result => |result| {
-            defer allocator.free(result.content);
-            // Find the parent tool_call node: by call_id if available, else fallback
-            const parent = if (result.call_id) |id| blk: {
-                const removed = self.runner.pending_tool_calls.fetchRemove(id);
-                // Free both the lookup key (from tool_result) and stored key (from tool_start)
-                allocator.free(id);
-                if (removed) |kv| {
-                    allocator.free(@constCast(kv.key));
-                    break :blk kv.value;
-                }
-                break :blk self.runner.last_tool_call;
-            } else self.runner.last_tool_call;
-            _ = self.appendNode(parent, .tool_result, result.content) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
-            self.session.persistEvent(.{
-                .entry_type = .tool_result,
-                .content = result.content,
-                .is_error = result.is_error,
-                .timestamp = std.time.milliTimestamp(),
-            });
-        },
-        .info => |text| {
-            defer allocator.free(text);
-            // Store for status bar display, not as a conversation node
-            const len = @min(text.len, self.runner.last_info.len);
-            @memcpy(self.runner.last_info[0..len], text[0..len]);
-            self.runner.last_info_len = @intCast(len);
-        },
-        .done => {
-            if (self.runner.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .agent_done = {} };
-                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
-            }
-            self.runner.current_assistant_node = null;
-        },
-        .reset_assistant_text => self.resetCurrentAssistantText(),
-        .err => |text| {
-            defer allocator.free(text);
-            if (self.runner.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
-                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
-            }
-            _ = self.appendNode(null, .err, text) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
-            self.session.persistEvent(.{
-                .entry_type = .err,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            });
-        },
-        // These round-trip events are normally consumed by
-        // `dispatchHookRequests` before the drain sees them. If one slips
-        // through (e.g. because dispatch ran with a null engine), signal
-        // `done` so the producer in the agent thread doesn't block forever.
-        .hook_request => |req| req.done.set(),
-        .lua_tool_request => |req| req.done.set(),
-    }
 }
 
 /// Submit user input: append the message to conversation history, create a
@@ -593,7 +473,7 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
             self.scroll_offset = 0;
             self.render_dirty = true;
         }
-        self.handleAgentEvent(event, allocator);
+        self.runner.handleAgentEvent(event, allocator);
 
         if (event == .done) {
             if (self.runner.agent_thread) |t| t.join();
@@ -1096,49 +976,6 @@ test "setScrollOffset marks dirty only when value changes" {
     try std.testing.expect(!b.isDirty());
 }
 
-test "resetCurrentAssistantText removes the in-progress node" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-test", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-
-    _ = try cb.appendNode(null, .user_message, "hi");
-    const partial = try cb.appendNode(null, .assistant_text, "partial ");
-    cb.runner.current_assistant_node = partial;
-
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-
-    cb.resetCurrentAssistantText();
-
-    try std.testing.expect(cb.runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
-}
-
-test "resetCurrentAssistantText is a no-op when nothing is in progress" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-
-    _ = try cb.appendNode(null, .user_message, "hi");
-
-    cb.resetCurrentAssistantText();
-
-    try std.testing.expect(cb.runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-}
-
 test "synthetic id scratch fits maxInt(u32)" {
     // Compile-time guard: the scratch buffer in rebuildHistoryFromEntries must
     // hold "synth_" plus the widest possible u32 counter value without
@@ -1149,33 +986,6 @@ test "synthetic id scratch fits maxInt(u32)" {
         var probe: [32]u8 = undefined;
         _ = std.fmt.bufPrint(&probe, "synth_{d}", .{max_counter}) catch @compileError("synth buffer too small");
     }
-}
-
-test "text_delta after reset starts a fresh assistant node" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-
-    // Simulate a partial stream: two text deltas append to one node.
-    cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
-    cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "wor") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello wor", cb.root_children.items[0].content.items);
-
-    // Fallback: reset, then push the full response.
-    cb.handleAgentEvent(.reset_assistant_text, allocator);
-    try std.testing.expectEqual(@as(usize, 0), cb.root_children.items.len);
-    try std.testing.expect(cb.runner.current_assistant_node == null);
-
-    cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello world", cb.root_children.items[0].content.items);
 }
 
 test "wake_fd default is null" {
@@ -1403,47 +1213,6 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
         .tool_result => |tr| try std.testing.expectEqualStrings("synth_0", tr.tool_use_id),
         else => return error.TestUnexpectedResult,
     }
-}
-
-test "handleAgentEvent correlates tool_result to tool_start via call_id" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-
-    // First tool_start with call_id "A"
-    cb.handleAgentEvent(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, "bash"),
-        .call_id = try allocator.dupe(u8, "A"),
-    } }, allocator);
-
-    // Second tool_start with call_id "B"
-    cb.handleAgentEvent(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, "read"),
-        .call_id = try allocator.dupe(u8, "B"),
-    } }, allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(@as(u32, 2), cb.runner.pending_tool_calls.count());
-
-    // tool_result for "B" (out-of-order vs starts) should parent under tool B
-    cb.handleAgentEvent(.{ .tool_result = .{
-        .call_id = try allocator.dupe(u8, "B"),
-        .content = try allocator.dupe(u8, "result B"),
-        .is_error = false,
-    } }, allocator);
-
-    const tool_b_node = cb.root_children.items[1];
-    try std.testing.expectEqual(@as(usize, 1), tool_b_node.children.items.len);
-    try std.testing.expectEqualStrings("result B", tool_b_node.children.items[0].content.items);
-    // Pending map no longer contains "B", still contains "A"
-    try std.testing.expectEqual(@as(u32, 1), cb.runner.pending_tool_calls.count());
-    try std.testing.expect(cb.runner.pending_tool_calls.get("A") != null);
 }
 
 test "restoreFromSession rebuilds both tree and messages" {
