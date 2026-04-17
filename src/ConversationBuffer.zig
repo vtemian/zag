@@ -142,6 +142,11 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
 /// Release all memory owned by this buffer: nodes, name, messages, and lists.
 /// The session_handle is NOT closed here; the owner (main or split creator) closes it.
 pub fn deinit(self: *ConversationBuffer) void {
+    // Join any live agent thread before freeing the state it reads/writes:
+    // messages, pending_tool_calls, and the event queue are all shared with
+    // the worker. Running this unconditionally is the only safe ordering on
+    // error-exit paths where the caller never got a chance to shut down.
+    self.shutdown();
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
         self.allocator.destroy(node);
