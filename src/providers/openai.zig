@@ -385,10 +385,10 @@ test "buildRequestBody formats tools with function wrapper" {
     defer parsed.deinit();
 
     const root = parsed.value.object;
-    const tools_arr = root.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 1), tools_arr.items.len);
+    const tools = root.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), tools.items.len);
 
-    const tool = tools_arr.items[0].object;
+    const tool = tools.items[0].object;
     try std.testing.expectEqualStrings("function", tool.get("type").?.string);
 
     const func = tool.get("function").?.object;
