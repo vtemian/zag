@@ -8,11 +8,11 @@
 
 - **Focus cue.** Every pane gets a rounded frame. Focused pane = accent-color frame + inverse-background title (`╭─▌ session ▐────╮`). Unfocused = dim frame + plain title (`╭── scratch 2 ────╮`).
 - **Split target.** Keep creating a new scratch session on `v`/`s`, but auto-label buffers `scratch 1`, `scratch 2`, ... and show a one-shot status message `split → scratch N` that clears on the next keystroke.
-- **Block cursor.** Solid accent-colored block at the end of input text in insert mode. Normal mode draws no cursor — the `[NORMAL]` label and hint line already carry the signal.
+- **Block cursor.** Solid accent-colored block at the end of input text in insert mode. Normal mode draws no cursor - the `[NORMAL]` label and hint line already carry the signal.
 - **Prompt glyph.** `>` → `›` (U+203A).
 - **Inter-pane dividers.** Removed. Each pane owns its full rect. Adjacent pane frames butt against each other (`╭─a─╮╭─b─╮`). Saves a subsystem; users get slightly denser layouts in return.
 
-**Architecture.** The work is contained in four files: `src/Theme.zig` (new highlight groups), `src/Layout.zig` (drop divider reservation), `src/Compositor.zig` (replace `drawBorders` with per-pane `drawFrames`, inset content, paint block cursor), `src/EventOrchestrator.zig` (scratch counter + transient status). No changes to `ConversationBuffer`, `NodeRenderer`, `MarkdownParser`, or `Buffer` vtables — `Screen.writeStrWrapped` already handles content clipping when we shrink the rect.
+**Architecture.** The work is contained in four files: `src/Theme.zig` (new highlight groups), `src/Layout.zig` (drop divider reservation), `src/Compositor.zig` (replace `drawBorders` with per-pane `drawFrames`, inset content, paint block cursor), `src/EventOrchestrator.zig` (scratch counter + transient status). No changes to `ConversationBuffer`, `NodeRenderer`, `MarkdownParser`, or `Buffer` vtables - `Screen.writeStrWrapped` already handles content clipping when we shrink the rect.
 
 **Invariant preserved per task.** `zig build test` exits 0, `zig fmt --check .` clean, `zig build run` (manual smoke test) still boots without visual regressions.
 
@@ -42,7 +42,7 @@ Two panes split vertically, focus on the left:
  [NORMAL] session | 16x5
 ```
 
-Narrow pane (W < 6 — title suppressed entirely):
+Narrow pane (W < 6 - title suppressed entirely):
 
 ```
 ╭──╮
@@ -57,7 +57,7 @@ Narrow pane (W < 6 — title suppressed entirely):
 **Files:**
 - Modify: `src/Theme.zig`
 
-**Step 1 — Write failing test** (append after the existing `"default theme exposes mode_insert and mode_normal highlights"` test, around line 494):
+**Step 1 - Write failing test** (append after the existing `"default theme exposes mode_insert and mode_normal highlights"` test, around line 494):
 
 ```zig
 test "default theme exposes focused border and title highlights" {
@@ -75,7 +75,7 @@ test "default theme exposes focused border and title highlights" {
 
 Run `zig build test`. Expected failure: `error: no field named 'border_focused' in struct 'Highlights'`.
 
-**Step 2 — Add the fields to `Highlights`** (insert after line 74 `border: CellStyle,`):
+**Step 2 - Add the fields to `Highlights`** (insert after line 74 `border: CellStyle,`):
 
 ```zig
 /// Window border lines when the pane is focused.
@@ -86,7 +86,7 @@ title_active: CellStyle,
 title_inactive: CellStyle,
 ```
 
-**Step 3 — Wire defaults** in `defaultTheme()` (insert after `.border = .{ .fg = dim },` at ~line 257):
+**Step 3 - Wire defaults** in `defaultTheme()` (insert after `.border = .{ .fg = dim },` at ~line 257):
 
 ```zig
 .border_focused = .{ .fg = accent, .bold = true },
@@ -94,34 +94,34 @@ title_inactive: CellStyle,
 .title_inactive = .{ .fg = dim },
 ```
 
-**Step 4 — Add ellipsis constant** at the top-level of `Theme.zig` (near the `Borders` definition around line 146):
+**Step 4 - Add ellipsis constant** at the top-level of `Theme.zig` (near the `Borders` definition around line 146):
 
 ```zig
 /// Display-width-1 glyph used to truncate titles that don't fit a pane.
 pub const ellipsis: u21 = 0x2026;
 ```
 
-**Step 5 — Fix stale doc comment** at line 54-55. The struct doc says "21 named highlight groups" but `Highlights` already has 23 fields; with these three additions it becomes 26. Replace the doc comment with a simpler wording that does not pin a count:
+**Step 5 - Fix stale doc comment** at line 54-55. The struct doc says "21 named highlight groups" but `Highlights` already has 23 fields; with these three additions it becomes 26. Replace the doc comment with a simpler wording that does not pin a count:
 
 ```zig
 /// Named highlight groups covering conversation, chrome, mode, and
 /// markdown elements. Plugins swap the whole struct at runtime.
 ```
 
-**Step 6 — Run tests.** `zig build test` — the new test should pass, and the existing theme tests (`"defaultTheme returns valid base colors"`, `"CellStyle with null fg inherits default via resolve"`, etc.) must still pass.
+**Step 6 - Run tests.** `zig build test` - the new test should pass, and the existing theme tests (`"defaultTheme returns valid base colors"`, `"CellStyle with null fg inherits default via resolve"`, etc.) must still pass.
 
 **Commit:** `theme: add border_focused + title_active + title_inactive highlights`
 
 ---
 
-## Task 2: Layout — drop the inter-pane divider
+## Task 2: Layout - drop the inter-pane divider
 
 **Files:**
 - Modify: `src/Layout.zig`
 
-**Step 1 — Update test expectations** (failing-first discipline: change the asserts to the new post-divider-removal values, watch them fail, then fix the code).
+**Step 1 - Update test expectations** (failing-first discipline: change the asserts to the new post-divider-removal values, watch them fail, then fix the code).
 
-Test `vertical split divides width with border` (rename, delete "with border" wording — around line 470):
+Test `vertical split divides width with border` (rename, delete "with border" wording - around line 470):
 
 ```zig
 test "vertical split divides width evenly" {
@@ -149,9 +149,9 @@ test "horizontal split divides height evenly" {
 }
 ```
 
-Run `zig build test` — expect assertion failures (current code gives width 39 / height 11+12 with a reserved gap).
+Run `zig build test` - expect assertion failures (current code gives width 39 / height 11+12 with a reserved gap).
 
-**Step 2 — Simplify `recalculateNode`.** Replace lines 319-364 of `src/Layout.zig` with:
+**Step 2 - Simplify `recalculateNode`.** Replace lines 319-364 of `src/Layout.zig` with:
 
 ```zig
 .split => |*s| {
@@ -199,20 +199,20 @@ Run `zig build test` — expect assertion failures (current code gives width 39 
 
 No more `usable`, no more `border_col`/`border_row` locals. Adjacent panes touch.
 
-**Step 3 — Run tests** again. Layout tests pass. Compositor border tests at `src/Compositor.zig:453-487` and `:489-523` will still fail because they assert a divider glyph at specific coordinates; fix those in Task 4.
+**Step 3 - Run tests** again. Layout tests pass. Compositor border tests at `src/Compositor.zig:453-487` and `:489-523` will still fail because they assert a divider glyph at specific coordinates; fix those in Task 4.
 
 **Commit:** `layout: remove divider column between split children`
 
 ---
 
-## Task 3: Compositor — per-pane rounded frames
+## Task 3: Compositor - per-pane rounded frames
 
 **Files:**
 - Modify: `src/Compositor.zig`
 
 This is the largest task. We delete `drawBorders` + its recursion, add `drawFrames` + helpers, and switch the call site in `composite`. Content insetting lives in Task 4 (same file, but kept separate so each commit is reviewable).
 
-**Step 1 — Add failing tests** (at the bottom of `src/Compositor.zig`, before the closing `// -- Tests --` footer). These replace the two deleted border tests at 453-487 and 489-523.
+**Step 1 - Add failing tests** (at the bottom of `src/Compositor.zig`, before the closing `// -- Tests --` footer). These replace the two deleted border tests at 453-487 and 489-523.
 
 ```zig
 test "composite draws rounded frame around a single pane" {
@@ -413,14 +413,14 @@ test "long titles are truncated with ellipsis" {
 }
 ```
 
-**Step 2 — Delete old border machinery.**
+**Step 2 - Delete old border machinery.**
 
 Remove from `src/Compositor.zig`:
 - `drawBorders` function (lines 197-241).
 - The call `self.drawBorders(root);` inside `composite` (~line 68, inside the `drawAllLeaves` branch).
 - The tests `"composite draws vertical split border from theme"` (lines 453-487) and `"composite draws horizontal split border"` (lines 489-523).
 
-**Step 3 — Add new frame-drawing machinery.** Insert before the `drawStatusLine` function:
+**Step 3 - Add new frame-drawing machinery.** Insert before the `drawStatusLine` function:
 
 ```zig
 /// Draw a rounded frame with title for every leaf. Two-pass so the focused
@@ -580,7 +580,7 @@ fn fitName(dest: []u8, name: []const u8, max: u16) []const u8 {
 }
 ```
 
-**Step 4 — Wire `drawFrames` into `composite`.** Replace the `drawAllLeaves(root); drawBorders(root);` block (lines 57-69) with:
+**Step 4 - Wire `drawFrames` into `composite`.** Replace the `drawAllLeaves(root); drawBorders(root);` block (lines 57-69) with:
 
 ```zig
 if (self.layout_dirty) {
@@ -613,20 +613,20 @@ if (self.layout_dirty) {
 
 Also extend `EventOrchestrator` (later in Task 6) to set `compositor.layout_dirty = true` after `focusDirection` so the frames repaint when focus moves between panes.
 
-**Step 5 — Run tests.** `zig build test`. All five new frame/title/truncation tests must pass, along with every existing compositor test not touching borders. If tests in other files break, diagnose before moving on.
+**Step 5 - Run tests.** `zig build test`. All five new frame/title/truncation tests must pass, along with every existing compositor test not touching borders. If tests in other files break, diagnose before moving on.
 
 **Commit:** `compositor: per-pane rounded frames with embedded titles`
 
 ---
 
-## Task 4: Compositor — inset content by 1 cell on every side
+## Task 4: Compositor - inset content by 1 cell on every side
 
 **Files:**
 - Modify: `src/Compositor.zig`
 
 Now that each pane has a frame occupying row `rect.y`, row `rect.y + rect.height - 1`, column `rect.x`, and column `rect.x + rect.width - 1`, the content must live strictly inside. Today, `drawBufferContent` starts at `rect.x + pad_h` / `rect.y + pad_v` and ends at `rect.x + rect.width` / `rect.y + rect.height`. It needs a 1-cell inset.
 
-**Step 1 — Update the pad-based content test** (`"composite writes buffer content at leaf rect with padding"`, around line 390). With a 1-cell frame inset, the `>` prompt now lives at `(1, 1 + pad_h)` instead of `(0, pad_h)`. Update the `expectEqual` positions.
+**Step 1 - Update the pad-based content test** (`"composite writes buffer content at leaf rect with padding"`, around line 390). With a 1-cell frame inset, the `>` prompt now lives at `(1, 1 + pad_h)` instead of `(0, pad_h)`. Update the `expectEqual` positions.
 
 ```zig
 // After composite(), '>' is at row 1 (past top border), col 1 + pad_h.
@@ -635,7 +635,7 @@ try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 1 + pad_h + 1)
 try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 ```
 
-**Step 2 — Modify `drawBufferContent`** (line 130 of `Compositor.zig`). Inset the rect before computing content bounds:
+**Step 2 - Modify `drawBufferContent`** (line 130 of `Compositor.zig`). Inset the rect before computing content bounds:
 
 ```zig
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
@@ -663,7 +663,7 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
 }
 ```
 
-**Step 3 — Update `drawDirtyLeaves`'s `clearRect` call** (line 113). The clearRect should clear only the inner area; the frame is redrawn separately via `drawFrames`. For simplicity, clear the full leaf rect and always redraw the frame at the end of the dirty-leaves path.
+**Step 3 - Update `drawDirtyLeaves`'s `clearRect` call** (line 113). The clearRect should clear only the inner area; the frame is redrawn separately via `drawFrames`. For simplicity, clear the full leaf rect and always redraw the frame at the end of the dirty-leaves path.
 
 Option A (simple): when any leaf is dirty, also set `layout_dirty = true` so the frame redraws. One more frame per dirty-leaf event.
 
@@ -688,18 +688,18 @@ if (leaf.buffer.isDirty()) {
 
 This keeps the frame intact across dirty-leaf updates, so we don't need the full redraw. Revert the "set layout_dirty" hack.
 
-**Step 4 — Run tests.** `zig build test`. The content-inset test passes; all other compositor tests that assert content positions (if any) need the same +1 adjustment.
+**Step 4 - Run tests.** `zig build test`. The content-inset test passes; all other compositor tests that assert content positions (if any) need the same +1 adjustment.
 
 **Commit:** `compositor: inset pane content by one cell for the frame`
 
 ---
 
-## Task 5: Compositor — block cursor + prompt glyph
+## Task 5: Compositor - block cursor + prompt glyph
 
 **Files:**
 - Modify: `src/Compositor.zig`
 
-**Step 1 — Update status-line / input-line tests** (`"composite draws status line on last row"`, `"input line paints mode indicator and normal-mode hint"`, `"input line shows status hint after mode label when status is set"` around lines 421-687). The `>` prompt becomes `›`. Change each `expectEqual(@as(u21, '>'), ...)` to `expectEqual(@as(u21, 0x203A), ...)` at the same coordinates, **except** that the status-line test must still check the mode-label layout (col 0 = `[`), not the deleted status-line-below-input divergence.
+**Step 1 - Update status-line / input-line tests** (`"composite draws status line on last row"`, `"input line paints mode indicator and normal-mode hint"`, `"input line shows status hint after mode label when status is set"` around lines 421-687). The `>` prompt becomes `›`. Change each `expectEqual(@as(u21, '>'), ...)` to `expectEqual(@as(u21, 0x203A), ...)` at the same coordinates, **except** that the status-line test must still check the mode-label layout (col 0 = `[`), not the deleted status-line-below-input divergence.
 
 Also add two new tests near the others:
 
@@ -774,9 +774,9 @@ test "normal mode does not paint a block cursor" {
 }
 ```
 
-**Step 2 — Update `drawInputLine`** (around line 313 of `Compositor.zig`):
+**Step 2 - Update `drawInputLine`** (around line 313 of `Compositor.zig`):
 
-Replace `"> "` (two occurrences) with `"› "` — use the literal UTF-8 bytes `"\u{203A} "`.
+Replace `"> "` (two occurrences) with `"› "` - use the literal UTF-8 bytes `"\u{203A} "`.
 
 After the existing `writeStr` that emits `input.text` in the insert-mode branch, paint the cursor:
 
@@ -801,20 +801,20 @@ After the existing `writeStr` that emits `input.text` in the insert-mode branch,
 
 We use `bg = accent` directly (per the Screen-primitives agent: `writeStr` never sets bg, so we can freely override it by mutating the cell). This yields a crisp accent-colored block matching the screenshot, and does not depend on the terminal's inverse implementation.
 
-**Step 3 — Run tests.** `zig build test`. The two new cursor tests pass. Update any remaining test that still expects `>` on the input row.
+**Step 3 - Run tests.** `zig build test`. The two new cursor tests pass. Update any remaining test that still expects `>` on the input row.
 
-**Step 4 — Manual smoke.** `zig build run`, type a few characters, press Esc, press `i`, observe: cursor is a solid accent block in insert mode; in normal mode no block, just `-- NORMAL -- (...)` hint.
+**Step 4 - Manual smoke.** `zig build run`, type a few characters, press Esc, press `i`, observe: cursor is a solid accent block in insert mode; in normal mode no block, just `-- NORMAL -- (...)` hint.
 
 **Commit:** `compositor: block cursor + chevron prompt in insert mode`
 
 ---
 
-## Task 6: EventOrchestrator — scratch counter + transient status
+## Task 6: EventOrchestrator - scratch counter + transient status
 
 **Files:**
 - Modify: `src/EventOrchestrator.zig`
 
-**Step 1 — Add fields.** Near the existing `next_buffer_id: u32 = 1` declaration (line 96), append:
+**Step 1 - Add fields.** Near the existing `next_buffer_id: u32 = 1` declaration (line 96), append:
 
 ```zig
 /// Rolling label counter for scratch panes created via split. Starts at 1
@@ -826,7 +826,7 @@ transient_status_buf: [64]u8 = undefined,
 transient_status_len: u8 = 0,
 ```
 
-**Step 2 — Name split panes.** Modify `createSplitPane` (around line 590):
+**Step 2 - Name split panes.** Modify `createSplitPane` (around line 590):
 
 ```zig
 fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
@@ -853,7 +853,7 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
 
 `ConversationBuffer.init` duplicates the name (confirmed in the orchestrator research agent's report), so the stack buffer is safe.
 
-**Step 3 — Announce on split.** Modify `doSplit` (around line 571):
+**Step 3 - Announce on split.** Modify `doSplit` (around line 571):
 
 ```zig
 fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
@@ -884,7 +884,7 @@ fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
 }
 ```
 
-**Step 4 — Wire transient status into the status derivation.** Find the per-frame status computation in `tick` (around line 320):
+**Step 4 - Wire transient status into the status derivation.** Find the per-frame status computation in `tick` (around line 320):
 
 ```zig
 const status = if (agent_running) blk: {
@@ -904,17 +904,17 @@ else if (agent_running) blk: {
 } else "";
 ```
 
-**Step 5 — Clear transient on keystroke.** Find the key-event entry point in `EventOrchestrator` (grep for `handleKey` or the keymap `lookup` call around lines 461-477). At the very top of that function, before any dispatch, insert:
+**Step 5 - Clear transient on keystroke.** Find the key-event entry point in `EventOrchestrator` (grep for `handleKey` or the keymap `lookup` call around lines 461-477). At the very top of that function, before any dispatch, insert:
 
 ```zig
 self.transient_status_len = 0;
 ```
 
-This clears the transient the next time the user presses anything — matching the "flash on split, clear on next keystroke" behavior.
+This clears the transient the next time the user presses anything - matching the "flash on split, clear on next keystroke" behavior.
 
-**Step 6 — Also redraw frames when focus moves.** Find the `focus_left`/`focus_down`/`focus_up`/`focus_right` branches in the dispatch switch. After each `self.layout.focusDirection(...)`, add `self.compositor.layout_dirty = true;` so the focused/unfocused frame styling updates on the next frame. If a single setter covers all four (e.g., a shared `doFocus` helper), add it there instead.
+**Step 6 - Also redraw frames when focus moves.** Find the `focus_left`/`focus_down`/`focus_up`/`focus_right` branches in the dispatch switch. After each `self.layout.focusDirection(...)`, add `self.compositor.layout_dirty = true;` so the focused/unfocused frame styling updates on the next frame. If a single setter covers all four (e.g., a shared `doFocus` helper), add it there instead.
 
-**Step 7 — Tests.**
+**Step 7 - Tests.**
 
 If there are existing EventOrchestrator tests, add two alongside them:
 
@@ -935,7 +935,7 @@ test "doSplit sets transient status that matches the new pane label" {
 
 If EventOrchestrator has no inline tests yet, skip the test additions for this task (its behavior is exercised end-to-end by the TUI smoke test in Task 7). Note the gap in the commit message.
 
-**Step 8 — Run tests.** `zig build test`, manually smoke `zig build run`, split with `v`, observe `[INSERT] split → scratch 1` for one frame, press any key, status clears.
+**Step 8 - Run tests.** `zig build test`, manually smoke `zig build run`, split with `v`, observe `[INSERT] split → scratch 1` for one frame, press any key, status clears.
 
 **Commit:** `orchestrator: label and announce split panes`
 
@@ -946,13 +946,13 @@ If EventOrchestrator has no inline tests yet, skip the test additions for this t
 **Files:**
 - None (manual + CI checks).
 
-**Step 1 — Formatting.** `zig fmt --check .`. If it complains, run `zig fmt .` and inspect the diff before committing.
+**Step 1 - Formatting.** `zig fmt --check .`. If it complains, run `zig fmt .` and inspect the diff before committing.
 
-**Step 2 — Full test suite.** `zig build test`. Every test must pass. Pay attention to leak reports from `testing.allocator` — they'd mean a `deinit` got missed during the cursor or title code paths.
+**Step 2 - Full test suite.** `zig build test`. Every test must pass. Pay attention to leak reports from `testing.allocator` - they'd mean a `deinit` got missed during the cursor or title code paths.
 
-**Step 3 — Metrics sanity.** `zig build -Dmetrics=true && zig build run -Dmetrics=true`. The frame trace now includes a `frames` span instead of `borders`. Confirm the per-frame time didn't regress significantly (the old single-divider path was ~1 write per split; the new path writes ~2·(W+H) cells per leaf on `layout_dirty` frames).
+**Step 3 - Metrics sanity.** `zig build -Dmetrics=true && zig build run -Dmetrics=true`. The frame trace now includes a `frames` span instead of `borders`. Confirm the per-frame time didn't regress significantly (the old single-divider path was ~1 write per split; the new path writes ~2·(W+H) cells per leaf on `layout_dirty` frames).
 
-**Step 4 — Visual regression walk-through.**
+**Step 4 - Visual regression walk-through.**
 
 Resume an existing session: `zig build run -- --last`. Verify:
 
@@ -964,7 +964,7 @@ Resume an existing session: `zig build run -- --last`. Verify:
 - Type at the prompt: cursor block moves with each keystroke. Press `Esc`, cursor disappears. Press `i`, cursor returns.
 - Resize the terminal window to 10×6 or smaller: titles suppress, frames still render without running off the screen.
 
-**Step 5 — Commit any final cleanup.**
+**Step 5 - Commit any final cleanup.**
 
 **Final commit (if anything trailed):** `ui: end-to-end focus-visible pane polish`
 
@@ -973,7 +973,7 @@ Resume an existing session: `zig build run -- --last`. Verify:
 ## Open questions / follow-ups (not blockers)
 
 - **Shared border characters.** Adjacent pane frames currently render two vertical lines (right edge of left pane + left edge of right pane). T-junction glyphs (`┤`, `├`, `┬`, `┴`) would collapse those into a single line, but that requires detecting adjacency and tracking the "walk direction" during frame rendering. Left out of scope; revisit once users ask for it.
-- **Title padding on narrow panes.** Between widths 6 and `reserved + 1`, the current math skips the title entirely. A middle-ground could still show a 1-char name or just the leading letter. Not doing this now — it makes the truncation rules asymmetric and the common case (normal-sized panes) is unaffected.
+- **Title padding on narrow panes.** Between widths 6 and `reserved + 1`, the current math skips the title entirely. A middle-ground could still show a 1-char name or just the leading letter. Not doing this now - it makes the truncation rules asymmetric and the common case (normal-sized panes) is unaffected.
 - **Focus-change repaint cost.** Setting `layout_dirty = true` on every focus move is cheap for a handful of panes but wasteful for 10+. If zag ever grows heavy layouts, add a `frames_dirty` flag separate from `layout_dirty` and paint frames on their own dirty signal.
 
 ---

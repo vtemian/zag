@@ -4,13 +4,13 @@
 
 `src/ConversationBuffer.zig` is 1322 lines with ~20 fields and three tangled concerns:
 
-1. **View** — node tree, renderer, scroll state, dirty flag, Buffer vtable
-2. **Session** — LLM message history, tool-call ID correlation, JSONL persistence
-3. **Agent lifecycle** — thread handle, cancel flag, event queue, Lua engine pointer, status-bar info, hook dispatch
+1. **View** - node tree, renderer, scroll state, dirty flag, Buffer vtable
+2. **Session** - LLM message history, tool-call ID correlation, JSONL persistence
+3. **Agent lifecycle** - thread handle, cancel flag, event queue, Lua engine pointer, status-bar info, hook dispatch
 
 The mixing is not hypothetical. Concrete symptoms:
 
-- `handleAgentEvent` mutates the tree (view), persists to session, and fires Lua hooks (runner) from a single method — every event variant pays the full three-way tax.
+- `handleAgentEvent` mutates the tree (view), persists to session, and fires Lua hooks (runner) from a single method - every event variant pays the full three-way tax.
 - `submitInput` appends to `messages` (session), creates a `user_message` node (view), and persists an entry (session) in one call.
 - `pending_tool_calls: StringHashMap(*Node)` bridges LLM call IDs (session concern) directly to tree-node pointers (view concern).
 - `EventOrchestrator.zig` reaches into `cb.event_queue`, `cb.wake_fd`, `cb.lua_engine`, `cb.cancel_flag`, `cb.agent_thread` at spawn time (five direct field writes), plus `cb.render_dirty` at the render gate. These writes can't be encapsulated while the struct is one type.
@@ -19,14 +19,14 @@ The mixing is not hypothetical. Concrete symptoms:
 The refactor pays its cost in exchange for:
 
 - Ability to host two views of the same session (split panes showing the same conversation at different scroll offsets, a diff buffer referencing live session state without owning it).
-- Independent testability of each concern — today there are zero tests for session persistence in isolation.
+- Independent testability of each concern - today there are zero tests for session persistence in isolation.
 - Reduced per-struct field count (20 → roughly 8 / 5 / 9 across the three types).
 
 ## Design
 
 ### Target types
 
-**`src/ConversationBuffer.zig`** — pure view over a node tree.
+**`src/ConversationBuffer.zig`** - pure view over a node tree.
 
 ```
 Fields:
@@ -48,7 +48,7 @@ Methods:
 
 No knowledge of messages, sessions, threads, events, or Lua.
 
-**`src/ConversationSession.zig`** — LLM conversation state and persistence.
+**`src/ConversationSession.zig`** - LLM conversation state and persistence.
 
 ```
 Fields:
@@ -72,7 +72,7 @@ Methods:
 
 No node tree, no threading, no hooks.
 
-**`src/AgentRunner.zig`** — agent lifecycle + event coordination.
+**`src/AgentRunner.zig`** - agent lifecycle + event coordination.
 
 ```
 Back-refs (not owned):
@@ -105,7 +105,7 @@ Methods:
   startAgent(provider, registry)                (spawn the thread)
 ```
 
-Owns the tangle point (`pending_tool_calls`, `current_assistant_node`, `last_tool_call`) because it's the only place the tangle is legitimate — these are coordination state between the LLM stream and the view tree.
+Owns the tangle point (`pending_tool_calls`, `current_assistant_node`, `last_tool_call`) because it's the only place the tangle is legitimate - these are coordination state between the LLM stream and the view tree.
 
 ### Orchestrator's composition
 
@@ -121,26 +121,26 @@ pub const Pane = struct {
 
 Root pane lives in `main.zig` and is handed to orchestrator as `Config.root_pane`. Split panes are created by `EventOrchestrator.createSplitPane` which allocates all three and returns a `Pane`.
 
-Layout still stores `Buffer` (the interface) in its leaves — no change to `Layout.zig`. `EventOrchestrator` resolves `pane_from_buffer(b)` via an internal map (`Pane` keyed by `view.id`) to recover the other two pieces when given a focused leaf.
+Layout still stores `Buffer` (the interface) in its leaves - no change to `Layout.zig`. `EventOrchestrator` resolves `pane_from_buffer(b)` via an internal map (`Pane` keyed by `view.id`) to recover the other two pieces when given a focused leaf.
 
 ### Decisions
 
-**D1 — Raw `*Node` pointers in `pending_tool_calls`.** Lifetimes are coupled via the orchestrator anyway (both `view` and `runner` deinit together via the `Pane`). Avoids a lookup cost per event; avoids adding a `getNode(id)` API to the view.
+**D1 - Raw `*Node` pointers in `pending_tool_calls`.** Lifetimes are coupled via the orchestrator anyway (both `view` and `runner` deinit together via the `Pane`). Avoids a lookup cost per event; avoids adding a `getNode(id)` API to the view.
 
-**D2 — Big-bang migration.** One branch. Both extractions land together. Cleaner end state, one merge, avoids delegation stubs that would need to be removed later.
+**D2 - Big-bang migration.** One branch. Both extractions land together. Cleaner end state, one merge, avoids delegation stubs that would need to be removed later.
 
-**D3 — `last_info` lives on `AgentRunner`.** The runner produces it (pulls from `info` events); orchestrator calls `pane.runner.lastInfo()` for the status bar. `ConversationBuffer` never sees it.
+**D3 - `last_info` lives on `AgentRunner`.** The runner produces it (pulls from `info` events); orchestrator calls `pane.runner.lastInfo()` for the status bar. `ConversationBuffer` never sees it.
 
-**D4 — Plan-first.** This document exists so the implementation doesn't drift mid-branch.
+**D4 - Plan-first.** This document exists so the implementation doesn't drift mid-branch.
 
 ### Migration order within the branch
 
-1. **Phase 0 — Safety net.** Add six missing tests that lock in behavior the audit found uncovered (`submitInput`, `loadFromEntries`, `rebuildMessages`, `restoreFromSession`, tool correlation via `handleAgentEvent`, `drainEvents` thread+queue lifecycle). These stay in `ConversationBuffer.zig` today; they move with the code post-extraction.
-2. **Phase 1 — Extract `ConversationSession`.** Move messages + persistence. `ConversationBuffer` composes `*ConversationSession` temporarily so the diff is minimal. Tests pass.
-3. **Phase 2 — Extract `AgentRunner`.** Move agent lifecycle, events, hooks, streaming state. `ConversationBuffer` composes `*AgentRunner` temporarily.
-4. **Phase 3 — Shrink `ConversationBuffer`.** Remove the composition fields from the view; the `Pane` now owns all three separately.
-5. **Phase 4 — Update callers.** `main.zig`, `EventOrchestrator.zig`, `Compositor.zig` learn about `Pane`. No other file changes (per the five-file audit).
-6. **Phase 5 — Verify.** Full test suite, formatter, manual TUI smoke test.
+1. **Phase 0 - Safety net.** Add six missing tests that lock in behavior the audit found uncovered (`submitInput`, `loadFromEntries`, `rebuildMessages`, `restoreFromSession`, tool correlation via `handleAgentEvent`, `drainEvents` thread+queue lifecycle). These stay in `ConversationBuffer.zig` today; they move with the code post-extraction.
+2. **Phase 1 - Extract `ConversationSession`.** Move messages + persistence. `ConversationBuffer` composes `*ConversationSession` temporarily so the diff is minimal. Tests pass.
+3. **Phase 2 - Extract `AgentRunner`.** Move agent lifecycle, events, hooks, streaming state. `ConversationBuffer` composes `*AgentRunner` temporarily.
+4. **Phase 3 - Shrink `ConversationBuffer`.** Remove the composition fields from the view; the `Pane` now owns all three separately.
+5. **Phase 4 - Update callers.** `main.zig`, `EventOrchestrator.zig`, `Compositor.zig` learn about `Pane`. No other file changes (per the five-file audit).
+6. **Phase 5 - Verify.** Full test suite, formatter, manual TUI smoke test.
 
 Between phases `zig build test` exits 0 and `zig fmt --check .` is clean. The branch is mergeable at any phase boundary if we choose to abandon later phases.
 
