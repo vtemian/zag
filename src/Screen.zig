@@ -8,6 +8,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.screen);
 const trace = @import("Metrics.zig");
+const width_mod = @import("width.zig");
+const Terminal = @import("Terminal.zig");
 
 const Screen = @This();
 
@@ -47,6 +49,10 @@ pub const Cell = struct {
     bg: Color = .default,
     /// Text style (bold, italic, etc.).
     style: Style = .{},
+    /// True when this cell is the second half of a wide character. Render
+    /// must skip continuation cells; overwriting a wide char requires
+    /// clearing both halves.
+    continuation: bool = false,
 };
 
 /// Width of the screen in columns.
@@ -145,13 +151,23 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
     while (iter.nextCodepoint()) |cp| {
-        if (c >= self.width) break;
         if (row >= self.height) break;
+        const w = width_mod.codepointWidth(cp);
+        if (w == 0) continue; // zero-width: do not consume a cell
+        if (c + w > self.width) break; // wide char doesn't fit — stop
         const cell = self.getCell(row, c);
         cell.codepoint = cp;
         cell.style = style;
         cell.fg = fg;
-        c += 1;
+        cell.continuation = false;
+        if (w == 2) {
+            const cont = self.getCell(row, c + 1);
+            cont.codepoint = ' ';
+            cont.style = style;
+            cont.fg = fg;
+            cont.continuation = true;
+        }
+        c += w;
     }
     return c;
 }
@@ -174,17 +190,27 @@ pub fn writeStrWrapped(
     var iter = view.iterator();
     while (iter.nextCodepoint()) |cp| {
         if (row >= max_row) break;
-        if (col >= max_col) {
-            // Wrap to next line
+        const w = width_mod.codepointWidth(cp);
+        if (w == 0) continue;
+        if (col + w > max_col) {
             row += 1;
             col = start_col;
             if (row >= max_row) break;
+            if (col + w > max_col) break; // still won't fit — give up
         }
         const cell = self.getCell(row, col);
         cell.codepoint = cp;
         cell.style = style;
         cell.fg = fg;
-        col += 1;
+        cell.continuation = false;
+        if (w == 2) {
+            const cont = self.getCell(row, col + 1);
+            cont.codepoint = ' ';
+            cont.style = style;
+            cont.fg = fg;
+            cont.continuation = true;
+        }
+        col += w;
     }
     return .{ .row = row, .col = col };
 }
@@ -241,49 +267,56 @@ fn colorsEqual(a: Color, b: Color) bool {
 ///
 /// **Mutates self**: copies current to previous after writing, so a
 /// subsequent render with no intervening cell changes produces no output.
+///
+/// The diff scans each row left to right, merging contiguous dirty cells
+/// that share the same style/fg/bg into a single cursor-move + SGR + run
+/// of UTF-8 bytes. Implicit terminal cursor advancement after each
+/// codepoint keeps the per-cell overhead near zero.
 pub fn render(self: *Screen, file: std.fs.File) !void {
     self.render_buf.clearRetainingCapacity();
 
     const writer = self.render_buf.writer(self.allocator);
 
-    // Diff the current grid against previous and generate ANSI sequences
     var cells_changed: u32 = 0;
     {
         var diff_span = trace.span("diff_generate");
         defer diff_span.endWithArgs(.{ .cells_changed = cells_changed });
 
-        // Begin synchronized output
         try writer.writeAll("\x1b[?2026h");
 
-        var cursor_row: u16 = 0;
-        var cursor_col: u16 = 0;
-        var cursor_valid = false;
         var last_style: ?Style = null;
         var last_fg: ?Color = null;
         var last_bg: ?Color = null;
 
         for (0..self.height) |row_usize| {
             const row: u16 = @intCast(row_usize);
-            for (0..self.width) |col_usize| {
-                const col: u16 = @intCast(col_usize);
-                const idx = row_usize * @as(usize, self.width) + col_usize;
+            const row_base = row_usize * @as(usize, self.width);
 
+            var col: u16 = 0;
+            while (col < self.width) {
+                const idx = row_base + col;
                 const cur = self.current[idx];
                 const prev = self.previous[idx];
 
-                if (cellsEqual(cur, prev)) continue;
-                cells_changed += 1;
-
-                // Move cursor if needed
-                if (!cursor_valid or cursor_row != row or cursor_col != col) {
-                    // ANSI cursor positions are 1-indexed
-                    try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
-                    cursor_row = row;
-                    cursor_col = col;
-                    cursor_valid = true;
+                // Clean cell: skip. Continuation cells are painted by
+                // their primary and must never start a run on their own;
+                // treat them as "skip" when the primary upstream already
+                // handled them.
+                if (cellsEqual(cur, prev)) {
+                    col += 1;
+                    continue;
+                }
+                if (cur.continuation) {
+                    col += 1;
+                    continue;
                 }
 
-                // Emit SGR if style or colors changed
+                const run_end = self.findRunEnd(row, col, cur);
+                cells_changed += run_end - col;
+
+                // ANSI cursor positions are 1-indexed.
+                try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
+
                 if (!stylesEqual(last_style, cur.style) or
                     !optColorsEqual(last_fg, cur.fg) or
                     !optColorsEqual(last_bg, cur.bg))
@@ -294,28 +327,24 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                     last_bg = cur.bg;
                 }
 
-                // Write the codepoint as UTF-8, falling back to U+FFFD for invalid codepoints
-                var encoded: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cur.codepoint, &encoded) catch |err| blk: {
-                    log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cur.codepoint), err });
-                    // U+FFFD REPLACEMENT CHARACTER (0xEF 0xBF 0xBD)
-                    encoded[0] = 0xEF;
-                    encoded[1] = 0xBF;
-                    encoded[2] = 0xBD;
-                    break :blk 3;
-                };
-                try writer.writeAll(encoded[0..len]);
+                // Walk the run one grid column at a time. Continuation
+                // cells emit no bytes (the primary already did, and the
+                // terminal has advanced the cursor through them).
+                var c: u16 = col;
+                while (c < run_end) : (c += 1) {
+                    const run_cell = self.current[row_base + c];
+                    if (run_cell.continuation) continue;
+                    try writeCodepoint(writer, run_cell.codepoint);
+                }
 
-                cursor_col +|= 1;
+                col = run_end;
             }
         }
 
-        // Reset attributes after rendering
         if (last_style != null or last_fg != null or last_bg != null) {
             try writer.writeAll("\x1b[0m");
         }
 
-        // End synchronized output
         try writer.writeAll("\x1b[?2026l");
     }
 
@@ -351,6 +380,69 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
     }
 }
 
+/// Scan forward from `start_col` on `row` for the longest contiguous
+/// run of dirty cells that share the first cell's style/fg/bg. Returns
+/// the column after the last cell in the run (one past the end). The
+/// returned column is always in `(start_col, self.width]`.
+///
+/// Continuation cells (second half of a wide char) are swallowed into
+/// the run — they inherit style from their primary and the terminal
+/// advances the cursor through them implicitly. A wide-char primary
+/// whose successor is not a continuation cell terminates the run so
+/// the next iteration re-syncs cursor position explicitly.
+fn findRunEnd(self: *const Screen, row: u16, start_col: u16, head: Cell) u16 {
+    const row_base = @as(usize, row) * @as(usize, self.width);
+    var c: u16 = start_col;
+
+    // Advance past the head cell. If head is wide and col+1 is a proper
+    // continuation, include it; otherwise stop before col+1 so the next
+    // outer iteration issues a fresh cursor move.
+    const head_width = width_mod.codepointWidth(head.codepoint);
+    c += 1;
+    if (head_width == 2 and c < self.width and self.current[row_base + c].continuation) {
+        c += 1;
+    } else if (head_width == 2) {
+        return c;
+    }
+
+    while (c < self.width) {
+        const cell = self.current[row_base + c];
+        if (cell.continuation) {
+            c += 1;
+            continue;
+        }
+        if (cellsEqual(cell, self.previous[row_base + c])) break;
+        if (!stylesEqual(head.style, cell.style)) break;
+        if (!colorsEqual(head.fg, cell.fg)) break;
+        if (!colorsEqual(head.bg, cell.bg)) break;
+
+        const w = width_mod.codepointWidth(cell.codepoint);
+        c += 1;
+        if (w == 2) {
+            if (c < self.width and self.current[row_base + c].continuation) {
+                c += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    return c;
+}
+
+/// Write a single codepoint as UTF-8 to `writer`, substituting U+FFFD
+/// (0xEF 0xBF 0xBD) when the codepoint is not valid Unicode.
+fn writeCodepoint(writer: anytype, cp: u21) !void {
+    var encoded: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(cp, &encoded) catch |err| blk: {
+        log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cp), err });
+        encoded[0] = 0xEF;
+        encoded[1] = 0xBF;
+        encoded[2] = 0xBD;
+        break :blk 3;
+    };
+    try writer.writeAll(encoded[0..len]);
+}
+
 /// Check if an optional style matches a concrete style.
 fn stylesEqual(maybe_last: ?Style, cur: Style) bool {
     const last = maybe_last orelse return false;
@@ -364,6 +456,11 @@ fn optColorsEqual(maybe_last: ?Color, cur: Color) bool {
 }
 
 /// Write SGR (Select Graphic Rendition) escape sequences for the given style and colors.
+///
+/// RGB colors are emitted as 24-bit SGR (`38;2;R;G;B` / `48;2;R;G;B`) only
+/// when `Terminal.true_color` is set. Otherwise they are downgraded to the
+/// closest entry in the 256-color palette so SSH sessions, xterm-256color,
+/// etc. render something reasonable instead of leaking raw escape codes.
 fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
     // Reset first, then apply. Simpler and avoids stale attributes.
     try writer.writeAll("\x1b[0");
@@ -378,16 +475,48 @@ fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
     switch (fg) {
         .default => {},
         .palette => |idx| try std.fmt.format(writer, ";38;5;{d}", .{idx}),
-        .rgb => |c| try std.fmt.format(writer, ";38;2;{d};{d};{d}", .{ c.r, c.g, c.b }),
+        .rgb => |c| if (Terminal.true_color) {
+            try std.fmt.format(writer, ";38;2;{d};{d};{d}", .{ c.r, c.g, c.b });
+        } else {
+            try std.fmt.format(writer, ";38;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
+        },
     }
 
     switch (bg) {
         .default => {},
         .palette => |idx| try std.fmt.format(writer, ";48;5;{d}", .{idx}),
-        .rgb => |c| try std.fmt.format(writer, ";48;2;{d};{d};{d}", .{ c.r, c.g, c.b }),
+        .rgb => |c| if (Terminal.true_color) {
+            try std.fmt.format(writer, ";48;2;{d};{d};{d}", .{ c.r, c.g, c.b });
+        } else {
+            try std.fmt.format(writer, ";48;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
+        },
     }
 
     try writer.writeAll("m");
+}
+
+/// Map a 24-bit RGB triple to the closest xterm-256 palette index.
+///
+/// The 256-color palette is:
+///   * 0..15   — ANSI / bright ANSI (terminal-dependent RGB; we avoid it)
+///   * 16..231 — 6x6x6 RGB cube: idx = 16 + 36*r + 6*g + b, r,g,b in 0..5
+///   * 232..255 — 24-step grayscale ramp
+///
+/// Perceptually-accurate conversion is out of scope; callers only hit this
+/// path when the terminal lacks true color, where any sensible approximation
+/// beats emitting unparseable 24-bit escapes.
+fn rgbTo256(r: u8, g: u8, b: u8) u8 {
+    // Near-grayscale: ramp is denser than the cube diagonal, use it.
+    if (r == g and g == b) {
+        if (r < 8) return 16;
+        if (r > 248) return 231;
+        return 232 + (r - 8) / 10;
+    }
+    // Quantize each channel to 0..5 steps of the 6x6x6 cube.
+    const qr: u8 = @intCast(@min(5, @as(u32, r) * 5 / 255));
+    const qg: u8 = @intCast(@min(5, @as(u32, g) * 5 / 255));
+    const qb: u8 = @intCast(@min(5, @as(u32, b) * 5 / 255));
+    return 16 + 36 * qr + 6 * qg + qb;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -665,6 +794,11 @@ test "render emits RGB background color SGR sequences" {
     var screen = try Screen.init(allocator, 2, 1);
     defer screen.deinit();
 
+    // Force the truecolor path for this test regardless of the host terminal.
+    const saved = Terminal.true_color;
+    Terminal.true_color = true;
+    defer Terminal.true_color = saved;
+
     screen.getCell(0, 0).codepoint = 'A';
     screen.getCell(0, 0).bg = .{ .rgb = .{ .r = 255, .g = 128, .b = 0 } };
 
@@ -681,6 +815,57 @@ test "render emits RGB background color SGR sequences" {
 
     // Should contain the RGB background SGR: 48;2;255;128;0
     try std.testing.expect(std.mem.indexOf(u8, output, "48;2;255;128;0") != null);
+}
+
+test "rgbTo256 maps grayscale into the 232..255 ramp" {
+    const idx = rgbTo256(128, 128, 128);
+    try std.testing.expect(idx >= 232 and idx <= 255);
+}
+
+test "rgbTo256 maps low grayscale to 16 and high grayscale to 231" {
+    try std.testing.expectEqual(@as(u8, 16), rgbTo256(0, 0, 0));
+    try std.testing.expectEqual(@as(u8, 231), rgbTo256(255, 255, 255));
+}
+
+test "rgbTo256 maps pure red to cube index 196" {
+    // 16 + 36*5 + 6*0 + 0 = 196
+    try std.testing.expectEqual(@as(u8, 196), rgbTo256(255, 0, 0));
+}
+
+test "rgbTo256 maps pure green and blue to expected cube indices" {
+    // green: 16 + 0 + 6*5 + 0 = 46
+    try std.testing.expectEqual(@as(u8, 46), rgbTo256(0, 255, 0));
+    // blue:  16 + 0 + 0 + 5 = 21
+    try std.testing.expectEqual(@as(u8, 21), rgbTo256(0, 0, 255));
+}
+
+test "writeSgr downgrades RGB to 256 when true_color is unavailable" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 2, 1);
+    defer screen.deinit();
+
+    const saved = Terminal.true_color;
+    Terminal.true_color = false;
+    defer Terminal.true_color = saved;
+
+    screen.getCell(0, 0).codepoint = 'R';
+    screen.getCell(0, 0).fg = .{ .rgb = .{ .r = 255, .g = 0, .b = 0 } };
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Pure red downgrades to palette index 196.
+    try std.testing.expect(std.mem.indexOf(u8, output, ";38;5;196m") != null);
+    // And the 24-bit form must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, output, ";38;2;255;0;0") == null);
 }
 
 test "render reuses output buffer across frames" {
@@ -816,4 +1001,112 @@ test "writeStr starts at offset column" {
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, 2).codepoint);
     try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 3).codepoint);
     try std.testing.expectEqual(@as(u21, 'b'), screen.getCellConst(0, 4).codepoint);
+}
+
+test "writeStr advances by 2 columns for CJK" {
+    var screen = try Screen.init(std.testing.allocator, 10, 1);
+    defer screen.deinit();
+    const end_col = screen.writeStr(0, 0, "中A", .{}, .default);
+    try std.testing.expectEqual(@as(u16, 3), end_col);
+    try std.testing.expect(screen.getCell(0, 0).codepoint == 0x4E2D);
+    try std.testing.expect(screen.getCell(0, 1).continuation);
+    try std.testing.expect(screen.getCell(0, 2).codepoint == 'A');
+}
+
+test "writeStr does not advance for combining marks" {
+    var screen = try Screen.init(std.testing.allocator, 4, 1);
+    defer screen.deinit();
+    // 'a' + combining acute (U+0301) + 'b'
+    const end_col = screen.writeStr(0, 0, "a\u{0301}b", .{}, .default);
+    try std.testing.expectEqual(@as(u16, 2), end_col);
+    try std.testing.expect(screen.getCell(0, 0).codepoint == 'a');
+    try std.testing.expect(screen.getCell(0, 1).codepoint == 'b');
+}
+
+test "writeStr skips wide char that would overflow the row" {
+    var screen = try Screen.init(std.testing.allocator, 3, 1);
+    defer screen.deinit();
+    // Two wide chars: col 0-1 fits, col 2 does NOT (would need col 2 + 3)
+    const end_col = screen.writeStr(0, 0, "中中", .{}, .default);
+    try std.testing.expectEqual(@as(u16, 2), end_col);
+    try std.testing.expect(screen.getCell(0, 2).codepoint == ' '); // untouched
+}
+
+test "diff emits at most one SGR per contiguous same-style run" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 20, 1);
+    defer screen.deinit();
+
+    // Fill 20 cells, all red foreground 'x'. One run, one style.
+    for (0..20) |i| {
+        const cell = screen.getCell(0, @intCast(i));
+        cell.codepoint = 'x';
+        cell.fg = .{ .palette = 1 };
+    }
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [2048]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Expected escape sequences: sync-start, cursor-pos, SGR, reset, sync-end (5).
+    // Cap at 6 to leave room for future refactors without overshooting by much.
+    var escapes: usize = 0;
+    for (output) |b| {
+        if (b == 0x1B) escapes += 1;
+    }
+    try std.testing.expect(escapes <= 6);
+
+    // And exactly one 256-palette-fg SGR emission in total.
+    const needle = "38;5;1";
+    var matches: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search, needle)) |pos| {
+        matches += 1;
+        search = pos + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+
+    // And all 20 'x' codepoints were emitted back-to-back somewhere.
+    try std.testing.expect(std.mem.indexOf(u8, output, "xxxxxxxxxxxxxxxxxxxx") != null);
+}
+
+test "diff merges run containing wide-char continuation cell" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 6, 1);
+    defer screen.deinit();
+
+    // Pattern: 'a' 'b' CJK(wide,cont) 'c' 'd' — all red fg, one style.
+    _ = screen.writeStr(0, 0, "ab中cd", .{}, .{ .palette = 1 });
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [2048]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Exactly one SGR for this same-style run.
+    const needle = "38;5;1";
+    var matches: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search, needle)) |pos| {
+        matches += 1;
+        search = pos + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+
+    // All codepoints emitted back-to-back (continuation cell consumed silently).
+    // U+4E2D "中" is 0xE4 0xB8 0xAD.
+    try std.testing.expect(std.mem.indexOf(u8, output, "ab\xE4\xB8\xADcd") != null);
 }

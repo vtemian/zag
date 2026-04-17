@@ -5,12 +5,36 @@
 
 const std = @import("std");
 const zlua = @import("zlua");
+const build_options = @import("build_options");
 const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
+
+/// Whether the Lua sandbox strips dangerous globals before user code runs.
+/// A shared plugin marketplace should never be one `os.execute("rm -rf ~")`
+/// away from disaster. Override with `-Dlua_sandbox=false` for local debugging.
+pub const sandbox_enabled = build_options.lua_sandbox;
+
+/// Lua bootstrap that preserves a minimal safe subset of `os`
+/// (date, time, clock) and nils out everything else that can touch
+/// the filesystem, spawn processes, or subvert the VM.
+const sandbox_strip =
+    \\local _date, _time, _clock = os.date, os.time, os.clock
+    \\os = nil
+    \\io = nil
+    \\debug = nil
+    \\package = nil
+    \\require = nil
+    \\dofile = nil
+    \\loadfile = nil
+    \\load = nil
+    \\loadstring = nil
+    \\string.dump = nil
+    \\os = { date = _date, time = _time, clock = _clock }
+;
 
 /// A tool defined in Lua via `zag.tool()`.
 pub const LuaTool = struct {
@@ -51,6 +75,13 @@ pub const LuaEngine = struct {
         errdefer lua.deinit();
 
         lua.openLibs();
+
+        if (sandbox_enabled) {
+            lua.doString(sandbox_strip) catch |err| {
+                log.err("lua sandbox bootstrap failed: {}", .{err});
+                return err;
+            };
+        }
 
         injectZagGlobal(lua);
 
@@ -643,8 +674,15 @@ pub const LuaEngine = struct {
     // -- Tool execution --------------------------------------------------------
 
     /// Execute a Lua tool by name with raw JSON input. Returns a ToolResult.
-    /// The caller's allocator is used for result content so ownership is clean.
-    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8, allocator: Allocator) types.ToolResult {
+    ///
+    /// Errors raised here:
+    /// - `InvalidInput`: the raw JSON does not parse.
+    /// - `OutOfMemory`: allocator failure while marshalling input or output.
+    ///
+    /// Lua runtime errors (thrown `error()`, `nil, err` convention, non-string
+    /// returns) are surfaced as `ToolResult { is_error = true }` so the LLM
+    /// can observe and retry.
+    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
         const tool = self.findTool(name) orelse return .{
             .content = "error: unknown lua tool",
             .is_error = true,
@@ -656,11 +694,14 @@ pub const LuaEngine = struct {
 
         // Parse JSON input and push as Lua table
         pushJsonAsTable(self.lua, input_json, self.allocator) catch |err| {
-            log.err("executeTool: failed to parse input JSON: {}", .{err});
             self.lua.pop(1); // pop the function
-            const msg = std.fmt.allocPrint(allocator, "error: invalid input JSON: {}", .{err}) catch
-                return .{ .content = "error: invalid input JSON", .is_error = true, .owned = false };
-            return .{ .content = msg, .is_error = true };
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.err("executeTool: failed to parse input JSON: {}", .{err});
+                    return error.InvalidInput;
+                },
+            }
         };
 
         // pcall(fn, input_table) -> result_string or nil,err
@@ -668,7 +709,7 @@ pub const LuaEngine = struct {
             const err_msg = self.lua.toString(-1) catch "unknown Lua error";
             const owned_msg = allocator.dupe(u8, err_msg) catch {
                 self.lua.pop(1);
-                return .{ .content = "error: Lua runtime error (OOM copying message)", .is_error = true, .owned = false };
+                return error.OutOfMemory;
             };
             self.lua.pop(1);
             return .{ .content = owned_msg, .is_error = true };
@@ -679,7 +720,7 @@ pub const LuaEngine = struct {
             const err_msg = self.lua.toString(-1) catch "unknown error from Lua tool";
             const owned = allocator.dupe(u8, err_msg) catch {
                 self.lua.pop(2);
-                return .{ .content = "error: OOM copying Lua error", .is_error = true, .owned = false };
+                return error.OutOfMemory;
             };
             self.lua.pop(2);
             return .{ .content = owned, .is_error = true };
@@ -692,7 +733,7 @@ pub const LuaEngine = struct {
         };
         const output = allocator.dupe(u8, result) catch {
             self.lua.pop(2);
-            return .{ .content = "error: OOM copying Lua result", .is_error = true, .owned = false };
+            return error.OutOfMemory;
         };
         self.lua.pop(2);
         return .{ .content = output, .is_error = false };
@@ -771,7 +812,10 @@ pub const LuaEngine = struct {
     }
 
     /// Adjust package.path so that `require` can find modules in the given directory.
+    /// No-op when the sandbox is enabled: `package` and `require` are stripped.
     pub fn setPluginPath(self: *LuaEngine, dir: []const u8) !void {
+        if (sandbox_enabled) return;
+
         const lua_code = try std.fmt.allocPrint(
             self.allocator,
             "package.path = package.path .. ';{s}/?.lua;{s}/?/init.lua'",
@@ -787,12 +831,131 @@ pub const LuaEngine = struct {
             return err;
         };
     }
+
+    /// Hook for agent threads to bind this engine as their active Lua context.
+    /// Currently a no-op: Lua tool execution round-trips through the main thread
+    /// via `AgentThread.lua_request_queue`, so no per-thread engine pointer is
+    /// needed. Kept as an extension point for future per-thread Lua states.
+    pub fn activate(self: *LuaEngine) void {
+        _ = self;
+    }
+
+    /// Symmetric counterpart to `activate()`. Currently a no-op; see `activate`.
+    pub fn deactivate(self: *LuaEngine) void {
+        _ = self;
+    }
 };
 
 // -- Tests -------------------------------------------------------------------
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "sandbox strips os.execute and friends" {
+    if (!sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString(
+        \\probe = {
+        \\  os_execute = type(os.execute),
+        \\  io = io,
+        \\  debug = debug,
+        \\  package = package,
+        \\  require = require,
+        \\  dofile = dofile,
+        \\  loadfile = loadfile,
+        \\  load = load,
+        \\}
+    );
+
+    const checks = [_]struct { field: [:0]const u8, expect_nil: bool }{
+        .{ .field = "io", .expect_nil = true },
+        .{ .field = "debug", .expect_nil = true },
+        .{ .field = "package", .expect_nil = true },
+        .{ .field = "require", .expect_nil = true },
+        .{ .field = "dofile", .expect_nil = true },
+        .{ .field = "loadfile", .expect_nil = true },
+        .{ .field = "load", .expect_nil = true },
+    };
+
+    _ = try engine.lua.getGlobal("probe");
+    defer engine.lua.pop(1);
+
+    _ = engine.lua.getField(-1, "os_execute");
+    const os_execute_type = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("nil", os_execute_type);
+    engine.lua.pop(1);
+
+    for (checks) |check| {
+        _ = engine.lua.getField(-1, check.field);
+        try std.testing.expectEqual(check.expect_nil, engine.lua.isNoneOrNil(-1));
+        engine.lua.pop(1);
+    }
+}
+
+test "sandbox strips string.dump to block bytecode injection" {
+    if (!sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("dump_kind = type(string.dump)");
+    _ = try engine.lua.getGlobal("dump_kind");
+    defer engine.lua.pop(1);
+    const kind = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("nil", kind);
+}
+
+test "sandbox preserves minimal os (date, time, clock)" {
+    if (!sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString(
+        \\probe_os = {
+        \\  date = type(os.date),
+        \\  time = type(os.time),
+        \\  clock = type(os.clock),
+        \\  execute = type(os.execute),
+        \\  remove = type(os.remove),
+        \\}
+    );
+
+    _ = try engine.lua.getGlobal("probe_os");
+    defer engine.lua.pop(1);
+
+    const survivors = [_][:0]const u8{ "date", "time", "clock" };
+    for (survivors) |name| {
+        _ = engine.lua.getField(-1, name);
+        const kind = try engine.lua.toString(-1);
+        try std.testing.expectEqualStrings("function", kind);
+        engine.lua.pop(1);
+    }
+
+    const removed = [_][:0]const u8{ "execute", "remove" };
+    for (removed) |name| {
+        _ = engine.lua.getField(-1, name);
+        const kind = try engine.lua.toString(-1);
+        try std.testing.expectEqualStrings("nil", kind);
+        engine.lua.pop(1);
+    }
+}
+
+test "sandbox disabled leaves os.execute reachable" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("probe_exec = type(os.execute)");
+    _ = try engine.lua.getGlobal("probe_exec");
+    defer engine.lua.pop(1);
+    const kind = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("function", kind);
 }
 
 test "LuaEngine init and deinit" {
@@ -882,7 +1045,7 @@ test "executeTool calls Lua function and returns result" {
         \\})
     );
 
-    const result = engine.executeTool("echo", "{\"message\": \"hi\"}", std.testing.allocator);
+    const result = try engine.executeTool("echo", "{\"message\": \"hi\"}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("echo: hi", result.content);
@@ -904,7 +1067,7 @@ test "executeTool handles Lua runtime errors" {
         \\})
     );
 
-    const result = engine.executeTool("crasher", "{}", std.testing.allocator);
+    const result = try engine.executeTool("crasher", "{}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "intentional crash") != null);
@@ -926,7 +1089,7 @@ test "executeTool handles nil,err return convention" {
         \\})
     );
 
-    const result = engine.executeTool("failsoft", "{}", std.testing.allocator);
+    const result = try engine.executeTool("failsoft", "{}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("something went wrong", result.content);
@@ -936,7 +1099,7 @@ test "executeTool returns error for unknown tool" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
-    const result = engine.executeTool("nonexistent", "{}", std.testing.allocator);
+    const result = try engine.executeTool("nonexistent", "{}", std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: unknown lua tool", result.content);
     try std.testing.expect(!result.owned);
@@ -1095,7 +1258,7 @@ test "end-to-end: config file to registry execution" {
     // Lua tools now round-trip via the event queue; spawn a pump thread
     // that services `lua_tool_request` events off the queue and dispatches
     // them through dispatchHookRequests, which is the production path.
-    var queue = AgentThread.EventQueue.init(std.testing.allocator);
+    var queue = try AgentThread.EventQueue.initBounded(std.testing.allocator, 16);
     defer queue.deinit();
 
     var stop = std.atomic.Value(bool).init(false);
@@ -1118,7 +1281,7 @@ test "end-to-end: config file to registry execution" {
     defer AgentThread.lua_request_queue = null;
 
     // Execute through the full registry path (luaToolExecute -> queue -> dispatcher -> executeTool)
-    const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator);
+    const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator, null);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("7", result.content);

@@ -261,9 +261,22 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
     col = self.screen.writeStr(last_row, col, " | ", resolved.screen_style, resolved.fg);
 
     // Show pane rect info
-    var info_buf: [64]u8 = undefined;
-    const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
-    _ = self.screen.writeStr(last_row, col, info, resolved.screen_style, resolved.fg);
+    var info_scratch: [64]u8 = undefined;
+    const info = std.fmt.bufPrint(&info_scratch, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
+    col = self.screen.writeStr(last_row, col, info, resolved.screen_style, resolved.fg);
+
+    // Surface any dropped events so UI divergence from the agent is visible
+    // immediately rather than silent. Only drawn when the counter is non-zero
+    // and the queue is live; the counter is undefined outside an agent run.
+    const cb = ConversationBuffer.fromBuffer(leaf.buffer);
+    if (cb.queue_active) {
+        const drops = cb.event_queue.dropped.load(.monotonic);
+        if (drops > 0) {
+            var drops_scratch: [32]u8 = undefined;
+            const drops_label = std.fmt.bufPrint(&drops_scratch, " [drops: {d}]", .{drops}) catch return;
+            _ = self.screen.writeStr(last_row, col, drops_label, resolved.screen_style, resolved.fg);
+        }
+    }
 
     // When metrics are enabled, show the last frame time right-aligned
     if (trace.enabled) {

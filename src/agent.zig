@@ -69,14 +69,11 @@ pub fn runLoopStreaming(
     const prompt = try buildSystemPrompt(registry, allocator);
     defer allocator.free(prompt);
 
-    thread_local_queue = queue;
-    thread_local_allocator = allocator;
+    // Bind the Lua-tool queue for this thread so `executeToolsSingle` (which
+    // runs inline on the agent thread) can round-trip Lua-defined tools to the
+    // main thread. Worker threads in `executeOneToolCall` set this themselves.
     AgentThread.lua_request_queue = queue;
-    defer {
-        thread_local_queue = null;
-        thread_local_allocator = null;
-        AgentThread.lua_request_queue = null;
-    }
+    defer AgentThread.lua_request_queue = null;
 
     var turn_num: u32 = 0;
     while (true) {
@@ -137,6 +134,15 @@ fn fireLifecycleHook(
     }
 }
 
+/// Per-call state threaded through the streaming callback. Keeps the queue,
+/// allocator, and running text_delta count on the caller's stack so a second
+/// thread entering `callLlm` cannot stomp on it.
+const StreamContext = struct {
+    queue: *AgentThread.EventQueue,
+    allocator: Allocator,
+    text_count: u32 = 0,
+};
+
 /// Call the LLM with streaming, falling back to non-streaming on error.
 fn callLlm(
     provider: llm.Provider,
@@ -147,23 +153,25 @@ fn callLlm(
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
 ) !types.LlmResponse {
-    thread_local_stream_text_count = 0;
+    var stream_ctx: StreamContext = .{ .queue = queue, .allocator = allocator };
+    const callback: llm.StreamCallback = .{
+        .ctx = &stream_ctx,
+        .on_event = &streamEventToQueue,
+    };
     return provider.callStreaming(
         prompt,
         messages,
         tool_defs,
         allocator,
-        &streamEventToQueue,
+        callback,
         cancel,
     ) catch |streaming_err| {
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
         const fallback = try provider.call(prompt, messages, tool_defs, allocator);
         // If streaming already rendered partial text, discard it so the
         // full fallback response doesn't appear concatenated to the partial.
-        if (thread_local_stream_text_count > 0) {
-            queue.push(.reset_assistant_text) catch |err| {
-                log.warn("failed to reset partial stream: {s}", .{@errorName(err)});
-            };
+        if (stream_ctx.text_count > 0) {
+            queue.tryPush(allocator, .reset_assistant_text);
         }
         // Push text to queue since streaming callback didn't fire (or was reset)
         for (fallback.content) |block| {
@@ -173,10 +181,7 @@ fn callLlm(
                         log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
                         continue;
                     };
-                    queue.push(.{ .text_delta = duped }) catch |err| {
-                        allocator.free(duped);
-                        log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
-                    };
+                    queue.tryPush(allocator, .{ .text_delta = duped });
                 },
                 else => {},
             }
@@ -189,7 +194,11 @@ fn callLlm(
 fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *AgentThread.EventQueue) !void {
     var scratch: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
-    try queue.push(.{ .info = try allocator.dupe(u8, msg) });
+    const duped = try allocator.dupe(u8, msg);
+    // On QueueFull the push returns an error before taking ownership, so we
+    // must free the dup ourselves or the bytes leak.
+    errdefer allocator.free(duped);
+    try queue.push(.{ .info = duped });
 }
 
 /// Extract tool_use blocks from a response into an owned slice.
@@ -396,7 +405,7 @@ fn runToolStep(
 
             const t0 = std.time.milliTimestamp();
             var final: ToolCallResult = blk: {
-                if (registry.execute(tc.name, effective_input, allocator)) |ok| {
+                if (registry.execute(tc.name, effective_input, allocator, cancel)) |ok| {
                     break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
                 } else |err| {
                     const msg = try std.fmt.allocPrint(allocator, "error: tool execution failed: {s}", .{@errorName(err)});
@@ -454,6 +463,7 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
         const msg = switch (err) {
             error.Cancelled => "error: cancelled",
             error.OutOfMemory => "error: out of memory",
+            error.QueueFull => "error: event queue full",
         };
         ctx.results[ctx.index] = .{ .content = msg, .is_error = true };
         return;
@@ -573,27 +583,17 @@ fn executeToolsSingle(
     return result_blocks;
 }
 
-/// Thread-local queue pointer bridging the bare function-pointer callback
-/// required by callStreaming to the EventQueue. Set before each
-/// callStreaming invocation and cleared afterward.
-threadlocal var thread_local_queue: ?*AgentThread.EventQueue = null;
-threadlocal var thread_local_allocator: ?Allocator = null;
-/// Count of text_delta events fired during the current streaming call.
-/// Reset at the start of each callLlm and read on streaming failure to
-/// decide whether the fallback must reset the in-progress assistant node.
-threadlocal var thread_local_stream_text_count: u32 = 0;
-
-/// Callback that converts a provider StreamEvent to an AgentEvent and
-/// pushes it to the thread-local EventQueue. String data is duped because
-/// the source slices point into temporary JSON parser memory that is freed
-/// after the callback returns.
-fn streamEventToQueue(event: llm.StreamEvent) void {
-    const q = thread_local_queue orelse return;
-    const alloc = thread_local_allocator orelse return;
+/// Callback that converts a provider StreamEvent to an AgentEvent and pushes
+/// it to the EventQueue carried by `ctx`. String data is duped because the
+/// source slices point into temporary JSON parser memory that is freed after
+/// the callback returns.
+fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
+    const stream_ctx: *StreamContext = @ptrCast(@alignCast(ctx));
+    const alloc = stream_ctx.allocator;
     const agent_event: AgentThread.AgentEvent = switch (event) {
         .text_delta => |t| blk: {
             const duped = alloc.dupe(u8, t) catch return;
-            thread_local_stream_text_count += 1;
+            stream_ctx.text_count += 1;
             break :blk .{ .text_delta = duped };
         },
         .tool_start => |t| .{ .tool_start = .{ .name = alloc.dupe(u8, t) catch return } },
@@ -601,7 +601,9 @@ fn streamEventToQueue(event: llm.StreamEvent) void {
         .done => .done,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
     };
-    q.push(agent_event) catch {};
+    // Pass the allocator that produced the duped payload so tryPush can
+    // free on QueueFull. Otherwise we leak the bytes on every drop.
+    stream_ctx.queue.tryPush(alloc, agent_event);
 }
 
 test {
@@ -684,7 +686,11 @@ test "tool results are collected into a user message" {
 
 /// A tool that echoes its input after sleeping 50ms. Used to verify
 /// parallel execution completes faster than sequential.
-fn echoSlowExecute(_: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+fn echoSlowExecute(
+    _: []const u8,
+    allocator: Allocator,
+    _: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
     std.Thread.sleep(50 * std.time.ns_per_ms);
     return .{ .content = try allocator.dupe(u8, "echo_result"), .is_error = false };
 }
@@ -699,7 +705,11 @@ const echo_slow_tool = types.Tool{
 };
 
 /// A tool that returns immediately with the tool name as content.
-fn echoFastExecute(_: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+fn echoFastExecute(
+    _: []const u8,
+    allocator: Allocator,
+    _: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
     return .{ .content = try allocator.dupe(u8, "fast_result"), .is_error = false };
 }
 
@@ -756,7 +766,7 @@ test "single tool call runs inline without threading" {
     defer registry.deinit();
     try registry.register(echo_fast_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     var cancel = AgentThread.CancelFlag.init(false);
@@ -788,7 +798,7 @@ test "parallel execution preserves result order" {
     try registry.register(echo_slow_tool);
     try registry.register(echo_fast_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     var cancel = AgentThread.CancelFlag.init(false);
@@ -831,7 +841,7 @@ test "parallel execution is faster than sequential" {
     defer registry.deinit();
     try registry.register(echo_slow_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     var cancel = AgentThread.CancelFlag.init(false);
@@ -844,7 +854,10 @@ test "parallel execution is faster than sequential" {
         .{ .id = "call_3", .name = "echo_slow", .input_raw = "{}" },
     };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = std.time.Timer.start() catch |err| {
+        std.debug.print("skipping benchmark: no monotonic clock ({s})\n", .{@errorName(err)});
+        return;
+    };
     const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
     const elapsed_ns = timer.read();
     defer freeToolResults(blocks, allocator);
@@ -864,7 +877,7 @@ test "cancel flag is respected in parallel execution" {
     defer registry.deinit();
     try registry.register(echo_slow_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     // Set cancel before execution
@@ -926,7 +939,7 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
         .{ .id = "call_2", .name = "read", .input_raw = "{\"path\":\"zag-hook-e2e.txt\"}" },
     };
 
-    var queue = AgentThread.EventQueue.init(alloc);
+    var queue = try AgentThread.EventQueue.initBounded(alloc, 256);
     defer queue.deinit();
     var cancel = AgentThread.CancelFlag.init(false);
 
