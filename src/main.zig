@@ -55,6 +55,22 @@ pub const std_options: std.Options = .{ .logFn = tuiLogHandler };
 
 var tui_active: bool = false;
 
+/// Per-thread re-entry guard for `tuiLogHandler`. The handler calls
+/// `root_buffer.appendNode` which allocates through the shared GPA. If a
+/// log fires from inside an allocator path on the same thread (e.g. from
+/// a `catch |err| log.warn(...)` branch that was itself reached from
+/// inside an alloc), the nested `appendNode` call would try to re-acquire
+/// the GPA mutex this thread already holds and Zig's debug allocator
+/// would panic with "Deadlock detected". The guard detects the re-entry
+/// and routes the log through `std.debug.print` (mutex-protected, non-
+/// allocating) so the message isn't silently dropped.
+threadlocal var in_log_handler: bool = false;
+
+/// Serialises `tuiLogHandler`'s access to `root_buffer` across threads.
+/// Agent threads log from arbitrary code paths; without this mutex two
+/// concurrent log calls would race on `root_children.append`.
+var log_mutex: std.Thread.Mutex = .{};
+
 /// Module-level root session: owns the LLM message history and persistence
 /// handle for the primary conversation.
 var root_session: ConversationSession = undefined;
@@ -75,17 +91,32 @@ fn tuiLogHandler(
     _ = level;
     const scope_prefix = if (scope == .default) "" else @tagName(scope) ++ ": ";
 
-    if (tui_active) {
-        var scratch: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&scratch, scope_prefix ++ format, args) catch return;
-        _ = root_buffer.appendNode(null, .status, msg) catch {};
-    } else {
+    if (!tui_active) {
         const stderr = std.fs.File.stderr();
         var stderr_scratch: [256]u8 = undefined;
         var w = stderr.writer(&stderr_scratch);
         w.interface.print(scope_prefix ++ format ++ "\n", args) catch {};
         w.interface.flush() catch {};
+        return;
     }
+
+    // Re-entry: a log fired while this handler was already running on
+    // this thread. Route to stderr via `std.debug.print` instead of
+    // calling `appendNode` again - the GPA mutex is still held by the
+    // outer alloc and a nested alloc would panic with "Deadlock detected".
+    if (in_log_handler) {
+        std.debug.print("zag log (reentrant): " ++ scope_prefix ++ format ++ "\n", args);
+        return;
+    }
+    in_log_handler = true;
+    defer in_log_handler = false;
+
+    log_mutex.lock();
+    defer log_mutex.unlock();
+
+    var scratch: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&scratch, scope_prefix ++ format, args) catch return;
+    _ = root_buffer.appendNode(null, .status, msg) catch {};
 }
 
 /// Append a plain text line to the root buffer as a status node. Used for
