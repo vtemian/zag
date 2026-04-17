@@ -24,8 +24,10 @@ pub fn execute(
     cancel: ?*std.atomic.Value(bool),
 ) types.ToolError!types.ToolResult {
     _ = cancel;
-    const parsed = std.json.parseFromSlice(EditInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
-        return error.InvalidInput;
+    const parsed = std.json.parseFromSlice(EditInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "error: invalid input to 'edit': {s}", .{@errorName(err)}) catch return types.oomResult();
+        return .{ .content = msg, .is_error = true };
+    };
     defer parsed.deinit();
     const input = parsed.value;
 

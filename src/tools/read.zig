@@ -23,8 +23,10 @@ pub fn execute(
     cancel: ?*std.atomic.Value(bool),
 ) types.ToolError!types.ToolResult {
     _ = cancel;
-    const parsed = std.json.parseFromSlice(ReadInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
-        return error.InvalidInput;
+    const parsed = std.json.parseFromSlice(ReadInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "error: invalid input to 'read': {s}", .{@errorName(err)}) catch return types.oomResult();
+        return .{ .content = msg, .is_error = true };
+    };
     defer parsed.deinit();
     const input = parsed.value;
 
@@ -107,6 +109,20 @@ test "read existing file" {
 
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings(test_content, result.content);
+}
+
+test "read returns detailed error result for invalid JSON input" {
+    const allocator = std.testing.allocator;
+
+    const result = try execute("not json", allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    try std.testing.expect(result.is_error);
+    // The tool-side parse error (SyntaxError etc.) must appear in the content
+    // so the LLM can correct the JSON on the next turn, rather than get a
+    // generic "invalid tool input" flatten.
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "invalid input") != null);
 }
 
 test "read non-existent file returns error" {

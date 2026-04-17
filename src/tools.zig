@@ -95,15 +95,13 @@ pub const Registry = struct {
         defer current_tool_name = null;
         return tool.execute(input_raw, allocator, cancel) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidInput => .{
-                .content = "error: invalid tool input",
-                .is_error = true,
-                .owned = false,
+            error.InvalidInput => blk: {
+                const msg = std.fmt.allocPrint(allocator, "error: tool '{s}' received invalid input", .{name}) catch return types.oomResult();
+                break :blk .{ .content = msg, .is_error = true, .owned = true };
             },
-            error.ToolFailed => .{
-                .content = "error: tool failed",
-                .is_error = true,
-                .owned = false,
+            error.ToolFailed => blk: {
+                const msg = std.fmt.allocPrint(allocator, "error: tool '{s}' failed", .{name}) catch return types.oomResult();
+                break :blk .{ .content = msg, .is_error = true, .owned = true };
             },
         };
     }
@@ -272,9 +270,11 @@ test "registry.execute flattens InvalidInput into a tool-result error" {
         .input_schema_json = "{\"type\":\"object\"}",
     }, .execute = testInvalidInputTool });
     const result = try r.execute("t", "{}", std.testing.allocator, null);
+    defer if (result.owned) std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
-    try std.testing.expectEqualStrings("error: invalid tool input", result.content);
-    try std.testing.expect(!result.owned);
+    try std.testing.expect(result.owned);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "invalid input") != null);
 }
 
 test "registry.execute rejects missing required field before dispatch" {
