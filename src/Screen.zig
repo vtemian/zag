@@ -168,7 +168,7 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
         if (row >= self.height) break;
         const w = width_mod.codepointWidth(cp);
         if (w == 0) continue; // zero-width: do not consume a cell
-        if (c + w > self.width) break; // wide char doesn't fit — stop
+        if (c + w > self.width) break; // wide char doesn't fit - stop
         const cell = self.getCell(row, c);
         cell.codepoint = cp;
         cell.style = style;
@@ -210,7 +210,7 @@ pub fn writeStrWrapped(
             row += 1;
             col = start_col;
             if (row >= max_row) break;
-            if (col + w > max_col) break; // still won't fit — give up
+            if (col + w > max_col) break; // still won't fit - give up
         }
         const cell = self.getCell(row, col);
         cell.codepoint = cp;
@@ -425,7 +425,7 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
 /// returned column is always in `(start_col, self.width]`.
 ///
 /// Continuation cells (second half of a wide char) are swallowed into
-/// the run — they inherit style from their primary and the terminal
+/// the run - they inherit style from their primary and the terminal
 /// advances the cursor through them implicitly. A wide-char primary
 /// whose successor is not a continuation cell terminates the run so
 /// the next iteration re-syncs cursor position explicitly.
@@ -537,9 +537,9 @@ fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
 /// Map a 24-bit RGB triple to the closest xterm-256 palette index.
 ///
 /// The 256-color palette is:
-///   * 0..15   — ANSI / bright ANSI (terminal-dependent RGB; we avoid it)
-///   * 16..231 — 6x6x6 RGB cube: idx = 16 + 36*r + 6*g + b, r,g,b in 0..5
-///   * 232..255 — 24-step grayscale ramp
+///   * 0..15   - ANSI / bright ANSI (terminal-dependent RGB; we avoid it)
+///   * 16..231 - 6x6x6 RGB cube: idx = 16 + 36*r + 6*g + b, r,g,b in 0..5
+///   * 232..255 - 24-step grayscale ramp
 ///
 /// Perceptually-accurate conversion is out of scope; callers only hit this
 /// path when the terminal lacks true color, where any sensible approximation
@@ -1121,7 +1121,7 @@ test "diff merges run containing wide-char continuation cell" {
     var screen = try Screen.init(allocator, 6, 1);
     defer screen.deinit();
 
-    // Pattern: 'a' 'b' CJK(wide,cont) 'c' 'd' — all red fg, one style.
+    // Pattern: 'a' 'b' CJK(wide,cont) 'c' 'd' - all red fg, one style.
     _ = screen.writeStr(0, 0, "ab中cd", .{}, .{ .palette = 1 });
 
     const pipe = try std.posix.pipe();

@@ -103,7 +103,6 @@ transient_status: [64]u8 = undefined,
 transient_status_len: u8 = 0,
 /// Frame counter for animating the status bar spinner.
 spinner_frame: u8 = 0,
-/// Fixed-size input line buffer.
 /// Bytes the user has typed on the input line but not yet submitted.
 typed: [MAX_INPUT]u8 = undefined,
 /// Number of valid bytes in `typed`.
@@ -724,7 +723,7 @@ fn onUserInputSubmitted(
 
     if (cb.isAgentRunning()) return;
 
-    // 256 slots is ~1s of fast streaming — enough headroom for a UI frame
+    // 256 slots is ~1s of fast streaming - enough headroom for a UI frame
     // stall without hiding persistent backpressure.
     cb.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
     cb.event_queue.wake_fd = self.wake_write_fd;

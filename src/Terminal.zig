@@ -125,8 +125,8 @@ pub fn init() !Terminal {
 /// Return true when `$COLORTERM` indicates 24-bit color support.
 ///
 /// The de-facto convention (used by tmux, alacritty, kitty, Ghostty, etc.)
-/// is to set `COLORTERM=truecolor` or `COLORTERM=24bit`. Anything else —
-/// including an empty value — means "fall back to 256-color palette".
+/// is to set `COLORTERM=truecolor` or `COLORTERM=24bit`. Anything else -
+/// including an empty value - means "fall back to 256-color palette".
 pub fn detectTrueColor() bool {
     const val = posix.getenv("COLORTERM") orelse return false;
     return trueColorFromValue(val);

@@ -1,7 +1,7 @@
 //! Terminal display width for Unicode codepoints.
 //!
 //! Based on East Asian Width (UAX #11) wide/fullwidth ranges plus common
-//! emoji blocks. Not a full Unicode width implementation — good enough for
+//! emoji blocks. Not a full Unicode width implementation - good enough for
 //! a terminal TUI, not good enough to ship as a library.
 
 const std = @import("std");
