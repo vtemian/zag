@@ -165,13 +165,13 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
     var c = col;
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
-    while (iter.nextCodepoint()) |cp| {
+    while (width_mod.nextCluster(&iter)) |cluster| {
         if (row >= self.height) break;
-        const w = width_mod.codepointWidth(cp);
-        if (w == 0) continue; // zero-width: do not consume a cell
-        if (c + w > self.width) break; // wide char doesn't fit - stop
+        const w = cluster.width;
+        if (w == 0) continue;
+        if (c + w > self.width) break;
         const cell = self.getCell(row, c);
-        cell.codepoint = cp;
+        cell.codepoint = cluster.base;
         cell.style = style;
         cell.fg = fg;
         cell.continuation = false;
