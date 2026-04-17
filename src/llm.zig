@@ -37,6 +37,16 @@ pub const StreamEvent = union(enum) {
     err: []const u8,
 };
 
+/// Carries a caller-owned context pointer alongside the event handler function.
+/// Providers invoke `callback.on_event(callback.ctx, event)` so the caller can
+/// thread per-call state without threadlocal smuggling.
+pub const StreamCallback = struct {
+    /// Opaque pointer to caller state. Ownership and lifetime belong to the caller.
+    ctx: *anyopaque,
+    /// Event handler. Receives the same `ctx` the caller supplied.
+    on_event: *const fn (ctx: *anyopaque, event: StreamEvent) void,
+};
+
 /// Wire format for request/response serialization.
 pub const Serializer = enum {
     /// Anthropic Messages API format.
@@ -257,7 +267,7 @@ pub const Provider = struct {
             allocator: Allocator,
         ) anyerror!types.LlmResponse,
 
-        /// Streaming variant: calls on_event for each SSE event.
+        /// Streaming variant: invokes `callback.on_event` for each SSE event.
         /// Assembles and returns the final LlmResponse when stream ends.
         /// Checks cancel flag periodically; returns partial response if cancelled.
         call_streaming: *const fn (
@@ -266,7 +276,7 @@ pub const Provider = struct {
             messages: []const types.Message,
             tool_definitions: []const types.ToolDefinition,
             allocator: Allocator,
-            on_event: *const fn (event: StreamEvent) void,
+            callback: StreamCallback,
             cancel: *std.atomic.Value(bool),
         ) anyerror!types.LlmResponse,
 
@@ -285,18 +295,19 @@ pub const Provider = struct {
         return self.vtable.call(self.ptr, system_prompt, messages, tool_definitions, allocator);
     }
 
-    /// Streaming variant: sends a conversation and calls on_event for each incremental event.
-    /// Returns the fully assembled LlmResponse when the stream completes or is cancelled.
+    /// Streaming variant: sends a conversation and invokes `callback.on_event`
+    /// for each incremental event. Returns the fully assembled LlmResponse when
+    /// the stream completes or is cancelled.
     pub fn callStreaming(
         self: Provider,
         system_prompt: []const u8,
         messages: []const types.Message,
         tool_definitions: []const types.ToolDefinition,
         allocator: Allocator,
-        on_event: *const fn (event: StreamEvent) void,
+        callback: StreamCallback,
         cancel: *std.atomic.Value(bool),
     ) !types.LlmResponse {
-        return self.vtable.call_streaming(self.ptr, system_prompt, messages, tool_definitions, allocator, on_event, cancel);
+        return self.vtable.call_streaming(self.ptr, system_prompt, messages, tool_definitions, allocator, callback, cancel);
     }
 };
 
@@ -851,7 +862,7 @@ test "Provider vtable call dispatches correctly" {
             messages: []const types.Message,
             tool_definitions: []const types.ToolDefinition,
             alloc: Allocator,
-            _: *const fn (event: StreamEvent) void,
+            _: StreamCallback,
             _: *std.atomic.Value(bool),
         ) anyerror!types.LlmResponse {
             return callImpl(ptr, system_prompt, messages, tool_definitions, alloc);
@@ -875,13 +886,14 @@ test "Provider vtable call dispatches correctly" {
 test "Provider callStreaming dispatches to vtable" {
     const allocator = std.testing.allocator;
 
-    const Ctx = struct {
-        var event_count: u32 = 0;
-        fn onEvent(_: StreamEvent) void {
-            event_count += 1;
+    const Counter = struct {
+        event_count: u32 = 0,
+        fn onEvent(ctx: *anyopaque, _: StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.event_count += 1;
         }
     };
-    Ctx.event_count = 0;
+    var counter: Counter = .{};
 
     const TestStreamProvider = struct {
         stream_count: u32 = 0,
@@ -908,13 +920,13 @@ test "Provider callStreaming dispatches to vtable" {
             _: []const types.Message,
             _: []const types.ToolDefinition,
             alloc: Allocator,
-            on_event: *const fn (event: StreamEvent) void,
+            callback: StreamCallback,
             _: *std.atomic.Value(bool),
         ) anyerror!types.LlmResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.stream_count += 1;
-            on_event(.{ .text_delta = "hello" });
-            on_event(.done);
+            callback.on_event(callback.ctx, .{ .text_delta = "hello" });
+            callback.on_event(callback.ctx, .done);
             const content = try alloc.alloc(types.ContentBlock, 1);
             const text = try alloc.dupe(u8, "hello");
             content[0] = .{ .text = .{ .text = text } };
@@ -935,11 +947,12 @@ test "Provider callStreaming dispatches to vtable" {
     const p = test_impl.provider();
 
     var cancel = std.atomic.Value(bool).init(false);
-    const response = try p.callStreaming("system", &.{}, &.{}, allocator, &Ctx.onEvent, &cancel);
+    const callback: StreamCallback = .{ .ctx = &counter, .on_event = &Counter.onEvent };
+    const response = try p.callStreaming("system", &.{}, &.{}, allocator, callback, &cancel);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), test_impl.stream_count);
-    try std.testing.expectEqual(@as(u32, 2), Ctx.event_count);
+    try std.testing.expectEqual(@as(u32, 2), counter.event_count);
     try std.testing.expectEqualStrings("test_stream", p.vtable.name);
 }
 

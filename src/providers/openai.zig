@@ -62,7 +62,7 @@ pub const OpenAiSerializer = struct {
         messages: []const types.Message,
         tool_definitions: []const types.ToolDefinition,
         allocator: Allocator,
-        on_event: *const fn (event: llm.StreamEvent) void,
+        callback: llm.StreamCallback,
         cancel: *std.atomic.Value(bool),
     ) anyerror!types.LlmResponse {
         const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
@@ -76,7 +76,7 @@ pub const OpenAiSerializer = struct {
         const stream = try llm.StreamingResponse.create(self.endpoint.url, body, headers.items, allocator);
         defer stream.destroy();
 
-        return parseSseStream(stream, allocator, on_event, cancel);
+        return parseSseStream(stream, allocator, callback, cancel);
     }
 };
 
@@ -323,11 +323,12 @@ const StreamingToolCall = struct {
 };
 
 /// Read SSE events incrementally from a streaming HTTP connection.
-/// Calls on_event for each event as it arrives, then assembles the final LlmResponse.
+/// Invokes `callback.on_event` for each event as it arrives, then assembles
+/// the final LlmResponse.
 fn parseSseStream(
     stream: *llm.StreamingResponse,
     allocator: Allocator,
-    on_event: *const fn (event: llm.StreamEvent) void,
+    callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
@@ -373,7 +374,7 @@ fn parseSseStream(
             if (delta.object.get("content")) |content| {
                 if (content == .string) {
                     try text_content.appendSlice(allocator, content.string);
-                    on_event(.{ .text_delta = content.string });
+                    callback.on_event(callback.ctx, .{ .text_delta = content.string });
                 }
             }
 
@@ -404,7 +405,7 @@ fn parseSseStream(
                                 const was_empty = tool_call.name.items.len == 0;
                                 try tool_call.name.appendSlice(allocator, name.string);
                                 if (was_empty) {
-                                    on_event(.{ .tool_start = name.string });
+                                    callback.on_event(callback.ctx, .{ .tool_start = name.string });
                                 }
                             }
                         }
