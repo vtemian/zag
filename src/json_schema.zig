@@ -18,6 +18,7 @@ pub const ValidationError = error{
     NotAnObject,
     MissingRequiredField,
     WrongFieldType,
+    MalformedSchema,
 } || std.mem.Allocator.Error || std.json.ParseError(std.json.Scanner);
 
 /// Validate `input_json` against `schema_json`. Returns `void` on success or
@@ -32,23 +33,45 @@ pub fn validate(
     const input = try std.json.parseFromSlice(std.json.Value, allocator, input_json, .{});
     defer input.deinit();
 
-    const schema_obj = schema.value.object;
+    const schema_obj = switch (schema.value) {
+        .object => |o| o,
+        else => return error.MalformedSchema,
+    };
     const input_obj = switch (input.value) {
         .object => |o| o,
         else => return error.NotAnObject,
     };
 
     if (schema_obj.get("required")) |req_list| {
-        for (req_list.array.items) |field| {
-            const name = field.string;
+        const items = switch (req_list) {
+            .array => |a| a.items,
+            else => return error.MalformedSchema,
+        };
+        for (items) |field| {
+            const name = switch (field) {
+                .string => |s| s,
+                else => return error.MalformedSchema,
+            };
             if (!input_obj.contains(name)) return error.MissingRequiredField;
         }
     }
 
     if (schema_obj.get("properties")) |props| {
+        const props_obj = switch (props) {
+            .object => |o| o,
+            else => return error.MalformedSchema,
+        };
         for (input_obj.keys(), input_obj.values()) |name, value| {
-            const spec = props.object.get(name) orelse continue; // unknown field: allow
-            const expected = (spec.object.get("type") orelse continue).string;
+            const spec = props_obj.get(name) orelse continue; // unknown field: allow
+            const spec_obj = switch (spec) {
+                .object => |o| o,
+                else => return error.MalformedSchema,
+            };
+            const type_val = spec_obj.get("type") orelse continue; // untyped spec: accept
+            const expected = switch (type_val) {
+                .string => |s| s,
+                else => return error.MalformedSchema,
+            };
             if (!typeMatches(expected, value)) return error.WrongFieldType;
         }
     }
@@ -90,4 +113,26 @@ test "valid input passes" {
     ;
     const input = "{\"cmd\":\"ls\"}";
     try validate(testing.allocator, schema, input);
+}
+
+test "non-object schema is MalformedSchema" {
+    const schema = "true";
+    const input = "{}";
+    try testing.expectError(error.MalformedSchema, validate(testing.allocator, schema, input));
+}
+
+test "non-string type spec is MalformedSchema" {
+    const schema =
+        \\{"type":"object","properties":{"x":{"type":5}}}
+    ;
+    const input = "{\"x\":1}";
+    try testing.expectError(error.MalformedSchema, validate(testing.allocator, schema, input));
+}
+
+test "non-array required is MalformedSchema" {
+    const schema =
+        \\{"type":"object","required":"cmd"}
+    ;
+    const input = "{\"cmd\":\"ls\"}";
+    try testing.expectError(error.MalformedSchema, validate(testing.allocator, schema, input));
 }
