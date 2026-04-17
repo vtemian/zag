@@ -820,6 +820,7 @@ test "imports compile" {
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/openai.zig");
     _ = @import("LuaEngine.zig");
+    _ = @import("Hooks.zig");
 }
 
 test "inputAppendChar adds character" {

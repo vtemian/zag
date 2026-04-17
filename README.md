@@ -18,6 +18,35 @@ Full-screen TUI with composable windows, a real Claude API agent with four tools
 
 ~5,800 lines of Zig. Zero external dependencies. 4.9MB binary.
 
+## Hooks
+
+Zag exposes a Neovim-style hook API via `zag.hook(event, opts?, fn)`. Plugins can observe, veto, or rewrite agent events from Lua. Events include `UserMessagePre`, `ToolPre`, `ToolPost`, `TurnStart`, and `TurnEnd`. Return `{ cancel = true, reason = "..." }` to veto, return a partial table to rewrite, return `nil` to observe.
+
+```lua
+-- Block destructive bash commands
+zag.hook("ToolPre", { pattern = "bash" }, function(evt)
+  if evt.args.command:match("rm %-rf") then
+    return { cancel = true, reason = "refused destructive rm" }
+  end
+end)
+
+-- Redact API keys from file reads before they reach the model
+zag.hook("ToolPost", { pattern = "read" }, function(evt)
+  local cleaned = evt.content:gsub("sk%-[%w%-]+", "[REDACTED]")
+  if cleaned ~= evt.content then
+    return { content = cleaned }
+  end
+end)
+
+-- Log each turn's token usage
+zag.hook("TurnEnd", function(evt)
+  print(string.format("turn %d: %d in / %d out",
+    evt.turn_num, evt.input_tokens, evt.output_tokens))
+end)
+```
+
+More examples in [`examples/hooks.lua`](examples/hooks.lua). Design notes in [`docs/plans/2026-04-16-lua-hooks-design.md`](docs/plans/2026-04-16-lua-hooks-design.md).
+
 ## Building
 
 ```bash
@@ -33,7 +62,6 @@ Requires Zig 0.15+.
 - Lua plugin system
 - libghostty-vt integration
 - Session persistence
-- Event system
 - Tree-sitter context
 - Multi-provider LLM support
 

@@ -11,6 +11,7 @@ const types = @import("types.zig");
 const tools = @import("tools.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig");
+const Hooks = @import("Hooks.zig");
 
 const AgentThread = @This();
 
@@ -32,6 +33,12 @@ pub const AgentEvent = union(enum) {
     /// text_delta starts a fresh render. Used when a partial stream
     /// is replaced by a non-streaming fallback response.
     reset_assistant_text,
+    /// Round-trip request: agent asks main thread to run Lua hooks
+    /// for this payload. Agent waits on `request.done` after pushing.
+    hook_request: *Hooks.HookRequest,
+    /// Round-trip request: a worker/agent thread asks main to execute
+    /// a Lua-defined tool and write the result back.
+    lua_tool_request: *Hooks.LuaToolRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -124,6 +131,15 @@ pub const EventQueue = struct {
 /// the agent thread loads to check.
 pub const CancelFlag = std.atomic.Value(bool);
 
+/// Thread-local event queue pointer used by `tools.luaToolExecute` to
+/// round-trip a Lua tool call to the main thread. Set at the start of the
+/// agent loop (and at the start of each parallel worker), cleared on exit.
+/// Lives here because AgentThread owns `EventQueue` and importing
+/// AgentThread from tools.zig would not create a cycle (tools.zig does not
+/// import AgentThread transitively; AgentThread imports tools.zig, so we
+/// place the threadlocal on the upstream module).
+pub threadlocal var lua_request_queue: ?*EventQueue = null;
+
 /// Spawn a background thread running the streaming agent loop.
 /// The thread calls agent.runLoopStreaming, pushing events to the queue.
 /// Returns the thread handle; the caller must join it when done.
@@ -159,8 +175,7 @@ fn threadMain(
     cancel: *CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
 ) void {
-    if (lua_engine) |eng| eng.activate();
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel) catch |err| {
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
         const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
         queue.push(.{ .err = duped_err }) catch {};
     };
@@ -288,4 +303,43 @@ test "push with null wake_fd skips the write" {
     var buf: [4]AgentEvent = undefined;
     const count = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "push and drain hook_request event" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    var payload: Hooks.HookPayload = .{ .agent_done = {} };
+    var req = Hooks.HookRequest.init(&payload);
+
+    try queue.push(.{ .hook_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(
+        Hooks.EventKind.agent_done,
+        buf[0].hook_request.payload.kind(),
+    );
+}
+
+test "push and drain lua_tool_request event" {
+    var queue = EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "hello",
+        .input_raw = "{}",
+        .allocator = std.testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+
+    try queue.push(.{ .lua_tool_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("hello", buf[0].lua_tool_request.tool_name);
 }

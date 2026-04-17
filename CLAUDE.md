@@ -155,7 +155,7 @@ src/
 
 <optional why, not what>
 
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
 
 Examples: `agent: add steering queue for mid-execution interrupts`, `tools/bash: add seatbelt sandboxing on macOS`
