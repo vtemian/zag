@@ -519,10 +519,12 @@ pub fn submitInput(
     text: []const u8,
     allocator: Allocator,
 ) !void {
-    const content = try allocator.alloc(types.ContentBlock, 1);
-    const duped = try allocator.dupe(u8, text);
-    content[0] = .{ .text = .{ .text = duped } };
-    try self.session.messages.append(allocator, .{ .role = .user, .content = content });
+    // The allocator is ignored here; ConversationSession uses its own.
+    // Phase 2 reintroduces it when submitInput moves onto AgentRunner and
+    // needs a scratch allocator for coordinated view+session work.
+    _ = allocator;
+
+    try self.session.appendUserMessage(text);
 
     _ = try self.appendNode(null, .user_message, text);
 

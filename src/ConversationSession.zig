@@ -34,6 +34,17 @@ pub fn attachSession(self: *ConversationSession, handle: *Session.SessionHandle)
     self.session_handle = handle;
 }
 
+/// Append a user message with one text ContentBlock. The text is duped
+/// into an allocation owned by the message's content slice.
+pub fn appendUserMessage(self: *ConversationSession, text: []const u8) !void {
+    const content = try self.allocator.alloc(types.ContentBlock, 1);
+    errdefer self.allocator.free(content);
+    const duped = try self.allocator.dupe(u8, text);
+    errdefer self.allocator.free(duped);
+    content[0] = .{ .text = .{ .text = duped } };
+    try self.messages.append(self.allocator, .{ .role = .user, .content = content });
+}
+
 /// Persist an event to the session JSONL file, if a session is attached.
 /// Failures are logged but not propagated; persistence is best-effort.
 pub fn persistEvent(self: *ConversationSession, entry: Session.Entry) void {
