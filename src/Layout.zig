@@ -37,8 +37,7 @@ pub const LayoutNode = union(enum) {
     /// Return the rect of this node regardless of whether it's a leaf or split.
     pub fn getRect(self: *const LayoutNode) Rect {
         return switch (self.*) {
-            .leaf => |l| l.rect,
-            .split => |s| s.rect,
+            inline else => |x| x.rect,
         };
     }
 
