@@ -117,6 +117,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "tool");
         lua.pushFunction(zlua.wrap(zagHookFn));
         lua.setField(-2, "hook");
+        lua.pushFunction(zlua.wrap(zagHookDelFn));
+        lua.setField(-2, "hook_del");
         lua.setGlobal("zag");
     }
 
@@ -284,6 +286,40 @@ pub const LuaEngine = struct {
         const id = try engine.hook_registry.register(kind, pattern, cb_ref);
         lua.pushInteger(@intCast(id));
         return 1;
+    }
+
+    /// Zig function backing `zag.hook_del(id)`.
+    fn zagHookDelFn(lua: *Lua) !i32 {
+        return zagHookDelFnInner(lua) catch |err| {
+            log.err("zag.hook_del() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagHookDelFnInner(lua: *Lua) !i32 {
+        const id_raw = lua.toInteger(1) catch {
+            log.err("zag.hook_del(): first argument must be a hook id integer", .{});
+            return error.LuaError;
+        };
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.err("zag.hook_del(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        const id: u32 = @intCast(id_raw);
+        // Unref the Lua callback before the hook entry is removed from the registry.
+        for (engine.hook_registry.hooks.items) |h| {
+            if (h.id == id) {
+                engine.lua.unref(zlua.registry_index, h.lua_ref);
+                break;
+            }
+        }
+        _ = engine.hook_registry.unregister(id);
+        return 0;
     }
 
     // -- Hook dispatch ---------------------------------------------------------
@@ -965,6 +1001,17 @@ test "zag.hook registers a hook" {
         engine.hook_registry.hooks.items[0].pattern.?,
     );
     try std.testing.expect(engine.hook_registry.hooks.items[1].pattern == null);
+}
+
+test "zag.hook_del removes a hook" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.id = zag.hook("TurnEnd", function() end)
+        \\zag.hook_del(_G.id)
+    );
+    try std.testing.expectEqual(@as(usize, 0), engine.hook_registry.hooks.items.len);
 }
 
 test "fireHook invokes Lua callback for matching event" {
