@@ -66,13 +66,6 @@ pub fn runLoopStreaming(
     const prompt = try buildSystemPrompt(registry, allocator);
     defer allocator.free(prompt);
 
-    thread_local_queue = queue;
-    thread_local_allocator = allocator;
-    defer {
-        thread_local_queue = null;
-        thread_local_allocator = null;
-    }
-
     while (true) {
         if (cancel.load(.acquire)) return;
 
@@ -89,6 +82,15 @@ pub fn runLoopStreaming(
     }
 }
 
+/// Per-call state threaded through the streaming callback. Keeps the queue,
+/// allocator, and running text_delta count on the caller's stack so a second
+/// thread entering `callLlm` cannot stomp on it.
+const StreamContext = struct {
+    queue: *AgentThread.EventQueue,
+    allocator: Allocator,
+    text_count: u32 = 0,
+};
+
 /// Call the LLM with streaming, falling back to non-streaming on error.
 fn callLlm(
     provider: llm.Provider,
@@ -99,20 +101,24 @@ fn callLlm(
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
 ) !types.LlmResponse {
-    thread_local_stream_text_count = 0;
+    var stream_ctx: StreamContext = .{ .queue = queue, .allocator = allocator };
+    const callback: llm.StreamCallback = .{
+        .ctx = &stream_ctx,
+        .on_event = &streamEventToQueue,
+    };
     return provider.callStreaming(
         prompt,
         messages,
         tool_defs,
         allocator,
-        &streamEventToQueue,
+        callback,
         cancel,
     ) catch |streaming_err| {
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
         const fallback = try provider.call(prompt, messages, tool_defs, allocator);
         // If streaming already rendered partial text, discard it so the
         // full fallback response doesn't appear concatenated to the partial.
-        if (thread_local_stream_text_count > 0) {
+        if (stream_ctx.text_count > 0) {
             queue.tryPush(allocator, .reset_assistant_text);
         }
         // Push text to queue since streaming callback didn't fire (or was reset)
@@ -349,27 +355,17 @@ fn executeToolsSingle(
     return result_blocks;
 }
 
-/// Thread-local queue pointer bridging the bare function-pointer callback
-/// required by callStreaming to the EventQueue. Set before each
-/// callStreaming invocation and cleared afterward.
-threadlocal var thread_local_queue: ?*AgentThread.EventQueue = null;
-threadlocal var thread_local_allocator: ?Allocator = null;
-/// Count of text_delta events fired during the current streaming call.
-/// Reset at the start of each callLlm and read on streaming failure to
-/// decide whether the fallback must reset the in-progress assistant node.
-threadlocal var thread_local_stream_text_count: u32 = 0;
-
-/// Callback that converts a provider StreamEvent to an AgentEvent and
-/// pushes it to the thread-local EventQueue. String data is duped because
-/// the source slices point into temporary JSON parser memory that is freed
-/// after the callback returns.
-fn streamEventToQueue(event: llm.StreamEvent) void {
-    const q = thread_local_queue orelse return;
-    const alloc = thread_local_allocator orelse return;
+/// Callback that converts a provider StreamEvent to an AgentEvent and pushes
+/// it to the EventQueue carried by `ctx`. String data is duped because the
+/// source slices point into temporary JSON parser memory that is freed after
+/// the callback returns.
+fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
+    const stream_ctx: *StreamContext = @ptrCast(@alignCast(ctx));
+    const alloc = stream_ctx.allocator;
     const agent_event: AgentThread.AgentEvent = switch (event) {
         .text_delta => |t| blk: {
             const duped = alloc.dupe(u8, t) catch return;
-            thread_local_stream_text_count += 1;
+            stream_ctx.text_count += 1;
             break :blk .{ .text_delta = duped };
         },
         .tool_start => |t| .{ .tool_start = .{ .name = alloc.dupe(u8, t) catch return } },
@@ -379,7 +375,7 @@ fn streamEventToQueue(event: llm.StreamEvent) void {
     };
     // Pass the allocator that produced the duped payload so tryPush can
     // free on QueueFull. Otherwise we leak the bytes on every drop.
-    q.tryPush(alloc, agent_event);
+    stream_ctx.queue.tryPush(alloc, agent_event);
 }
 
 test {
