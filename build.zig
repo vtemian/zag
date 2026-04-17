@@ -6,10 +6,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const metrics_enabled = b.option(bool, "metrics", "Enable performance metrics") orelse false;
+    const lua_sandbox_enabled = b.option(
+        bool,
+        "lua_sandbox",
+        "Restrict Lua plugins: strip os/io/debug/package/require etc.",
+    ) orelse true;
 
     // Shared build options module for comptime feature flags
     const build_options = b.addOptions();
     build_options.addOption(bool, "metrics", metrics_enabled);
+    build_options.addOption(bool, "lua_sandbox", lua_sandbox_enabled);
 
     const zlua_dep = b.dependency("zlua", .{
         .target = target,
