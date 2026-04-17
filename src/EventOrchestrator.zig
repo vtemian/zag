@@ -125,7 +125,13 @@ pub fn init(cfg: Config) EventOrchestrator {
 }
 
 /// Release the orchestrator's owned extra panes. Root buffer is owned by main.
+///
+/// Agent threads are cancelled and joined *before* any buffers are freed: an
+/// error-return from run() skips any explicit cleanup step, so doing this here
+/// unconditionally prevents use-after-free on extra pane buffers whose agent
+/// threads are still live.
 pub fn deinit(self: *EventOrchestrator) void {
+    self.shutdownAgents();
     for (self.extra_panes.items) |pane| {
         if (pane.session) |sh| {
             sh.close();
@@ -546,7 +552,8 @@ fn getFocusedConversation(self: *EventOrchestrator) *ConversationBuffer {
         self.root_buffer;
 }
 
-/// Shutdown all agent threads (root + every extra pane). Call before deinit.
+/// Shutdown all agent threads (root + every extra pane). Called from deinit()
+/// so the error-return path from run() cannot skip it.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
     self.root_buffer.shutdown();
     for (self.extra_panes.items) |pane| {

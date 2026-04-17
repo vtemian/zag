@@ -266,8 +266,6 @@ pub fn main() !void {
 
     try orchestrator.run();
 
-    orchestrator.shutdownAgents();
-
     // Auto-dump trace on exit when metrics are enabled
     if (trace.enabled) {
         _ = trace.dump("zag-trace.json") catch |err| blk: {
