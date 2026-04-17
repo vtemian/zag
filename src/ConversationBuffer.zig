@@ -1320,3 +1320,205 @@ test "text_delta fires post-hook with text" {
     try std.testing.expectEqualStrings("chunk!", try engine.lua.toString(-1));
     engine.lua.pop(1);
 }
+
+test "submitInput appends user message and user_message node" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "submit-test");
+    defer cb.deinit();
+
+    try cb.submitInput("hello", allocator);
+
+    // Node tree side
+    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("hello", cb.root_children.items[0].content.items);
+
+    // Message list side
+    try std.testing.expectEqual(@as(usize, 1), cb.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, cb.messages.items[0].role);
+    try std.testing.expectEqual(@as(usize, 1), cb.messages.items[0].content.len);
+    switch (cb.messages.items[0].content[0]) {
+        .text => |t| try std.testing.expectEqualStrings("hello", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Streaming state reset
+    try std.testing.expect(cb.current_assistant_node == null);
+    try std.testing.expect(cb.last_tool_call == null);
+}
+
+test "loadFromEntries builds node tree from session entries" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "load-test");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "first", .timestamp = 0 },
+        .{ .entry_type = .assistant_text, .content = "reply", .timestamp = 1 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .timestamp = 2 },
+        .{ .entry_type = .tool_result, .content = "ok", .timestamp = 3 },
+    };
+
+    try cb.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(@as(usize, 3), cb.root_children.items.len);
+    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
+    try std.testing.expectEqual(NodeType.assistant_text, cb.root_children.items[1].node_type);
+    try std.testing.expectEqual(NodeType.tool_call, cb.root_children.items[2].node_type);
+    // tool_result is a child of tool_call
+    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items[2].children.items.len);
+    try std.testing.expectEqual(NodeType.tool_result, cb.root_children.items[2].children.items[0].node_type);
+}
+
+test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "rebuild-test");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
+        .{ .entry_type = .assistant_text, .content = "calling tool", .timestamp = 1 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .tool_input = "{\"c\":\"ls\"}", .timestamp = 2 },
+        .{ .entry_type = .tool_result, .content = "file1", .is_error = false, .timestamp = 3 },
+        .{ .entry_type = .assistant_text, .content = "done", .timestamp = 4 },
+    };
+
+    try cb.rebuildMessages(&entries, allocator);
+
+    // Expected message sequence: user, assistant(text + tool_use), user(tool_result), assistant(text)
+    try std.testing.expectEqual(@as(usize, 4), cb.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, cb.messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, cb.messages.items[1].role);
+    try std.testing.expectEqual(types.Role.user, cb.messages.items[2].role);
+    try std.testing.expectEqual(types.Role.assistant, cb.messages.items[3].role);
+
+    // Assistant message 1 has text + tool_use
+    try std.testing.expectEqual(@as(usize, 2), cb.messages.items[1].content.len);
+    switch (cb.messages.items[1].content[1]) {
+        .tool_use => |tu| {
+            try std.testing.expectEqualStrings("synth_0", tu.id);
+            try std.testing.expectEqualStrings("bash", tu.name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // tool_result user message references synth_0
+    switch (cb.messages.items[2].content[0]) {
+        .tool_result => |tr| try std.testing.expectEqualStrings("synth_0", tr.tool_use_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handleAgentEvent correlates tool_result to tool_start via call_id" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr");
+    defer cb.deinit();
+
+    // First tool_start with call_id "A"
+    cb.handleAgentEvent(.{ .tool_start = .{
+        .name = try allocator.dupe(u8, "bash"),
+        .call_id = try allocator.dupe(u8, "A"),
+    } }, allocator);
+
+    // Second tool_start with call_id "B"
+    cb.handleAgentEvent(.{ .tool_start = .{
+        .name = try allocator.dupe(u8, "read"),
+        .call_id = try allocator.dupe(u8, "B"),
+    } }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(u32, 2), cb.pending_tool_calls.count());
+
+    // tool_result for "B" (out-of-order vs starts) should parent under tool B
+    cb.handleAgentEvent(.{ .tool_result = .{
+        .call_id = try allocator.dupe(u8, "B"),
+        .content = try allocator.dupe(u8, "result B"),
+        .is_error = false,
+    } }, allocator);
+
+    const tool_b_node = cb.root_children.items[1];
+    try std.testing.expectEqual(@as(usize, 1), tool_b_node.children.items.len);
+    try std.testing.expectEqualStrings("result B", tool_b_node.children.items[0].content.items);
+    // Pending map no longer contains "B", still contains "A"
+    try std.testing.expectEqual(@as(u32, 1), cb.pending_tool_calls.count());
+    try std.testing.expect(cb.pending_tool_calls.get("A") != null);
+}
+
+test "restoreFromSession rebuilds both tree and messages" {
+    const allocator = std.testing.allocator;
+
+    // The session lives under .zag/sessions (cwd-relative). We synthesize a
+    // deterministic id, write a small JSONL file ourselves, and build a
+    // SessionHandle struct pointing at it. Writing the file directly (rather
+    // than via SessionHandle.appendEntry in a loop) sidesteps a known
+    // quirk of std.fs.File positional writers — each freshly-created writer
+    // starts at pos 0 — so a single writer loop is the reliable pattern.
+    std.fs.cwd().makePath(".zag/sessions") catch {};
+
+    const session_id = "restore_test_0123456789abcdef01";
+
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
+
+    defer {
+        std.fs.cwd().deleteFile(jsonl_path) catch {};
+    }
+
+    // Write two entries using a single writer so positional offsets advance.
+    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    {
+        var write_scratch: [512]u8 = undefined;
+        var fw = file.writer(&write_scratch);
+        try fw.interface.writeAll("{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":0}\n");
+        try fw.interface.writeAll("{\"type\":\"assistant_text\",\"content\":\"hello\",\"ts\":1}\n");
+        try fw.interface.flush();
+    }
+
+    // Build a minimal SessionHandle pointing at the file we just wrote.
+    // restoreFromSession only reads `id`/`id_len` and `meta.name_len`/`nameSlice`.
+    var handle = Session.SessionHandle{
+        .id_len = @intCast(session_id.len),
+        .file = file,
+        .meta = .{},
+        .allocator = allocator,
+    };
+    @memcpy(handle.id[0..session_id.len], session_id);
+    defer handle.close();
+
+    // Fresh buffer restores it
+    var cb = try ConversationBuffer.init(allocator, 0, "restored");
+    defer cb.deinit();
+    try cb.restoreFromSession(&handle, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
+    try std.testing.expectEqual(NodeType.assistant_text, cb.root_children.items[1].node_type);
+    try std.testing.expectEqual(@as(usize, 2), cb.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, cb.messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, cb.messages.items[1].role);
+}
+
+test "drainEvents joins thread and deinits queue on .done" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "drain-test");
+    defer cb.deinit();
+
+    // Simulate the spawn setup without a real agent thread: just the queue.
+    cb.event_queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    cb.queue_active = true;
+
+    // Fake "thread" that immediately exits. We spawn it so agent_thread is non-null.
+    const Noop = struct {
+        fn run() void {}
+    };
+    cb.agent_thread = try std.Thread.spawn(.{}, Noop.run, .{});
+
+    // Push a done event
+    try cb.event_queue.push(.done);
+
+    const finished = cb.drainEvents(allocator);
+
+    try std.testing.expect(finished);
+    try std.testing.expect(cb.agent_thread == null);
+    try std.testing.expect(!cb.queue_active);
+}
