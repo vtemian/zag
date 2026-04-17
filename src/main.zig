@@ -12,6 +12,7 @@ const tools = @import("tools.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationSession = @import("ConversationSession.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
@@ -53,6 +54,9 @@ pub const std_options: std.Options = .{ .logFn = tuiLogHandler };
 
 var tui_active: bool = false;
 
+/// Module-level root session: owns the LLM message history and persistence
+/// handle for the primary conversation.
+var root_session: ConversationSession = undefined;
 /// Module-level root buffer. Shared with tuiLogHandler so log output lands in
 /// the same place the user reads messages.
 var root_buffer: ConversationBuffer = undefined;
@@ -159,7 +163,10 @@ pub fn main() !void {
 
     const allocator = if (build_options.metrics) counting.allocator() else gpa.allocator();
 
-    root_buffer = try ConversationBuffer.init(allocator, 0, "session");
+    root_session = ConversationSession.init(allocator);
+    defer root_session.deinit();
+
+    root_buffer = try ConversationBuffer.init(allocator, 0, "session", &root_session);
     defer root_buffer.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
@@ -228,7 +235,7 @@ pub fn main() !void {
     defer if (session_handle) |*sh| sh.close();
 
     if (session_handle) |*sh| {
-        root_buffer.session_handle = sh;
+        root_session.attachSession(sh);
         if (resume_id != null) {
             root_buffer.restoreFromSession(sh, allocator) catch |err| {
                 log.warn("session restore failed: {}", .{err});
@@ -316,7 +323,9 @@ test {
 
 test "appendOutputText creates a status node" {
     const allocator = std.testing.allocator;
-    root_buffer = try ConversationBuffer.init(allocator, 0, "test");
+    root_session = ConversationSession.init(allocator);
+    defer root_session.deinit();
+    root_buffer = try ConversationBuffer.init(allocator, 0, "test", &root_session);
     defer root_buffer.deinit();
 
     try appendOutputText("hello world");

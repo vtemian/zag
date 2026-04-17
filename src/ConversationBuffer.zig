@@ -11,6 +11,7 @@ const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const types = @import("types.zig");
 const Session = @import("Session.zig");
+const ConversationSession = @import("ConversationSession.zig");
 const agent_events = @import("agent_events.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Hooks = @import("Hooks.zig");
@@ -98,8 +99,9 @@ render_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 
-/// Conversation history for LLM calls. Each buffer maintains its own.
-messages: std.ArrayList(types.Message) = .empty,
+/// LLM conversation state: message history and persistence handle.
+/// Borrowed, not owned. Lifetime is managed by the orchestrator.
+session: *ConversationSession,
 /// Pending tool_call nodes keyed by call_id, for parenting tool_result nodes.
 /// Supports parallel tool execution where events interleave.
 pending_tool_calls: std.StringHashMap(*Node) = undefined,
@@ -111,8 +113,6 @@ current_assistant_node: ?*Node = null,
 last_info: [128]u8 = .{0} ** 128,
 /// Length of the last info message.
 last_info_len: u8 = 0,
-/// Open session file for persistence (null if unsaved buffer).
-session_handle: ?*Session.SessionHandle = null,
 /// Background agent thread, if one is running for this buffer.
 /// Lifecycle is managed by the orchestrator; the buffer only holds the
 /// handle so `deinit` can join on error-exit paths.
@@ -131,8 +131,9 @@ wake_fd: ?std.posix.fd_t = null,
 /// drain loop to service `hook_request` events pushed by the agent.
 lua_engine: ?*LuaEngine = null,
 
-/// Create a new empty buffer with the given id and name.
-pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
+/// Create a new empty buffer with the given id and name. Borrows `session`
+/// for LLM message history and persistence; the caller retains ownership.
+pub fn init(allocator: Allocator, id: u32, name: []const u8, session: *ConversationSession) !ConversationBuffer {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
 
@@ -143,25 +144,25 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
         .next_id = 0,
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
+        .session = session,
         .pending_tool_calls = std.StringHashMap(*Node).init(allocator),
     };
 }
 
-/// Release all memory owned by this buffer: nodes, name, messages, and lists.
-/// The session_handle is NOT closed here; the owner (main or split creator) closes it.
+/// Release all memory owned by this buffer: nodes, name, and lists.
+/// Messages and the session handle live on `ConversationSession` and are not
+/// freed here. The session itself is also not owned by the buffer.
 pub fn deinit(self: *ConversationBuffer) void {
     // Join any live agent thread before freeing the state it reads/writes:
-    // messages, pending_tool_calls, and the event queue are all shared with
-    // the worker. Running this unconditionally is the only safe ordering on
-    // error-exit paths where the caller never got a chance to shut down.
+    // pending_tool_calls and the event queue are shared with the worker.
+    // Running this unconditionally is the only safe ordering on error-exit
+    // paths where the caller never got a chance to shut down.
     self.shutdown();
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
         self.allocator.destroy(node);
     }
     self.root_children.deinit(self.allocator);
-    for (self.messages.items) |msg| msg.deinit(self.allocator);
-    self.messages.deinit(self.allocator);
     // Free owned call_id keys in the pending map
     var key_it = self.pending_tool_calls.keyIterator();
     while (key_it.next()) |key| self.allocator.free(@constCast(key.*));
@@ -394,83 +395,6 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
     self.render_dirty = true;
 }
 
-/// Reconstruct the LLM message history from loaded entries.
-pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry, allocator: Allocator) !void {
-    var assistant_blocks: std.ArrayList(types.ContentBlock) = .empty;
-    defer assistant_blocks.deinit(allocator);
-
-    var tool_result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-    defer tool_result_blocks.deinit(allocator);
-
-    var tool_id_counter: u32 = 0;
-    var last_tool_use_id: ?[]const u8 = null;
-
-    for (entries) |entry| {
-        switch (entry.entry_type) {
-            .user_message => {
-                try self.flushAssistantMessage(&assistant_blocks, allocator);
-                try self.flushToolResultMessage(&tool_result_blocks, allocator);
-
-                const content = try allocator.alloc(types.ContentBlock, 1);
-                errdefer allocator.free(content);
-                content[0] = .{ .text = .{ .text = try allocator.dupe(u8, entry.content) } };
-                try self.messages.append(allocator, .{ .role = .user, .content = content });
-            },
-            .assistant_text => {
-                try self.flushToolResultMessage(&tool_result_blocks, allocator);
-                const duped = try allocator.dupe(u8, entry.content);
-                try assistant_blocks.append(allocator, .{ .text = .{ .text = duped } });
-            },
-            .tool_call => {
-                try self.flushToolResultMessage(&tool_result_blocks, allocator);
-                // Widened to [32]u8 so "synth_" + up to maxInt(u32) always fits.
-                var scratch: [32]u8 = undefined;
-                const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{tool_id_counter});
-                tool_id_counter += 1;
-                const duped_id = try allocator.dupe(u8, synthetic_id);
-                const duped_name = try allocator.dupe(u8, entry.tool_name);
-                const duped_input = try allocator.dupe(u8, if (entry.tool_input.len > 0) entry.tool_input else "{}");
-                try assistant_blocks.append(allocator, .{ .tool_use = .{
-                    .id = duped_id,
-                    .name = duped_name,
-                    .input_raw = duped_input,
-                } });
-                if (last_tool_use_id) |prev_id| allocator.free(prev_id);
-                last_tool_use_id = try allocator.dupe(u8, synthetic_id);
-            },
-            .tool_result => {
-                try self.flushAssistantMessage(&assistant_blocks, allocator);
-                const use_id = if (last_tool_use_id) |id| blk: {
-                    last_tool_use_id = null;
-                    break :blk id;
-                } else try allocator.dupe(u8, "unknown");
-                try tool_result_blocks.append(allocator, .{ .tool_result = .{
-                    .tool_use_id = use_id,
-                    .content = try allocator.dupe(u8, entry.content),
-                    .is_error = entry.is_error,
-                } });
-            },
-            .info, .err, .session_start, .session_rename => {},
-        }
-    }
-
-    try self.flushAssistantMessage(&assistant_blocks, allocator);
-    try self.flushToolResultMessage(&tool_result_blocks, allocator);
-    if (last_tool_use_id) |id| allocator.free(id);
-}
-
-fn flushAssistantMessage(self: *ConversationBuffer, blocks: *std.ArrayList(types.ContentBlock), allocator: Allocator) !void {
-    if (blocks.items.len == 0) return;
-    const content = try blocks.toOwnedSlice(allocator);
-    try self.messages.append(allocator, .{ .role = .assistant, .content = content });
-}
-
-fn flushToolResultMessage(self: *ConversationBuffer, blocks: *std.ArrayList(types.ContentBlock), allocator: Allocator) !void {
-    if (blocks.items.len == 0) return;
-    const content = try blocks.toOwnedSlice(allocator);
-    try self.messages.append(allocator, .{ .role = .user, .content = content });
-}
-
 /// Remove all nodes from the buffer, freeing their memory.
 pub fn clear(self: *ConversationBuffer) void {
     for (self.root_children.items) |node| {
@@ -480,15 +404,6 @@ pub fn clear(self: *ConversationBuffer) void {
     self.root_children.clearRetainingCapacity();
     self.next_id = 0;
     self.render_dirty = true;
-}
-
-/// Persist an event to the session JSONL file, if a session is attached.
-/// Failures are logged but not propagated; persistence is best-effort.
-pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
-    const sh = self.session_handle orelse return;
-    sh.appendEntry(entry) catch |err| {
-        log.warn("session persist failed: {}", .{err});
-    };
 }
 
 /// Process a single agent event: update the node tree and persist to session.
@@ -510,7 +425,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
                     break :blk null;
                 };
             }
-            self.persistEvent(.{
+            self.session.persistEvent(.{
                 .entry_type = .assistant_text,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
@@ -529,7 +444,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
                     allocator.free(id);
                 }
             }
-            self.persistEvent(.{
+            self.session.persistEvent(.{
                 .entry_type = .tool_call,
                 .tool_name = ev.name,
                 .timestamp = std.time.milliTimestamp(),
@@ -549,7 +464,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
                 break :blk self.last_tool_call;
             } else self.last_tool_call;
             _ = self.appendNode(parent, .tool_result, result.content) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
-            self.persistEvent(.{
+            self.session.persistEvent(.{
                 .entry_type = .tool_result,
                 .content = result.content,
                 .is_error = result.is_error,
@@ -578,7 +493,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
                 eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
             }
             _ = self.appendNode(null, .err, text) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
-            self.persistEvent(.{
+            self.session.persistEvent(.{
                 .entry_type = .err,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
@@ -607,11 +522,11 @@ pub fn submitInput(
     const content = try allocator.alloc(types.ContentBlock, 1);
     const duped = try allocator.dupe(u8, text);
     content[0] = .{ .text = .{ .text = duped } };
-    try self.messages.append(allocator, .{ .role = .user, .content = content });
+    try self.session.messages.append(allocator, .{ .role = .user, .content = content });
 
     _ = try self.appendNode(null, .user_message, text);
 
-    self.persistEvent(.{
+    self.session.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
         .timestamp = std.time.milliTimestamp(),
@@ -754,7 +669,7 @@ pub const SessionSummaryInputs = struct {
 /// The returned slices point into the buffer's messages and are valid
 /// until the next mutation.
 pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInputs {
-    const msgs = self.messages.items;
+    const msgs = self.session.messages.items;
     if (msgs.len < 2) return null;
 
     const user_text = extractFirstText(msgs[0]) orelse return null;
@@ -798,6 +713,13 @@ pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle,
         allocator.free(self.name);
         self.name = try allocator.dupe(u8, sh.meta.nameSlice());
     }
+}
+
+/// Shim: delegate message rebuild to the attached session.
+/// This exists to keep the intermediate commit compiling during the
+/// ConversationBuffer/ConversationSession split. It is removed in Task 1.3.
+pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry, allocator: Allocator) !void {
+    try self.session.rebuildMessages(entries, allocator);
 }
 
 // -- Buffer interface --------------------------------------------------------
@@ -873,7 +795,9 @@ test {
 
 test "init and deinit" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
     defer cb.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), cb.id);
@@ -883,7 +807,9 @@ test "init and deinit" {
 
 test "appendNode creates root-level nodes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 1, "session");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 1, "session", &scb);
     defer cb.deinit();
 
     const n1 = try cb.appendNode(null, .user_message, "hello");
@@ -898,7 +824,9 @@ test "appendNode creates root-level nodes" {
 
 test "getVisibleLines returns rendered lines" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 3, "session");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 3, "session", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -916,7 +844,9 @@ test "getVisibleLines returns rendered lines" {
 
 test "buffer interface dispatches correctly" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 7, "iface-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 7, "iface-test", &scb);
     defer cb.deinit();
 
     const b = cb.buf();
@@ -931,7 +861,9 @@ test "buffer interface dispatches correctly" {
 
 test "fromBuffer roundtrips correctly" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip", &scb);
     defer cb.deinit();
 
     const b = cb.buf();
@@ -941,7 +873,9 @@ test "fromBuffer roundtrips correctly" {
 
 test "getVisibleLines with range skips off-screen nodes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "range-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "range-test", &scb);
     defer cb.deinit();
 
     // Create 5 single-line nodes
@@ -970,7 +904,9 @@ test "getVisibleLines with range skips off-screen nodes" {
 
 test "buffer interface returns line count" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "lc-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "lc-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -985,7 +921,9 @@ test "buffer interface returns line count" {
 
 test "getVisibleLines returns consistent results when content unchanged" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "cache-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1013,7 +951,9 @@ test "getVisibleLines returns consistent results when content unchanged" {
 
 test "getVisibleLines reflects new content after appendToNode" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .user_message, "hello");
@@ -1038,7 +978,9 @@ test "getVisibleLines reflects new content after appendToNode" {
 
 test "getVisibleLines reflects new nodes after appendNode" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "append-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "append-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "first");
@@ -1062,7 +1004,9 @@ test "getVisibleLines reflects new nodes after appendNode" {
 
 test "clear invalidates line cache" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1083,7 +1027,9 @@ test "clear invalidates line cache" {
 
 test "buffer starts clean" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
     defer cb.deinit();
 
     const b = cb.buf();
@@ -1092,7 +1038,9 @@ test "buffer starts clean" {
 
 test "appendNode marks buffer dirty" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1102,7 +1050,9 @@ test "appendNode marks buffer dirty" {
 
 test "clearDirty resets the flag" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1115,7 +1065,9 @@ test "clearDirty resets the flag" {
 
 test "appendToNode marks buffer dirty" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .user_message, "hello");
@@ -1128,7 +1080,9 @@ test "appendToNode marks buffer dirty" {
 
 test "setScrollOffset marks dirty only when value changes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
     defer cb.deinit();
 
     var b = cb.buf();
@@ -1150,7 +1104,9 @@ test "setScrollOffset marks dirty only when value changes" {
 
 test "resetCurrentAssistantText removes the in-progress node" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-test", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hi");
@@ -1168,7 +1124,9 @@ test "resetCurrentAssistantText removes the in-progress node" {
 
 test "resetCurrentAssistantText is a no-op when nothing is in progress" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop", &scb);
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hi");
@@ -1193,7 +1151,9 @@ test "synthetic id scratch fits maxInt(u32)" {
 
 test "text_delta after reset starts a fresh assistant node" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow", &scb);
     defer cb.deinit();
 
     // Simulate a partial stream: two text deltas append to one node.
@@ -1214,7 +1174,9 @@ test "text_delta after reset starts a fresh assistant node" {
 
 test "wake_fd default is null" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wake-default");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-default", &scb);
     defer cb.deinit();
 
     try std.testing.expect(cb.wake_fd == null);
@@ -1224,7 +1186,9 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
     // Mirrors the submitInput sequence (init EventQueue, copy wake_fd)
     // without spawning a real agent thread.
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate", &scb);
     defer cb.deinit();
 
     cb.wake_fd = 777;
@@ -1323,7 +1287,9 @@ test "text_delta fires post-hook with text" {
 
 test "submitInput appends user message and user_message node" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "submit-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "submit-test", &scb);
     defer cb.deinit();
 
     try cb.submitInput("hello", allocator);
@@ -1334,10 +1300,10 @@ test "submitInput appends user message and user_message node" {
     try std.testing.expectEqualStrings("hello", cb.root_children.items[0].content.items);
 
     // Message list side
-    try std.testing.expectEqual(@as(usize, 1), cb.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, cb.messages.items[0].role);
-    try std.testing.expectEqual(@as(usize, 1), cb.messages.items[0].content.len);
-    switch (cb.messages.items[0].content[0]) {
+    try std.testing.expectEqual(@as(usize, 1), cb.session.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[0].role);
+    try std.testing.expectEqual(@as(usize, 1), cb.session.messages.items[0].content.len);
+    switch (cb.session.messages.items[0].content[0]) {
         .text => |t| try std.testing.expectEqualStrings("hello", t.text),
         else => return error.TestUnexpectedResult,
     }
@@ -1349,7 +1315,9 @@ test "submitInput appends user message and user_message node" {
 
 test "loadFromEntries builds node tree from session entries" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "load-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "load-test", &scb);
     defer cb.deinit();
 
     const entries = [_]Session.Entry{
@@ -1372,7 +1340,9 @@ test "loadFromEntries builds node tree from session entries" {
 
 test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "rebuild-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "rebuild-test", &scb);
     defer cb.deinit();
 
     const entries = [_]Session.Entry{
@@ -1386,15 +1356,15 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
     try cb.rebuildMessages(&entries, allocator);
 
     // Expected message sequence: user, assistant(text + tool_use), user(tool_result), assistant(text)
-    try std.testing.expectEqual(@as(usize, 4), cb.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, cb.messages.items[0].role);
-    try std.testing.expectEqual(types.Role.assistant, cb.messages.items[1].role);
-    try std.testing.expectEqual(types.Role.user, cb.messages.items[2].role);
-    try std.testing.expectEqual(types.Role.assistant, cb.messages.items[3].role);
+    try std.testing.expectEqual(@as(usize, 4), cb.session.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, cb.session.messages.items[1].role);
+    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[2].role);
+    try std.testing.expectEqual(types.Role.assistant, cb.session.messages.items[3].role);
 
     // Assistant message 1 has text + tool_use
-    try std.testing.expectEqual(@as(usize, 2), cb.messages.items[1].content.len);
-    switch (cb.messages.items[1].content[1]) {
+    try std.testing.expectEqual(@as(usize, 2), cb.session.messages.items[1].content.len);
+    switch (cb.session.messages.items[1].content[1]) {
         .tool_use => |tu| {
             try std.testing.expectEqualStrings("synth_0", tu.id);
             try std.testing.expectEqualStrings("bash", tu.name);
@@ -1403,7 +1373,7 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
     }
 
     // tool_result user message references synth_0
-    switch (cb.messages.items[2].content[0]) {
+    switch (cb.session.messages.items[2].content[0]) {
         .tool_result => |tr| try std.testing.expectEqualStrings("synth_0", tr.tool_use_id),
         else => return error.TestUnexpectedResult,
     }
@@ -1411,7 +1381,9 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
 
 test "handleAgentEvent correlates tool_result to tool_start via call_id" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr", &scb);
     defer cb.deinit();
 
     // First tool_start with call_id "A"
@@ -1486,21 +1458,25 @@ test "restoreFromSession rebuilds both tree and messages" {
     defer handle.close();
 
     // Fresh buffer restores it
-    var cb = try ConversationBuffer.init(allocator, 0, "restored");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "restored", &scb);
     defer cb.deinit();
     try cb.restoreFromSession(&handle, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
     try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
     try std.testing.expectEqual(NodeType.assistant_text, cb.root_children.items[1].node_type);
-    try std.testing.expectEqual(@as(usize, 2), cb.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, cb.messages.items[0].role);
-    try std.testing.expectEqual(types.Role.assistant, cb.messages.items[1].role);
+    try std.testing.expectEqual(@as(usize, 2), cb.session.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, cb.session.messages.items[1].role);
 }
 
 test "drainEvents joins thread and deinits queue on .done" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "drain-test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "drain-test", &scb);
     defer cb.deinit();
 
     // Simulate the spawn setup without a real agent thread: just the queue.

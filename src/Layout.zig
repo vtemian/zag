@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationSession = @import("ConversationSession.zig");
 
 const Layout = @This();
 
@@ -429,7 +430,9 @@ test "setRoot creates a single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
     defer cb.deinit();
 
     try layout.setRoot(cb.buf());
@@ -445,7 +448,9 @@ test "recalculate sets leaf rect with status row reserved" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
     defer cb.deinit();
 
     try layout.setRoot(cb.buf());
@@ -463,9 +468,13 @@ test "vertical split divides width evenly" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
@@ -494,9 +503,13 @@ test "horizontal split divides height evenly" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
@@ -524,9 +537,13 @@ test "focus navigation between vertical splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
@@ -548,9 +565,13 @@ test "focus navigation between horizontal splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "top", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
@@ -570,9 +591,13 @@ test "closeWindow removes focused pane" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
@@ -594,7 +619,9 @@ test "closeWindow is no-op on single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "only");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "only", &scb);
     defer cb.deinit();
 
     try layout.setRoot(cb.buf());
@@ -608,9 +635,13 @@ test "visibleLeaves returns all leaves" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
@@ -629,7 +660,9 @@ test "recalculate with tiny screen is safe" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
     defer cb.deinit();
 
     try layout.setRoot(cb.buf());
@@ -644,7 +677,9 @@ test "focus direction no-op when no neighbor exists" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "only");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "only", &scb);
     defer cb.deinit();
 
     try layout.setRoot(cb.buf());
@@ -663,9 +698,13 @@ test "setRoot replaces existing tree" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "first");
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "first", &scb1);
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "second");
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "second", &scb2);
     defer cb2.deinit();
 
     try layout.setRoot(cb1.buf());
