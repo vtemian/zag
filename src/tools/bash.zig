@@ -50,7 +50,8 @@ pub fn execute(
     defer allocator.free(outcome.stderr);
 
     if (outcome.cancelled) {
-        _ = child.kill() catch {};
+        // Escalate straight to SIGKILL: the shell child may have trapped TERM, and cancellation must be unignorable.
+        std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
         _ = child.wait() catch {};
         return .{ .content = "error: cancelled", .is_error = true, .owned = false };
     }
