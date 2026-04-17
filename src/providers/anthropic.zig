@@ -40,7 +40,18 @@ pub const AnthropicSerializer = struct {
         messages: []const types.Message,
         tool_definitions: []const types.ToolDefinition,
         allocator: Allocator,
-    ) anyerror!types.LlmResponse {
+    ) llm.ProviderError!types.LlmResponse {
+        return callImplInner(ptr, system_prompt, messages, tool_definitions, allocator) catch |err|
+            return llm.mapProviderError(err);
+    }
+
+    fn callImplInner(
+        ptr: *anyopaque,
+        system_prompt: []const u8,
+        messages: []const types.Message,
+        tool_definitions: []const types.ToolDefinition,
+        allocator: Allocator,
+    ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
@@ -63,7 +74,20 @@ pub const AnthropicSerializer = struct {
         allocator: Allocator,
         callback: llm.StreamCallback,
         cancel: *std.atomic.Value(bool),
-    ) anyerror!types.LlmResponse {
+    ) llm.ProviderError!types.LlmResponse {
+        return callStreamingImplInner(ptr, system_prompt, messages, tool_definitions, allocator, callback, cancel) catch |err|
+            return llm.mapProviderError(err);
+    }
+
+    fn callStreamingImplInner(
+        ptr: *anyopaque,
+        system_prompt: []const u8,
+        messages: []const types.Message,
+        tool_definitions: []const types.ToolDefinition,
+        allocator: Allocator,
+        callback: llm.StreamCallback,
+        cancel: *std.atomic.Value(bool),
+    ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);

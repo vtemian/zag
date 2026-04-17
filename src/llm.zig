@@ -17,6 +17,47 @@ const log = std.log.scoped(.llm);
 /// `pending_line` until the agent OOMs.
 const MAX_SSE_LINE: usize = 1 * 1024 * 1024; // 1 MiB
 
+/// Errors a Provider's call/callStreaming may legitimately produce.
+/// Unexpected stdlib errors (HTTP plumbing, JSON parse) are logged and
+/// remapped to `ApiError` at the provider boundary so the vtable surface
+/// stays small and callers can switch exhaustively.
+pub const ProviderError = std.mem.Allocator.Error || error{
+    /// Upstream endpoint returned a non-2xx status, malformed transport
+    /// framing, or any other transport-layer failure that couldn't be
+    /// classified more specifically.
+    ApiError,
+    /// Endpoint URL failed to parse (usually a config / env-var typo).
+    InvalidUri,
+    /// Response body couldn't be parsed as the expected shape.
+    MalformedResponse,
+    /// No API key available for the configured provider.
+    MissingApiKey,
+    /// An SSE line exceeded MAX_SSE_LINE before terminating.
+    SseLineTooLong,
+    /// Accumulated SSE event data exceeded MAX_SSE_EVENT_DATA.
+    SseEventDataTooLarge,
+};
+
+/// Remap an arbitrary error to the narrow `ProviderError` surface.
+/// Errors already in the set pass through; anything else is logged and
+/// returned as `ApiError`. Used at provider entry points so stdlib HTTP
+/// and JSON errors don't leak past the vtable.
+pub fn mapProviderError(err: anyerror) ProviderError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ApiError => error.ApiError,
+        error.InvalidUri => error.InvalidUri,
+        error.MalformedResponse => error.MalformedResponse,
+        error.MissingApiKey => error.MissingApiKey,
+        error.SseLineTooLong => error.SseLineTooLong,
+        error.SseEventDataTooLarge => error.SseEventDataTooLarge,
+        else => blk: {
+            log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
+            break :blk error.ApiError;
+        },
+    };
+}
+
 /// Hard cap on the accumulated "data:" payload of a single SSE event, summed
 /// across all data lines before the dispatching blank line.
 const MAX_SSE_EVENT_DATA: usize = 4 * 1024 * 1024; // 4 MiB
@@ -265,7 +306,7 @@ pub const Provider = struct {
             messages: []const types.Message,
             tool_definitions: []const types.ToolDefinition,
             allocator: Allocator,
-        ) anyerror!types.LlmResponse,
+        ) ProviderError!types.LlmResponse,
 
         /// Streaming variant: invokes `callback.on_event` for each SSE event.
         /// Assembles and returns the final LlmResponse when stream ends.
@@ -278,7 +319,7 @@ pub const Provider = struct {
             allocator: Allocator,
             callback: StreamCallback,
             cancel: *std.atomic.Value(bool),
-        ) anyerror!types.LlmResponse,
+        ) ProviderError!types.LlmResponse,
 
         /// Human-readable provider name (for logging and display).
         name: []const u8,
@@ -291,7 +332,7 @@ pub const Provider = struct {
         messages: []const types.Message,
         tool_definitions: []const types.ToolDefinition,
         allocator: Allocator,
-    ) !types.LlmResponse {
+    ) ProviderError!types.LlmResponse {
         return self.vtable.call(self.ptr, system_prompt, messages, tool_definitions, allocator);
     }
 
@@ -306,7 +347,7 @@ pub const Provider = struct {
         allocator: Allocator,
         callback: StreamCallback,
         cancel: *std.atomic.Value(bool),
-    ) !types.LlmResponse {
+    ) ProviderError!types.LlmResponse {
         return self.vtable.call_streaming(self.ptr, system_prompt, messages, tool_definitions, allocator, callback, cancel);
     }
 };
@@ -842,7 +883,7 @@ test "Provider vtable call dispatches correctly" {
             _: []const types.Message,
             _: []const types.ToolDefinition,
             alloc: Allocator,
-        ) anyerror!types.LlmResponse {
+        ) ProviderError!types.LlmResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
             const content = try alloc.alloc(types.ContentBlock, 1);
@@ -864,7 +905,7 @@ test "Provider vtable call dispatches correctly" {
             alloc: Allocator,
             _: StreamCallback,
             _: *std.atomic.Value(bool),
-        ) anyerror!types.LlmResponse {
+        ) ProviderError!types.LlmResponse {
             return callImpl(ptr, system_prompt, messages, tool_definitions, alloc);
         }
 
@@ -910,7 +951,7 @@ test "Provider callStreaming dispatches to vtable" {
             _: []const types.Message,
             _: []const types.ToolDefinition,
             _: Allocator,
-        ) anyerror!types.LlmResponse {
+        ) ProviderError!types.LlmResponse {
             unreachable;
         }
 
@@ -922,7 +963,7 @@ test "Provider callStreaming dispatches to vtable" {
             alloc: Allocator,
             callback: StreamCallback,
             _: *std.atomic.Value(bool),
-        ) anyerror!types.LlmResponse {
+        ) ProviderError!types.LlmResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.stream_count += 1;
             callback.on_event(callback.ctx, .{ .text_delta = "hello" });
