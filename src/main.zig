@@ -305,6 +305,11 @@ pub fn main() !void {
     });
     defer orchestrator.deinit();
 
+    // The compositor needs the orchestrator to resolve per-pane diagnostics
+    // (e.g. the dropped-event counter) from a focused leaf's Buffer. Wire
+    // this after orchestrator construction so the pointer is stable.
+    compositor.orchestrator = &orchestrator;
+
     // Now that the orchestrator owns the keymap registry, wire its pointer
     // onto the lua engine and load user config so `zag.keymap()` overrides
     // land before any keys are dispatched. Tool registration follows so
