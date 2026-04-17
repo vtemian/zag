@@ -11,6 +11,7 @@ const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationSession = @import("ConversationSession.zig");
 const Theme = @import("Theme.zig");
 const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
@@ -521,7 +522,9 @@ test "composite writes buffer content at leaf rect with padding" {
         .layout_dirty = true,
     };
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -553,7 +556,9 @@ test "composite draws status line on last row" {
         .layout_dirty = true,
     };
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb);
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -571,6 +576,89 @@ test "composite draws status line on last row" {
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(9, 10).codepoint);
 }
 
+<<<<<<< HEAD
+=======
+test "composite draws vertical split border from theme" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 10);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left", &scb1);
+    defer cb1.deinit();
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right", &scb2);
+    defer cb2.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb1.buf());
+    layout.recalculate(40, 10);
+    try layout.splitVertical(0.5, cb2.buf());
+    layout.recalculate(40, 10);
+
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
+
+    const root = layout.root.?;
+    const first_rect = root.split.first.leaf.rect;
+    const border_col = first_rect.x + first_rect.width;
+
+    const border_cell = screen.getCellConst(first_rect.y, border_col);
+    try std.testing.expectEqual(theme.borders.vertical, border_cell.codepoint);
+}
+
+test "composite draws horizontal split border" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var scb1 = ConversationSession.init(allocator);
+    defer scb1.deinit();
+    var cb1 = try ConversationBuffer.init(allocator, 0, "top", &scb1);
+    defer cb1.deinit();
+    var scb2 = ConversationSession.init(allocator);
+    defer scb2.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom", &scb2);
+    defer cb2.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb1.buf());
+    layout.recalculate(40, 12);
+    try layout.splitHorizontal(0.5, cb2.buf());
+    layout.recalculate(40, 12);
+
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
+
+    const root = layout.root.?;
+    const first_rect = root.split.first.leaf.rect;
+    const border_row = first_rect.y + first_rect.height;
+
+    const border_cell = screen.getCellConst(border_row, first_rect.x);
+    try std.testing.expectEqual(theme.borders.horizontal, border_cell.codepoint);
+}
+
+>>>>>>> 1933387 (session: extract ConversationSession (persistence + messages))
 test "composite skips clean buffer leaves" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
@@ -585,7 +673,9 @@ test "composite skips clean buffer leaves" {
         .layout_dirty = true,
     };
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -628,7 +718,9 @@ test "drawStatusLine paints the mode indicator at column 0 (shadowed row)" {
         .layout_dirty = true,
     };
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb);
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -657,7 +749,9 @@ test "input line paints mode indicator and normal-mode hint" {
         .layout_dirty = true,
     };
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb);
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -710,7 +804,9 @@ test "input line shows status hint after mode label when status is set" {
         .layout_dirty = true,
     };
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb);
     defer cb.deinit();
 
     var layout = Layout.init(allocator);

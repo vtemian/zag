@@ -20,6 +20,7 @@ const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationSession = @import("ConversationSession.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
@@ -48,10 +49,13 @@ const Action = enum { none, quit, redraw };
 /// Result of handling a slash command.
 const CommandResult = enum { handled, quit, not_a_command };
 
-/// A split pane's owned resources: buffer and optional session.
+/// A split pane's owned resources: buffer, conversation session, and optional
+/// on-disk session handle.
 pub const SplitPane = struct {
     /// The conversation buffer for this pane.
     buffer: *ConversationBuffer,
+    /// LLM message state attached to the buffer.
+    conv_session: *ConversationSession,
     /// Session handle for persistence, or null if persistence is unavailable.
     session: ?*Session.SessionHandle,
 };
@@ -194,6 +198,8 @@ pub fn deinit(self: *EventOrchestrator) void {
         }
         pane.buffer.deinit();
         self.allocator.destroy(pane.buffer);
+        pane.conv_session.deinit();
+        self.allocator.destroy(pane.conv_session);
     }
     self.extra_panes.deinit(self.allocator);
     self.keymap_registry.deinit();
@@ -671,15 +677,21 @@ fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
     return @intCast(written.len);
 }
 
-/// Create a new split pane: buffer + optional session, tracked for cleanup.
+/// Create a new split pane: session + buffer + optional persistence handle,
+/// tracked for cleanup.
 fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
+    const cs = try self.allocator.create(ConversationSession);
+    errdefer self.allocator.destroy(cs);
+    cs.* = ConversationSession.init(self.allocator);
+    errdefer cs.deinit();
+
     const cb = try self.allocator.create(ConversationBuffer);
     errdefer self.allocator.destroy(cb);
 
     var name_scratch: [32]u8 = undefined;
     const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
 
-    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
+    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name, cs);
     errdefer cb.deinit();
 
     // Wake pipe so agent events on this pane interrupt the orchestrator's
@@ -694,7 +706,11 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     // Attach session if persistence is available
     const sh = self.attachSession(cb);
 
-    try self.extra_panes.append(self.allocator, .{ .buffer = cb, .session = sh });
+    try self.extra_panes.append(self.allocator, .{
+        .buffer = cb,
+        .conv_session = cs,
+        .session = sh,
+    });
     return cb;
 }
 
@@ -707,7 +723,7 @@ fn attachSession(self: *EventOrchestrator, cb: *ConversationBuffer) ?*Session.Se
         self.allocator.destroy(h);
         return null;
     };
-    cb.session_handle = h;
+    cb.session.attachSession(h);
     return h;
 }
 
@@ -773,7 +789,7 @@ fn onUserInputSubmitted(
 
     cb.agent_thread = AgentThread.spawn(
         self.provider.provider,
-        &cb.messages,
+        &cb.session.messages,
         self.registry,
         self.allocator,
         &cb.event_queue,
@@ -793,7 +809,7 @@ fn onUserInputSubmitted(
 /// ask the provider for a 3-5 word title and rename the session.
 /// Best-effort: any failure is logged and swallowed.
 fn autoNameSession(self: *EventOrchestrator, cb: *ConversationBuffer) void {
-    const sh = cb.session_handle orelse return;
+    const sh = cb.session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
     const inputs = cb.sessionSummaryInputs() orelse return;
