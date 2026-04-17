@@ -61,18 +61,14 @@ pub const Pane = struct {
     runner: *AgentRunner,
 };
 
-/// A split pane's owned resources. Extends `Pane` with the optional
-/// on-disk session handle so orchestrator-owned panes carry enough
-/// state to tear themselves down.
-pub const SplitPane = struct {
-    /// The conversation buffer for this pane.
-    buffer: *ConversationBuffer,
-    /// LLM message state attached to the buffer.
-    conv_session: *ConversationSession,
-    /// Agent thread lifecycle + event coordination for this pane.
-    runner: *AgentRunner,
+/// A registered pane plus the persistence handle that keeps it tied to
+/// an on-disk session. The orchestrator owns each `PaneEntry`: deinit
+/// frees the three Pane objects plus the handle in the right order.
+pub const PaneEntry = struct {
+    /// The composed view/session/runner for this pane.
+    pane: Pane,
     /// Session handle for persistence, or null if persistence is unavailable.
-    session: ?*Session.SessionHandle,
+    session_handle: ?*Session.SessionHandle = null,
 };
 
 // -- Fields ------------------------------------------------------------------
@@ -87,15 +83,10 @@ screen: *Screen,
 layout: *Layout,
 /// Renders layout into the screen grid.
 compositor: *Compositor,
-/// Root conversation buffer (the initial session pane).
-root_buffer: *ConversationBuffer,
-/// LLM conversation state for the root pane. Borrowed from main; used to
-/// persist, rebuild messages, and extract auto-naming inputs.
-root_session: *ConversationSession,
-/// Agent lifecycle for the root pane. Borrowed from main; used to spawn
-/// the agent thread, drain events, cancel, and read `last_info` for the
-/// status bar. Phase 4 folds this into a `Pane` and removes the side-car.
-root_runner: *AgentRunner,
+/// The primary (root) conversation pane: view + session + runner, all
+/// borrowed from main. The orchestrator does not own the underlying
+/// allocations for this pane; it does for every entry in `extra_panes`.
+root_pane: Pane,
 /// LLM provider for model calls and model ID lookups.
 provider: *llm.ProviderResult,
 /// Tool registry for dispatching tool calls.
@@ -118,7 +109,7 @@ wake_read_fd: posix.fd_t,
 wake_write_fd: posix.fd_t,
 
 /// Extra panes created by splits, tracked for cleanup.
-extra_panes: std.ArrayList(SplitPane) = .empty,
+extra_panes: std.ArrayList(PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
 next_buffer_id: u32 = 1,
 /// Rolling label counter for scratch panes. First split produces
@@ -189,9 +180,7 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .screen = cfg.screen,
         .layout = cfg.layout,
         .compositor = cfg.compositor,
-        .root_buffer = cfg.root_pane.view,
-        .root_session = cfg.root_pane.session,
-        .root_runner = cfg.root_pane.runner,
+        .root_pane = cfg.root_pane,
         .provider = cfg.provider,
         .registry = cfg.registry,
         .session_mgr = cfg.session_mgr,
@@ -215,8 +204,8 @@ pub fn init(cfg: Config) !EventOrchestrator {
 /// threads are still live.
 pub fn deinit(self: *EventOrchestrator) void {
     self.shutdownAgents();
-    for (self.extra_panes.items) |pane| {
-        if (pane.session) |sh| {
+    for (self.extra_panes.items) |entry| {
+        if (entry.session_handle) |sh| {
             sh.close();
             self.allocator.destroy(sh);
         }
@@ -224,12 +213,12 @@ pub fn deinit(self: *EventOrchestrator) void {
         // queue. The session and view may be read by the worker right up
         // until the join completes, so freeing them before shutdown would
         // race on the worker's last frame.
-        pane.runner.deinit();
-        self.allocator.destroy(pane.runner);
-        pane.buffer.deinit();
-        self.allocator.destroy(pane.buffer);
-        pane.conv_session.deinit();
-        self.allocator.destroy(pane.conv_session);
+        entry.pane.runner.deinit();
+        self.allocator.destroy(entry.pane.runner);
+        entry.pane.view.deinit();
+        self.allocator.destroy(entry.pane.view);
+        entry.pane.session.deinit();
+        self.allocator.destroy(entry.pane.session);
     }
     self.extra_panes.deinit(self.allocator);
     self.keymap_registry.deinit();
@@ -363,15 +352,15 @@ fn tick(
         }
     }
 
-    // Drain agent events from all buffers
-    self.drainBuffer(self.root_buffer);
-    for (self.extra_panes.items) |pane| {
-        self.drainBuffer(pane.buffer);
+    // Drain agent events from every pane
+    self.drainPane(self.root_pane);
+    for (self.extra_panes.items) |entry| {
+        self.drainPane(entry.pane);
     }
 
-    // Check if any buffer has pending visual changes
-    const any_dirty = self.root_buffer.render_dirty or for (self.extra_panes.items) |pane| {
-        if (pane.buffer.render_dirty) break true;
+    // Check if any pane has pending visual changes
+    const any_dirty = self.root_pane.view.render_dirty or for (self.extra_panes.items) |entry| {
+        if (entry.pane.view.render_dirty) break true;
     } else false;
 
     // Spinner ticks only when actual events arrive
@@ -385,13 +374,12 @@ fn tick(
 
     if (!frame_dirty) return;
 
-    const focused = self.getFocusedConversation();
-    const runner = self.runnerForBuffer(focused);
-    const agent_running = runner.isAgentRunning();
+    const focused = self.getFocusedPane();
+    const agent_running = focused.runner.isAgentRunning();
     const status = if (self.transient_status_len > 0)
         self.transient_status[0..self.transient_status_len]
     else if (agent_running) blk: {
-        const info = runner.lastInfo();
+        const info = focused.runner.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
     self.compositor.composite(self.layout, .{
@@ -457,10 +445,9 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         switch (k.key) {
             .char => |ch| {
                 if (ch == 'c') {
-                    const focused = self.getFocusedConversation();
-                    const runner = self.runnerForBuffer(focused);
-                    if (runner.isAgentRunning()) {
-                        runner.cancelAgent();
+                    const focused = self.getFocusedPane();
+                    if (focused.runner.isAgentRunning()) {
+                        focused.runner.cancelAgent();
                         return .none;
                     }
                     return .quit;
@@ -500,8 +487,8 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                     return .redraw;
                 },
                 .not_a_command => {
-                    const focused = self.getFocusedConversation();
-                    if (self.runnerForBuffer(focused).isAgentRunning()) return .none;
+                    const focused = self.getFocusedPane();
+                    if (focused.runner.isAgentRunning()) return .none;
 
                     self.onUserInputSubmitted(focused, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
@@ -611,7 +598,7 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 /// the underlying allocation failure and logs it; callers don't need to
 /// propagate status-message errors.
 fn appendStatus(self: *EventOrchestrator, text: []const u8) void {
-    _ = self.root_buffer.appendNode(null, .status, text) catch |err|
+    _ = self.root_pane.view.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
 }
 
@@ -680,11 +667,11 @@ fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
     // Capture the label that createSplitPane is about to consume so the
     // announce below matches the new pane's name.
     const scratch_id = self.next_scratch_id;
-    const new_buf = self.createSplitPane() catch |err| {
+    const pane = self.createSplitPane() catch |err| {
         log.warn("split pane creation failed: {}", .{err});
         return;
     };
-    const b = new_buf.buf();
+    const b = pane.view.buf();
     const split = switch (direction) {
         .vertical => self.layout.splitVertical(0.5, b),
         .horizontal => self.layout.splitHorizontal(0.5, b),
@@ -709,11 +696,9 @@ fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
     return @intCast(written.len);
 }
 
-/// Create a new split pane: session + buffer + runner + optional persistence
-/// handle, tracked for cleanup. With `ConversationBuffer` no longer holding
-/// a runner back-ref, the three allocations are straight-line: session,
-/// view, runner.
-fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
+/// Create a new split pane: session + view + runner + optional persistence
+/// handle, tracked for cleanup. Returns the freshly composed `Pane`.
+fn createSplitPane(self: *EventOrchestrator) !Pane {
     const cs = try self.allocator.create(ConversationSession);
     errdefer self.allocator.destroy(cs);
     cs.* = ConversationSession.init(self.allocator);
@@ -741,23 +726,20 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
 
-    try self.extra_panes.append(self.allocator, .{
-        .buffer = cb,
-        .conv_session = cs,
-        .runner = runner,
-        .session = null,
-    });
+    const pane: Pane = .{ .view = cb, .session = cs, .runner = runner };
 
-    // Attach the session only after the pane is registered so
-    // sessionForBuffer/attachSession can find the pane by buffer pointer.
-    const sh = self.attachSession(cb);
-    self.extra_panes.items[self.extra_panes.items.len - 1].session = sh;
+    // Register the entry before attaching the session handle so any
+    // subsequent `paneFromBuffer` call already sees this pane.
+    try self.extra_panes.append(self.allocator, .{ .pane = pane });
 
-    return cb;
+    const sh = self.attachSession(pane);
+    self.extra_panes.items[self.extra_panes.items.len - 1].session_handle = sh;
+
+    return pane;
 }
 
-/// Try to create and attach a session to a buffer. Returns the handle or null.
-fn attachSession(self: *EventOrchestrator, cb: *ConversationBuffer) ?*Session.SessionHandle {
+/// Try to create and attach a session to a pane. Returns the handle or null.
+fn attachSession(self: *EventOrchestrator, pane: Pane) ?*Session.SessionHandle {
     const mgr = &(self.session_mgr.* orelse return null);
     const h = self.allocator.create(Session.SessionHandle) catch return null;
     h.* = mgr.createSession(self.provider.model_id) catch |err| {
@@ -765,26 +747,25 @@ fn attachSession(self: *EventOrchestrator, cb: *ConversationBuffer) ?*Session.Se
         self.allocator.destroy(h);
         return null;
     };
-    self.sessionForBuffer(cb).attachSession(h);
+    pane.session.attachSession(h);
     return h;
 }
 
 // -- Helpers -----------------------------------------------------------------
 
-/// Drain a buffer's agent events and auto-name its session on first completion.
-fn drainBuffer(self: *EventOrchestrator, buf: *ConversationBuffer) void {
-    const runner = self.runnerForBuffer(buf);
-    if (runner.drainEvents(self.allocator)) {
-        self.autoNameSession(buf);
+/// Drain a pane's agent events and auto-name its session on first completion.
+fn drainPane(self: *EventOrchestrator, pane: Pane) void {
+    if (pane.runner.drainEvents(self.allocator)) {
+        self.autoNameSession(pane);
     }
 }
 
-/// Record the user's input on `cb`, then spawn an agent thread to respond.
-/// The buffer owns the conversation data; the orchestrator owns the worker
-/// and the surrounding hook dance.
+/// Record the user's input on `pane`, then spawn an agent thread to respond.
+/// The pane owns the conversation data (view + session); the orchestrator
+/// owns the worker and the surrounding hook dance.
 fn onUserInputSubmitted(
     self: *EventOrchestrator,
-    cb: *ConversationBuffer,
+    pane: Pane,
     text: []const u8,
 ) !void {
     // Fire UserMessagePre synchronously. Hooks may veto (return cancel) or
@@ -804,7 +785,7 @@ fn onUserInputSubmitted(
         eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
         if (eng.takeCancel()) |reason| {
             defer self.allocator.free(reason);
-            _ = try cb.appendNode(null, .err, reason);
+            _ = try pane.view.appendNode(null, .err, reason);
             return;
         }
         if (payload.user_message_pre.text_rewrite) |rewritten| {
@@ -813,52 +794,49 @@ fn onUserInputSubmitted(
         }
     }
 
-    const runner = self.runnerForBuffer(cb);
-    const session = self.sessionForBuffer(cb);
-    try runner.submitInput(working_text, self.allocator);
+    try pane.runner.submitInput(working_text, self.allocator);
 
     if (self.lua_engine) |eng| {
         var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
         eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
     }
 
-    if (runner.isAgentRunning()) return;
+    if (pane.runner.isAgentRunning()) return;
 
     // 256 slots is ~1s of fast streaming - enough headroom for a UI frame
     // stall without hiding persistent backpressure.
-    runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
-    runner.event_queue.wake_fd = self.wake_write_fd;
-    runner.queue_active = true;
-    runner.lua_engine = self.lua_engine;
-    runner.cancel_flag.store(false, .release);
+    pane.runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
+    pane.runner.event_queue.wake_fd = self.wake_write_fd;
+    pane.runner.queue_active = true;
+    pane.runner.lua_engine = self.lua_engine;
+    pane.runner.cancel_flag.store(false, .release);
 
-    runner.agent_thread = AgentThread.spawn(
+    pane.runner.agent_thread = AgentThread.spawn(
         self.provider.provider,
-        &session.messages,
+        &pane.session.messages,
         self.registry,
         self.allocator,
-        &runner.event_queue,
-        &runner.cancel_flag,
+        &pane.runner.event_queue,
+        &pane.runner.cancel_flag,
         self.lua_engine,
     ) catch |err| {
-        _ = cb.appendNode(null, .err, @errorName(err)) catch |append_err|
+        _ = pane.view.appendNode(null, .err, @errorName(err)) catch |append_err|
             log.warn("dropped event: {s}", .{@errorName(append_err)});
-        runner.event_queue.deinit();
-        runner.queue_active = false;
-        runner.agent_thread = null;
+        pane.runner.event_queue.deinit();
+        pane.runner.queue_active = false;
+        pane.runner.agent_thread = null;
         return err;
     };
 }
 
-/// If `cb` has a session without a name and enough conversation to summarize,
+/// If `pane` has a session without a name and enough conversation to summarize,
 /// ask the provider for a 3-5 word title and rename the session.
 /// Best-effort: any failure is logged and swallowed.
-fn autoNameSession(self: *EventOrchestrator, cb: *ConversationBuffer) void {
-    const session = self.sessionForBuffer(cb);
-    const sh = session.session_handle orelse return;
+fn autoNameSession(self: *EventOrchestrator, pane: Pane) void {
+    const sh = pane.session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
-    const inputs = session.sessionSummaryInputs() orelse return;
+    const inputs = pane.session.sessionSummaryInputs() orelse return;
 
     const summary = self.generateSessionName(inputs) catch |err| {
         log.debug("auto-name failed: {}", .{err});
@@ -912,45 +890,31 @@ fn generateSessionName(
     return error.NoResponseText;
 }
 
-/// Get the focused buffer as a ConversationBuffer. Falls back to the root.
-fn getFocusedConversation(self: *EventOrchestrator) *ConversationBuffer {
-    return if (self.layout.getFocusedLeaf()) |l|
-        ConversationBuffer.fromBuffer(l.buffer)
-    else
-        self.root_buffer;
+/// Get the focused pane. Falls back to the root pane when the layout has
+/// no focused leaf or the focused leaf's buffer is not owned by any pane
+/// (should not happen in practice; the fallback keeps UI code total).
+fn getFocusedPane(self: *EventOrchestrator) Pane {
+    const leaf = self.layout.getFocusedLeaf() orelse return self.root_pane;
+    return self.paneFromBuffer(leaf.buffer) orelse self.root_pane;
 }
 
-/// Resolve the `AgentRunner` that drives a given buffer. Phase 3
-/// transitional helper: the root buffer's runner is side-car stored on
-/// the orchestrator, and split-pane buffers carry their runner in the
-/// `SplitPane` record. Phase 4 replaces this with a direct `Pane`
-/// field on the orchestrator that pairs buffer + session + runner.
-fn runnerForBuffer(self: *EventOrchestrator, cb: *ConversationBuffer) *AgentRunner {
-    if (cb == self.root_buffer) return self.root_runner;
-    for (self.extra_panes.items) |pane| {
-        if (pane.buffer == cb) return pane.runner;
+/// Look up the pane whose view backs `b`. Returns null if no registered
+/// pane matches, which Compositor and any other reader should treat as a
+/// soft failure rather than a crash.
+pub fn paneFromBuffer(self: *EventOrchestrator, b: Buffer) ?Pane {
+    if (self.root_pane.view.buf().ptr == b.ptr) return self.root_pane;
+    for (self.extra_panes.items) |entry| {
+        if (entry.pane.view.buf().ptr == b.ptr) return entry.pane;
     }
-    // A buffer not in any pane record shouldn't be reachable from the UI;
-    // fall back to the root runner so the diagnostic path degrades
-    // rather than crashes.
-    return self.root_runner;
-}
-
-/// Same as `runnerForBuffer` but returns the matching session.
-fn sessionForBuffer(self: *EventOrchestrator, cb: *ConversationBuffer) *ConversationSession {
-    if (cb == self.root_buffer) return self.root_session;
-    for (self.extra_panes.items) |pane| {
-        if (pane.buffer == cb) return pane.conv_session;
-    }
-    return self.root_session;
+    return null;
 }
 
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
 /// so the error-return path from run() cannot skip it.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
-    self.root_runner.shutdown();
-    for (self.extra_panes.items) |pane| {
-        pane.runner.shutdown();
+    self.root_pane.runner.shutdown();
+    for (self.extra_panes.items) |entry| {
+        entry.pane.runner.shutdown();
     }
 }
 
