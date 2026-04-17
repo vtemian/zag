@@ -8,6 +8,8 @@ const std = @import("std");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
 
+const log = std.log.scoped(.tool_bash);
+
 /// Interval between cancel-flag checks while collecting child output.
 const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
 
@@ -41,8 +43,8 @@ pub fn execute(
     };
 
     const outcome = collectWithCancel(&child, allocator, cancel) catch |err| {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        if (child.kill()) |_| {} else |kill_err| log.debug("bash cleanup kill: {s}", .{@errorName(kill_err)});
+        if (child.wait()) |_| {} else |wait_err| log.debug("bash cleanup wait: {s}", .{@errorName(wait_err)});
         const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -51,8 +53,8 @@ pub fn execute(
 
     if (outcome.cancelled) {
         // Escalate straight to SIGKILL: the shell child may have trapped TERM, and cancellation must be unignorable.
-        std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
-        _ = child.wait() catch {};
+        std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| log.debug("bash cancel kill: {s}", .{@errorName(err)});
+        _ = child.wait() catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
         return .{ .content = "error: cancelled", .is_error = true, .owned = false };
     }
 
