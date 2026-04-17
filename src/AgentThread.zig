@@ -156,7 +156,7 @@ fn threadMain(
     lua_engine: ?*LuaEngine.LuaEngine,
 ) void {
     if (lua_engine) |eng| eng.activate();
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel) catch |err| {
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
         const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
         queue.push(.{ .err = duped_err }) catch {};
     };

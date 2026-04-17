@@ -574,9 +574,12 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 .timestamp = std.time.milliTimestamp(),
             });
         },
-        .hook_request, .lua_tool_request => {
-            // Dispatched by the main-thread drain loop; not handled here.
-        },
+        // These round-trip events are normally consumed by
+        // `dispatchHookRequests` before the drain sees them. If one slips
+        // through (e.g. because dispatch ran with a null engine), signal
+        // `done` so the producer in the agent thread doesn't block forever.
+        .hook_request => |req| req.done.set(),
+        .lua_tool_request => |req| req.done.set(),
     }
 }
 
@@ -668,7 +671,6 @@ pub fn submitInput(
 /// compacted back into the queue in their original order. Called before the
 /// normal drain loop so pre-hook vetos round-trip with minimal latency.
 pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine) void {
-    const eng = engine orelse return;
     queue.mutex.lock();
     defer queue.mutex.unlock();
 
@@ -676,14 +678,27 @@ pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine)
     for (queue.items.items) |ev| {
         switch (ev) {
             .hook_request => |req| {
-                eng.fireHook(req.payload) catch |err| {
-                    log.warn("hook dispatch failed: {}", .{err});
-                };
-                if (eng.takeCancel()) |reason| {
-                    req.cancelled = true;
-                    req.cancel_reason = reason;
+                if (engine) |eng| {
+                    eng.fireHook(req.payload) catch |err| {
+                        log.warn("hook dispatch failed: {}", .{err});
+                    };
+                    if (eng.takeCancel()) |reason| {
+                        req.cancelled = true;
+                        req.cancel_reason = reason;
+                    }
                 }
+                // Always signal, even without an engine: the agent thread
+                // is parked on `req.done` and must be released so the
+                // tool call can proceed (or fail) cleanly.
                 req.done.set();
+            },
+            .lua_tool_request => |req| {
+                // No engine-less dispatch path yet for lua tools; just
+                // unblock the pusher.
+                if (engine == null) req.done.set() else {
+                    queue.items.items[write] = ev;
+                    write += 1;
+                }
             },
             else => {
                 queue.items.items[write] = ev;
