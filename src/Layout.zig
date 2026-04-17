@@ -318,14 +318,10 @@ fn recalculateNode(node: *LayoutNode, rect: Rect) void {
             s.rect = rect;
             switch (s.direction) {
                 .vertical => {
-                    // Left/right split, subtract 1 col for the border
-                    const usable = if (rect.width > 1) rect.width - 1 else rect.width;
-                    const first_width = floatToU16(ratio: {
-                        break :ratio @as(f32, @floatFromInt(usable)) * s.ratio;
-                    });
-                    const second_width = usable - first_width;
-                    const border_col = rect.x + first_width;
-
+                    const first_width = floatToU16(
+                        @as(f32, @floatFromInt(rect.width)) * s.ratio,
+                    );
+                    const second_width = rect.width - first_width;
                     recalculateNode(s.first, .{
                         .x = rect.x,
                         .y = rect.y,
@@ -333,21 +329,17 @@ fn recalculateNode(node: *LayoutNode, rect: Rect) void {
                         .height = rect.height,
                     });
                     recalculateNode(s.second, .{
-                        .x = border_col + 1,
+                        .x = rect.x + first_width,
                         .y = rect.y,
                         .width = second_width,
                         .height = rect.height,
                     });
                 },
                 .horizontal => {
-                    // Top/bottom split, subtract 1 row for the border
-                    const usable = if (rect.height > 1) rect.height - 1 else rect.height;
-                    const first_height = floatToU16(ratio: {
-                        break :ratio @as(f32, @floatFromInt(usable)) * s.ratio;
-                    });
-                    const second_height = usable - first_height;
-                    const border_row = rect.y + first_height;
-
+                    const first_height = floatToU16(
+                        @as(f32, @floatFromInt(rect.height)) * s.ratio,
+                    );
+                    const second_height = rect.height - first_height;
                     recalculateNode(s.first, .{
                         .x = rect.x,
                         .y = rect.y,
@@ -356,7 +348,7 @@ fn recalculateNode(node: *LayoutNode, rect: Rect) void {
                     });
                     recalculateNode(s.second, .{
                         .x = rect.x,
-                        .y = border_row + 1,
+                        .y = rect.y + first_height,
                         .width = rect.width,
                         .height = second_height,
                     });
@@ -467,7 +459,7 @@ test "recalculate sets leaf rect with status row reserved" {
     try std.testing.expectEqual(@as(u16, 23), leaf.rect.height);
 }
 
-test "vertical split divides width with border" {
+test "vertical split divides width evenly" {
     const allocator = std.testing.allocator;
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -491,14 +483,14 @@ test "vertical split divides width with border" {
     const first = split.first.leaf;
     const second = split.second.leaf;
     try std.testing.expectEqual(@as(u16, 0), first.rect.x);
-    try std.testing.expectEqual(@as(u16, 39), first.rect.width);
+    try std.testing.expectEqual(@as(u16, 40), first.rect.width);
     try std.testing.expectEqual(@as(u16, 40), second.rect.x);
     try std.testing.expectEqual(@as(u16, 40), second.rect.width);
     try std.testing.expectEqual(@as(u16, 23), first.rect.height);
     try std.testing.expectEqual(@as(u16, 23), second.rect.height);
 }
 
-test "horizontal split divides height with border" {
+test "horizontal split divides height evenly" {
     const allocator = std.testing.allocator;
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -522,8 +514,8 @@ test "horizontal split divides height with border" {
     const second = split.second.leaf;
     try std.testing.expectEqual(@as(u16, 0), first.rect.y);
     try std.testing.expectEqual(@as(u16, 11), first.rect.height);
-    try std.testing.expectEqual(@as(u16, 12), second.rect.y);
-    try std.testing.expectEqual(@as(u16, 11), second.rect.height);
+    try std.testing.expectEqual(@as(u16, 11), second.rect.y);
+    try std.testing.expectEqual(@as(u16, 12), second.rect.height);
     try std.testing.expectEqual(@as(u16, 80), first.rect.width);
     try std.testing.expectEqual(@as(u16, 80), second.rect.width);
 }
