@@ -258,6 +258,10 @@ fn tick(
         .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.wake_read_fd, .events = posix.POLL.IN, .revents = 0 },
     };
+    // Swallow errors here: EINTR from signals is the normal case (SIGWINCH
+    // delivers a resize this way), and any other poll error will resurface
+    // on the next syscall in this tick. Logging every EINTR would spam the
+    // status log on every terminal resize.
     _ = posix.poll(&fds, -1) catch {};
 
     // Drain stale wake bytes so one wake equals one frame regardless of how
@@ -551,7 +555,7 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 
     if (std.mem.eql(u8, command, "/perf") or std.mem.eql(u8, command, "/perf-dump")) {
         if (!trace.enabled) {
-            self.appendStatus("metrics not enabled (build with -Dmetrics=true)") catch {};
+            self.appendStatus("metrics not enabled (build with -Dmetrics=true)");
             return .handled;
         }
 
@@ -573,18 +577,18 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
                 @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
                 stats.avg_allocs_per_frame,
             }) catch "Performance: error formatting";
-            self.appendStatus(msg) catch {};
+            self.appendStatus(msg);
         } else {
             const count = trace.dump("zag-trace.json") catch |err| blk: {
                 var scratch: [256]u8 = undefined;
                 const err_msg = std.fmt.bufPrint(&scratch, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
-                self.appendStatus(err_msg) catch {};
+                self.appendStatus(err_msg);
                 break :blk @as(usize, 0);
             };
             if (count > 0) {
                 var scratch: [256]u8 = undefined;
                 const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
-                self.appendStatus(dump_msg) catch {};
+                self.appendStatus(dump_msg);
             }
         }
         return .handled;
@@ -593,16 +597,19 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
     if (std.mem.eql(u8, command, "/model")) {
         var scratch: [128]u8 = undefined;
         const model_info = std.fmt.bufPrint(&scratch, "model: {s}", .{self.provider.model_id}) catch "model: unknown";
-        self.appendStatus(model_info) catch {};
+        self.appendStatus(model_info);
         return .handled;
     }
 
     return .not_a_command;
 }
 
-/// Append a plain text line to the root buffer as a status node.
-fn appendStatus(self: *EventOrchestrator, text: []const u8) !void {
-    _ = try self.root_buffer.appendNode(null, .status, text);
+/// Append a plain text line to the root buffer as a status node. Absorbs
+/// the underlying allocation failure and logs it; callers don't need to
+/// propagate status-message errors.
+fn appendStatus(self: *EventOrchestrator, text: []const u8) void {
+    _ = self.root_buffer.appendNode(null, .status, text) catch |err|
+        log.warn("appendStatus failed: {}", .{err});
 }
 
 // -- Window management -------------------------------------------------------
