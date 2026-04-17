@@ -370,7 +370,7 @@ fn drawPanePrompt(
         if (input.agent_running and col < right_edge) {
             const spinner = "|/-\\";
             const idx: usize = @intCast(input.spinner_frame % 4);
-            _ = self.screen.writeStr(prompt_row, col + 1, spinner[idx .. idx + 1], resolved.screen_style, resolved.fg);
+            _ = self.screen.writeStr(prompt_row, col, spinner[idx .. idx + 1], resolved.screen_style, resolved.fg);
         }
         return;
     }
