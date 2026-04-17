@@ -11,10 +11,7 @@ const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const types = @import("types.zig");
 const Session = @import("Session.zig");
-const AgentThread = @import("AgentThread.zig");
-const llm = @import("llm.zig");
-const tools_mod = @import("tools.zig");
-const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const agent_events = @import("agent_events.zig");
 
 const ConversationBuffer = @This();
 
@@ -115,11 +112,14 @@ last_info_len: u8 = 0,
 /// Open session file for persistence (null if unsaved buffer).
 session_handle: ?*Session.SessionHandle = null,
 /// Background agent thread, if one is running for this buffer.
+/// Lifecycle is managed by the orchestrator; the buffer only holds the
+/// handle so `deinit` can join on error-exit paths.
 agent_thread: ?std.Thread = null,
-/// Event queue for agent-to-main communication.
-event_queue: AgentThread.EventQueue = undefined,
+/// Event queue for agent-to-main communication. The orchestrator
+/// initializes this when spawning an agent and tears it down on drain.
+event_queue: agent_events.EventQueue = undefined,
 /// Atomic flag for requesting agent thread cancellation.
-cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false),
+cancel_flag: agent_events.CancelFlag = agent_events.CancelFlag.init(false),
 /// Whether the event queue has been initialized (needs deinit).
 queue_active: bool = false,
 
@@ -484,7 +484,7 @@ pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
 }
 
 /// Process a single agent event: update the node tree and persist to session.
-pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent, allocator: Allocator) void {
+pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEvent, allocator: Allocator) void {
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
@@ -567,18 +567,17 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
     }
 }
 
-/// Restore buffer state from a persisted session: load the node tree,
-/// rebuild the LLM message history, and update the buffer name from meta.
-/// Submit user input: append to message history, create node, persist, spawn agent.
+/// Submit user input: append the message to conversation history, create a
+/// user_message node, and persist the entry to the session log.
+///
+/// The buffer is a pure data container: it does not spawn an agent thread.
+/// Agent-thread lifecycle belongs to the orchestrator, which calls this
+/// method and then decides whether to start the agent.
 pub fn submitInput(
     self: *ConversationBuffer,
     text: []const u8,
-    provider: llm.Provider,
-    registry: *const tools_mod.Registry,
     allocator: Allocator,
-    lua_eng: ?*LuaEngine,
 ) !void {
-    // Append user message to conversation history
     const content = try allocator.alloc(types.ContentBlock, 1);
     const duped = try allocator.dupe(u8, text);
     content[0] = .{ .text = .{ .text = duped } };
@@ -592,38 +591,16 @@ pub fn submitInput(
         .timestamp = std.time.milliTimestamp(),
     });
 
-    // Reset streaming state and spawn agent thread
+    // Reset streaming state so the next agent run starts from a clean UI.
     self.current_assistant_node = null;
     self.last_tool_call = null;
-    self.cancel_flag.store(false, .release);
-
-    // 256 slots is ~1s of fast streaming — enough headroom for a UI frame
-    // stall without hiding persistent backpressure.
-    self.event_queue = try AgentThread.EventQueue.initBounded(allocator, 256);
-    self.queue_active = true;
-
-    self.agent_thread = AgentThread.spawn(
-        provider,
-        &self.messages,
-        registry,
-        allocator,
-        &self.event_queue,
-        &self.cancel_flag,
-        lua_eng,
-    ) catch |err| {
-        _ = self.appendNode(null, .err, @errorName(err)) catch |append_err| log.warn("dropped event: {s}", .{@errorName(append_err)});
-        self.event_queue.deinit();
-        self.queue_active = false;
-        self.agent_thread = null;
-        return err;
-    };
 }
 
 /// Drain pending agent events. Returns true if the agent finished this frame.
 pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
     if (self.agent_thread == null) return false;
 
-    var drain: [64]AgentThread.AgentEvent = undefined;
+    var drain: [64]agent_events.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
     var finished = false;
 
@@ -674,72 +651,36 @@ pub fn shutdown(self: *ConversationBuffer) void {
     }
 }
 
-/// Generate a short session name via LLM and apply it to the session.
-pub fn autoNameSession(self: *ConversationBuffer, provider: llm.Provider, allocator: Allocator) void {
-    const sh = self.session_handle orelse return;
-    if (sh.meta.name_len > 0 or self.messages.items.len < 2) return;
+/// Inputs for auto-naming a session: the first user text and the first
+/// assistant text (truncated). Returns null when the buffer does not yet
+/// have enough content to produce a summary.
+pub const SessionSummaryInputs = struct {
+    user_text: []const u8,
+    assistant_text: []const u8,
+};
 
-    const summary = self.generateSessionName(provider, allocator) catch |err| {
-        log.debug("auto-name failed: {}", .{err});
-        return;
-    };
-    defer allocator.free(summary);
-
-    sh.rename(summary) catch |err| {
-        log.warn("session rename failed: {}", .{err});
-    };
-}
-
-/// Send a minimal LLM request to summarize a conversation in 3-5 words.
-fn generateSessionName(self: *const ConversationBuffer, provider: llm.Provider, allocator: Allocator) ![]const u8 {
+/// Extract the first user-text / first-assistant-text pair for session
+/// auto-naming. Returns null if the buffer lacks at least one of each.
+/// The returned slices point into the buffer's messages and are valid
+/// until the next mutation.
+pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInputs {
     const msgs = self.messages.items;
-    if (msgs.len < 2) return error.InsufficientMessages;
+    if (msgs.len < 2) return null;
 
-    const user_text = extractFirstText(msgs[0]) orelse return error.NoUserText;
+    const user_text = extractFirstText(msgs[0]) orelse return null;
     // The second message may be tool_use-only (no text). Scan forward to find
     // the first assistant message with a text block.
-    const assistant_full = blk: {
-        for (msgs[1..]) |msg| {
-            if (msg.role == .assistant) {
-                if (extractFirstText(msg)) |text| break :blk text;
+    for (msgs[1..]) |msg| {
+        if (msg.role == .assistant) {
+            if (extractFirstText(msg)) |assistant_full| {
+                return .{
+                    .user_text = user_text,
+                    .assistant_text = assistant_full[0..@min(assistant_full.len, 200)],
+                };
             }
         }
-        return error.NoAssistantText;
-    };
-    const assistant_text = assistant_full[0..@min(assistant_full.len, 200)];
-
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = user_text } };
-
-    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(assistant_content);
-    assistant_content[0] = .{ .text = .{ .text = assistant_text } };
-
-    var summary_msgs = [_]types.Message{
-        .{ .role = .user, .content = user_content },
-        .{ .role = .assistant, .content = assistant_content },
-    };
-
-    const response = try provider.call(
-        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        &summary_msgs,
-        &.{},
-        allocator,
-    );
-    defer response.deinit(allocator);
-
-    allocator.free(user_content);
-    allocator.free(assistant_content);
-
-    for (response.content) |block| {
-        switch (block) {
-            .text => |t| return try allocator.dupe(u8, t.text),
-            else => {},
-        }
     }
-
-    return error.NoResponseText;
+    return null;
 }
 
 fn extractFirstText(msg: types.Message) ?[]const u8 {
