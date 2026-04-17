@@ -179,8 +179,56 @@ pub const Cluster = struct {
 ///
 /// Returns null if the iterator is exhausted.
 pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
-    _ = iter;
-    @compileError("not yet implemented");
+    const first = iter.nextCodepoint() orelse return null;
+
+    // Regional indicator pair → flag, width 2. Unpaired → width 1 (the usual
+    // codepointWidth). Consume the second indicator only if present.
+    if (isRegionalIndicator(first)) {
+        const saved = iter.i;
+        if (iter.nextCodepoint()) |second| {
+            if (isRegionalIndicator(second)) {
+                return .{ .base = first, .width = 2 };
+            }
+        }
+        iter.i = saved;
+        return .{ .base = first, .width = 1 };
+    }
+
+    const base_width = codepointWidth(first);
+
+    // A width-0 base (control, stray combining mark) stands alone; do not
+    // absorb trailing joiners. They'll start their own cluster and produce
+    // harmless width-0 output at the call site.
+    if (base_width == 0) {
+        return .{ .base = first, .width = 0 };
+    }
+
+    // Absorb any trailing joiners / modifiers into this cluster. Visual width
+    // stays at base_width because every absorbed codepoint contributes 0.
+    while (true) {
+        const saved = iter.i;
+        const next = iter.nextCodepoint() orelse break;
+
+        // Skin-tone modifier or VS-16 always absorbs.
+        if (isSkinToneModifier(next) or next == 0xFE0F) continue;
+
+        // ZWJ: consume the ZWJ and the codepoint after it (the joined
+        // emoji). If nothing follows, the sequence is malformed at EOF.
+        // Stop cleanly.
+        if (next == 0x200D) {
+            _ = iter.nextCodepoint() orelse break;
+            continue;
+        }
+
+        // Generic combining / zero-width absorbs.
+        if (codepointWidth(next) == 0) continue;
+
+        // Anything else belongs to the next cluster.
+        iter.i = saved;
+        break;
+    }
+
+    return .{ .base = first, .width = base_width };
 }
 
 fn isRegionalIndicator(cp: u21) bool {
