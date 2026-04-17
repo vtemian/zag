@@ -26,6 +26,7 @@ const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const AgentThread = @import("AgentThread.zig");
 const Hooks = @import("Hooks.zig");
+const Keymap = @import("Keymap.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
@@ -99,6 +100,16 @@ spinner_frame: u8 = 0,
 input_buf: [MAX_INPUT]u8 = undefined,
 /// Number of valid bytes in input_buf.
 input_len: usize = 0,
+/// Global editing mode. Insert = typing into input buffer;
+/// Normal = keymap bindings fire, typing is disabled.
+///
+/// v1 is deliberately global (not per-buffer): window-management
+/// commands are global, and a shared mode keeps the UX predictable.
+/// Focus-switching between panes does not reset the mode.
+current_mode: Keymap.Mode = .insert,
+/// Keymap registry. Built from defaults in `init`; Lua config can
+/// register overrides via `zag.keymap()` before `loadUserConfig` runs.
+keymap_registry: Keymap.Registry = undefined,
 
 // -- Construction ------------------------------------------------------------
 
@@ -120,8 +131,8 @@ pub const Config = struct {
     wake_write_fd: posix.fd_t,
 };
 
-pub fn init(cfg: Config) EventOrchestrator {
-    return .{
+pub fn init(cfg: Config) !EventOrchestrator {
+    var self = EventOrchestrator{
         .allocator = cfg.allocator,
         .terminal = cfg.terminal,
         .screen = cfg.screen,
@@ -137,6 +148,10 @@ pub fn init(cfg: Config) EventOrchestrator {
         .wake_read_fd = cfg.wake_read_fd,
         .wake_write_fd = cfg.wake_write_fd,
     };
+    self.keymap_registry = Keymap.Registry.init(cfg.allocator);
+    errdefer self.keymap_registry.deinit();
+    try self.keymap_registry.loadDefaults();
+    return self;
 }
 
 /// Release the orchestrator's owned extra panes. Root buffer is owned by main.
@@ -156,6 +171,7 @@ pub fn deinit(self: *EventOrchestrator) void {
         self.allocator.destroy(pane.buffer);
     }
     self.extra_panes.deinit(self.allocator);
+    self.keymap_registry.deinit();
 }
 
 // -- Event loop --------------------------------------------------------------
@@ -175,6 +191,7 @@ pub fn run(self: *EventOrchestrator) !void {
         .agent_running = false,
         .spinner_frame = 0,
         .fps = 0,
+        .mode = self.current_mode,
     });
     try self.screen.render(self.stdout_file);
 
@@ -310,6 +327,7 @@ fn tick(
         .agent_running = agent_running,
         .spinner_frame = self.spinner_frame,
         .fps = current_fps.*,
+        .mode = self.current_mode,
     });
     try self.screen.render(self.stdout_file);
 }
@@ -343,30 +361,16 @@ fn inputDeleteWord(buf: []const u8, len: usize) usize {
 }
 
 /// Handle a keyboard event. Returns the action for the main loop.
+///
+/// Dispatch order:
+///   1. Ctrl+C (mode-independent): cancel running agent, else quit.
+///   2. Ctrl+W in insert mode: delete-word on the input buffer.
+///   3. Keymap lookup against (current_mode, k). If found, run the action.
+///   4. Normal mode with no binding: silently ignore.
+///   5. Insert mode fall-through: Enter/Backspace/char/page_up/page_down.
 fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
-    // Alt+key: window management (i3-style)
-    if (k.modifiers.alt) {
-        switch (k.key) {
-            .char => |ch| switch (ch) {
-                'h' => self.layout.focusDirection(.left),
-                'j' => self.layout.focusDirection(.down),
-                'k' => self.layout.focusDirection(.up),
-                'l' => self.layout.focusDirection(.right),
-                'v' => self.doSplit(.vertical),
-                's' => self.doSplit(.horizontal),
-                'q' => {
-                    self.layout.closeWindow();
-                    self.layout.recalculate(self.screen.width, self.screen.height);
-                    self.compositor.layout_dirty = true;
-                },
-                else => {},
-            },
-            else => {},
-        }
-        return .redraw;
-    }
-
-    // Ctrl shortcuts
+    // Ctrl+C is always-on regardless of mode: it's the universal escape
+    // hatch (cancel a running agent, or quit the app).
     if (k.modifiers.ctrl) {
         switch (k.key) {
             .char => |ch| {
@@ -374,12 +378,14 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                     const focused = self.getFocusedConversation();
                     if (focused.isAgentRunning()) {
                         focused.cancelAgent();
-                    } else {
-                        return .quit;
+                        return .none;
                     }
-                    return .none;
+                    return .quit;
                 }
-                if (ch == 'w') {
+                // Ctrl+W is an input-editing shortcut, so it only fires
+                // in insert mode. Normal mode falls through to the
+                // keymap registry (or ignored).
+                if (ch == 'w' and self.current_mode == .insert) {
                     self.input_len = inputDeleteWord(&self.input_buf, self.input_len);
                     return .redraw;
                 }
@@ -388,6 +394,16 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         }
     }
 
+    // Keymap dispatch: run the bound action if any.
+    if (self.keymap_registry.lookup(self.current_mode, k)) |action| {
+        self.executeAction(action);
+        return .redraw;
+    }
+
+    // Normal mode ignores unbound keys (no typing, no accidental side effects).
+    if (self.current_mode == .normal) return .none;
+
+    // Insert mode: regular input-line editing.
     switch (k.key) {
         .enter => {
             if (self.input_len == 0) return .none;
@@ -438,6 +454,46 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         else => {},
     }
     return .redraw;
+}
+
+/// Run a keymap-bound Action. Mutating mode, layout, or compositor state
+/// lives here exclusively so handleKey stays a pure dispatcher.
+fn executeAction(self: *EventOrchestrator, action: Keymap.Action) void {
+    switch (action) {
+        .focus_left => self.layout.focusDirection(.left),
+        .focus_down => self.layout.focusDirection(.down),
+        .focus_up => self.layout.focusDirection(.up),
+        .focus_right => self.layout.focusDirection(.right),
+        .split_vertical => self.doSplit(.vertical),
+        .split_horizontal => self.doSplit(.horizontal),
+        .close_window => {
+            self.layout.closeWindow();
+            self.layout.recalculate(self.screen.width, self.screen.height);
+            self.compositor.layout_dirty = true;
+        },
+        .enter_insert_mode => self.current_mode = .insert,
+        .enter_normal_mode => self.current_mode = .normal,
+    }
+}
+
+/// Compute the mode the system should be in after `event` is processed,
+/// given the current mode and the keymap registry. Returns the same mode
+/// if no transition applies.
+///
+/// Pure function (no side effects). Mirrors the mode-state branch of
+/// `executeAction` so tests can verify mode transitions without having
+/// to stand up a full orchestrator.
+fn modeAfterKey(
+    mode: Keymap.Mode,
+    event: input.KeyEvent,
+    registry: *const Keymap.Registry,
+) Keymap.Mode {
+    const action = registry.lookup(mode, event) orelse return mode;
+    return switch (action) {
+        .enter_insert_mode => .insert,
+        .enter_normal_mode => .normal,
+        else => mode,
+    };
 }
 
 /// Try to handle input as a slash command. Returns .not_a_command if it isn't one.
@@ -777,4 +833,40 @@ test "inputDeleteWord on single word clears all" {
 test "inputDeleteWord on empty returns zero" {
     var buf: [10]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 0));
+}
+
+test "modeAfterKey: Esc transitions insert -> normal" {
+    var registry = Keymap.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.loadDefaults();
+
+    const after = modeAfterKey(.insert, .{ .key = .escape, .modifiers = .{} }, &registry);
+    try std.testing.expectEqual(Keymap.Mode.normal, after);
+}
+
+test "modeAfterKey: i transitions normal -> insert" {
+    var registry = Keymap.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.loadDefaults();
+
+    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }, &registry);
+    try std.testing.expectEqual(Keymap.Mode.insert, after);
+}
+
+test "modeAfterKey: unbound key preserves mode" {
+    var registry = Keymap.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.loadDefaults();
+
+    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'z' }, .modifiers = .{} }, &registry);
+    try std.testing.expectEqual(Keymap.Mode.normal, after);
+}
+
+test "modeAfterKey: non-mode action (focus_left) keeps mode" {
+    var registry = Keymap.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.loadDefaults();
+
+    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }, &registry);
+    try std.testing.expectEqual(Keymap.Mode.normal, after);
 }

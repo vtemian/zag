@@ -9,6 +9,7 @@ const build_options = @import("build_options");
 const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
+const Keymap = @import("Keymap.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -67,9 +68,20 @@ pub const LuaEngine = struct {
     /// Optional reason string allocated via `self.allocator`. Owned by
     /// the caller of `takeCancel()` once handed off.
     pending_cancel_reason: ?[]const u8 = null,
+    /// Optional pointer to the shared keymap registry. The orchestrator
+    /// sets this after `init()` and before `loadUserConfig()` so
+    /// `zag.keymap()` calls from `config.lua` land in the same registry
+    /// that dispatches keys.
+    keymap_registry: ?*Keymap.Registry = null,
 
-    /// Create a new LuaEngine, initializing the VM, loading user config,
-    /// and collecting tool definitions. Silently skips if no config exists.
+    /// Create a new LuaEngine. Sets up the VM and installs the `zag.*`
+    /// globals but does NOT load user config. Callers must wire any
+    /// pointers (e.g. `keymap_registry`) and then call `loadUserConfig`.
+    ///
+    /// Callers who drive the VM directly via `self.lua.doString(...)` and
+    /// invoke `zag.*` functions MUST call `self.storeSelfPointer()` first,
+    /// otherwise the bindings fail to find the engine. `loadUserConfig()`
+    /// handles this automatically.
     pub fn init(allocator: Allocator) !LuaEngine {
         const lua = try Lua.init(allocator);
         errdefer lua.deinit();
@@ -85,21 +97,17 @@ pub const LuaEngine = struct {
 
         injectZagGlobal(lua);
 
-        var self = LuaEngine{
+        return LuaEngine{
             .lua = lua,
             .allocator = allocator,
             .tools = .empty,
             .hook_registry = Hooks.Registry.init(allocator),
         };
-
-        self.loadUserConfig();
-
-        return self;
     }
 
     /// Resolve ~/.config/zag paths, set plugin search path, load config.lua.
     /// All failures are logged and swallowed; missing config is not an error.
-    fn loadUserConfig(self: *LuaEngine) void {
+    pub fn loadUserConfig(self: *LuaEngine) void {
         const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
         defer self.allocator.free(home);
 
@@ -150,6 +158,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "hook");
         lua.pushFunction(zlua.wrap(zagHookDelFn));
         lua.setField(-2, "hook_del");
+        lua.pushFunction(zlua.wrap(zagKeymapFn));
+        lua.setField(-2, "keymap");
         lua.setGlobal("zag");
     }
 
@@ -351,6 +361,67 @@ pub const LuaEngine = struct {
             }
         }
         _ = engine.hook_registry.unregister(id);
+        return 0;
+    }
+
+    /// Zig function backing `zag.keymap(mode, key, action)`.
+    /// Writes a binding into `engine.keymap_registry` if the engine has
+    /// one attached; otherwise logs a warning and no-ops so that test
+    /// harnesses without a registry don't crash.
+    fn zagKeymapFn(lua: *Lua) !i32 {
+        return zagKeymapFnInner(lua) catch |err| {
+            log.err("zag.keymap() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagKeymapFnInner(lua: *Lua) !i32 {
+        // All three string args are borrowed from the Lua VM; read them
+        // before any stack-mutating calls below.
+        const mode_name = lua.toString(1) catch {
+            log.err("zag.keymap(): arg 1 (mode) must be a string", .{});
+            return error.LuaError;
+        };
+        const mode: Keymap.Mode = if (std.mem.eql(u8, mode_name, "normal"))
+            .normal
+        else if (std.mem.eql(u8, mode_name, "insert"))
+            .insert
+        else {
+            log.err("zag.keymap(): unknown mode '{s}'", .{mode_name});
+            return error.LuaError;
+        };
+
+        const key_str = lua.toString(2) catch {
+            log.err("zag.keymap(): arg 2 (key) must be a string", .{});
+            return error.LuaError;
+        };
+        const spec = Keymap.parseKeySpec(key_str) catch {
+            log.err("zag.keymap(): invalid key spec '{s}'", .{key_str});
+            return error.LuaError;
+        };
+
+        const action_name = lua.toString(3) catch {
+            log.err("zag.keymap(): arg 3 (action) must be a string", .{});
+            return error.LuaError;
+        };
+        const action = Keymap.parseActionName(action_name) orelse {
+            log.err("zag.keymap(): unknown action '{s}'", .{action_name});
+            return error.LuaError;
+        };
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.err("zag.keymap(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        const registry = engine.keymap_registry orelse {
+            log.warn("zag.keymap(): no registry bound; binding ignored", .{});
+            return 0;
+        };
+        try registry.register(mode, spec, action);
         return 0;
     }
 
@@ -1375,4 +1446,32 @@ test "UserMessagePre can rewrite text" {
     try std.testing.expect(payload.user_message_pre.text_rewrite != null);
     defer std.testing.allocator.free(payload.user_message_pre.text_rewrite.?);
     try std.testing.expectEqualStrings("expanded: hi", payload.user_message_pre.text_rewrite.?);
+}
+
+test "zag.keymap registers into the shared registry" {
+    const alloc = std.testing.allocator;
+    var registry = Keymap.Registry.init(alloc);
+    defer registry.deinit();
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.keymap_registry = &registry;
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.keymap("normal", "w", "focus_right")
+        \\zag.keymap("normal", "<C-q>", "close_window")
+    );
+
+    try std.testing.expectEqual(
+        Keymap.Action.focus_right,
+        registry.lookup(.normal, .{ .key = .{ .char = 'w' }, .modifiers = .{} }).?,
+    );
+    try std.testing.expectEqual(
+        Keymap.Action.close_window,
+        registry.lookup(.normal, .{
+            .key = .{ .char = 'q' },
+            .modifiers = .{ .ctrl = true },
+        }).?,
+    );
 }

@@ -126,7 +126,7 @@ fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHa
             \\cwd: {s}
             \\
             \\Type a message and press Enter. Ctrl+C or /quit to exit.
-            \\Alt+h/j/k/l focus, Alt+v/s split, Alt+q close. /model to show model.
+            \\Esc = normal mode, i = insert mode. In normal: h/j/k/l focus, v/s split, q close. /model to show model.
         , .{ model_id, cwd }) catch "Welcome to zag";
         try appendOutputText(welcome);
         return;
@@ -185,17 +185,15 @@ pub fn main() !void {
     var registry = try tools.createDefaultRegistry(allocator);
     defer registry.deinit();
 
+    // Initialize Lua plugin engine. Init is split from config loading so
+    // we can wire the keymap registry pointer (owned by the orchestrator)
+    // before running config.lua; otherwise `zag.keymap` calls in config.lua
+    // would silently no-op.
     var lua_engine: ?LuaEngine = LuaEngine.init(allocator) catch |err| blk: {
         log.warn("lua init failed, plugins disabled: {}", .{err});
         break :blk null;
     };
     defer if (lua_engine) |*eng| eng.deinit();
-
-    if (lua_engine) |*eng| {
-        eng.registerTools(&registry) catch |err| {
-            log.warn("failed to register lua tools: {}", .{err});
-        };
-    }
 
     // Wire the lua engine into the root buffer so the main-thread drain loop
     // can service `hook_request` / `lua_tool_request` events pushed by the
@@ -268,7 +266,7 @@ pub fn main() !void {
     try postStartupBanner(resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
     // -- Hand off to the orchestrator ----------------------------------------
-    var orchestrator = EventOrchestrator.init(.{
+    var orchestrator = try EventOrchestrator.init(.{
         .allocator = allocator,
         .terminal = &term,
         .screen = &screen,
@@ -285,6 +283,18 @@ pub fn main() !void {
         .wake_write_fd = wake_write,
     });
     defer orchestrator.deinit();
+
+    // Now that the orchestrator owns the keymap registry, wire its pointer
+    // onto the lua engine and load user config so `zag.keymap()` overrides
+    // land before any keys are dispatched. Tool registration follows so
+    // the tools collected during config.lua make it into the dispatch registry.
+    if (lua_engine) |*eng| {
+        eng.keymap_registry = &orchestrator.keymap_registry;
+        eng.loadUserConfig();
+        eng.registerTools(&registry) catch |err| {
+            log.warn("failed to register lua tools: {}", .{err});
+        };
+    }
 
     try orchestrator.run();
 

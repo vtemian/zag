@@ -11,6 +11,7 @@ const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const Theme = @import("Theme.zig");
+const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
 
 const Compositor = @This();
@@ -37,6 +38,9 @@ pub const InputState = struct {
     spinner_frame: u8,
     /// Current FPS (shown when metrics enabled).
     fps: u32,
+    /// Current editing mode; rendered as a leading `[INSERT]`/`[NORMAL]`
+    /// label in the status line.
+    mode: Keymap.Mode,
 };
 
 /// Composite the layout into the screen grid.
@@ -77,7 +81,7 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
     {
         var s = trace.span("status_line");
         defer s.end();
-        self.drawStatusLine(focused);
+        self.drawStatusLine(focused, input.mode);
     }
     {
         var s = trace.span("input_line");
@@ -237,7 +241,7 @@ fn drawBorders(self: *Compositor, node: *const Layout.LayoutNode) void {
 }
 
 /// Draw the status line on the last row using the theme status_line highlight.
-fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
+fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Keymap.Mode) void {
     const last_row = self.screen.height - 1;
     const resolved = Theme.resolve(self.theme.highlights.status_line, self.theme);
 
@@ -250,13 +254,15 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
         cell.bg = resolved.bg;
     }
 
+    // Mode indicator at column 0 so the current mode is impossible to miss.
+    var col: u16 = self.paintModeLabel(last_row, mode);
+
     // Show focused buffer name
     const leaf = switch (focused.*) {
         .leaf => |l| l,
         .split => return,
     };
 
-    var col: u16 = 1;
     col = self.screen.writeStr(last_row, col, leaf.buffer.getName(), resolved.screen_style, resolved.fg);
     col = self.screen.writeStr(last_row, col, " | ", resolved.screen_style, resolved.fg);
 
@@ -289,6 +295,20 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode) void {
     }
 }
 
+/// Paint the `[INSERT]`/`[NORMAL]` label at column 0 of `row` using the
+/// mode-specific highlight. Returns the next free column after the label.
+fn paintModeLabel(self: *Compositor, row: u16, mode: Keymap.Mode) u16 {
+    const label: []const u8 = switch (mode) {
+        .insert => "[INSERT] ",
+        .normal => "[NORMAL] ",
+    };
+    const resolved = switch (mode) {
+        .insert => Theme.resolve(self.theme.highlights.mode_insert, self.theme),
+        .normal => Theme.resolve(self.theme.highlights.mode_normal, self.theme),
+    };
+    return self.screen.writeStr(row, 0, label, resolved.screen_style, resolved.fg);
+}
+
 /// Draw the input/status line on the last row, overwriting the status line.
 fn drawInputLine(self: *Compositor, input: InputState) void {
     if (self.screen.height == 0) return;
@@ -303,9 +323,18 @@ fn drawInputLine(self: *Compositor, input: InputState) void {
         cell.bg = .default;
     }
 
-    if (input.status.len > 0) {
+    // Mode label renders first in both modes so it's impossible to miss.
+    const after_label = self.paintModeLabel(row, input.mode);
+
+    if (input.mode == .normal) {
+        // Normal mode takes precedence over status/prompt: typing is
+        // disabled, so we show a help hint next to the mode label.
+        const hint = "-- NORMAL -- (i: insert  h/j/k/l: focus  v/s: split  q: close)";
+        const resolved = Theme.resolve(self.theme.highlights.mode_normal, self.theme);
+        _ = self.screen.writeStr(row, after_label, hint, resolved.screen_style, resolved.fg);
+    } else if (input.status.len > 0) {
         const resolved = Theme.resolve(self.theme.highlights.status, self.theme);
-        const end_col = self.screen.writeStr(row, 0, input.status, resolved.screen_style, resolved.fg);
+        const end_col = self.screen.writeStr(row, after_label, input.status, resolved.screen_style, resolved.fg);
         if (input.agent_running) {
             const spinner = "|/-\\";
             _ = self.screen.writeStr(row, end_col + 1, spinner[input.spinner_frame .. input.spinner_frame + 1], resolved.screen_style, resolved.fg);
@@ -313,7 +342,7 @@ fn drawInputLine(self: *Compositor, input: InputState) void {
     } else {
         const prompt = Theme.resolve(self.theme.highlights.input_prompt, self.theme);
         const text = Theme.resolve(self.theme.highlights.input_text, self.theme);
-        const c = self.screen.writeStr(row, 0, "> ", prompt.screen_style, prompt.fg);
+        const c = self.screen.writeStr(row, after_label, "> ", prompt.screen_style, prompt.fg);
         _ = self.screen.writeStr(row, c, input.text, text.screen_style, text.fg);
     }
 
@@ -355,7 +384,7 @@ test "composite with empty layout does not crash" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 }
 
 test "composite writes buffer content at leaf rect with padding" {
@@ -381,7 +410,7 @@ test "composite writes buffer content at leaf rect with padding" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(0, pad_h).codepoint);
@@ -411,11 +440,14 @@ test "composite draws status line on last row" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
-    // Last row shows input prompt (overwrites status line)
-    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(9, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(9, 1).codepoint);
+    // Last row shows `[INSERT] > ` (mode label + prompt; overwrites status line).
+    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'I'), screen.getCellConst(9, 1).codepoint);
+    // `[INSERT] ` is 9 chars (indices 0..8), so the prompt starts at col 9.
+    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(9, 9).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(9, 10).codepoint);
 }
 
 test "composite draws vertical split border from theme" {
@@ -444,7 +476,7 @@ test "composite draws vertical split border from theme" {
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     const root = layout.root.?;
     const first_rect = root.split.first.leaf.rect;
@@ -480,7 +512,7 @@ test "composite draws horizontal split border" {
     try layout.splitHorizontal(0.5, cb2.buf());
     layout.recalculate(40, 12);
 
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     const root = layout.root.?;
     const first_rect = root.split.first.leaf.rect;
@@ -514,7 +546,7 @@ test "composite skips clean buffer leaves" {
     layout.recalculate(40, 10);
 
     // First composite: buffer is dirty, content should appear
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, pad_h + 2).codepoint);
@@ -523,8 +555,133 @@ test "composite skips clean buffer leaves" {
     screen.getCell(0, pad_h + 2).codepoint = 'Z';
 
     // Second composite: buffer is clean (clearDirty was called), so leaf is skipped
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0 });
+    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     // The 'Z' should persist because the clean leaf was not redrawn
     try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(0, pad_h + 2).codepoint);
+}
+
+test "drawStatusLine paints the mode indicator at column 0 (shadowed row)" {
+    // drawInputLine runs after drawStatusLine and fully repaints the same
+    // last row, so the status-line output is not user-visible today. This
+    // test exercises the private drawStatusLine directly to guard that
+    // path in case the layout ever splits the rows.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 10);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 10);
+
+    const focused = layout.focused orelse layout.root.?;
+    compositor.drawStatusLine(focused, .normal);
+
+    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(9, 1).codepoint);
+}
+
+test "input line paints mode indicator and normal-mode hint" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 80, 10);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(80, 10);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .normal,
+    });
+
+    const last_row = screen.height - 1;
+
+    // `[NORMAL] ` starts at col 0.
+    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(last_row, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, ']'), screen.getCellConst(last_row, 7).codepoint);
+
+    // After the 9-char label (`[NORMAL] `) the `-- NORMAL -- ...` hint begins.
+    try std.testing.expectEqual(@as(u21, '-'), screen.getCellConst(last_row, 9).codepoint);
+    try std.testing.expectEqual(@as(u21, '-'), screen.getCellConst(last_row, 10).codepoint);
+
+    // The `>` prompt from insert mode must NOT appear anywhere on this row.
+    var found_prompt = false;
+    for (0..screen.width) |c| {
+        if (screen.getCellConst(last_row, @intCast(c)).codepoint == '>') {
+            found_prompt = true;
+            break;
+        }
+    }
+    try std.testing.expect(!found_prompt);
+}
+
+test "input line shows status hint after mode label when status is set" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 80, 10);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(80, 10);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "thinking",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    const last_row = screen.height - 1;
+
+    // `[INSERT] ` is 9 chars; status text begins at col 9.
+    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 't'), screen.getCellConst(last_row, 9).codepoint);
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(last_row, 10).codepoint);
 }
