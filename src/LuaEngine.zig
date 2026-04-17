@@ -320,8 +320,15 @@ pub const LuaEngine = struct {
     // -- Tool execution --------------------------------------------------------
 
     /// Execute a Lua tool by name with raw JSON input. Returns a ToolResult.
-    /// The caller's allocator is used for result content so ownership is clean.
-    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8, allocator: Allocator) types.ToolResult {
+    ///
+    /// Errors raised here:
+    /// - `InvalidInput`: the raw JSON does not parse.
+    /// - `OutOfMemory`: allocator failure while marshalling input or output.
+    ///
+    /// Lua runtime errors (thrown `error()`, `nil, err` convention, non-string
+    /// returns) are surfaced as `ToolResult { is_error = true }` so the LLM
+    /// can observe and retry.
+    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
         const tool = self.findTool(name) orelse return .{
             .content = "error: unknown lua tool",
             .is_error = true,
@@ -333,11 +340,14 @@ pub const LuaEngine = struct {
 
         // Parse JSON input and push as Lua table
         pushJsonAsTable(self.lua, input_json, self.allocator) catch |err| {
-            log.err("executeTool: failed to parse input JSON: {}", .{err});
             self.lua.pop(1); // pop the function
-            const msg = std.fmt.allocPrint(allocator, "error: invalid input JSON: {}", .{err}) catch
-                return .{ .content = "error: invalid input JSON", .is_error = true, .owned = false };
-            return .{ .content = msg, .is_error = true };
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.err("executeTool: failed to parse input JSON: {}", .{err});
+                    return error.InvalidInput;
+                },
+            }
         };
 
         // pcall(fn, input_table) -> result_string or nil,err
@@ -345,7 +355,7 @@ pub const LuaEngine = struct {
             const err_msg = self.lua.toString(-1) catch "unknown Lua error";
             const owned_msg = allocator.dupe(u8, err_msg) catch {
                 self.lua.pop(1);
-                return .{ .content = "error: Lua runtime error (OOM copying message)", .is_error = true, .owned = false };
+                return error.OutOfMemory;
             };
             self.lua.pop(1);
             return .{ .content = owned_msg, .is_error = true };
@@ -356,7 +366,7 @@ pub const LuaEngine = struct {
             const err_msg = self.lua.toString(-1) catch "unknown error from Lua tool";
             const owned = allocator.dupe(u8, err_msg) catch {
                 self.lua.pop(2);
-                return .{ .content = "error: OOM copying Lua error", .is_error = true, .owned = false };
+                return error.OutOfMemory;
             };
             self.lua.pop(2);
             return .{ .content = owned, .is_error = true };
@@ -369,7 +379,7 @@ pub const LuaEngine = struct {
         };
         const output = allocator.dupe(u8, result) catch {
             self.lua.pop(2);
-            return .{ .content = "error: OOM copying Lua result", .is_error = true, .owned = false };
+            return error.OutOfMemory;
         };
         self.lua.pop(2);
         return .{ .content = output, .is_error = false };
@@ -474,7 +484,7 @@ pub const LuaEngine = struct {
 /// Static function pointer shared by all Lua tools.
 /// Uses `active_engine` to find the LuaEngine and `tools_mod.current_tool_name`
 /// to know which tool was called.
-fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+fn luaToolExecute(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
     const engine = active_engine orelse return .{
         .content = "error: no active Lua engine",
         .is_error = true,
@@ -581,7 +591,7 @@ test "executeTool calls Lua function and returns result" {
         \\})
     );
 
-    const result = engine.executeTool("echo", "{\"message\": \"hi\"}", std.testing.allocator);
+    const result = try engine.executeTool("echo", "{\"message\": \"hi\"}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("echo: hi", result.content);
@@ -603,7 +613,7 @@ test "executeTool handles Lua runtime errors" {
         \\})
     );
 
-    const result = engine.executeTool("crasher", "{}", std.testing.allocator);
+    const result = try engine.executeTool("crasher", "{}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "intentional crash") != null);
@@ -625,7 +635,7 @@ test "executeTool handles nil,err return convention" {
         \\})
     );
 
-    const result = engine.executeTool("failsoft", "{}", std.testing.allocator);
+    const result = try engine.executeTool("failsoft", "{}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("something went wrong", result.content);
@@ -635,7 +645,7 @@ test "executeTool returns error for unknown tool" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
-    const result = engine.executeTool("nonexistent", "{}", std.testing.allocator);
+    const result = try engine.executeTool("nonexistent", "{}", std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: unknown lua tool", result.content);
     try std.testing.expect(!result.owned);

@@ -52,15 +52,35 @@ pub const Registry = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    /// Execute a tool by name, passing raw JSON input. Returns an error result if the tool is unknown.
-    pub fn execute(self: *const Registry, name: []const u8, input_raw: []const u8, allocator: Allocator) !types.ToolResult {
+    /// Execute a tool by name, passing raw JSON input.
+    ///
+    /// `InvalidInput` and `ToolFailed` errors raised by the tool are flattened
+    /// into a `ToolResult { is_error = true }` here so the LLM can observe the
+    /// failure and retry. Only `OutOfMemory` propagates to the caller, because
+    /// there is no meaningful way for the LLM to recover from it.
+    ///
+    /// An unknown tool name is likewise returned as `ToolResult { is_error = true }`.
+    pub fn execute(self: *const Registry, name: []const u8, input_raw: []const u8, allocator: Allocator) error{OutOfMemory}!types.ToolResult {
         const tool = self.get(name) orelse return .{
             .content = "error: unknown tool",
             .is_error = true,
+            .owned = false,
         };
         current_tool_name = name;
         defer current_tool_name = null;
-        return tool.execute(input_raw, allocator);
+        return tool.execute(input_raw, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidInput => .{
+                .content = "error: invalid tool input",
+                .is_error = true,
+                .owned = false,
+            },
+            error.ToolFailed => .{
+                .content = "error: tool failed",
+                .is_error = true,
+                .owned = false,
+            },
+        };
     }
 };
 
@@ -143,6 +163,30 @@ test "execute sets current_tool_name during execution" {
 
     // After execution, should be cleared
     try std.testing.expect(current_tool_name == null);
+}
+
+fn testInvalidInputTool(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+    _ = std.json.parseFromSlice(struct { x: u32 }, allocator, input_raw, .{}) catch
+        return error.InvalidInput;
+    return .{ .content = "ok", .is_error = false, .owned = false };
+}
+
+test "tool can raise InvalidInput directly" {
+    try std.testing.expectError(error.InvalidInput, testInvalidInputTool("not json", std.testing.allocator));
+}
+
+test "registry.execute flattens InvalidInput into a tool-result error" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+    try r.register(.{ .definition = .{
+        .name = "t",
+        .description = "",
+        .input_schema_json = "{\"type\":\"object\"}",
+    }, .execute = testInvalidInputTool });
+    const result = try r.execute("t", "not json", std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("error: invalid tool input", result.content);
+    try std.testing.expect(!result.owned);
 }
 
 test {
