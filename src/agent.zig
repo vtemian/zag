@@ -7,6 +7,8 @@ const types = @import("types.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const AgentThread = @import("AgentThread.zig");
+const Hooks = @import("Hooks.zig");
+const LuaEngine = @import("LuaEngine.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -59,6 +61,7 @@ pub fn runLoopStreaming(
     allocator: Allocator,
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
+    lua_engine: ?*LuaEngine.LuaEngine,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
@@ -84,7 +87,7 @@ pub fn runLoopStreaming(
         defer allocator.free(tool_calls);
         if (tool_calls.len == 0) break;
 
-        const results = try executeTools(tool_calls, registry, allocator, queue, cancel);
+        const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine);
         try messages.append(allocator, .{ .role = .user, .content = results });
     }
 }
@@ -177,52 +180,142 @@ const ToolCallContext = struct {
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
     results: []ToolCallResult,
+    lua_engine: ?*LuaEngine.LuaEngine,
 };
 
-/// Run one tool call's full pipeline: check cancel, push tool_start,
-/// execute the tool, push tool_result. Tool execution errors are captured
-/// as error results; infrastructure failures (cancel, OOM, queue push)
-/// are returned as errors for the caller to handle.
+/// Outcome of firing a `ToolPre` hook round-trip. On `.proceed`, the
+/// optional slice is a rewritten args_json that the caller owns (free
+/// after the downstream `registry.execute` call). On `.vetoed`, the
+/// slice is a reason string the caller owns and must free after
+/// synthesizing the error tool_result.
+const PreHookOutcome = union(enum) {
+    proceed: ?[]const u8,
+    vetoed: []const u8,
+};
+
+/// Fire `ToolPre` for one tool call and block on a main-thread
+/// round-trip. Polls the cancel flag every 50ms so a user interrupt
+/// during Lua work still tears down promptly.
+///
+/// Verification for this helper is deferred to the E2E test added in
+/// Task 17, which exercises veto + rewrite against a real registry.
+fn firePreHook(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    tc: types.ContentBlock.ToolUse,
+    allocator: Allocator,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) !PreHookOutcome {
+    // No engine or no hooks registered -> proceed immediately without a
+    // main-thread round-trip. Keeps unit tests that lack a dispatcher from
+    // deadlocking, and avoids useless queue churn in production runs with
+    // no hooks configured.
+    if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) {
+        return .{ .proceed = null };
+    }
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = tc.name,
+        .call_id = tc.id,
+        .args_json = tc.input_raw,
+        .args_rewrite = null,
+    } };
+    var req = Hooks.HookRequest.init(&payload);
+    try queue.push(.{ .hook_request = &req });
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) return error.Cancelled;
+        }
+    }
+    if (req.cancelled) {
+        const reason = req.cancel_reason orelse try allocator.dupe(u8, "vetoed by hook");
+        return .{ .vetoed = reason };
+    }
+    return .{ .proceed = payload.tool_pre.args_rewrite };
+}
+
+/// Run one tool call's full pipeline: check cancel, fire ToolPre,
+/// push tool_start, execute the tool (or synthesize a veto result),
+/// push tool_result. Tool execution errors are captured as error
+/// results; infrastructure failures (cancel, OOM, queue push) are
+/// returned as errors for the caller to handle.
 fn runToolStep(
     tc: types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
     allocator: Allocator,
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
+    lua_engine: ?*LuaEngine.LuaEngine,
 ) !ToolCallResult {
     if (cancel.load(.acquire)) return error.Cancelled;
 
-    log.info("executing tool: {s}", .{tc.name});
+    const outcome = try firePreHook(lua_engine, tc, allocator, queue, cancel);
 
-    {
-        const start_name = try allocator.dupe(u8, tc.name);
-        errdefer allocator.free(start_name);
-        const start_id = try allocator.dupe(u8, tc.id);
-        errdefer allocator.free(start_id);
-        try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+    switch (outcome) {
+        .vetoed => |reason| {
+            defer allocator.free(reason);
+
+            const synth = try std.fmt.allocPrint(allocator, "vetoed by hook: {s}", .{reason});
+            errdefer allocator.free(synth);
+
+            {
+                const start_name = try allocator.dupe(u8, tc.name);
+                errdefer allocator.free(start_name);
+                const start_id = try allocator.dupe(u8, tc.id);
+                errdefer allocator.free(start_id);
+                try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+            }
+
+            const result_content = try allocator.dupe(u8, synth);
+            errdefer allocator.free(result_content);
+            const result_id = try allocator.dupe(u8, tc.id);
+            errdefer allocator.free(result_id);
+            try queue.push(.{ .tool_result = .{
+                .content = result_content,
+                .is_error = true,
+                .call_id = result_id,
+            } });
+
+            return .{ .content = synth, .is_error = true, .owned = true };
+        },
+        .proceed => |maybe_rewrite| {
+            defer if (maybe_rewrite) |r| allocator.free(r);
+            const effective_input = maybe_rewrite orelse tc.input_raw;
+
+            log.info("executing tool: {s}", .{tc.name});
+
+            {
+                const start_name = try allocator.dupe(u8, tc.name);
+                errdefer allocator.free(start_name);
+                const start_id = try allocator.dupe(u8, tc.id);
+                errdefer allocator.free(start_id);
+                try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+            }
+
+            const step: ToolCallResult = blk: {
+                if (registry.execute(tc.name, effective_input, allocator)) |ok| {
+                    break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
+                } else |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "error: tool execution failed: {s}", .{@errorName(err)});
+                    break :blk .{ .content = msg, .is_error = true, .owned = true };
+                }
+            };
+            errdefer if (step.owned) allocator.free(step.content);
+
+            const result_content = try allocator.dupe(u8, step.content);
+            errdefer allocator.free(result_content);
+            const result_id = try allocator.dupe(u8, tc.id);
+            errdefer allocator.free(result_id);
+            try queue.push(.{ .tool_result = .{
+                .content = result_content,
+                .is_error = step.is_error,
+                .call_id = result_id,
+            } });
+
+            return step;
+        },
     }
-
-    const step: ToolCallResult = blk: {
-        if (registry.execute(tc.name, tc.input_raw, allocator)) |ok| {
-            break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
-        } else |err| {
-            const msg = try std.fmt.allocPrint(allocator, "error: tool execution failed: {s}", .{@errorName(err)});
-            break :blk .{ .content = msg, .is_error = true, .owned = true };
-        }
-    };
-    errdefer if (step.owned) allocator.free(step.content);
-
-    const result_content = try allocator.dupe(u8, step.content);
-    errdefer allocator.free(result_content);
-    const result_id = try allocator.dupe(u8, tc.id);
-    errdefer allocator.free(result_id);
-    try queue.push(.{ .tool_result = .{
-        .content = result_content,
-        .is_error = step.is_error,
-        .call_id = result_id,
-    } });
-
-    return step;
 }
 
 /// Thread entry point for parallel tool execution. Returns void because
@@ -235,6 +328,7 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
         ctx.allocator,
         ctx.queue,
         ctx.cancel,
+        ctx.lua_engine,
     ) catch |err| {
         const msg = switch (err) {
             error.Cancelled => "error: cancelled",
@@ -256,12 +350,13 @@ fn executeTools(
     allocator: Allocator,
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
+    lua_engine: ?*LuaEngine.LuaEngine,
 ) ![]types.ContentBlock {
     if (tool_calls.len == 0) return &.{};
 
     // Single-call fast path: run inline without spawning a thread
     if (tool_calls.len == 1) {
-        return executeToolsSingle(tool_calls[0], registry, allocator, queue, cancel);
+        return executeToolsSingle(tool_calls[0], registry, allocator, queue, cancel, lua_engine);
     }
 
     // Parallel path: spawn one thread per tool call
@@ -294,6 +389,7 @@ fn executeTools(
             .queue = queue,
             .cancel = cancel,
             .results = results,
+            .lua_engine = lua_engine,
         };
         log.info("spawning tool thread: {s}", .{tc.name});
         handles[i] = std.Thread.spawn(.{}, executeOneToolCall, .{&contexts[i]}) catch |err| {
@@ -336,8 +432,9 @@ fn executeToolsSingle(
     allocator: Allocator,
     queue: *AgentThread.EventQueue,
     cancel: *AgentThread.CancelFlag,
+    lua_engine: ?*LuaEngine.LuaEngine,
 ) ![]types.ContentBlock {
-    const step = try runToolStep(tc, registry, allocator, queue, cancel);
+    const step = try runToolStep(tc, registry, allocator, queue, cancel, lua_engine);
     defer if (step.owned) allocator.free(step.content);
 
     // Separate copy for conversation history (Message owns these).
@@ -519,7 +616,13 @@ fn drainAndFreeQueue(queue: *AgentThread.EventQueue, allocator: Allocator) void 
                 },
                 .info => |s| allocator.free(s),
                 .err => |s| allocator.free(s),
-                .done, .reset_assistant_text, .hook_request, .lua_tool_request => {},
+                // Hook and Lua-tool requests are a round-trip: the producer
+                // is blocked on `req.done`. Signal here so a request that
+                // reached the normal drain (e.g. dispatcher early-returned
+                // on null engine) still unblocks its pusher.
+                .hook_request => |req| req.done.set(),
+                .lua_tool_request => |req| req.done.set(),
+                .done, .reset_assistant_text => {},
             }
         }
     }
@@ -541,7 +644,7 @@ test "single tool call runs inline without threading" {
         .{ .id = "call_1", .name = "echo_fast", .input_raw = "{}" },
     };
 
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
 
@@ -575,7 +678,7 @@ test "parallel execution preserves result order" {
         .{ .id = "call_fast", .name = "echo_fast", .input_raw = "{}" },
     };
 
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
 
@@ -621,7 +724,7 @@ test "parallel execution is faster than sequential" {
     };
 
     var timer = std.time.Timer.start() catch unreachable;
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
     const elapsed_ns = timer.read();
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
@@ -651,7 +754,7 @@ test "cancel flag is respected in parallel execution" {
         .{ .id = "call_2", .name = "echo_slow", .input_raw = "{}" },
     };
 
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
 
