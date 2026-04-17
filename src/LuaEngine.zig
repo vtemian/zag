@@ -1288,7 +1288,7 @@ test "fireHook invokes Lua callback for matching event" {
 
 test "end-to-end: config file to registry execution" {
     const AgentThread = @import("AgentThread.zig");
-    const ConversationBuffer = @import("ConversationBuffer.zig");
+    const AgentRunner = @import("AgentRunner.zig");
 
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
@@ -1336,11 +1336,11 @@ test "end-to-end: config file to registry execution" {
     const pump_thread = try std.Thread.spawn(.{}, struct {
         fn pump(q: *AgentThread.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
-                ConversationBuffer.dispatchHookRequests(q, eng);
+                AgentRunner.dispatchHookRequests(q, eng);
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes by the test thread are serviced.
-            ConversationBuffer.dispatchHookRequests(q, eng);
+            AgentRunner.dispatchHookRequests(q, eng);
         }
     }.pump, .{ &queue, &engine, &stop });
     defer {

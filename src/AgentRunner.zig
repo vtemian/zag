@@ -91,6 +91,114 @@ pub fn shutdown(self: *AgentRunner) void {
     }
 }
 
+/// Whether an agent is currently running.
+pub fn isAgentRunning(self: *const AgentRunner) bool {
+    return self.agent_thread != null;
+}
+
+/// Request cooperative cancellation of the running agent. Call `shutdown`
+/// to wait for the thread to exit.
+pub fn cancelAgent(self: *AgentRunner) void {
+    self.cancel_flag.store(true, .release);
+}
+
+/// Return the last info/status message (e.g., token counts) captured by
+/// the last `.info` event. Empty until an info event has been handled.
+pub fn lastInfo(self: *const AgentRunner) []const u8 {
+    return self.last_info[0..self.last_info_len];
+}
+
+/// Pull any hook_request events out of the queue and service them on the
+/// main thread (the only thread allowed to touch Lua). Non-hook events are
+/// compacted back into the ring in their original order. Called before the
+/// normal drain loop so pre-hook vetos round-trip with minimal latency.
+pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void {
+    queue.mutex.lock();
+    defer queue.mutex.unlock();
+
+    if (queue.len == 0) return;
+
+    // Walk the ring from head to tail, in-place compacting non-hook events
+    // back into contiguous slots starting at `head`. Hook/tool requests are
+    // fired synchronously and dropped from the ring.
+    const cap = queue.buffer.len;
+    var read = queue.head;
+    var write = queue.head;
+    var remaining = queue.len;
+    var kept: usize = 0;
+    while (remaining > 0) : (remaining -= 1) {
+        const ev = queue.buffer[read];
+        read = (read + 1) % cap;
+        switch (ev) {
+            .hook_request => |req| {
+                if (engine) |eng| {
+                    eng.fireHook(req.payload) catch |err| {
+                        log.warn("hook dispatch failed: {}", .{err});
+                    };
+                    if (eng.takeCancel()) |reason| {
+                        req.cancelled = true;
+                        req.cancel_reason = reason;
+                    }
+                }
+                // Always signal, even without an engine: the agent thread
+                // is parked on `req.done` and must be released so the
+                // tool call can proceed (or fail) cleanly.
+                req.done.set();
+            },
+            .lua_tool_request => |req| {
+                if (engine) |eng| {
+                    if (eng.executeTool(req.tool_name, req.input_raw, req.allocator)) |result| {
+                        req.result_content = result.content;
+                        req.result_is_error = result.is_error;
+                        req.result_owned = result.owned;
+                    } else |err| {
+                        req.error_name = @errorName(err);
+                    }
+                }
+                // Always signal, even without an engine, so the pushing
+                // thread doesn't block forever.
+                req.done.set();
+            },
+            else => {
+                queue.buffer[write] = ev;
+                write = (write + 1) % cap;
+                kept += 1;
+            },
+        }
+    }
+    queue.len = kept;
+    queue.tail = write;
+}
+
+/// Drain pending agent events. Returns true if the agent finished this frame.
+pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
+    if (self.agent_thread == null) return false;
+
+    dispatchHookRequests(&self.event_queue, self.lua_engine);
+
+    var drain: [64]agent_events.AgentEvent = undefined;
+    const count = self.event_queue.drain(&drain);
+    var finished = false;
+
+    for (drain[0..count]) |event| {
+        if (self.view.scroll_offset != 0) {
+            self.view.scroll_offset = 0;
+            self.view.render_dirty = true;
+        }
+        self.handleAgentEvent(event, allocator);
+
+        if (event == .done) {
+            if (self.agent_thread) |t| t.join();
+            self.agent_thread = null;
+            self.event_queue.deinit();
+            self.queue_active = false;
+            finished = true;
+        }
+    }
+
+    return finished;
+}
+
 /// Discard the in-progress assistant text node. Used when a partial
 /// streamed response is being replaced by a non-streaming fallback:
 /// the UI rebuilds from a clean state when the next text_delta arrives.
@@ -325,4 +433,156 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
     // Pending map no longer contains "B", still contains "A"
     try std.testing.expectEqual(@as(u32, 1), runner.pending_tool_calls.count());
     try std.testing.expect(runner.pending_tool_calls.get("A") != null);
+}
+
+test "wake_fd default is null" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-default", &scb, &runner);
+    defer cb.deinit();
+    runner.view = &cb;
+
+    try std.testing.expect(runner.wake_fd == null);
+}
+
+test "wake_fd propagates to a freshly initialized EventQueue" {
+    // Mirrors the submitInput sequence (init EventQueue, copy wake_fd)
+    // without spawning a real agent thread.
+    const allocator = std.testing.allocator;
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate", &scb, &runner);
+    defer cb.deinit();
+    runner.view = &cb;
+
+    runner.wake_fd = 777;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+    queue.wake_fd = runner.wake_fd;
+
+    try std.testing.expect(queue.wake_fd != null);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 777), queue.wake_fd.?);
+}
+
+test "dispatchHookRequests fires Lua hook and signals done" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.last_turn = nil
+        \\zag.hook("TurnStart", function(evt) _G.last_turn = evt.turn_num end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 7, .message_count = 1 } };
+    var req = Hooks.HookRequest.init(&payload);
+    try queue.push(.{ .hook_request = &req });
+
+    dispatchHookRequests(&queue, &engine);
+
+    try std.testing.expect(req.done.isSet());
+    _ = try engine.lua.getGlobal("last_turn");
+    try std.testing.expectEqual(@as(i64, 7), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "lua_tool_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool({
+        \\  name = "echo",
+        \\  description = "echo input",
+        \\  input_schema = { type = "object" },
+        \\  execute = function(args) return "ok: " .. tostring(args.val) end,
+        \\})
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "echo",
+        .input_raw = "{\"val\":1}",
+        .allocator = alloc,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    try queue.push(.{ .lua_tool_request = &req });
+
+    dispatchHookRequests(&queue, &engine);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_content != null);
+    defer if (req.result_owned) alloc.free(req.result_content.?);
+    try std.testing.expect(std.mem.indexOf(u8, req.result_content.?, "ok: 1") != null);
+}
+
+test "text_delta fires post-hook with text" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.last_delta = nil
+        \\zag.hook("TextDelta", { enabled = true }, function(evt)
+        \\  _G.last_delta = evt.text
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = "chunk!" } };
+    try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("last_delta");
+    try std.testing.expectEqualStrings("chunk!", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "drainEvents joins thread and deinits queue on .done" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "drain-test", &scb, &runner);
+    defer cb.deinit();
+    runner.view = &cb;
+
+    // Simulate the spawn setup without a real agent thread: just the queue.
+    runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    runner.queue_active = true;
+
+    // Fake "thread" that immediately exits. We spawn it so agent_thread is non-null.
+    const Noop = struct {
+        fn run() void {}
+    };
+    runner.agent_thread = try std.Thread.spawn(.{}, Noop.run, .{});
+
+    // Push a done event
+    try runner.event_queue.push(.done);
+
+    const finished = runner.drainEvents(allocator);
+
+    try std.testing.expect(finished);
+    try std.testing.expect(runner.agent_thread == null);
+    try std.testing.expect(!runner.queue_active);
 }
