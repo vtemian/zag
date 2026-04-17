@@ -1164,3 +1164,28 @@ test "text_delta after reset starts a fresh assistant node" {
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
     try std.testing.expectEqualStrings("Hello world", cb.root_children.items[0].content.items);
 }
+
+test "wake_fd default is null" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-default");
+    defer cb.deinit();
+
+    try std.testing.expect(cb.wake_fd == null);
+}
+
+test "wake_fd propagates to a freshly initialized EventQueue" {
+    // Mirrors the submitInput sequence (init EventQueue, copy wake_fd)
+    // without spawning a real agent thread.
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate");
+    defer cb.deinit();
+
+    cb.wake_fd = 777;
+
+    var queue = AgentThread.EventQueue.init(allocator);
+    defer queue.deinit();
+    queue.wake_fd = cb.wake_fd;
+
+    try std.testing.expect(queue.wake_fd != null);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 777), queue.wake_fd.?);
+}

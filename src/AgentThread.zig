@@ -85,9 +85,11 @@ pub const EventQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.items.append(self.allocator, event);
-        // Signal the wake pipe if one is configured. Ignore errors: a full
-        // pipe means a wake is already pending, and any other error is
-        // non-fatal for event delivery.
+        // Signal the wake pipe if one is configured. Expected errors:
+        // WouldBlock (pipe full means a wake is already pending) and
+        // BrokenPipe (reader closed during shutdown). Unexpected errors
+        // are also swallowed because event delivery already succeeded;
+        // the main loop authoritatively reads the queue, not this byte.
         if (self.wake_fd) |fd| {
             _ = std.posix.write(fd, &[_]u8{1}) catch {};
         }
