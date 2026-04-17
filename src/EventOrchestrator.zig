@@ -648,8 +648,21 @@ fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
 
+    // The new pane is ready to be typed into. Drop back to insert mode so
+    // the user can start a conversation without an extra `i` keystroke,
+    // even if the split was triggered from normal mode.
+    self.current_mode = modeAfterSplit();
+
     // Transient announce; cleared on the next key event.
     self.transient_status_len = formatSplitAnnounce(&self.transient_status, scratch_id);
+}
+
+/// A freshly created pane is almost always going to be typed into, so we
+/// land in insert mode regardless of the caller's previous mode. Encoded
+/// as a pure function so the rule stays in one place and is testable
+/// without constructing a full orchestrator.
+fn modeAfterSplit() Keymap.Mode {
+    return .insert;
 }
 
 /// Format the `split -> scratch N` one-shot announce into `dest`.
@@ -929,6 +942,13 @@ test "formatSplitAnnounce handles three-digit ids" {
 test "formatSplitAnnounce returns zero when destination is too small" {
     var buf: [4]u8 = undefined;
     try std.testing.expectEqual(@as(u8, 0), formatSplitAnnounce(&buf, 1));
+}
+
+test "modeAfterSplit always returns insert" {
+    // The rule is unconditional; document it in a test so the intent
+    // survives refactors. If you want a different default after split,
+    // this is the test that should force the conversation.
+    try std.testing.expectEqual(Keymap.Mode.insert, modeAfterSplit());
 }
 
 test "modeAfterKey: Esc transitions insert -> normal" {
