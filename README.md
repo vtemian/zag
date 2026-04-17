@@ -47,6 +47,25 @@ end)
 
 More examples in [`examples/hooks.lua`](examples/hooks.lua). Design notes in [`docs/plans/2026-04-16-lua-hooks-design.md`](docs/plans/2026-04-16-lua-hooks-design.md).
 
+## Modal editing
+
+Zag is modal in the vim sense. Sessions start in **insert** mode (typing goes straight to the prompt). Press `Esc` to enter **normal** mode, where keys fire window bindings instead of appending to the input buffer. Press `i` to return. The status line carries a clear `[INSERT]` / `[NORMAL]` tag and the input line swaps the `>` prompt for a help hint, so the current mode is impossible to miss.
+
+Default normal-mode bindings:
+
+- `h` / `j` / `k` / `l` — focus the window in that direction
+- `v` / `s` — split vertically / horizontally
+- `q` — close the focused window
+- `i` — back to insert mode
+
+Rebind any key from `~/.config/zag/config.lua`:
+
+```lua
+zag.keymap("normal", "w", "focus_right")
+```
+
+More examples in [`examples/keymap.lua`](examples/keymap.lua). Design notes in [`docs/plans/2026-04-17-modal-keymap-design.md`](docs/plans/2026-04-17-modal-keymap-design.md).
+
 ## Building
 
 ```bash

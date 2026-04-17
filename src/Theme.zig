@@ -96,6 +96,10 @@ pub const Highlights = struct {
     md_blockquote: CellStyle,
     /// Markdown horizontal rule.
     md_hr: CellStyle,
+    /// Modal indicator in the status line (insert mode).
+    mode_insert: CellStyle,
+    /// Modal indicator in the status line (normal mode).
+    mode_normal: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.
@@ -263,6 +267,8 @@ pub fn defaultTheme() Theme {
             .md_list_bullet = .{ .fg = accent },
             .md_blockquote = .{ .fg = dim, .italic = true },
             .md_hr = .{ .fg = dim },
+            .mode_insert = .{ .fg = success, .bold = true },
+            .mode_normal = .{ .fg = accent, .bold = true },
         },
         .spacing = .{
             .turn_gap = 1,
@@ -476,6 +482,15 @@ test "applyToCell with null bg preserves cell bg" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "default theme exposes mode_insert and mode_normal highlights" {
+    var theme = defaultTheme();
+    const insert = resolve(theme.highlights.mode_insert, &theme);
+    const normal = resolve(theme.highlights.mode_normal, &theme);
+    try std.testing.expect(!std.meta.eql(insert.fg, normal.fg));
+    try std.testing.expect(insert.screen_style.bold);
+    try std.testing.expect(normal.screen_style.bold);
 }
 
 test "StyledLine construction" {
