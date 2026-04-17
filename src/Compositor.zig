@@ -63,9 +63,9 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
             self.drawAllLeaves(root);
         }
         {
-            var s = trace.span("borders");
+            var s = trace.span("frames");
             defer s.end();
-            self.drawBorders(root);
+            self.drawFrames(root, focused);
         }
         self.layout_dirty = false;
     } else {
@@ -110,7 +110,16 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
             if (leaf.buffer.isDirty()) {
-                self.screen.clearRect(leaf.rect.y, leaf.rect.x, leaf.rect.width, leaf.rect.height);
+                // Clear only the interior; the frame survives across
+                // dirty-leaf updates so we don't need to redraw it.
+                if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
+                    self.screen.clearRect(
+                        leaf.rect.y + 1,
+                        leaf.rect.x + 1,
+                        leaf.rect.width - 2,
+                        leaf.rect.height - 2,
+                    );
+                }
                 self.drawBufferContent(&leaf);
                 leaf.buffer.clearDirty();
             }
@@ -126,10 +135,19 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
 ///
 /// Renders the buffer's node tree to styled display lines via the
 /// NodeRenderer, then writes each span into the screen grid with its
-/// resolved style. Applies padding_h and padding_v from the theme spacing.
+/// resolved style. Shrinks the rect by 1 cell on each side to leave room
+/// for the pane's frame, then applies padding_h/padding_v from the theme.
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
-    const rect = leaf.rect;
-    if (rect.width == 0 or rect.height == 0) return;
+    const outer = leaf.rect;
+    // Each pane owns a 1-cell frame on every side. Content must fit inside.
+    if (outer.width < 3 or outer.height < 3) return;
+
+    const rect = Layout.Rect{
+        .x = outer.x + 1,
+        .y = outer.y + 1,
+        .width = outer.width - 2,
+        .height = outer.height - 2,
+    };
 
     const buf = leaf.buffer;
 
@@ -192,52 +210,143 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
     }
 }
 
-/// Recursively draw borders between split children using theme border
-/// characters and the border highlight group.
-fn drawBorders(self: *Compositor, node: *const Layout.LayoutNode) void {
+/// Draw a rounded frame with title for every leaf. Two-pass so the focused
+/// frame wins any cells shared with an adjacent unfocused frame.
+fn drawFrames(self: *Compositor, root: *const Layout.LayoutNode, focused: *const Layout.LayoutNode) void {
+    self.drawFramesPass(root, focused, .unfocused);
+    self.drawFramesPass(root, focused, .focused);
+}
+
+const PanePass = enum { focused, unfocused };
+
+fn drawFramesPass(self: *Compositor, node: *const Layout.LayoutNode, focused: *const Layout.LayoutNode, pass: PanePass) void {
     switch (node.*) {
-        .leaf => {},
-        .split => |split| {
-            const border_resolved = Theme.resolve(self.theme.highlights.border, self.theme);
-
-            switch (split.direction) {
-                .vertical => {
-                    // Draw a vertical line between the two halves
-                    const border_col = split.first.getRect().x +
-                        split.first.getRect().width;
-                    if (border_col < self.screen.width) {
-                        for (0..split.rect.height) |row_off| {
-                            const row = split.rect.y + @as(u16, @intCast(row_off));
-                            if (row >= self.screen.height) break;
-                            const cell = self.screen.getCell(row, border_col);
-                            cell.codepoint = self.theme.borders.vertical;
-                            cell.style = border_resolved.screen_style;
-                            cell.fg = border_resolved.fg;
-                        }
-                    }
-                },
-                .horizontal => {
-                    // Draw a horizontal line between the two halves
-                    const border_row = split.first.getRect().y +
-                        split.first.getRect().height;
-                    if (border_row < self.screen.height) {
-                        for (0..split.rect.width) |col_off| {
-                            const col = split.rect.x + @as(u16, @intCast(col_off));
-                            if (col >= self.screen.width) break;
-                            const cell = self.screen.getCell(border_row, col);
-                            cell.codepoint = self.theme.borders.horizontal;
-                            cell.style = border_resolved.screen_style;
-                            cell.fg = border_resolved.fg;
-                        }
-                    }
-                },
-            }
-
-            // Recurse into children
-            self.drawBorders(split.first);
-            self.drawBorders(split.second);
+        .leaf => {
+            const is_focused = (node == focused);
+            const want = (pass == .focused and is_focused) or
+                (pass == .unfocused and !is_focused);
+            if (want) self.drawPaneFrame(&node.leaf, is_focused);
+        },
+        .split => |s| {
+            self.drawFramesPass(s.first, focused, pass);
+            self.drawFramesPass(s.second, focused, pass);
         },
     }
+}
+
+/// Draw a single rounded rectangle with an embedded title on the top edge.
+fn drawPaneFrame(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, focused: bool) void {
+    const rect = leaf.rect;
+    if (rect.width < 2 or rect.height < 2) return;
+
+    const border = if (focused)
+        Theme.resolve(self.theme.highlights.border_focused, self.theme)
+    else
+        Theme.resolve(self.theme.highlights.border, self.theme);
+    const title = if (focused)
+        Theme.resolve(self.theme.highlights.title_active, self.theme)
+    else
+        Theme.resolve(self.theme.highlights.title_inactive, self.theme);
+
+    const top = rect.y;
+    const bottom = rect.y + rect.height - 1;
+    const left = rect.x;
+    const right = rect.x + rect.width - 1;
+
+    // Corners
+    self.paintCell(top, left, self.theme.borders.top_left, border);
+    self.paintCell(top, right, self.theme.borders.top_right, border);
+    self.paintCell(bottom, left, self.theme.borders.bottom_left, border);
+    self.paintCell(bottom, right, self.theme.borders.bottom_right, border);
+
+    // Top and bottom edges (title will overwrite the top as needed)
+    var col: u16 = left + 1;
+    while (col < right) : (col += 1) {
+        self.paintCell(top, col, self.theme.borders.horizontal, border);
+        self.paintCell(bottom, col, self.theme.borders.horizontal, border);
+    }
+
+    // Left and right edges
+    var row: u16 = top + 1;
+    while (row < bottom) : (row += 1) {
+        self.paintCell(row, left, self.theme.borders.vertical, border);
+        self.paintCell(row, right, self.theme.borders.vertical, border);
+    }
+
+    self.drawPaneTitle(rect, leaf.buffer.getName(), border, title, focused);
+}
+
+/// Paint a single cell: codepoint + style + fg. Leaves bg untouched so the
+/// terminal default shows through (matches the rest of the chrome).
+fn paintCell(self: *Compositor, row: u16, col: u16, codepoint: u21, s: Theme.ResolvedStyle) void {
+    if (row >= self.screen.height or col >= self.screen.width) return;
+    const cell = self.screen.getCell(row, col);
+    cell.codepoint = codepoint;
+    cell.style = s.screen_style;
+    cell.fg = s.fg;
+}
+
+/// Draw the pane's title embedded in the top border.
+///
+/// Focused layout (W=20, name "session"):  `╭─ [session] ──────╮`
+///   reserved = 6 cells (2 corners + 2 dashes + 2 inverse caps)
+///   available name glyphs = W - reserved
+///
+/// Unfocused layout:  `╭── session ───────╮`
+///   reserved = 4 cells (2 corners + 2 spaces)
+///
+/// When `available < 1`, the title is skipped (solid top border).
+fn drawPaneTitle(self: *Compositor, rect: Layout.Rect, name: []const u8, border: Theme.ResolvedStyle, title: Theme.ResolvedStyle, focused: bool) void {
+    if (rect.width < 6) return;
+
+    const reserved: u16 = if (focused) 6 else 4;
+    if (rect.width <= reserved) return;
+    const available: u16 = rect.width - reserved;
+
+    var name_scratch: [128]u8 = undefined;
+    const fitted = fitName(&name_scratch, name, available);
+    if (fitted.len == 0) return;
+
+    const end_col: u16 = rect.x + rect.width - 1;
+    var col: u16 = rect.x + 1;
+
+    // Leading dash
+    self.paintCell(rect.y, col, self.theme.borders.horizontal, border);
+    col += 1;
+
+    // Left pad cell (inverse space when focused, plain space otherwise)
+    self.paintCell(rect.y, col, ' ', if (focused) title else border);
+    col += 1;
+
+    // Name glyphs
+    col = self.screen.writeStr(rect.y, col, fitted, title.screen_style, title.fg);
+
+    // Right pad cell
+    self.paintCell(rect.y, col, ' ', if (focused) title else border);
+    col += 1;
+
+    // Fill remaining cells with dashes
+    while (col < end_col) : (col += 1) {
+        self.paintCell(rect.y, col, self.theme.borders.horizontal, border);
+    }
+}
+
+/// Copy `name` into `dest`, truncating with U+2026 if it exceeds `max` display
+/// columns. Assumes ASCII input (buffer names today are `"session"`,
+/// `"scratch N"`, `"test"`). Returns a slice backed by `dest` or `name`.
+fn fitName(dest: []u8, name: []const u8, max: u16) []const u8 {
+    const m: usize = max;
+    if (name.len <= m) return name;
+    if (m == 0) return dest[0..0];
+    if (m == 1) {
+        const ell = "\u{2026}"; // 3 bytes UTF-8
+        @memcpy(dest[0..3], ell);
+        return dest[0..3];
+    }
+    const keep: usize = m - 1;
+    @memcpy(dest[0..keep], name[0..keep]);
+    @memcpy(dest[keep .. keep + 3], "\u{2026}");
+    return dest[0 .. keep + 3];
 }
 
 /// Draw the status line on the last row using the theme status_line highlight.
@@ -413,9 +522,10 @@ test "composite writes buffer content at leaf rect with padding" {
     compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
-    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(0, pad_h).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(0, pad_h + 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, pad_h + 2).codepoint);
+    // Frame shifts content by +1 row / +1 col; content row is 1, content col is 1 + pad_h.
+    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(1, 1 + pad_h).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 1 + pad_h + 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 }
 
 test "composite draws status line on last row" {
@@ -450,78 +560,6 @@ test "composite draws status line on last row" {
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(9, 10).codepoint);
 }
 
-test "composite draws vertical split border from theme" {
-    const allocator = std.testing.allocator;
-    var screen = try Screen.init(allocator, 40, 10);
-    defer screen.deinit();
-
-    const theme = Theme.defaultTheme();
-
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
-
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
-    defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
-    defer cb2.deinit();
-
-    var layout = Layout.init(allocator);
-    defer layout.deinit();
-    try layout.setRoot(cb1.buf());
-    layout.recalculate(40, 10);
-    try layout.splitVertical(0.5, cb2.buf());
-    layout.recalculate(40, 10);
-
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
-
-    const root = layout.root.?;
-    const first_rect = root.split.first.leaf.rect;
-    const border_col = first_rect.x + first_rect.width;
-
-    const border_cell = screen.getCellConst(first_rect.y, border_col);
-    try std.testing.expectEqual(theme.borders.vertical, border_cell.codepoint);
-}
-
-test "composite draws horizontal split border" {
-    const allocator = std.testing.allocator;
-    var screen = try Screen.init(allocator, 40, 12);
-    defer screen.deinit();
-
-    const theme = Theme.defaultTheme();
-
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
-
-    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
-    defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
-    defer cb2.deinit();
-
-    var layout = Layout.init(allocator);
-    defer layout.deinit();
-    try layout.setRoot(cb1.buf());
-    layout.recalculate(40, 12);
-    try layout.splitHorizontal(0.5, cb2.buf());
-    layout.recalculate(40, 12);
-
-    compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
-
-    const root = layout.root.?;
-    const first_rect = root.split.first.leaf.rect;
-    const border_row = first_rect.y + first_rect.height;
-
-    const border_cell = screen.getCellConst(border_row, first_rect.x);
-    try std.testing.expectEqual(theme.borders.horizontal, border_cell.codepoint);
-}
-
 test "composite skips clean buffer leaves" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
@@ -549,16 +587,16 @@ test "composite skips clean buffer leaves" {
     compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, pad_h + 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 
-    // Manually overwrite a cell to detect if the leaf is redrawn
-    screen.getCell(0, pad_h + 2).codepoint = 'Z';
+    // Manually overwrite a cell to detect if the leaf is redrawn.
+    screen.getCell(1, 1 + pad_h + 2).codepoint = 'Z';
 
-    // Second composite: buffer is clean (clearDirty was called), so leaf is skipped
+    // Second composite: buffer is clean (clearDirty was called), so leaf is skipped.
     compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
-    // The 'Z' should persist because the clean leaf was not redrawn
-    try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(0, pad_h + 2).codepoint);
+    // The 'Z' survives because the clean leaf was not redrawn.
+    try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 }
 
 test "drawStatusLine paints the mode indicator at column 0 (shadowed row)" {
@@ -684,4 +722,228 @@ test "input line shows status hint after mode label when status is set" {
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 't'), screen.getCellConst(last_row, 9).codepoint);
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(last_row, 10).codepoint);
+}
+
+test "composite draws rounded frame around a single pane" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 20, 6);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(20, 6);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    // Corners at pane bounds (screen height 6 reserves row 5 for status,
+    // so the pane rect is 20x5 — bottom edge lives on row 4).
+    try std.testing.expectEqual(theme.borders.top_left, screen.getCellConst(0, 0).codepoint);
+    try std.testing.expectEqual(theme.borders.top_right, screen.getCellConst(0, 19).codepoint);
+    try std.testing.expectEqual(theme.borders.bottom_left, screen.getCellConst(4, 0).codepoint);
+    try std.testing.expectEqual(theme.borders.bottom_right, screen.getCellConst(4, 19).codepoint);
+    try std.testing.expectEqual(theme.borders.vertical, screen.getCellConst(1, 0).codepoint);
+    try std.testing.expectEqual(theme.borders.vertical, screen.getCellConst(1, 19).codepoint);
+}
+
+test "focused pane frame uses border_focused highlight, unfocused uses border" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 8);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    defer cb2.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb1.buf());
+    layout.recalculate(40, 8);
+    try layout.splitVertical(0.5, cb2.buf());
+    layout.recalculate(40, 8);
+    // Focus defaults to the first child (left pane).
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    const focused = Theme.resolve(theme.highlights.border_focused, &theme);
+    const plain = Theme.resolve(theme.highlights.border, &theme);
+
+    // Left pane's top-left corner uses the focused border fg.
+    try std.testing.expect(std.meta.eql(screen.getCellConst(0, 0).fg, focused.fg));
+    // Right pane's top-left corner (col 20) uses the plain border fg.
+    try std.testing.expect(std.meta.eql(screen.getCellConst(0, 20).fg, plain.fg));
+}
+
+test "focused pane title has inverse style, unfocused is plain" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 8);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb1 = try ConversationBuffer.init(allocator, 0, "aa");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bb");
+    defer cb2.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb1.buf());
+    layout.recalculate(40, 8);
+    try layout.splitVertical(0.5, cb2.buf());
+    layout.recalculate(40, 8);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    // Find the `a` name glyph in the focused pane's top edge (cols 0..19).
+    var found_focused_a = false;
+    for (1..19) |c| {
+        const cell = screen.getCellConst(0, @intCast(c));
+        if (cell.codepoint == 'a' and cell.style.inverse) {
+            found_focused_a = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_focused_a);
+
+    // Find the `b` name glyph in the unfocused pane's top edge (cols 20..39).
+    var found_unfocused_b = false;
+    for (21..39) |c| {
+        const cell = screen.getCellConst(0, @intCast(c));
+        if (cell.codepoint == 'b' and !cell.style.inverse) {
+            found_unfocused_b = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_unfocused_b);
+}
+
+test "title is suppressed when pane width is below 6" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 5, 6);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "longname");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(5, 6);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    // No cell on the top row should carry a name character.
+    var saw_name_char = false;
+    for (0..5) |c| {
+        const cp = screen.getCellConst(0, @intCast(c)).codepoint;
+        if (cp == 'l' or cp == 'o' or cp == 'n' or cp == 'g' or cp == 'a' or cp == 'm' or cp == 'e') {
+            saw_name_char = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_name_char);
+}
+
+test "long titles are truncated with ellipsis" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 12, 6);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    // available = 12 - 6 = 6 glyphs for the name -> truncates "verylongname" to "veryl…"
+    var cb = try ConversationBuffer.init(allocator, 0, "verylongname");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(12, 6);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    var saw_ellipsis = false;
+    for (0..12) |c| {
+        if (screen.getCellConst(0, @intCast(c)).codepoint == Theme.ellipsis) {
+            saw_ellipsis = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_ellipsis);
 }
