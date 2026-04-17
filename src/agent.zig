@@ -193,6 +193,16 @@ const PreHookOutcome = union(enum) {
     vetoed: []const u8,
 };
 
+/// Outcome of firing a `ToolPost` hook round-trip. When set,
+/// `content_rewrite` is an owned slice allocated with the caller's
+/// allocator that replaces the tool's result content. `is_error_rewrite`
+/// optionally overrides the error flag. Both are null when no hook
+/// mutated the tool result.
+const PostHookOutcome = struct {
+    content_rewrite: ?[]const u8,
+    is_error_rewrite: ?bool,
+};
+
 /// Fire `ToolPre` for one tool call and block on a main-thread
 /// round-trip. Polls the cancel flag every 50ms so a user interrupt
 /// during Lua work still tears down promptly.
@@ -233,6 +243,52 @@ fn firePreHook(
         return .{ .vetoed = reason };
     }
     return .{ .proceed = payload.tool_pre.args_rewrite };
+}
+
+/// Fire `ToolPost` for one tool call and block on a main-thread
+/// round-trip. Symmetric with `firePreHook`: polls the cancel flag
+/// every 50ms. Returns `error.Cancelled` if the user aborts during
+/// Lua work. The `duration_ms` is the elapsed time spent in
+/// `registry.execute`, forwarded to Lua as a metric.
+///
+/// Verification for this helper is deferred to the E2E test added in
+/// Task 17, which exercises content rewrite against a real registry.
+fn firePostHook(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    tc: types.ContentBlock.ToolUse,
+    elapsed_ms: u64,
+    result: ToolCallResult,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) !PostHookOutcome {
+    // No engine or no hooks registered -> skip round-trip. Same rationale
+    // as firePreHook: avoid deadlocks in dispatcher-less tests and useless
+    // queue churn when no post hooks are configured.
+    if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) {
+        return .{ .content_rewrite = null, .is_error_rewrite = null };
+    }
+    var payload: Hooks.HookPayload = .{ .tool_post = .{
+        .name = tc.name,
+        .call_id = tc.id,
+        .content = result.content,
+        .is_error = result.is_error,
+        .duration_ms = elapsed_ms,
+        .content_rewrite = null,
+        .is_error_rewrite = null,
+    } };
+    var req = Hooks.HookRequest.init(&payload);
+    try queue.push(.{ .hook_request = &req });
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) return error.Cancelled;
+        }
+    }
+    return .{
+        .content_rewrite = payload.tool_post.content_rewrite,
+        .is_error_rewrite = payload.tool_post.is_error_rewrite,
+    };
 }
 
 /// Run one tool call's full pipeline: check cancel, fire ToolPre,
@@ -293,7 +349,8 @@ fn runToolStep(
                 try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
             }
 
-            const step: ToolCallResult = blk: {
+            const t0 = std.time.milliTimestamp();
+            var final: ToolCallResult = blk: {
                 if (registry.execute(tc.name, effective_input, allocator)) |ok| {
                     break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
                 } else |err| {
@@ -301,19 +358,33 @@ fn runToolStep(
                     break :blk .{ .content = msg, .is_error = true, .owned = true };
                 }
             };
-            errdefer if (step.owned) allocator.free(step.content);
+            errdefer if (final.owned) allocator.free(final.content);
+            // milliTimestamp() is monotonic in practice but the type is i64.
+            // Clamp to 0 to avoid negative-delta wraparound when casting to u64.
+            const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - t0));
 
-            const result_content = try allocator.dupe(u8, step.content);
+            const post = try firePostHook(lua_engine, tc, elapsed_ms, final, queue, cancel);
+            // If a hook rewrote the content, the rewrite is owned by us.
+            // Drop the original content (if owned) and swap in the rewrite.
+            // Reassigning `final` in place keeps the single errdefer above
+            // pointing at whichever slice is currently live.
+            if (post.content_rewrite) |rewrite| {
+                if (final.owned) allocator.free(final.content);
+                final = .{ .content = rewrite, .is_error = final.is_error, .owned = true };
+            }
+            if (post.is_error_rewrite) |b| final.is_error = b;
+
+            const result_content = try allocator.dupe(u8, final.content);
             errdefer allocator.free(result_content);
             const result_id = try allocator.dupe(u8, tc.id);
             errdefer allocator.free(result_id);
             try queue.push(.{ .tool_result = .{
                 .content = result_content,
-                .is_error = step.is_error,
+                .is_error = final.is_error,
                 .call_id = result_id,
             } });
 
-            return step;
+            return final;
         },
     }
 }
