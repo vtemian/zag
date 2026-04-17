@@ -327,8 +327,15 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         while (written < self.render_buf.items.len) {
             written += file.write(self.render_buf.items[written..]) catch |err| switch (err) {
                 error.WouldBlock => {
-                    // Output buffer full; brief pause then retry
-                    std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+                    // Terminal output buffer full. Block until the kernel
+                    // reports the fd is writable again instead of polling
+                    // with an arbitrary retry delay. poll() retries EINTR
+                    // internally; on unexpected errors we just retry the
+                    // write, which will surface the real error.
+                    var fds = [_]std.posix.pollfd{
+                        .{ .fd = file.handle, .events = std.posix.POLL.OUT, .revents = 0 },
+                    };
+                    _ = std.posix.poll(&fds, -1) catch {};
                     continue;
                 },
                 else => return err,
