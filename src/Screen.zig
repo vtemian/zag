@@ -266,51 +266,56 @@ fn colorsEqual(a: Color, b: Color) bool {
 ///
 /// **Mutates self**: copies current to previous after writing, so a
 /// subsequent render with no intervening cell changes produces no output.
+///
+/// The diff scans each row left to right, merging contiguous dirty cells
+/// that share the same style/fg/bg into a single cursor-move + SGR + run
+/// of UTF-8 bytes. Implicit terminal cursor advancement after each
+/// codepoint keeps the per-cell overhead near zero.
 pub fn render(self: *Screen, file: std.fs.File) !void {
     self.render_buf.clearRetainingCapacity();
 
     const writer = self.render_buf.writer(self.allocator);
 
-    // Diff the current grid against previous and generate ANSI sequences
     var cells_changed: u32 = 0;
     {
         var diff_span = trace.span("diff_generate");
         defer diff_span.endWithArgs(.{ .cells_changed = cells_changed });
 
-        // Begin synchronized output
         try writer.writeAll("\x1b[?2026h");
 
-        var cursor_row: u16 = 0;
-        var cursor_col: u16 = 0;
-        var cursor_valid = false;
         var last_style: ?Style = null;
         var last_fg: ?Color = null;
         var last_bg: ?Color = null;
 
         for (0..self.height) |row_usize| {
             const row: u16 = @intCast(row_usize);
-            for (0..self.width) |col_usize| {
-                const col: u16 = @intCast(col_usize);
-                const idx = row_usize * @as(usize, self.width) + col_usize;
+            const row_base = row_usize * @as(usize, self.width);
 
+            var col: u16 = 0;
+            while (col < self.width) {
+                const idx = row_base + col;
                 const cur = self.current[idx];
                 const prev = self.previous[idx];
 
-                if (cellsEqual(cur, prev)) continue;
-                // Skip continuation cells — they're painted by their primary cell
-                if (cur.continuation) continue;
-                cells_changed += 1;
-
-                // Move cursor if needed
-                if (!cursor_valid or cursor_row != row or cursor_col != col) {
-                    // ANSI cursor positions are 1-indexed
-                    try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
-                    cursor_row = row;
-                    cursor_col = col;
-                    cursor_valid = true;
+                // Clean cell: skip. Continuation cells are painted by
+                // their primary and must never start a run on their own;
+                // treat them as "skip" when the primary upstream already
+                // handled them.
+                if (cellsEqual(cur, prev)) {
+                    col += 1;
+                    continue;
+                }
+                if (cur.continuation) {
+                    col += 1;
+                    continue;
                 }
 
-                // Emit SGR if style or colors changed
+                const run_end = self.findRunEnd(row, col, cur);
+                cells_changed += run_end - col;
+
+                // ANSI cursor positions are 1-indexed.
+                try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
+
                 if (!stylesEqual(last_style, cur.style) or
                     !optColorsEqual(last_fg, cur.fg) or
                     !optColorsEqual(last_bg, cur.bg))
@@ -321,28 +326,24 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                     last_bg = cur.bg;
                 }
 
-                // Write the codepoint as UTF-8, falling back to U+FFFD for invalid codepoints
-                var encoded: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cur.codepoint, &encoded) catch |err| blk: {
-                    log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cur.codepoint), err });
-                    // U+FFFD REPLACEMENT CHARACTER (0xEF 0xBF 0xBD)
-                    encoded[0] = 0xEF;
-                    encoded[1] = 0xBF;
-                    encoded[2] = 0xBD;
-                    break :blk 3;
-                };
-                try writer.writeAll(encoded[0..len]);
+                // Walk the run one grid column at a time. Continuation
+                // cells emit no bytes (the primary already did, and the
+                // terminal has advanced the cursor through them).
+                var c: u16 = col;
+                while (c < run_end) : (c += 1) {
+                    const run_cell = self.current[row_base + c];
+                    if (run_cell.continuation) continue;
+                    try writeCodepoint(writer, run_cell.codepoint);
+                }
 
-                cursor_col +|= width_mod.codepointWidth(cur.codepoint);
+                col = run_end;
             }
         }
 
-        // Reset attributes after rendering
         if (last_style != null or last_fg != null or last_bg != null) {
             try writer.writeAll("\x1b[0m");
         }
 
-        // End synchronized output
         try writer.writeAll("\x1b[?2026l");
     }
 
@@ -369,6 +370,69 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         defer copy_span.end();
         @memcpy(self.previous, self.current);
     }
+}
+
+/// Scan forward from `start_col` on `row` for the longest contiguous
+/// run of dirty cells that share the first cell's style/fg/bg. Returns
+/// the column after the last cell in the run (one past the end). The
+/// returned column is always in `(start_col, self.width]`.
+///
+/// Continuation cells (second half of a wide char) are swallowed into
+/// the run — they inherit style from their primary and the terminal
+/// advances the cursor through them implicitly. A wide-char primary
+/// whose successor is not a continuation cell terminates the run so
+/// the next iteration re-syncs cursor position explicitly.
+fn findRunEnd(self: *const Screen, row: u16, start_col: u16, head: Cell) u16 {
+    const row_base = @as(usize, row) * @as(usize, self.width);
+    var c: u16 = start_col;
+
+    // Advance past the head cell. If head is wide and col+1 is a proper
+    // continuation, include it; otherwise stop before col+1 so the next
+    // outer iteration issues a fresh cursor move.
+    const head_width = width_mod.codepointWidth(head.codepoint);
+    c += 1;
+    if (head_width == 2 and c < self.width and self.current[row_base + c].continuation) {
+        c += 1;
+    } else if (head_width == 2) {
+        return c;
+    }
+
+    while (c < self.width) {
+        const cell = self.current[row_base + c];
+        if (cell.continuation) {
+            c += 1;
+            continue;
+        }
+        if (cellsEqual(cell, self.previous[row_base + c])) break;
+        if (!stylesEqual(head.style, cell.style)) break;
+        if (!colorsEqual(head.fg, cell.fg)) break;
+        if (!colorsEqual(head.bg, cell.bg)) break;
+
+        const w = width_mod.codepointWidth(cell.codepoint);
+        c += 1;
+        if (w == 2) {
+            if (c < self.width and self.current[row_base + c].continuation) {
+                c += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    return c;
+}
+
+/// Write a single codepoint as UTF-8 to `writer`, substituting U+FFFD
+/// (0xEF 0xBF 0xBD) when the codepoint is not valid Unicode.
+fn writeCodepoint(writer: anytype, cp: u21) !void {
+    var encoded: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(cp, &encoded) catch |err| blk: {
+        log.warn("invalid codepoint U+{X:0>4}: {}", .{ @as(u32, cp), err });
+        encoded[0] = 0xEF;
+        encoded[1] = 0xBF;
+        encoded[2] = 0xBD;
+        break :blk 3;
+    };
+    try writer.writeAll(encoded[0..len]);
 }
 
 /// Check if an optional style matches a concrete style.
@@ -865,4 +929,83 @@ test "writeStr skips wide char that would overflow the row" {
     const end_col = screen.writeStr(0, 0, "中中", .{}, .default);
     try std.testing.expectEqual(@as(u16, 2), end_col);
     try std.testing.expect(screen.getCell(0, 2).codepoint == ' '); // untouched
+}
+
+test "diff emits at most one SGR per contiguous same-style run" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 20, 1);
+    defer screen.deinit();
+
+    // Fill 20 cells, all red foreground 'x'. One run, one style.
+    for (0..20) |i| {
+        const cell = screen.getCell(0, @intCast(i));
+        cell.codepoint = 'x';
+        cell.fg = .{ .palette = 1 };
+    }
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [2048]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Expected escape sequences: sync-start, cursor-pos, SGR, reset, sync-end (5).
+    // Cap at 6 to leave room for future refactors without overshooting by much.
+    var escapes: usize = 0;
+    for (output) |b| {
+        if (b == 0x1B) escapes += 1;
+    }
+    try std.testing.expect(escapes <= 6);
+
+    // And exactly one 256-palette-fg SGR emission in total.
+    const needle = "38;5;1";
+    var matches: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search, needle)) |pos| {
+        matches += 1;
+        search = pos + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+
+    // And all 20 'x' codepoints were emitted back-to-back somewhere.
+    try std.testing.expect(std.mem.indexOf(u8, output, "xxxxxxxxxxxxxxxxxxxx") != null);
+}
+
+test "diff merges run containing wide-char continuation cell" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 6, 1);
+    defer screen.deinit();
+
+    // Pattern: 'a' 'b' CJK(wide,cont) 'c' 'd' — all red fg, one style.
+    _ = screen.writeStr(0, 0, "ab中cd", .{}, .{ .palette = 1 });
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [2048]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Exactly one SGR for this same-style run.
+    const needle = "38;5;1";
+    var matches: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search, needle)) |pos| {
+        matches += 1;
+        search = pos + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+
+    // All codepoints emitted back-to-back (continuation cell consumed silently).
+    // U+4E2D "中" is 0xE4 0xB8 0xAD.
+    try std.testing.expect(std.mem.indexOf(u8, output, "ab\xE4\xB8\xADcd") != null);
 }
