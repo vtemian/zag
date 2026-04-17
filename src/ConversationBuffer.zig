@@ -707,19 +707,12 @@ pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle,
     }
 
     try self.loadFromEntries(entries);
-    try self.rebuildMessages(entries, allocator);
+    try self.session.rebuildMessages(entries, allocator);
 
     if (sh.meta.name_len > 0) {
         allocator.free(self.name);
         self.name = try allocator.dupe(u8, sh.meta.nameSlice());
     }
-}
-
-/// Shim: delegate message rebuild to the attached session.
-/// This exists to keep the intermediate commit compiling during the
-/// ConversationBuffer/ConversationSession split. It is removed in Task 1.3.
-pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry, allocator: Allocator) !void {
-    try self.session.rebuildMessages(entries, allocator);
 }
 
 // -- Buffer interface --------------------------------------------------------
@@ -1353,7 +1346,7 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
         .{ .entry_type = .assistant_text, .content = "done", .timestamp = 4 },
     };
 
-    try cb.rebuildMessages(&entries, allocator);
+    try cb.session.rebuildMessages(&entries, allocator);
 
     // Expected message sequence: user, assistant(text + tool_use), user(tool_result), assistant(text)
     try std.testing.expectEqual(@as(usize, 4), cb.session.messages.items.len);
