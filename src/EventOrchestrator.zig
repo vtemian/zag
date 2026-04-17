@@ -812,7 +812,7 @@ fn autoNameSession(self: *EventOrchestrator, cb: *ConversationBuffer) void {
     const sh = cb.session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
-    const inputs = cb.sessionSummaryInputs() orelse return;
+    const inputs = cb.session.sessionSummaryInputs() orelse return;
 
     const summary = self.generateSessionName(inputs) catch |err| {
         log.debug("auto-name failed: {}", .{err});
@@ -828,7 +828,7 @@ fn autoNameSession(self: *EventOrchestrator, cb: *ConversationBuffer) void {
 /// Send a minimal LLM request to summarize the first exchange in 3-5 words.
 fn generateSessionName(
     self: *EventOrchestrator,
-    inputs: ConversationBuffer.SessionSummaryInputs,
+    inputs: ConversationSession.SessionSummaryInputs,
 ) ![]const u8 {
     const allocator = self.allocator;
 
