@@ -433,14 +433,13 @@ fn doSplit(direction: Layout.SplitDirection, ctx: *const AppContext) void {
 
 /// Drain all pending bytes from the wake pipe. Called after poll() returns
 /// so a single wake-up corresponds to one main loop iteration regardless
-/// of how many bytes are queued.
+/// of how many bytes are queued. Errors (WouldBlock when drained, or
+/// unexpected pipe failures) are non-fatal: the authoritative state lives
+/// in the event queue and resize flag, not in the byte count.
 fn drainWakePipe(fd: std.posix.fd_t) void {
     var buf: [64]u8 = undefined;
     while (true) {
-        _ = std.posix.read(fd, &buf) catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => return,
-        };
+        _ = std.posix.read(fd, &buf) catch return;
     }
 }
 
@@ -882,4 +881,33 @@ test "appendOutputText creates a status node" {
     try std.testing.expectEqual(@as(usize, 1), buffer.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, buffer.root_children.items[0].node_type);
     try std.testing.expectEqualStrings("hello world", buffer.root_children.items[0].content.items);
+}
+
+test "drainWakePipe empties a pipe with pending bytes" {
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+
+    // Write a burst of wake bytes like multiple agent thread pushes.
+    const payload = [_]u8{1} ** 7;
+    _ = try std.posix.write(fds[1], &payload);
+
+    drainWakePipe(fds[0]);
+
+    // Read end must now report WouldBlock (fully drained).
+    var scratch: [4]u8 = undefined;
+    const read_err = std.posix.read(fds[0], &scratch);
+    try std.testing.expectError(error.WouldBlock, read_err);
+}
+
+test "drainWakePipe on an empty pipe returns without error" {
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+
+    // Nothing written: drain should still return cleanly.
+    drainWakePipe(fds[0]);
+
+    var scratch: [4]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, std.posix.read(fds[0], &scratch));
 }

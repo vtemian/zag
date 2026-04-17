@@ -271,3 +271,16 @@ test "raw mode enter and exit round-trips termios" {
     // We don't assert this because some test environments may already be raw
     _ = original;
 }
+
+test "setWakeFd stores the fd for the SIGWINCH handler to use" {
+    const previous = wake_fd;
+    defer wake_fd = previous;
+
+    setWakeFd(42);
+    try std.testing.expectEqual(@as(posix.fd_t, 42), wake_fd);
+
+    // Negative sentinel means "unset" by convention; the handler uses
+    // `fd >= 0` to gate the syscall.
+    setWakeFd(-1);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), wake_fd);
+}
