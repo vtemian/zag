@@ -1,8 +1,11 @@
 //! Compositor: merges buffer content into a Screen grid via the layout tree.
 //!
 //! Reads visible lines from each buffer leaf in the layout and writes them
-//! into the Screen at each leaf's rect position. Draws a rounded frame with
-//! an embedded title around every pane, plus the bottom status/input line.
+//! into the Screen at each leaf's rect position. Around every pane draws a
+//! rounded frame with an embedded title, and inside every pane reserves the
+//! bottom content row for a `› <draft>` prompt (block cursor on the focused
+//! pane when in insert mode). The global bottom row is a status-only line
+//! with the mode label, focused buffer name, size, and optional metrics.
 //! All styling reads from the Theme.
 
 const std = @import("std");
@@ -40,6 +43,13 @@ pub const InputState = struct {
     /// Current editing mode; rendered as the `[INSERT]`/`[NORMAL]`
     /// label in the bottom status row.
     mode: Keymap.Mode,
+    /// One-shot status message (split announces, agent lastInfo, etc.).
+    /// Replaces the focused pane's prompt row when non-empty.
+    status: []const u8 = "",
+    /// Whether the focused pane's agent is running (shows a spinner next
+    /// to the status on the focused pane's prompt row).
+    agent_running: bool = false,
+    spinner_frame: u8 = 0,
 };
 
 /// Composite the layout into the screen grid.
@@ -82,6 +92,14 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
         defer s.end();
         self.drawStatusLine(focused, input.mode, input.fps);
     }
+
+    // Per-pane prompts: repainted every frame because drafts change on
+    // every keystroke, independent of layout_dirty or buffer dirty state.
+    {
+        var s = trace.span("pane_prompts");
+        defer s.end();
+        self.drawPanePrompts(root, focused, input);
+    }
 }
 
 /// Draw content for all leaves (used on layout change / full redraw).
@@ -106,12 +124,15 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
             if (leaf.buffer.isDirty()) {
                 // Clear only the interior; the frame survives across
                 // dirty-leaf updates so we don't need to redraw it.
+                // Mirror the prompt-row reservation in drawBufferContent so
+                // content-dirty clears don't wipe the per-pane prompt.
                 if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
+                    const reserve: u16 = if (leaf.rect.height >= 4) 1 else 0;
                     self.screen.clearRect(
                         leaf.rect.y + 1,
                         leaf.rect.x + 1,
                         leaf.rect.width - 2,
-                        leaf.rect.height - 2,
+                        leaf.rect.height - 2 - reserve,
                     );
                 }
                 self.drawBufferContent(&leaf);
@@ -136,11 +157,15 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
     // Each pane owns a 1-cell frame on every side. Content must fit inside.
     if (outer.width < 3 or outer.height < 3) return;
 
+    // Reserve the bottom-most content row for the per-pane prompt whenever
+    // the pane is tall enough. A 3-row pane only has room for frame + one
+    // content row, so we skip the reservation there.
+    const reserve_prompt: u16 = if (outer.height >= 4) 1 else 0;
     const rect = Layout.Rect{
         .x = outer.x + 1,
         .y = outer.y + 1,
         .width = outer.width - 2,
-        .height = outer.height - 2,
+        .height = outer.height - 2 - reserve_prompt,
     };
 
     const buf = leaf.buffer;
@@ -278,6 +303,107 @@ fn paintCell(self: *Compositor, row: u16, col: u16, codepoint: u21, s: Theme.Res
     cell.codepoint = codepoint;
     cell.style = s.screen_style;
     cell.fg = s.fg;
+}
+
+/// Draw `› <draft>` plus a cursor (for the focused pane in insert mode)
+/// at the bottom content row of every pane. Called every frame because
+/// drafts update on every keystroke, independent of layout or buffer
+/// dirty state.
+fn drawPanePrompts(
+    self: *Compositor,
+    root: *const Layout.LayoutNode,
+    focused: *const Layout.LayoutNode,
+    input: InputState,
+) void {
+    self.drawPanePromptsPass(root, focused, input);
+}
+
+fn drawPanePromptsPass(
+    self: *Compositor,
+    node: *const Layout.LayoutNode,
+    focused: *const Layout.LayoutNode,
+    input: InputState,
+) void {
+    switch (node.*) {
+        .leaf => {
+            const is_focused = (node == focused);
+            self.drawPanePrompt(&node.leaf, is_focused, input);
+        },
+        .split => |s| {
+            self.drawPanePromptsPass(s.first, focused, input);
+            self.drawPanePromptsPass(s.second, focused, input);
+        },
+    }
+}
+
+/// Paint one pane's prompt row. No-op when the pane is too short/narrow.
+/// On the focused pane, `input.status` replaces the prompt whenever it's
+/// non-empty (split announces, `lastInfo`, "streaming..."), with an
+/// optional spinner tail when `input.agent_running`.
+fn drawPanePrompt(
+    self: *Compositor,
+    leaf: *const Layout.LayoutNode.Leaf,
+    focused: bool,
+    input: InputState,
+) void {
+    const rect = leaf.rect;
+    // Frame takes 2 rows; need at least one content row + one prompt row.
+    if (rect.height < 4 or rect.width < 4) return;
+
+    const prompt_row = rect.y + rect.height - 2;
+    const content_x = rect.x + 1 + self.theme.spacing.padding_h;
+    // Exclusive right edge: the rightmost column belongs to the frame.
+    const right_edge = rect.x + rect.width - 1;
+    if (content_x >= right_edge) return;
+
+    // Focused pane: if a global status toast is set, it takes over the
+    // prompt row entirely (with an optional spinner). This preserves the
+    // split-announce / agent-info UX that the global bar used to carry.
+    if (focused and input.status.len > 0) {
+        const resolved = Theme.resolve(self.theme.highlights.status, self.theme);
+        const available_status: usize = right_edge - content_x;
+        const status_shown = if (input.status.len <= available_status)
+            input.status
+        else
+            input.status[0..available_status];
+        const col = self.screen.writeStr(prompt_row, content_x, status_shown, resolved.screen_style, resolved.fg);
+        if (input.agent_running and col < right_edge) {
+            const spinner = "|/-\\";
+            const idx: usize = @intCast(input.spinner_frame % 4);
+            _ = self.screen.writeStr(prompt_row, col + 1, spinner[idx .. idx + 1], resolved.screen_style, resolved.fg);
+        }
+        return;
+    }
+
+    const cb = ConversationBuffer.fromBuffer(leaf.buffer);
+    const draft = cb.getDraft();
+
+    const prompt = Theme.resolve(self.theme.highlights.input_prompt, self.theme);
+    const text = Theme.resolve(self.theme.highlights.input_text, self.theme);
+
+    // `› ` glyph + trailing space; 2 columns of chrome.
+    if (content_x + 2 > right_edge) return;
+    const after_prompt = self.screen.writeStr(prompt_row, content_x, "\u{203A} ", prompt.screen_style, prompt.fg);
+
+    // Byte-level clip for the draft; input handler only accepts ASCII today,
+    // so this is safe. Leaves one cell for the cursor block when the pane
+    // is focused in insert mode.
+    const available: usize = if (right_edge > after_prompt + 1)
+        right_edge - after_prompt - 1
+    else
+        0;
+    const shown = if (draft.len <= available) draft else draft[0..available];
+
+    const end_col = self.screen.writeStr(prompt_row, after_prompt, shown, text.screen_style, text.fg);
+
+    // Cursor cell: only on the focused pane in insert mode.
+    if (focused and input.mode == .insert and end_col < right_edge) {
+        const cell = self.screen.getCell(prompt_row, end_col);
+        cell.codepoint = ' ';
+        cell.style = .{};
+        cell.fg = self.theme.colors.fg;
+        cell.bg = self.theme.colors.accent;
+    }
 }
 
 /// Draw the pane's title embedded in the top border.
@@ -799,4 +925,148 @@ test "long titles are truncated with ellipsis" {
         }
     }
     try std.testing.expect(saw_ellipsis);
+}
+
+test "focused pane renders its draft with a block cursor at end" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 8);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    defer cb.deinit();
+    for ("hi") |ch| cb.appendToDraft(ch);
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 8);
+
+    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+
+    // Pane is 40x7 (8 rows minus 1 for global status row).
+    // Prompt row = rect.y + rect.height - 2 = 5.
+    // Content starts at col rect.x + 1 + pad_h = 2 (pad_h = 1 by default).
+    // Prompt glyph at col 2, space at 3, 'h' at 4, 'i' at 5, cursor at 6.
+    try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(5, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(5, 4).codepoint);
+    try std.testing.expectEqual(@as(u21, 'i'), screen.getCellConst(5, 5).codepoint);
+    // Cursor cell: space + accent bg.
+    const cursor = screen.getCellConst(5, 6);
+    try std.testing.expectEqual(@as(u21, ' '), cursor.codepoint);
+    try std.testing.expect(!std.meta.eql(cursor.bg, Screen.Color.default));
+}
+
+test "unfocused pane shows its draft without a cursor block" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 8);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+    var cb1 = try ConversationBuffer.init(allocator, 0, "a");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "b");
+    defer cb2.deinit();
+    for ("world") |ch| cb2.appendToDraft(ch);
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb1.buf());
+    layout.recalculate(40, 8);
+    try layout.splitVertical(0.5, cb2.buf());
+    layout.recalculate(40, 8);
+    // Focus stays on the left pane (cb1).
+
+    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+
+    // Right pane rect is (x=20, width=20). Prompt row = 5. Content col = 20+1+1 = 22.
+    try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(5, 22).codepoint);
+    try std.testing.expectEqual(@as(u21, 'w'), screen.getCellConst(5, 24).codepoint);
+    // Right pane is unfocused: no cell on its prompt row has a non-default bg.
+    var any_bg = false;
+    for (20..40) |c| {
+        if (!std.meta.eql(screen.getCellConst(5, @intCast(c)).bg, Screen.Color.default)) {
+            any_bg = true;
+            break;
+        }
+    }
+    try std.testing.expect(!any_bg);
+}
+
+test "normal mode does not paint a block cursor in the focused pane" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 8);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    defer cb.deinit();
+    for ("hi") |ch| cb.appendToDraft(ch);
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 8);
+
+    compositor.composite(&layout, .{ .fps = 0, .mode = .normal });
+
+    // Prompt row = 5. Draft shows but no cursor block.
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(5, 4).codepoint);
+    var any_bg = false;
+    for (1..39) |c| {
+        if (!std.meta.eql(screen.getCellConst(5, @intCast(c)).bg, Screen.Color.default)) {
+            any_bg = true;
+            break;
+        }
+    }
+    try std.testing.expect(!any_bg);
+}
+
+test "tiny pane (height 3) skips the prompt reservation" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 20, 4);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    defer cb.deinit();
+    for ("hi") |ch| cb.appendToDraft(ch);
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(20, 4);
+    // Pane rect = 20x3 (4 rows - 1 for status). Too small for a prompt row,
+    // so the composite must not crash and must not draw a prompt glyph.
+
+    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+
+    var saw_prompt = false;
+    for (0..screen.height) |r| for (0..screen.width) |c| {
+        if (screen.getCellConst(@intCast(r), @intCast(c)).codepoint == 0x203A) {
+            saw_prompt = true;
+            break;
+        }
+    };
+    try std.testing.expect(!saw_prompt);
 }
