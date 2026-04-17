@@ -11,6 +11,7 @@ const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const EventOrchestrator = @import("EventOrchestrator.zig");
 const Theme = @import("Theme.zig");
 const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
@@ -23,6 +24,11 @@ screen: *Screen,
 allocator: Allocator,
 /// Design system for colors, highlights, spacing, and borders.
 theme: *const Theme,
+/// Orchestrator handle used to resolve pane-scoped diagnostics (e.g. the
+/// dropped-event counter on AgentRunner) from a focused leaf's Buffer.
+/// Null when running outside an orchestrator, which disables those
+/// diagnostics but leaves everything else intact.
+orchestrator: ?*EventOrchestrator = null,
 /// Whether the layout changed (resize/split/close) and borders need redrawing.
 /// The caller sets this; composite clears it.
 layout_dirty: bool = true,
@@ -381,11 +387,20 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
     const info = std.fmt.bufPrint(&info_scratch, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
     col = self.screen.writeStr(last_row, col, info, resolved.screen_style, resolved.fg);
 
-    // Phase 3 temporary gap: the dropped-event counter lives on AgentRunner
-    // (reachable via Pane), but Compositor only has a Buffer interface. Phase
-    // 4 threads the orchestrator through Compositor and reintroduces the
-    // lookup via EventOrchestrator.paneFromBuffer(leaf.buffer). Until then
-    // this diagnostic display is intentionally disabled.
+    // Dropped-event counter: visible only when backpressure actually hit.
+    // Resolved from the focused leaf's Buffer via the orchestrator's pane
+    // lookup; degrades silently when the Compositor is driven without an
+    // orchestrator (e.g. in unit tests).
+    if (self.orchestrator) |orch| {
+        if (orch.paneFromBuffer(leaf.buffer)) |pane| {
+            const dropped = pane.runner.droppedEventCount();
+            if (dropped > 0) {
+                var drops_scratch: [32]u8 = undefined;
+                const drops_label = std.fmt.bufPrint(&drops_scratch, " [drops: {d}]", .{dropped}) catch return;
+                col = self.screen.writeStr(last_row, col, drops_label, resolved.screen_style, resolved.fg);
+            }
+        }
+    }
 
     // When metrics are enabled, show the last frame time right-aligned
     if (trace.enabled) {

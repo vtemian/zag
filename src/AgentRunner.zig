@@ -108,6 +108,20 @@ pub fn lastInfo(self: *const AgentRunner) []const u8 {
     return self.last_info[0..self.last_info_len];
 }
 
+/// Whether the event queue currently holds initialized storage (i.e.,
+/// an agent is running or finishing up). Callers use this to gate
+/// reads of `event_queue` state such as the dropped-event counter.
+pub fn queueActive(self: *const AgentRunner) bool {
+    return self.queue_active;
+}
+
+/// Number of events dropped due to bounded-queue backpressure since this
+/// runner's current queue was initialized. Zero when the queue is inactive.
+pub fn droppedEventCount(self: *const AgentRunner) u64 {
+    if (!self.queue_active) return 0;
+    return self.event_queue.dropped.load(.monotonic);
+}
+
 /// Reset streaming/correlation state so the next agent run renders from
 /// a clean slate. Does not touch the pending_tool_calls map, which must
 /// be empty at this point (otherwise there's a correlation leak and the
