@@ -15,6 +15,7 @@ const AgentThread = @import("AgentThread.zig");
 const llm = @import("llm.zig");
 const tools_mod = @import("tools.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const Hooks = @import("Hooks.zig");
 
 const ConversationBuffer = @This();
 
@@ -125,6 +126,9 @@ queue_active: bool = false,
 /// Wake fd for the main loop. Copied into EventQueue at submit time so
 /// agent threads can wake the poll() in main.zig.
 wake_fd: ?std.posix.fd_t = null,
+/// Pointer to the shared Lua engine, if any. Used by the main-thread
+/// drain loop to service `hook_request` events pushed by the agent.
+lua_engine: ?*LuaEngine = null,
 
 /// Create a new empty buffer with the given id and name.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
@@ -485,6 +489,10 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
+            if (self.lua_engine) |eng| {
+                var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text } };
+                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+            }
             if (self.current_assistant_node) |node| {
                 self.appendToNode(node, text) catch |err| {
                     log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
@@ -549,11 +557,19 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
             self.last_info_len = @intCast(len);
         },
         .done => {
+            if (self.lua_engine) |eng| {
+                var payload: Hooks.HookPayload = .{ .agent_done = {} };
+                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+            }
             self.current_assistant_node = null;
         },
         .reset_assistant_text => self.resetCurrentAssistantText(),
         .err => |text| {
             defer allocator.free(text);
+            if (self.lua_engine) |eng| {
+                var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
+                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+            }
             _ = self.appendNode(null, .err, text) catch {};
             self.persistEvent(.{
                 .entry_type = .err,
@@ -561,6 +577,12 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 .timestamp = std.time.milliTimestamp(),
             });
         },
+        // These round-trip events are normally consumed by
+        // `dispatchHookRequests` before the drain sees them. If one slips
+        // through (e.g. because dispatch ran with a null engine), signal
+        // `done` so the producer in the agent thread doesn't block forever.
+        .hook_request => |req| req.done.set(),
+        .lua_tool_request => |req| req.done.set(),
     }
 }
 
@@ -575,17 +597,49 @@ pub fn submitInput(
     allocator: Allocator,
     lua_eng: ?*LuaEngine,
 ) !void {
+    // Fire UserMessagePre synchronously: hooks may veto or rewrite the text
+    // before it enters the conversation history. `working_text` is the
+    // effective text used for the rest of submitInput; if a rewrite fires
+    // the freshly allocated slice is tracked in `text_rewrite_owned` and
+    // freed on return (including the cancel early-return, which can't own
+    // a rewrite since the veto path returns before rewrite handling).
+    var working_text: []const u8 = text;
+    var text_rewrite_owned: ?[]const u8 = null;
+    defer if (text_rewrite_owned) |t| allocator.free(t);
+
+    if (lua_eng) |eng| {
+        var payload: Hooks.HookPayload = .{ .user_message_pre = .{
+            .text = text,
+            .text_rewrite = null,
+        } };
+        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+        if (eng.takeCancel()) |reason| {
+            defer allocator.free(reason);
+            _ = try self.appendNode(null, .err, reason);
+            return;
+        }
+        if (payload.user_message_pre.text_rewrite) |rewritten| {
+            working_text = rewritten;
+            text_rewrite_owned = rewritten;
+        }
+    }
+
     // Append user message to conversation history
     const content = try allocator.alloc(types.ContentBlock, 1);
-    const duped = try allocator.dupe(u8, text);
+    const duped = try allocator.dupe(u8, working_text);
     content[0] = .{ .text = .{ .text = duped } };
     try self.messages.append(allocator, .{ .role = .user, .content = content });
 
-    _ = try self.appendNode(null, .user_message, text);
+    if (lua_eng) |eng| {
+        var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
+        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+    }
+
+    _ = try self.appendNode(null, .user_message, working_text);
 
     self.persistEvent(.{
         .entry_type = .user_message,
-        .content = text,
+        .content = working_text,
         .timestamp = std.time.milliTimestamp(),
     });
 
@@ -597,6 +651,7 @@ pub fn submitInput(
     self.event_queue = AgentThread.EventQueue.init(allocator);
     self.event_queue.wake_fd = self.wake_fd;
     self.queue_active = true;
+    self.lua_engine = lua_eng;
 
     self.agent_thread = AgentThread.spawn(
         provider,
@@ -615,9 +670,57 @@ pub fn submitInput(
     };
 }
 
+/// Pull any hook_request events out of the queue and service them on the
+/// main thread (the only thread allowed to touch Lua). Non-hook events are
+/// compacted back into the queue in their original order. Called before the
+/// normal drain loop so pre-hook vetos round-trip with minimal latency.
+pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine) void {
+    queue.mutex.lock();
+    defer queue.mutex.unlock();
+
+    var write: usize = 0;
+    for (queue.items.items) |ev| {
+        switch (ev) {
+            .hook_request => |req| {
+                if (engine) |eng| {
+                    eng.fireHook(req.payload) catch |err| {
+                        log.warn("hook dispatch failed: {}", .{err});
+                    };
+                    if (eng.takeCancel()) |reason| {
+                        req.cancelled = true;
+                        req.cancel_reason = reason;
+                    }
+                }
+                // Always signal, even without an engine: the agent thread
+                // is parked on `req.done` and must be released so the
+                // tool call can proceed (or fail) cleanly.
+                req.done.set();
+            },
+            .lua_tool_request => |req| {
+                if (engine) |eng| {
+                    const result = eng.executeTool(req.tool_name, req.input_raw, req.allocator);
+                    req.result_content = result.content;
+                    req.result_is_error = result.is_error;
+                    req.result_owned = result.owned;
+                }
+                // Always signal, even without an engine, so the pushing
+                // thread doesn't block forever.
+                req.done.set();
+            },
+            else => {
+                queue.items.items[write] = ev;
+                write += 1;
+            },
+        }
+    }
+    queue.items.items.len = write;
+}
+
 /// Drain pending agent events. Returns true if the agent finished this frame.
 pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
     if (self.agent_thread == null) return false;
+
+    dispatchHookRequests(&self.event_queue, self.lua_engine);
 
     var drain: [64]AgentThread.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
@@ -1188,4 +1291,88 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
 
     try std.testing.expect(queue.wake_fd != null);
     try std.testing.expectEqual(@as(std.posix.fd_t, 777), queue.wake_fd.?);
+}
+
+test "dispatchHookRequests fires Lua hook and signals done" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.last_turn = nil
+        \\zag.hook("TurnStart", function(evt) _G.last_turn = evt.turn_num end)
+    );
+
+    var queue = AgentThread.EventQueue.init(alloc);
+    defer queue.deinit();
+
+    var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 7, .message_count = 1 } };
+    var req = Hooks.HookRequest.init(&payload);
+    try queue.push(.{ .hook_request = &req });
+
+    dispatchHookRequests(&queue, &engine);
+
+    try std.testing.expect(req.done.isSet());
+    _ = try engine.lua.getGlobal("last_turn");
+    try std.testing.expectEqual(@as(i64, 7), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "lua_tool_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool({
+        \\  name = "echo",
+        \\  description = "echo input",
+        \\  input_schema = { type = "object" },
+        \\  execute = function(args) return "ok: " .. tostring(args.val) end,
+        \\})
+    );
+
+    var queue = AgentThread.EventQueue.init(alloc);
+    defer queue.deinit();
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "echo",
+        .input_raw = "{\"val\":1}",
+        .allocator = alloc,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    try queue.push(.{ .lua_tool_request = &req });
+
+    dispatchHookRequests(&queue, &engine);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_content != null);
+    defer if (req.result_owned) alloc.free(req.result_content.?);
+    try std.testing.expect(std.mem.indexOf(u8, req.result_content.?, "ok: 1") != null);
+}
+
+test "text_delta fires post-hook with text" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.last_delta = nil
+        \\zag.hook("TextDelta", { enabled = true }, function(evt)
+        \\  _G.last_delta = evt.text
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = "chunk!" } };
+    try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("last_delta");
+    try std.testing.expectEqualStrings("chunk!", try engine.lua.toString(-1));
+    engine.lua.pop(1);
 }
