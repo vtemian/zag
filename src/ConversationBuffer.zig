@@ -362,35 +362,20 @@ pub fn clear(self: *ConversationBuffer) void {
     self.render_dirty = true;
 }
 
-/// Submit user input: append the message to conversation history, create a
-/// user_message node, and persist the entry to the session log.
-///
-/// The buffer is a pure data container: it does not spawn an agent thread.
-/// Agent-thread lifecycle belongs to the orchestrator, which calls this
-/// method and then decides whether to start the agent.
+/// Append a user_message node at the root of the tree and return it.
+/// Thin wrapper around `appendNode` used by the runner's submit path.
+pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
+    return self.appendNode(null, .user_message, text);
+}
+
+/// Submit user input. Thin shim over `AgentRunner.submitInput`; removed
+/// in Phase 4 when callers take a Pane directly.
 pub fn submitInput(
     self: *ConversationBuffer,
     text: []const u8,
     allocator: Allocator,
 ) !void {
-    // The allocator is ignored here; ConversationSession uses its own.
-    // Phase 2 reintroduces it when submitInput moves onto AgentRunner and
-    // needs a scratch allocator for coordinated view+session work.
-    _ = allocator;
-
-    try self.session.appendUserMessage(text);
-
-    _ = try self.appendNode(null, .user_message, text);
-
-    self.session.persistEvent(.{
-        .entry_type = .user_message,
-        .content = text,
-        .timestamp = std.time.milliTimestamp(),
-    });
-
-    // Reset streaming state so the next agent run starts from a clean UI.
-    self.runner.current_assistant_node = null;
-    self.runner.last_tool_call = null;
+    return self.runner.submitInput(text, allocator);
 }
 
 /// Drain pending agent events. Thin delegation to the runner so existing
