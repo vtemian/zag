@@ -99,14 +99,15 @@ next_buffer_id: u32 = 1,
 next_scratch_id: u32 = 1,
 /// One-shot status message rendered on the input/status row, cleared on
 /// the next key event. Used for announces like `split → scratch 2`.
-transient_status_buf: [64]u8 = undefined,
+transient_status: [64]u8 = undefined,
 transient_status_len: u8 = 0,
 /// Frame counter for animating the status bar spinner.
 spinner_frame: u8 = 0,
 /// Fixed-size input line buffer.
-input_buf: [MAX_INPUT]u8 = undefined,
-/// Number of valid bytes in input_buf.
-input_len: usize = 0,
+/// Bytes the user has typed on the input line but not yet submitted.
+typed: [MAX_INPUT]u8 = undefined,
+/// Number of valid bytes in `typed`.
+typed_len: usize = 0,
 /// Global editing mode. Insert = typing into input buffer;
 /// Normal = keymap bindings fire, typing is disabled.
 ///
@@ -193,7 +194,7 @@ pub fn run(self: *EventOrchestrator) !void {
 
     // Initial render
     self.compositor.composite(self.layout, .{
-        .text = self.input_buf[0..self.input_len],
+        .text = self.typed[0..self.typed_len],
         .status = "",
         .agent_running = false,
         .spinner_frame = 0,
@@ -330,13 +331,13 @@ fn tick(
     const focused = self.getFocusedConversation();
     const agent_running = focused.isAgentRunning();
     const status = if (self.transient_status_len > 0)
-        self.transient_status_buf[0..self.transient_status_len]
+        self.transient_status[0..self.transient_status_len]
     else if (agent_running) blk: {
         const info = focused.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
     self.compositor.composite(self.layout, .{
-        .text = self.input_buf[0..self.input_len],
+        .text = self.typed[0..self.typed_len],
         .status = status,
         .agent_running = agent_running,
         .spinner_frame = self.spinner_frame,
@@ -409,7 +410,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 // in insert mode. Normal mode falls through to the
                 // keymap registry (or ignored).
                 if (ch == 'w' and self.current_mode == .insert) {
-                    self.input_len = inputDeleteWord(&self.input_buf, self.input_len);
+                    self.typed_len = inputDeleteWord(&self.typed, self.typed_len);
                     return .redraw;
                 }
             },
@@ -429,14 +430,14 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // Insert mode: regular input-line editing.
     switch (k.key) {
         .enter => {
-            if (self.input_len == 0) return .none;
+            if (self.typed_len == 0) return .none;
 
-            const user_input = self.input_buf[0..self.input_len];
+            const user_input = self.typed[0..self.typed_len];
 
             switch (self.handleCommand(user_input)) {
                 .quit => return .quit,
                 .handled => {
-                    self.input_len = 0;
+                    self.typed_len = 0;
                     return .redraw;
                 },
                 .not_a_command => {
@@ -447,17 +448,17 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                         log.warn("submit failed: {}", .{err});
                         return .none;
                     };
-                    self.input_len = 0;
+                    self.typed_len = 0;
                     return .redraw;
                 },
             }
         },
         .backspace => {
-            self.input_len = inputDeleteBack(self.input_len);
+            self.typed_len = inputDeleteBack(self.typed_len);
         },
         .char => |ch| {
             if (ch >= 0x20 and ch < 0x7f) {
-                self.input_len = inputAppendChar(&self.input_buf, self.input_len, @intCast(ch));
+                self.typed_len = inputAppendChar(&self.typed, self.typed_len, @intCast(ch));
             }
         },
         .page_up => {
@@ -625,11 +626,11 @@ fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
 
     // Transient announce; cleared on the next key event.
     const written = std.fmt.bufPrint(
-        &self.transient_status_buf,
+        &self.transient_status,
         "split \u{2192} scratch {d}",
         .{scratch_id},
     ) catch "";
-    self.transient_status_len = @intCast(@min(written.len, self.transient_status_buf.len));
+    self.transient_status_len = @intCast(@min(written.len, self.transient_status.len));
 }
 
 /// Create a new split pane: buffer + optional session, tracked for cleanup.
@@ -637,8 +638,8 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     const cb = try self.allocator.create(ConversationBuffer);
     errdefer self.allocator.destroy(cb);
 
-    var name_buf: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+    var name_scratch: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
 
     cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
     errdefer cb.deinit();

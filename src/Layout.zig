@@ -158,14 +158,14 @@ pub fn focusDirection(self: *Layout, dir: FocusDirection) void {
     };
 
     // Collect all leaves
-    var leaves_buf: [64]*LayoutNode = undefined;
+    var leaves: [64]*LayoutNode = undefined;
     var leaf_count: usize = 0;
-    collectLeaves(r, &leaves_buf, &leaf_count);
+    collectLeaves(r, &leaves, &leaf_count);
 
     var best: ?*LayoutNode = null;
     var best_dist: i32 = std.math.maxInt(i32);
 
-    for (leaves_buf[0..leaf_count]) |node| {
+    for (leaves[0..leaf_count]) |node| {
         if (node == f) continue;
         const rect = node.leaf.rect;
 
