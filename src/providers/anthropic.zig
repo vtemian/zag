@@ -170,11 +170,11 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     }
 
     // Parse content blocks
-    const content_array = root.get("content").?.array;
+    const content = root.get("content").?.array;
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
 
-    for (content_array.items) |item| {
+    for (content.items) |item| {
         const obj = item.object;
         const block_type = obj.get("type").?.string;
 
