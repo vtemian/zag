@@ -120,21 +120,38 @@ keymap_registry: Keymap.Registry = undefined,
 
 // -- Construction ------------------------------------------------------------
 
-/// Initial configuration, bundled so init() has a sane call site.
+/// Initial configuration, bundled so init() has a sane call site. Each
+/// field maps one-to-one to an orchestrator field of the same name.
 pub const Config = struct {
+    /// Heap allocator for runtime allocations.
     allocator: Allocator,
+    /// Terminal I/O: raw mode, alternate screen, resize signals.
     terminal: *Terminal,
+    /// Cell grid and ANSI renderer.
     screen: *Screen,
+    /// Window tree: splits and focus state.
     layout: *Layout,
+    /// Renders layout into the screen grid.
     compositor: *Compositor,
+    /// Root conversation buffer (initial session pane).
     root_buffer: *ConversationBuffer,
+    /// LLM provider for model calls and model ID lookups.
     provider: *llm.ProviderResult,
+    /// Tool registry for dispatching tool calls.
     registry: *const tools.Registry,
+    /// Session manager for persistence, or null if unavailable.
     session_mgr: *?Session.SessionManager,
+    /// Lua plugin engine, or null if Lua init failed.
     lua_engine: ?*LuaEngine,
+    /// Where to write the rendered screen.
     stdout_file: std.fs.File,
+    /// Allocator wrapper for per-frame alloc counts; non-null with -Dmetrics.
     counting: ?*trace.CountingAllocator,
+    /// Read end of the wake pipe; polled alongside stdin so agent events
+    /// and SIGWINCH can interrupt poll() without a busy-wait.
     wake_read_fd: posix.fd_t,
+    /// Write end of the wake pipe, wired into every pane's event queue so
+    /// agent workers can wake the main loop from arbitrary threads.
     wake_write_fd: posix.fd_t,
 };
 
