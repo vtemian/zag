@@ -23,8 +23,10 @@ pub fn execute(
     cancel: ?*std.atomic.Value(bool),
 ) types.ToolError!types.ToolResult {
     _ = cancel;
-    const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
-        return error.InvalidInput;
+    const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "error: invalid input to 'write': {s}", .{@errorName(err)}) catch return types.oomResult();
+        return .{ .content = msg, .is_error = true };
+    };
     defer parsed.deinit();
     const input = parsed.value;
 
@@ -125,7 +127,13 @@ test "write counts lines correctly" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote 4 lines") != null);
 }
 
-test "write with invalid input returns InvalidInput" {
+test "write returns detailed error result for invalid JSON input" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidInput, execute("not json", allocator, null));
+
+    const result = try execute("not json", allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "invalid input") != null);
 }

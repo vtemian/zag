@@ -28,8 +28,10 @@ pub fn execute(
     allocator: Allocator,
     cancel: ?*std.atomic.Value(bool),
 ) types.ToolError!types.ToolResult {
-    const parsed = std.json.parseFromSlice(BashInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
-        return error.InvalidInput;
+    const parsed = std.json.parseFromSlice(BashInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "error: invalid input to 'bash': {s}", .{@errorName(err)}) catch return types.oomResult();
+        return .{ .content = msg, .is_error = true };
+    };
     defer parsed.deinit();
     const input = parsed.value;
 
@@ -173,9 +175,15 @@ test "failing command has non-zero exit code" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "exit code: 42") != null);
 }
 
-test "invalid input returns InvalidInput" {
+test "bash returns detailed error result for invalid JSON input" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidInput, execute("not json", allocator, null));
+
+    const result = try execute("not json", allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "invalid input") != null);
 }
 
 test "bash kills child on cancel" {
