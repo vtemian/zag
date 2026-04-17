@@ -113,12 +113,34 @@ pub const ToolDefinition = struct {
     prompt_snippet: ?[]const u8 = null,
 };
 
+/// Narrow error set returned by tool execute functions.
+///
+/// - `InvalidInput` means the raw JSON does not match the tool's expected shape
+///   (parse failure or, in the future, pre-dispatch schema validation failure).
+/// - `ToolFailed` is a fallback for exceptional infrastructure failures. Most
+///   routine tool errors (file-not-found, non-zero exit code) should still be
+///   reported as `ToolResult { is_error = true }` so the LLM can retry.
+/// - `Allocator.Error` propagates OOM distinctly so callers can drop the turn.
+pub const ToolError = error{
+    InvalidInput,
+    ToolFailed,
+} || std.mem.Allocator.Error;
+
 /// A fully wired tool: its definition plus the function that executes it.
 pub const Tool = struct {
     /// The tool's metadata (name, description, schema).
     definition: ToolDefinition,
     /// The function pointer that executes this tool given raw JSON input.
-    execute: *const fn (input_raw: []const u8, allocator: Allocator) anyerror!ToolResult,
+    ///
+    /// Long-running tools (bash) should poll `cancel` periodically and abort early
+    /// when the flag is set. Fast tools (read/write/edit) may ignore it.
+    /// `cancel` is optional so unit tests and out-of-band callers can invoke tools
+    /// without wiring up an atomic.
+    execute: *const fn (
+        input_raw: []const u8,
+        allocator: Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) ToolError!ToolResult,
 };
 
 /// Maximum file size in bytes that tools will read into memory (10 MB).

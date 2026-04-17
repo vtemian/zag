@@ -8,6 +8,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const Hooks = @import("Hooks.zig");
 const AgentThread = @import("AgentThread.zig");
+const json_schema = @import("json_schema.zig");
 const Allocator = std.mem.Allocator;
 
 /// Thread-local name of the tool currently being executed.
@@ -54,15 +55,57 @@ pub const Registry = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    /// Execute a tool by name, passing raw JSON input. Returns an error result if the tool is unknown.
-    pub fn execute(self: *const Registry, name: []const u8, input_raw: []const u8, allocator: Allocator) !types.ToolResult {
+    /// Execute a tool by name, passing raw JSON input.
+    ///
+    /// Before dispatch the raw input is validated against the tool's declared
+    /// JSON schema so obvious mistakes (missing required fields, wrong types,
+    /// non-JSON payloads) are caught at the boundary and returned as a
+    /// `ToolResult { is_error = true }` with a message naming the violation.
+    ///
+    /// `InvalidInput` and `ToolFailed` errors raised by the tool itself are
+    /// likewise flattened into a `ToolResult { is_error = true }` so the LLM
+    /// can observe the failure and retry. Only `OutOfMemory` propagates to the
+    /// caller, because there is no meaningful way for the LLM to recover from it.
+    ///
+    /// An unknown tool name is likewise returned as `ToolResult { is_error = true }`.
+    pub fn execute(
+        self: *const Registry,
+        name: []const u8,
+        input_raw: []const u8,
+        allocator: Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) error{OutOfMemory}!types.ToolResult {
         const tool = self.get(name) orelse return .{
             .content = "error: unknown tool",
             .is_error = true,
+            .owned = false,
+        };
+        json_schema.validate(allocator, tool.definition.input_schema_json, input_raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                const msg = std.fmt.allocPrint(
+                    allocator,
+                    "error: invalid input ({s})",
+                    .{@errorName(err)},
+                ) catch return types.oomResult();
+                return .{ .content = msg, .is_error = true, .owned = true };
+            },
         };
         current_tool_name = name;
         defer current_tool_name = null;
-        return tool.execute(input_raw, allocator);
+        return tool.execute(input_raw, allocator, cancel) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidInput => .{
+                .content = "error: invalid tool input",
+                .is_error = true,
+                .owned = false,
+            },
+            error.ToolFailed => .{
+                .content = "error: tool failed",
+                .is_error = true,
+                .owned = false,
+            },
+        };
     }
 };
 
@@ -80,7 +123,14 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
 /// caller's thread (agent loop or parallel tool worker) and round-trips
 /// through the main thread via `AgentThread.lua_request_queue` because
 /// Lua state may only be touched from the main thread.
-pub fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+pub fn luaToolExecute(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel; // Lua tools round-trip through the main thread; the cancel pointer
+    // could be wired into the request so long-running Lua tools poll it,
+    // but today all Lua tools complete quickly.
     const queue = AgentThread.lua_request_queue orelse return .{
         .content = "error: no lua queue bound for this thread",
         .is_error = true,
@@ -101,7 +151,15 @@ pub fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!type
         .result_owned = false,
         .error_name = null,
     };
-    try queue.push(.{ .lua_tool_request = &req });
+    queue.push(.{ .lua_tool_request = &req }) catch |err| switch (err) {
+        // QueueFull here means the main thread can't accept the round-trip;
+        // surface as a tool failure rather than propagate an unrelated error.
+        error.QueueFull => return .{
+            .content = "error: event queue full; lua tool not dispatched",
+            .is_error = true,
+            .owned = false,
+        },
+    };
     req.done.wait();
     if (req.error_name) |name| {
         return .{
@@ -142,7 +200,7 @@ test "execute unknown tool returns error result" {
     var registry = Registry.init(allocator);
     defer registry.deinit();
 
-    const result = try registry.execute("nonexistent", "{}", allocator);
+    const result = try registry.execute("nonexistent", "{}", allocator, null);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: unknown tool", result.content);
 }
@@ -154,7 +212,7 @@ test "execute registered tool" {
 
     try registry.register(bash_tool.tool);
 
-    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator);
+    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator, null);
     defer allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "hi") != null);
@@ -181,11 +239,59 @@ test "execute sets current_tool_name during execution" {
     // Before execution, should be null
     try std.testing.expect(current_tool_name == null);
 
-    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator);
+    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator, null);
     defer allocator.free(result.content);
 
     // After execution, should be cleared
     try std.testing.expect(current_tool_name == null);
+}
+
+fn testInvalidInputTool(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
+    _ = std.json.parseFromSlice(struct { x: u32 }, allocator, input_raw, .{}) catch
+        return error.InvalidInput;
+    return .{ .content = "ok", .is_error = false, .owned = false };
+}
+
+test "tool can raise InvalidInput directly" {
+    try std.testing.expectError(error.InvalidInput, testInvalidInputTool("not json", std.testing.allocator, null));
+}
+
+test "registry.execute flattens InvalidInput into a tool-result error" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+    // Schema accepts any object, so validation passes and the tool itself
+    // raises InvalidInput (its parse target requires field `x`).
+    try r.register(.{ .definition = .{
+        .name = "t",
+        .description = "",
+        .input_schema_json = "{\"type\":\"object\"}",
+    }, .execute = testInvalidInputTool });
+    const result = try r.execute("t", "{}", std.testing.allocator, null);
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("error: invalid tool input", result.content);
+    try std.testing.expect(!result.owned);
+}
+
+test "registry.execute rejects missing required field before dispatch" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+    try r.register(.{ .definition = .{
+        .name = "t",
+        .description = "",
+        .input_schema_json =
+        \\{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string"}}}
+        ,
+    }, .execute = testInvalidInputTool });
+    const result = try r.execute("t", "{\"other\":\"x\"}", std.testing.allocator, null);
+    defer if (result.owned) std.testing.allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(result.owned);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "MissingRequiredField") != null);
 }
 
 test {

@@ -11,9 +11,7 @@ const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const types = @import("types.zig");
 const Session = @import("Session.zig");
-const AgentThread = @import("AgentThread.zig");
-const llm = @import("llm.zig");
-const tools_mod = @import("tools.zig");
+const agent_events = @import("agent_events.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Hooks = @import("Hooks.zig");
 
@@ -116,11 +114,14 @@ last_info_len: u8 = 0,
 /// Open session file for persistence (null if unsaved buffer).
 session_handle: ?*Session.SessionHandle = null,
 /// Background agent thread, if one is running for this buffer.
+/// Lifecycle is managed by the orchestrator; the buffer only holds the
+/// handle so `deinit` can join on error-exit paths.
 agent_thread: ?std.Thread = null,
-/// Event queue for agent-to-main communication.
-event_queue: AgentThread.EventQueue = undefined,
+/// Event queue for agent-to-main communication. The orchestrator
+/// initializes this when spawning an agent and tears it down on drain.
+event_queue: agent_events.EventQueue = undefined,
 /// Atomic flag for requesting agent thread cancellation.
-cancel_flag: AgentThread.CancelFlag = AgentThread.CancelFlag.init(false),
+cancel_flag: agent_events.CancelFlag = agent_events.CancelFlag.init(false),
 /// Whether the event queue has been initialized (needs deinit).
 queue_active: bool = false,
 /// Wake fd for the main loop. Copied into EventQueue at submit time so
@@ -149,6 +150,11 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
 /// Release all memory owned by this buffer: nodes, name, messages, and lists.
 /// The session_handle is NOT closed here; the owner (main or split creator) closes it.
 pub fn deinit(self: *ConversationBuffer) void {
+    // Join any live agent thread before freeing the state it reads/writes:
+    // messages, pending_tool_calls, and the event queue are all shared with
+    // the worker. Running this unconditionally is the only safe ordering on
+    // error-exit paths where the caller never got a chance to shut down.
+    self.shutdown();
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
         self.allocator.destroy(node);
@@ -417,8 +423,9 @@ pub fn rebuildMessages(self: *ConversationBuffer, entries: []const Session.Entry
             },
             .tool_call => {
                 try self.flushToolResultMessage(&tool_result_blocks, allocator);
-                var scratch: [16]u8 = undefined;
-                const synthetic_id = std.fmt.bufPrint(&scratch, "synth_{d}", .{tool_id_counter}) catch unreachable;
+                // Widened to [32]u8 so "synth_" + up to maxInt(u32) always fits.
+                var scratch: [32]u8 = undefined;
+                const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{tool_id_counter});
                 tool_id_counter += 1;
                 const duped_id = try allocator.dupe(u8, synthetic_id);
                 const duped_name = try allocator.dupe(u8, entry.tool_name);
@@ -485,7 +492,7 @@ pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
 }
 
 /// Process a single agent event: update the node tree and persist to session.
-pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent, allocator: Allocator) void {
+pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEvent, allocator: Allocator) void {
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
@@ -517,7 +524,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
             // If we have a call_id, store in the map for result correlation
             if (ev.call_id) |id| {
                 if (node) |n| {
-                    self.pending_tool_calls.put(id, n) catch {};
+                    self.pending_tool_calls.put(id, n) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
                 } else {
                     allocator.free(id);
                 }
@@ -541,7 +548,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 }
                 break :blk self.last_tool_call;
             } else self.last_tool_call;
-            _ = self.appendNode(parent, .tool_result, result.content) catch {};
+            _ = self.appendNode(parent, .tool_result, result.content) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
             self.persistEvent(.{
                 .entry_type = .tool_result,
                 .content = result.content,
@@ -570,7 +577,7 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
                 var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
                 eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
             }
-            _ = self.appendNode(null, .err, text) catch {};
+            _ = self.appendNode(null, .err, text) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
             self.persistEvent(.{
                 .entry_type = .err,
                 .content = text,
@@ -586,100 +593,56 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: AgentThread.AgentEvent
     }
 }
 
-/// Restore buffer state from a persisted session: load the node tree,
-/// rebuild the LLM message history, and update the buffer name from meta.
-/// Submit user input: append to message history, create node, persist, spawn agent.
+/// Submit user input: append the message to conversation history, create a
+/// user_message node, and persist the entry to the session log.
+///
+/// The buffer is a pure data container: it does not spawn an agent thread.
+/// Agent-thread lifecycle belongs to the orchestrator, which calls this
+/// method and then decides whether to start the agent.
 pub fn submitInput(
     self: *ConversationBuffer,
     text: []const u8,
-    provider: llm.Provider,
-    registry: *const tools_mod.Registry,
     allocator: Allocator,
-    lua_eng: ?*LuaEngine,
 ) !void {
-    // Fire UserMessagePre synchronously: hooks may veto or rewrite the text
-    // before it enters the conversation history. `working_text` is the
-    // effective text used for the rest of submitInput; if a rewrite fires
-    // the freshly allocated slice is tracked in `text_rewrite_owned` and
-    // freed on return (including the cancel early-return, which can't own
-    // a rewrite since the veto path returns before rewrite handling).
-    var working_text: []const u8 = text;
-    var text_rewrite_owned: ?[]const u8 = null;
-    defer if (text_rewrite_owned) |t| allocator.free(t);
-
-    if (lua_eng) |eng| {
-        var payload: Hooks.HookPayload = .{ .user_message_pre = .{
-            .text = text,
-            .text_rewrite = null,
-        } };
-        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
-        if (eng.takeCancel()) |reason| {
-            defer allocator.free(reason);
-            _ = try self.appendNode(null, .err, reason);
-            return;
-        }
-        if (payload.user_message_pre.text_rewrite) |rewritten| {
-            working_text = rewritten;
-            text_rewrite_owned = rewritten;
-        }
-    }
-
-    // Append user message to conversation history
     const content = try allocator.alloc(types.ContentBlock, 1);
-    const duped = try allocator.dupe(u8, working_text);
+    const duped = try allocator.dupe(u8, text);
     content[0] = .{ .text = .{ .text = duped } };
     try self.messages.append(allocator, .{ .role = .user, .content = content });
 
-    if (lua_eng) |eng| {
-        var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
-        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
-    }
-
-    _ = try self.appendNode(null, .user_message, working_text);
+    _ = try self.appendNode(null, .user_message, text);
 
     self.persistEvent(.{
         .entry_type = .user_message,
-        .content = working_text,
+        .content = text,
         .timestamp = std.time.milliTimestamp(),
     });
 
-    // Reset streaming state and spawn agent thread
+    // Reset streaming state so the next agent run starts from a clean UI.
     self.current_assistant_node = null;
     self.last_tool_call = null;
-    self.cancel_flag.store(false, .release);
-
-    self.event_queue = AgentThread.EventQueue.init(allocator);
-    self.event_queue.wake_fd = self.wake_fd;
-    self.queue_active = true;
-    self.lua_engine = lua_eng;
-
-    self.agent_thread = AgentThread.spawn(
-        provider,
-        &self.messages,
-        registry,
-        allocator,
-        &self.event_queue,
-        &self.cancel_flag,
-        lua_eng,
-    ) catch |err| {
-        _ = self.appendNode(null, .err, @errorName(err)) catch {};
-        self.event_queue.deinit();
-        self.queue_active = false;
-        self.agent_thread = null;
-        return err;
-    };
 }
 
 /// Pull any hook_request events out of the queue and service them on the
 /// main thread (the only thread allowed to touch Lua). Non-hook events are
-/// compacted back into the queue in their original order. Called before the
+/// compacted back into the ring in their original order. Called before the
 /// normal drain loop so pre-hook vetos round-trip with minimal latency.
-pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine) void {
+pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void {
     queue.mutex.lock();
     defer queue.mutex.unlock();
 
-    var write: usize = 0;
-    for (queue.items.items) |ev| {
+    if (queue.len == 0) return;
+
+    // Walk the ring from head to tail, in-place compacting non-hook events
+    // back into contiguous slots starting at `head`. Hook/tool requests are
+    // fired synchronously and dropped from the ring.
+    const cap = queue.buffer.len;
+    var read = queue.head;
+    var write = queue.head;
+    var remaining = queue.len;
+    var kept: usize = 0;
+    while (remaining > 0) : (remaining -= 1) {
+        const ev = queue.buffer[read];
+        read = (read + 1) % cap;
         switch (ev) {
             .hook_request => |req| {
                 if (engine) |eng| {
@@ -698,22 +661,27 @@ pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine)
             },
             .lua_tool_request => |req| {
                 if (engine) |eng| {
-                    const result = eng.executeTool(req.tool_name, req.input_raw, req.allocator);
-                    req.result_content = result.content;
-                    req.result_is_error = result.is_error;
-                    req.result_owned = result.owned;
+                    if (eng.executeTool(req.tool_name, req.input_raw, req.allocator)) |result| {
+                        req.result_content = result.content;
+                        req.result_is_error = result.is_error;
+                        req.result_owned = result.owned;
+                    } else |err| {
+                        req.error_name = @errorName(err);
+                    }
                 }
                 // Always signal, even without an engine, so the pushing
                 // thread doesn't block forever.
                 req.done.set();
             },
             else => {
-                queue.items.items[write] = ev;
-                write += 1;
+                queue.buffer[write] = ev;
+                write = (write + 1) % cap;
+                kept += 1;
             },
         }
     }
-    queue.items.items.len = write;
+    queue.len = kept;
+    queue.tail = write;
 }
 
 /// Drain pending agent events. Returns true if the agent finished this frame.
@@ -722,7 +690,7 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
 
     dispatchHookRequests(&self.event_queue, self.lua_engine);
 
-    var drain: [64]AgentThread.AgentEvent = undefined;
+    var drain: [64]agent_events.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
     var finished = false;
 
@@ -773,72 +741,36 @@ pub fn shutdown(self: *ConversationBuffer) void {
     }
 }
 
-/// Generate a short session name via LLM and apply it to the session.
-pub fn autoNameSession(self: *ConversationBuffer, provider: llm.Provider, allocator: Allocator) void {
-    const sh = self.session_handle orelse return;
-    if (sh.meta.name_len > 0 or self.messages.items.len < 2) return;
+/// Inputs for auto-naming a session: the first user text and the first
+/// assistant text (truncated). Returns null when the buffer does not yet
+/// have enough content to produce a summary.
+pub const SessionSummaryInputs = struct {
+    user_text: []const u8,
+    assistant_text: []const u8,
+};
 
-    const summary = self.generateSessionName(provider, allocator) catch |err| {
-        log.debug("auto-name failed: {}", .{err});
-        return;
-    };
-    defer allocator.free(summary);
-
-    sh.rename(summary) catch |err| {
-        log.warn("session rename failed: {}", .{err});
-    };
-}
-
-/// Send a minimal LLM request to summarize a conversation in 3-5 words.
-fn generateSessionName(self: *const ConversationBuffer, provider: llm.Provider, allocator: Allocator) ![]const u8 {
+/// Extract the first user-text / first-assistant-text pair for session
+/// auto-naming. Returns null if the buffer lacks at least one of each.
+/// The returned slices point into the buffer's messages and are valid
+/// until the next mutation.
+pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInputs {
     const msgs = self.messages.items;
-    if (msgs.len < 2) return error.InsufficientMessages;
+    if (msgs.len < 2) return null;
 
-    const user_text = extractFirstText(msgs[0]) orelse return error.NoUserText;
+    const user_text = extractFirstText(msgs[0]) orelse return null;
     // The second message may be tool_use-only (no text). Scan forward to find
     // the first assistant message with a text block.
-    const assistant_full = blk: {
-        for (msgs[1..]) |msg| {
-            if (msg.role == .assistant) {
-                if (extractFirstText(msg)) |text| break :blk text;
+    for (msgs[1..]) |msg| {
+        if (msg.role == .assistant) {
+            if (extractFirstText(msg)) |assistant_full| {
+                return .{
+                    .user_text = user_text,
+                    .assistant_text = assistant_full[0..@min(assistant_full.len, 200)],
+                };
             }
         }
-        return error.NoAssistantText;
-    };
-    const assistant_text = assistant_full[0..@min(assistant_full.len, 200)];
-
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = user_text } };
-
-    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(assistant_content);
-    assistant_content[0] = .{ .text = .{ .text = assistant_text } };
-
-    var summary_msgs = [_]types.Message{
-        .{ .role = .user, .content = user_content },
-        .{ .role = .assistant, .content = assistant_content },
-    };
-
-    const response = try provider.call(
-        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        &summary_msgs,
-        &.{},
-        allocator,
-    );
-    defer response.deinit(allocator);
-
-    allocator.free(user_content);
-    allocator.free(assistant_content);
-
-    for (response.content) |block| {
-        switch (block) {
-            .text => |t| return try allocator.dupe(u8, t.text),
-            else => {},
-        }
     }
-
-    return error.NoResponseText;
+    return null;
 }
 
 fn extractFirstText(msg: types.Message) ?[]const u8 {
@@ -1247,6 +1179,18 @@ test "resetCurrentAssistantText is a no-op when nothing is in progress" {
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
 }
 
+test "synthetic id scratch fits maxInt(u32)" {
+    // Compile-time guard: the scratch buffer in rebuildHistoryFromEntries must
+    // hold "synth_" plus the widest possible u32 counter value without
+    // overflowing. Widening the buffer without updating this probe would let
+    // the invariant silently erode.
+    comptime {
+        const max_counter: u64 = std.math.maxInt(u32);
+        var probe: [32]u8 = undefined;
+        _ = std.fmt.bufPrint(&probe, "synth_{d}", .{max_counter}) catch @compileError("synth buffer too small");
+    }
+}
+
 test "text_delta after reset starts a fresh assistant node" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "reset-flow");
@@ -1285,7 +1229,7 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
 
     cb.wake_fd = 777;
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
     defer queue.deinit();
     queue.wake_fd = cb.wake_fd;
 
@@ -1304,7 +1248,7 @@ test "dispatchHookRequests fires Lua hook and signals done" {
         \\zag.hook("TurnStart", function(evt) _G.last_turn = evt.turn_num end)
     );
 
-    var queue = AgentThread.EventQueue.init(alloc);
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
     defer queue.deinit();
 
     var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 7, .message_count = 1 } };
@@ -1334,7 +1278,7 @@ test "lua_tool_request round-trips via main thread" {
         \\})
     );
 
-    var queue = AgentThread.EventQueue.init(alloc);
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
     defer queue.deinit();
 
     var req: Hooks.LuaToolRequest = .{
