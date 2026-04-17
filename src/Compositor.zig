@@ -1,8 +1,9 @@
 //! Compositor: merges buffer content into a Screen grid via the layout tree.
 //!
 //! Reads visible lines from each buffer leaf in the layout and writes them
-//! into the Screen at each leaf's rect position. Draws split borders and a
-//! status line. All styling reads from the Theme.
+//! into the Screen at each leaf's rect position. Draws a rounded frame with
+//! an embedded title around every pane, plus the bottom status/input line.
+//! All styling reads from the Theme.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -765,7 +766,7 @@ test "composite draws rounded frame around a single pane" {
     });
 
     // Corners at pane bounds (screen height 6 reserves row 5 for status,
-    // so the pane rect is 20x5 — bottom edge lives on row 4).
+    // so the pane rect is 20x5 - bottom edge lives on row 4).
     try std.testing.expectEqual(theme.borders.top_left, screen.getCellConst(0, 0).codepoint);
     try std.testing.expectEqual(theme.borders.top_right, screen.getCellConst(0, 19).codepoint);
     try std.testing.expectEqual(theme.borders.bottom_left, screen.getCellConst(4, 0).codepoint);

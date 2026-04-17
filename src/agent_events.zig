@@ -3,7 +3,7 @@
 //! The agent thread produces `AgentEvent`s into a bounded `EventQueue`;
 //! the main thread drains them each frame. A `CancelFlag` lets the main
 //! thread request cooperative cancellation. These types live here (rather
-//! than in `AgentThread.zig`) so observers — like `ConversationBuffer` —
+//! than in `AgentThread.zig`) so observers - like `ConversationBuffer` -
 //! can reference them without pulling in the spawn machinery.
 
 const std = @import("std");
@@ -265,7 +265,7 @@ test "drain with small buffer returns partial" {
 }
 
 test "EventQueue bounded: pushes beyond capacity go to dropped" {
-    // Capacity 4 — fill it, then the next push must be refused with QueueFull
+    // Capacity 4 - fill it, then the next push must be refused with QueueFull
     // so the counter ticks and the UI can render a "dropped N" indicator.
     const alloc = std.testing.allocator;
     var queue = try EventQueue.initBounded(alloc, 4);
