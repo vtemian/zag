@@ -242,14 +242,15 @@ pub fn main() !void {
     var session_handle = initSession(&session_mgr, resume_id, provider.model_id);
     defer if (session_handle) |*sh| sh.close();
 
+    const root_pane: EventOrchestrator.Pane = .{
+        .view = &root_buffer,
+        .session = &root_session,
+        .runner = &root_runner,
+    };
+
     if (session_handle) |*sh| {
         root_session.attachSession(sh);
         if (resume_id != null) {
-            const root_pane: EventOrchestrator.Pane = .{
-                .view = &root_buffer,
-                .session = &root_session,
-                .runner = &root_runner,
-            };
             EventOrchestrator.restorePane(root_pane, sh, allocator) catch |err| {
                 log.warn("session restore failed: {}", .{err});
             };
@@ -292,9 +293,7 @@ pub fn main() !void {
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_buffer = &root_buffer,
-        .root_session = &root_session,
-        .root_runner = &root_runner,
+        .root_pane = root_pane,
         .provider = &provider,
         .registry = &registry,
         .session_mgr = &session_mgr,
