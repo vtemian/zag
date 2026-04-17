@@ -2,11 +2,12 @@
 //! window management, frame scheduling. main.zig configures systems
 //! and hands them off via init() + run().
 //!
-//! Design: the orchestrator does not own the terminal/screen/layout/compositor;
-//! those are created in main() and passed as pointers. It does own the input
-//! buffer, the extra split panes, and frame-local state (spinner, fps counters).
-//! AppContext (the old ad-hoc bundle) is gone: its fields live directly on the
-//! orchestrator.
+//! Ownership: the terminal, screen, layout, compositor, and root buffer
+//! are created in main() and held here as pointers - their lifetimes
+//! exceed the orchestrator's. The orchestrator itself owns the input
+//! line state (`typed` + `typed_len`), the extra split panes, the
+//! keymap registry, and frame-local counters (spinner, fps, transient
+//! status).
 
 const std = @import("std");
 const posix = std.posix;
