@@ -693,12 +693,15 @@ pub fn dispatchHookRequests(queue: *AgentThread.EventQueue, engine: ?*LuaEngine)
                 req.done.set();
             },
             .lua_tool_request => |req| {
-                // No engine-less dispatch path yet for lua tools; just
-                // unblock the pusher.
-                if (engine == null) req.done.set() else {
-                    queue.items.items[write] = ev;
-                    write += 1;
+                if (engine) |eng| {
+                    const result = eng.executeTool(req.tool_name, req.input_raw, req.allocator);
+                    req.result_content = result.content;
+                    req.result_is_error = result.is_error;
+                    req.result_owned = result.owned;
                 }
+                // Always signal, even without an engine, so the pushing
+                // thread doesn't block forever.
+                req.done.set();
             },
             else => {
                 queue.items.items[write] = ev;
@@ -1285,6 +1288,43 @@ test "dispatchHookRequests fires Lua hook and signals done" {
     _ = try engine.lua.getGlobal("last_turn");
     try std.testing.expectEqual(@as(i64, 7), try engine.lua.toInteger(-1));
     engine.lua.pop(1);
+}
+
+test "lua_tool_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool({
+        \\  name = "echo",
+        \\  description = "echo input",
+        \\  input_schema = { type = "object" },
+        \\  execute = function(args) return "ok: " .. tostring(args.val) end,
+        \\})
+    );
+
+    var queue = AgentThread.EventQueue.init(alloc);
+    defer queue.deinit();
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "echo",
+        .input_raw = "{\"val\":1}",
+        .allocator = alloc,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    try queue.push(.{ .lua_tool_request = &req });
+
+    dispatchHookRequests(&queue, &engine);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_content != null);
+    defer if (req.result_owned) alloc.free(req.result_content.?);
+    try std.testing.expect(std.mem.indexOf(u8, req.result_content.?, "ok: 1") != null);
 }
 
 test "text_delta fires post-hook with text" {

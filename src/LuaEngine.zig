@@ -12,10 +12,6 @@ const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
 
-/// Engine pointer for the currently active agent thread.
-/// Set by `activate()` before the agent loop runs, read by `luaToolExecute`.
-threadlocal var active_engine: ?*LuaEngine = null;
-
 /// A tool defined in Lua via `zag.tool()`.
 pub const LuaTool = struct {
     /// Tool name (owned, heap-allocated).
@@ -695,9 +691,9 @@ pub const LuaEngine = struct {
     }
 
     /// Register all collected Lua tools into a tools.Registry.
-    /// Also sets the thread-local active_engine so luaToolExecute can find us.
+    /// Tools dispatch via `tools_mod.luaToolExecute`, which round-trips
+    /// the call onto the main thread via the event queue.
     pub fn registerTools(self: *LuaEngine, registry: *tools_mod.Registry) !void {
-        self.activate();
         for (self.tools.items) |tool| {
             try registry.register(.{
                 .definition = .{
@@ -706,14 +702,9 @@ pub const LuaEngine = struct {
                     .input_schema_json = tool.input_schema_json,
                     .prompt_snippet = tool.prompt_snippet,
                 },
-                .execute = &luaToolExecute,
+                .execute = &tools_mod.luaToolExecute,
             });
         }
-    }
-
-    /// Set the thread-local active_engine for this agent thread.
-    pub fn activate(self: *LuaEngine) void {
-        active_engine = self;
     }
 
     /// Load and execute a Lua config file, collecting any `zag.tool()` calls it makes.
@@ -743,23 +734,6 @@ pub const LuaEngine = struct {
         };
     }
 };
-
-/// Static function pointer shared by all Lua tools.
-/// Uses `active_engine` to find the LuaEngine and `tools_mod.current_tool_name`
-/// to know which tool was called.
-fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
-    const engine = active_engine orelse return .{
-        .content = "error: no active Lua engine",
-        .is_error = true,
-        .owned = false,
-    };
-    const tool_name = tools_mod.current_tool_name orelse return .{
-        .content = "error: no current tool name",
-        .is_error = true,
-        .owned = false,
-    };
-    return engine.executeTool(tool_name, input_raw, allocator);
-}
 
 // -- Tests -------------------------------------------------------------------
 
@@ -1014,6 +988,9 @@ test "fireHook invokes Lua callback for matching event" {
 }
 
 test "end-to-end: config file to registry execution" {
+    const AgentThread = @import("AgentThread.zig");
+    const ConversationBuffer = @import("ConversationBuffer.zig");
+
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
@@ -1050,7 +1027,32 @@ test "end-to-end: config file to registry execution" {
     defer registry.deinit();
     try engine.registerTools(&registry);
 
-    // Execute through the full registry path (luaToolExecute -> active_engine -> executeTool)
+    // Lua tools now round-trip via the event queue; spawn a pump thread
+    // that services `lua_tool_request` events off the queue and dispatches
+    // them through dispatchHookRequests, which is the production path.
+    var queue = AgentThread.EventQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, struct {
+        fn pump(q: *AgentThread.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                ConversationBuffer.dispatchHookRequests(q, eng);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            // Final drain so any late pushes by the test thread are serviced.
+            ConversationBuffer.dispatchHookRequests(q, eng);
+        }
+    }.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    AgentThread.lua_request_queue = &queue;
+    defer AgentThread.lua_request_queue = null;
+
+    // Execute through the full registry path (luaToolExecute -> queue -> dispatcher -> executeTool)
     const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);

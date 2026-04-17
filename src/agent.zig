@@ -71,9 +71,11 @@ pub fn runLoopStreaming(
 
     thread_local_queue = queue;
     thread_local_allocator = allocator;
+    AgentThread.lua_request_queue = queue;
     defer {
         thread_local_queue = null;
         thread_local_allocator = null;
+        AgentThread.lua_request_queue = null;
     }
 
     var turn_num: u32 = 0;
@@ -436,6 +438,11 @@ fn runToolStep(
 /// Zig thread functions cannot propagate errors; infrastructure failures
 /// are captured as error results so the turn can still complete.
 fn executeOneToolCall(ctx: *const ToolCallContext) void {
+    // Worker threads that invoke Lua-defined tools need the queue pointer
+    // so `tools.luaToolExecute` can round-trip the call to the main thread.
+    AgentThread.lua_request_queue = ctx.queue;
+    defer AgentThread.lua_request_queue = null;
+
     const step = runToolStep(
         ctx.tool_call,
         ctx.registry,
