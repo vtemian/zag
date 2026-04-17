@@ -182,8 +182,8 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
     }
 
     // Collect spans into a dynamic list, then convert to a slice
-    var span_list: std.ArrayList(StyledSpan) = .empty;
-    defer span_list.deinit(allocator);
+    var spans: std.ArrayList(StyledSpan) = .empty;
+    defer spans.deinit(allocator);
 
     // First pass: find code spans to protect them from further parsing
     // Second pass: parse bold/italic/link in non-code regions
@@ -201,7 +201,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             if (close) |end| {
                 const code_text = line[i + 1 .. end];
                 const owned = try allocator.dupe(u8, code_text);
-                try span_list.append(allocator, .{ .text = owned, .style = theme.highlights.md_code_inline });
+                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_code_inline });
                 i = end + 1;
                 continue;
             }
@@ -214,7 +214,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             if (close) |end| {
                 const bold_text = line[i + 2 .. end];
                 const owned = try allocator.dupe(u8, bold_text);
-                try span_list.append(allocator, .{ .text = owned, .style = theme.highlights.md_bold });
+                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_bold });
                 i = end + 2;
                 continue;
             }
@@ -227,7 +227,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             if (close) |end| {
                 const italic_text = line[i + 1 .. end];
                 const owned = try allocator.dupe(u8, italic_text);
-                try span_list.append(allocator, .{ .text = owned, .style = theme.highlights.md_italic });
+                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_italic });
                 i = end + 1;
                 continue;
             }
@@ -237,7 +237,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
         if (line[i] == '[') {
             if (parseLink(line, i)) |link| {
                 const owned = try allocator.dupe(u8, link.text);
-                try span_list.append(allocator, .{ .text = owned, .style = theme.highlights.md_link });
+                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_link });
                 i = link.end;
                 continue;
             }
@@ -252,17 +252,16 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
         }
         const plain = line[start..i];
         const owned = try allocator.dupe(u8, plain);
-        try span_list.append(allocator, .{ .text = owned, .style = default_style });
+        try spans.append(allocator, .{ .text = owned, .style = default_style });
     }
 
-    if (span_list.items.len == 0) {
+    if (spans.items.len == 0) {
         return Theme.emptyStyledLine(allocator);
     }
 
     // Move the span list contents into an owned slice
-    const spans = try allocator.alloc(StyledSpan, span_list.items.len);
-    @memcpy(spans, span_list.items);
-    return .{ .spans = spans };
+    const out = try spans.toOwnedSlice(allocator);
+    return .{ .spans = out };
 }
 
 /// Find the closing backtick starting from `start`. Returns index of the closing `.

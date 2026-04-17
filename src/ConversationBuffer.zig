@@ -366,7 +366,7 @@ pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
 // -- Draft input --------------------------------------------------------
 
 /// Append a single byte to the draft. No-op if the draft is full.
-/// Does not touch `render_dirty` — the compositor repaints the prompt
+/// Does not touch `render_dirty`. The compositor repaints the prompt
 /// every frame anyway.
 pub fn appendToDraft(self: *ConversationBuffer, ch: u8) void {
     if (self.draft_len >= self.draft.len) return;

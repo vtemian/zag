@@ -150,11 +150,10 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
     defer parsed.deinit();
     const root = parsed.value.object;
 
-    const choices = root.get("choices") orelse return error.MalformedResponse;
-    const choices_array = choices.array;
-    if (choices_array.items.len == 0) return error.MalformedResponse;
+    const choices = (root.get("choices") orelse return error.MalformedResponse).array;
+    if (choices.items.len == 0) return error.MalformedResponse;
 
-    const choice = choices_array.items[0].object;
+    const choice = choices.items[0].object;
 
     const stop_reason: types.StopReason = blk: {
         const fr = choice.get("finish_reason") orelse break :blk .end_turn;
@@ -386,10 +385,10 @@ test "buildRequestBody formats tools with function wrapper" {
     defer parsed.deinit();
 
     const root = parsed.value.object;
-    const tools_arr = root.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 1), tools_arr.items.len);
+    const tools = root.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), tools.items.len);
 
-    const tool = tools_arr.items[0].object;
+    const tool = tools.items[0].object;
     try std.testing.expectEqualStrings("function", tool.get("type").?.string);
 
     const func = tool.get("function").?.object;

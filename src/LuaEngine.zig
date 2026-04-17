@@ -391,12 +391,12 @@ pub const LuaEngine = struct {
             return error.LuaError;
         };
 
-        const key_str = lua.toString(2) catch {
+        const key = lua.toString(2) catch {
             log.err("zag.keymap(): arg 2 (key) must be a string", .{});
             return error.LuaError;
         };
-        const spec = Keymap.parseKeySpec(key_str) catch {
-            log.err("zag.keymap(): invalid key spec '{s}'", .{key_str});
+        const spec = Keymap.parseKeySpec(key) catch {
+            log.err("zag.keymap(): invalid key spec '{s}'", .{key});
             return error.LuaError;
         };
 

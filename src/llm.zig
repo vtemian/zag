@@ -588,8 +588,8 @@ pub const StreamingResponse = struct {
         };
 
         // Receive response headers.
-        var redirect_buf: [0]u8 = .{};
-        var response = self.req.receiveHead(&redirect_buf) catch |err| {
+        var no_redirects: [0]u8 = .{};
+        var response = self.req.receiveHead(&no_redirects) catch |err| {
             log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
             return error.ApiError;
         };
