@@ -76,8 +76,16 @@ pub fn runLoopStreaming(
         thread_local_allocator = null;
     }
 
+    var turn_num: u32 = 0;
     while (true) {
         if (cancel.load(.acquire)) return;
+        turn_num += 1;
+
+        var turn_start: Hooks.HookPayload = .{ .turn_start = .{
+            .turn_num = turn_num,
+            .message_count = messages.items.len,
+        } };
+        fireLifecycleHook(lua_engine, &turn_start, queue, cancel);
 
         const response = try callLlm(provider, prompt, messages.items, tool_defs, allocator, queue, cancel);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
@@ -85,10 +93,45 @@ pub fn runLoopStreaming(
 
         const tool_calls = try collectToolCalls(response.content, allocator);
         defer allocator.free(tool_calls);
-        if (tool_calls.len == 0) break;
 
-        const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine);
-        try messages.append(allocator, .{ .role = .user, .content = results });
+        if (tool_calls.len > 0) {
+            const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine);
+            try messages.append(allocator, .{ .role = .user, .content = results });
+        }
+
+        var turn_end: Hooks.HookPayload = .{ .turn_end = .{
+            .turn_num = turn_num,
+            .stop_reason = @tagName(response.stop_reason),
+            .input_tokens = response.input_tokens,
+            .output_tokens = response.output_tokens,
+        } };
+        fireLifecycleHook(lua_engine, &turn_end, queue, cancel);
+
+        if (tool_calls.len == 0) break;
+    }
+}
+
+/// Fire an observer-only lifecycle hook (TurnStart/TurnEnd/AgentDone etc.).
+/// Short-circuits when no engine or no hooks are registered. Polls cancel
+/// every 50ms so a user interrupt still tears down the round-trip.
+/// Returns void: lifecycle hooks cannot veto or rewrite, and a cancel mid-
+/// round-trip is swallowed silently (the main loop's cancel check catches it
+/// on the next iteration).
+fn fireLifecycleHook(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    payload: *Hooks.HookPayload,
+    queue: *AgentThread.EventQueue,
+    cancel: *AgentThread.CancelFlag,
+) void {
+    if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) return;
+    var req = Hooks.HookRequest.init(payload);
+    queue.push(.{ .hook_request = &req }) catch return;
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            return;
+        } else |_| {
+            if (cancel.load(.acquire)) return;
+        }
     }
 }
 
