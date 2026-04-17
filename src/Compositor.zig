@@ -451,8 +451,18 @@ fn drawInputLine(self: *Compositor, input: InputState) void {
     } else {
         const prompt = Theme.resolve(self.theme.highlights.input_prompt, self.theme);
         const text = Theme.resolve(self.theme.highlights.input_text, self.theme);
-        const c = self.screen.writeStr(row, after_label, "> ", prompt.screen_style, prompt.fg);
-        _ = self.screen.writeStr(row, c, input.text, text.screen_style, text.fg);
+        const c = self.screen.writeStr(row, after_label, "\u{203A} ", prompt.screen_style, prompt.fg);
+        const end_col = self.screen.writeStr(row, c, input.text, text.screen_style, text.fg);
+
+        // Block cursor: paint a single cell at end_col with accent bg so it
+        // reads as a solid insert-mode caret against any terminal background.
+        if (end_col < self.screen.width) {
+            const cursor_cell = self.screen.getCell(row, end_col);
+            cursor_cell.codepoint = ' ';
+            cursor_cell.style = .{};
+            cursor_cell.fg = self.theme.colors.fg;
+            cursor_cell.bg = self.theme.colors.accent;
+        }
     }
 
     // Show render time and FPS right-aligned when metrics are enabled
@@ -552,11 +562,11 @@ test "composite draws status line on last row" {
 
     compositor.composite(&layout, .{ .text = "", .status = "", .agent_running = false, .spinner_frame = 0, .fps = 0, .mode = .insert });
 
-    // Last row shows `[INSERT] > ` (mode label + prompt; overwrites status line).
+    // Last row shows `[INSERT] › ` (mode label + prompt; overwrites status line).
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'I'), screen.getCellConst(9, 1).codepoint);
     // `[INSERT] ` is 9 chars (indices 0..8), so the prompt starts at col 9.
-    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(9, 9).codepoint);
+    try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(9, 9).codepoint);
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(9, 10).codepoint);
 }
 
@@ -946,4 +956,84 @@ test "long titles are truncated with ellipsis" {
         }
     }
     try std.testing.expect(saw_ellipsis);
+}
+
+test "insert mode paints a block cursor at end of input text" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 6);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "x");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 6);
+
+    compositor.composite(&layout, .{
+        .text = "hi",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .insert,
+    });
+
+    const last_row = screen.height - 1;
+    // Row layout: `[INSERT] ` (9 cols) + `› ` (2 cols) + `hi` (2 cols) = cursor at col 13.
+    const cursor = screen.getCellConst(last_row, 13);
+    try std.testing.expectEqual(@as(u21, ' '), cursor.codepoint);
+    // bg must differ from the default to read as a painted block.
+    try std.testing.expect(!std.meta.eql(cursor.bg, Screen.Color.default));
+}
+
+test "normal mode does not paint a block cursor" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 6);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "x");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 6);
+
+    compositor.composite(&layout, .{
+        .text = "",
+        .status = "",
+        .agent_running = false,
+        .spinner_frame = 0,
+        .fps = 0,
+        .mode = .normal,
+    });
+
+    const last_row = screen.height - 1;
+    // No cell on the input row should have a non-default bg.
+    var any_bg = false;
+    for (0..screen.width) |c| {
+        if (!std.meta.eql(screen.getCellConst(last_row, @intCast(c)).bg, Screen.Color.default)) {
+            any_bg = true;
+            break;
+        }
+    }
+    try std.testing.expect(!any_bg);
 }
