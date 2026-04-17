@@ -157,3 +157,156 @@ fn isWide(cp: u21) bool {
         else => false,
     };
 }
+
+/// One grapheme-ish cluster extracted from a UTF-8 iterator.
+///
+/// `base` is the starting codepoint of the cluster. This is what gets stored
+/// in the primary Screen cell. Joined codepoints (ZWJ continuations, skin-tone
+/// modifiers, variation selectors, combining marks) are consumed silently and
+/// do not appear in the returned cluster.
+///
+/// `width` is the visual column count for the cluster: 0, 1, or 2.
+pub const Cluster = struct {
+    base: u21,
+    width: u2,
+};
+
+/// Read the next cluster from a UTF-8 iterator.
+///
+/// Handles: ZWJ sequences (`emoji ZWJ emoji...`), skin-tone modifiers
+/// (U+1F3FB..U+1F3FF), variation selector VS-16 (U+FE0F), combining marks,
+/// and regional-indicator flag pairs (two U+1F1E6..U+1F1FF codepoints).
+///
+/// Returns null if the iterator is exhausted.
+pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
+    _ = iter;
+    @compileError("not yet implemented");
+}
+
+fn isRegionalIndicator(cp: u21) bool {
+    return cp >= 0x1F1E6 and cp <= 0x1F1FF;
+}
+
+fn isSkinToneModifier(cp: u21) bool {
+    return cp >= 0x1F3FB and cp <= 0x1F3FF;
+}
+
+fn iterOf(s: []const u8) std.unicode.Utf8Iterator {
+    const view = std.unicode.Utf8View.initUnchecked(s);
+    return view.iterator();
+}
+
+test "nextCluster: plain ASCII is width 1, one codepoint per cluster" {
+    var iter = iterOf("hi");
+    const a = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'h'), a.base);
+    try testing.expectEqual(@as(u2, 1), a.width);
+    const b = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'i'), b.base);
+    try testing.expectEqual(@as(u2, 1), b.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: single wide codepoint is one cluster of width 2" {
+    var iter = iterOf("中");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x4E2D), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: single emoji is one cluster of width 2" {
+    var iter = iterOf("😀");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F600), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: combining mark fuses into the preceding letter" {
+    // 'a' + combining acute → one cluster, width 1, base='a'
+    var iter = iterOf("a\u{0301}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'a'), c.base);
+    try testing.expectEqual(@as(u2, 1), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: emoji + VS-16 is one cluster" {
+    // ❤ + VS-16 → one cluster, base = U+2764, width = codepointWidth(U+2764)
+    // U+2764 is NOT in our wide table today (width 1). We deliberately do not
+    // upgrade the base's width on VS-16; just fuse the VS-16 into the cluster.
+    var iter = iterOf("\u{2764}\u{FE0F}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x2764), c.base);
+    try testing.expectEqual(@as(u2, 1), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: emoji + skin-tone is one cluster of width 2" {
+    // 👍 + 🏻 → one cluster, base = thumbs up, width 2
+    var iter = iterOf("\u{1F44D}\u{1F3FB}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F44D), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: ZWJ family emoji is one cluster of width 2" {
+    // 👨‍👩‍👧 → one cluster, base = man, width 2
+    var iter = iterOf("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F468), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: flag pair is one cluster of width 2" {
+    // 🇺🇸 → one cluster, base = U+1F1FA, width 2
+    var iter = iterOf("\u{1F1FA}\u{1F1F8}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F1FA), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: lone regional indicator is width 1" {
+    // A single U+1F1E6 with no partner → width 1 (matches codepointWidth)
+    var iter = iterOf("\u{1F1E6}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F1E6), c.base);
+    try testing.expectEqual(@as(u2, 1), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: two flags back-to-back emit two clusters" {
+    // 🇺🇸🇯🇵 → US flag cluster + JP flag cluster, each width 2
+    var iter = iterOf("\u{1F1FA}\u{1F1F8}\u{1F1EF}\u{1F1F5}");
+    const us = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F1FA), us.base);
+    try testing.expectEqual(@as(u2, 2), us.width);
+    const jp = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F1EF), jp.base);
+    try testing.expectEqual(@as(u2, 2), jp.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: emoji followed by plain ASCII emits two clusters" {
+    var iter = iterOf("\u{1F600}a");
+    const e = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F600), e.base);
+    try testing.expectEqual(@as(u2, 2), e.width);
+    const a = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'a'), a.base);
+    try testing.expectEqual(@as(u2, 1), a.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: trailing ZWJ with no follow-up codepoint returns the base alone" {
+    // 👨 + ZWJ + <EOF>. Must not infinite loop; must not UB.
+    var iter = iterOf("\u{1F468}\u{200D}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F468), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
