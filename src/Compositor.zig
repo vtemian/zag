@@ -356,6 +356,12 @@ fn drawPanePrompt(
     const right_edge = rect.x + rect.width - 1;
     if (content_x >= right_edge) return;
 
+    // Clear the prompt row interior so stale cursor bg from a prior
+    // frame doesn't bleed behind the newly written draft. `writeStr`
+    // never touches `bg`, so once a cell was painted with accent bg
+    // for the cursor block it keeps that bg until we explicitly reset it.
+    self.screen.clearRect(prompt_row, content_x, right_edge - content_x, 1);
+
     // Focused pane: if a global status toast is set, it takes over the
     // prompt row entirely (with an optional spinner). This preserves the
     // split-announce / agent-info UX that the global bar used to carry.
@@ -960,6 +966,51 @@ test "focused pane renders its draft with a block cursor at end" {
     const cursor = screen.getCellConst(5, 6);
     try std.testing.expectEqual(@as(u21, ' '), cursor.codepoint);
     try std.testing.expect(!std.meta.eql(cursor.bg, Screen.Color.default));
+}
+
+test "cursor bg does not bleed across keystrokes" {
+    // Regression: writeStr never touches bg, so painting the cursor cell
+    // with accent bg used to leave a trail behind as the draft grew -
+    // each old cursor column kept its accent bg forever.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 8);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 8);
+
+    // Frame 1: user types "hi". Cursor lands at col 6 with accent bg.
+    for ("hi") |ch| cb.appendToDraft(ch);
+    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
+
+    // Frame 2: user types one more char. New cursor at col 7. The cell
+    // at col 6 now holds the glyph `s` (from "his") and MUST have
+    // default bg - no accent smear.
+    cb.appendToDraft('s');
+    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    try std.testing.expectEqual(@as(u21, 's'), screen.getCellConst(5, 6).codepoint);
+    try std.testing.expect(std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
+    // New cursor at col 7 picks up the accent.
+    try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 7).bg, Screen.Color.default));
+
+    // Frame 3: delete back to "hi". Col 7's old cursor cell must also
+    // reset to default bg - nothing trailing off the right of the draft.
+    cb.deleteBackFromDraft();
+    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    try std.testing.expect(std.meta.eql(screen.getCellConst(5, 7).bg, Screen.Color.default));
+    try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 }
 
 test "unfocused pane shows its draft without a cursor block" {
