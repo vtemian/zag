@@ -870,3 +870,31 @@ test "modeAfterKey: non-mode action (focus_left) keeps mode" {
     const after = modeAfterKey(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }, &registry);
     try std.testing.expectEqual(Keymap.Mode.normal, after);
 }
+
+test "drainWakePipe consumes all pending bytes" {
+    const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    // Write more than the 64-byte internal scratch so drainWakePipe must loop.
+    const payload = [_]u8{1} ** 128;
+    try std.testing.expectEqual(@as(usize, 128), try posix.write(fds[1], &payload));
+
+    drainWakePipe(fds[0]);
+
+    // A subsequent non-blocking read must now return WouldBlock, proving the
+    // pipe is empty. EAGAIN maps to error.WouldBlock on Zig 0.15.
+    var scratch: [8]u8 = undefined;
+    const residual = posix.read(fds[0], &scratch);
+    try std.testing.expectError(error.WouldBlock, residual);
+}
+
+test "drainWakePipe on empty pipe returns without blocking" {
+    const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    // Pipe is empty; the function must bail on the first WouldBlock rather
+    // than hang. If this test ever times out, drainWakePipe is blocking.
+    drainWakePipe(fds[0]);
+}
