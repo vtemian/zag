@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const json_schema = @import("json_schema.zig");
 const Allocator = std.mem.Allocator;
 
 /// Thread-local name of the tool currently being executed.
@@ -54,10 +55,15 @@ pub const Registry = struct {
 
     /// Execute a tool by name, passing raw JSON input.
     ///
-    /// `InvalidInput` and `ToolFailed` errors raised by the tool are flattened
-    /// into a `ToolResult { is_error = true }` here so the LLM can observe the
-    /// failure and retry. Only `OutOfMemory` propagates to the caller, because
-    /// there is no meaningful way for the LLM to recover from it.
+    /// Before dispatch the raw input is validated against the tool's declared
+    /// JSON schema so obvious mistakes (missing required fields, wrong types,
+    /// non-JSON payloads) are caught at the boundary and returned as a
+    /// `ToolResult { is_error = true }` with a message naming the violation.
+    ///
+    /// `InvalidInput` and `ToolFailed` errors raised by the tool itself are
+    /// likewise flattened into a `ToolResult { is_error = true }` so the LLM
+    /// can observe the failure and retry. Only `OutOfMemory` propagates to the
+    /// caller, because there is no meaningful way for the LLM to recover from it.
     ///
     /// An unknown tool name is likewise returned as `ToolResult { is_error = true }`.
     pub fn execute(self: *const Registry, name: []const u8, input_raw: []const u8, allocator: Allocator) error{OutOfMemory}!types.ToolResult {
@@ -65,6 +71,17 @@ pub const Registry = struct {
             .content = "error: unknown tool",
             .is_error = true,
             .owned = false,
+        };
+        json_schema.validate(allocator, tool.definition.input_schema_json, input_raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                const msg = std.fmt.allocPrint(
+                    allocator,
+                    "error: invalid input ({s})",
+                    .{@errorName(err)},
+                ) catch return types.oomResult();
+                return .{ .content = msg, .is_error = true, .owned = true };
+            },
         };
         current_tool_name = name;
         defer current_tool_name = null;
@@ -178,15 +195,34 @@ test "tool can raise InvalidInput directly" {
 test "registry.execute flattens InvalidInput into a tool-result error" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
+    // Schema accepts any object, so validation passes and the tool itself
+    // raises InvalidInput (its parse target requires field `x`).
     try r.register(.{ .definition = .{
         .name = "t",
         .description = "",
         .input_schema_json = "{\"type\":\"object\"}",
     }, .execute = testInvalidInputTool });
-    const result = try r.execute("t", "not json", std.testing.allocator);
+    const result = try r.execute("t", "{}", std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: invalid tool input", result.content);
     try std.testing.expect(!result.owned);
+}
+
+test "registry.execute rejects missing required field before dispatch" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+    try r.register(.{ .definition = .{
+        .name = "t",
+        .description = "",
+        .input_schema_json =
+        \\{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string"}}}
+        ,
+    }, .execute = testInvalidInputTool });
+    const result = try r.execute("t", "{\"other\":\"x\"}", std.testing.allocator);
+    defer if (result.owned) std.testing.allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(result.owned);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "MissingRequiredField") != null);
 }
 
 test {
