@@ -329,6 +329,11 @@ pub const LuaEngine = struct {
     /// Mutates `payload` in place if a hook returns a rewrite.
     /// A hook that raises is logged and skipped; subsequent hooks still run.
     pub fn fireHook(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
+        // Fast path: no hooks registered at all. Avoids any Lua VM
+        // interaction on the streaming hot path (e.g. TextDelta firing
+        // once per token).
+        if (self.hook_registry.hooks.items.len == 0) return;
+
         const pattern_key = hookPatternKey(payload.*);
 
         var it = self.hook_registry.iterMatching(payload.kind(), pattern_key);
@@ -449,12 +454,23 @@ pub const LuaEngine = struct {
     /// the top of the stack. Every `getField` is paired with `pop(1)`.
     fn applyHookReturn(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
         // Stack: [..., ret_table]
-        // Check `cancel` first. If set, short-circuit rewrite handling.
+        // Check `cancel` first. If set and the payload kind supports veto,
+        // short-circuit rewrite handling. For observer-only events we
+        // ignore cancel so a stray `{cancel=true}` from a lifecycle or
+        // post-hook can't leak into the next veto-capable event.
         _ = self.lua.getField(-1, "cancel");
         const cancel = self.lua.isBoolean(-1) and self.lua.toBoolean(-1);
         self.lua.pop(1);
 
         if (cancel) {
+            const veto_allowed = switch (payload.*) {
+                .tool_pre, .user_message_pre => true,
+                else => false,
+            };
+            if (!veto_allowed) {
+                log.warn("hook returned cancel=true for observer-only event {s}; ignored", .{@tagName(payload.kind())});
+                return;
+            }
             self.pending_cancel = true;
             _ = self.lua.getField(-1, "reason");
             if (self.lua.isString(-1)) {
