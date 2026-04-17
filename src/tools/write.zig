@@ -13,10 +13,9 @@ const WriteInput = struct {
 };
 
 /// Write content to a file, creating parent directories as needed.
-pub fn execute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
-    const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .content = "error: invalid input, expected { \"path\": \"...\", \"content\": \"...\" }", .is_error = true, .owned = false };
-    };
+pub fn execute(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+    const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
+        return error.InvalidInput;
     defer parsed.deinit();
     const input = parsed.value;
 
@@ -117,8 +116,7 @@ test "write counts lines correctly" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote 4 lines") != null);
 }
 
-test "write with invalid input returns error" {
+test "write with invalid input returns InvalidInput" {
     const allocator = std.testing.allocator;
-    const result = try execute("not json", allocator);
-    try std.testing.expect(result.is_error);
+    try std.testing.expectError(error.InvalidInput, execute("not json", allocator));
 }

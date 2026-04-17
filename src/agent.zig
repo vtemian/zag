@@ -201,14 +201,8 @@ fn runToolStep(
         try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
     }
 
-    const step: ToolCallResult = blk: {
-        if (registry.execute(tc.name, tc.input_raw, allocator)) |ok| {
-            break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
-        } else |err| {
-            const msg = try std.fmt.allocPrint(allocator, "error: tool execution failed: {s}", .{@errorName(err)});
-            break :blk .{ .content = msg, .is_error = true, .owned = true };
-        }
-    };
+    const ok = try registry.execute(tc.name, tc.input_raw, allocator);
+    const step: ToolCallResult = .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
     errdefer if (step.owned) allocator.free(step.content);
 
     const result_content = try allocator.dupe(u8, step.content);
@@ -468,7 +462,7 @@ test "tool results are collected into a user message" {
 
 /// A tool that echoes its input after sleeping 50ms. Used to verify
 /// parallel execution completes faster than sequential.
-fn echoSlowExecute(_: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+fn echoSlowExecute(_: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
     std.Thread.sleep(50 * std.time.ns_per_ms);
     return .{ .content = try allocator.dupe(u8, "echo_result"), .is_error = false };
 }
@@ -483,7 +477,7 @@ const echo_slow_tool = types.Tool{
 };
 
 /// A tool that returns immediately with the tool name as content.
-fn echoFastExecute(_: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+fn echoFastExecute(_: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
     return .{ .content = try allocator.dupe(u8, "fast_result"), .is_error = false };
 }
 
