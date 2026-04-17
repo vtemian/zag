@@ -5,6 +5,7 @@
 //! synchronized output (CSI ?2026h/l) to eliminate flicker.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.screen);
 const trace = @import("Metrics.zig");
@@ -67,8 +68,20 @@ previous: []Cell,
 allocator: Allocator,
 /// Persistent output buffer reused across render() calls.
 render_buf: std.ArrayList(u8),
+/// Set when the prior render exceeded `write_deadline_ms` and returned
+/// `error.WriteTimeout`. The next render wipes `previous` to force a
+/// full redraw, since the terminal received an unknown partial prefix
+/// of the dropped frame.
+write_timed_out: bool = false,
 
 const empty_cell = Cell{};
+
+/// Maximum time a single render's write phase may spend waiting for the
+/// terminal output fd to accept bytes before we give up on the frame.
+/// Long enough for a slow SSH link to drain one screenful; short enough
+/// that a truly stalled tty (hung connection, frozen emulator) can't
+/// freeze the event loop for more than a quarter second.
+const write_deadline_ms: i64 = 250;
 
 /// Initialize a new screen with the given dimensions.
 /// Both grids are filled with empty (space) cells.
@@ -92,6 +105,7 @@ pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
         .previous = previous,
         .allocator = allocator,
         .render_buf = .empty,
+        .write_timed_out = false,
     };
 }
 
@@ -273,6 +287,16 @@ fn colorsEqual(a: Color, b: Color) bool {
 /// of UTF-8 bytes. Implicit terminal cursor advancement after each
 /// codepoint keeps the per-cell overhead near zero.
 pub fn render(self: *Screen, file: std.fs.File) !void {
+    // Recovery path: a prior render returned WriteTimeout with a partial
+    // frame written to the terminal. `previous` no longer reflects what
+    // the terminal actually has, so force every cell to diff as dirty.
+    // The full redraw that follows implicitly re-establishes cursor
+    // position and SGR state.
+    if (self.write_timed_out) {
+        @memset(self.previous, empty_cell);
+        self.write_timed_out = false;
+    }
+
     self.render_buf.clearRetainingCapacity();
 
     const writer = self.render_buf.writer(self.allocator);
@@ -348,23 +372,38 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         try writer.writeAll("\x1b[?2026l");
     }
 
-    // Single write to stdout, retrying on WouldBlock
+    // Single write to stdout with bounded backpressure tolerance.
+    // A fully stalled tty (hung SSH, frozen emulator, XOFF) must not be
+    // allowed to pin the event loop indefinitely. On each WouldBlock we
+    // poll for writability, but the total time spent across all polls
+    // within one render is capped at `write_deadline_ms`. Past that we
+    // drop the frame and let the next render redraw from scratch.
     {
         var write_span = trace.span("write");
         defer write_span.endWithArgs(.{ .bytes = self.render_buf.items.len });
         var written: usize = 0;
+        var block_started_ms: ?i64 = null;
         while (written < self.render_buf.items.len) {
             written += file.write(self.render_buf.items[written..]) catch |err| switch (err) {
                 error.WouldBlock => {
-                    // Terminal output buffer full. Block until the kernel
-                    // reports the fd is writable again instead of polling
-                    // with an arbitrary retry delay. poll() retries EINTR
-                    // internally; on unexpected errors we just retry the
-                    // write, which will surface the real error.
+                    const now_ms = std.time.milliTimestamp();
+                    if (block_started_ms == null) block_started_ms = now_ms;
+                    const elapsed_ms: i64 = now_ms - block_started_ms.?;
+                    if (elapsed_ms >= write_deadline_ms) {
+                        self.write_timed_out = true;
+                        // Suppress the warning in tests so `zig build test`
+                        // output stays pristine; the deadline-test asserts
+                        // on return value and state, which is the real signal.
+                        if (!builtin.is_test) {
+                            log.warn("render write stalled {d}ms; dropping frame", .{elapsed_ms});
+                        }
+                        return error.WriteTimeout;
+                    }
+                    const remaining_ms: i32 = @intCast(write_deadline_ms - elapsed_ms);
                     var fds = [_]std.posix.pollfd{
                         .{ .fd = file.handle, .events = std.posix.POLL.OUT, .revents = 0 },
                     };
-                    _ = std.posix.poll(&fds, -1) catch {};
+                    _ = std.posix.poll(&fds, remaining_ms) catch {};
                     continue;
                 },
                 else => return err,
@@ -1109,4 +1148,74 @@ test "diff merges run containing wide-char continuation cell" {
     // All codepoints emitted back-to-back (continuation cell consumed silently).
     // U+4E2D "中" is 0xE4 0xB8 0xAD.
     try std.testing.expect(std.mem.indexOf(u8, output, "ab\xE4\xB8\xADcd") != null);
+}
+
+test "render returns WriteTimeout when tty backpressure exceeds deadline" {
+    const allocator = std.testing.allocator;
+
+    // Non-blocking pipe whose read end we never drain, so the write buffer
+    // fills up and never drains.
+    const pipe = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+    defer write_end.close();
+
+    // Preload the pipe buffer until the next write would block. Ensures the
+    // render's first `file.write` hits WouldBlock rather than succeeding by
+    // chance if the kernel buffer happens to be large.
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 'x');
+    while (true) {
+        _ = std.posix.write(pipe[1], &junk) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+
+    var screen = try Screen.init(allocator, 40, 10);
+    defer screen.deinit();
+    for (screen.current) |*cell| cell.codepoint = 'Z';
+
+    const start_ms = std.time.milliTimestamp();
+    const result = screen.render(write_end);
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+
+    try std.testing.expectError(error.WriteTimeout, result);
+    try std.testing.expect(screen.write_timed_out);
+    // The deadline is 250ms; we should have spent at least 200ms waiting.
+    // Upper bound catches any accidental unbounded poll.
+    try std.testing.expect(elapsed_ms >= 200);
+    try std.testing.expect(elapsed_ms < 2000);
+}
+
+test "render after write_timed_out forces full redraw" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 4, 2);
+    defer screen.deinit();
+
+    // Identical content in both grids: without intervention, the diff would
+    // produce no cell output on this render.
+    for (screen.current) |*cell| cell.codepoint = 'Q';
+    for (screen.previous) |*cell| cell.codepoint = 'Q';
+
+    // Stand in for "the previous render returned WriteTimeout."
+    screen.write_timed_out = true;
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    try std.testing.expect(!screen.write_timed_out);
+
+    var scratch: [1024]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Because the flag wiped `previous` to empty cells at entry, every 'Q'
+    // is now dirty and the frame re-emits the content.
+    try std.testing.expect(std.mem.indexOf(u8, output, "Q") != null);
 }
