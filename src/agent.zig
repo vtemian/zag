@@ -465,7 +465,7 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
 /// an owned content block slice for the conversation history.
 /// When multiple tools are requested, they run in parallel on
 /// separate OS threads. A single tool call runs inline.
-fn executeTools(
+pub fn executeTools(
     tool_calls: []const types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
     allocator: Allocator,
