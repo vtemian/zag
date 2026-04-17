@@ -50,8 +50,20 @@ const Action = enum { none, quit, redraw };
 /// Result of handling a slash command.
 const CommandResult = enum { handled, quit, not_a_command };
 
-/// A split pane's owned resources: buffer, conversation session, agent
-/// runner, and optional on-disk session handle.
+/// The three objects that together form a conversation pane: the view
+/// (rendering), the session (LLM message + persistence state), and the
+/// runner (agent thread + event coordination). Callers that need all
+/// three compose them through this struct; each field is a borrowed
+/// pointer and the three lifetimes are coupled.
+pub const Pane = struct {
+    view: *ConversationBuffer,
+    session: *ConversationSession,
+    runner: *AgentRunner,
+};
+
+/// A split pane's owned resources. Extends `Pane` with the optional
+/// on-disk session handle so orchestrator-owned panes carry enough
+/// state to tear themselves down.
 pub const SplitPane = struct {
     /// The conversation buffer for this pane.
     buffer: *ConversationBuffer,
@@ -77,6 +89,13 @@ layout: *Layout,
 compositor: *Compositor,
 /// Root conversation buffer (the initial session pane).
 root_buffer: *ConversationBuffer,
+/// LLM conversation state for the root pane. Borrowed from main; used to
+/// persist, rebuild messages, and extract auto-naming inputs.
+root_session: *ConversationSession,
+/// Agent lifecycle for the root pane. Borrowed from main; used to spawn
+/// the agent thread, drain events, cancel, and read `last_info` for the
+/// status bar. Phase 4 folds this into a `Pane` and removes the side-car.
+root_runner: *AgentRunner,
 /// LLM provider for model calls and model ID lookups.
 provider: *llm.ProviderResult,
 /// Tool registry for dispatching tool calls.
@@ -143,6 +162,12 @@ pub const Config = struct {
     compositor: *Compositor,
     /// Root conversation buffer (initial session pane).
     root_buffer: *ConversationBuffer,
+    /// LLM conversation state for the root pane. Borrowed from main;
+    /// Phase 4 folds this into a `Pane` and removes the side-car.
+    root_session: *ConversationSession,
+    /// Agent lifecycle for the root pane. Borrowed from main; Phase 4
+    /// folds this into a `Pane` and removes the side-car.
+    root_runner: *AgentRunner,
     /// LLM provider for model calls and model ID lookups.
     provider: *llm.ProviderResult,
     /// Tool registry for dispatching tool calls.
@@ -171,6 +196,8 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .layout = cfg.layout,
         .compositor = cfg.compositor,
         .root_buffer = cfg.root_buffer,
+        .root_session = cfg.root_session,
+        .root_runner = cfg.root_runner,
         .provider = cfg.provider,
         .registry = cfg.registry,
         .session_mgr = cfg.session_mgr,
@@ -365,11 +392,12 @@ fn tick(
     if (!frame_dirty) return;
 
     const focused = self.getFocusedConversation();
-    const agent_running = focused.isAgentRunning();
+    const runner = self.runnerForBuffer(focused);
+    const agent_running = runner.isAgentRunning();
     const status = if (self.transient_status_len > 0)
         self.transient_status[0..self.transient_status_len]
     else if (agent_running) blk: {
-        const info = focused.lastInfo();
+        const info = runner.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
     self.compositor.composite(self.layout, .{
@@ -436,8 +464,9 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
             .char => |ch| {
                 if (ch == 'c') {
                     const focused = self.getFocusedConversation();
-                    if (focused.isAgentRunning()) {
-                        focused.cancelAgent();
+                    const runner = self.runnerForBuffer(focused);
+                    if (runner.isAgentRunning()) {
+                        runner.cancelAgent();
                         return .none;
                     }
                     return .quit;
@@ -478,7 +507,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 },
                 .not_a_command => {
                     const focused = self.getFocusedConversation();
-                    if (focused.isAgentRunning()) return .none;
+                    if (self.runnerForBuffer(focused).isAgentRunning()) return .none;
 
                     self.onUserInputSubmitted(focused, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
@@ -687,27 +716,27 @@ fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
 }
 
 /// Create a new split pane: session + buffer + runner + optional persistence
-/// handle, tracked for cleanup.
+/// handle, tracked for cleanup. With `ConversationBuffer` no longer holding
+/// a runner back-ref, the three allocations are straight-line: session,
+/// view, runner.
 fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     const cs = try self.allocator.create(ConversationSession);
     errdefer self.allocator.destroy(cs);
     cs.* = ConversationSession.init(self.allocator);
     errdefer cs.deinit();
 
+    var name_scratch: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+
     const cb = try self.allocator.create(ConversationBuffer);
     errdefer self.allocator.destroy(cb);
+    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
+    errdefer cb.deinit();
 
     const runner = try self.allocator.create(AgentRunner);
     errdefer self.allocator.destroy(runner);
     runner.* = AgentRunner.init(self.allocator, cb, cs);
     errdefer runner.deinit();
-
-    var name_scratch: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
-
-    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name, cs, runner);
-    errdefer cb.deinit();
-    runner.view = cb;
 
     // Wake pipe so agent events on this pane interrupt the orchestrator's
     // poll(). Lua engine pointer so main-thread drain can service hook and
@@ -718,15 +747,18 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
 
-    // Attach session if persistence is available
-    const sh = self.attachSession(cb);
-
     try self.extra_panes.append(self.allocator, .{
         .buffer = cb,
         .conv_session = cs,
         .runner = runner,
-        .session = sh,
+        .session = null,
     });
+
+    // Attach the session only after the pane is registered so
+    // sessionForBuffer/attachSession can find the pane by buffer pointer.
+    const sh = self.attachSession(cb);
+    self.extra_panes.items[self.extra_panes.items.len - 1].session = sh;
+
     return cb;
 }
 
@@ -739,7 +771,7 @@ fn attachSession(self: *EventOrchestrator, cb: *ConversationBuffer) ?*Session.Se
         self.allocator.destroy(h);
         return null;
     };
-    cb.session.attachSession(h);
+    self.sessionForBuffer(cb).attachSession(h);
     return h;
 }
 
@@ -747,7 +779,8 @@ fn attachSession(self: *EventOrchestrator, cb: *ConversationBuffer) ?*Session.Se
 
 /// Drain a buffer's agent events and auto-name its session on first completion.
 fn drainBuffer(self: *EventOrchestrator, buf: *ConversationBuffer) void {
-    if (buf.drainEvents(self.allocator)) {
+    const runner = self.runnerForBuffer(buf);
+    if (runner.drainEvents(self.allocator)) {
         self.autoNameSession(buf);
     }
 }
@@ -786,37 +819,39 @@ fn onUserInputSubmitted(
         }
     }
 
-    try cb.submitInput(working_text, self.allocator);
+    const runner = self.runnerForBuffer(cb);
+    const session = self.sessionForBuffer(cb);
+    try runner.submitInput(working_text, self.allocator);
 
     if (self.lua_engine) |eng| {
         var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
         eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
     }
 
-    if (cb.isAgentRunning()) return;
+    if (runner.isAgentRunning()) return;
 
     // 256 slots is ~1s of fast streaming - enough headroom for a UI frame
     // stall without hiding persistent backpressure.
-    cb.runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
-    cb.runner.event_queue.wake_fd = self.wake_write_fd;
-    cb.runner.queue_active = true;
-    cb.runner.lua_engine = self.lua_engine;
-    cb.runner.cancel_flag.store(false, .release);
+    runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
+    runner.event_queue.wake_fd = self.wake_write_fd;
+    runner.queue_active = true;
+    runner.lua_engine = self.lua_engine;
+    runner.cancel_flag.store(false, .release);
 
-    cb.runner.agent_thread = AgentThread.spawn(
+    runner.agent_thread = AgentThread.spawn(
         self.provider.provider,
-        &cb.session.messages,
+        &session.messages,
         self.registry,
         self.allocator,
-        &cb.runner.event_queue,
-        &cb.runner.cancel_flag,
+        &runner.event_queue,
+        &runner.cancel_flag,
         self.lua_engine,
     ) catch |err| {
         _ = cb.appendNode(null, .err, @errorName(err)) catch |append_err|
             log.warn("dropped event: {s}", .{@errorName(append_err)});
-        cb.runner.event_queue.deinit();
-        cb.runner.queue_active = false;
-        cb.runner.agent_thread = null;
+        runner.event_queue.deinit();
+        runner.queue_active = false;
+        runner.agent_thread = null;
         return err;
     };
 }
@@ -825,10 +860,11 @@ fn onUserInputSubmitted(
 /// ask the provider for a 3-5 word title and rename the session.
 /// Best-effort: any failure is logged and swallowed.
 fn autoNameSession(self: *EventOrchestrator, cb: *ConversationBuffer) void {
-    const sh = cb.session.session_handle orelse return;
+    const session = self.sessionForBuffer(cb);
+    const sh = session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
-    const inputs = cb.session.sessionSummaryInputs() orelse return;
+    const inputs = session.sessionSummaryInputs() orelse return;
 
     const summary = self.generateSessionName(inputs) catch |err| {
         log.debug("auto-name failed: {}", .{err});
@@ -890,12 +926,60 @@ fn getFocusedConversation(self: *EventOrchestrator) *ConversationBuffer {
         self.root_buffer;
 }
 
+/// Resolve the `AgentRunner` that drives a given buffer. Phase 3
+/// transitional helper: the root buffer's runner is side-car stored on
+/// the orchestrator, and split-pane buffers carry their runner in the
+/// `SplitPane` record. Phase 4 replaces this with a direct `Pane`
+/// field on the orchestrator that pairs buffer + session + runner.
+fn runnerForBuffer(self: *EventOrchestrator, cb: *ConversationBuffer) *AgentRunner {
+    if (cb == self.root_buffer) return self.root_runner;
+    for (self.extra_panes.items) |pane| {
+        if (pane.buffer == cb) return pane.runner;
+    }
+    // A buffer not in any pane record shouldn't be reachable from the UI;
+    // fall back to the root runner so the diagnostic path degrades
+    // rather than crashes.
+    return self.root_runner;
+}
+
+/// Same as `runnerForBuffer` but returns the matching session.
+fn sessionForBuffer(self: *EventOrchestrator, cb: *ConversationBuffer) *ConversationSession {
+    if (cb == self.root_buffer) return self.root_session;
+    for (self.extra_panes.items) |pane| {
+        if (pane.buffer == cb) return pane.conv_session;
+    }
+    return self.root_session;
+}
+
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
 /// so the error-return path from run() cannot skip it.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
-    self.root_buffer.shutdown();
+    self.root_runner.shutdown();
     for (self.extra_panes.items) |pane| {
-        pane.buffer.shutdown();
+        pane.runner.shutdown();
+    }
+}
+
+/// Restore a pane from an on-disk session: rebuilds both the view tree
+/// and the LLM message history, attaches the session handle, and copies
+/// the stored session name (if any) back onto the view. Replaces the old
+/// `ConversationBuffer.restoreFromSession` coordinator now that the view
+/// no longer holds a session reference.
+pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Allocator) !void {
+    const session_id = handle.id[0..handle.id_len];
+    const entries = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (entries) |entry| Session.freeEntry(entry, allocator);
+        allocator.free(entries);
+    }
+
+    try pane.view.loadFromEntries(entries);
+    try pane.session.rebuildMessages(entries, allocator);
+    pane.session.attachSession(handle);
+
+    if (handle.meta.name_len > 0) {
+        allocator.free(pane.view.name);
+        pane.view.name = try allocator.dupe(u8, handle.meta.nameSlice());
     }
 }
 
@@ -1035,4 +1119,100 @@ test "drainWakePipe on empty pipe returns without blocking" {
     // Pipe is empty; the function must bail on the first WouldBlock rather
     // than hang. If this test ever times out, drainWakePipe is blocking.
     drainWakePipe(fds[0]);
+}
+
+test "Pane composes view + session + runner" {
+    const allocator = std.testing.allocator;
+
+    const session = try allocator.create(ConversationSession);
+    session.* = ConversationSession.init(allocator);
+    defer {
+        session.deinit();
+        allocator.destroy(session);
+    }
+
+    const view = try allocator.create(ConversationBuffer);
+    view.* = try ConversationBuffer.init(allocator, 0, "pane-test");
+    defer {
+        view.deinit();
+        allocator.destroy(view);
+    }
+
+    const runner = try allocator.create(AgentRunner);
+    runner.* = AgentRunner.init(allocator, view, session);
+    defer {
+        runner.deinit();
+        allocator.destroy(runner);
+    }
+
+    const pane: Pane = .{ .view = view, .session = session, .runner = runner };
+
+    // All three objects are reachable through the Pane. Runner sees the
+    // same view pointer; view sees its own name.
+    try std.testing.expectEqual(view, pane.view);
+    try std.testing.expectEqual(session, pane.session);
+    try std.testing.expectEqual(runner, pane.runner);
+    try std.testing.expectEqual(view, pane.runner.view);
+    try std.testing.expectEqual(session, pane.runner.session);
+    try std.testing.expectEqualStrings("pane-test", pane.view.name);
+}
+
+test "restorePane rebuilds both tree and messages" {
+    const allocator = std.testing.allocator;
+
+    // The session lives under .zag/sessions (cwd-relative). We synthesize a
+    // deterministic id, write a small JSONL file ourselves, and build a
+    // SessionHandle struct pointing at it. Writing the file directly (rather
+    // than via SessionHandle.appendEntry in a loop) sidesteps a known
+    // quirk of std.fs.File positional writers: each freshly-created writer
+    // starts at pos 0, so a single writer loop is the reliable pattern.
+    std.fs.cwd().makePath(".zag/sessions") catch {};
+
+    const session_id = "restore_test_0123456789abcdef01";
+
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
+
+    defer {
+        std.fs.cwd().deleteFile(jsonl_path) catch {};
+    }
+
+    // Write two entries using a single writer so positional offsets advance.
+    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    {
+        var write_scratch: [512]u8 = undefined;
+        var fw = file.writer(&write_scratch);
+        try fw.interface.writeAll("{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":0}\n");
+        try fw.interface.writeAll("{\"type\":\"assistant_text\",\"content\":\"hello\",\"ts\":1}\n");
+        try fw.interface.flush();
+    }
+
+    // Build a minimal SessionHandle pointing at the file we just wrote.
+    // restorePane only reads id/id_len and meta.name_len/nameSlice.
+    var handle = Session.SessionHandle{
+        .id_len = @intCast(session_id.len),
+        .file = file,
+        .meta = .{},
+        .allocator = allocator,
+    };
+    @memcpy(handle.id[0..session_id.len], session_id);
+    defer handle.close();
+
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "restored");
+    defer cb.deinit();
+    var runner = AgentRunner.init(allocator, &cb, &scb);
+    defer runner.deinit();
+
+    const pane: Pane = .{ .view = &cb, .session = &scb, .runner = &runner };
+    try restorePane(pane, &handle, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[0].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, cb.root_children.items[1].node_type);
+    try std.testing.expectEqual(@as(usize, 2), scb.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, scb.messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, scb.messages.items[1].role);
+    try std.testing.expect(scb.session_handle != null);
 }

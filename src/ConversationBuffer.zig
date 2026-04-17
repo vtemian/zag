@@ -9,10 +9,7 @@ const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
-const types = @import("types.zig");
 const Session = @import("Session.zig");
-const ConversationSession = @import("ConversationSession.zig");
-const AgentRunner = @import("AgentRunner.zig");
 
 const ConversationBuffer = @This();
 
@@ -97,25 +94,11 @@ render_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 
-/// LLM conversation state: message history and persistence handle.
-/// Borrowed, not owned. Lifetime is managed by the orchestrator.
-session: *ConversationSession,
-/// Agent runner that drives this buffer: streaming state, correlation map,
-/// thread handle, event queue, Lua engine pointer, wake fd. Borrowed, not
-/// owned. Lifetime is managed by the orchestrator. Phase 4 removes this
-/// field in favor of a `Pane` struct composing the three types.
-runner: *AgentRunner,
-
-/// Create a new empty buffer with the given id and name. Borrows `session`
-/// for LLM message history and persistence and `runner` for agent-thread
-/// coordination; the caller retains ownership of both.
-pub fn init(
-    allocator: Allocator,
-    id: u32,
-    name: []const u8,
-    session: *ConversationSession,
-    runner: *AgentRunner,
-) !ConversationBuffer {
+/// Create a new empty buffer with the given id and name. The buffer is a
+/// pure view; its LLM messages live on `ConversationSession` and its
+/// agent-thread coordination lives on `AgentRunner`. Callers compose the
+/// three through `EventOrchestrator.Pane`.
+pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
 
@@ -126,8 +109,6 @@ pub fn init(
         .next_id = 0,
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
-        .session = session,
-        .runner = runner,
     };
 }
 
@@ -331,17 +312,22 @@ pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !v
     self.render_dirty = true;
 }
 
-/// Populate the node tree from loaded JSONL entries.
+/// Populate the node tree from loaded JSONL entries. The tool_result
+/// parenting uses a local walker rather than the runner's correlation map
+/// because this path runs during session restore, before any agent has
+/// been spawned; JSONL entries are always in chronological order so the
+/// most recently seen tool_call is the right parent.
 pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry) !void {
+    var last_tool_call: ?*Node = null;
     for (entries) |entry| {
         switch (entry.entry_type) {
             .user_message => _ = try self.appendNode(null, .user_message, entry.content),
             .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
             .tool_call => {
-                self.runner.last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+                last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
             },
             .tool_result => {
-                _ = try self.appendNode(self.runner.last_tool_call, .tool_result, entry.content);
+                _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
             },
             .info => _ = try self.appendNode(null, .status, entry.content),
             .err => _ = try self.appendNode(null, .err, entry.content),
@@ -366,63 +352,6 @@ pub fn clear(self: *ConversationBuffer) void {
 /// Thin wrapper around `appendNode` used by the runner's submit path.
 pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
-}
-
-/// Submit user input. Thin shim over `AgentRunner.submitInput`; removed
-/// in Phase 4 when callers take a Pane directly.
-pub fn submitInput(
-    self: *ConversationBuffer,
-    text: []const u8,
-    allocator: Allocator,
-) !void {
-    return self.runner.submitInput(text, allocator);
-}
-
-/// Drain pending agent events. Thin delegation to the runner so existing
-/// callers work while Phase 4 threads the Pane struct through orchestrator.
-pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
-    return self.runner.drainEvents(allocator);
-}
-
-/// Whether an agent is currently running for this buffer. Shim over
-/// `AgentRunner.isAgentRunning`; removed in Phase 4.
-pub fn isAgentRunning(self: *const ConversationBuffer) bool {
-    return self.runner.isAgentRunning();
-}
-
-/// Return the last info/status message (e.g., token counts) for status bar
-/// display. Shim over `AgentRunner.lastInfo`; removed in Phase 4.
-pub fn lastInfo(self: *const ConversationBuffer) []const u8 {
-    return self.runner.lastInfo();
-}
-
-/// Request cancellation of the running agent. Shim over
-/// `AgentRunner.cancelAgent`; removed in Phase 4.
-pub fn cancelAgent(self: *ConversationBuffer) void {
-    self.runner.cancelAgent();
-}
-
-/// Cancel and join the agent thread if running. Shim over
-/// `AgentRunner.shutdown`; removed in Phase 4.
-pub fn shutdown(self: *ConversationBuffer) void {
-    self.runner.shutdown();
-}
-
-pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle, allocator: Allocator) !void {
-    const session_id = sh.id[0..sh.id_len];
-    const entries = try Session.loadEntries(session_id, allocator);
-    defer {
-        for (entries) |entry| Session.freeEntry(entry, allocator);
-        allocator.free(entries);
-    }
-
-    try self.loadFromEntries(entries);
-    try self.session.rebuildMessages(entries, allocator);
-
-    if (sh.meta.name_len > 0) {
-        allocator.free(self.name);
-        self.name = try allocator.dupe(u8, sh.meta.nameSlice());
-    }
 }
 
 // -- Buffer interface --------------------------------------------------------
@@ -498,14 +427,8 @@ test {
 
 test "init and deinit" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
-    runner.view = &cb;
 
     try std.testing.expectEqual(@as(u32, 0), cb.id);
     try std.testing.expectEqualStrings("test", cb.name);
@@ -514,14 +437,8 @@ test "init and deinit" {
 
 test "appendNode creates root-level nodes" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 1, "session", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 1, "session");
     defer cb.deinit();
-    runner.view = &cb;
 
     const n1 = try cb.appendNode(null, .user_message, "hello");
     const n2 = try cb.appendNode(null, .assistant_text, "hi there");
@@ -535,14 +452,8 @@ test "appendNode creates root-level nodes" {
 
 test "getVisibleLines returns rendered lines" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 3, "session", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 3, "session");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -559,14 +470,8 @@ test "getVisibleLines returns rendered lines" {
 
 test "buffer interface dispatches correctly" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 7, "iface-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 7, "iface-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     const b = cb.buf();
     try std.testing.expectEqualStrings("iface-test", b.getName());
@@ -580,14 +485,8 @@ test "buffer interface dispatches correctly" {
 
 test "fromBuffer roundtrips correctly" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip");
     defer cb.deinit();
-    runner.view = &cb;
 
     const b = cb.buf();
     const recovered = ConversationBuffer.fromBuffer(b);
@@ -596,14 +495,8 @@ test "fromBuffer roundtrips correctly" {
 
 test "getVisibleLines with range skips off-screen nodes" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "range-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "range-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     // Create 5 single-line nodes
     _ = try cb.appendNode(null, .user_message, "line0");
@@ -631,14 +524,8 @@ test "getVisibleLines with range skips off-screen nodes" {
 
 test "buffer interface returns line count" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "lc-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "lc-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -652,14 +539,8 @@ test "buffer interface returns line count" {
 
 test "getVisibleLines returns consistent results when content unchanged" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "cache-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .assistant_text, "world");
@@ -686,14 +567,8 @@ test "getVisibleLines returns consistent results when content unchanged" {
 
 test "getVisibleLines reflects new content after appendToNode" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     const node = try cb.appendNode(null, .user_message, "hello");
 
@@ -717,14 +592,8 @@ test "getVisibleLines reflects new content after appendToNode" {
 
 test "getVisibleLines reflects new nodes after appendNode" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "append-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "append-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "first");
 
@@ -747,14 +616,8 @@ test "getVisibleLines reflects new nodes after appendNode" {
 
 test "clear invalidates line cache" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -774,14 +637,8 @@ test "clear invalidates line cache" {
 
 test "buffer starts clean" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     const b = cb.buf();
     try std.testing.expect(!b.isDirty());
@@ -789,14 +646,8 @@ test "buffer starts clean" {
 
 test "appendNode marks buffer dirty" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     const b = cb.buf();
@@ -805,14 +656,8 @@ test "appendNode marks buffer dirty" {
 
 test "clearDirty resets the flag" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     var b = cb.buf();
@@ -824,14 +669,8 @@ test "clearDirty resets the flag" {
 
 test "appendToNode marks buffer dirty" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     const node = try cb.appendNode(null, .user_message, "hello");
     var b = cb.buf();
@@ -843,14 +682,8 @@ test "appendToNode marks buffer dirty" {
 
 test "setScrollOffset marks dirty only when value changes" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     var b = cb.buf();
 
@@ -881,48 +714,10 @@ test "synthetic id scratch fits maxInt(u32)" {
     }
 }
 
-test "submitInput appends user message and user_message node" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "submit-test", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-
-    try cb.submitInput("hello", allocator);
-
-    // Node tree side
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("hello", cb.root_children.items[0].content.items);
-
-    // Message list side
-    try std.testing.expectEqual(@as(usize, 1), cb.session.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[0].role);
-    try std.testing.expectEqual(@as(usize, 1), cb.session.messages.items[0].content.len);
-    switch (cb.session.messages.items[0].content[0]) {
-        .text => |t| try std.testing.expectEqualStrings("hello", t.text),
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Streaming state reset
-    try std.testing.expect(cb.runner.current_assistant_node == null);
-    try std.testing.expect(cb.runner.last_tool_call == null);
-}
-
 test "loadFromEntries builds node tree from session entries" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "load-test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "load-test");
     defer cb.deinit();
-    runner.view = &cb;
 
     const entries = [_]Session.Entry{
         .{ .entry_type = .user_message, .content = "first", .timestamp = 0 },
@@ -940,109 +735,4 @@ test "loadFromEntries builds node tree from session entries" {
     // tool_result is a child of tool_call
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items[2].children.items.len);
     try std.testing.expectEqual(NodeType.tool_result, cb.root_children.items[2].children.items[0].node_type);
-}
-
-test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "rebuild-test", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-
-    const entries = [_]Session.Entry{
-        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
-        .{ .entry_type = .assistant_text, .content = "calling tool", .timestamp = 1 },
-        .{ .entry_type = .tool_call, .tool_name = "bash", .tool_input = "{\"c\":\"ls\"}", .timestamp = 2 },
-        .{ .entry_type = .tool_result, .content = "file1", .is_error = false, .timestamp = 3 },
-        .{ .entry_type = .assistant_text, .content = "done", .timestamp = 4 },
-    };
-
-    try cb.session.rebuildMessages(&entries, allocator);
-
-    // Expected message sequence: user, assistant(text + tool_use), user(tool_result), assistant(text)
-    try std.testing.expectEqual(@as(usize, 4), cb.session.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[0].role);
-    try std.testing.expectEqual(types.Role.assistant, cb.session.messages.items[1].role);
-    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[2].role);
-    try std.testing.expectEqual(types.Role.assistant, cb.session.messages.items[3].role);
-
-    // Assistant message 1 has text + tool_use
-    try std.testing.expectEqual(@as(usize, 2), cb.session.messages.items[1].content.len);
-    switch (cb.session.messages.items[1].content[1]) {
-        .tool_use => |tu| {
-            try std.testing.expectEqualStrings("synth_0", tu.id);
-            try std.testing.expectEqualStrings("bash", tu.name);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // tool_result user message references synth_0
-    switch (cb.session.messages.items[2].content[0]) {
-        .tool_result => |tr| try std.testing.expectEqualStrings("synth_0", tr.tool_use_id),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "restoreFromSession rebuilds both tree and messages" {
-    const allocator = std.testing.allocator;
-
-    // The session lives under .zag/sessions (cwd-relative). We synthesize a
-    // deterministic id, write a small JSONL file ourselves, and build a
-    // SessionHandle struct pointing at it. Writing the file directly (rather
-    // than via SessionHandle.appendEntry in a loop) sidesteps a known
-    // quirk of std.fs.File positional writers — each freshly-created writer
-    // starts at pos 0 — so a single writer loop is the reliable pattern.
-    std.fs.cwd().makePath(".zag/sessions") catch {};
-
-    const session_id = "restore_test_0123456789abcdef01";
-
-    var jsonl_path_buf: [256]u8 = undefined;
-    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
-
-    defer {
-        std.fs.cwd().deleteFile(jsonl_path) catch {};
-    }
-
-    // Write two entries using a single writer so positional offsets advance.
-    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
-    {
-        var write_scratch: [512]u8 = undefined;
-        var fw = file.writer(&write_scratch);
-        try fw.interface.writeAll("{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":0}\n");
-        try fw.interface.writeAll("{\"type\":\"assistant_text\",\"content\":\"hello\",\"ts\":1}\n");
-        try fw.interface.flush();
-    }
-
-    // Build a minimal SessionHandle pointing at the file we just wrote.
-    // restoreFromSession only reads `id`/`id_len` and `meta.name_len`/`nameSlice`.
-    var handle = Session.SessionHandle{
-        .id_len = @intCast(session_id.len),
-        .file = file,
-        .meta = .{},
-        .allocator = allocator,
-    };
-    @memcpy(handle.id[0..session_id.len], session_id);
-    defer handle.close();
-
-    // Fresh buffer restores it
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "restored", &scb, &runner);
-    defer cb.deinit();
-    runner.view = &cb;
-    try cb.restoreFromSession(&handle, allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
-    try std.testing.expectEqual(NodeType.assistant_text, cb.root_children.items[1].node_type);
-    try std.testing.expectEqual(@as(usize, 2), cb.session.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, cb.session.messages.items[0].role);
-    try std.testing.expectEqual(types.Role.assistant, cb.session.messages.items[1].role);
 }

@@ -171,16 +171,11 @@ pub fn main() !void {
     root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
 
-    // The runner holds a back-ref to the view it updates; the view holds a
-    // forward ref to the runner it dispatches through. Break the cycle in
-    // two steps: build the runner with a placeholder view first, build the
-    // view, then patch the runner's view field. Phase 4 collapses this.
+    root_buffer = try ConversationBuffer.init(allocator, 0, "session");
+    defer root_buffer.deinit();
+
     root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
     defer root_runner.deinit();
-
-    root_buffer = try ConversationBuffer.init(allocator, 0, "session", &root_session, &root_runner);
-    defer root_buffer.deinit();
-    root_runner.view = &root_buffer;
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
     // handler write a byte to wake_write; the orchestrator polls wake_read to
@@ -250,7 +245,12 @@ pub fn main() !void {
     if (session_handle) |*sh| {
         root_session.attachSession(sh);
         if (resume_id != null) {
-            root_buffer.restoreFromSession(sh, allocator) catch |err| {
+            const root_pane: EventOrchestrator.Pane = .{
+                .view = &root_buffer,
+                .session = &root_session,
+                .runner = &root_runner,
+            };
+            EventOrchestrator.restorePane(root_pane, sh, allocator) catch |err| {
                 log.warn("session restore failed: {}", .{err});
             };
         }
@@ -293,6 +293,8 @@ pub fn main() !void {
         .layout = &layout,
         .compositor = &compositor,
         .root_buffer = &root_buffer,
+        .root_session = &root_session,
+        .root_runner = &root_runner,
         .provider = &provider,
         .registry = &registry,
         .session_mgr = &session_mgr,
@@ -338,11 +340,10 @@ test "appendOutputText creates a status node" {
     const allocator = std.testing.allocator;
     root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
+    root_buffer = try ConversationBuffer.init(allocator, 0, "test");
+    defer root_buffer.deinit();
     root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
     defer root_runner.deinit();
-    root_buffer = try ConversationBuffer.init(allocator, 0, "test", &root_session, &root_runner);
-    defer root_buffer.deinit();
-    root_runner.view = &root_buffer;
 
     try appendOutputText("hello world");
 

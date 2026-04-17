@@ -8,8 +8,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationSession = @import("ConversationSession.zig");
-const AgentRunner = @import("AgentRunner.zig");
 
 const Layout = @This();
 
@@ -431,14 +429,8 @@ test "setRoot creates a single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
-    runner.view = &cb;
 
     try layout.setRoot(cb.buf());
 
@@ -453,14 +445,8 @@ test "recalculate sets leaf rect with status row reserved" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
-    runner.view = &cb;
 
     try layout.setRoot(cb.buf());
     layout.recalculate(80, 24);
@@ -477,22 +463,10 @@ test "vertical split divides width evenly" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
@@ -520,22 +494,10 @@ test "horizontal split divides height evenly" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
@@ -562,22 +524,10 @@ test "focus navigation between vertical splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
@@ -598,22 +548,10 @@ test "focus navigation between horizontal splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "top", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
@@ -632,22 +570,10 @@ test "closeWindow removes focused pane" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
@@ -668,14 +594,8 @@ test "closeWindow is no-op on single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "only", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "only");
     defer cb.deinit();
-    runner.view = &cb;
 
     try layout.setRoot(cb.buf());
 
@@ -688,22 +608,10 @@ test "visibleLeaves returns all leaves" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     layout.recalculate(80, 24);
@@ -721,14 +629,8 @@ test "recalculate with tiny screen is safe" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
-    runner.view = &cb;
 
     try layout.setRoot(cb.buf());
 
@@ -742,14 +644,8 @@ test "focus direction no-op when no neighbor exists" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "only", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "only");
     defer cb.deinit();
-    runner.view = &cb;
 
     try layout.setRoot(cb.buf());
     layout.recalculate(80, 24);
@@ -767,22 +663,10 @@ test "setRoot replaces existing tree" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "first", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "first");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "second", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "second");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     try layout.setRoot(cb1.buf());
     try std.testing.expectEqualStrings("first", layout.root.?.leaf.buffer.getName());
