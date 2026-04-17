@@ -5,11 +5,34 @@
 
 const std = @import("std");
 const zlua = @import("zlua");
+const build_options = @import("build_options");
 const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
+
+/// Whether the Lua sandbox strips dangerous globals before user code runs.
+/// A shared plugin marketplace should never be one `os.execute("rm -rf ~")`
+/// away from disaster. Override with `-Dlua_sandbox=false` for local debugging.
+pub const sandbox_enabled = build_options.lua_sandbox;
+
+/// Lua bootstrap that preserves a minimal safe subset of `os`
+/// (date, time, clock) and nils out everything else that can touch
+/// the filesystem, spawn processes, or subvert the VM.
+const sandbox_strip =
+    \\local _date, _time, _clock = os.date, os.time, os.clock
+    \\os = nil
+    \\io = nil
+    \\debug = nil
+    \\package = nil
+    \\require = nil
+    \\dofile = nil
+    \\loadfile = nil
+    \\load = nil
+    \\loadstring = nil
+    \\os = { date = _date, time = _time, clock = _clock }
+;
 
 /// Engine pointer for the currently active agent thread.
 /// Set by `activate()` before the agent loop runs, read by `luaToolExecute`.
@@ -46,6 +69,13 @@ pub const LuaEngine = struct {
         errdefer lua.deinit();
 
         lua.openLibs();
+
+        if (sandbox_enabled) {
+            lua.doString(sandbox_strip) catch |err| {
+                log.err("lua sandbox bootstrap failed: {}", .{err});
+                return err;
+            };
+        }
 
         injectZagGlobal(lua);
 
@@ -463,7 +493,10 @@ pub const LuaEngine = struct {
     }
 
     /// Adjust package.path so that `require` can find modules in the given directory.
+    /// No-op when the sandbox is enabled: `package` and `require` are stripped.
     pub fn setPluginPath(self: *LuaEngine, dir: []const u8) !void {
+        if (sandbox_enabled) return;
+
         const lua_code = try std.fmt.allocPrint(
             self.allocator,
             "package.path = package.path .. ';{s}/?.lua;{s}/?/init.lua'",
@@ -511,6 +544,99 @@ fn luaToolExecute(
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "sandbox strips os.execute and friends" {
+    if (!sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString(
+        \\probe = {
+        \\  os_execute = type(os.execute),
+        \\  io = io,
+        \\  debug = debug,
+        \\  package = package,
+        \\  require = require,
+        \\  dofile = dofile,
+        \\  loadfile = loadfile,
+        \\  load = load,
+        \\}
+    );
+
+    const checks = [_]struct { field: [:0]const u8, expect_nil: bool }{
+        .{ .field = "io", .expect_nil = true },
+        .{ .field = "debug", .expect_nil = true },
+        .{ .field = "package", .expect_nil = true },
+        .{ .field = "require", .expect_nil = true },
+        .{ .field = "dofile", .expect_nil = true },
+        .{ .field = "loadfile", .expect_nil = true },
+        .{ .field = "load", .expect_nil = true },
+    };
+
+    _ = try engine.lua.getGlobal("probe");
+    defer engine.lua.pop(1);
+
+    _ = engine.lua.getField(-1, "os_execute");
+    const os_execute_type = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("nil", os_execute_type);
+    engine.lua.pop(1);
+
+    for (checks) |check| {
+        _ = engine.lua.getField(-1, check.field);
+        try std.testing.expectEqual(check.expect_nil, engine.lua.isNoneOrNil(-1));
+        engine.lua.pop(1);
+    }
+}
+
+test "sandbox preserves minimal os (date, time, clock)" {
+    if (!sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString(
+        \\probe_os = {
+        \\  date = type(os.date),
+        \\  time = type(os.time),
+        \\  clock = type(os.clock),
+        \\  execute = type(os.execute),
+        \\  remove = type(os.remove),
+        \\}
+    );
+
+    _ = try engine.lua.getGlobal("probe_os");
+    defer engine.lua.pop(1);
+
+    const survivors = [_][:0]const u8{ "date", "time", "clock" };
+    for (survivors) |name| {
+        _ = engine.lua.getField(-1, name);
+        const kind = try engine.lua.toString(-1);
+        try std.testing.expectEqualStrings("function", kind);
+        engine.lua.pop(1);
+    }
+
+    const removed = [_][:0]const u8{ "execute", "remove" };
+    for (removed) |name| {
+        _ = engine.lua.getField(-1, name);
+        const kind = try engine.lua.toString(-1);
+        try std.testing.expectEqualStrings("nil", kind);
+        engine.lua.pop(1);
+    }
+}
+
+test "sandbox disabled leaves os.execute reachable" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("probe_exec = type(os.execute)");
+    _ = try engine.lua.getGlobal("probe_exec");
+    defer engine.lua.pop(1);
+    const kind = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("function", kind);
 }
 
 test "LuaEngine init and deinit" {
