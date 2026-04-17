@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const Hooks = @import("Hooks.zig");
+const AgentThread = @import("AgentThread.zig");
 const Allocator = std.mem.Allocator;
 
 /// Thread-local name of the tool currently being executed.
@@ -72,6 +74,47 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     try registry.register(edit_tool.tool);
     try registry.register(bash_tool.tool);
     return registry;
+}
+
+/// Static function pointer shared by all Lua-defined tools. Runs on the
+/// caller's thread (agent loop or parallel tool worker) and round-trips
+/// through the main thread via `AgentThread.lua_request_queue` because
+/// Lua state may only be touched from the main thread.
+pub fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!types.ToolResult {
+    const queue = AgentThread.lua_request_queue orelse return .{
+        .content = "error: no lua queue bound for this thread",
+        .is_error = true,
+        .owned = false,
+    };
+    const tool_name = current_tool_name orelse return .{
+        .content = "error: no current tool name",
+        .is_error = true,
+        .owned = false,
+    };
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = tool_name,
+        .input_raw = input_raw,
+        .allocator = allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    try queue.push(.{ .lua_tool_request = &req });
+    req.done.wait();
+    if (req.error_name) |name| {
+        return .{
+            .content = try std.fmt.allocPrint(allocator, "error: lua tool failed: {s}", .{name}),
+            .is_error = true,
+            .owned = true,
+        };
+    }
+    return .{
+        .content = req.result_content orelse "",
+        .is_error = req.result_is_error,
+        .owned = req.result_owned,
+    };
 }
 
 test "register and get a tool" {

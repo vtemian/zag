@@ -120,6 +120,15 @@ pub const EventQueue = struct {
 /// the agent thread loads to check.
 pub const CancelFlag = std.atomic.Value(bool);
 
+/// Thread-local event queue pointer used by `tools.luaToolExecute` to
+/// round-trip a Lua tool call to the main thread. Set at the start of the
+/// agent loop (and at the start of each parallel worker), cleared on exit.
+/// Lives here because AgentThread owns `EventQueue` and importing
+/// AgentThread from tools.zig would not create a cycle (tools.zig does not
+/// import AgentThread transitively; AgentThread imports tools.zig, so we
+/// place the threadlocal on the upstream module).
+pub threadlocal var lua_request_queue: ?*EventQueue = null;
+
 /// Spawn a background thread running the streaming agent loop.
 /// The thread calls agent.runLoopStreaming, pushing events to the queue.
 /// Returns the thread handle; the caller must join it when done.
@@ -155,7 +164,6 @@ fn threadMain(
     cancel: *CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
 ) void {
-    if (lua_engine) |eng| eng.activate();
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
         const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
         queue.push(.{ .err = duped_err }) catch {};
