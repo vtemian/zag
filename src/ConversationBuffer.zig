@@ -656,48 +656,6 @@ pub fn shutdown(self: *ConversationBuffer) void {
     }
 }
 
-/// Inputs for auto-naming a session: the first user text and the first
-/// assistant text (truncated). Returns null when the buffer does not yet
-/// have enough content to produce a summary.
-pub const SessionSummaryInputs = struct {
-    user_text: []const u8,
-    assistant_text: []const u8,
-};
-
-/// Extract the first user-text / first-assistant-text pair for session
-/// auto-naming. Returns null if the buffer lacks at least one of each.
-/// The returned slices point into the buffer's messages and are valid
-/// until the next mutation.
-pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInputs {
-    const msgs = self.session.messages.items;
-    if (msgs.len < 2) return null;
-
-    const user_text = extractFirstText(msgs[0]) orelse return null;
-    // The second message may be tool_use-only (no text). Scan forward to find
-    // the first assistant message with a text block.
-    for (msgs[1..]) |msg| {
-        if (msg.role == .assistant) {
-            if (extractFirstText(msg)) |assistant_full| {
-                return .{
-                    .user_text = user_text,
-                    .assistant_text = assistant_full[0..@min(assistant_full.len, 200)],
-                };
-            }
-        }
-    }
-    return null;
-}
-
-fn extractFirstText(msg: types.Message) ?[]const u8 {
-    for (msg.content) |block| {
-        switch (block) {
-            .text => |t| return t.text,
-            else => {},
-        }
-    }
-    return null;
-}
-
 pub fn restoreFromSession(self: *ConversationBuffer, sh: *Session.SessionHandle, allocator: Allocator) !void {
     const session_id = sh.id[0..sh.id_len];
     const entries = try Session.loadEntries(session_id, allocator);
