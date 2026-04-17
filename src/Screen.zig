@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.screen);
 const trace = @import("Metrics.zig");
 const width_mod = @import("width.zig");
+const Terminal = @import("Terminal.zig");
 
 const Screen = @This();
 
@@ -448,6 +449,11 @@ fn optColorsEqual(maybe_last: ?Color, cur: Color) bool {
 }
 
 /// Write SGR (Select Graphic Rendition) escape sequences for the given style and colors.
+///
+/// RGB colors are emitted as 24-bit SGR (`38;2;R;G;B` / `48;2;R;G;B`) only
+/// when `Terminal.true_color` is set. Otherwise they are downgraded to the
+/// closest entry in the 256-color palette so SSH sessions, xterm-256color,
+/// etc. render something reasonable instead of leaking raw escape codes.
 fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
     // Reset first, then apply. Simpler and avoids stale attributes.
     try writer.writeAll("\x1b[0");
@@ -462,16 +468,48 @@ fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
     switch (fg) {
         .default => {},
         .palette => |idx| try std.fmt.format(writer, ";38;5;{d}", .{idx}),
-        .rgb => |c| try std.fmt.format(writer, ";38;2;{d};{d};{d}", .{ c.r, c.g, c.b }),
+        .rgb => |c| if (Terminal.true_color) {
+            try std.fmt.format(writer, ";38;2;{d};{d};{d}", .{ c.r, c.g, c.b });
+        } else {
+            try std.fmt.format(writer, ";38;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
+        },
     }
 
     switch (bg) {
         .default => {},
         .palette => |idx| try std.fmt.format(writer, ";48;5;{d}", .{idx}),
-        .rgb => |c| try std.fmt.format(writer, ";48;2;{d};{d};{d}", .{ c.r, c.g, c.b }),
+        .rgb => |c| if (Terminal.true_color) {
+            try std.fmt.format(writer, ";48;2;{d};{d};{d}", .{ c.r, c.g, c.b });
+        } else {
+            try std.fmt.format(writer, ";48;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
+        },
     }
 
     try writer.writeAll("m");
+}
+
+/// Map a 24-bit RGB triple to the closest xterm-256 palette index.
+///
+/// The 256-color palette is:
+///   * 0..15   — ANSI / bright ANSI (terminal-dependent RGB; we avoid it)
+///   * 16..231 — 6x6x6 RGB cube: idx = 16 + 36*r + 6*g + b, r,g,b in 0..5
+///   * 232..255 — 24-step grayscale ramp
+///
+/// Perceptually-accurate conversion is out of scope; callers only hit this
+/// path when the terminal lacks true color, where any sensible approximation
+/// beats emitting unparseable 24-bit escapes.
+fn rgbTo256(r: u8, g: u8, b: u8) u8 {
+    // Near-grayscale: ramp is denser than the cube diagonal, use it.
+    if (r == g and g == b) {
+        if (r < 8) return 16;
+        if (r > 248) return 231;
+        return 232 + (r - 8) / 10;
+    }
+    // Quantize each channel to 0..5 steps of the 6x6x6 cube.
+    const qr: u8 = @intCast(@min(5, @as(u32, r) * 5 / 255));
+    const qg: u8 = @intCast(@min(5, @as(u32, g) * 5 / 255));
+    const qb: u8 = @intCast(@min(5, @as(u32, b) * 5 / 255));
+    return 16 + 36 * qr + 6 * qg + qb;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -749,6 +787,11 @@ test "render emits RGB background color SGR sequences" {
     var screen = try Screen.init(allocator, 2, 1);
     defer screen.deinit();
 
+    // Force the truecolor path for this test regardless of the host terminal.
+    const saved = Terminal.true_color;
+    Terminal.true_color = true;
+    defer Terminal.true_color = saved;
+
     screen.getCell(0, 0).codepoint = 'A';
     screen.getCell(0, 0).bg = .{ .rgb = .{ .r = 255, .g = 128, .b = 0 } };
 
@@ -765,6 +808,57 @@ test "render emits RGB background color SGR sequences" {
 
     // Should contain the RGB background SGR: 48;2;255;128;0
     try std.testing.expect(std.mem.indexOf(u8, output, "48;2;255;128;0") != null);
+}
+
+test "rgbTo256 maps grayscale into the 232..255 ramp" {
+    const idx = rgbTo256(128, 128, 128);
+    try std.testing.expect(idx >= 232 and idx <= 255);
+}
+
+test "rgbTo256 maps low grayscale to 16 and high grayscale to 231" {
+    try std.testing.expectEqual(@as(u8, 16), rgbTo256(0, 0, 0));
+    try std.testing.expectEqual(@as(u8, 231), rgbTo256(255, 255, 255));
+}
+
+test "rgbTo256 maps pure red to cube index 196" {
+    // 16 + 36*5 + 6*0 + 0 = 196
+    try std.testing.expectEqual(@as(u8, 196), rgbTo256(255, 0, 0));
+}
+
+test "rgbTo256 maps pure green and blue to expected cube indices" {
+    // green: 16 + 0 + 6*5 + 0 = 46
+    try std.testing.expectEqual(@as(u8, 46), rgbTo256(0, 255, 0));
+    // blue:  16 + 0 + 0 + 5 = 21
+    try std.testing.expectEqual(@as(u8, 21), rgbTo256(0, 0, 255));
+}
+
+test "writeSgr downgrades RGB to 256 when true_color is unavailable" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 2, 1);
+    defer screen.deinit();
+
+    const saved = Terminal.true_color;
+    Terminal.true_color = false;
+    defer Terminal.true_color = saved;
+
+    screen.getCell(0, 0).codepoint = 'R';
+    screen.getCell(0, 0).fg = .{ .rgb = .{ .r = 255, .g = 0, .b = 0 } };
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Pure red downgrades to palette index 196.
+    try std.testing.expect(std.mem.indexOf(u8, output, ";38;5;196m") != null);
+    // And the 24-bit form must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, output, ";38;2;255;0;0") == null);
 }
 
 test "render reuses output buffer across frames" {
