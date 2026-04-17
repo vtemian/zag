@@ -31,6 +31,7 @@ const sandbox_strip =
     \\loadfile = nil
     \\load = nil
     \\loadstring = nil
+    \\string.dump = nil
     \\os = { date = _date, time = _time, clock = _clock }
 ;
 
@@ -588,6 +589,19 @@ test "sandbox strips os.execute and friends" {
         try std.testing.expectEqual(check.expect_nil, engine.lua.isNoneOrNil(-1));
         engine.lua.pop(1);
     }
+}
+
+test "sandbox strips string.dump to block bytecode injection" {
+    if (!sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("dump_kind = type(string.dump)");
+    _ = try engine.lua.getGlobal("dump_kind");
+    defer engine.lua.pop(1);
+    const kind = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("nil", kind);
 }
 
 test "sandbox preserves minimal os (date, time, clock)" {
