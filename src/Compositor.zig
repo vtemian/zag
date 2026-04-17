@@ -11,8 +11,6 @@ const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationSession = @import("ConversationSession.zig");
-const AgentRunner = @import("AgentRunner.zig");
 const Theme = @import("Theme.zig");
 const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
@@ -383,18 +381,11 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
     const info = std.fmt.bufPrint(&info_scratch, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
     col = self.screen.writeStr(last_row, col, info, resolved.screen_style, resolved.fg);
 
-    // Surface any dropped events so UI divergence from the agent is visible
-    // immediately rather than silent. Only drawn when the counter is non-zero
-    // and the queue is live; the counter is undefined outside an agent run.
-    const cb = ConversationBuffer.fromBuffer(leaf.buffer);
-    if (cb.runner.queue_active) {
-        const drops = cb.runner.event_queue.dropped.load(.monotonic);
-        if (drops > 0) {
-            var drops_scratch: [32]u8 = undefined;
-            const drops_label = std.fmt.bufPrint(&drops_scratch, " [drops: {d}]", .{drops}) catch return;
-            _ = self.screen.writeStr(last_row, col, drops_label, resolved.screen_style, resolved.fg);
-        }
-    }
+    // Phase 3 temporary gap: the dropped-event counter lives on AgentRunner
+    // (reachable via Pane), but Compositor only has a Buffer interface. Phase
+    // 4 threads the orchestrator through Compositor and reintroduces the
+    // lookup via EventOrchestrator.paneFromBuffer(leaf.buffer). Until then
+    // this diagnostic display is intentionally disabled.
 
     // When metrics are enabled, show the last frame time right-aligned
     if (trace.enabled) {
@@ -523,14 +514,8 @@ test "composite writes buffer content at leaf rect with padding" {
         .layout_dirty = true,
     };
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
-    runner.view = &cb;
     _ = try cb.appendNode(null, .user_message, "hello");
 
     var layout = Layout.init(allocator);
@@ -561,14 +546,8 @@ test "composite draws status line on last row" {
         .layout_dirty = true,
     };
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
-    runner.view = &cb;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -601,22 +580,10 @@ test "composite draws vertical split border from theme" {
         .layout_dirty = true,
     };
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -649,22 +616,10 @@ test "composite draws horizontal split border" {
         .layout_dirty = true,
     };
 
-    var scb1 = ConversationSession.init(allocator);
-    defer scb1.deinit();
-    var cb1_placeholder: ConversationBuffer = undefined;
-    var runner1 = AgentRunner.init(allocator, &cb1_placeholder, &scb1);
-    defer runner1.deinit();
-    var cb1 = try ConversationBuffer.init(allocator, 0, "top", &scb1, &runner1);
+    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
     defer cb1.deinit();
-    runner1.view = &cb1;
-    var scb2 = ConversationSession.init(allocator);
-    defer scb2.deinit();
-    var cb2_placeholder: ConversationBuffer = undefined;
-    var runner2 = AgentRunner.init(allocator, &cb2_placeholder, &scb2);
-    defer runner2.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom", &scb2, &runner2);
+    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
     defer cb2.deinit();
-    runner2.view = &cb2;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -698,14 +653,8 @@ test "composite skips clean buffer leaves" {
         .layout_dirty = true,
     };
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
-    runner.view = &cb;
     _ = try cb.appendNode(null, .user_message, "hello");
 
     var layout = Layout.init(allocator);
@@ -747,14 +696,8 @@ test "drawStatusLine paints the mode indicator at column 0 (shadowed row)" {
         .layout_dirty = true,
     };
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
-    runner.view = &cb;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -782,14 +725,8 @@ test "input line paints mode indicator and normal-mode hint" {
         .layout_dirty = true,
     };
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
-    runner.view = &cb;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -841,14 +778,8 @@ test "input line shows status hint after mode label when status is set" {
         .layout_dirty = true,
     };
 
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb_placeholder: ConversationBuffer = undefined;
-    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
-    defer runner.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf", &scb, &runner);
+    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
-    runner.view = &cb;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();

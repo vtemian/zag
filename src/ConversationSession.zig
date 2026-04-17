@@ -194,3 +194,42 @@ test "init and deinit" {
     try std.testing.expectEqual(@as(usize, 0), s.messages.items.len);
     try std.testing.expect(s.session_handle == null);
 }
+
+test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
+        .{ .entry_type = .assistant_text, .content = "calling tool", .timestamp = 1 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .tool_input = "{\"c\":\"ls\"}", .timestamp = 2 },
+        .{ .entry_type = .tool_result, .content = "file1", .is_error = false, .timestamp = 3 },
+        .{ .entry_type = .assistant_text, .content = "done", .timestamp = 4 },
+    };
+
+    try scb.rebuildMessages(&entries, allocator);
+
+    // Expected message sequence: user, assistant(text + tool_use), user(tool_result), assistant(text)
+    try std.testing.expectEqual(@as(usize, 4), scb.messages.items.len);
+    try std.testing.expectEqual(types.Role.user, scb.messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, scb.messages.items[1].role);
+    try std.testing.expectEqual(types.Role.user, scb.messages.items[2].role);
+    try std.testing.expectEqual(types.Role.assistant, scb.messages.items[3].role);
+
+    // Assistant message 1 has text + tool_use
+    try std.testing.expectEqual(@as(usize, 2), scb.messages.items[1].content.len);
+    switch (scb.messages.items[1].content[1]) {
+        .tool_use => |tu| {
+            try std.testing.expectEqualStrings("synth_0", tu.id);
+            try std.testing.expectEqualStrings("bash", tu.name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // tool_result user message references synth_0
+    switch (scb.messages.items[2].content[0]) {
+        .tool_result => |tr| try std.testing.expectEqualStrings("synth_0", tr.tool_use_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
