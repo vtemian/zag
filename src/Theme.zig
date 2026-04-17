@@ -51,8 +51,8 @@ pub const CellStyle = struct {
     inverse: bool = false,
 };
 
-/// The 21 named highlight groups covering conversation, chrome, and
-/// markdown elements.
+/// Named highlight groups covering conversation, chrome, mode, and
+/// markdown elements. Plugins swap the whole struct at runtime.
 pub const Highlights = struct {
     /// User-typed messages.
     user_message: CellStyle,
@@ -72,6 +72,12 @@ pub const Highlights = struct {
     tab_inactive: CellStyle,
     /// Window border lines.
     border: CellStyle,
+    /// Window border lines when the pane is focused.
+    border_focused: CellStyle,
+    /// Pane title bar background when the pane is focused (inverse accent).
+    title_active: CellStyle,
+    /// Pane title bar when the pane is unfocused.
+    title_inactive: CellStyle,
     /// Status/mode line.
     status_line: CellStyle,
     /// Input prompt character.
@@ -115,6 +121,9 @@ pub const Spacing = struct {
     /// Vertical padding inside window borders.
     padding_v: u16,
 };
+
+/// Display-width-1 glyph used to truncate pane titles that don't fit.
+pub const ellipsis: u21 = 0x2026;
 
 /// Border drawing style.
 pub const BorderStyle = enum {
@@ -255,6 +264,9 @@ pub fn defaultTheme() Theme {
             .tab_active = .{ .fg = fg, .bold = true },
             .tab_inactive = .{ .fg = dim },
             .border = .{ .fg = dim },
+            .border_focused = .{ .fg = accent, .bold = true },
+            .title_active = .{ .fg = accent, .bold = true, .inverse = true },
+            .title_inactive = .{ .fg = dim },
             .status_line = .{ .fg = dim, .dim = true },
             .input_prompt = .{ .fg = accent, .bold = true },
             .input_text = .{ .fg = fg },
@@ -491,6 +503,18 @@ test "default theme exposes mode_insert and mode_normal highlights" {
     try std.testing.expect(!std.meta.eql(insert.fg, normal.fg));
     try std.testing.expect(insert.screen_style.bold);
     try std.testing.expect(normal.screen_style.bold);
+}
+
+test "default theme exposes focused border and title highlights" {
+    var theme = defaultTheme();
+    const focused = resolve(theme.highlights.border_focused, &theme);
+    const plain = resolve(theme.highlights.border, &theme);
+    const title_on = resolve(theme.highlights.title_active, &theme);
+    const title_off = resolve(theme.highlights.title_inactive, &theme);
+    try std.testing.expect(!std.meta.eql(focused.fg, plain.fg));
+    try std.testing.expect(title_on.screen_style.inverse);
+    try std.testing.expect(!title_off.screen_style.inverse);
+    try std.testing.expectEqual(@as(u21, 0x2026), ellipsis);
 }
 
 test "StyledLine construction" {
