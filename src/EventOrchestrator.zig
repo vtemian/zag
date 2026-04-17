@@ -4,10 +4,10 @@
 //!
 //! Ownership: the terminal, screen, layout, compositor, and root buffer
 //! are created in main() and held here as pointers - their lifetimes
-//! exceed the orchestrator's. The orchestrator itself owns the input
-//! line state (`typed` + `typed_len`), the extra split panes, the
-//! keymap registry, and frame-local counters (spinner, fps, transient
-//! status).
+//! exceed the orchestrator's. The orchestrator itself owns the extra
+//! split panes, the keymap registry, and frame-local counters
+//! (spinner, fps, transient status). Each pane owns its own draft
+//! input (see ConversationBuffer.draft).
 
 const std = @import("std");
 const posix = std.posix;
@@ -37,9 +37,6 @@ const build_options = @import("build_options");
 const log = std.log.scoped(.orchestrator);
 
 const EventOrchestrator = @This();
-
-/// Maximum number of bytes the user can type on the input line.
-pub const MAX_INPUT = 4096;
 
 /// Characters for the animated spinner.
 const spinner_chars = "|/-\\";
@@ -121,10 +118,6 @@ transient_status: [64]u8 = undefined,
 transient_status_len: u8 = 0,
 /// Frame counter for animating the status bar spinner.
 spinner_frame: u8 = 0,
-/// Bytes the user has typed on the input line but not yet submitted.
-typed: [MAX_INPUT]u8 = undefined,
-/// Number of valid bytes in `typed`.
-typed_len: usize = 0,
 /// Global editing mode. Insert = typing into input buffer;
 /// Normal = keymap bindings fire, typing is disabled.
 ///
@@ -235,8 +228,9 @@ pub fn run(self: *EventOrchestrator) !void {
     var running = true;
 
     // Initial render
+    const focused_view = self.getFocusedPane().view;
     self.compositor.composite(self.layout, .{
-        .text = self.typed[0..self.typed_len],
+        .text = focused_view.getDraft(),
         .status = "",
         .agent_running = false,
         .spinner_frame = 0,
@@ -383,7 +377,7 @@ fn tick(
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
     self.compositor.composite(self.layout, .{
-        .text = self.typed[0..self.typed_len],
+        .text = focused.view.getDraft(),
         .status = status,
         .agent_running = agent_running,
         .spinner_frame = self.spinner_frame,
@@ -399,32 +393,6 @@ fn tick(
 }
 
 // -- Input handling ----------------------------------------------------------
-
-/// Append a character (as a single byte, ASCII-only for now) to the input buffer.
-/// Returns the new length, or the old length if the buffer is full.
-fn inputAppendChar(buf: []u8, len: usize, char: u8) usize {
-    if (len >= buf.len) return len;
-    buf[len] = char;
-    return len + 1;
-}
-
-/// Delete the last byte from the input buffer.
-/// Returns the new length (0 if already empty).
-fn inputDeleteBack(len: usize) usize {
-    if (len == 0) return 0;
-    return len - 1;
-}
-
-/// Delete the last word from the input buffer (Ctrl+W / readline behavior).
-/// Skips trailing spaces, then deletes back to the previous space or start.
-fn inputDeleteWord(buf: []const u8, len: usize) usize {
-    var i = len;
-    // Skip trailing spaces
-    while (i > 0 and buf[i - 1] == ' ') i -= 1;
-    // Delete back to previous space
-    while (i > 0 and buf[i - 1] != ' ') i -= 1;
-    return i;
-}
 
 /// Handle a keyboard event. Returns the action for the main loop.
 ///
@@ -456,7 +424,8 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 // in insert mode. Normal mode falls through to the
                 // keymap registry (or ignored).
                 if (ch == 'w' and self.current_mode == .insert) {
-                    self.typed_len = inputDeleteWord(&self.typed, self.typed_len);
+                    const v = self.getFocusedPane().view;
+                    v.deleteWordFromDraft();
                     return .redraw;
                 }
             },
@@ -473,17 +442,19 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // Normal mode ignores unbound keys (no typing, no accidental side effects).
     if (self.current_mode == .normal) return .none;
 
-    // Insert mode: regular input-line editing.
+    // Insert mode: regular input-line editing. Route all edits into the
+    // focused pane's draft so focus-switching preserves per-pane text.
+    const draft_view = self.getFocusedPane().view;
     switch (k.key) {
         .enter => {
-            if (self.typed_len == 0) return .none;
+            if (draft_view.draft_len == 0) return .none;
 
-            const user_input = self.typed[0..self.typed_len];
+            const user_input = draft_view.draft[0..draft_view.draft_len];
 
             switch (self.handleCommand(user_input)) {
                 .quit => return .quit,
                 .handled => {
-                    self.typed_len = 0;
+                    draft_view.clearDraft();
                     return .redraw;
                 },
                 .not_a_command => {
@@ -494,17 +465,17 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                         log.warn("submit failed: {}", .{err});
                         return .none;
                     };
-                    self.typed_len = 0;
+                    draft_view.clearDraft();
                     return .redraw;
                 },
             }
         },
         .backspace => {
-            self.typed_len = inputDeleteBack(self.typed_len);
+            draft_view.deleteBackFromDraft();
         },
         .char => |ch| {
             if (ch >= 0x20 and ch < 0x7f) {
-                self.typed_len = inputAppendChar(&self.typed, self.typed_len, @intCast(ch));
+                draft_view.appendToDraft(@intCast(ch));
             }
         },
         .page_up => {
@@ -947,55 +918,6 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
 
 test {
     @import("std").testing.refAllDecls(@This());
-}
-
-test "inputAppendChar adds character" {
-    var buf: [10]u8 = undefined;
-    var len: usize = 0;
-    len = inputAppendChar(&buf, len, 'h');
-    len = inputAppendChar(&buf, len, 'i');
-    try std.testing.expectEqual(@as(usize, 2), len);
-    try std.testing.expectEqualStrings("hi", buf[0..len]);
-}
-
-test "inputAppendChar respects buffer limit" {
-    var buf: [3]u8 = undefined;
-    var len: usize = 0;
-    len = inputAppendChar(&buf, len, 'a');
-    len = inputAppendChar(&buf, len, 'b');
-    len = inputAppendChar(&buf, len, 'c');
-    len = inputAppendChar(&buf, len, 'd'); // should not grow
-    try std.testing.expectEqual(@as(usize, 3), len);
-    try std.testing.expectEqualStrings("abc", buf[0..len]);
-}
-
-test "inputDeleteBack removes last character" {
-    try std.testing.expectEqual(@as(usize, 2), inputDeleteBack(3));
-    try std.testing.expectEqual(@as(usize, 0), inputDeleteBack(1));
-}
-
-test "inputDeleteBack on empty returns zero" {
-    try std.testing.expectEqual(@as(usize, 0), inputDeleteBack(0));
-}
-
-test "inputDeleteWord removes last word" {
-    var buf = [_]u8{ 'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l' };
-    try std.testing.expectEqual(@as(usize, 6), inputDeleteWord(&buf, 10));
-}
-
-test "inputDeleteWord skips trailing spaces" {
-    var buf = [_]u8{ 'h', 'e', 'l', 'l', 'o', ' ', ' ', 0, 0, 0 };
-    try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 7));
-}
-
-test "inputDeleteWord on single word clears all" {
-    var buf = [_]u8{ 'h', 'e', 'l', 'l', 'o' };
-    try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 5));
-}
-
-test "inputDeleteWord on empty returns zero" {
-    var buf: [10]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 0));
 }
 
 test "formatSplitAnnounce writes the standard announce for id 1" {
