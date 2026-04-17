@@ -554,43 +554,7 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
     }
 
     if (std.mem.eql(u8, command, "/perf") or std.mem.eql(u8, command, "/perf-dump")) {
-        if (!trace.enabled) {
-            self.appendStatus("metrics not enabled (build with -Dmetrics=true)");
-            return .handled;
-        }
-
-        if (std.mem.eql(u8, command, "/perf")) {
-            const stats = trace.getStats();
-            var scratch: [512]u8 = undefined;
-            const msg = std.fmt.bufPrint(&scratch,
-                \\Performance (last {d} frames):
-                \\  avg frame:       {d:.1}ms
-                \\  p99 frame:       {d:.1}ms
-                \\  max frame:       {d:.1}ms
-                \\  peak memory:     {d:.1}MB
-                \\  avg allocs/frame: {d:.1}
-            , .{
-                stats.frame_count,
-                @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0,
-                @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0,
-                @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0,
-                @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
-                stats.avg_allocs_per_frame,
-            }) catch "Performance: error formatting";
-            self.appendStatus(msg);
-        } else {
-            const count = trace.dump("zag-trace.json") catch |err| blk: {
-                var scratch: [256]u8 = undefined;
-                const err_msg = std.fmt.bufPrint(&scratch, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
-                self.appendStatus(err_msg);
-                break :blk @as(usize, 0);
-            };
-            if (count > 0) {
-                var scratch: [256]u8 = undefined;
-                const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
-                self.appendStatus(dump_msg);
-            }
-        }
+        self.handlePerfCommand(command);
         return .handled;
     }
 
@@ -610,6 +574,57 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 fn appendStatus(self: *EventOrchestrator, text: []const u8) void {
     _ = self.root_buffer.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
+}
+
+/// Handle `/perf` (summary) or `/perf-dump` (write trace file).
+/// Pre: caller already matched one of those two command strings.
+fn handlePerfCommand(self: *EventOrchestrator, command: []const u8) void {
+    if (!trace.enabled) {
+        self.appendStatus("metrics not enabled (build with -Dmetrics=true)");
+        return;
+    }
+    if (std.mem.eql(u8, command, "/perf")) {
+        self.showPerfStats();
+    } else {
+        self.dumpTraceFile();
+    }
+}
+
+/// Format the current performance snapshot and append it as a status node.
+fn showPerfStats(self: *EventOrchestrator) void {
+    const stats = trace.getStats();
+    var scratch: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&scratch,
+        \\Performance (last {d} frames):
+        \\  avg frame:       {d:.1}ms
+        \\  p99 frame:       {d:.1}ms
+        \\  max frame:       {d:.1}ms
+        \\  peak memory:     {d:.1}MB
+        \\  avg allocs/frame: {d:.1}
+    , .{
+        stats.frame_count,
+        @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
+        stats.avg_allocs_per_frame,
+    }) catch "Performance: error formatting";
+    self.appendStatus(msg);
+}
+
+/// Write the current trace events to ./zag-trace.json and report the
+/// event count (or the error) back to the user via appendStatus.
+fn dumpTraceFile(self: *EventOrchestrator) void {
+    const count = trace.dump("zag-trace.json") catch |err| {
+        var scratch: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&scratch, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
+        self.appendStatus(err_msg);
+        return;
+    };
+    if (count == 0) return;
+    var scratch: [256]u8 = undefined;
+    const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
+    self.appendStatus(dump_msg);
 }
 
 // -- Window management -------------------------------------------------------
