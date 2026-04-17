@@ -193,7 +193,12 @@ pub fn run(self: *EventOrchestrator) !void {
         .fps = 0,
         .mode = self.current_mode,
     });
-    try self.screen.render(self.stdout_file);
+    self.screen.render(self.stdout_file) catch |err| switch (err) {
+        // Backpressure on the terminal fd: frame is dropped, the next
+        // render in the main loop will redraw from scratch.
+        error.WriteTimeout => {},
+        else => return err,
+    };
 
     while (running) {
         try self.tick(&running, &fps_timer, &fps_frame_count, &current_fps);
@@ -329,7 +334,12 @@ fn tick(
         .fps = current_fps.*,
         .mode = self.current_mode,
     });
-    try self.screen.render(self.stdout_file);
+    self.screen.render(self.stdout_file) catch |err| switch (err) {
+        // Backpressure on the terminal fd: frame is dropped, the next
+        // tick will redraw from scratch.
+        error.WriteTimeout => {},
+        else => return err,
+    };
 }
 
 // -- Input handling ----------------------------------------------------------
