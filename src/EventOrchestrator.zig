@@ -484,22 +484,10 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 /// lives here exclusively so handleKey stays a pure dispatcher.
 fn executeAction(self: *EventOrchestrator, action: Keymap.Action) void {
     switch (action) {
-        .focus_left => {
-            self.layout.focusDirection(.left);
-            self.compositor.layout_dirty = true;
-        },
-        .focus_down => {
-            self.layout.focusDirection(.down);
-            self.compositor.layout_dirty = true;
-        },
-        .focus_up => {
-            self.layout.focusDirection(.up);
-            self.compositor.layout_dirty = true;
-        },
-        .focus_right => {
-            self.layout.focusDirection(.right);
-            self.compositor.layout_dirty = true;
-        },
+        .focus_left => self.doFocus(.left),
+        .focus_down => self.doFocus(.down),
+        .focus_up => self.doFocus(.up),
+        .focus_right => self.doFocus(.right),
         .split_vertical => self.doSplit(.vertical),
         .split_horizontal => self.doSplit(.horizontal),
         .close_window => {
@@ -510,6 +498,13 @@ fn executeAction(self: *EventOrchestrator, action: Keymap.Action) void {
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
     }
+}
+
+/// Shift focus to the neighbouring pane and mark the compositor dirty so
+/// the focused / unfocused frame styling repaints.
+fn doFocus(self: *EventOrchestrator, dir: Layout.FocusDirection) void {
+    self.layout.focusDirection(dir);
+    self.compositor.layout_dirty = true;
 }
 
 /// Compute the mode the system should be in after `event` is processed,
