@@ -787,6 +787,7 @@ test "imports compile" {
     _ = @import("providers/openai.zig");
     _ = @import("LuaEngine.zig");
     _ = @import("Hooks.zig");
+    _ = @import("test_hooks_e2e.zig");
 }
 
 test "inputAppendChar adds character" {
