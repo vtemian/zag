@@ -24,6 +24,8 @@ const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
+const AgentThread = @import("AgentThread.zig");
+const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
 
@@ -373,13 +375,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                     const focused = self.getFocusedConversation();
                     if (focused.isAgentRunning()) return .none;
 
-                    focused.submitInput(
-                        user_input,
-                        self.provider.provider,
-                        self.registry,
-                        self.allocator,
-                        self.lua_engine,
-                    ) catch |err| {
+                    self.onUserInputSubmitted(focused, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
                         return .none;
                     };
@@ -540,8 +536,104 @@ fn attachSession(self: *EventOrchestrator, cb: *ConversationBuffer) ?*Session.Se
 /// Drain a buffer's agent events and auto-name its session on first completion.
 fn drainBuffer(self: *EventOrchestrator, buf: *ConversationBuffer) void {
     if (buf.drainEvents(self.allocator)) {
-        buf.autoNameSession(self.provider.provider, self.allocator);
+        self.autoNameSession(buf);
     }
+}
+
+/// Record the user's input on `cb`, then spawn an agent thread to respond.
+/// The buffer owns the conversation data; the orchestrator owns the worker.
+fn onUserInputSubmitted(
+    self: *EventOrchestrator,
+    cb: *ConversationBuffer,
+    text: []const u8,
+) !void {
+    try cb.submitInput(text, self.allocator);
+
+    if (cb.isAgentRunning()) return;
+
+    // 256 slots is ~1s of fast streaming — enough headroom for a UI frame
+    // stall without hiding persistent backpressure.
+    cb.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
+    cb.queue_active = true;
+    cb.cancel_flag.store(false, .release);
+
+    cb.agent_thread = AgentThread.spawn(
+        self.provider.provider,
+        &cb.messages,
+        self.registry,
+        self.allocator,
+        &cb.event_queue,
+        &cb.cancel_flag,
+        self.lua_engine,
+    ) catch |err| {
+        _ = cb.appendNode(null, .err, @errorName(err)) catch |append_err|
+            log.warn("dropped event: {s}", .{@errorName(append_err)});
+        cb.event_queue.deinit();
+        cb.queue_active = false;
+        cb.agent_thread = null;
+        return err;
+    };
+}
+
+/// If `cb` has a session without a name and enough conversation to summarize,
+/// ask the provider for a 3-5 word title and rename the session.
+/// Best-effort: any failure is logged and swallowed.
+fn autoNameSession(self: *EventOrchestrator, cb: *ConversationBuffer) void {
+    const sh = cb.session_handle orelse return;
+    if (sh.meta.name_len > 0) return;
+
+    const inputs = cb.sessionSummaryInputs() orelse return;
+
+    const summary = self.generateSessionName(inputs) catch |err| {
+        log.debug("auto-name failed: {}", .{err});
+        return;
+    };
+    defer self.allocator.free(summary);
+
+    sh.rename(summary) catch |err| {
+        log.warn("session rename failed: {}", .{err});
+    };
+}
+
+/// Send a minimal LLM request to summarize the first exchange in 3-5 words.
+fn generateSessionName(
+    self: *EventOrchestrator,
+    inputs: ConversationBuffer.SessionSummaryInputs,
+) ![]const u8 {
+    const allocator = self.allocator;
+
+    const user_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(user_content);
+    user_content[0] = .{ .text = .{ .text = inputs.user_text } };
+
+    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(assistant_content);
+    assistant_content[0] = .{ .text = .{ .text = inputs.assistant_text } };
+
+    var summary_msgs = [_]types.Message{
+        .{ .role = .user, .content = user_content },
+        .{ .role = .assistant, .content = assistant_content },
+    };
+
+    const response = try self.provider.provider.call(
+        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
+        &summary_msgs,
+        &.{},
+        allocator,
+    );
+    defer response.deinit(allocator);
+
+    allocator.free(user_content);
+    allocator.free(assistant_content);
+
+    for (response.content) |block| {
+        switch (block) {
+            .text => |t| return try allocator.dupe(u8, t.text),
+            else => {},
+        }
+    }
+
+    return error.NoResponseText;
 }
 
 /// Get the focused buffer as a ConversationBuffer. Falls back to the root.
