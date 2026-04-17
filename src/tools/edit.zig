@@ -14,7 +14,16 @@ const EditInput = struct {
 };
 
 /// Replace a unique occurrence of old_text with new_text in the given file.
-pub fn execute(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+///
+/// `cancel` is accepted for signature compatibility with long-running tools but
+/// ignored here: edits are fast enough that a mid-call cancel would race with
+/// the syscall anyway.
+pub fn execute(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
     const parsed = std.json.parseFromSlice(EditInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
         return error.InvalidInput;
     defer parsed.deinit();
@@ -118,7 +127,7 @@ test "successful replacement" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"old_text\": \"hello\", \"new_text\": \"goodbye\"}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(!result.is_error);
@@ -144,7 +153,7 @@ test "old_text not found returns error" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"old_text\": \"nonexistent\", \"new_text\": \"x\"}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "not found") != null);
 }
@@ -163,7 +172,7 @@ test "multiple matches returns error" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"old_text\": \"aaa\", \"new_text\": \"ccc\"}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(result.is_error);

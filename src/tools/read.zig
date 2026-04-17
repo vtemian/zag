@@ -13,7 +13,16 @@ const ReadInput = struct {
 };
 
 /// Read a file from disk. Returns the text content, truncated to max_lines if the file is long.
-pub fn execute(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+///
+/// `cancel` is accepted for signature compatibility with long-running tools but
+/// ignored here: reads are fast enough that a mid-call cancel would race with
+/// the syscall anyway.
+pub fn execute(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
     const parsed = std.json.parseFromSlice(ReadInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
         return error.InvalidInput;
     defer parsed.deinit();
@@ -93,7 +102,7 @@ test "read existing file" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\"}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(!result.is_error);
@@ -107,7 +116,7 @@ test "read non-existent file returns error" {
         \\{"path": "/tmp/zag-test-does-not-exist-12345.txt"}
     ;
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(result.is_error);
@@ -130,7 +139,7 @@ test "read with max_lines truncation" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"max_lines\": 2}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(!result.is_error);

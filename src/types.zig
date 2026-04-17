@@ -131,7 +131,16 @@ pub const Tool = struct {
     /// The tool's metadata (name, description, schema).
     definition: ToolDefinition,
     /// The function pointer that executes this tool given raw JSON input.
-    execute: *const fn (input_raw: []const u8, allocator: Allocator) ToolError!ToolResult,
+    ///
+    /// Long-running tools (bash) should poll `cancel` periodically and abort early
+    /// when the flag is set. Fast tools (read/write/edit) may ignore it.
+    /// `cancel` is optional so unit tests and out-of-band callers can invoke tools
+    /// without wiring up an atomic.
+    execute: *const fn (
+        input_raw: []const u8,
+        allocator: Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) ToolError!ToolResult,
 };
 
 /// Maximum file size in bytes that tools will read into memory (10 MB).

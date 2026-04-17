@@ -484,7 +484,16 @@ pub const LuaEngine = struct {
 /// Static function pointer shared by all Lua tools.
 /// Uses `active_engine` to find the LuaEngine and `tools_mod.current_tool_name`
 /// to know which tool was called.
-fn luaToolExecute(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+///
+/// `cancel` is accepted for Tool.execute signature parity but not yet plumbed
+/// into Lua: the Lua bridge is synchronous and cooperative cancellation inside
+/// user scripts would need a debug hook. Left as a future extension.
+fn luaToolExecute(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
     const engine = active_engine orelse return .{
         .content = "error: no active Lua engine",
         .is_error = true,
@@ -750,7 +759,7 @@ test "end-to-end: config file to registry execution" {
     try engine.registerTools(&registry);
 
     // Execute through the full registry path (luaToolExecute -> active_engine -> executeTool)
-    const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator);
+    const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator, null);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("7", result.content);

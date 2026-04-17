@@ -66,7 +66,13 @@ pub const Registry = struct {
     /// caller, because there is no meaningful way for the LLM to recover from it.
     ///
     /// An unknown tool name is likewise returned as `ToolResult { is_error = true }`.
-    pub fn execute(self: *const Registry, name: []const u8, input_raw: []const u8, allocator: Allocator) error{OutOfMemory}!types.ToolResult {
+    pub fn execute(
+        self: *const Registry,
+        name: []const u8,
+        input_raw: []const u8,
+        allocator: Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) error{OutOfMemory}!types.ToolResult {
         const tool = self.get(name) orelse return .{
             .content = "error: unknown tool",
             .is_error = true,
@@ -85,7 +91,7 @@ pub const Registry = struct {
         };
         current_tool_name = name;
         defer current_tool_name = null;
-        return tool.execute(input_raw, allocator) catch |err| switch (err) {
+        return tool.execute(input_raw, allocator, cancel) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidInput => .{
                 .content = "error: invalid tool input",
@@ -136,7 +142,7 @@ test "execute unknown tool returns error result" {
     var registry = Registry.init(allocator);
     defer registry.deinit();
 
-    const result = try registry.execute("nonexistent", "{}", allocator);
+    const result = try registry.execute("nonexistent", "{}", allocator, null);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: unknown tool", result.content);
 }
@@ -148,7 +154,7 @@ test "execute registered tool" {
 
     try registry.register(bash_tool.tool);
 
-    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator);
+    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator, null);
     defer allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "hi") != null);
@@ -175,21 +181,26 @@ test "execute sets current_tool_name during execution" {
     // Before execution, should be null
     try std.testing.expect(current_tool_name == null);
 
-    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator);
+    const result = try registry.execute("bash", "{\"command\": \"echo hi\"}", allocator, null);
     defer allocator.free(result.content);
 
     // After execution, should be cleared
     try std.testing.expect(current_tool_name == null);
 }
 
-fn testInvalidInputTool(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+fn testInvalidInputTool(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
     _ = std.json.parseFromSlice(struct { x: u32 }, allocator, input_raw, .{}) catch
         return error.InvalidInput;
     return .{ .content = "ok", .is_error = false, .owned = false };
 }
 
 test "tool can raise InvalidInput directly" {
-    try std.testing.expectError(error.InvalidInput, testInvalidInputTool("not json", std.testing.allocator));
+    try std.testing.expectError(error.InvalidInput, testInvalidInputTool("not json", std.testing.allocator, null));
 }
 
 test "registry.execute flattens InvalidInput into a tool-result error" {
@@ -202,7 +213,7 @@ test "registry.execute flattens InvalidInput into a tool-result error" {
         .description = "",
         .input_schema_json = "{\"type\":\"object\"}",
     }, .execute = testInvalidInputTool });
-    const result = try r.execute("t", "{}", std.testing.allocator);
+    const result = try r.execute("t", "{}", std.testing.allocator, null);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("error: invalid tool input", result.content);
     try std.testing.expect(!result.owned);
@@ -218,7 +229,7 @@ test "registry.execute rejects missing required field before dispatch" {
         \\{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string"}}}
         ,
     }, .execute = testInvalidInputTool });
-    const result = try r.execute("t", "{\"other\":\"x\"}", std.testing.allocator);
+    const result = try r.execute("t", "{\"other\":\"x\"}", std.testing.allocator, null);
     defer if (result.owned) std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
     try std.testing.expect(result.owned);
