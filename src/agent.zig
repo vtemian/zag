@@ -113,9 +113,7 @@ fn callLlm(
         // If streaming already rendered partial text, discard it so the
         // full fallback response doesn't appear concatenated to the partial.
         if (thread_local_stream_text_count > 0) {
-            queue.push(.reset_assistant_text) catch |err| {
-                log.warn("failed to reset partial stream: {s}", .{@errorName(err)});
-            };
+            queue.tryPush(allocator, .reset_assistant_text);
         }
         // Push text to queue since streaming callback didn't fire (or was reset)
         for (fallback.content) |block| {
@@ -125,10 +123,7 @@ fn callLlm(
                         log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
                         continue;
                     };
-                    queue.push(.{ .text_delta = duped }) catch |err| {
-                        allocator.free(duped);
-                        log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
-                    };
+                    queue.tryPush(allocator, .{ .text_delta = duped });
                 },
                 else => {},
             }
