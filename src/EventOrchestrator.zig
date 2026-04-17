@@ -94,6 +94,13 @@ wake_write_fd: posix.fd_t,
 extra_panes: std.ArrayList(SplitPane) = .empty,
 /// Counter for creating new buffers when splitting windows.
 next_buffer_id: u32 = 1,
+/// Rolling label counter for scratch panes. First split produces
+/// `scratch 1`; increments each time `createSplitPane` runs.
+next_scratch_id: u32 = 1,
+/// One-shot status message rendered on the input/status row, cleared on
+/// the next key event. Used for announces like `split → scratch 2`.
+transient_status_buf: [64]u8 = undefined,
+transient_status_len: u8 = 0,
 /// Frame counter for animating the status bar spinner.
 spinner_frame: u8 = 0,
 /// Fixed-size input line buffer.
@@ -322,7 +329,9 @@ fn tick(
 
     const focused = self.getFocusedConversation();
     const agent_running = focused.isAgentRunning();
-    const status = if (agent_running) blk: {
+    const status = if (self.transient_status_len > 0)
+        self.transient_status_buf[0..self.transient_status_len]
+    else if (agent_running) blk: {
         const info = focused.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
@@ -379,6 +388,10 @@ fn inputDeleteWord(buf: []const u8, len: usize) usize {
 ///   4. Normal mode with no binding: silently ignore.
 ///   5. Insert mode fall-through: Enter/Backspace/char/page_up/page_down.
 fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
+    // Any keystroke dismisses the transient status so split announces
+    // disappear as soon as the user does anything.
+    self.transient_status_len = 0;
+
     // Ctrl+C is always-on regardless of mode: it's the universal escape
     // hatch (cancel a running agent, or quit the app).
     if (k.modifiers.ctrl) {
@@ -470,10 +483,22 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 /// lives here exclusively so handleKey stays a pure dispatcher.
 fn executeAction(self: *EventOrchestrator, action: Keymap.Action) void {
     switch (action) {
-        .focus_left => self.layout.focusDirection(.left),
-        .focus_down => self.layout.focusDirection(.down),
-        .focus_up => self.layout.focusDirection(.up),
-        .focus_right => self.layout.focusDirection(.right),
+        .focus_left => {
+            self.layout.focusDirection(.left);
+            self.compositor.layout_dirty = true;
+        },
+        .focus_down => {
+            self.layout.focusDirection(.down);
+            self.compositor.layout_dirty = true;
+        },
+        .focus_up => {
+            self.layout.focusDirection(.up);
+            self.compositor.layout_dirty = true;
+        },
+        .focus_right => {
+            self.layout.focusDirection(.right);
+            self.compositor.layout_dirty = true;
+        },
         .split_vertical => self.doSplit(.vertical),
         .split_horizontal => self.doSplit(.horizontal),
         .close_window => {
@@ -579,6 +604,9 @@ fn handleResize(self: *EventOrchestrator, cols: u16, rows: u16) !void {
 
 /// Split the focused window, creating a new pane with its own session.
 fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
+    // Capture the label that createSplitPane is about to consume so the
+    // announce below matches the new pane's name.
+    const scratch_id = self.next_scratch_id;
     const new_buf = self.createSplitPane() catch |err| {
         log.warn("split pane creation failed: {}", .{err});
         return;
@@ -594,6 +622,14 @@ fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
     };
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
+
+    // Transient announce; cleared on the next key event.
+    const written = std.fmt.bufPrint(
+        &self.transient_status_buf,
+        "split \u{2192} scratch {d}",
+        .{scratch_id},
+    ) catch "";
+    self.transient_status_len = @intCast(@min(written.len, self.transient_status_buf.len));
 }
 
 /// Create a new split pane: buffer + optional session, tracked for cleanup.
@@ -601,7 +637,10 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     const cb = try self.allocator.create(ConversationBuffer);
     errdefer self.allocator.destroy(cb);
 
-    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, "scratch");
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+
+    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
     errdefer cb.deinit();
 
     // Wake pipe so agent events on this pane interrupt the orchestrator's
@@ -611,6 +650,7 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     cb.lua_engine = self.lua_engine;
 
     self.next_buffer_id += 1;
+    self.next_scratch_id += 1;
 
     // Attach session if persistence is available
     const sh = self.attachSession(cb);
