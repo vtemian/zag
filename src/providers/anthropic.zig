@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
+const serialize = @import("serialize.zig");
 const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
 
@@ -87,7 +88,15 @@ pub fn buildRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
-    return buildRequestBodyInner(model, system_prompt, messages, tool_definitions, false, allocator);
+    return serialize.buildRequestBody(allocator, .{
+        .model = model,
+        .system_prompt = system_prompt,
+        .messages = messages,
+        .tool_definitions = tool_definitions,
+        .max_tokens = default_max_tokens,
+        .stream = false,
+        .flavor = .anthropic,
+    });
 }
 
 /// Same as buildRequestBody but with "stream": true.
@@ -98,90 +107,15 @@ pub fn buildStreamingRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
-    return buildRequestBodyInner(model, system_prompt, messages, tool_definitions, true, allocator);
-}
-
-fn buildRequestBodyInner(
-    model: []const u8,
-    system_prompt: []const u8,
-    messages: []const types.Message,
-    tool_definitions: []const types.ToolDefinition,
-    stream: bool,
-    allocator: Allocator,
-) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
-    const w = &out.writer;
-
-    try w.writeAll("{");
-
-    // model
-    try w.print("\"model\":\"{s}\",", .{model});
-    try w.print("\"max_tokens\":{d},", .{default_max_tokens});
-
-    // stream
-    if (stream) {
-        try w.writeAll("\"stream\":true,");
-    }
-
-    // system
-    try w.writeAll("\"system\":");
-    try std.json.Stringify.value(system_prompt, .{}, w);
-    try w.writeAll(",");
-
-    // tools
-    try w.writeAll("\"tools\":[");
-    for (tool_definitions, 0..) |def, i| {
-        if (i > 0) try w.writeAll(",");
-        try w.print("{{\"name\":\"{s}\",\"description\":", .{def.name});
-        try std.json.Stringify.value(def.description, .{}, w);
-        try w.print(",\"input_schema\":{s}}}", .{def.input_schema_json});
-    }
-    try w.writeAll("],");
-
-    // messages
-    try w.writeAll("\"messages\":[");
-    for (messages, 0..) |msg, i| {
-        if (i > 0) try w.writeAll(",");
-        try writeMessage(msg, w);
-    }
-    try w.writeAll("]");
-
-    try w.writeAll("}");
-
-    return out.toOwnedSlice();
-}
-
-/// Writes a single message (role + content blocks) as JSON into the writer.
-fn writeMessage(msg: types.Message, w: *std.io.Writer) !void {
-    const role = switch (msg.role) {
-        .user => "user",
-        .assistant => "assistant",
-    };
-
-    try w.print("{{\"role\":\"{s}\",\"content\":[", .{role});
-
-    for (msg.content, 0..) |block, i| {
-        if (i > 0) try w.writeAll(",");
-        switch (block) {
-            .text => |t| {
-                try w.writeAll("{\"type\":\"text\",\"text\":");
-                try std.json.Stringify.value(t.text, .{}, w);
-                try w.writeAll("}");
-            },
-            .tool_use => |tu| {
-                try w.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{ tu.id, tu.name, tu.input_raw });
-            },
-            .tool_result => |tr| {
-                try w.print("{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",", .{tr.tool_use_id});
-                if (tr.is_error) try w.writeAll("\"is_error\":true,");
-                try w.writeAll("\"content\":");
-                try std.json.Stringify.value(tr.content, .{}, w);
-                try w.writeAll("}");
-            },
-        }
-    }
-
-    try w.writeAll("]}");
+    return serialize.buildRequestBody(allocator, .{
+        .model = model,
+        .system_prompt = system_prompt,
+        .messages = messages,
+        .tool_definitions = tool_definitions,
+        .max_tokens = default_max_tokens,
+        .stream = true,
+        .flavor = .anthropic,
+    });
 }
 
 /// Parses a raw JSON response from the Anthropic API into a typed LlmResponse.
@@ -472,91 +406,6 @@ test "parseResponse parses tool_use response" {
         },
         else => return error.TestUnexpectedResult,
     }
-}
-
-test "writeMessage serializes tool_use content block" {
-    const allocator = std.testing.allocator;
-
-    const content = try allocator.alloc(types.ContentBlock, 1);
-    defer allocator.free(content);
-    content[0] = .{ .tool_use = .{
-        .id = "toolu_001",
-        .name = "read",
-        .input_raw = "{\"path\":\"/tmp/test.txt\"}",
-    } };
-
-    const msg = types.Message{ .role = .assistant, .content = content };
-
-    var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
-    const json = try out.toOwnedSlice();
-    defer allocator.free(json);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
-    const blocks = root.get("content").?.array;
-    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
-    try std.testing.expectEqualStrings("tool_use", blocks.items[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("toolu_001", blocks.items[0].object.get("id").?.string);
-    try std.testing.expectEqualStrings("read", blocks.items[0].object.get("name").?.string);
-}
-
-test "writeMessage serializes tool_result content block" {
-    const allocator = std.testing.allocator;
-
-    const content = try allocator.alloc(types.ContentBlock, 1);
-    defer allocator.free(content);
-    content[0] = .{ .tool_result = .{
-        .tool_use_id = "toolu_001",
-        .content = "file contents here",
-        .is_error = false,
-    } };
-
-    const msg = types.Message{ .role = .user, .content = content };
-
-    var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
-    const json = try out.toOwnedSlice();
-    defer allocator.free(json);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-    try std.testing.expectEqualStrings("user", root.get("role").?.string);
-    const blocks = root.get("content").?.array;
-    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
-    try std.testing.expectEqualStrings("tool_result", blocks.items[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("toolu_001", blocks.items[0].object.get("tool_use_id").?.string);
-}
-
-test "writeMessage serializes error tool_result with is_error flag" {
-    const allocator = std.testing.allocator;
-
-    const content = try allocator.alloc(types.ContentBlock, 1);
-    defer allocator.free(content);
-    content[0] = .{ .tool_result = .{
-        .tool_use_id = "toolu_002",
-        .content = "error: not found",
-        .is_error = true,
-    } };
-
-    const msg = types.Message{ .role = .user, .content = content };
-
-    var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
-    const json = try out.toOwnedSlice();
-    defer allocator.free(json);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    const blocks = parsed.value.object.get("content").?.array;
-    const block = blocks.items[0].object;
-    try std.testing.expect(block.get("is_error").?.bool);
 }
 
 test "parseResponse returns error for malformed JSON" {
