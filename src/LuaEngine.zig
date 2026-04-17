@@ -154,27 +154,27 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        // Read name (Lua string, borrowed from VM)
+        // Read name (Lua string, borrowed from VM; invalidated by next pop)
         _ = lua.getField(1, "name");
-        const name_raw = lua.toString(-1) catch {
+        const tool_name = lua.toString(-1) catch {
             log.err("zag.tool(): 'name' field must be a string", .{});
             lua.pop(1);
             return error.LuaError;
         };
         lua.pop(1);
 
-        // Read description (Lua string, borrowed from VM)
+        // Read description (Lua string, borrowed from VM; invalidated by next pop)
         _ = lua.getField(1, "description");
-        const desc_raw = lua.toString(-1) catch {
+        const description = lua.toString(-1) catch {
             log.err("zag.tool(): 'description' field must be a string", .{});
             lua.pop(1);
             return error.LuaError;
         };
         lua.pop(1);
 
-        // Read optional prompt_snippet (Lua string, borrowed from VM)
+        // Read optional prompt_snippet (Lua string, borrowed from VM; invalidated by next pop)
         _ = lua.getField(1, "prompt_snippet");
-        const snippet_raw: ?[]const u8 = if (lua.isString(-1))
+        const prompt_snippet: ?[]const u8 = if (lua.isString(-1))
             lua.toString(-1) catch null
         else
             null;
@@ -210,24 +210,24 @@ pub const LuaEngine = struct {
         errdefer lua.unref(zlua.registry_index, func_ref);
 
         // Dupe borrowed Lua strings into engine allocator
-        const name = try engine.allocator.dupe(u8, name_raw);
-        errdefer engine.allocator.free(name);
+        const tool_name_owned = try engine.allocator.dupe(u8, tool_name);
+        errdefer engine.allocator.free(tool_name_owned);
 
-        const description = try engine.allocator.dupe(u8, desc_raw);
-        errdefer engine.allocator.free(description);
+        const description_owned = try engine.allocator.dupe(u8, description);
+        errdefer engine.allocator.free(description_owned);
 
-        const snippet = if (snippet_raw) |s| try engine.allocator.dupe(u8, s) else null;
-        errdefer if (snippet) |s| engine.allocator.free(s);
+        const prompt_snippet_owned = if (prompt_snippet) |s| try engine.allocator.dupe(u8, s) else null;
+        errdefer if (prompt_snippet_owned) |s| engine.allocator.free(s);
 
         try engine.tools.append(engine.allocator, .{
-            .name = name,
-            .description = description,
+            .name = tool_name_owned,
+            .description = description_owned,
             .input_schema_json = schema_json,
-            .prompt_snippet = snippet,
+            .prompt_snippet = prompt_snippet_owned,
             .func_ref = func_ref,
         });
 
-        log.info("registered Lua tool: {s}", .{name});
+        log.info("registered Lua tool: {s}", .{tool_name_owned});
         return 0;
     }
 
@@ -241,12 +241,13 @@ pub const LuaEngine = struct {
     }
 
     fn zagHookFnInner(lua: *Lua) !i32 {
-        const event_raw = lua.toString(1) catch {
+        // Borrowed from the Lua VM; only read before any stack-mutating calls.
+        const event_name = lua.toString(1) catch {
             log.err("zag.hook(): first argument must be event name string", .{});
             return error.LuaError;
         };
-        const kind = Hooks.parseEventName(event_raw) orelse {
-            log.err("zag.hook(): unknown event '{s}'", .{event_raw});
+        const kind = Hooks.parseEventName(event_name) orelse {
+            log.err("zag.hook(): unknown event '{s}'", .{event_name});
             return error.LuaError;
         };
 
@@ -297,7 +298,7 @@ pub const LuaEngine = struct {
     }
 
     fn zagHookDelFnInner(lua: *Lua) !i32 {
-        const id_raw = lua.toInteger(1) catch {
+        const hook_id = lua.toInteger(1) catch {
             log.err("zag.hook_del(): first argument must be a hook id integer", .{});
             return error.LuaError;
         };
@@ -310,7 +311,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        const id: u32 = @intCast(id_raw);
+        const id: u32 = @intCast(hook_id);
         // Unref the Lua callback before the hook entry is removed from the registry.
         for (engine.hook_registry.hooks.items) |h| {
             if (h.id == id) {
@@ -474,10 +475,11 @@ pub const LuaEngine = struct {
             self.pending_cancel = true;
             _ = self.lua.getField(-1, "reason");
             if (self.lua.isString(-1)) {
-                if (self.lua.toString(-1)) |reason_raw| {
+                // Borrowed from Lua VM; must be duped before the pop below.
+                if (self.lua.toString(-1)) |reason_text| {
                     // Free any previously stored reason before overwriting.
                     if (self.pending_cancel_reason) |old| self.allocator.free(old);
-                    self.pending_cancel_reason = self.allocator.dupe(u8, reason_raw) catch null;
+                    self.pending_cancel_reason = self.allocator.dupe(u8, reason_text) catch null;
                 } else |_| {}
             }
             self.lua.pop(1);

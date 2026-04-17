@@ -252,8 +252,8 @@ const PostHookOutcome = struct {
 /// round-trip. Polls the cancel flag every 50ms so a user interrupt
 /// during Lua work still tears down promptly.
 ///
-/// Verification for this helper is deferred to the E2E test added in
-/// Task 17, which exercises veto + rewrite against a real registry.
+/// Verified end-to-end by the ToolPre veto coverage in the
+/// `executeTools` test suite below.
 fn firePreHook(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
@@ -296,8 +296,8 @@ fn firePreHook(
 /// Lua work. The `duration_ms` is the elapsed time spent in
 /// `registry.execute`, forwarded to Lua as a metric.
 ///
-/// Verification for this helper is deferred to the E2E test added in
-/// Task 17, which exercises content rewrite against a real registry.
+/// Verified end-to-end by the ToolPost content-rewrite coverage in
+/// the `executeTools` test suite below.
 fn firePostHook(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
@@ -889,5 +889,101 @@ test "cancel flag is respected in parallel execution" {
             },
             else => return error.TestUnexpectedResult,
         }
+    }
+}
+
+test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
+    const ConversationBuffer = @import("ConversationBuffer.zig");
+    const read_tool = @import("tools/read.zig");
+    const alloc = std.testing.allocator;
+
+    // Setup LuaEngine with two hooks.
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", { pattern = "bash" }, function(evt)
+        \\  return { cancel = true, reason = "no shell" }
+        \\end)
+        \\zag.hook("ToolPost", { pattern = "read" }, function(evt)
+        \\  return { content = "REDACTED" }
+        \\end)
+    );
+
+    // Registry holds only the `read` tool. The bash call is vetoed before
+    // registry.execute is ever consulted, so bash registration is unneeded.
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(read_tool.tool);
+
+    // Write a temp file for read to target.
+    const tmp = "zag-hook-e2e.txt";
+    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "hello" });
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_1", .name = "bash", .input_raw = "{\"command\":\"ls\"}" },
+        .{ .id = "call_2", .name = "read", .input_raw = "{\"path\":\"zag-hook-e2e.txt\"}" },
+    };
+
+    var queue = AgentThread.EventQueue.init(alloc);
+    defer queue.deinit();
+    var cancel = AgentThread.CancelFlag.init(false);
+
+    // Pump thread: services hook_request and lua_tool_request events off the
+    // queue. `dispatchHookRequests` handles both; only one registered tool
+    // (read) is Zig, so lua_tool_request won't fire here, but the pump stays
+    // agnostic.
+    const Pump = struct {
+        fn pump(q: *AgentThread.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                ConversationBuffer.dispatchHookRequests(q, eng);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            // Final drain so any late pushes (e.g. ToolPost after the last
+            // registry.execute returns) are serviced before we join.
+            ConversationBuffer.dispatchHookRequests(q, eng);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    // Bind the Lua-tool threadlocal in case a Lua tool slips into the
+    // registry in a later refactor. Not strictly required today.
+    AgentThread.lua_request_queue = &queue;
+    defer AgentThread.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine);
+    defer freeToolResults(blocks, alloc);
+
+    // Drain whatever lifecycle events the executor pushed (tool_start,
+    // tool_result etc.) so the queue exits cleanly.
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+
+    // Block 0: bash was vetoed before execution.
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expectEqualStrings("call_1", tr.tool_use_id);
+            try std.testing.expect(tr.is_error);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "vetoed") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "no shell") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Block 1: read executed, ToolPost rewrote content to "REDACTED".
+    switch (blocks[1]) {
+        .tool_result => |tr| {
+            try std.testing.expectEqualStrings("call_2", tr.tool_use_id);
+            try std.testing.expect(!tr.is_error);
+            try std.testing.expectEqualStrings("REDACTED", tr.content);
+        },
+        else => return error.TestUnexpectedResult,
     }
 }
