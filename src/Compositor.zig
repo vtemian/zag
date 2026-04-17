@@ -801,7 +801,9 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
     layout.recalculate(40, 8);
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(40, 8);
-    // Focus defaults to the first child (left pane).
+    // Focus followed the split to the right pane; walk back so this test
+    // can check the focused/unfocused contrast on the left/right pair.
+    layout.focusDirection(.left);
 
     compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
 
@@ -838,6 +840,8 @@ test "focused pane title has inverse style, unfocused is plain" {
     layout.recalculate(40, 8);
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(40, 8);
+    // Focus followed the split; refocus left so `a` is the focused pane.
+    layout.focusDirection(.left);
 
     compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
 
@@ -1036,7 +1040,9 @@ test "unfocused pane shows its draft without a cursor block" {
     layout.recalculate(40, 8);
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(40, 8);
-    // Focus stays on the left pane (cb1).
+    // Focus followed the split to the right pane; refocus left so the right
+    // pane (cb2) is the unfocused one whose prompt row we inspect below.
+    layout.focusDirection(.left);
 
     compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
 
