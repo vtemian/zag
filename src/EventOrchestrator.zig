@@ -620,12 +620,16 @@ fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
     self.compositor.layout_dirty = true;
 
     // Transient announce; cleared on the next key event.
-    const written = std.fmt.bufPrint(
-        &self.transient_status,
-        "split \u{2192} scratch {d}",
-        .{scratch_id},
-    ) catch "";
-    self.transient_status_len = @intCast(@min(written.len, self.transient_status.len));
+    self.transient_status_len = formatSplitAnnounce(&self.transient_status, scratch_id);
+}
+
+/// Format the `split -> scratch N` one-shot announce into `dest`.
+/// Returns the byte length written, or 0 if `dest` can't fit the message.
+fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
+    const written = std.fmt.bufPrint(dest, "split \u{2192} scratch {d}", .{scratch_id}) catch {
+        return 0;
+    };
+    return @intCast(written.len);
 }
 
 /// Create a new split pane: buffer + optional session, tracked for cleanup.
@@ -879,6 +883,23 @@ test "inputDeleteWord on single word clears all" {
 test "inputDeleteWord on empty returns zero" {
     var buf: [10]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), inputDeleteWord(&buf, 0));
+}
+
+test "formatSplitAnnounce writes the standard announce for id 1" {
+    var buf: [64]u8 = undefined;
+    const len = formatSplitAnnounce(&buf, 1);
+    try std.testing.expectEqualStrings("split \u{2192} scratch 1", buf[0..len]);
+}
+
+test "formatSplitAnnounce handles three-digit ids" {
+    var buf: [64]u8 = undefined;
+    const len = formatSplitAnnounce(&buf, 999);
+    try std.testing.expectEqualStrings("split \u{2192} scratch 999", buf[0..len]);
+}
+
+test "formatSplitAnnounce returns zero when destination is too small" {
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(u8, 0), formatSplitAnnounce(&buf, 1));
 }
 
 test "modeAfterKey: Esc transitions insert -> normal" {
