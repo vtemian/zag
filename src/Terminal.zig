@@ -25,6 +25,19 @@ original_termios: posix.termios,
 /// The last known terminal size.
 size: Size,
 
+// -- Module-level terminal capability flag -----------------------------------
+
+/// Whether the terminal advertises 24-bit true color via `$COLORTERM`.
+/// Populated once by `Terminal.init` (or explicitly by tests) and read by
+/// `Screen.writeSgr` to decide whether to emit RGB SGR codes directly or
+/// downgrade them to the closest 256-palette index.
+///
+/// A module-level `var` is intentional: terminal color capability is a
+/// process-wide property set once at startup. Threading it through every
+/// `writeSgr` call would add noise without buying testability (tests set
+/// this directly before asserting render output).
+pub var true_color: bool = false;
+
 // -- Atomic SIGWINCH flag (file-level global for signal handler access) ------
 
 /// Must be file-level global because POSIX signal handlers receive no user context
@@ -81,7 +94,10 @@ pub fn init() !Terminal {
     // 7. Install SIGWINCH handler
     installSigwinchHandler();
 
-    // 8. Query initial terminal size
+    // 8. Detect 24-bit color capability from $COLORTERM.
+    true_color = detectTrueColor();
+
+    // 9. Query initial terminal size
     const size = getSize() catch |err| blk: {
         log.warn("getSize failed ({s}), falling back to 24x80", .{@errorName(err)});
         break :blk Size{ .rows = 24, .cols = 80 };
@@ -91,6 +107,23 @@ pub fn init() !Terminal {
         .original_termios = original,
         .size = size,
     };
+}
+
+/// Return true when `$COLORTERM` indicates 24-bit color support.
+///
+/// The de-facto convention (used by tmux, alacritty, kitty, Ghostty, etc.)
+/// is to set `COLORTERM=truecolor` or `COLORTERM=24bit`. Anything else —
+/// including an empty value — means "fall back to 256-color palette".
+pub fn detectTrueColor() bool {
+    const val = posix.getenv("COLORTERM") orelse return false;
+    return trueColorFromValue(val);
+}
+
+/// Pure predicate split out of `detectTrueColor` so unit tests can exercise
+/// the matching rules without mutating process environment (Zig 0.15 does
+/// not expose `setenv`/`unsetenv` under `std.posix`).
+pub fn trueColorFromValue(val: []const u8) bool {
+    return std.mem.eql(u8, val, "truecolor") or std.mem.eql(u8, val, "24bit");
 }
 
 /// Restore terminal state in reverse order: disable mouse, disable synchronized
@@ -225,6 +258,26 @@ test "checkResize returns size after flag set" {
     // Either way, the flag must have been consumed
     try std.testing.expect(!resize_pending.load(.acquire));
     _ = result;
+}
+
+test "trueColorFromValue recognises COLORTERM=truecolor and 24bit" {
+    try std.testing.expect(trueColorFromValue("truecolor"));
+    try std.testing.expect(trueColorFromValue("24bit"));
+}
+
+test "trueColorFromValue rejects empty and unrelated values" {
+    try std.testing.expect(!trueColorFromValue(""));
+    try std.testing.expect(!trueColorFromValue("yes"));
+    try std.testing.expect(!trueColorFromValue("TRUECOLOR"));
+}
+
+test "detectTrueColor honours COLORTERM env var" {
+    // detectTrueColor reads process env; we can only observe, not mutate,
+    // in Zig 0.15 (no std.posix.setenv). Assert it agrees with the current
+    // $COLORTERM: if set to truecolor/24bit the fn returns true, otherwise
+    // false. Either way this exercises the env-read path.
+    const expected = if (posix.getenv("COLORTERM")) |v| trueColorFromValue(v) else false;
+    try std.testing.expectEqual(expected, detectTrueColor());
 }
 
 test "raw mode enter and exit round-trips termios" {
