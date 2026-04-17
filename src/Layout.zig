@@ -260,7 +260,10 @@ fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer
         replaceChild(r, f, split);
     }
 
-    // Focus stays on the original leaf (first child)
+    // A fresh pane is almost always what the user wants to type into next,
+    // so focus follows the split. The old pane stays a keystroke away via
+    // vim-style navigation.
+    self.focused = new_leaf;
 }
 
 /// Recursively walk the tree and replace `old` with `new` in its parent split.
@@ -458,6 +461,28 @@ test "recalculate sets leaf rect with status row reserved" {
     try std.testing.expectEqual(@as(u16, 23), leaf.rect.height);
 }
 
+test "split focuses the new pane" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    defer cb1.deinit();
+    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    defer cb2.deinit();
+    var cb3 = try ConversationBuffer.init(allocator, 2, "bottom");
+    defer cb3.deinit();
+
+    try layout.setRoot(cb1.buf());
+    layout.recalculate(80, 24);
+
+    try layout.splitVertical(0.5, cb2.buf());
+    try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
+
+    try layout.splitHorizontal(0.5, cb3.buf());
+    try std.testing.expectEqualStrings("bottom", layout.getFocusedLeaf().?.buffer.getName());
+}
+
 test "vertical split divides width evenly" {
     const allocator = std.testing.allocator;
     var layout = Layout.init(allocator);
@@ -534,13 +559,14 @@ test "focus navigation between vertical splits" {
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
-    try std.testing.expectEqualStrings("left", layout.getFocusedLeaf().?.buffer.getName());
-
-    layout.focusDirection(.right);
+    // The new pane owns focus after split.
     try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
 
     layout.focusDirection(.left);
     try std.testing.expectEqualStrings("left", layout.getFocusedLeaf().?.buffer.getName());
+
+    layout.focusDirection(.right);
+    try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "focus navigation between horizontal splits" {
@@ -558,11 +584,14 @@ test "focus navigation between horizontal splits" {
     try layout.splitHorizontal(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
-    layout.focusDirection(.down);
+    // The new pane owns focus after split.
     try std.testing.expectEqualStrings("bottom", layout.getFocusedLeaf().?.buffer.getName());
 
     layout.focusDirection(.up);
     try std.testing.expectEqualStrings("top", layout.getFocusedLeaf().?.buffer.getName());
+
+    layout.focusDirection(.down);
+    try std.testing.expectEqualStrings("bottom", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "closeWindow removes focused pane" {
@@ -580,7 +609,7 @@ test "closeWindow removes focused pane" {
     try layout.splitVertical(0.5, cb2.buf());
     layout.recalculate(80, 24);
 
-    layout.focusDirection(.right);
+    // Split lands focus on the new right pane.
     try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
 
     layout.closeWindow();
