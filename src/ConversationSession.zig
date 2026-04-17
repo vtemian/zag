@@ -54,6 +54,16 @@ pub fn persistEvent(self: *ConversationSession, entry: Session.Entry) void {
     };
 }
 
+/// Persist a user_message entry with the current timestamp. Convenience
+/// wrapper around `persistEvent` for the submit path.
+pub fn persistUserMessage(self: *ConversationSession, text: []const u8) void {
+    self.persistEvent(.{
+        .entry_type = .user_message,
+        .content = text,
+        .timestamp = std.time.milliTimestamp(),
+    });
+}
+
 /// Reconstruct the LLM message history from loaded entries.
 pub fn rebuildMessages(self: *ConversationSession, entries: []const Session.Entry, allocator: Allocator) !void {
     var assistant_blocks: std.ArrayList(types.ContentBlock) = .empty;

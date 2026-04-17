@@ -108,6 +108,32 @@ pub fn lastInfo(self: *const AgentRunner) []const u8 {
     return self.last_info[0..self.last_info_len];
 }
 
+/// Reset streaming/correlation state so the next agent run renders from
+/// a clean slate. Does not touch the pending_tool_calls map, which must
+/// be empty at this point (otherwise there's a correlation leak and the
+/// next run would reparent tool_results under stale nodes).
+pub fn resetStreamingState(self: *AgentRunner) void {
+    self.current_assistant_node = null;
+    self.last_tool_call = null;
+}
+
+/// Submit user input: record it on the session history, paint a user
+/// node on the view, persist a JSONL entry, and reset streaming state
+/// so the next agent run starts from a clean UI. The view and session
+/// are coordinated here rather than on either half alone.
+///
+/// The runner does not spawn the agent thread. Agent lifecycle belongs
+/// to the orchestrator, which calls this method and then decides
+/// whether to start the agent.
+pub fn submitInput(self: *AgentRunner, text: []const u8, allocator: Allocator) !void {
+    _ = allocator;
+
+    try self.session.appendUserMessage(text);
+    _ = try self.view.appendUserNode(text);
+    self.session.persistUserMessage(text);
+    self.resetStreamingState();
+}
+
 /// Pull any hook_request events out of the queue and service them on the
 /// main thread (the only thread allowed to touch Lua). Non-hook events are
 /// compacted back into the ring in their original order. Called before the
@@ -554,6 +580,37 @@ test "text_delta fires post-hook with text" {
     _ = try engine.lua.getGlobal("last_delta");
     try std.testing.expectEqualStrings("chunk!", try engine.lua.toString(-1));
     engine.lua.pop(1);
+}
+
+test "submitInput records user message on session, tree, and resets streaming" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationSession.init(allocator);
+    defer scb.deinit();
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "submit-runner", &scb, &runner);
+    defer cb.deinit();
+    runner.view = &cb;
+
+    // Seed streaming state; submit must clear it before returning.
+    const stale = try cb.appendNode(null, .assistant_text, "stale");
+    runner.current_assistant_node = stale;
+
+    try runner.submitInput("hi", allocator);
+
+    // Streaming state cleared.
+    try std.testing.expect(runner.current_assistant_node == null);
+    try std.testing.expect(runner.last_tool_call == null);
+
+    // Tree got the stale assistant_text plus the new user_message.
+    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[1].node_type);
+    try std.testing.expectEqualStrings("hi", cb.root_children.items[1].content.items);
+
+    // Session has one user message with a single text block.
+    try std.testing.expectEqual(@as(usize, 1), scb.messages.items.len);
+    try std.testing.expectEqualStrings("hi", scb.messages.items[0].content[0].text.text);
 }
 
 test "drainEvents joins thread and deinits queue on .done" {
