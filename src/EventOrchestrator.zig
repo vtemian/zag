@@ -160,14 +160,8 @@ pub const Config = struct {
     layout: *Layout,
     /// Renders layout into the screen grid.
     compositor: *Compositor,
-    /// Root conversation buffer (initial session pane).
-    root_buffer: *ConversationBuffer,
-    /// LLM conversation state for the root pane. Borrowed from main;
-    /// Phase 4 folds this into a `Pane` and removes the side-car.
-    root_session: *ConversationSession,
-    /// Agent lifecycle for the root pane. Borrowed from main; Phase 4
-    /// folds this into a `Pane` and removes the side-car.
-    root_runner: *AgentRunner,
+    /// Root pane: view + session + runner composition. Borrowed from main.
+    root_pane: Pane,
     /// LLM provider for model calls and model ID lookups.
     provider: *llm.ProviderResult,
     /// Tool registry for dispatching tool calls.
@@ -195,9 +189,9 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .screen = cfg.screen,
         .layout = cfg.layout,
         .compositor = cfg.compositor,
-        .root_buffer = cfg.root_buffer,
-        .root_session = cfg.root_session,
-        .root_runner = cfg.root_runner,
+        .root_buffer = cfg.root_pane.view,
+        .root_session = cfg.root_pane.session,
+        .root_runner = cfg.root_pane.runner,
         .provider = cfg.provider,
         .registry = cfg.registry,
         .session_mgr = cfg.session_mgr,
