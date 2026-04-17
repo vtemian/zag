@@ -906,7 +906,7 @@ test "cancel flag is respected in parallel execution" {
 }
 
 test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
-    const ConversationBuffer = @import("ConversationBuffer.zig");
+    const AgentRunner = @import("AgentRunner.zig");
     const read_tool = @import("tools/read.zig");
     const alloc = std.testing.allocator;
 
@@ -950,12 +950,12 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
     const Pump = struct {
         fn pump(q: *AgentThread.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
-                ConversationBuffer.dispatchHookRequests(q, eng);
+                AgentRunner.dispatchHookRequests(q, eng);
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes (e.g. ToolPost after the last
             // registry.execute returns) are serviced before we join.
-            ConversationBuffer.dispatchHookRequests(q, eng);
+            AgentRunner.dispatchHookRequests(q, eng);
         }
     };
     var stop = std.atomic.Value(bool).init(false);
