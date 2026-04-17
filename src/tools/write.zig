@@ -13,7 +13,16 @@ const WriteInput = struct {
 };
 
 /// Write content to a file, creating parent directories as needed.
-pub fn execute(input_raw: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
+///
+/// `cancel` is accepted for signature compatibility with long-running tools but
+/// ignored here: writes are fast enough that a mid-call cancel would race with
+/// the syscall anyway.
+pub fn execute(
+    input_raw: []const u8,
+    allocator: Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
     const parsed = std.json.parseFromSlice(WriteInput, allocator, input_raw, .{ .ignore_unknown_fields = true }) catch
         return error.InvalidInput;
     defer parsed.deinit();
@@ -87,7 +96,7 @@ test "write a new file" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"hello world\\n\"}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(!result.is_error);
@@ -109,7 +118,7 @@ test "write counts lines correctly" {
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"a\\nb\\nc\\n\"}}", .{tmp_path});
     defer allocator.free(input);
 
-    const result = try execute(input, allocator);
+    const result = try execute(input, allocator, null);
     defer allocator.free(result.content);
 
     try std.testing.expect(!result.is_error);
@@ -118,5 +127,5 @@ test "write counts lines correctly" {
 
 test "write with invalid input returns InvalidInput" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidInput, execute("not json", allocator));
+    try std.testing.expectError(error.InvalidInput, execute("not json", allocator, null));
 }
