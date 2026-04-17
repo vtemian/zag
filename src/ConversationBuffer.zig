@@ -12,6 +12,7 @@ const Theme = @import("Theme.zig");
 const types = @import("types.zig");
 const Session = @import("Session.zig");
 const ConversationSession = @import("ConversationSession.zig");
+const AgentRunner = @import("AgentRunner.zig");
 const agent_events = @import("agent_events.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Hooks = @import("Hooks.zig");
@@ -102,38 +103,22 @@ renderer: NodeRenderer,
 /// LLM conversation state: message history and persistence handle.
 /// Borrowed, not owned. Lifetime is managed by the orchestrator.
 session: *ConversationSession,
-/// Pending tool_call nodes keyed by call_id, for parenting tool_result nodes.
-/// Supports parallel tool execution where events interleave.
-pending_tool_calls: std.StringHashMap(*Node) = undefined,
-/// Fallback for tool_start events without a call_id (streaming previews).
-last_tool_call: ?*Node = null,
-/// Current assistant text node being streamed to.
-current_assistant_node: ?*Node = null,
-/// Last info message (token counts) for status bar display.
-last_info: [128]u8 = .{0} ** 128,
-/// Length of the last info message.
-last_info_len: u8 = 0,
-/// Background agent thread, if one is running for this buffer.
-/// Lifecycle is managed by the orchestrator; the buffer only holds the
-/// handle so `deinit` can join on error-exit paths.
-agent_thread: ?std.Thread = null,
-/// Event queue for agent-to-main communication. The orchestrator
-/// initializes this when spawning an agent and tears it down on drain.
-event_queue: agent_events.EventQueue = undefined,
-/// Atomic flag for requesting agent thread cancellation.
-cancel_flag: agent_events.CancelFlag = agent_events.CancelFlag.init(false),
-/// Whether the event queue has been initialized (needs deinit).
-queue_active: bool = false,
-/// Wake fd for the main loop. Copied into EventQueue at submit time so
-/// agent threads can wake the poll() in main.zig.
-wake_fd: ?std.posix.fd_t = null,
-/// Pointer to the shared Lua engine, if any. Used by the main-thread
-/// drain loop to service `hook_request` events pushed by the agent.
-lua_engine: ?*LuaEngine = null,
+/// Agent runner that drives this buffer: streaming state, correlation map,
+/// thread handle, event queue, Lua engine pointer, wake fd. Borrowed, not
+/// owned. Lifetime is managed by the orchestrator. Phase 4 removes this
+/// field in favor of a `Pane` struct composing the three types.
+runner: *AgentRunner,
 
 /// Create a new empty buffer with the given id and name. Borrows `session`
-/// for LLM message history and persistence; the caller retains ownership.
-pub fn init(allocator: Allocator, id: u32, name: []const u8, session: *ConversationSession) !ConversationBuffer {
+/// for LLM message history and persistence and `runner` for agent-thread
+/// coordination; the caller retains ownership of both.
+pub fn init(
+    allocator: Allocator,
+    id: u32,
+    name: []const u8,
+    session: *ConversationSession,
+    runner: *AgentRunner,
+) !ConversationBuffer {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
 
@@ -145,28 +130,20 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8, session: *Conversat
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
         .session = session,
-        .pending_tool_calls = std.StringHashMap(*Node).init(allocator),
+        .runner = runner,
     };
 }
 
 /// Release all memory owned by this buffer: nodes, name, and lists.
-/// Messages and the session handle live on `ConversationSession` and are not
-/// freed here. The session itself is also not owned by the buffer.
+/// Messages and the session handle live on `ConversationSession`; the
+/// agent thread, event queue, and streaming state live on `AgentRunner`.
+/// Neither is owned by the buffer.
 pub fn deinit(self: *ConversationBuffer) void {
-    // Join any live agent thread before freeing the state it reads/writes:
-    // pending_tool_calls and the event queue are shared with the worker.
-    // Running this unconditionally is the only safe ordering on error-exit
-    // paths where the caller never got a chance to shut down.
-    self.shutdown();
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
         self.allocator.destroy(node);
     }
     self.root_children.deinit(self.allocator);
-    // Free owned call_id keys in the pending map
-    var key_it = self.pending_tool_calls.keyIterator();
-    while (key_it.next()) |key| self.allocator.free(@constCast(key.*));
-    self.pending_tool_calls.deinit();
     self.allocator.free(self.name);
 }
 
@@ -361,8 +338,8 @@ pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !v
 /// streamed response is being replaced by a non-streaming fallback:
 /// the UI rebuilds from a clean state when the next text_delta arrives.
 pub fn resetCurrentAssistantText(self: *ConversationBuffer) void {
-    const node = self.current_assistant_node orelse return;
-    self.current_assistant_node = null;
+    const node = self.runner.current_assistant_node orelse return;
+    self.runner.current_assistant_node = null;
 
     for (self.root_children.items, 0..) |child, i| {
         if (child == node) {
@@ -382,10 +359,10 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .user_message => _ = try self.appendNode(null, .user_message, entry.content),
             .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
             .tool_call => {
-                self.last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+                self.runner.last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
             },
             .tool_result => {
-                _ = try self.appendNode(self.last_tool_call, .tool_result, entry.content);
+                _ = try self.appendNode(self.runner.last_tool_call, .tool_result, entry.content);
             },
             .info => _ = try self.appendNode(null, .status, entry.content),
             .err => _ = try self.appendNode(null, .err, entry.content),
@@ -411,16 +388,16 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
-            if (self.lua_engine) |eng| {
+            if (self.runner.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text } };
                 eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
             }
-            if (self.current_assistant_node) |node| {
+            if (self.runner.current_assistant_node) |node| {
                 self.appendToNode(node, text) catch |err| {
                     log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
                 };
             } else {
-                self.current_assistant_node = self.appendNode(null, .assistant_text, text) catch |err| blk: {
+                self.runner.current_assistant_node = self.appendNode(null, .assistant_text, text) catch |err| blk: {
                     log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
                     break :blk null;
                 };
@@ -433,13 +410,13 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
         },
         .tool_start => |ev| {
             defer allocator.free(ev.name);
-            self.current_assistant_node = null;
+            self.runner.current_assistant_node = null;
             const node = self.appendNode(null, .tool_call, ev.name) catch null;
-            self.last_tool_call = node;
+            self.runner.last_tool_call = node;
             // If we have a call_id, store in the map for result correlation
             if (ev.call_id) |id| {
                 if (node) |n| {
-                    self.pending_tool_calls.put(id, n) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
+                    self.runner.pending_tool_calls.put(id, n) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
                 } else {
                     allocator.free(id);
                 }
@@ -454,15 +431,15 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
             defer allocator.free(result.content);
             // Find the parent tool_call node: by call_id if available, else fallback
             const parent = if (result.call_id) |id| blk: {
-                const removed = self.pending_tool_calls.fetchRemove(id);
+                const removed = self.runner.pending_tool_calls.fetchRemove(id);
                 // Free both the lookup key (from tool_result) and stored key (from tool_start)
                 allocator.free(id);
                 if (removed) |kv| {
                     allocator.free(@constCast(kv.key));
                     break :blk kv.value;
                 }
-                break :blk self.last_tool_call;
-            } else self.last_tool_call;
+                break :blk self.runner.last_tool_call;
+            } else self.runner.last_tool_call;
             _ = self.appendNode(parent, .tool_result, result.content) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
             self.session.persistEvent(.{
                 .entry_type = .tool_result,
@@ -474,21 +451,21 @@ pub fn handleAgentEvent(self: *ConversationBuffer, event: agent_events.AgentEven
         .info => |text| {
             defer allocator.free(text);
             // Store for status bar display, not as a conversation node
-            const len = @min(text.len, self.last_info.len);
-            @memcpy(self.last_info[0..len], text[0..len]);
-            self.last_info_len = @intCast(len);
+            const len = @min(text.len, self.runner.last_info.len);
+            @memcpy(self.runner.last_info[0..len], text[0..len]);
+            self.runner.last_info_len = @intCast(len);
         },
         .done => {
-            if (self.lua_engine) |eng| {
+            if (self.runner.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .agent_done = {} };
                 eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
             }
-            self.current_assistant_node = null;
+            self.runner.current_assistant_node = null;
         },
         .reset_assistant_text => self.resetCurrentAssistantText(),
         .err => |text| {
             defer allocator.free(text);
-            if (self.lua_engine) |eng| {
+            if (self.runner.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
                 eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
             }
@@ -535,8 +512,8 @@ pub fn submitInput(
     });
 
     // Reset streaming state so the next agent run starts from a clean UI.
-    self.current_assistant_node = null;
-    self.last_tool_call = null;
+    self.runner.current_assistant_node = null;
+    self.runner.last_tool_call = null;
 }
 
 /// Pull any hook_request events out of the queue and service them on the
@@ -603,12 +580,12 @@ pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine
 
 /// Drain pending agent events. Returns true if the agent finished this frame.
 pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
-    if (self.agent_thread == null) return false;
+    if (self.runner.agent_thread == null) return false;
 
-    dispatchHookRequests(&self.event_queue, self.lua_engine);
+    dispatchHookRequests(&self.runner.event_queue, self.runner.lua_engine);
 
     var drain: [64]agent_events.AgentEvent = undefined;
-    const count = self.event_queue.drain(&drain);
+    const count = self.runner.event_queue.drain(&drain);
     var finished = false;
 
     for (drain[0..count]) |event| {
@@ -619,10 +596,10 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
         self.handleAgentEvent(event, allocator);
 
         if (event == .done) {
-            if (self.agent_thread) |t| t.join();
-            self.agent_thread = null;
-            self.event_queue.deinit();
-            self.queue_active = false;
+            if (self.runner.agent_thread) |t| t.join();
+            self.runner.agent_thread = null;
+            self.runner.event_queue.deinit();
+            self.runner.queue_active = false;
             finished = true;
         }
     }
@@ -632,29 +609,29 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
 
 /// Whether an agent is currently running for this buffer.
 pub fn isAgentRunning(self: *const ConversationBuffer) bool {
-    return self.agent_thread != null;
+    return self.runner.agent_thread != null;
 }
 
 /// Return the last info/status message (e.g., token counts) for status bar display.
 pub fn lastInfo(self: *const ConversationBuffer) []const u8 {
-    return self.last_info[0..self.last_info_len];
+    return self.runner.last_info[0..self.runner.last_info_len];
 }
 
 /// Request cancellation of the running agent.
 pub fn cancelAgent(self: *ConversationBuffer) void {
-    self.cancel_flag.store(true, .release);
+    self.runner.cancel_flag.store(true, .release);
 }
 
 /// Cancel and join the agent thread if running. Call before deinit.
 pub fn shutdown(self: *ConversationBuffer) void {
-    if (self.agent_thread) |t| {
-        self.cancel_flag.store(true, .release);
+    if (self.runner.agent_thread) |t| {
+        self.runner.cancel_flag.store(true, .release);
         t.join();
-        self.agent_thread = null;
+        self.runner.agent_thread = null;
     }
-    if (self.queue_active) {
-        self.event_queue.deinit();
-        self.queue_active = false;
+    if (self.runner.queue_active) {
+        self.runner.event_queue.deinit();
+        self.runner.queue_active = false;
     }
 }
 
@@ -750,8 +727,12 @@ test "init and deinit" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     try std.testing.expectEqual(@as(u32, 0), cb.id);
     try std.testing.expectEqualStrings("test", cb.name);
@@ -762,8 +743,12 @@ test "appendNode creates root-level nodes" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 1, "session", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 1, "session", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const n1 = try cb.appendNode(null, .user_message, "hello");
     const n2 = try cb.appendNode(null, .assistant_text, "hi there");
@@ -779,8 +764,12 @@ test "getVisibleLines returns rendered lines" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 3, "session", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 3, "session", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -799,8 +788,12 @@ test "buffer interface dispatches correctly" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 7, "iface-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 7, "iface-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const b = cb.buf();
     try std.testing.expectEqualStrings("iface-test", b.getName());
@@ -816,8 +809,12 @@ test "fromBuffer roundtrips correctly" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const b = cb.buf();
     const recovered = ConversationBuffer.fromBuffer(b);
@@ -828,8 +825,12 @@ test "getVisibleLines with range skips off-screen nodes" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "range-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "range-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     // Create 5 single-line nodes
     _ = try cb.appendNode(null, .user_message, "line0");
@@ -859,8 +860,12 @@ test "buffer interface returns line count" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "lc-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "lc-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -876,8 +881,12 @@ test "getVisibleLines returns consistent results when content unchanged" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "cache-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "cache-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .assistant_text, "world");
@@ -906,8 +915,12 @@ test "getVisibleLines reflects new content after appendToNode" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const node = try cb.appendNode(null, .user_message, "hello");
 
@@ -933,8 +946,12 @@ test "getVisibleLines reflects new nodes after appendNode" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "append-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "append-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "first");
 
@@ -959,8 +976,12 @@ test "clear invalidates line cache" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -982,8 +1003,12 @@ test "buffer starts clean" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const b = cb.buf();
     try std.testing.expect(!b.isDirty());
@@ -993,8 +1018,12 @@ test "appendNode marks buffer dirty" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     const b = cb.buf();
@@ -1005,8 +1034,12 @@ test "clearDirty resets the flag" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     var b = cb.buf();
@@ -1020,8 +1053,12 @@ test "appendToNode marks buffer dirty" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const node = try cb.appendNode(null, .user_message, "hello");
     var b = cb.buf();
@@ -1035,8 +1072,12 @@ test "setScrollOffset marks dirty only when value changes" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     var b = cb.buf();
 
@@ -1059,18 +1100,22 @@ test "resetCurrentAssistantText removes the in-progress node" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hi");
     const partial = try cb.appendNode(null, .assistant_text, "partial ");
-    cb.current_assistant_node = partial;
+    cb.runner.current_assistant_node = partial;
 
     try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
 
     cb.resetCurrentAssistantText();
 
-    try std.testing.expect(cb.current_assistant_node == null);
+    try std.testing.expect(cb.runner.current_assistant_node == null);
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
     try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
 }
@@ -1079,14 +1124,18 @@ test "resetCurrentAssistantText is a no-op when nothing is in progress" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     _ = try cb.appendNode(null, .user_message, "hi");
 
     cb.resetCurrentAssistantText();
 
-    try std.testing.expect(cb.current_assistant_node == null);
+    try std.testing.expect(cb.runner.current_assistant_node == null);
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
 }
 
@@ -1106,8 +1155,12 @@ test "text_delta after reset starts a fresh assistant node" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     // Simulate a partial stream: two text deltas append to one node.
     cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
@@ -1118,7 +1171,7 @@ test "text_delta after reset starts a fresh assistant node" {
     // Fallback: reset, then push the full response.
     cb.handleAgentEvent(.reset_assistant_text, allocator);
     try std.testing.expectEqual(@as(usize, 0), cb.root_children.items.len);
-    try std.testing.expect(cb.current_assistant_node == null);
+    try std.testing.expect(cb.runner.current_assistant_node == null);
 
     cb.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
@@ -1129,10 +1182,14 @@ test "wake_fd default is null" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "wake-default", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-default", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
-    try std.testing.expect(cb.wake_fd == null);
+    try std.testing.expect(cb.runner.wake_fd == null);
 }
 
 test "wake_fd propagates to a freshly initialized EventQueue" {
@@ -1141,14 +1198,18 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
-    cb.wake_fd = 777;
+    cb.runner.wake_fd = 777;
 
     var queue = try agent_events.EventQueue.initBounded(allocator, 16);
     defer queue.deinit();
-    queue.wake_fd = cb.wake_fd;
+    queue.wake_fd = cb.runner.wake_fd;
 
     try std.testing.expect(queue.wake_fd != null);
     try std.testing.expectEqual(@as(std.posix.fd_t, 777), queue.wake_fd.?);
@@ -1242,8 +1303,12 @@ test "submitInput appends user message and user_message node" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "submit-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "submit-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     try cb.submitInput("hello", allocator);
 
@@ -1262,16 +1327,20 @@ test "submitInput appends user message and user_message node" {
     }
 
     // Streaming state reset
-    try std.testing.expect(cb.current_assistant_node == null);
-    try std.testing.expect(cb.last_tool_call == null);
+    try std.testing.expect(cb.runner.current_assistant_node == null);
+    try std.testing.expect(cb.runner.last_tool_call == null);
 }
 
 test "loadFromEntries builds node tree from session entries" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "load-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "load-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const entries = [_]Session.Entry{
         .{ .entry_type = .user_message, .content = "first", .timestamp = 0 },
@@ -1295,8 +1364,12 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "rebuild-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "rebuild-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     const entries = [_]Session.Entry{
         .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
@@ -1336,8 +1409,12 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     // First tool_start with call_id "A"
     cb.handleAgentEvent(.{ .tool_start = .{
@@ -1352,7 +1429,7 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
     } }, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(@as(u32, 2), cb.pending_tool_calls.count());
+    try std.testing.expectEqual(@as(u32, 2), cb.runner.pending_tool_calls.count());
 
     // tool_result for "B" (out-of-order vs starts) should parent under tool B
     cb.handleAgentEvent(.{ .tool_result = .{
@@ -1365,8 +1442,8 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
     try std.testing.expectEqual(@as(usize, 1), tool_b_node.children.items.len);
     try std.testing.expectEqualStrings("result B", tool_b_node.children.items[0].content.items);
     // Pending map no longer contains "B", still contains "A"
-    try std.testing.expectEqual(@as(u32, 1), cb.pending_tool_calls.count());
-    try std.testing.expect(cb.pending_tool_calls.get("A") != null);
+    try std.testing.expectEqual(@as(u32, 1), cb.runner.pending_tool_calls.count());
+    try std.testing.expect(cb.runner.pending_tool_calls.get("A") != null);
 }
 
 test "restoreFromSession rebuilds both tree and messages" {
@@ -1413,8 +1490,12 @@ test "restoreFromSession rebuilds both tree and messages" {
     // Fresh buffer restores it
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "restored", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "restored", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
     try cb.restoreFromSession(&handle, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
@@ -1429,25 +1510,29 @@ test "drainEvents joins thread and deinits queue on .done" {
     const allocator = std.testing.allocator;
     var scb = ConversationSession.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "drain-test", &scb);
+    var cb_placeholder: ConversationBuffer = undefined;
+    var runner = AgentRunner.init(allocator, &cb_placeholder, &scb);
+    defer runner.deinit();
+    var cb = try ConversationBuffer.init(allocator, 0, "drain-test", &scb, &runner);
     defer cb.deinit();
+    runner.view = &cb;
 
     // Simulate the spawn setup without a real agent thread: just the queue.
-    cb.event_queue = try agent_events.EventQueue.initBounded(allocator, 16);
-    cb.queue_active = true;
+    cb.runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    cb.runner.queue_active = true;
 
     // Fake "thread" that immediately exits. We spawn it so agent_thread is non-null.
     const Noop = struct {
         fn run() void {}
     };
-    cb.agent_thread = try std.Thread.spawn(.{}, Noop.run, .{});
+    cb.runner.agent_thread = try std.Thread.spawn(.{}, Noop.run, .{});
 
     // Push a done event
-    try cb.event_queue.push(.done);
+    try cb.runner.event_queue.push(.done);
 
     const finished = cb.drainEvents(allocator);
 
     try std.testing.expect(finished);
-    try std.testing.expect(cb.agent_thread == null);
-    try std.testing.expect(!cb.queue_active);
+    try std.testing.expect(cb.runner.agent_thread == null);
+    try std.testing.expect(!cb.runner.queue_active);
 }

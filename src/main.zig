@@ -13,6 +13,7 @@ const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationSession = @import("ConversationSession.zig");
+const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
@@ -60,6 +61,10 @@ var root_session: ConversationSession = undefined;
 /// Module-level root buffer. Shared with tuiLogHandler so log output lands in
 /// the same place the user reads messages.
 var root_buffer: ConversationBuffer = undefined;
+/// Module-level root agent runner: owns the primary conversation's agent
+/// thread, event queue, and streaming state. Phase 4 collapses this with
+/// the buffer and session into a single `Pane` value.
+var root_runner: AgentRunner = undefined;
 
 fn tuiLogHandler(
     comptime level: std.log.Level,
@@ -166,8 +171,16 @@ pub fn main() !void {
     root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
 
-    root_buffer = try ConversationBuffer.init(allocator, 0, "session", &root_session);
+    // The runner holds a back-ref to the view it updates; the view holds a
+    // forward ref to the runner it dispatches through. Break the cycle in
+    // two steps: build the runner with a placeholder view first, build the
+    // view, then patch the runner's view field. Phase 4 collapses this.
+    root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
+    defer root_runner.deinit();
+
+    root_buffer = try ConversationBuffer.init(allocator, 0, "session", &root_session, &root_runner);
     defer root_buffer.deinit();
+    root_runner.view = &root_buffer;
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
     // handler write a byte to wake_write; the orchestrator polls wake_read to
@@ -179,7 +192,7 @@ pub fn main() !void {
         std.posix.close(wake_read);
         std.posix.close(wake_write);
     }
-    root_buffer.wake_fd = wake_write;
+    root_runner.wake_fd = wake_write;
     Terminal.setWakeFd(wake_write);
 
     var layout = Layout.init(allocator);
@@ -202,11 +215,11 @@ pub fn main() !void {
     };
     defer if (lua_engine) |*eng| eng.deinit();
 
-    // Wire the lua engine into the root buffer so the main-thread drain loop
+    // Wire the lua engine into the root runner so the main-thread drain loop
     // can service `hook_request` / `lua_tool_request` events pushed by the
     // agent. Extra split panes inherit this wiring from the orchestrator.
     if (lua_engine) |*eng| {
-        root_buffer.lua_engine = eng;
+        root_runner.lua_engine = eng;
     }
 
     const startup_mode = parseStartupArgs(allocator) catch .new_session;
@@ -325,8 +338,11 @@ test "appendOutputText creates a status node" {
     const allocator = std.testing.allocator;
     root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
-    root_buffer = try ConversationBuffer.init(allocator, 0, "test", &root_session);
+    root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
+    defer root_runner.deinit();
+    root_buffer = try ConversationBuffer.init(allocator, 0, "test", &root_session, &root_runner);
     defer root_buffer.deinit();
+    root_runner.view = &root_buffer;
 
     try appendOutputText("hello world");
 

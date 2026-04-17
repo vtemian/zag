@@ -21,6 +21,7 @@ const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationSession = @import("ConversationSession.zig");
+const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
@@ -49,13 +50,15 @@ const Action = enum { none, quit, redraw };
 /// Result of handling a slash command.
 const CommandResult = enum { handled, quit, not_a_command };
 
-/// A split pane's owned resources: buffer, conversation session, and optional
-/// on-disk session handle.
+/// A split pane's owned resources: buffer, conversation session, agent
+/// runner, and optional on-disk session handle.
 pub const SplitPane = struct {
     /// The conversation buffer for this pane.
     buffer: *ConversationBuffer,
     /// LLM message state attached to the buffer.
     conv_session: *ConversationSession,
+    /// Agent thread lifecycle + event coordination for this pane.
+    runner: *AgentRunner,
     /// Session handle for persistence, or null if persistence is unavailable.
     session: ?*Session.SessionHandle,
 };
@@ -196,6 +199,12 @@ pub fn deinit(self: *EventOrchestrator) void {
             sh.close();
             self.allocator.destroy(sh);
         }
+        // Runner first: it joins the agent thread and drains the event
+        // queue. The session and view may be read by the worker right up
+        // until the join completes, so freeing them before shutdown would
+        // race on the worker's last frame.
+        pane.runner.deinit();
+        self.allocator.destroy(pane.runner);
         pane.buffer.deinit();
         self.allocator.destroy(pane.buffer);
         pane.conv_session.deinit();
@@ -677,8 +686,8 @@ fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
     return @intCast(written.len);
 }
 
-/// Create a new split pane: session + buffer + optional persistence handle,
-/// tracked for cleanup.
+/// Create a new split pane: session + buffer + runner + optional persistence
+/// handle, tracked for cleanup.
 fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     const cs = try self.allocator.create(ConversationSession);
     errdefer self.allocator.destroy(cs);
@@ -688,17 +697,23 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     const cb = try self.allocator.create(ConversationBuffer);
     errdefer self.allocator.destroy(cb);
 
+    const runner = try self.allocator.create(AgentRunner);
+    errdefer self.allocator.destroy(runner);
+    runner.* = AgentRunner.init(self.allocator, cb, cs);
+    errdefer runner.deinit();
+
     var name_scratch: [32]u8 = undefined;
     const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
 
-    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name, cs);
+    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name, cs, runner);
     errdefer cb.deinit();
+    runner.view = cb;
 
     // Wake pipe so agent events on this pane interrupt the orchestrator's
     // poll(). Lua engine pointer so main-thread drain can service hook and
     // tool round-trips. Both inherit from the orchestrator's config.
-    cb.wake_fd = self.wake_write_fd;
-    cb.lua_engine = self.lua_engine;
+    runner.wake_fd = self.wake_write_fd;
+    runner.lua_engine = self.lua_engine;
 
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
@@ -709,6 +724,7 @@ fn createSplitPane(self: *EventOrchestrator) !*ConversationBuffer {
     try self.extra_panes.append(self.allocator, .{
         .buffer = cb,
         .conv_session = cs,
+        .runner = runner,
         .session = sh,
     });
     return cb;
@@ -781,26 +797,26 @@ fn onUserInputSubmitted(
 
     // 256 slots is ~1s of fast streaming - enough headroom for a UI frame
     // stall without hiding persistent backpressure.
-    cb.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
-    cb.event_queue.wake_fd = self.wake_write_fd;
-    cb.queue_active = true;
-    cb.lua_engine = self.lua_engine;
-    cb.cancel_flag.store(false, .release);
+    cb.runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
+    cb.runner.event_queue.wake_fd = self.wake_write_fd;
+    cb.runner.queue_active = true;
+    cb.runner.lua_engine = self.lua_engine;
+    cb.runner.cancel_flag.store(false, .release);
 
-    cb.agent_thread = AgentThread.spawn(
+    cb.runner.agent_thread = AgentThread.spawn(
         self.provider.provider,
         &cb.session.messages,
         self.registry,
         self.allocator,
-        &cb.event_queue,
-        &cb.cancel_flag,
+        &cb.runner.event_queue,
+        &cb.runner.cancel_flag,
         self.lua_engine,
     ) catch |err| {
         _ = cb.appendNode(null, .err, @errorName(err)) catch |append_err|
             log.warn("dropped event: {s}", .{@errorName(append_err)});
-        cb.event_queue.deinit();
-        cb.queue_active = false;
-        cb.agent_thread = null;
+        cb.runner.event_queue.deinit();
+        cb.runner.queue_active = false;
+        cb.runner.agent_thread = null;
         return err;
     };
 }
