@@ -380,8 +380,9 @@ pub fn deleteBackFromDraft(self: *ConversationBuffer) void {
     self.draft_len -= 1;
 }
 
-/// Remove the last word (plus any trailing spaces) from the draft.
-/// Matches the Ctrl+W behaviour of `inputDeleteWord`.
+/// Remove the last word from the draft along with any trailing spaces
+/// before the word and any separator space after it. Matches Ctrl+W in
+/// shells and vim: "strip trailing space, the word, then the separator".
 pub fn deleteWordFromDraft(self: *ConversationBuffer) void {
     // Strip trailing spaces.
     while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
