@@ -363,7 +363,6 @@ fn tick(
 
     if (!frame_dirty) return;
 
-    // TODO: consumed by per-pane prompts in Task 4.
     const focused = self.getFocusedPane();
     const agent_running = focused.runner.isAgentRunning();
     const status = if (self.transient_status_len > 0)
@@ -372,10 +371,12 @@ fn tick(
         const info = focused.runner.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
-    _ = .{ focused, agent_running, status };
     self.compositor.composite(self.layout, .{
         .fps = current_fps.*,
         .mode = self.current_mode,
+        .status = status,
+        .agent_running = agent_running,
+        .spinner_frame = self.spinner_frame,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
         // Backpressure on the terminal fd: frame is dropped, the next
