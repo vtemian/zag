@@ -15,6 +15,10 @@ const ConversationBuffer = @This();
 
 const log = std.log.scoped(.conversation_buffer);
 
+/// Maximum bytes of in-progress draft a single pane can hold. Fixed so
+/// the draft lives inline on the buffer struct with no separate alloc.
+pub const MAX_DRAFT = 4096;
+
 /// Semantic classification of a node's content.
 pub const NodeType = enum {
     custom,
@@ -93,6 +97,11 @@ scroll_offset: u32 = 0,
 render_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
+/// In-progress text the user is editing at this pane's prompt.
+/// Becomes the next user message when Enter is pressed.
+draft: [MAX_DRAFT]u8 = undefined,
+/// Number of valid bytes in `draft`.
+draft_len: usize = 0,
 
 /// Create a new empty buffer with the given id and name. The buffer is a
 /// pure view; its LLM messages live on `ConversationSession` and its
@@ -352,6 +361,52 @@ pub fn clear(self: *ConversationBuffer) void {
 /// Thin wrapper around `appendNode` used by the runner's submit path.
 pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
+}
+
+// -- Draft input --------------------------------------------------------
+
+/// Append a single byte to the draft. No-op if the draft is full.
+/// Does not touch `render_dirty` — the compositor repaints the prompt
+/// every frame anyway.
+pub fn appendToDraft(self: *ConversationBuffer, ch: u8) void {
+    if (self.draft_len >= self.draft.len) return;
+    self.draft[self.draft_len] = ch;
+    self.draft_len += 1;
+}
+
+/// Remove the last byte from the draft. No-op on empty.
+pub fn deleteBackFromDraft(self: *ConversationBuffer) void {
+    if (self.draft_len == 0) return;
+    self.draft_len -= 1;
+}
+
+/// Remove the last word (plus any trailing spaces) from the draft.
+/// Matches the Ctrl+W behaviour of `inputDeleteWord`.
+pub fn deleteWordFromDraft(self: *ConversationBuffer) void {
+    // Strip trailing spaces.
+    while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
+        self.draft_len -= 1;
+    }
+    // Strip the word itself.
+    while (self.draft_len > 0 and self.draft[self.draft_len - 1] != ' ') {
+        self.draft_len -= 1;
+    }
+    // Strip separator spaces left between the word and what preceded it,
+    // so "hello world" → "hello" (not "hello ").
+    while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
+        self.draft_len -= 1;
+    }
+}
+
+/// Clear the draft entirely.
+pub fn clearDraft(self: *ConversationBuffer) void {
+    self.draft_len = 0;
+}
+
+/// Return the current draft as a borrowed slice. Invalid after any
+/// mutation above.
+pub fn getDraft(self: *const ConversationBuffer) []const u8 {
+    return self.draft[0..self.draft_len];
 }
 
 // -- Buffer interface --------------------------------------------------------
@@ -735,4 +790,68 @@ test "loadFromEntries builds node tree from session entries" {
     // tool_result is a child of tool_call
     try std.testing.expectEqual(@as(usize, 1), cb.root_children.items[2].children.items.len);
     try std.testing.expectEqual(NodeType.tool_result, cb.root_children.items[2].children.items[0].node_type);
+}
+
+test "draft starts empty" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    try std.testing.expectEqualStrings("", cb.getDraft());
+    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
+}
+
+test "appendToDraft grows the draft" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    cb.appendToDraft('h');
+    cb.appendToDraft('i');
+    try std.testing.expectEqualStrings("hi", cb.getDraft());
+}
+
+test "appendToDraft respects MAX_DRAFT cap" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    var i: usize = 0;
+    while (i < MAX_DRAFT + 10) : (i += 1) cb.appendToDraft('x');
+    try std.testing.expectEqual(@as(usize, MAX_DRAFT), cb.draft_len);
+}
+
+test "deleteBackFromDraft shrinks by one" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    cb.appendToDraft('h');
+    cb.appendToDraft('i');
+    cb.deleteBackFromDraft();
+    try std.testing.expectEqualStrings("h", cb.getDraft());
+    cb.deleteBackFromDraft();
+    cb.deleteBackFromDraft(); // no-op on empty
+    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
+}
+
+test "deleteWordFromDraft strips trailing word plus spaces" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hello world") |ch| cb.appendToDraft(ch);
+    cb.deleteWordFromDraft();
+    try std.testing.expectEqualStrings("hello", cb.getDraft());
+}
+
+test "clearDraft resets length to zero" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hello") |ch| cb.appendToDraft(ch);
+    cb.clearDraft();
+    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
+    try std.testing.expectEqualStrings("", cb.getDraft());
 }
