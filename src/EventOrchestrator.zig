@@ -228,12 +228,7 @@ pub fn run(self: *EventOrchestrator) !void {
     var running = true;
 
     // Initial render
-    const focused_view = self.getFocusedPane().view;
     self.compositor.composite(self.layout, .{
-        .text = focused_view.getDraft(),
-        .status = "",
-        .agent_running = false,
-        .spinner_frame = 0,
         .fps = 0,
         .mode = self.current_mode,
     });
@@ -368,6 +363,7 @@ fn tick(
 
     if (!frame_dirty) return;
 
+    // TODO: consumed by per-pane prompts in Task 4.
     const focused = self.getFocusedPane();
     const agent_running = focused.runner.isAgentRunning();
     const status = if (self.transient_status_len > 0)
@@ -376,11 +372,8 @@ fn tick(
         const info = focused.runner.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
+    _ = .{ focused, agent_running, status };
     self.compositor.composite(self.layout, .{
-        .text = focused.view.getDraft(),
-        .status = status,
-        .agent_running = agent_running,
-        .spinner_frame = self.spinner_frame,
         .fps = current_fps.*,
         .mode = self.current_mode,
     });
