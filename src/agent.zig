@@ -141,7 +141,11 @@ fn callLlm(
 fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *AgentThread.EventQueue) !void {
     var scratch: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
-    try queue.push(.{ .info = try allocator.dupe(u8, msg) });
+    const duped = try allocator.dupe(u8, msg);
+    // On QueueFull the push returns an error before taking ownership, so we
+    // must free the dup ourselves or the bytes leak.
+    errdefer allocator.free(duped);
+    try queue.push(.{ .info = duped });
 }
 
 /// Extract tool_use blocks from a response into an owned slice.
@@ -239,6 +243,7 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
         const msg = switch (err) {
             error.Cancelled => "error: cancelled",
             error.OutOfMemory => "error: out of memory",
+            error.QueueFull => "error: event queue full",
         };
         ctx.results[ctx.index] = .{ .content = msg, .is_error = true };
         return;
@@ -383,7 +388,9 @@ fn streamEventToQueue(event: llm.StreamEvent) void {
         .done => .done,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
     };
-    q.tryPush(agent_event);
+    // Pass the allocator that produced the duped payload so tryPush can
+    // free on QueueFull. Otherwise we leak the bytes on every drop.
+    q.tryPush(alloc, agent_event);
 }
 
 test {
@@ -532,7 +539,7 @@ test "single tool call runs inline without threading" {
     defer registry.deinit();
     try registry.register(echo_fast_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     var cancel = AgentThread.CancelFlag.init(false);
@@ -564,7 +571,7 @@ test "parallel execution preserves result order" {
     try registry.register(echo_slow_tool);
     try registry.register(echo_fast_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     var cancel = AgentThread.CancelFlag.init(false);
@@ -607,7 +614,7 @@ test "parallel execution is faster than sequential" {
     defer registry.deinit();
     try registry.register(echo_slow_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     var cancel = AgentThread.CancelFlag.init(false);
@@ -643,7 +650,7 @@ test "cancel flag is respected in parallel execution" {
     defer registry.deinit();
     try registry.register(echo_slow_tool);
 
-    var queue = AgentThread.EventQueue.init(allocator);
+    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     // Set cancel before execution

@@ -592,7 +592,9 @@ pub fn submitInput(
     self.last_tool_call = null;
     self.cancel_flag.store(false, .release);
 
-    self.event_queue = AgentThread.EventQueue.init(allocator);
+    // 256 slots is ~1s of fast streaming — enough headroom for a UI frame
+    // stall without hiding persistent backpressure.
+    self.event_queue = try AgentThread.EventQueue.initBounded(allocator, 256);
     self.queue_active = true;
 
     self.agent_thread = AgentThread.spawn(

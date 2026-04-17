@@ -52,73 +52,107 @@ pub const AgentEvent = union(enum) {
         /// Null when correlation is not needed (single tool).
         call_id: ?[]const u8 = null,
     };
+
+    /// Free any heap-allocated bytes owned by this event.
+    /// Call on drop paths (queue full, error recovery) so an event that
+    /// never reaches a consumer does not leak. `.done` and
+    /// `.reset_assistant_text` own nothing.
+    pub fn freeOwned(self: AgentEvent, allocator: Allocator) void {
+        switch (self) {
+            .text_delta => |s| allocator.free(s),
+            .tool_start => |t| {
+                allocator.free(t.name);
+                if (t.call_id) |id| allocator.free(id);
+            },
+            .tool_result => |r| {
+                allocator.free(r.content);
+                if (r.call_id) |id| allocator.free(id);
+            },
+            .info => |s| allocator.free(s),
+            .err => |s| allocator.free(s),
+            .done, .reset_assistant_text => {},
+        }
+    }
 };
 
-/// Thread-safe event queue using a mutex and an ArrayList.
-/// The agent thread pushes events; the main thread drains them.
+/// Thread-safe, fixed-capacity event queue backed by a ring buffer.
+///
+/// Bounded capacity is deliberate: an unbounded queue hides the real issue
+/// (the UI can't keep up) by growing without limit. When the ring is full
+/// `push` returns `error.QueueFull`; `tryPush` converts that into an
+/// increment of `dropped` and frees the event's owned bytes so the drop is
+/// observable and leak-free.
 pub const EventQueue = struct {
-    /// Guards concurrent access to items.
+    /// Guards concurrent access to buffer / head / tail / len.
     mutex: std.Thread.Mutex = .{},
-    /// Backing storage for queued events.
-    items: std.ArrayList(AgentEvent),
-    /// Allocator for the backing list.
+    /// Ring storage for queued events. Length equals the queue's capacity.
+    buffer: []AgentEvent,
+    /// Index of the next event to be drained.
+    head: usize = 0,
+    /// Index where the next pushed event will be written.
+    tail: usize = 0,
+    /// Number of events currently queued. Invariant: 0 <= len <= buffer.len.
+    len: usize = 0,
+    /// Allocator that owns `buffer`.
     allocator: Allocator,
-    /// Count of events that failed to push due to allocation failure.
+    /// Count of events refused because the queue was full.
     /// Surfaced in the UI so a stalled queue never silently diverges from
     /// the agent's actual progress.
     dropped: std.atomic.Value(u64) = .{ .raw = 0 },
 
-    /// Create a new empty event queue.
-    pub fn init(allocator: Allocator) EventQueue {
+    /// Allocate a ring buffer of exactly `capacity` slots. Caller owns the
+    /// returned queue and must call `deinit` to release backing storage.
+    pub fn initBounded(allocator: Allocator, capacity: usize) !EventQueue {
         return .{
-            .items = .empty,
+            .buffer = try allocator.alloc(AgentEvent, capacity),
             .allocator = allocator,
         };
     }
 
     /// Release backing storage. Caller must ensure no concurrent access.
+    /// Does not free bytes owned by still-queued events; drain the queue
+    /// yourself if you care about those.
     pub fn deinit(self: *EventQueue) void {
-        self.items.deinit(self.allocator);
+        self.allocator.free(self.buffer);
     }
 
-    /// Push an event onto the queue. Thread-safe.
-    pub fn push(self: *EventQueue, event: AgentEvent) !void {
+    /// Push an event onto the queue. Returns `error.QueueFull` when the
+    /// ring is at capacity so the caller can free any heap bytes the event
+    /// owns. Thread-safe.
+    pub fn push(self: *EventQueue, event: AgentEvent) error{QueueFull}!void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.items.append(self.allocator, event);
+        if (self.len == self.buffer.len) return error.QueueFull;
+        self.buffer[self.tail] = event;
+        self.tail = (self.tail + 1) % self.buffer.len;
+        self.len += 1;
     }
 
-    /// Best-effort push: bumps `dropped` on failure instead of returning the
-    /// error. Use at call sites that have nowhere useful to propagate the
-    /// error (background threads, streaming callbacks) so the loss is at
-    /// least observable through the counter.
-    pub fn tryPush(self: *EventQueue, event: AgentEvent) void {
+    /// Best-effort push: on `QueueFull`, bump `dropped` and free the
+    /// event's owned bytes using `allocator`. The allocator must be the
+    /// one that produced those bytes; pass the same one every call site
+    /// used to dupe the payload.
+    pub fn tryPush(self: *EventQueue, allocator: Allocator, event: AgentEvent) void {
         self.push(event) catch {
             _ = self.dropped.fetchAdd(1, .monotonic);
+            event.freeOwned(allocator);
         };
     }
 
-    /// Drain up to buf.len events into the provided buffer.
+    /// Drain up to out.len events into the provided buffer.
     /// Returns the number of events copied. Thread-safe.
-    pub fn drain(self: *EventQueue, buf: []AgentEvent) usize {
+    pub fn drain(self: *EventQueue, out: []AgentEvent) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const count = @min(self.items.items.len, buf.len);
-        @memcpy(buf[0..count], self.items.items[0..count]);
-
-        // Remove drained items by shifting remaining to front
-        const remaining = self.items.items.len - count;
-        if (remaining > 0) {
-            std.mem.copyForwards(
-                AgentEvent,
-                self.items.items[0..remaining],
-                self.items.items[count..self.items.items.len],
-            );
+        const n = @min(self.len, out.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            out[i] = self.buffer[self.head];
+            self.head = (self.head + 1) % self.buffer.len;
         }
-        self.items.items.len = remaining;
-
-        return count;
+        self.len -= n;
+        return n;
     }
 };
 
@@ -164,10 +198,19 @@ fn threadMain(
 ) void {
     if (lua_engine) |eng| eng.activate();
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel) catch |err| {
-        const duped_err = allocator.dupe(u8, @errorName(err)) catch "unknown error";
-        queue.tryPush(.{ .err = duped_err });
+        // Must dup because the event sits in the queue until drained and
+        // @errorName points into .rodata which is safe but tryPush wants a
+        // single ownership rule: all `.err` payloads are caller-owned.
+        const duped_err = allocator.dupe(u8, @errorName(err)) catch {
+            // Dup itself failed — record it as a drop and move on.
+            _ = queue.dropped.fetchAdd(1, .monotonic);
+            queue.tryPush(allocator, .done);
+            return;
+        };
+        queue.tryPush(allocator, .{ .err = duped_err });
     };
-    queue.tryPush(.done);
+    // `.done` owns no bytes; allocator is only used if the ring is full.
+    queue.tryPush(allocator, .done);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -177,7 +220,7 @@ test {
 }
 
 test "push and drain events" {
-    var queue = EventQueue.init(std.testing.allocator);
+    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
     defer queue.deinit();
 
     try queue.push(.{ .text_delta = "hello" });
@@ -191,7 +234,7 @@ test "push and drain events" {
 }
 
 test "drain empty queue returns zero" {
-    var queue = EventQueue.init(std.testing.allocator);
+    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
     defer queue.deinit();
 
     var buf: [8]AgentEvent = undefined;
@@ -200,7 +243,7 @@ test "drain empty queue returns zero" {
 }
 
 test "push multiple drain all" {
-    var queue = EventQueue.init(std.testing.allocator);
+    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
     defer queue.deinit();
 
     try queue.push(.{ .text_delta = "a" });
@@ -225,7 +268,7 @@ test "push multiple drain all" {
 }
 
 test "drain clears queue" {
-    var queue = EventQueue.init(std.testing.allocator);
+    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
     defer queue.deinit();
 
     try queue.push(.{ .text_delta = "first" });
@@ -239,7 +282,7 @@ test "drain clears queue" {
 }
 
 test "drain with small buffer returns partial" {
-    var queue = EventQueue.init(std.testing.allocator);
+    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
     defer queue.deinit();
 
     try queue.push(.{ .text_delta = "a" });
@@ -259,16 +302,31 @@ test "drain with small buffer returns partial" {
     try std.testing.expectEqualStrings("c", buf[0].text_delta);
 }
 
-test "EventQueue.tryPush increments dropped on allocation failure" {
-    // Force every allocation to fail so push() returns OutOfMemory and the
-    // counter observes the drop instead of the caller swallowing it.
-    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var queue = EventQueue.init(fa.allocator());
+test "EventQueue bounded: pushes beyond capacity go to dropped" {
+    // Capacity 4 — fill it, then the next push must be refused with QueueFull
+    // so the counter ticks and the UI can render a "dropped N" indicator.
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 4);
     defer queue.deinit();
+    defer {
+        // Drain remaining events and free their payloads so the leak detector
+        // stays quiet. Mirrors what a real consumer would do.
+        var buf: [8]AgentEvent = undefined;
+        while (true) {
+            const n = queue.drain(&buf);
+            if (n == 0) break;
+            for (buf[0..n]) |ev| ev.freeOwned(alloc);
+        }
+    }
 
-    queue.tryPush(.{ .info = "x" });
+    for (0..4) |_| {
+        const owned = try alloc.dupe(u8, "x");
+        errdefer alloc.free(owned);
+        try queue.push(.{ .info = owned });
+    }
+    // 5th push must drop. The dup is allocated so freeOwned can reclaim it;
+    // otherwise the leak detector would catch the leak the task is about.
+    const overflow = try alloc.dupe(u8, "x");
+    queue.tryPush(alloc, .{ .info = overflow });
     try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
-
-    queue.tryPush(.done);
-    try std.testing.expectEqual(@as(u64, 2), queue.dropped.load(.acquire));
 }
