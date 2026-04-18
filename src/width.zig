@@ -64,9 +64,9 @@ test "emoji skin-tone modifiers are width 2" {
     try testing.expectEqual(@as(u2, 2), codepointWidth(0x1F3FF));
 }
 
-test "regional indicator symbol letters pin current behaviour" {
-    // TODO: regional indicators form flags as pairs; a proper implementation
-    // reports width 2 for a grouped pair and width 1 (or 0) for singletons.
+test "regional indicator singleton codepointWidth is 1" {
+    // Regional indicators are width 1 on their own. Flag pairs are handled
+    // in nextCluster; see "nextCluster: flag pair is one cluster of width 2".
     try testing.expectEqual(@as(u2, 1), codepointWidth(0x1F1E6));
 }
 
