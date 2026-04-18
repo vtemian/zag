@@ -203,9 +203,9 @@ pub fn writeStrWrapped(
     var col = start_col;
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
-    while (iter.nextCodepoint()) |cp| {
+    while (width_mod.nextCluster(&iter)) |cluster| {
         if (row >= max_row) break;
-        const w = width_mod.codepointWidth(cp);
+        const w = cluster.width;
         if (w == 0) continue;
         if (col + w > max_col) {
             row += 1;
@@ -214,7 +214,7 @@ pub fn writeStrWrapped(
             if (col + w > max_col) break; // still won't fit - give up
         }
         const cell = self.getCell(row, col);
-        cell.codepoint = cp;
+        cell.codepoint = cluster.base;
         cell.style = style;
         cell.fg = fg;
         cell.continuation = false;
@@ -1285,19 +1285,19 @@ test "writeStr: combining mark fuses into preceding letter without extra cell" {
 }
 
 test "writeStrWrapped: ZWJ emoji respects cluster width at wrap boundary" {
-    var screen = try Screen.init(testing.allocator, 3, 3);
+    var screen = try Screen.init(testing.allocator, 2, 3);
     defer screen.deinit();
 
-    // 3-col wide screen. Write "a👨‍👩‍👧b":
-    //   'a' at (0,0) w=1
-    //   family emoji w=2 would overflow (col 1 + 2 > 3) → wraps to row 1
-    //   'b' at row 1 col 2 (after emoji at cols 0-1)
-    const pos = screen.writeStrWrapped(0, 0, 3, 3, "a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}b", .{}, .default);
-    try testing.expectEqual(@as(u16, 1), pos.row);
-    try testing.expectEqual(@as(u16, 3), pos.col);
+    // 2-col wide screen. Write "a👨‍👩‍👧b":
+    //   'a' at (0,0) w=1, col=1
+    //   family cluster w=2 overflows (1+2>2): wrap to row 1; cluster at (1,0)-(1,1), col=2
+    //   'b' w=1 overflows (2+1>2): wrap to row 2; 'b' at (2,0), col=1
+    const pos = screen.writeStrWrapped(0, 0, 3, 2, "a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}b", .{}, .default);
+    try testing.expectEqual(@as(u16, 2), pos.row);
+    try testing.expectEqual(@as(u16, 1), pos.col);
 
     try testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 0).codepoint);
     try testing.expectEqual(@as(u21, 0x1F468), screen.getCellConst(1, 0).codepoint);
     try testing.expect(screen.getCellConst(1, 1).continuation);
-    try testing.expectEqual(@as(u21, 'b'), screen.getCellConst(1, 2).codepoint);
+    try testing.expectEqual(@as(u21, 'b'), screen.getCellConst(2, 0).codepoint);
 }
