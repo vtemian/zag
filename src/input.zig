@@ -105,6 +105,104 @@ pub const ParseResult = union(enum) {
     skip: struct { consumed: usize },
 };
 
+/// Maximum bytes the Parser will buffer while waiting for an escape
+/// sequence to complete. 128 is twice the max single-read size and
+/// leaves generous headroom — CSI sequences in the wild top out at
+/// ~20 bytes.
+const PARSER_BUF_SIZE = 128;
+
+/// Stateful input parser that buffers partial escape sequences across
+/// multiple reads and applies a timeout to disambiguate bare-Escape
+/// from an unfinished CSI/SS3 prefix.
+///
+/// Typical usage:
+///
+///     var parser: input.Parser = .{};
+///     while (running) {
+///         const now = std.time.milliTimestamp();
+///         if (parser.pollOnce(stdin_fd, now)) |event| {
+///             // dispatch event
+///         }
+///     }
+pub const Parser = struct {
+    pending: [PARSER_BUF_SIZE]u8 = undefined,
+    pending_len: usize = 0,
+
+    /// Monotonic millisecond timestamp of the first byte currently
+    /// sitting in `pending`. Reset whenever `pending_len` goes from 0
+    /// to nonzero. Only meaningful while `pending_len > 0`.
+    pending_since_ms: i64 = 0,
+
+    /// How long a partial escape may sit in `pending` before we flush
+    /// the leading byte as bare-Escape. 50 ms is the xterm/iTerm
+    /// convention.
+    escape_timeout_ms: i64 = 50,
+
+    /// Append bytes to the pending buffer. On overflow (a pathological
+    /// terminal flooding a single sequence past PARSER_BUF_SIZE), the
+    /// pending buffer is reset to a clean state and the incoming bytes
+    /// start a fresh accumulation. Losing a single malformed sequence
+    /// is the right failure mode: the next readable byte resyncs the
+    /// parser, whereas silent truncation would wedge the UI on an
+    /// incomplete event that never completes.
+    pub fn feedBytes(self: *Parser, bytes: []const u8, now_ms: i64) void {
+        if (bytes.len == 0) return;
+        if (self.pending_len + bytes.len > self.pending.len) {
+            log.warn("pending buffer overflow ({d} + {d} > {d}), resetting parser state", .{
+                self.pending_len, bytes.len, self.pending.len,
+            });
+            self.pending_len = 0;
+        }
+        if (self.pending_len == 0) self.pending_since_ms = now_ms;
+        const room = self.pending.len - self.pending_len;
+        const take = @min(room, bytes.len);
+        @memcpy(self.pending[self.pending_len..][0..take], bytes[0..take]);
+        self.pending_len += take;
+    }
+
+    /// Try to produce one event from the pending buffer. Returns null
+    /// if the buffer is empty, or if it starts with an incomplete
+    /// escape sequence that hasn't timed out yet.
+    pub fn nextEvent(self: *Parser, now_ms: i64) ?Event {
+        while (true) {
+            if (self.pending_len == 0) return null;
+            const slice = self.pending[0..self.pending_len];
+            switch (nextEventInBuf(slice)) {
+                .ok => |o| {
+                    self.consume(o.consumed, now_ms);
+                    return o.event;
+                },
+                .skip => |s| {
+                    self.consume(s.consumed, now_ms);
+                    // Loop to try the next byte.
+                },
+                .incomplete => {
+                    if (slice[0] == 0x1b and now_ms - self.pending_since_ms >= self.escape_timeout_ms) {
+                        // Timeout: flush the leading ESC as bare Escape.
+                        self.consume(1, now_ms);
+                        return Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } };
+                    }
+                    return null;
+                },
+            }
+        }
+    }
+
+    /// Shift `n` bytes off the front of the pending buffer. If the
+    /// buffer is now non-empty, `pending_since_ms` advances to `now_ms`
+    /// so subsequent incomplete checks measure from the new head.
+    fn consume(self: *Parser, n: usize, now_ms: i64) void {
+        if (n >= self.pending_len) {
+            self.pending_len = 0;
+            return;
+        }
+        const tail = self.pending_len - n;
+        std.mem.copyForwards(u8, self.pending[0..tail], self.pending[n..self.pending_len]);
+        self.pending_len = tail;
+        self.pending_since_ms = now_ms;
+    }
+};
+
 /// Maximum bytes we read in a single poll, enough for any escape sequence.
 const READ_BUF_SIZE = 64;
 
@@ -1019,4 +1117,91 @@ test "nextEventInBuf: ESC + '[' + arrow across fragmented calls still works when
     try std.testing.expect(r == .ok);
     try std.testing.expectEqual(@as(usize, 6), r.ok.consumed);
     // 'X' tail is untouched and becomes the next event.
+}
+
+test "Parser: single complete event feedBytes then nextEvent" {
+    var p: Parser = .{};
+    p.feedBytes(&.{'A'}, 0);
+    const ev = p.nextEvent(0).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(p.nextEvent(0) == null);
+}
+
+test "Parser: fragmented CSI Ctrl+Up assembles across two feedBytes calls" {
+    var p: Parser = .{};
+    // First fragment: ESC [
+    p.feedBytes(&.{ 0x1b, '[' }, 0);
+    try std.testing.expect(p.nextEvent(0) == null); // incomplete, no timeout yet
+
+    // Second fragment: 1 ; 5 A — completes the sequence
+    p.feedBytes(&.{ '1', ';', '5', 'A' }, 1);
+    const ev = p.nextEvent(1).?;
+    switch (ev) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.up, k.key);
+            try std.testing.expectEqual(true, k.modifiers.ctrl);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: fragmented SS3 arrow assembles across two feedBytes calls" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, 'O' }, 0);
+    try std.testing.expect(p.nextEvent(0) == null);
+    p.feedBytes(&.{'A'}, 1);
+    const ev = p.nextEvent(1).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key.up, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: two events back-to-back drain in order" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 'A', 'B' }, 0);
+    try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, p.nextEvent(0).?.key.key);
+    try std.testing.expectEqual(KeyEvent.Key{ .char = 'B' }, p.nextEvent(0).?.key.key);
+    try std.testing.expect(p.nextEvent(0) == null);
+}
+
+test "Parser: garbage byte skipped, event after it still parses" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0xFF, 'A' }, 0);
+    const ev = p.nextEvent(0).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: overflow resets pending then buffers new bytes fresh" {
+    // Pathological endpoint: flood beyond PARSER_BUF_SIZE. The pending
+    // buffer resets on overflow so the next readable byte can resync.
+    var p: Parser = .{};
+    var junk: [PARSER_BUF_SIZE]u8 = undefined;
+    @memset(&junk, '0');
+    p.feedBytes(&junk, 0);
+    try std.testing.expectEqual(@as(usize, PARSER_BUF_SIZE), p.pending_len);
+
+    // Feeding one more byte must reset, not silently drop.
+    p.feedBytes(&.{'A'}, 1);
+    try std.testing.expectEqual(@as(usize, 1), p.pending_len);
+    const ev = p.nextEvent(1).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: bare-ESC from a single byte without timeout returns null" {
+    // With now_ms equal to pending_since_ms (0ms elapsed), we must not
+    // emit bare-ESC yet. Only Task 4's timeout path produces it.
+    var p: Parser = .{};
+    p.feedBytes(&.{0x1b}, 10);
+    try std.testing.expect(p.nextEvent(10) == null);
+    try std.testing.expect(p.nextEvent(59) == null); // under the 50ms deadline
 }
