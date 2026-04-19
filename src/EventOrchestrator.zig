@@ -52,6 +52,9 @@ const CommandResult = enum { handled, quit, not_a_command };
 pub const Pane = WindowManager.Pane;
 /// Re-exported from WindowManager: pane + persistence handle tuple.
 pub const PaneEntry = WindowManager.PaneEntry;
+/// Re-exported from WindowManager so main.zig can call it as
+/// `EventOrchestrator.restorePane` without reaching into the sub-module.
+pub const restorePane = WindowManager.restorePane;
 
 // -- Fields ------------------------------------------------------------------
 
@@ -253,7 +256,7 @@ fn tick(
     // Check for terminal resize (SIGWINCH)
     const resized = self.terminal.checkResize();
     if (resized) |new_size| {
-        try self.handleResize(new_size.cols, new_size.rows);
+        try self.window_manager.handleResize(new_size.cols, new_size.rows);
     }
 
     // Start frame timing (only for frames that do real work)
@@ -293,7 +296,7 @@ fn tick(
         if (event == .resize) {
             const sz = event.resize;
             self.terminal.size = .{ .rows = sz.rows, .cols = sz.cols };
-            try self.handleResize(sz.cols, sz.rows);
+            try self.window_manager.handleResize(sz.cols, sz.rows);
         } else {
             const action = switch (event) {
                 .key => |k| self.handleKey(k),
@@ -325,7 +328,7 @@ fn tick(
 
     if (!frame_dirty) return;
 
-    const focused = self.getFocusedPane();
+    const focused = self.window_manager.getFocusedPane();
     const agent_running = focused.runner.isAgentRunning();
     const status = if (self.window_manager.transient_status_len > 0)
         self.window_manager.transient_status[0..self.window_manager.transient_status_len]
@@ -369,7 +372,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         switch (k.key) {
             .char => |ch| {
                 if (ch == 'c') {
-                    const focused = self.getFocusedPane();
+                    const focused = self.window_manager.getFocusedPane();
                     if (focused.runner.isAgentRunning()) {
                         focused.runner.cancelAgent();
                         return .none;
@@ -380,7 +383,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 // in insert mode. Normal mode falls through to the
                 // keymap registry (or ignored).
                 if (ch == 'w' and self.window_manager.current_mode == .insert) {
-                    const v = self.getFocusedPane().view;
+                    const v = self.window_manager.getFocusedPane().view;
                     v.deleteWordFromDraft();
                     return .redraw;
                 }
@@ -391,7 +394,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 
     // Keymap dispatch: run the bound action if any.
     if (self.window_manager.keymap_registry.lookup(self.window_manager.current_mode, k)) |action| {
-        self.executeAction(action);
+        self.window_manager.executeAction(action);
         return .redraw;
     }
 
@@ -400,7 +403,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 
     // Insert mode: regular input-line editing. Route all edits into the
     // focused pane's draft so focus-switching preserves per-pane text.
-    const draft_view = self.getFocusedPane().view;
+    const draft_view = self.window_manager.getFocusedPane().view;
     switch (k.key) {
         .enter => {
             if (draft_view.draft_len == 0) return .none;
@@ -414,7 +417,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                     return .redraw;
                 },
                 .not_a_command => {
-                    const focused = self.getFocusedPane();
+                    const focused = self.window_manager.getFocusedPane();
                     if (focused.runner.isAgentRunning()) return .none;
 
                     self.onUserInputSubmitted(focused, user_input) catch |err| {
@@ -451,53 +454,6 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         else => {},
     }
     return .redraw;
-}
-
-/// Run a keymap-bound Action. Mutating mode, layout, or compositor state
-/// lives here exclusively so handleKey stays a pure dispatcher.
-fn executeAction(self: *EventOrchestrator, action: Keymap.Action) void {
-    switch (action) {
-        .focus_left => self.doFocus(.left),
-        .focus_down => self.doFocus(.down),
-        .focus_up => self.doFocus(.up),
-        .focus_right => self.doFocus(.right),
-        .split_vertical => self.doSplit(.vertical),
-        .split_horizontal => self.doSplit(.horizontal),
-        .close_window => {
-            self.window_manager.layout.closeWindow();
-            self.window_manager.layout.recalculate(self.screen.width, self.screen.height);
-            self.window_manager.compositor.layout_dirty = true;
-        },
-        .enter_insert_mode => self.window_manager.current_mode = .insert,
-        .enter_normal_mode => self.window_manager.current_mode = .normal,
-    }
-}
-
-/// Shift focus to the neighbouring pane and mark the compositor dirty so
-/// the focused / unfocused frame styling repaints.
-fn doFocus(self: *EventOrchestrator, dir: Layout.FocusDirection) void {
-    self.window_manager.layout.focusDirection(dir);
-    self.window_manager.compositor.layout_dirty = true;
-}
-
-/// Compute the mode the system should be in after `event` is processed,
-/// given the current mode and the keymap registry. Returns the same mode
-/// if no transition applies.
-///
-/// Pure function (no side effects). Mirrors the mode-state branch of
-/// `executeAction` so tests can verify mode transitions without having
-/// to stand up a full orchestrator.
-fn modeAfterKey(
-    mode: Keymap.Mode,
-    event: input.KeyEvent,
-    registry: *const Keymap.Registry,
-) Keymap.Mode {
-    const action = registry.lookup(mode, event) orelse return mode;
-    return switch (action) {
-        .enter_insert_mode => .insert,
-        .enter_normal_mode => .normal,
-        else => mode,
-    };
 }
 
 /// Try to handle input as a slash command. Returns .not_a_command if it isn't one.
@@ -578,117 +534,6 @@ fn dumpTraceFile(self: *EventOrchestrator) void {
     var scratch: [256]u8 = undefined;
     const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
     self.appendStatus(dump_msg);
-}
-
-// -- Window management -------------------------------------------------------
-
-/// Resize screen and layout.
-fn handleResize(self: *EventOrchestrator, cols: u16, rows: u16) !void {
-    try self.screen.resize(cols, rows);
-    self.window_manager.layout.recalculate(cols, rows);
-    self.window_manager.compositor.layout_dirty = true;
-}
-
-/// Split the focused window, creating a new pane with its own session.
-fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
-    // Capture the label that createSplitPane is about to consume so the
-    // announce below matches the new pane's name.
-    const scratch_id = self.window_manager.next_scratch_id;
-    const pane = self.createSplitPane() catch |err| {
-        log.warn("split pane creation failed: {}", .{err});
-        return;
-    };
-    const b = pane.view.buf();
-    const split = switch (direction) {
-        .vertical => self.window_manager.layout.splitVertical(0.5, b),
-        .horizontal => self.window_manager.layout.splitHorizontal(0.5, b),
-    };
-    split catch |err| {
-        log.warn("split failed: {}", .{err});
-        return;
-    };
-    self.window_manager.layout.recalculate(self.screen.width, self.screen.height);
-    self.window_manager.compositor.layout_dirty = true;
-
-    // The new pane is ready to be typed into. Drop back to insert mode so
-    // the user can start a conversation without an extra `i` keystroke,
-    // even if the split was triggered from normal mode.
-    self.window_manager.current_mode = modeAfterSplit();
-
-    // Transient announce; cleared on the next key event.
-    self.window_manager.transient_status_len = formatSplitAnnounce(&self.window_manager.transient_status, scratch_id);
-}
-
-/// A freshly created pane is almost always going to be typed into, so we
-/// land in insert mode regardless of the caller's previous mode. Encoded
-/// as a pure function so the rule stays in one place and is testable
-/// without constructing a full orchestrator.
-fn modeAfterSplit() Keymap.Mode {
-    return .insert;
-}
-
-/// Format the `split -> scratch N` one-shot announce into `dest`.
-/// Returns the byte length written, or 0 if `dest` can't fit the message.
-fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
-    const written = std.fmt.bufPrint(dest, "split \u{2192} scratch {d}", .{scratch_id}) catch {
-        return 0;
-    };
-    return @intCast(written.len);
-}
-
-/// Create a new split pane: session + view + runner + optional persistence
-/// handle, tracked for cleanup. Returns the freshly composed `Pane`.
-fn createSplitPane(self: *EventOrchestrator) !Pane {
-    const cs = try self.allocator.create(ConversationSession);
-    errdefer self.allocator.destroy(cs);
-    cs.* = ConversationSession.init(self.allocator);
-    errdefer cs.deinit();
-
-    var name_scratch: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.window_manager.next_scratch_id}) catch "scratch";
-
-    const cb = try self.allocator.create(ConversationBuffer);
-    errdefer self.allocator.destroy(cb);
-    cb.* = try ConversationBuffer.init(self.allocator, self.window_manager.next_buffer_id, name);
-    errdefer cb.deinit();
-
-    const runner = try self.allocator.create(AgentRunner);
-    errdefer self.allocator.destroy(runner);
-    runner.* = AgentRunner.init(self.allocator, cb, cs);
-    errdefer runner.deinit();
-
-    // Wake pipe so agent events on this pane interrupt the orchestrator's
-    // poll(). Lua engine pointer so main-thread drain can service hook and
-    // tool round-trips. Both inherit from the orchestrator's config.
-    runner.wake_fd = self.wake_write_fd;
-    runner.lua_engine = self.lua_engine;
-
-    self.window_manager.next_buffer_id += 1;
-    self.window_manager.next_scratch_id += 1;
-
-    const pane: Pane = .{ .view = cb, .session = cs, .runner = runner };
-
-    // Register the entry before attaching the session handle so any
-    // subsequent `paneFromBuffer` call already sees this pane.
-    try self.window_manager.extra_panes.append(self.allocator, .{ .pane = pane });
-
-    const sh = self.attachSession(pane);
-    self.window_manager.extra_panes.items[self.window_manager.extra_panes.items.len - 1].session_handle = sh;
-
-    return pane;
-}
-
-/// Try to create and attach a session to a pane. Returns the handle or null.
-fn attachSession(self: *EventOrchestrator, pane: Pane) ?*Session.SessionHandle {
-    const mgr = &(self.session_mgr.* orelse return null);
-    const h = self.allocator.create(Session.SessionHandle) catch return null;
-    h.* = mgr.createSession(self.provider.model_id) catch |err| {
-        log.warn("session creation failed for split: {}", .{err});
-        self.allocator.destroy(h);
-        return null;
-    };
-    pane.session.attachSession(h);
-    return h;
 }
 
 // -- Helpers -----------------------------------------------------------------
@@ -809,25 +654,6 @@ fn generateSessionName(
     return error.NoResponseText;
 }
 
-/// Get the focused pane. Falls back to the root pane when the layout has
-/// no focused leaf or the focused leaf's buffer is not owned by any pane
-/// (should not happen in practice; the fallback keeps UI code total).
-fn getFocusedPane(self: *EventOrchestrator) Pane {
-    const leaf = self.window_manager.layout.getFocusedLeaf() orelse return self.window_manager.root_pane;
-    return self.paneFromBuffer(leaf.buffer) orelse self.window_manager.root_pane;
-}
-
-/// Look up the pane whose view backs `b`. Returns null if no registered
-/// pane matches, which Compositor and any other reader should treat as a
-/// soft failure rather than a crash.
-pub fn paneFromBuffer(self: *EventOrchestrator, b: Buffer) ?Pane {
-    if (self.window_manager.root_pane.view.buf().ptr == b.ptr) return self.window_manager.root_pane;
-    for (self.window_manager.extra_panes.items) |entry| {
-        if (entry.pane.view.buf().ptr == b.ptr) return entry.pane;
-    }
-    return null;
-}
-
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
 /// so the error-return path from run() cannot skip it.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
@@ -841,95 +667,12 @@ pub fn shutdownAgents(self: *EventOrchestrator) void {
     self.supervisor.shutdownAll(runners.items);
 }
 
-/// Restore a pane from an on-disk session: rebuilds both the view tree
-/// and the LLM message history, attaches the session handle, and copies
-/// the stored session name (if any) back onto the view. Replaces the old
-/// `ConversationBuffer.restoreFromSession` coordinator now that the view
-/// no longer holds a session reference.
-pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Allocator) !void {
-    const session_id = handle.id[0..handle.id_len];
-    const entries = try Session.loadEntries(session_id, allocator);
-    defer {
-        for (entries) |entry| Session.freeEntry(entry, allocator);
-        allocator.free(entries);
-    }
-
-    try pane.view.loadFromEntries(entries);
-    try pane.session.rebuildMessages(entries, allocator);
-    pane.session.attachSession(handle);
-
-    if (handle.meta.name_len > 0) {
-        allocator.free(pane.view.name);
-        pane.view.name = try allocator.dupe(u8, handle.meta.nameSlice());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 test {
     @import("std").testing.refAllDecls(@This());
-}
-
-test "formatSplitAnnounce writes the standard announce for id 1" {
-    var buf: [64]u8 = undefined;
-    const len = formatSplitAnnounce(&buf, 1);
-    try std.testing.expectEqualStrings("split \u{2192} scratch 1", buf[0..len]);
-}
-
-test "formatSplitAnnounce handles three-digit ids" {
-    var buf: [64]u8 = undefined;
-    const len = formatSplitAnnounce(&buf, 999);
-    try std.testing.expectEqualStrings("split \u{2192} scratch 999", buf[0..len]);
-}
-
-test "formatSplitAnnounce returns zero when destination is too small" {
-    var buf: [4]u8 = undefined;
-    try std.testing.expectEqual(@as(u8, 0), formatSplitAnnounce(&buf, 1));
-}
-
-test "modeAfterSplit always returns insert" {
-    // The rule is unconditional; document it in a test so the intent
-    // survives refactors. If you want a different default after split,
-    // this is the test that should force the conversation.
-    try std.testing.expectEqual(Keymap.Mode.insert, modeAfterSplit());
-}
-
-test "modeAfterKey: Esc transitions insert -> normal" {
-    var registry = Keymap.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    try registry.loadDefaults();
-
-    const after = modeAfterKey(.insert, .{ .key = .escape, .modifiers = .{} }, &registry);
-    try std.testing.expectEqual(Keymap.Mode.normal, after);
-}
-
-test "modeAfterKey: i transitions normal -> insert" {
-    var registry = Keymap.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    try registry.loadDefaults();
-
-    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }, &registry);
-    try std.testing.expectEqual(Keymap.Mode.insert, after);
-}
-
-test "modeAfterKey: unbound key preserves mode" {
-    var registry = Keymap.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    try registry.loadDefaults();
-
-    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'z' }, .modifiers = .{} }, &registry);
-    try std.testing.expectEqual(Keymap.Mode.normal, after);
-}
-
-test "modeAfterKey: non-mode action (focus_left) keeps mode" {
-    var registry = Keymap.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    try registry.loadDefaults();
-
-    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }, &registry);
-    try std.testing.expectEqual(Keymap.Mode.normal, after);
 }
 
 test "drainWakePipe consumes all pending bytes" {
@@ -958,100 +701,4 @@ test "drainWakePipe on empty pipe returns without blocking" {
     // Pipe is empty; the function must bail on the first WouldBlock rather
     // than hang. If this test ever times out, drainWakePipe is blocking.
     drainWakePipe(fds[0]);
-}
-
-test "Pane composes view + session + runner" {
-    const allocator = std.testing.allocator;
-
-    const session = try allocator.create(ConversationSession);
-    session.* = ConversationSession.init(allocator);
-    defer {
-        session.deinit();
-        allocator.destroy(session);
-    }
-
-    const view = try allocator.create(ConversationBuffer);
-    view.* = try ConversationBuffer.init(allocator, 0, "pane-test");
-    defer {
-        view.deinit();
-        allocator.destroy(view);
-    }
-
-    const runner = try allocator.create(AgentRunner);
-    runner.* = AgentRunner.init(allocator, view, session);
-    defer {
-        runner.deinit();
-        allocator.destroy(runner);
-    }
-
-    const pane: Pane = .{ .view = view, .session = session, .runner = runner };
-
-    // All three objects are reachable through the Pane. Runner sees the
-    // same view pointer; view sees its own name.
-    try std.testing.expectEqual(view, pane.view);
-    try std.testing.expectEqual(session, pane.session);
-    try std.testing.expectEqual(runner, pane.runner);
-    try std.testing.expectEqual(view, pane.runner.view);
-    try std.testing.expectEqual(session, pane.runner.session);
-    try std.testing.expectEqualStrings("pane-test", pane.view.name);
-}
-
-test "restorePane rebuilds both tree and messages" {
-    const allocator = std.testing.allocator;
-
-    // The session lives under .zag/sessions (cwd-relative). We synthesize a
-    // deterministic id, write a small JSONL file ourselves, and build a
-    // SessionHandle struct pointing at it. Writing the file directly (rather
-    // than via SessionHandle.appendEntry in a loop) sidesteps a known
-    // quirk of std.fs.File positional writers: each freshly-created writer
-    // starts at pos 0, so a single writer loop is the reliable pattern.
-    std.fs.cwd().makePath(".zag/sessions") catch {};
-
-    const session_id = "restore_test_0123456789abcdef01";
-
-    var jsonl_path_buf: [256]u8 = undefined;
-    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
-
-    defer {
-        std.fs.cwd().deleteFile(jsonl_path) catch {};
-    }
-
-    // Write two entries using a single writer so positional offsets advance.
-    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
-    {
-        var write_scratch: [512]u8 = undefined;
-        var fw = file.writer(&write_scratch);
-        try fw.interface.writeAll("{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":0}\n");
-        try fw.interface.writeAll("{\"type\":\"assistant_text\",\"content\":\"hello\",\"ts\":1}\n");
-        try fw.interface.flush();
-    }
-
-    // Build a minimal SessionHandle pointing at the file we just wrote.
-    // restorePane only reads id/id_len and meta.name_len/nameSlice.
-    var handle = Session.SessionHandle{
-        .id_len = @intCast(session_id.len),
-        .file = file,
-        .meta = .{},
-        .allocator = allocator,
-    };
-    @memcpy(handle.id[0..session_id.len], session_id);
-    defer handle.close();
-
-    var scb = ConversationSession.init(allocator);
-    defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "restored");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
-    defer runner.deinit();
-
-    const pane: Pane = .{ .view = &cb, .session = &scb, .runner = &runner };
-    try restorePane(pane, &handle, allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[0].node_type);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, cb.root_children.items[1].node_type);
-    try std.testing.expectEqual(@as(usize, 2), scb.messages.items.len);
-    try std.testing.expectEqual(types.Role.user, scb.messages.items[0].role);
-    try std.testing.expectEqual(types.Role.assistant, scb.messages.items[1].role);
-    try std.testing.expect(scb.session_handle != null);
 }

@@ -511,7 +511,7 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
     // lookup; degrades silently when the Compositor is driven without an
     // orchestrator (e.g. in unit tests).
     if (self.orchestrator) |orch| {
-        if (orch.paneFromBuffer(leaf.buffer)) |pane| {
+        if (orch.window_manager.paneFromBuffer(leaf.buffer)) |pane| {
             const dropped = pane.runner.droppedEventCount();
             if (dropped > 0) {
                 var drops_scratch: [32]u8 = undefined;
