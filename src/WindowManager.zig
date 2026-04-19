@@ -397,6 +397,76 @@ fn dumpTraceFile(self: *WindowManager) void {
     self.appendStatus(dump_msg);
 }
 
+/// Drain a pane's agent events and auto-name its session on first completion.
+/// Hook dispatch is the coordinator's responsibility (see AgentSupervisor.drainHooks).
+pub fn drainPane(self: *WindowManager, pane: Pane) void {
+    if (pane.runner.drainEvents(self.allocator)) {
+        self.autoNameSession(pane);
+    }
+}
+
+/// If `pane` has a session without a name and enough conversation to summarize,
+/// ask the provider for a 3-5 word title and rename the session.
+/// Best-effort: any failure is logged and swallowed.
+fn autoNameSession(self: *WindowManager, pane: Pane) void {
+    const sh = pane.session.session_handle orelse return;
+    if (sh.meta.name_len > 0) return;
+
+    const inputs = pane.session.sessionSummaryInputs() orelse return;
+
+    const summary = self.generateSessionName(inputs) catch |err| {
+        log.debug("auto-name failed: {}", .{err});
+        return;
+    };
+    defer self.allocator.free(summary);
+
+    sh.rename(summary) catch |err| {
+        log.warn("session rename failed: {}", .{err});
+    };
+}
+
+/// Send a minimal LLM request to summarize the first exchange in 3-5 words.
+fn generateSessionName(
+    self: *WindowManager,
+    inputs: ConversationSession.SessionSummaryInputs,
+) ![]const u8 {
+    const allocator = self.allocator;
+
+    const user_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(user_content);
+    user_content[0] = .{ .text = .{ .text = inputs.user_text } };
+
+    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(assistant_content);
+    assistant_content[0] = .{ .text = .{ .text = inputs.assistant_text } };
+
+    var summary_msgs = [_]types.Message{
+        .{ .role = .user, .content = user_content },
+        .{ .role = .assistant, .content = assistant_content },
+    };
+
+    const req = llm.Request{
+        .system_prompt = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
+        .messages = &summary_msgs,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const response = try self.provider.provider.call(&req);
+    defer response.deinit(allocator);
+
+    allocator.free(user_content);
+    allocator.free(assistant_content);
+
+    for (response.content) |block| {
+        switch (block) {
+            .text => |t| return try allocator.dupe(u8, t.text),
+            else => {},
+        }
+    }
+
+    return error.NoResponseText;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
