@@ -725,6 +725,10 @@ pub const StreamingResponse = struct {
             const line = maybe_line orelse {
                 // End of stream: return a final event if data accumulated
                 if (event_data.items.len > 0) {
+                    if (!std.unicode.utf8ValidateSlice(event_data.items)) {
+                        log.warn("SSE event contains invalid UTF-8 ({d} bytes) at stream end; skipping", .{event_data.items.len});
+                        return null;
+                    }
                     return SseEvent{
                         .event_type = event_buf[0..event_len],
                         .data = event_data.items,
@@ -736,6 +740,19 @@ pub const StreamingResponse = struct {
             if (line.len == 0) {
                 // Blank line: dispatch event if we have data
                 if (event_data.items.len > 0) {
+                    // Validate UTF-8 at the event boundary before the
+                    // provider layer hands event_data to std.json. A
+                    // truncated codepoint from a misbehaving endpoint
+                    // would otherwise reach the JSON parser as an
+                    // opaque syntax error that providers catch-and-
+                    // continue without logging. Log, drop the event,
+                    // keep the stream going.
+                    if (!std.unicode.utf8ValidateSlice(event_data.items)) {
+                        log.warn("SSE event contains invalid UTF-8 ({d} bytes); skipping", .{event_data.items.len});
+                        event_data.clearRetainingCapacity();
+                        event_len = 0;
+                        continue;
+                    }
                     return SseEvent{
                         .event_type = event_buf[0..event_len],
                         .data = event_data.items,
@@ -1276,6 +1293,42 @@ test "nextSseEvent caps event_data at MAX_SSE_EVENT_DATA" {
         error.SseEventDataTooLarge,
         sr.nextSseEvent(&cancel, &event_buf, &event_data),
     );
+}
+
+test "nextSseEvent skips event with invalid UTF-8 in data" {
+    const allocator = std.testing.allocator;
+
+    // First event contains a truncated UTF-8 lead byte (0xC3 alone is the
+    // start of a 2-byte sequence with nothing following): it must be
+    // dropped without crashing. Second event is valid and must come
+    // through intact so we know the stream itself keeps going.
+    const stream = "data: hello \xC3\n\ndata: ok\n\n";
+
+    var fake = std.Io.Reader.fixed(stream);
+
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var event_buf: [128]u8 = undefined;
+    var event_data: std.ArrayList(u8) = .empty;
+    defer event_data.deinit(allocator);
+
+    const first = try sr.nextSseEvent(&cancel, &event_buf, &event_data);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqualStrings("ok", first.?.data);
+
+    const second = try sr.nextSseEvent(&cancel, &event_buf, &event_data);
+    try std.testing.expect(second == null);
 }
 
 test "Provider.call accepts a Request struct" {
