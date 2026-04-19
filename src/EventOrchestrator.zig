@@ -27,7 +27,6 @@ const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
-const AgentThread = @import("AgentThread.zig");
 const AgentSupervisor = @import("AgentSupervisor.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
@@ -747,6 +746,7 @@ fn attachSession(self: *EventOrchestrator, pane: Pane) ?*Session.SessionHandle {
 
 /// Drain a pane's agent events and auto-name its session on first completion.
 fn drainPane(self: *EventOrchestrator, pane: Pane) void {
+    self.supervisor.drainHooks(pane.runner);
     if (pane.runner.drainEvents(self.allocator)) {
         self.autoNameSession(pane);
     }
@@ -795,30 +795,7 @@ fn onUserInputSubmitted(
 
     if (pane.runner.isAgentRunning()) return;
 
-    // 256 slots is ~1s of fast streaming - enough headroom for a UI frame
-    // stall without hiding persistent backpressure.
-    pane.runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
-    pane.runner.event_queue.wake_fd = self.wake_write_fd;
-    pane.runner.queue_active = true;
-    pane.runner.lua_engine = self.lua_engine;
-    pane.runner.cancel_flag.store(false, .release);
-
-    pane.runner.agent_thread = AgentThread.spawn(
-        self.provider.provider,
-        &pane.session.messages,
-        self.registry,
-        self.allocator,
-        &pane.runner.event_queue,
-        &pane.runner.cancel_flag,
-        self.lua_engine,
-    ) catch |err| {
-        _ = pane.view.appendNode(null, .err, @errorName(err)) catch |append_err|
-            log.warn("dropped event: {s}", .{@errorName(append_err)});
-        pane.runner.event_queue.deinit();
-        pane.runner.queue_active = false;
-        pane.runner.agent_thread = null;
-        return err;
-    };
+    try self.supervisor.submit(pane.runner, &pane.session.messages);
 }
 
 /// If `pane` has a session without a name and enough conversation to summarize,
@@ -905,10 +882,14 @@ pub fn paneFromBuffer(self: *EventOrchestrator, b: Buffer) ?Pane {
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
 /// so the error-return path from run() cannot skip it.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
-    self.root_pane.runner.shutdown();
+    var runners: std.ArrayList(*AgentRunner) = .empty;
+    defer runners.deinit(self.allocator);
+
+    runners.append(self.allocator, self.root_pane.runner) catch return;
     for (self.extra_panes.items) |entry| {
-        entry.pane.runner.shutdown();
+        runners.append(self.allocator, entry.pane.runner) catch return;
     }
+    self.supervisor.shutdownAll(runners.items);
 }
 
 /// Restore a pane from an on-disk session: rebuilds both the view tree
