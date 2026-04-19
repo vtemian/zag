@@ -1200,6 +1200,19 @@ test "Parser: garbage byte skipped, event after it still parses" {
 test "Parser: overflow resets pending then buffers new bytes fresh" {
     // Pathological endpoint: flood beyond PARSER_BUF_SIZE. The pending
     // buffer resets on overflow so the next readable byte can resync.
+    //
+    // The reset path emits an operator-facing `log.warn` (kept for
+    // production observability). The default Zig test runner prints any
+    // log at or below `testing.log_level` to stderr, which would leak
+    // this diagnostic into otherwise pristine test output. Raise the
+    // threshold to `.err` for the duration of this test so the warn is
+    // silenced, then restore it. Behavioural guarantees below (reset
+    // to zero, buffer the new byte, next event fires) remain the real
+    // contract under test.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
     var p: Parser = .{};
     var junk: [PARSER_BUF_SIZE]u8 = undefined;
     @memset(&junk, '0');
