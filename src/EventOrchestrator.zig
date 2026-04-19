@@ -291,12 +291,12 @@ fn tick(
         }
     }
 
-    // Drain agent events from every pane. Supervisor handles hook dispatch;
-    // WindowManager handles UI-side drain + session auto-naming.
-    self.supervisor.drainHooks(self.window_manager.root_pane.runner);
+    // Drain agent events from every pane. AgentRunner.drainEvents calls
+    // dispatchHookRequests first thing, which is the sole owner of hook
+    // dispatch at the tick boundary. AgentSupervisor.drainHooks stays on
+    // the module for callers that want hook dispatch without a full drain.
     self.window_manager.drainPane(self.window_manager.root_pane);
     for (self.window_manager.extra_panes.items) |entry| {
-        self.supervisor.drainHooks(entry.pane.runner);
         self.window_manager.drainPane(entry.pane);
     }
 

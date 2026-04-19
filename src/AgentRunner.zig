@@ -526,6 +526,39 @@ test "dispatchHookRequests fires Lua hook and signals done" {
     engine.lua.pop(1);
 }
 
+test "dispatchHookRequests alone pumps hooks without a prior drainHooks call" {
+    // Regression pin for the redundancy cleanup: once the inline
+    // supervisor.drainHooks call is removed from EventOrchestrator.tick,
+    // dispatchHookRequests (invoked by drainEvents) must still be enough
+    // to fire hooks queued while the worker was busy. This pin passes
+    // against the current tree and must keep passing after the removal.
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\_G.pin_turn = nil
+        \\zag.hook("TurnStart", function(evt) _G.pin_turn = evt.turn_num end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 42, .message_count = 1 } };
+    var req = Hooks.HookRequest.init(&payload);
+    try queue.push(.{ .hook_request = &req });
+
+    // No prior supervisor.drainHooks call. dispatchHookRequests alone
+    // must pump the queued hook.
+    dispatchHookRequests(&queue, &engine);
+
+    try std.testing.expect(req.done.isSet());
+    _ = try engine.lua.getGlobal("pin_turn");
+    try std.testing.expectEqual(@as(i64, 42), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
 test "lua_tool_request round-trips via main thread" {
     const alloc = std.testing.allocator;
 
