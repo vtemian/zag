@@ -18,18 +18,14 @@ const tools = @import("tools.zig");
 const input = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
-const Buffer = @import("Buffer.zig");
-const ConversationBuffer = @import("ConversationBuffer.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
-const Theme = @import("Theme.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const AgentSupervisor = @import("AgentSupervisor.zig");
 const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
-const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
 
@@ -62,13 +58,11 @@ allocator: Allocator,
 terminal: *Terminal,
 /// Cell grid and ANSI renderer.
 screen: *Screen,
-/// LLM provider for model calls and model ID lookups.
+/// LLM provider. Used for the /model command status line; the sub-modules
+/// hold their own pointer for model calls and model ID lookups.
 provider: *llm.ProviderResult,
-/// Tool registry for dispatching tool calls.
-registry: *const tools.Registry,
-/// Session manager for persistence (optional, may be null).
-session_mgr: *?Session.SessionManager,
-/// Lua plugin engine, or null if Lua init failed.
+/// Lua plugin engine. Used for user-input hooks routed on the main thread;
+/// the supervisor holds its own pointer for worker-side hook dispatch.
 lua_engine: ?*LuaEngine,
 /// Where to write the rendered screen.
 stdout_file: std.fs.File,
@@ -78,10 +72,6 @@ counting: ?*trace.CountingAllocator,
 /// agent-thread event pushes and SIGWINCH can interrupt its wait without a
 /// busy-wait sleep.
 wake_read_fd: posix.fd_t,
-/// Write end of the wake pipe. Threaded into every buffer's event_queue so
-/// agent workers can wake the main loop from arbitrary threads. Main owns
-/// the fd; the orchestrator only stores it for split-pane wiring.
-wake_write_fd: posix.fd_t,
 /// Persistent escape-sequence parser. Outlives a single poll cycle
 /// so fragmented CSI/SS3 sequences assemble correctly.
 input_parser: input.Parser = .{},
@@ -135,13 +125,10 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .terminal = cfg.terminal,
         .screen = cfg.screen,
         .provider = cfg.provider,
-        .registry = cfg.registry,
-        .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
         .stdout_file = cfg.stdout_file,
         .counting = cfg.counting,
         .wake_read_fd = cfg.wake_read_fd,
-        .wake_write_fd = cfg.wake_write_fd,
     };
     self.window_manager = try WindowManager.init(.{
         .allocator = cfg.allocator,
