@@ -10,6 +10,7 @@ const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
+const input = @import("input.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -73,6 +74,11 @@ pub const LuaEngine = struct {
     /// `zag.keymap()` calls from `config.lua` land in the same registry
     /// that dispatches keys.
     keymap_registry: ?*Keymap.Registry = null,
+    /// Optional pointer to the input parser. Wired from main.zig after
+    /// orchestrator construction so `zag.set_escape_timeout_ms()` can
+    /// tune the bare-Escape deadline at config-load time. Null when the
+    /// engine is exercised standalone in tests.
+    input_parser: ?*input.Parser = null,
 
     /// Create a new LuaEngine. Sets up the VM and installs the `zag.*`
     /// globals but does NOT load user config. Callers must wire any
@@ -160,6 +166,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "hook_del");
         lua.pushFunction(zlua.wrap(zagKeymapFn));
         lua.setField(-2, "keymap");
+        lua.pushFunction(zlua.wrap(zagSetEscapeTimeoutMsFn));
+        lua.setField(-2, "set_escape_timeout_ms");
         lua.setGlobal("zag");
     }
 
@@ -422,6 +430,34 @@ pub const LuaEngine = struct {
             return 0;
         };
         try registry.register(mode, spec, action);
+        return 0;
+    }
+
+    /// Zig function backing `zag.set_escape_timeout_ms(ms)`.
+    /// Writes the bare-Escape deadline through `engine.input_parser` if
+    /// it is attached; no-ops otherwise so the test harness without a
+    /// parser doesn't crash. Negative timeouts are rejected as a Lua
+    /// runtime error.
+    fn zagSetEscapeTimeoutMsFn(lua: *Lua) !i32 {
+        const ms = lua.checkInteger(1);
+        if (ms < 0) {
+            log.warn("zag.set_escape_timeout_ms(): negative timeout {d}", .{ms});
+            return error.LuaError;
+        }
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.set_escape_timeout_ms(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        const parser = engine.input_parser orelse {
+            log.warn("zag.set_escape_timeout_ms(): no parser bound; value ignored", .{});
+            return 0;
+        };
+        parser.escape_timeout_ms = ms;
         return 0;
     }
 
@@ -1527,4 +1563,29 @@ test "zag.keymap registers into the shared registry" {
             .modifiers = .{ .ctrl = true },
         }).?,
     );
+}
+
+test "zag.set_escape_timeout_ms updates Parser.escape_timeout_ms" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    var parser: input.Parser = .{};
+    engine.input_parser = &parser;
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.set_escape_timeout_ms(120)");
+
+    try std.testing.expectEqual(@as(i64, 120), parser.escape_timeout_ms);
+}
+
+test "zag.set_escape_timeout_ms rejects negative" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    var parser: input.Parser = .{};
+    engine.input_parser = &parser;
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString("zag.set_escape_timeout_ms(-10)");
+    try std.testing.expectError(error.LuaRuntime, result);
 }
