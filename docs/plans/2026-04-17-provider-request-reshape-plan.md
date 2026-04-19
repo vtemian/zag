@@ -1,10 +1,10 @@
-# Provider Request Reshape — Implementation Plan
+# Provider Request Reshape Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task. Each task is one commit. Follow TDD for every task: write the failing test (or make the failure manifest as a compile error), watch it fail for the *right reason*, implement, watch it pass, commit.
 
 **Goal:** Stop leaking Anthropic's wire shape through the LLM provider abstraction. Introduce a provider-neutral `Request` / `StreamRequest` struct as the vtable input, and push per-provider serialization entirely into each provider's own file. The shared `src/providers/serialize.zig` dispatcher dies.
 
-**Architecture:** Today `Provider.call` and `Provider.callStreaming` take `(system_prompt, messages, tool_definitions, allocator, [callback, cancel])` as five positional parameters. Both providers then delegate to `serialize.buildRequestBody`, which switches on a `Flavor` enum at six different points to choose Anthropic- or OpenAI-specific writers. We replace the five-param signature with a pass-by-const-pointer `Request` struct, move every Anthropic-specific writer into `src/providers/anthropic.zig`, move every OpenAI-specific writer into `src/providers/openai.zig`, and delete `serialize.zig`. The `Flavor` enum is deleted with it. Response shape (`LlmResponse`) is already provider-neutral — no change needed there. Tests that currently live in `serialize.zig` migrate to the provider file that owns the writer they exercise.
+**Architecture:** Today `Provider.call` and `Provider.callStreaming` take `(system_prompt, messages, tool_definitions, allocator, [callback, cancel])` as five positional parameters. Both providers then delegate to `serialize.buildRequestBody`, which switches on a `Flavor` enum at six different points to choose Anthropic- or OpenAI-specific writers. We replace the five-param signature with a pass-by-const-pointer `Request` struct, move every Anthropic-specific writer into `src/providers/anthropic.zig`, move every OpenAI-specific writer into `src/providers/openai.zig`, and delete `serialize.zig`. The `Flavor` enum is deleted with it. Response shape (`LlmResponse`) is already provider-neutral; no change needed there. Tests that currently live in `serialize.zig` migrate to the provider file that owns the writer they exercise.
 
 **Tech Stack:** Zig 0.15, existing `std.json.Stringify` + `std.io.Writer.Allocating`. No new dependencies.
 
@@ -19,7 +19,11 @@
 5. **Commit message format:** `<subsystem>: <imperative, <70 chars>`. Example: `llm: introduce Request struct for provider vtable`.
 6. **Keep `LlmResponse` unchanged.** Response shape is already neutral; don't touch it.
 7. **Preserve test coverage.** Every test in `serialize.zig` has a home in `anthropic.zig` or `openai.zig` after this plan. Do not delete tests without moving them.
-8. **No backwards-compat shims.** We rename / retype freely — there are only 5 provider call sites in the repo.
+8. **No backwards-compat shims.** We rename / retype freely; there are only 5 provider call sites in the repo.
+9. **Worktree Edit discipline.** When executing from `.worktrees/<branch>/`, always use fully qualified absolute paths in `Edit` calls and verify every change with `git diff` on the worktree plus `git status --short` on the main repo. Subagents have been known to silently target the main repo with relative paths; watch for and discard any orphan edits immediately. See `feedback_worktree_edit_paths.md`.
+10. **Test-math rigor.** Before committing any task, mentally trace each assertion against the proposed code. If a trace contradicts the plan's expected values, stop and document the deviation in the commit body.
+11. **`Flavor` vs `Serializer` are distinct enums.** `Flavor` lives inside `src/providers/serialize.zig` and gets deleted when that file dies. `Serializer` lives inside `src/llm.zig` (field of `Endpoint`, used by `createProviderWithRegistry`'s `switch (endpoint.serializer)`) and is preserved. The plan does not touch `Serializer`. If you find yourself editing `Serializer`, you are wrong.
+12. **No dashes in new comments or commit bodies.** Use periods or semicolons; compound-word hyphens (`pipe2`, `x-api-key`) are fine. This catches em dashes that sneak in from plan text.
 
 ---
 
@@ -51,9 +55,9 @@ pub const VTable = struct {
 };
 ```
 
-The problem isn't the information content — it's the *shape*. `system_prompt` is passed as a separate parameter because Anthropic puts it at the top level of the request body. OpenAI has no such concept; instead it splices system into the first message with `role: "system"`. Every OpenAI code path through `serialize.zig` has to carry `system_prompt` alongside `messages` just to reassemble it inside `writeMessagesWithSystem` (src/providers/serialize.zig:118).
+The problem isn't the information content; it's the *shape*. `system_prompt` is passed as a separate parameter because Anthropic puts it at the top level of the request body. OpenAI has no such concept; instead it splices system into the first message with `role: "system"`. Every OpenAI code path through `serialize.zig` has to carry `system_prompt` alongside `messages` just to reassemble it inside `writeMessagesWithSystem` (src/providers/serialize.zig:118).
 
-`serialize.zig:48-78` (`buildRequestBody`) dispatches on `Flavor` at the top. Below that, `writeToolDefinitions` (line 83-102), `writeMessages`/`writeMessagesWithSystem` (line 106-127), and `writeMessage` (line 131-135) all re-dispatch on `Flavor`. Six total switches. Each switch is a place where a future provider (Gemini, Mistral, anything) has to add a branch — or do gymnastics to wedge itself into one of the two existing branches.
+`serialize.zig:48-78` (`buildRequestBody`) dispatches on `Flavor` at the top. Below that, `writeToolDefinitions` (line 83-102), `writeMessages`/`writeMessagesWithSystem` (line 106-127), and `writeMessage` (line 131-135) all re-dispatch on `Flavor`. Six total switches. Each switch is a place where a future provider (Gemini, Mistral, anything) has to add a branch; or do gymnastics to wedge itself into one of the two existing branches.
 
 The cure is not abstraction. The cure is *owning what's yours*. Anthropic-specific writers belong in `anthropic.zig`. OpenAI-specific writers belong in `openai.zig`. The shared layer shrinks to what's actually shared: the `Endpoint` struct, the HTTP plumbing (`httpPostJson`, `StreamingResponse`), the `buildHeaders` helper, the `ProviderError` type, and the `StreamCallback` contract. None of those care about wire format.
 
@@ -83,7 +87,7 @@ Plus the vtable implementation in each provider:
 ## Task 1: Declare `Request` and `StreamRequest` (red)
 
 **Files:**
-- Modify: `src/llm.zig` — add new struct declarations only. No signature change yet.
+- Modify: `src/llm.zig`; add new struct declarations only. No signature change yet.
 
 **Step 1: Add the request types**
 
@@ -98,7 +102,7 @@ Insert after the `StreamCallback` struct declaration (around line 89), before th
 /// emits its own request body.
 pub const Request = struct {
     /// Free-text system prompt. How it lands in the wire format is
-    /// the provider's problem — Anthropic uses a top-level `system`
+    /// the provider's problem; Anthropic uses a top-level `system`
     /// field, OpenAI injects a `role: "system"` message.
     system_prompt: []const u8,
     /// Conversation history in chronological order.
@@ -124,7 +128,7 @@ pub const StreamRequest = struct {
 
 **Step 2: Add a failing test that uses the new type**
 
-Append to the existing test block at the bottom of `src/llm.zig` (find the `test {` block at EOF — if there are sibling `test "..."` blocks, put the new one alongside):
+Append to the existing test block at the bottom of `src/llm.zig` (find the `test {` block at EOF; if there are sibling `test "..."` blocks, put the new one alongside):
 
 ```zig
 test "Provider.call accepts a Request struct" {
@@ -140,7 +144,7 @@ test "Provider.call accepts a Request struct" {
         .allocator = std.testing.allocator,
     };
     _ = req;
-    // Intentionally no call yet — this file compiles because Request
+    // Intentionally no call yet; this file compiles because Request
     // is a plain struct. Task 2 updates Provider.call to take *const
     // Request and this test is extended to call a mock provider.
 }
@@ -152,7 +156,7 @@ test "Provider.call accepts a Request struct" {
 zig build test 2>&1 | tail -15
 ```
 
-Expected: all tests pass. This "red" is a soft-red — the test compiles but doesn't exercise the new shape yet. Task 2 extends the test when the API supports it.
+Expected: all tests pass. This "red" is a soft-red; the test compiles but doesn't exercise the new shape yet. Task 2 extends the test when the API supports it.
 
 **Step 4: Commit**
 
@@ -174,12 +178,12 @@ EOF
 ## Task 2: Migrate vtable + Provider wrapper + all call sites to Request/StreamRequest
 
 **Files:**
-- Modify: `src/llm.zig` — VTable, `Provider.call`, `Provider.callStreaming`.
-- Modify: `src/providers/anthropic.zig` — `callImpl` / `callImplInner` / `callStreamingImpl` / `callStreamingImplInner`.
-- Modify: `src/providers/openai.zig` — same four functions.
-- Modify: `src/agent.zig:161-170` — two call sites.
-- Modify: `src/EventOrchestrator.zig:850-855` — one call site.
-- Modify: `src/llm.zig` test blocks at ~920 and ~992 — two call sites.
+- Modify: `src/llm.zig`; VTable, `Provider.call`, `Provider.callStreaming`.
+- Modify: `src/providers/anthropic.zig`; `callImpl` / `callImplInner` / `callStreamingImpl` / `callStreamingImplInner`.
+- Modify: `src/providers/openai.zig`; same four functions.
+- Modify: `src/agent.zig:161-170`; two call sites.
+- Modify: `src/EventOrchestrator.zig:~854`; one call site.
+- Modify: `src/llm.zig` test blocks at ~920 and ~992; two call sites.
 
 **Step 1: Update the VTable**
 
@@ -324,7 +328,7 @@ fn callLlm(
         };
         const fallback = try provider.call(&req);
 
-        // ... (rest of fallback logic unchanged — stream_ctx.text_count
+        // ... (rest of fallback logic unchanged; stream_ctx.text_count
         // check, reset_assistant_text push, for-loop over fallback.content)
 ```
 
@@ -332,7 +336,7 @@ Keep the body of the fallback block unchanged. Only the two provider invocations
 
 **Step 6: Update EventOrchestrator call site**
 
-In `src/EventOrchestrator.zig:850-855`, replace:
+In `src/EventOrchestrator.zig:~854`, replace:
 
 ```zig
     const response = try self.provider.provider.call(
@@ -355,7 +359,14 @@ with:
     const response = try self.provider.provider.call(&req);
 ```
 
-**Step 7: Update the llm.zig test call sites**
+**Step 7: Update the llm.zig test mock vtables AND call sites**
+
+The llm.zig test suite contains two inline mock providers whose `vtable: Provider.VTable` literals point to local `callImpl` / `callStreamingImpl` functions that still carry the old 5-param signature. These will refuse to compile once the VTable signature changes in Step 1. Update both:
+
+- First mock at `src/llm.zig:~871-925` (`TestProvider` used by "Provider.call dispatches to vtable"): change both `callImpl(ptr, _, _, _, alloc)` (5 params) and `callStreamingImpl(ptr, _, _, _, _, alloc, _, _)` (7 params) to accept `req: *const Request` / `req: *const StreamRequest` respectively. Replace references to `alloc` inside their bodies with `req.allocator`. The `callImpl` body that delegates (`return callImpl(ptr, ...)`) from the streaming variant also needs retargeting.
+- Second mock at `src/llm.zig:~939-985` (`TestStreamProvider` used by "Provider callStreaming dispatches to vtable"): same treatment. The `callback.on_event(callback.ctx, ...)` calls inside `callStreamingImpl` now come from `req.callback.*`.
+
+Then update the call sites:
 
 Around `src/llm.zig:920` the test invokes a mock provider with `p.call("system", &.{}, &.{}, allocator)`. Replace with:
 
@@ -382,6 +393,8 @@ Around `src/llm.zig:992`:
     };
     const response = try p.callStreaming(&stream_req);
 ```
+
+**Skipping the mock update will produce a compile error like `expected fn(*anyopaque, *const Request) ..., found fn(*anyopaque, []const u8, ...)` at the `const vtable: Provider.VTable = .{ ... };` literal.** Catch this in Step 8 if missed here.
 
 **Step 8: Run the full suite**
 
@@ -419,8 +432,8 @@ EOF
 ## Task 3: Move Anthropic serialization into `anthropic.zig`
 
 **Files:**
-- Modify: `src/providers/anthropic.zig` — add all Anthropic-specific writers locally.
-- Modify: `src/providers/serialize.zig` — delete the `.anthropic` branches (leave the `.openai` branches for now).
+- Modify: `src/providers/anthropic.zig`; add all Anthropic-specific writers locally.
+- Modify: `src/providers/serialize.zig`; delete the `.anthropic` branches (leave the `.openai` branches for now).
 - Move tests: the four Anthropic-related tests in `serialize.zig` move to `anthropic.zig`.
 
 **Step 1: Extract the Anthropic writers**
@@ -556,7 +569,7 @@ Copy these test blocks from `src/providers/serialize.zig` into `src/providers/an
 - `test "anthropic emits empty tools array"` (lines ~393-409)
 - `test "anthropic writeMessage serializes tool_use content block"` (lines ~411-439)
 - `test "anthropic writeMessage serializes tool_result with is_error"` (lines ~441-464)
-- `test "streaming flag is included when requested"` (lines ~348-360) — this exercised `.anthropic` flavor, so it belongs here
+- `test "streaming flag is included when requested"` (lines ~348-360); this exercised `.anthropic` flavor, so it belongs here
 
 Update the tests' function calls: replace `buildRequestBody(testing.allocator, .{...flavor = .anthropic...})` with direct calls to the new `serializeRequest(...)` (private) or `buildRequestBody(...)` (public). Replace `writeMessage(msg, .anthropic, &out.writer)` with just `writeMessage(msg, &out.writer)` (the flavor parameter is gone).
 
@@ -576,7 +589,7 @@ Similarly for tool_result test.
 
 **Step 5: Delete Anthropic branches from `serialize.zig`**
 
-In `src/providers/serialize.zig`, change the `Flavor` enum to just `openai` (temporary — fully deleted in Task 5). Remove every `.anthropic =>` arm:
+In `src/providers/serialize.zig`, change the `Flavor` enum to just `openai` (temporary; fully deleted in Task 5). Remove every `.anthropic =>` arm:
 
 - In `buildRequestBody` (line 58-74): remove the `.anthropic =>` arm. After this, `buildRequestBody` no longer switches on Flavor but only emits OpenAI.
 - In `writeToolDefinitions` (line 83-102): remove the `.anthropic =>` arm.
@@ -609,7 +622,7 @@ anthropic: move serialization into provider, drop Flavor.anthropic
 Anthropic-specific writers (messages, tool_definitions, writeMessage)
 now live in anthropic.zig. serialize.zig's Flavor enum loses the
 anthropic arm. Six tests relocate to anthropic.zig alongside the
-code they exercise. OpenAI still uses serialize.zig — that split
+code they exercise. OpenAI still uses serialize.zig; that split
 lands in the next commit.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -622,8 +635,8 @@ EOF
 ## Task 4: Move OpenAI serialization into `openai.zig`
 
 **Files:**
-- Modify: `src/providers/openai.zig` — add all OpenAI-specific writers locally.
-- Modify: `src/providers/serialize.zig` — delete the `.openai` branches (this reduces serialize.zig to nothing useful; it gets deleted in Task 5).
+- Modify: `src/providers/openai.zig`; add all OpenAI-specific writers locally.
+- Modify: `src/providers/serialize.zig`; delete the `.openai` branches (this reduces serialize.zig to nothing useful; it gets deleted in Task 5).
 - Move tests: the OpenAI-related tests in `serialize.zig` move to `openai.zig`.
 
 **Step 1: Extract the OpenAI writers**
@@ -823,7 +836,7 @@ Copy into `openai.zig`'s test section:
 - `test "openai omits tools field when none are provided"` (~376-391)
 - `test "openai writeMessage flattens tool_use into tool_calls"` (~466-495)
 - `test "openai writeMessage emits tool role for tool_result"` (~497-522)
-- `test "streaming flag is omitted by default"` (~362-374) — the existing version uses `.openai` flavor
+- `test "streaming flag is omitted by default"` (~362-374); the existing version uses `.openai` flavor
 
 Update each test's calls:
 
@@ -832,7 +845,7 @@ Update each test's calls:
 
 **Step 5: Delete `serialize.zig` entirely**
 
-After moving every test and writer out, `src/providers/serialize.zig` contains only the empty shell of `Flavor`, `RequestBodyOptions`, and the `buildRequestBody` dispatcher — none of which anyone imports. Delete the file:
+After moving every test and writer out, `src/providers/serialize.zig` contains only the empty shell of `Flavor`, `RequestBodyOptions`, and the `buildRequestBody` dispatcher; none of which anyone imports. Delete the file:
 
 ```bash
 git rm src/providers/serialize.zig
@@ -872,7 +885,7 @@ OpenAI-specific writers (serializeRequest, writeMessagesWithSystem,
 writeMessage, writeToolDefinitions) now live in openai.zig.
 serialize.zig had nothing left after anthropic.zig's extraction;
 deleted along with the Flavor enum. Per-provider files are now
-self-contained — a future provider wires up its own serializer
+self-contained; a future provider wires up its own serializer
 without touching either existing one.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -927,7 +940,7 @@ Check `body` being sent. The easiest way: temporarily log the serialized body in
 log.debug("request body: {s}", .{body});
 ```
 
-Compare against a known-good request from before the refactor (check `git stash pop` against the prior commit). Diff should be zero — any difference is a bug introduced by the extraction.
+Compare against a known-good request from before the refactor (check `git stash pop` against the prior commit). Diff should be zero; any difference is a bug introduced by the extraction.
 
 **Step 5: If both providers pass, mark the plan complete**
 
