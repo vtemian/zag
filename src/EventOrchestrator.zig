@@ -28,6 +28,7 @@ const Theme = @import("Theme.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const AgentThread = @import("AgentThread.zig");
+const AgentSupervisor = @import("AgentSupervisor.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const types = @import("types.zig");
@@ -131,6 +132,8 @@ current_mode: Keymap.Mode = .insert,
 /// Keymap registry. Built from defaults in `init`; Lua config can
 /// register overrides via `zag.keymap()` before `loadUserConfig` runs.
 keymap_registry: Keymap.Registry = undefined,
+/// Per-pane agent lifecycle supervisor.
+supervisor: AgentSupervisor = undefined,
 
 // -- Construction ------------------------------------------------------------
 
@@ -186,6 +189,13 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .wake_read_fd = cfg.wake_read_fd,
         .wake_write_fd = cfg.wake_write_fd,
     };
+    self.supervisor = AgentSupervisor.init(
+        cfg.allocator,
+        cfg.wake_write_fd,
+        cfg.lua_engine,
+        cfg.provider,
+        cfg.registry,
+    );
     self.keymap_registry = Keymap.Registry.init(cfg.allocator);
     errdefer self.keymap_registry.deinit();
     try self.keymap_registry.loadDefaults();
