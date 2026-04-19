@@ -83,6 +83,33 @@ pub fn submit(
     );
 }
 
+/// Drain pending hook requests on `runner`'s queue by calling into
+/// the shared Lua engine. Non-hook events stay in the queue for the
+/// regular drain path. Safe no-op when Lua is unavailable.
+pub fn drainHooks(self: *AgentSupervisor, runner: *AgentRunner) void {
+    const engine = self.lua_engine orelse return;
+    if (!runner.queue_active) return;
+    AgentRunner.dispatchHookRequests(&runner.event_queue, engine);
+}
+
+/// Cancel every runner cooperatively in a first pass, then `shutdown()`
+/// each one in a second pass to join its thread and deinit its queue.
+/// Splitting the loop means all agents start winding down before any
+/// single join blocks, which matters when a tool call is slow.
+///
+/// `AgentRunner.shutdown()` is idempotent (guards on `queue_active` and
+/// `agent_thread`), so a subsequent `runner.deinit()` in the
+/// orchestrator's extra-panes loop is safe: the second call is a no-op.
+pub fn shutdownAll(self: *AgentSupervisor, runners: []const *AgentRunner) void {
+    _ = self;
+    for (runners) |runner| {
+        runner.cancelAgent();
+    }
+    for (runners) |runner| {
+        runner.shutdown();
+    }
+}
+
 // Tests.
 
 test {
