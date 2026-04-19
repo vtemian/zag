@@ -874,12 +874,34 @@ pub const LuaEngine = struct {
     }
 
     /// Load and execute a Lua config file, collecting any `zag.tool()` calls it makes.
-    /// Caller is responsible for logging on error (keeps test output pristine).
+    /// Syntax and runtime errors are caught under protectedCall so a broken
+    /// config.lua surfaces a logged warning and a clean Zig error instead of
+    /// propagating a raw Lua panic out of the init chain.
     pub fn loadConfig(self: *LuaEngine, path: []const u8) !void {
         self.storeSelfPointer();
         const path_z = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_z);
-        try self.lua.doFile(path_z);
+
+        // Load the file into a closure on the stack without executing.
+        // LuaFile/LuaSyntax bubble up here; no Lua message is pushed for LuaFile,
+        // so we only drain the stack on LuaSyntax.
+        self.lua.loadFile(path_z, .binary_text) catch |err| {
+            if (err == error.LuaSyntax) {
+                const msg = self.lua.toString(-1) catch "<unprintable>";
+                log.warn("config syntax error in {s}: {s}", .{ path, msg });
+                self.lua.pop(1);
+            }
+            return err;
+        };
+
+        // Run the loaded chunk under pcall so runtime errors surface as a Zig
+        // error instead of crashing the host.
+        self.lua.protectedCall(.{ .args = 0, .results = 0 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "<unprintable>";
+            log.warn("config runtime error in {s}: {s}", .{ path, msg });
+            self.lua.pop(1);
+            return err;
+        };
     }
 
     /// Adjust package.path so that `require` can find modules in the given directory.
@@ -1235,6 +1257,37 @@ test "loadConfig with nonexistent file returns error" {
         error.LuaFile,
         engine.loadConfig("/tmp/zag_nonexistent_config_12345.lua"),
     );
+}
+
+test "loadConfig reports syntax error gracefully instead of crashing" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    const tmp_path = "/tmp/zag_test_config_syntax_error.lua";
+    {
+        const file = try std.fs.createFileAbsolute(tmp_path, .{});
+        defer file.close();
+        // Unclosed table literal: classic syntax error.
+        try file.writeAll("local x = { 1, 2,\n");
+    }
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    try std.testing.expectError(error.LuaSyntax, engine.loadConfig(tmp_path));
+}
+
+test "loadConfig reports runtime error gracefully" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    const tmp_path = "/tmp/zag_test_config_runtime_error.lua";
+    {
+        const file = try std.fs.createFileAbsolute(tmp_path, .{});
+        defer file.close();
+        try file.writeAll("error('user aborted config')\n");
+    }
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    try std.testing.expectError(error.LuaRuntime, engine.loadConfig(tmp_path));
 }
 
 test "zag.hook registers a hook" {
