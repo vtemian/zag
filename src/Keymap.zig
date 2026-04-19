@@ -49,7 +49,7 @@ pub fn parseActionName(name: []const u8) ?Action {
 }
 
 /// A specification of a keystroke: a Key variant + modifier flags.
-/// Matches the shape emitted by input.parseBytes for real keypresses.
+/// Matches the shape emitted by input.Parser for real keypresses.
 pub const KeySpec = struct {
     key: input.KeyEvent.Key,
     modifiers: input.KeyEvent.Modifiers = .{},
