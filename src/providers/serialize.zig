@@ -23,7 +23,7 @@ const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
 
 /// Which provider wire format to emit.
-pub const Flavor = enum { anthropic, openai };
+pub const Flavor = enum { openai };
 
 /// Inputs required to build a chat-completion-style request body.
 pub const RequestBodyOptions = struct {
@@ -56,14 +56,6 @@ pub fn buildRequestBody(allocator: Allocator, opts: RequestBodyOptions) ![]const
     if (opts.stream) try w.writeAll("\"stream\":true,");
 
     switch (opts.flavor) {
-        .anthropic => {
-            try w.writeAll("\"system\":");
-            try std.json.Stringify.value(opts.system_prompt, .{}, w);
-            try w.writeAll(",");
-            try writeToolDefinitions(opts.tool_definitions, .anthropic, w);
-            try w.writeAll(",");
-            try writeMessages(opts.messages, .anthropic, w);
-        },
         .openai => {
             try writeMessagesWithSystem(opts.system_prompt, opts.messages, w);
             if (opts.tool_definitions.len > 0) {
@@ -85,11 +77,6 @@ fn writeToolDefinitions(defs: []const types.ToolDefinition, flavor: Flavor, w: a
     for (defs, 0..) |def, i| {
         if (i > 0) try w.writeAll(",");
         switch (flavor) {
-            .anthropic => {
-                try w.print("{{\"name\":\"{s}\",\"description\":", .{def.name});
-                try std.json.Stringify.value(def.description, .{}, w);
-                try w.print(",\"input_schema\":{s}}}", .{def.input_schema_json});
-            },
             .openai => {
                 try w.writeAll("{\"type\":\"function\",\"function\":{");
                 try w.print("\"name\":\"{s}\",\"description\":", .{def.name});
@@ -130,44 +117,8 @@ fn writeMessagesWithSystem(system: []const u8, msgs: []const types.Message, w: a
 /// Writes a single message in the given flavor's content format.
 fn writeMessage(msg: types.Message, flavor: Flavor, w: anytype) !void {
     switch (flavor) {
-        .anthropic => try writeAnthropicMessage(msg, w),
         .openai => try writeOpenAiMessage(msg, w),
     }
-}
-
-fn writeAnthropicMessage(msg: types.Message, w: anytype) !void {
-    const role = switch (msg.role) {
-        .user => "user",
-        .assistant => "assistant",
-    };
-
-    try w.print("{{\"role\":\"{s}\",\"content\":[", .{role});
-
-    for (msg.content, 0..) |block, i| {
-        if (i > 0) try w.writeAll(",");
-        switch (block) {
-            .text => |t| {
-                try w.writeAll("{\"type\":\"text\",\"text\":");
-                try std.json.Stringify.value(t.text, .{}, w);
-                try w.writeAll("}");
-            },
-            .tool_use => |tu| {
-                try w.print(
-                    "{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}",
-                    .{ tu.id, tu.name, tu.input_raw },
-                );
-            },
-            .tool_result => |tr| {
-                try w.print("{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",", .{tr.tool_use_id});
-                if (tr.is_error) try w.writeAll("\"is_error\":true,");
-                try w.writeAll("\"content\":");
-                try std.json.Stringify.value(tr.content, .{}, w);
-                try w.writeAll("}");
-            },
-        }
-    }
-
-    try w.writeAll("]}");
 }
 
 fn writeOpenAiMessage(msg: types.Message, w: anytype) !void {
@@ -276,20 +227,6 @@ test {
     testing.refAllDecls(@This());
 }
 
-test "anthropic body places system as top-level field" {
-    const body = try buildRequestBody(testing.allocator, .{
-        .model = "m",
-        .system_prompt = "sys",
-        .messages = &.{},
-        .tool_definitions = &.{},
-        .max_tokens = 128,
-        .stream = false,
-        .flavor = .anthropic,
-    });
-    defer testing.allocator.free(body);
-    try testing.expect(std.mem.indexOf(u8, body, "\"system\":\"sys\"") != null);
-}
-
 test "openai body places system as first message" {
     const body = try buildRequestBody(testing.allocator, .{
         .model = "m",
@@ -302,27 +239,6 @@ test "openai body places system as first message" {
     });
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\",\"content\":\"sys\"") != null);
-}
-
-test "anthropic wraps tool as bare object" {
-    const tool_defs = [_]types.ToolDefinition{
-        .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
-    };
-
-    const body = try buildRequestBody(testing.allocator, .{
-        .model = "m",
-        .system_prompt = "sys",
-        .messages = &.{},
-        .tool_definitions = &tool_defs,
-        .max_tokens = 128,
-        .stream = false,
-        .flavor = .anthropic,
-    });
-    defer testing.allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"t\",") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"input_schema\":{\"type\":\"object\"}") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\"") == null);
 }
 
 test "openai wraps tool as type-function object" {
@@ -343,20 +259,6 @@ test "openai wraps tool as type-function object" {
 
     try testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"function\":{\"name\":\"t\",") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"parameters\":") != null);
-}
-
-test "streaming flag is included when requested" {
-    const body = try buildRequestBody(testing.allocator, .{
-        .model = "m",
-        .system_prompt = "sys",
-        .messages = &.{},
-        .tool_definitions = &.{},
-        .max_tokens = 128,
-        .stream = true,
-        .flavor = .anthropic,
-    });
-    defer testing.allocator.free(body);
-    try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
 }
 
 test "streaming flag is omitted by default" {
@@ -388,79 +290,6 @@ test "openai omits tools field when none are provided" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
     try testing.expect(parsed.value.object.get("tools") == null);
-}
-
-test "anthropic emits empty tools array" {
-    const body = try buildRequestBody(testing.allocator, .{
-        .model = "m",
-        .system_prompt = "sys",
-        .messages = &.{},
-        .tool_definitions = &.{},
-        .max_tokens = 128,
-        .stream = false,
-        .flavor = .anthropic,
-    });
-    defer testing.allocator.free(body);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("tools").?.array;
-    try testing.expectEqual(@as(usize, 0), tools.items.len);
-}
-
-test "anthropic writeMessage serializes tool_use content block" {
-    const allocator = testing.allocator;
-
-    const content = try allocator.alloc(types.ContentBlock, 1);
-    defer allocator.free(content);
-    content[0] = .{ .tool_use = .{
-        .id = "toolu_001",
-        .name = "read",
-        .input_raw = "{\"path\":\"/tmp/test.txt\"}",
-    } };
-
-    const msg = types.Message{ .role = .assistant, .content = content };
-
-    var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, .anthropic, &out.writer);
-    const json = try out.toOwnedSlice();
-    defer allocator.free(json);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-    try testing.expectEqualStrings("assistant", root.get("role").?.string);
-    const blocks = root.get("content").?.array;
-    try testing.expectEqual(@as(usize, 1), blocks.items.len);
-    try testing.expectEqualStrings("tool_use", blocks.items[0].object.get("type").?.string);
-    try testing.expectEqualStrings("toolu_001", blocks.items[0].object.get("id").?.string);
-    try testing.expectEqualStrings("read", blocks.items[0].object.get("name").?.string);
-}
-
-test "anthropic writeMessage serializes tool_result with is_error" {
-    const allocator = testing.allocator;
-
-    const content = try allocator.alloc(types.ContentBlock, 1);
-    defer allocator.free(content);
-    content[0] = .{ .tool_result = .{
-        .tool_use_id = "toolu_002",
-        .content = "error: not found",
-        .is_error = true,
-    } };
-
-    const msg = types.Message{ .role = .user, .content = content };
-
-    var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, .anthropic, &out.writer);
-    const json = try out.toOwnedSlice();
-    defer allocator.free(json);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    const block = parsed.value.object.get("content").?.array.items[0].object;
-    try testing.expect(block.get("is_error").?.bool);
 }
 
 test "openai writeMessage flattens tool_use into tool_calls" {
