@@ -280,7 +280,8 @@ fn tick(
     // delivers a resize this way), and any other poll error will resurface
     // on the next syscall in this tick. Logging every EINTR would spam the
     // status log on every terminal resize.
-    _ = posix.poll(&fds, -1) catch {};
+    const poll_timeout: i32 = self.input_parser.pollTimeoutMs(std.time.milliTimestamp()) orelse -1;
+    _ = posix.poll(&fds, poll_timeout) catch {};
 
     // Drain stale wake bytes so one wake equals one frame regardless of how
     // many events were pushed between polls.

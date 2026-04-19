@@ -219,6 +219,24 @@ pub const Parser = struct {
         if (n > 0) self.feedBytes(buf[0..n], now_ms);
         return self.nextEvent(now_ms);
     }
+
+    /// How many milliseconds should the event loop's poll() block before
+    /// returning, given the parser's current pending state?
+    ///
+    /// Returns null when the parser has no pending bytes starting with
+    /// ESC — in that case the caller should block indefinitely (or on
+    /// other fd activity). Otherwise returns the remaining escape
+    /// timeout clamped to [0, escape_timeout_ms]; the caller passes this
+    /// to `poll` so the bare-ESC timeout actually fires when no new
+    /// bytes arrive after a lone Escape keypress.
+    pub fn pollTimeoutMs(self: *const Parser, now_ms: i64) ?i32 {
+        if (self.pending_len == 0) return null;
+        if (self.pending[0] != 0x1b) return null;
+        const elapsed = now_ms - self.pending_since_ms;
+        const remaining = self.escape_timeout_ms - elapsed;
+        if (remaining <= 0) return 0;
+        return @intCast(remaining);
+    }
 };
 
 /// Maximum bytes we read in a single poll, enough for any escape sequence.
@@ -1312,4 +1330,28 @@ test "Parser.pollOnce: fragmented CSI via a real pipe resolves to Ctrl+Up" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "Parser.pollTimeoutMs: null when no pending bytes" {
+    var p: Parser = .{};
+    try std.testing.expect(p.pollTimeoutMs(0) == null);
+}
+
+test "Parser.pollTimeoutMs: null when pending head is not ESC" {
+    var p: Parser = .{};
+    p.feedBytes(&.{'A'}, 0);
+    try std.testing.expect(p.pollTimeoutMs(0) == null);
+}
+
+test "Parser.pollTimeoutMs: returns remaining ms when ESC is pending" {
+    var p: Parser = .{};
+    p.feedBytes(&.{0x1b}, 0);
+    // At t=0, full 50 ms remain.
+    try std.testing.expectEqual(@as(i32, 50), p.pollTimeoutMs(0).?);
+    // At t=10, 40 ms remain.
+    try std.testing.expectEqual(@as(i32, 40), p.pollTimeoutMs(10).?);
+    // At t=50, 0 ms remain (clamped).
+    try std.testing.expectEqual(@as(i32, 0), p.pollTimeoutMs(50).?);
+    // Past the deadline, still 0 (never negative).
+    try std.testing.expectEqual(@as(i32, 0), p.pollTimeoutMs(100).?);
 }
