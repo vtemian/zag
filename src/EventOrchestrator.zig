@@ -516,15 +516,28 @@ fn onUserInputSubmitted(
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
 /// so the error-return path from run() cannot skip it.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
-    var runners: std.ArrayList(*AgentRunner) = .empty;
-    defer runners.deinit(self.allocator);
+    // Stack-allocated so shutdown itself cannot fail on OOM. 32 is
+    // far beyond any realistic TUI split count; if a user somehow
+    // creates 33+ panes, shutdown logs and proceeds with the first 32.
+    const cap = shutdown_runner_cap;
+    var buf: [cap]*AgentRunner = undefined;
+    var len: usize = 0;
 
-    runners.append(self.allocator, self.window_manager.root_pane.runner) catch return;
+    buf[len] = self.window_manager.root_pane.runner;
+    len += 1;
     for (self.window_manager.extra_panes.items) |entry| {
-        runners.append(self.allocator, entry.pane.runner) catch return;
+        if (len >= cap) {
+            log.warn("shutdown: more than {d} panes, stopping early", .{cap});
+            break;
+        }
+        buf[len] = entry.pane.runner;
+        len += 1;
     }
-    self.supervisor.shutdownAll(runners.items);
+    self.supervisor.shutdownAll(buf[0..len]);
 }
+
+/// Compile-time cap on the shutdown runner list; see shutdownAgents.
+const shutdown_runner_cap: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -560,4 +573,13 @@ test "drainWakePipe on empty pipe returns without blocking" {
     // Pipe is empty; the function must bail on the first WouldBlock rather
     // than hang. If this test ever times out, drainWakePipe is blocking.
     drainWakePipe(fds[0]);
+}
+
+test "shutdownAgents uses BoundedArray capacity that fits 1 root + typical splits" {
+    // Weak regression pin: if someone shrinks the shutdown cap below
+    // a plausible pane count, this test fails. The real evidence that
+    // shutdown cannot OOM is the diff (no self.allocator use on the
+    // runner list path).
+    const realistic_ceiling: usize = 16;
+    try std.testing.expect(realistic_ceiling <= shutdown_runner_cap);
 }
