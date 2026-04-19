@@ -194,7 +194,7 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
         return .{ .base = first, .width = 1 };
     }
 
-    const base_width = codepointWidth(first);
+    var base_width = codepointWidth(first);
 
     // A width-0 base (control, stray combining mark) stands alone; do not
     // absorb trailing joiners. They'll start their own cluster and produce
@@ -209,8 +209,16 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
         const saved = iter.i;
         const next = iter.nextCodepoint() orelse break;
 
-        // Skin-tone modifier or VS-16 always absorbs.
-        if (isSkinToneModifier(next) or next == 0xFE0F) continue;
+        // Skin-tone modifier always absorbs.
+        if (isSkinToneModifier(next)) continue;
+
+        // VS-16 (U+FE0F) absorbs and promotes a width-1 base to width 2.
+        // VS-16 is the explicit signal that the user wants emoji rendering,
+        // so terminals draw the cluster as a wide glyph.
+        if (next == 0xFE0F) {
+            if (base_width == 1) base_width = 2;
+            continue;
+        }
 
         // ZWJ: consume the ZWJ and the codepoint after it (the joined
         // emoji). If nothing follows, the sequence is malformed at EOF.
@@ -280,14 +288,14 @@ test "nextCluster: combining mark fuses into the preceding letter" {
     try testing.expect(nextCluster(&iter) == null);
 }
 
-test "nextCluster: emoji + VS-16 is one cluster" {
-    // ❤ + VS-16 → one cluster, base = U+2764, width = codepointWidth(U+2764)
-    // U+2764 is NOT in our wide table today (width 1). We deliberately do not
-    // upgrade the base's width on VS-16; just fuse the VS-16 into the cluster.
+test "nextCluster: emoji + VS-16 upgrades base to width 2" {
+    // VS-16 signals emoji presentation; every major terminal renders
+    // U+2764 (heart) with VS-16 as a 2-cell glyph. The cluster absorbs
+    // VS-16 and promotes base_width accordingly.
     var iter = iterOf("\u{2764}\u{FE0F}");
     const c = nextCluster(&iter).?;
     try testing.expectEqual(@as(u21, 0x2764), c.base);
-    try testing.expectEqual(@as(u2, 1), c.width);
+    try testing.expectEqual(@as(u2, 2), c.width);
     try testing.expect(nextCluster(&iter) == null);
 }
 
