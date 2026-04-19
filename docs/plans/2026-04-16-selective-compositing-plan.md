@@ -59,7 +59,7 @@ test "clearRect clips to screen bounds" {
         cell.codepoint = 'X';
     }
 
-    // Rect extends past screen edge — should not crash
+    // Rect extends past screen edge, should not crash
     screen.clearRect(2, 3, 10, 10);
 
     // Inside bounds: cleared
@@ -544,7 +544,7 @@ untouched, letting Screen.render diff them as unchanged."
 
 In `main.zig`, everywhere `layout.recalculate` is called, also set `compositor.layout_dirty = true`. There are several sites:
 
-- Line 540: initial `layout.recalculate` — `layout_dirty` starts as `true`, so no change needed.
+- Line 540: initial `layout.recalculate`: `layout_dirty` starts as `true`, so no change needed.
 - Line 611-614 (SIGWINCH resize): after `layout.recalculate`, add `compositor.layout_dirty = true;`
 - Line 657-659 (resize event): after `layout.recalculate`, add `compositor.layout_dirty = true;`
 - In `doSplit` (around line 405): after `layout.recalculate`, add `compositor.layout_dirty = true;`
@@ -617,7 +617,7 @@ Expected: All tests pass.
 
 Run: `zig build -Dmetrics=true run`
 - Type some messages, verify content renders correctly
-- Use `/perf` to check frame metrics — allocs/frame should be lower on idle frames
+- Use `/perf` to check frame metrics: allocs/frame should be lower on idle frames
 - Open splits with Ctrl+W v, verify both panes render
 - Scroll with Page Up/Down, verify content updates
 
@@ -647,11 +647,11 @@ Expected: All tests pass.
 **Step 2: Build with metrics and verify**
 
 Run: `zig build -Dmetrics=true run`
-Test: send a message, wait for response, then sit idle. Check `/perf` output — frame count should be near zero during idle. During streaming, frames should correspond to event batches, not a fixed 62fps.
+Test: send a message, wait for response, then sit idle. Check `/perf` output, frame count should be near zero during idle. During streaming, frames should correspond to event batches, not a fixed 62fps.
 
 **Step 3: Verify multi-split behavior**
 
-Open 3+ splits. Send a message in one pane. Verify only that pane updates while others remain static. Switch focus and scroll in a different pane — only that pane should redraw.
+Open 3+ splits. Send a message in one pane. Verify only that pane updates while others remain static. Switch focus and scroll in a different pane, only that pane should redraw.
 
 **Step 4: Verify resize**
 

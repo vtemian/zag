@@ -1,10 +1,10 @@
-# Grapheme Width Fusion — Implementation Plan
+# Grapheme Width Fusion: Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task. Each task is one commit. Follow TDD for every task: write the failing test, watch it fail for the *right reason*, implement, watch it pass, commit.
 
 **Goal:** Make Zag's cell grid render ZWJ emoji sequences, skin-tone modifiers, variation selectors, and regional-indicator flag pairs as single visual clusters instead of shredding each codepoint into its own cells.
 
-**Architecture:** Introduce a `nextCluster` helper in `src/width.zig` that advances a `std.unicode.Utf8Iterator` through one grapheme-ish cluster and returns `{ base, width }`. `Screen.writeStr` and `Screen.writeStrWrapped` switch from per-codepoint iteration to per-cluster iteration. The `Cell` struct is unchanged — we store the base codepoint in the primary cell and rely on the existing continuation-cell mechanism for visual width 2. Downstream renderer (`findRunEnd`, SGR emit path) needs no changes because it already reads one codepoint per cell and respects the `continuation` flag.
+**Architecture:** Introduce a `nextCluster` helper in `src/width.zig` that advances a `std.unicode.Utf8Iterator` through one grapheme-ish cluster and returns `{ base, width }`. `Screen.writeStr` and `Screen.writeStrWrapped` switch from per-codepoint iteration to per-cluster iteration. The `Cell` struct is unchanged, we store the base codepoint in the primary cell and rely on the existing continuation-cell mechanism for visual width 2. Downstream renderer (`findRunEnd`, SGR emit path) needs no changes because it already reads one codepoint per cell and respects the `continuation` flag.
 
 **Tech Stack:** Zig 0.15, `std.unicode.Utf8View.Iterator`, existing `src/width.zig` + `src/Screen.zig` only. No new dependencies.
 
@@ -30,15 +30,15 @@ Today `Screen.writeStr` (src/Screen.zig:163-187) walks `std.unicode.Utf8View.Ite
 The bug: a ZWJ emoji sequence like 👨‍👩‍👧 (`U+1F468 U+200D U+1F469 U+200D U+1F467`) currently writes as:
 
 - col 0–1: 👨 (w=2, primary + continuation)
-- col 2–3: 👩 (w=2 — ZWJ silently skipped, next emoji overwrites) — **bug: should be zero additional width**
-- col 4–5: 👧 (w=2) — **bug: same**
+- col 2–3: 👩 (w=2: ZWJ silently skipped, next emoji overwrites), **bug: should be zero additional width**
+- col 4–5: 👧 (w=2): **bug: same**
 
 Net: 6 cells allocated for a glyph the terminal draws in 1 cluster (visual width 2). Prompt positioning, truncation, and diff all lie.
 
 Similar bugs:
 
 - 👍🏻 (thumb-up + medium-light skin tone, `U+1F44D U+1F3FB`) allocates 4 cells (2+2) instead of 2.
-- ❤️ (heart + VS-16, `U+2764 U+FE0F`) allocates 1 cell (VS-16 is width 0 today, and U+2764 is width 1 in the UAX). Terminals usually render this as width 2 when emoji presentation is forced. Out of scope for this plan — we won't upgrade non-wide bases to width 2 on VS-16. Document it.
+- ❤️ (heart + VS-16, `U+2764 U+FE0F`) allocates 1 cell (VS-16 is width 0 today, and U+2764 is width 1 in the UAX). Terminals usually render this as width 2 when emoji presentation is forced. Out of scope for this plan: we won't upgrade non-wide bases to width 2 on VS-16. Document it.
 - 🇺🇸 (flag, `U+1F1FA U+1F1F8`) allocates 2 cells of width 1 each. Terminals render as one width-2 glyph. This **is** in scope.
 
 ---
@@ -46,7 +46,7 @@ Similar bugs:
 ## Task 1: Add a Cluster type and failing tests for `nextCluster`
 
 **Files:**
-- Modify: `src/width.zig` (add `Cluster` type and new tests only — no implementation yet)
+- Modify: `src/width.zig` (add `Cluster` type and new tests only: no implementation yet)
 
 **Step 1: Add the new test block and type declaration**
 
@@ -55,7 +55,7 @@ At the top of `src/width.zig`, after the existing `isWide` function (line 159), 
 ```zig
 /// One grapheme-ish cluster extracted from a UTF-8 iterator.
 ///
-/// `base` is the starting codepoint of the cluster — this is what gets stored
+/// `base` is the starting codepoint of the cluster, this is what gets stored
 /// in the primary Screen cell. Joined codepoints (ZWJ continuations, skin-tone
 /// modifiers, variation selectors, combining marks) are consumed silently and
 /// do not appear in the returned cluster.
@@ -87,7 +87,7 @@ fn isSkinToneModifier(cp: u21) bool {
 }
 ```
 
-Then add this test block at the end of `src/width.zig` (after the existing `test { @import("std").testing.refAllDecls(@This()); }` block, or replace that block's position — it must come last):
+Then add this test block at the end of `src/width.zig` (after the existing `test { @import("std").testing.refAllDecls(@This()); }` block, or replace that block's position, it must come last):
 
 ```zig
 fn iterOf(s: []const u8) std.unicode.Utf8Iterator {
@@ -268,7 +268,7 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
 
     const base_width = codepointWidth(first);
 
-    // A width-0 base (control, stray combining mark) stands alone — do not
+    // A width-0 base (control, stray combining mark) stands alone, do not
     // absorb trailing joiners; they'll start their own cluster and produce
     // harmless width-0 output at the call site.
     if (base_width == 0) {
@@ -285,7 +285,7 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
         if (isSkinToneModifier(next) or next == 0xFE0F) continue;
 
         // ZWJ: consume the ZWJ and the codepoint after it (the joined
-        // emoji). If nothing follows, the sequence is malformed at EOF —
+        // emoji). If nothing follows, the sequence is malformed at EOF ,
         // stop cleanly.
         if (next == 0x200D) {
             _ = iter.nextCodepoint() orelse break;
@@ -344,7 +344,7 @@ EOF
 ## Task 3: Add failing Screen tests for cluster rendering
 
 **Files:**
-- Modify: `src/Screen.zig` — append new test cases to the end of the file's test block (find the existing `test "..."` blocks near the bottom; add these alongside).
+- Modify: `src/Screen.zig`: append new test cases to the end of the file's test block (find the existing `test "..."` blocks near the bottom; add these alongside).
 
 **Step 1: Locate where Screen tests live**
 
@@ -562,7 +562,7 @@ screen: writeStr uses grapheme clusters instead of codepoints
 
 Swap Utf8Iterator.nextCodepoint for width.nextCluster so ZWJ emoji,
 skin-tone modifiers, VS-16, and flag pairs occupy their correct
-visual width in the cell grid. Cell struct unchanged — joined
+visual width in the cell grid. Cell struct unchanged, joined
 codepoints beyond the base are silently consumed.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -688,7 +688,7 @@ test "regional indicator symbol letters pin current behaviour" {
 }
 ```
 
-The `codepointWidth` for a lone regional indicator is still 1 — that's correct and unchanged. The TODO no longer applies because pair handling is now in `nextCluster`. Update to:
+The `codepointWidth` for a lone regional indicator is still 1, that's correct and unchanged. The TODO no longer applies because pair handling is now in `nextCluster`. Update to:
 
 ```zig
 test "regional indicator singleton codepointWidth is 1" {
@@ -725,7 +725,7 @@ EOF
 **Files:**
 - None modified. This is a verification-only task.
 
-**Why:** Compositor uses `screen.writeStr` for titles, prompts, status line, and wrapped content (src/Compositor.zig ~375, 397-403, 432-433, 501, 507, 519, 535). MarkdownParser/NodeRenderer produce styled lines that eventually reach `writeStr`. None of these should observe a behavior change for ASCII, CJK, or existing emoji — only for previously-broken cluster inputs.
+**Why:** Compositor uses `screen.writeStr` for titles, prompts, status line, and wrapped content (src/Compositor.zig ~375, 397-403, 432-433, 501, 507, 519, 535). MarkdownParser/NodeRenderer produce styled lines that eventually reach `writeStr`. None of these should observe a behavior change for ASCII, CJK, or existing emoji, only for previously-broken cluster inputs.
 
 **Step 1: Run the full test suite**
 
@@ -743,13 +743,13 @@ zig build
 
 Then in a separate terminal, run `./zig-out/bin/zag` and type a message containing:
 
-- `中文` — should render as 2 cells per character (unchanged from before)
-- `😀` — should render as 2 cells (unchanged)
-- `👨‍👩‍👧` — should render as 2 cells (**was 6**)
-- `👍🏻` — should render as 2 cells (**was 4**)
-- `🇺🇸` — should render as 2 cells (**was 2 of width 1 each = visually corrupted**)
+- `中文`: should render as 2 cells per character (unchanged from before)
+- `😀`: should render as 2 cells (unchanged)
+- `👨‍👩‍👧`: should render as 2 cells (**was 6**)
+- `👍🏻`: should render as 2 cells (**was 4**)
+- `🇺🇸`: should render as 2 cells (**was 2 of width 1 each = visually corrupted**)
 
-If any of these look wrong in the TUI but the tests pass, investigate — likely the diff/render path or a Compositor clearing bug. **Do not close the task without the visual check.** Tests pass ≠ feature works; that rule is in CLAUDE.md and the TDD skill.
+If any of these look wrong in the TUI but the tests pass, investigate, likely the diff/render path or a Compositor clearing bug. **Do not close the task without the visual check.** Tests pass ≠ feature works; that rule is in CLAUDE.md and the TDD skill.
 
 **Step 3: If everything is clean, commit nothing and mark the plan complete**
 

@@ -1,8 +1,8 @@
-# Ghostty-Review Fixes — Implementation Plan
+# Ghostty-Review Fixes: Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task. Each task is one commit. Follow TDD for every task: write the failing test, watch it fail, implement, watch it pass, commit.
 
-**Goal:** Address the 10 correctness, robustness, and architecture issues identified in the 2026-04-16 architectural review — wide-character rendering, silent error swallowing, SSE DoS, god-object decomposition, thread-local callback state, Lua single-VM assumption, tool schema validation, provider serialization duplication, `anyerror` boundary, unjustified `catch unreachable`.
+**Goal:** Address the 10 correctness, robustness, and architecture issues identified in the 2026-04-16 architectural review, wide-character rendering, silent error swallowing, SSE DoS, god-object decomposition, thread-local callback state, Lua single-VM assumption, tool schema validation, provider serialization duplication, `anyerror` boundary, unjustified `catch unreachable`.
 
 **Architecture:** Land fixes in four phases, ordered by risk: correctness → robustness → architecture → performance. Each phase ends at a stable green state so work can pause between phases without leaving half-done refactors in tree. No cross-task dependencies within a phase.
 
@@ -19,13 +19,13 @@
 5. **Commit message format:** `<subsystem>: <imperative, <70 chars>` with optional why-paragraph. See the last 30 commits for voice.
 6. **Do not amend commits.** Create new commits. If you need to fix something from a prior task, that's a new commit.
 7. **No backwards-compat shims without asking Vlad.** This is a pre-1.0 codebase; rename/delete freely.
-8. **Naming:** no type in names (`_str`, `_buf`, `_result` embedded — forbidden). Use domain roles.
+8. **Naming:** no type in names (`_str`, `_buf`, `_result` embedded: forbidden). Use domain roles.
 9. **Every allocation needs `errdefer`.** If you add `alloc.dupe`, `ArrayList.append`, etc., check the next line can fail.
 10. **Zig 0.15 ArrayList:** use `.empty` + pass allocator per method. Never `ArrayList.init(allocator)`.
 
 ---
 
-## Phase 1 — Correctness (the bugs that are already wrong today)
+## Phase 1: Correctness (the bugs that are already wrong today)
 
 Goal: fix four correctness bugs. Two of them (wcwidth, SSE cap) are user-observable. Two (queue visibility, `catch unreachable`) matter for diagnosability.
 
@@ -37,7 +37,7 @@ Goal: fix four correctness bugs. Two of them (wcwidth, SSE cap) are user-observa
 
 **Files:**
 - Create: `src/width.zig`
-- No edits to Screen.zig yet — Task 1.2 wires it in.
+- No edits to Screen.zig yet: Task 1.2 wires it in.
 
 **Step 1: Write the failing test**
 
@@ -96,7 +96,7 @@ Append to `src/width.zig`:
 //! Terminal display width for Unicode codepoints.
 //!
 //! Based on East Asian Width (UAX #11) wide/fullwidth ranges plus common
-//! emoji blocks. Not a full Unicode width implementation — good enough for
+//! emoji blocks. Not a full Unicode width implementation, good enough for
 //! a terminal TUI, not good enough to ship as a library.
 
 /// Display width in terminal cells: 0 (control/combining), 1 (normal),
@@ -202,7 +202,7 @@ git commit -m "$(cat <<'EOF'
 render: add codepoint display width module
 
 Covers wide/fullwidth (UAX #11 W and F), combining marks, zero-width
-joiners, variation selectors. Not a full Unicode width implementation —
+joiners, variation selectors. Not a full Unicode width implementation ,
 wcwidth-adjacent, enough for a TUI that wants correct CJK and emoji
 rendering.
 
@@ -218,11 +218,11 @@ EOF
 **Why:** `src/Screen.zig:143-190` and the render loop at `src/Screen.zig:244-320` must advance columns by the codepoint's display width, not by 1. Wide chars must claim two cells (second cell marked as continuation or emptied); zero-width chars must not advance the column at all.
 
 **Files:**
-- Modify: `src/Screen.zig:41-50` (Cell struct — add `continuation: bool = false` field)
+- Modify: `src/Screen.zig:41-50` (Cell struct: add `continuation: bool = false` field)
 - Modify: `src/Screen.zig:143-157` (writeStr)
 - Modify: `src/Screen.zig:161-190` (writeStrWrapped)
-- Modify: `src/Screen.zig:244-320` (render — skip continuation cells, advance by width)
-- Modify: any places that pattern-match on `Cell` — search for `cell.codepoint` and update construction sites.
+- Modify: `src/Screen.zig:244-320` (render: skip continuation cells, advance by width)
+- Modify: any places that pattern-match on `Cell`: search for `cell.codepoint` and update construction sites.
 
 **Step 1: Write the failing test**
 
@@ -262,7 +262,7 @@ test "writeStr skips wide char that would overflow the row" {
 **Step 2: Verify tests fail**
 
 Run: `zig build test 2>&1 | grep -A2 "writeStr advances"`
-Expected: failure — wide char is written as width 1, assertions fail.
+Expected: failure, wide char is written as width 1, assertions fail.
 
 **Step 3: Implement**
 
@@ -298,7 +298,7 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
         if (row >= self.height) break;
         const w = width_mod.codepointWidth(cp);
         if (w == 0) continue; // zero-width: do not consume a cell
-        if (c + w > self.width) break; // wide char doesn't fit — stop
+        if (c + w > self.width) break; // wide char doesn't fit, stop
         const cell = self.getCell(row, c);
         cell.codepoint = cp;
         cell.style = style;
@@ -342,7 +342,7 @@ pub fn writeStrWrapped(
             row += 1;
             col = start_col;
             if (row >= max_row) break;
-            if (col + w > max_col) break; // still won't fit — give up
+            if (col + w > max_col) break; // still won't fit, give up
         }
         const cell = self.getCell(row, col);
         cell.codepoint = cp;
@@ -365,7 +365,7 @@ pub fn writeStrWrapped(
 In the render loop at `src/Screen.zig:244-320`, inside the `for (0..self.width) |col_usize|` loop body, after reading `cur` and `prev`:
 
 ```zig
-// Skip continuation cells — they're painted by their primary cell
+// Skip continuation cells, they're painted by their primary cell
 if (cur.continuation) continue;
 ```
 
@@ -420,7 +420,7 @@ test "readLine caps pending_line at MAX_SSE_LINE" {
     var buf = try testing.allocator.alloc(u8, MAX_SSE_LINE + 1024);
     defer testing.allocator.free(buf);
     @memset(buf, 'x');
-    // buf has no '\n' — classic attack
+    // buf has no '\n', classic attack
 
     var fake: FakeBodyReader = .{ .data = buf };
     var sr: StreamingResponse = .{
@@ -440,12 +440,12 @@ test "readLine caps pending_line at MAX_SSE_LINE" {
 }
 ```
 
-(If a `FakeBodyReader` helper doesn't already exist, add a minimal one at the top of the test section — just enough to back `readSliceShort`.)
+(If a `FakeBodyReader` helper doesn't already exist, add a minimal one at the top of the test section, just enough to back `readSliceShort`.)
 
 **Step 2: Verify test fails**
 
 Run: `zig build test 2>&1 | grep -A2 "readLine caps"`
-Expected: failure — either OOM or no such error variant exists.
+Expected: failure, either OOM or no such error variant exists.
 
 **Step 3: Implement caps**
 
@@ -519,9 +519,9 @@ EOF
 
 **Why:** Four sites use `catch unreachable` where the operation can actually fail. These turn recoverable errors into panics.
 
-- `src/ConversationBuffer.zig:414` — `bufPrint(&[16]u8, "synth_{d}", counter)` panics once the counter crosses 9999999 (10 digits).
-- `src/llm.zig:419`, `src/llm.zig:489` — `std.Uri.parse(url)` panics on a malformed endpoint.
-- `src/agent.zig:623` — `Timer.start()` in a benchmark test panics if no monotonic clock.
+- `src/ConversationBuffer.zig:414`: `bufPrint(&[16]u8, "synth_{d}", counter)` panics once the counter crosses 9999999 (10 digits).
+- `src/llm.zig:419`, `src/llm.zig:489`: `std.Uri.parse(url)` panics on a malformed endpoint.
+- `src/agent.zig:623`: `Timer.start()` in a benchmark test panics if no monotonic clock.
 
 **Files:** `src/ConversationBuffer.zig`, `src/llm.zig`, `src/agent.zig`.
 
@@ -583,7 +583,7 @@ At `src/agent.zig:623`, the site is inside a test benchmark. Either skip the tes
 
 ```zig
 var timer = std.time.Timer.start() catch |err| {
-    std.debug.print("skipping benchmark — no monotonic clock: {s}\n", .{@errorName(err)});
+    std.debug.print("skipping benchmark, no monotonic clock: {s}\n", .{@errorName(err)});
     return;
 };
 ```
@@ -640,7 +640,7 @@ test "EventQueue.tryPush increments dropped on failure" {
 }
 ```
 
-(If `FailingAllocator` doesn't exist yet, add a minimal one in the test block — `std.testing.FailingAllocator` also works if available in this Zig version.)
+(If `FailingAllocator` doesn't exist yet, add a minimal one in the test block, `std.testing.FailingAllocator` also works if available in this Zig version.)
 
 **Step 2: Verify failure**
 
@@ -693,16 +693,16 @@ Now replace every `queue.push(...) catch {}` with `queue.tryPush(...)`. The site
 - `src/AgentThread.zig:156`: `queue.tryPush(.done);`
 - `src/agent.zig:386`: `q.tryPush(agent_event);`
 
-For `ConversationBuffer.zig:509,533,554,606` — these aren't `queue.push`, they're `appendNode` / `persistEvent` / `put`. Apply the same pattern but against a `ConversationBuffer.dropped` counter, or leave with explicit `log.warn` (both are acceptable). The minimal first cut: replace the bare `catch {}` with `catch |err| log.warn("dropped event: {s}", .{@errorName(err)});` for the ConversationBuffer sites. Save the full counter wiring for Task 2.1.
+For `ConversationBuffer.zig:509,533,554,606`, these aren't `queue.push`, they're `appendNode` / `persistEvent` / `put`. Apply the same pattern but against a `ConversationBuffer.dropped` counter, or leave with explicit `log.warn` (both are acceptable). The minimal first cut: replace the bare `catch {}` with `catch |err| log.warn("dropped event: {s}", .{@errorName(err)});` for the ConversationBuffer sites. Save the full counter wiring for Task 2.1.
 
 **Step 4: Surface the counter in the status line**
 
-In `src/Compositor.zig` near where the status is rendered (around line 260-304), read `cb.event_queue.dropped.load(.monotonic)` and, if non-zero, append `" [drops: N]"` to the status string. Keep the code minimal — this is observability, not a feature.
+In `src/Compositor.zig` near where the status is rendered (around line 260-304), read `cb.event_queue.dropped.load(.monotonic)` and, if non-zero, append `" [drops: N]"` to the status string. Keep the code minimal, this is observability, not a feature.
 
 **Step 5: Verify**
 
-Run: `zig build test` — green.
-Run: `zig build run` — no regressions in normal flow.
+Run: `zig build test`, green.
+Run: `zig build run`, no regressions in normal flow.
 
 **Step 6: Commit**
 
@@ -723,7 +723,7 @@ EOF
 
 ---
 
-## Phase 2 — Robustness (make failure modes predictable)
+## Phase 2: Robustness (make failure modes predictable)
 
 Goal: make failure modes explicit. After Phase 2, every observable failure has a code path that handles it rather than silently corrupting state.
 
@@ -750,7 +750,7 @@ test "EventQueue bounded: pushes beyond capacity go to dropped" {
 
 **Step 2: Verify failure**
 
-Run: `zig build test` — fails, `initBounded` unknown.
+Run: `zig build test`, fails, `initBounded` unknown.
 
 **Step 3: Implement**
 
@@ -789,7 +789,7 @@ pub const EventQueue = struct {
     pub fn tryPush(self: *EventQueue, event: AgentEvent) void {
         self.push(event) catch {
             _ = self.dropped.fetchAdd(1, .monotonic);
-            // Caller leaked any allocations inside `event` — document this.
+            // Caller leaked any allocations inside `event`, document this.
             // Push sites must free owned bytes on QueueFull if they care.
         };
     }
@@ -829,11 +829,11 @@ q.push(agent_event) catch {
 };
 ```
 
-Add `AgentEvent.freeOwned` helper in `src/AgentThread.zig` that frees the owned bytes per variant. Update `tryPush` to take an allocator *or* require each caller to handle cleanup explicitly. Pick one; I recommend the explicit pattern (no free inside tryPush — the struct doesn't know the allocator).
+Add `AgentEvent.freeOwned` helper in `src/AgentThread.zig` that frees the owned bytes per variant. Update `tryPush` to take an allocator *or* require each caller to handle cleanup explicitly. Pick one; I recommend the explicit pattern (no free inside tryPush, the struct doesn't know the allocator).
 
 **Step 5: Verify**
 
-Run: `zig build test` — green.
+Run: `zig build test`, green.
 
 **Step 6: Commit**
 
@@ -845,7 +845,7 @@ agent: bound event queue to fixed capacity with explicit drop
 EventQueue is now a ring buffer (capacity 256). Push returns QueueFull
 rather than growing; tryPush increments the dropped counter. Callers
 free owned allocations on drop explicitly. This replaces unbounded
-growth, which concealed the real problem — the UI couldn't keep up.
+growth, which concealed the real problem, the UI couldn't keep up.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -854,7 +854,7 @@ EOF
 
 ---
 
-### Task 2.2: Typed tool error set — remove `anyerror` from tool signatures
+### Task 2.2: Typed tool error set: remove `anyerror` from tool signatures
 
 **Why:** `src/types.zig:117-122` declares `execute: *const fn (...) anyerror!ToolResult`. `src/tools.zig:56` propagates it. This collapses OOM, invalid-input, and tool-business-logic failures into one bucket so callers can't handle them distinctly.
 
@@ -906,13 +906,13 @@ fn testInvalidInputTool(input_raw: []const u8, allocator: Allocator) types.ToolE
 
 **Step 3: Verify failure**
 
-Run: `zig build test` — compile error, signatures mismatch.
+Run: `zig build test`, compile error, signatures mismatch.
 
 **Step 4: Port every tool**
 
 `src/tools/read.zig`, `src/tools/write.zig`, `src/tools/edit.zig`, `src/tools/bash.zig`: change signature from `anyerror!ToolResult` to `types.ToolError!ToolResult`. Replace `json.parseFromSlice` failures with `return error.InvalidInput`. Replace generic tool failures with `error.ToolFailed`. Propagate `error.OutOfMemory` as-is.
 
-`src/LuaEngine.zig:324` — `executeTool` signature becomes `ToolError!ToolResult`. Lua call failures map to `error.ToolFailed`; table-conversion OOM to `error.OutOfMemory`.
+`src/LuaEngine.zig:324`, `executeTool` signature becomes `ToolError!ToolResult`. Lua call failures map to `error.ToolFailed`; table-conversion OOM to `error.OutOfMemory`.
 
 **Step 5: Update `src/tools.zig:56`**
 
@@ -942,7 +942,7 @@ const msg = switch (err) {
 
 **Step 6: Verify**
 
-Run: `zig build test` — green. Run `zig build run` manually.
+Run: `zig build test`, green. Run `zig build run` manually.
 
 **Step 7: Commit**
 
@@ -1018,7 +1018,7 @@ test "valid input passes" {
 ```zig
 /// Minimal JSON-Schema validator. Supports: object type, required, properties
 /// with string/integer/number/boolean types. Unknown fields are allowed.
-/// Everything else in JSON-Schema is silently accepted — YAGNI until it breaks.
+/// Everything else in JSON-Schema is silently accepted, YAGNI until it breaks.
 pub fn validate(allocator: std.mem.Allocator, schema_json: []const u8, input_json: []const u8) ValidationError!void {
     const schema = try std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{});
     defer schema.deinit();
@@ -1087,7 +1087,7 @@ Add `const json_schema = @import("json_schema.zig");` at the top.
 
 **Step 4: Verify**
 
-Run: `zig build test` — green.
+Run: `zig build test`, green.
 
 **Step 5: Commit**
 
@@ -1164,7 +1164,7 @@ test "bash kills child on cancel" {
 In `src/tools/bash.zig`, after `child.spawn()`, poll `cancel` while collecting output instead of using `collectOutput` blocking. Replace the collectOutput call with a loop:
 
 ```zig
-// Simplified sketch — actual impl must read stdout/stderr via poll(2) or
+// Simplified sketch, actual impl must read stdout/stderr via poll(2) or
 // non-blocking pipes to maintain backpressure.
 const poll_interval_ns = 50 * std.time.ns_per_ms;
 while (true) {
@@ -1182,11 +1182,11 @@ while (true) {
 }
 ```
 
-This is a non-trivial rewrite of bash — allocate a full day. Consider splitting into a sub-task if too big.
+This is a non-trivial rewrite of bash, allocate a full day. Consider splitting into a sub-task if too big.
 
 **Step 4: Verify**
 
-Run: `zig build test` — green. Manual smoke: run `bash { "command": "sleep 30" }`, press the cancel keybind, confirm the child dies within a second.
+Run: `zig build test`, green. Manual smoke: run `bash { "command": "sleep 30" }`, press the cancel keybind, confirm the child dies within a second.
 
 **Step 5: Commit**
 
@@ -1198,7 +1198,7 @@ tools/bash: kill child on cancel
 Tool execute now accepts a cancel pointer. Bash polls it while reading
 child output; on cancel, kills the child and returns a cancelled
 result within one poll interval (50ms). Other tools accept the cancel
-pointer as a nop — only long-running tools need it.
+pointer as a nop, only long-running tools need it.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1282,7 +1282,7 @@ Use `stream_ctx.text_count` in the fallback reset-assistant-text check.
 
 **Step 4: Verify**
 
-Run: `zig build test` — green. Manual: streaming still works.
+Run: `zig build test`, green. Manual: streaming still works.
 
 **Step 5: Commit**
 
@@ -1302,7 +1302,7 @@ EOF
 
 ---
 
-## Phase 3 — Architecture (reduce coupling, unlock plugins)
+## Phase 3: Architecture (reduce coupling, unlock plugins)
 
 Goal: decompose the two god objects (`main.zig`, `ConversationBuffer.zig`), eliminate provider serialization duplication, and put up at least a soft sandbox for Lua.
 
@@ -1377,12 +1377,12 @@ test "orchestrator handles a synthetic key and posts to focused buffer" {
 }
 ```
 
-Keep this test lightweight — the orchestrator is control flow, not logic. Refactor tests matter more than new ones here.
+Keep this test lightweight, the orchestrator is control flow, not logic. Refactor tests matter more than new ones here.
 
 **Step 4: Verify**
 
-Run: `zig build test` — green.
-Run: `zig build run` — manual smoke: open app, type, split, quit.
+Run: `zig build test`, green.
+Run: `zig build run`, manual smoke: open app, type, split, quit.
 
 **Step 5: Commit**
 
@@ -1412,8 +1412,8 @@ EOF
 **Step 1: Change `submitInput` to only enqueue a user message**
 
 ```zig
-// Before: submitInput(text, provider, registry, allocator, lua_eng) — spawns thread
-// After: submitInput(text, allocator) — appends node, message, returns void
+// Before: submitInput(text, provider, registry, allocator, lua_eng), spawns thread
+// After: submitInput(text, allocator), appends node, message, returns void
 pub fn submitInput(self: *ConversationBuffer, text: []const u8, allocator: Allocator) !void {
     const node = try self.appendNode(null, .user_text, text);
     _ = node;
@@ -1458,7 +1458,7 @@ The existing tests in `ConversationBuffer.zig` should already pass since they do
 
 **Step 5: Verify**
 
-Run: `zig build test` — green.
+Run: `zig build test`, green.
 
 **Step 6: Commit**
 
@@ -1538,11 +1538,11 @@ test "openai body places system as first message" {
 
 **Step 3: Implement, then port providers**
 
-Replace both providers' `buildRequestBodyInner` with calls to `serialize.buildRequestBody(allocator, .{ ..., .flavor = .anthropic })` and `.openai`. Keep each provider file as a thin adapter — auth headers, endpoint URL, response parsing.
+Replace both providers' `buildRequestBodyInner` with calls to `serialize.buildRequestBody(allocator, .{ ..., .flavor = .anthropic })` and `.openai`. Keep each provider file as a thin adapter, auth headers, endpoint URL, response parsing.
 
 **Step 4: Verify**
 
-Run: `zig build test` — green. Manual: run against both providers, confirm requests succeed.
+Run: `zig build test`, green. Manual: run against both providers, confirm requests succeed.
 
 **Step 5: Commit**
 
@@ -1564,7 +1564,7 @@ EOF
 
 ---
 
-### Task 3.4: Lua sandbox — disable `os`, `io`, `debug` for user plugins
+### Task 3.4: Lua sandbox: disable `os`, `io`, `debug` for user plugins
 
 **Why:** `src/LuaEngine.zig:48` calls `lua.openLibs()`, exposing `os.execute`, `io.popen`, `debug.getregistry`. A shared plugin marketplace is one `os.execute("rm -rf ~")` away from disaster. Ghostty won't copy executables from the internet; Zag shouldn't give copy-paste plugins kernel-level access.
 
@@ -1612,7 +1612,7 @@ Provide a `-Dlua_sandbox=false` build flag in `build.zig` so developers can temp
 
 **Step 3: Verify**
 
-Run: `zig build test` — green.
+Run: `zig build test`, green.
 
 **Step 4: Commit**
 
@@ -1633,7 +1633,7 @@ EOF
 
 ---
 
-## Phase 4 — Performance (only after Phases 1-3 are green)
+## Phase 4: Performance (only after Phases 1-3 are green)
 
 Goal: make the rendering pipeline efficient. These changes are not correctness fixes; they reduce terminal bandwidth and visual latency.
 
@@ -1641,7 +1641,7 @@ Goal: make the rendering pipeline efficient. These changes are not correctness f
 
 ### Task 4.1: Merge horizontal runs and use implicit cursor advancement
 
-**Why:** `src/Screen.zig:244-320` emits a cursor-move + SGR for every changed cell. Rendering 10000 styled lines produces 500KB of ANSI instead of ~5KB. The terminal can advance the cursor implicitly after each character — we don't need to position before every cell, only before a new run.
+**Why:** `src/Screen.zig:244-320` emits a cursor-move + SGR for every changed cell. Rendering 10000 styled lines produces 500KB of ANSI instead of ~5KB. The terminal can advance the cursor implicitly after each character, we don't need to position before every cell, only before a new run.
 
 **Files:** `src/Screen.zig`.
 
@@ -1664,7 +1664,7 @@ test "diff emits at most one SGR per contiguous same-style run" {
     var buf: [2048]u8 = undefined;
     const n = try std.posix.read(pipe[0], &buf);
     const out = buf[0..n];
-    // Count "\x1b[38;5;1m" occurrences — should be exactly 1
+    // Count "\x1b[38;5;1m" occurrences, should be exactly 1
     var count: usize = 0;
     var iter = std.mem.splitSequence(u8, out, "\x1b[");
     while (iter.next()) |_| count += 1;
@@ -1702,7 +1702,7 @@ Also emit `\x1b[K` (clear to EOL) when the suffix of the line is becoming empty 
 
 **Step 3: Verify**
 
-Run: `zig build test` — green including the size test.
+Run: `zig build test`, green including the size test.
 Run: set `ZAG_METRICS=1`, measure ANSI bytes per frame, confirm reduction.
 
 **Step 4: Commit**
@@ -1725,7 +1725,7 @@ EOF
 
 ---
 
-### Task 4.2: Terminal capability detection — truecolor vs 256-color
+### Task 4.2: Terminal capability detection: truecolor vs 256-color
 
 **Why:** `src/Theme.zig` hard-codes `.rgb` colors. A user on a 256-color terminal sees garbled output. Ghostty queries `$COLORTERM` and terminfo; we can do at least the env-var check.
 
@@ -1780,11 +1780,11 @@ EOF
 
 These emerged in the review but are non-critical for the current pass:
 
-- **Per-pane Lua engine** — a real fix for the `active_engine` collision. Requires the main-thread request/response queue design from `docs/plans/2026-04-16-lua-hooks-design.md`. Revisit after Task 3.2 is stable.
-- **Session-format versioning** — add a `"format_version": 1` field to session metadata and a migration table for future schema changes.
-- **Tool-call timestamp sequence number** — sessions use ms timestamps; add a monotonic sequence counter for intra-ms ordering.
-- **Grapheme cluster input** — `src/input.zig:177-186` emits one event per codepoint; for Devanagari/Thai input, combine combining marks with their base character before emitting.
-- **Config hot reload** — add a `/reload` command that re-runs `LuaEngine.loadUserConfig` without restarting.
+- **Per-pane Lua engine**: a real fix for the `active_engine` collision. Requires the main-thread request/response queue design from `docs/plans/2026-04-16-lua-hooks-design.md`. Revisit after Task 3.2 is stable.
+- **Session-format versioning**: add a `"format_version": 1` field to session metadata and a migration table for future schema changes.
+- **Tool-call timestamp sequence number**: sessions use ms timestamps; add a monotonic sequence counter for intra-ms ordering.
+- **Grapheme cluster input**: `src/input.zig:177-186` emits one event per codepoint; for Devanagari/Thai input, combine combining marks with their base character before emitting.
+- **Config hot reload**: add a `/reload` command that re-runs `LuaEngine.loadUserConfig` without restarting.
 
 ---
 
@@ -1808,8 +1808,8 @@ These emerged in the review but are non-critical for the current pass:
 
 Plan complete and saved to `docs/plans/2026-04-16-ghostty-review-fixes.md`. Two execution options:
 
-**1. Subagent-Driven (this session)** — fresh subagent per task, review between tasks, fast iteration. Recommended for Phase 1 where each task is small and independent.
+**1. Subagent-Driven (this session)**, fresh subagent per task, review between tasks, fast iteration. Recommended for Phase 1 where each task is small and independent.
 
-**2. Parallel Session (separate)** — new session with `superpowers:executing-plans`, batch execution with checkpoints. Recommended for Phase 3 where tasks are large architectural changes.
+**2. Parallel Session (separate)**, new session with `superpowers:executing-plans`, batch execution with checkpoints. Recommended for Phase 3 where tasks are large architectural changes.
 
 Which approach, Vlad?

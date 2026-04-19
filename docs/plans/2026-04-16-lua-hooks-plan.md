@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
-**Goal:** Expose a Neovim-autocmd-style hook API — `zag.hook(event, opts, fn)` — so Lua plugins can observe, veto, and rewrite agent events. Consolidate all Lua execution onto the main thread.
+**Goal:** Expose a Neovim-autocmd-style hook API, `zag.hook(event, opts, fn)`, so Lua plugins can observe, veto, and rewrite agent events. Consolidate all Lua execution onto the main thread.
 
 **Architecture:** New `src/Hooks.zig` owns event definitions, payload types, registry, and pattern matching. `AgentThread.EventQueue` gains two request/response variants (`hook_request`, `lua_tool_request`) that let any background thread round-trip through the main thread via `std.Thread.ResetEvent`. Firing sites live in `agent.zig` (round-trip), `ConversationBuffer.submitInput` (local), and `drainBuffer` in `main.zig` (drain-time).
 
@@ -20,7 +20,7 @@
 - Create: `src/Hooks.zig`
 - Modify: `src/main.zig` (add one `_ = @import("Hooks.zig");` inside the test block so tests get discovered)
 
-**Step 1 — Write the failing test (inline in `Hooks.zig`)**
+**Step 1, Write the failing test (inline in `Hooks.zig`)**
 
 ```zig
 test "matchesPattern covers null, wildcard, exact, and comma list" {
@@ -40,7 +40,7 @@ test "parseEventName maps all nine strings" {
 }
 ```
 
-**Step 2 — Run tests, expect compile failure**
+**Step 2, Run tests, expect compile failure**
 
 ```
 zig build test 2>&1 | head -30
@@ -48,7 +48,7 @@ zig build test 2>&1 | head -30
 
 Expected: `error: unable to resolve 'Hooks'` or similar (module not yet imported).
 
-**Step 3 — Create `src/Hooks.zig` with minimum to pass**
+**Step 3, Create `src/Hooks.zig` with minimum to pass**
 
 ```zig
 //! Hook registry, event types, and round-trip request structs for Lua hooks.
@@ -122,7 +122,7 @@ test {
 }
 ```
 
-**Step 4 — Run tests, expect pass**
+**Step 4, Run tests, expect pass**
 
 ```
 zig build test
@@ -130,7 +130,7 @@ zig build test
 
 Expected: `All tests passed.` (or similar clean output). Specifically, `matchesPattern covers null...` and `parseEventName maps all nine strings` should both pass.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Hooks.zig src/main.zig
@@ -149,7 +149,7 @@ EOF
 **Files:**
 - Modify: `src/Hooks.zig`
 
-**Step 1 — Write failing tests**
+**Step 1, Write failing tests**
 
 Append to `Hooks.zig`:
 
@@ -174,7 +174,7 @@ test "HookPayload kind() returns the union tag" {
 }
 ```
 
-**Step 2 — Run tests, expect compile errors**
+**Step 2, Run tests, expect compile errors**
 
 ```
 zig build test 2>&1 | head -30
@@ -182,7 +182,7 @@ zig build test 2>&1 | head -30
 
 Expected: `error: use of undeclared identifier 'HookPayload'`.
 
-**Step 3 — Implement HookPayload + HookRequest**
+**Step 3, Implement HookPayload + HookRequest**
 
 Insert in `Hooks.zig` before the tests:
 
@@ -256,7 +256,7 @@ pub const HookRequest = struct {
 };
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -264,7 +264,7 @@ zig build test
 
 Expected: new HookRequest/HookPayload tests pass.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Hooks.zig
@@ -283,7 +283,7 @@ EOF
 **Files:**
 - Modify: `src/Hooks.zig`
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "Registry registers, iterates, and unregisters" {
@@ -311,7 +311,7 @@ test "Registry registers, iterates, and unregisters" {
 }
 ```
 
-**Step 2 — Run tests, expect compile error**
+**Step 2, Run tests, expect compile error**
 
 ```
 zig build test 2>&1 | head -20
@@ -319,7 +319,7 @@ zig build test 2>&1 | head -20
 
 Expected: `error: use of undeclared identifier 'Registry'`.
 
-**Step 3 — Implement Registry**
+**Step 3, Implement Registry**
 
 Append to `Hooks.zig`:
 
@@ -416,7 +416,7 @@ pub const Registry = struct {
 };
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -424,7 +424,7 @@ zig build test
 
 Expected: registry test passes.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Hooks.zig
@@ -443,7 +443,7 @@ EOF
 **Files:**
 - Modify: `src/AgentThread.zig:18-55`
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 Append to the existing tests in `AgentThread.zig`:
 
@@ -467,7 +467,7 @@ test "push and drain hook_request event" {
 }
 ```
 
-**Step 2 — Run tests, expect compile error**
+**Step 2, Run tests, expect compile error**
 
 ```
 zig build test 2>&1 | head -20
@@ -475,7 +475,7 @@ zig build test 2>&1 | head -20
 
 Expected: `error: no field named 'hook_request' in union 'AgentEvent'`.
 
-**Step 3 — Add variant**
+**Step 3, Add variant**
 
 At the top of `AgentThread.zig`, add `const Hooks = @import("Hooks.zig");` near the other imports. In the `AgentEvent` union at line 18, append:
 
@@ -485,7 +485,7 @@ At the top of `AgentThread.zig`, add `const Hooks = @import("Hooks.zig");` near 
 hook_request: *Hooks.HookRequest,
 ```
 
-**Step 4 — Run tests, expect pass**
+**Step 4, Run tests, expect pass**
 
 ```
 zig build test
@@ -493,7 +493,7 @@ zig build test
 
 Expected: the new test passes.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/AgentThread.zig
@@ -513,7 +513,7 @@ EOF
 - Modify: `src/Hooks.zig` (add `LuaToolRequest`)
 - Modify: `src/AgentThread.zig` (add variant)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 In `AgentThread.zig` test block:
 
@@ -542,11 +542,11 @@ test "push and drain lua_tool_request event" {
 }
 ```
 
-**Step 2 — Run tests, expect compile error**
+**Step 2, Run tests, expect compile error**
 
 Expected: `error: use of undeclared identifier 'LuaToolRequest'`.
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 Append to `Hooks.zig`:
 
@@ -577,7 +577,7 @@ Then in `AgentThread.zig` `AgentEvent` union, append:
 lua_tool_request: *Hooks.LuaToolRequest,
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -585,7 +585,7 @@ zig build test
 
 Expected: new test passes.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Hooks.zig src/AgentThread.zig
@@ -604,7 +604,7 @@ EOF
 **Files:**
 - Modify: `src/LuaEngine.zig` (add `hooks` field, `zagHookFn`, expose `zag.hook`)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 At the bottom of `LuaEngine.zig` add a test that runs a Lua snippet and asserts the hook count:
 
@@ -628,11 +628,11 @@ test "zag.hook registers a hook" {
 }
 ```
 
-**Step 2 — Run test, expect compile error**
+**Step 2, Run test, expect compile error**
 
 Expected: `error: no field named 'hook_registry'`.
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 In `LuaEngine.zig`:
 
@@ -651,7 +651,7 @@ hook_registry: Hooks.Registry,
 .hook_registry = Hooks.Registry.init(allocator),
 ```
 
-4. Teardown in `deinit` — iterate hooks and unref each Lua callback, then `hook_registry.deinit()`:
+4. Teardown in `deinit`: iterate hooks and unref each Lua callback, then `hook_registry.deinit()`:
 
 ```zig
 for (self.hook_registry.hooks.items) |h| {
@@ -734,7 +734,7 @@ fn zagHookFnInner(lua: *Lua) !i32 {
 }
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -742,7 +742,7 @@ zig build test
 
 Expected: the new test passes, existing tests still pass.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/LuaEngine.zig
@@ -756,12 +756,12 @@ EOF
 
 ---
 
-## Task 7: `LuaEngine.fireHook(*HookPayload)` — dispatch to Lua
+## Task 7: `LuaEngine.fireHook(*HookPayload)`: dispatch to Lua
 
 **Files:**
 - Modify: `src/LuaEngine.zig`
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "fireHook invokes Lua callback for matching event" {
@@ -785,11 +785,11 @@ test "fireHook invokes Lua callback for matching event" {
 }
 ```
 
-**Step 2 — Run test, expect compile error**
+**Step 2, Run test, expect compile error**
 
 Expected: `error: no member named 'fireHook'`.
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 Add to `LuaEngine.zig`:
 
@@ -830,7 +830,7 @@ fn hookPatternKey(payload: Hooks.HookPayload) []const u8 {
 }
 
 /// Push the payload as a Lua table onto the stack.
-/// The table is a fresh Lua table — strings are copied into the VM.
+/// The table is a fresh Lua table, strings are copied into the VM.
 fn pushPayloadAsTable(self: *LuaEngine, payload: Hooks.HookPayload) !void {
     self.lua.newTable();
     switch (payload) {
@@ -1000,7 +1000,7 @@ pub fn takeCancel(self: *LuaEngine) ?[]const u8 {
 
 NOTE: `luaTableToJson` already exists (used by `zag.tool()`); reuse it.
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1008,7 +1008,7 @@ zig build test
 
 Expected: the new test passes. Existing tests still pass.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/LuaEngine.zig
@@ -1027,7 +1027,7 @@ EOF
 **Files:**
 - Modify: `src/LuaEngine.zig` (tests only; implementation already in Task 7)
 
-**Step 1 — Write failing tests**
+**Step 1, Write failing tests**
 
 ```zig
 test "fireHook applies veto" {
@@ -1076,7 +1076,7 @@ test "fireHook applies args rewrite" {
 }
 ```
 
-**Step 2 — Run tests**
+**Step 2, Run tests**
 
 ```
 zig build test
@@ -1084,15 +1084,15 @@ zig build test
 
 If any assertion fails, revisit Task 7 implementation. Typical culprits: string pop order, `args_rewrite` ownership.
 
-**Step 3 — Fix (if needed)**
+**Step 3, Fix (if needed)**
 
 Iterate on `applyHookReturn` / `luaTableToJson` until both tests pass.
 
-**Step 4 — Run tests again**
+**Step 4, Run tests again**
 
 Expected: green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/LuaEngine.zig
@@ -1112,7 +1112,7 @@ EOF
 - Modify: `src/ConversationBuffer.zig:481-562` (handleAgentEvent) and `src/ConversationBuffer.zig:614-639` (drainEvents) to thread through `lua_engine`
 - Modify: `src/main.zig:336-340` (`drainBuffer`) to pass the engine
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 Add to `ConversationBuffer.zig`:
 
@@ -1144,11 +1144,11 @@ test "drainEvents dispatches hook_request via lua_engine" {
 }
 ```
 
-**Step 2 — Run test, expect compile error**
+**Step 2, Run test, expect compile error**
 
 Expected: `error: no function 'dispatchHookRequests'`.
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 Option chosen: split `drainEvents` into two passes. Pass 1 handles request events (hook_request, lua_tool_request) by draining *only* those out of order; pass 2 drains the remaining one-way events as before. This keeps request/response latency low without reordering the user-visible event stream.
 
@@ -1189,7 +1189,7 @@ pub fn dispatchHookRequests(
 }
 ```
 
-Then in `ConversationBuffer.drainEvents`, call `dispatchHookRequests(&self.event_queue, self.lua_engine)` at the top. The ConversationBuffer already has access to the engine (passed via `submitInput` — we store it on the buffer as a new field).
+Then in `ConversationBuffer.drainEvents`, call `dispatchHookRequests(&self.event_queue, self.lua_engine)` at the top. The ConversationBuffer already has access to the engine (passed via `submitInput`, we store it on the buffer as a new field).
 
 Add field to ConversationBuffer struct:
 
@@ -1210,7 +1210,7 @@ pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
 }
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1218,7 +1218,7 @@ zig build test
 
 Expected: new dispatch test passes; existing drain tests unaffected.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/ConversationBuffer.zig
@@ -1237,7 +1237,7 @@ EOF
 **Files:**
 - Modify: `src/ConversationBuffer.zig:481-562` (`handleAgentEvent`)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "text_delta fires post-hook with text" {
@@ -1261,11 +1261,11 @@ test "text_delta fires post-hook with text" {
 }
 ```
 
-**Step 2 — Run tests**
+**Step 2, Run tests**
 
 Test should pass already because `fireHook` handles `.text_delta`. If it doesn't, fix.
 
-**Step 3 — Integrate into `handleAgentEvent`**
+**Step 3, Integrate into `handleAgentEvent`**
 
 In `handleAgentEvent` (line 481), before each one-way event's existing handling, fire the corresponding hook if the engine is present. For `.text_delta`:
 
@@ -1293,7 +1293,7 @@ if (lua_eng) |eng| {
 }
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1301,7 +1301,7 @@ zig build test
 
 Expected: all tests green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/ConversationBuffer.zig
@@ -1320,7 +1320,7 @@ EOF
 **Files:**
 - Modify: `src/ConversationBuffer.zig:567-612` (`submitInput`)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "UserMessagePre can veto submission" {
@@ -1366,11 +1366,11 @@ test "UserMessagePre can rewrite text" {
 }
 ```
 
-**Step 2 — Run tests**
+**Step 2, Run tests**
 
 Expected: tests pass at the LuaEngine level.
 
-**Step 3 — Integrate into `submitInput`**
+**Step 3, Integrate into `submitInput`**
 
 At the top of `submitInput` (line 567), before `self.messages.append`:
 
@@ -1405,7 +1405,7 @@ _ = try self.appendNode(null, .user_message, working_text);
 // ... continue with persistEvent, etc., using working_text
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1413,7 +1413,7 @@ zig build test
 
 Expected: green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/ConversationBuffer.zig
@@ -1432,7 +1432,7 @@ EOF
 **Files:**
 - Modify: `src/agent.zig:253-330` (`executeTools`) and `src/agent.zig:186-226` (`runToolStep`)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 Agent integration tests are painful (need a mock provider). Instead, add a focused test in `agent.zig` that calls a small helper `firePreHooksSerial` that we extract:
 
@@ -1440,7 +1440,7 @@ Agent integration tests are painful (need a mock provider). Instead, add a focus
 test "firePreHooksSerial returns veto flags and rewrites per tool" {
     // Construct a fake engine + queue, push hook_request events and
     // simulate main thread processing in a background thread.
-    // (Setup omitted for brevity — see testing/hook_harness.zig from Task 17.)
+    // (Setup omitted for brevity, see testing/hook_harness.zig from Task 17.)
 }
 ```
 
@@ -1448,11 +1448,11 @@ For this task, simpler: verify that `runToolStep`, when given a pre-cancelled To
 
 Actually: to stay bite-sized, the test is a Zig test that wires a fake registry and verifies behavior without real Lua. Skip the unit test here; this task relies on Task 17's integration test.
 
-**Step 2 — Skip (no unit test feasible without heavier harness)**
+**Step 2, Skip (no unit test feasible without heavier harness)**
 
 Add a comment marker to remember verification comes from Task 17.
 
-**Step 3 — Implement pre-hook firing**
+**Step 3, Implement pre-hook firing**
 
 In `executeTools` (both single-call fast path and parallel path) and before dispatch, add a pre-hook round-trip per tool call. The round-trip is serial across tools for determinism.
 
@@ -1559,7 +1559,7 @@ switch (outcome) {
 }
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1567,7 +1567,7 @@ zig build test
 
 Expected: existing tests pass; no new unit tests for this task (covered by Task 17 E2E).
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/agent.zig
@@ -1586,13 +1586,13 @@ EOF
 **Files:**
 - Modify: `src/agent.zig:186-226` (`runToolStep`)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 Covered by E2E Task 17. Document the expected behavior in a comment.
 
-**Step 2 — (skipped — see Task 17)**
+**Step 2, (skipped, see Task 17)**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 After the `registry.execute` call, before pushing `tool_result` to the queue, fire a post-hook round-trip:
 
@@ -1631,7 +1631,7 @@ const result_content = try allocator.dupe(u8, effective_content);
 
 Track `elapsed_ms` by capturing `std.time.milliTimestamp()` before and after `registry.execute`.
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1639,7 +1639,7 @@ zig build test
 
 Expected: green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/agent.zig
@@ -1658,13 +1658,13 @@ EOF
 **Files:**
 - Modify: `src/agent.zig:55-90` (`runLoopStreaming`)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 Covered by Task 17.
 
-**Step 2 — (skipped)**
+**Step 2, (skipped)**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 Add a helper:
 
@@ -1713,7 +1713,7 @@ while (true) {
 }
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1721,7 +1721,7 @@ zig build test
 
 Expected: green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/agent.zig
@@ -1738,11 +1738,11 @@ EOF
 ## Task 15: Route Lua tool execution through main thread
 
 **Files:**
-- Modify: `src/LuaEngine.zig` (`luaToolExecute` — delete threadlocal version, add new main-thread-only `executeLuaTool`)
-- Modify: `src/tools.zig` — add a wrapper that packages `lua_tool_request` and waits
-- Modify: `src/ConversationBuffer.zig` — extend `dispatchHookRequests` to also service `lua_tool_request` events
+- Modify: `src/LuaEngine.zig` (`luaToolExecute`: delete threadlocal version, add new main-thread-only `executeLuaTool`)
+- Modify: `src/tools.zig`: add a wrapper that packages `lua_tool_request` and waits
+- Modify: `src/ConversationBuffer.zig`: extend `dispatchHookRequests` to also service `lua_tool_request` events
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "lua_tool_request round-trips via main thread" {
@@ -1782,11 +1782,11 @@ test "lua_tool_request round-trips via main thread" {
 }
 ```
 
-**Step 2 — Run test, expect compile / logic failure**
+**Step 2, Run test, expect compile / logic failure**
 
 Expected: the test fails because `dispatchHookRequests` currently only handles `.hook_request`.
 
-**Step 3 — Extend `dispatchHookRequests`**
+**Step 3, Extend `dispatchHookRequests`**
 
 In `ConversationBuffer.zig`, extend the switch in `dispatchHookRequests`:
 
@@ -1807,7 +1807,7 @@ In `ConversationBuffer.zig`, extend the switch in `dispatchHookRequests`:
 
 In `tools.zig`, add a new tool registration path for Lua tools that wraps the round-trip. First, expose a channel from the main loop that any tool can push to. Simplest: a global-ish holder.
 
-Cleaner: add a new type `LuaToolProxy` that captures `*EventQueue`. Instead of making every Lua tool point to the same static `luaToolExecute` that reads threadlocals, each tool points to a closure-like struct that holds the queue pointer. Since Zig can't easily do closures for C function pointers, use a threadlocal **queue pointer** (replacing the threadlocal engine pointer — much narrower):
+Cleaner: add a new type `LuaToolProxy` that captures `*EventQueue`. Instead of making every Lua tool point to the same static `luaToolExecute` that reads threadlocals, each tool points to a closure-like struct that holds the queue pointer. Since Zig can't easily do closures for C function pointers, use a threadlocal **queue pointer** (replacing the threadlocal engine pointer, much narrower):
 
 ```zig
 // in tools.zig:
@@ -1835,7 +1835,7 @@ pub fn luaToolExecute(input_raw: []const u8, allocator: Allocator) anyerror!type
         .error_name = null,
     };
     try queue.push(.{ .lua_tool_request = &req });
-    req.done.wait(); // acceptable — caller is a worker thread; main thread is draining
+    req.done.wait(); // acceptable, caller is a worker thread; main thread is draining
     if (req.error_name) |name| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "error: lua tool failed: {s}", .{name}),
@@ -1865,7 +1865,7 @@ tools.lua_request_queue = ctx.queue;
 defer tools.lua_request_queue = null;
 ```
 
-**Step 4 — Delete the `active_engine` threadlocal and its uses in `LuaEngine.zig`**
+**Step 4, Delete the `active_engine` threadlocal and its uses in `LuaEngine.zig`**
 
 Remove `activate()`, the `active_engine` declaration, and the read of `active_engine` inside the old `luaToolExecute`. Remove the `eng.activate()` call in `AgentThread.threadMain`. Remove the `self.activate()` call inside `LuaEngine.registerTools`.
 
@@ -1873,7 +1873,7 @@ Move `luaToolExecute` out of `LuaEngine.zig` (the free function at line 477) and
 
 In `LuaEngine.registerTools`, change the `.execute = &luaToolExecute` reference to point to the new `tools.luaToolExecute`.
 
-**Step 5 — Run tests**
+**Step 5, Run tests**
 
 ```
 zig build test
@@ -1881,7 +1881,7 @@ zig build test
 
 Expected: the round-trip test passes. Existing tests still pass (the `active_engine` story is gone but the registration/execution still works through the new path).
 
-**Step 6 — Commit**
+**Step 6, Commit**
 
 ```bash
 git add src/LuaEngine.zig src/tools.zig src/ConversationBuffer.zig src/AgentThread.zig src/agent.zig
@@ -1903,7 +1903,7 @@ EOF
 **Files:**
 - Modify: `src/LuaEngine.zig`
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "zag.hook_del removes a hook" {
@@ -1918,9 +1918,9 @@ test "zag.hook_del removes a hook" {
 }
 ```
 
-**Step 2 — Run test, expect Lua error (hook_del not defined)**
+**Step 2, Run test, expect Lua error (hook_del not defined)**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 In `injectZagGlobal`:
 
@@ -1950,7 +1950,7 @@ fn zagHookDelFn(lua: *Lua) !i32 {
 }
 ```
 
-**Step 4 — Run tests**
+**Step 4, Run tests**
 
 ```
 zig build test
@@ -1958,7 +1958,7 @@ zig build test
 
 Expected: green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/LuaEngine.zig
@@ -1972,13 +1972,13 @@ EOF
 
 ---
 
-## Task 17: End-to-end test — veto + rewrite across a real agent turn
+## Task 17: End-to-end test: veto + rewrite across a real agent turn
 
 **Files:**
 - Create: `src/test_hooks_e2e.zig`
-- Modify: `src/main.zig` — add `_ = @import("test_hooks_e2e.zig");` in the test block
+- Modify: `src/main.zig`: add `_ = @import("test_hooks_e2e.zig");` in the test block
 
-**Step 1 — Design the E2E**
+**Step 1, Design the E2E**
 
 Spin up a mock provider that emits one assistant message containing two tool calls (one bash, one read). Register three hooks:
 - `ToolPre(bash)` → veto
@@ -1987,7 +1987,7 @@ Spin up a mock provider that emits one assistant message containing two tool cal
 
 Run `executeTools` synchronously (no agent thread; call it directly). Verify the resulting `ContentBlock[]` has: vetoed block with "vetoed by hook" error, read block with redacted content.
 
-**Step 2 — Write the test**
+**Step 2, Write the test**
 
 ```zig
 // src/test_hooks_e2e.zig
@@ -2077,7 +2077,7 @@ test "e2e: ToolPre veto + ToolPost redact" {
 
 NOTE: `agent.executeTools` is currently file-private. Make it `pub` as part of this task.
 
-**Step 3 — Run the test**
+**Step 3, Run the test**
 
 ```
 zig build test
@@ -2085,11 +2085,11 @@ zig build test
 
 Expected: the E2E test passes. This is the first real proof that hooks work across the veto + rewrite + round-trip surface.
 
-**Step 4 — Fix any issues**
+**Step 4, Fix any issues**
 
 The E2E is the most likely place to surface bugs in earlier tasks. Iterate until green.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/test_hooks_e2e.zig src/main.zig src/agent.zig
@@ -2109,11 +2109,11 @@ EOF
 - Modify: `README.md`
 - Create: `examples/hooks.lua`
 
-**Step 1 — Add a docs section**
+**Step 1, Add a docs section**
 
 Extend the README with a "Hooks" section linking to the design doc and showing the three canonical examples (veto, rewrite, observe).
 
-**Step 2 — Write `examples/hooks.lua`**
+**Step 2, Write `examples/hooks.lua`**
 
 ```lua
 -- Example plugin config demonstrating zag.hook.
@@ -2148,14 +2148,14 @@ zag.hook("TurnEnd", function(evt)
 end)
 ```
 
-**Step 3 — Run formatting / tests**
+**Step 3, Run formatting / tests**
 
 ```
 zig fmt --check .
 zig build test
 ```
 
-**Step 4 — Commit**
+**Step 4, Commit**
 
 ```bash
 git add README.md examples/hooks.lua
@@ -2175,7 +2175,7 @@ EOF
 2. **Full build:** `zig build` succeeds with no warnings.
 3. **All tests:** `zig build test` prints `All tests passed.`
 4. **Manual smoke test:** Create a throwaway `~/.config/zag/config.lua` with one hook from the examples, run `zig build run`, issue a prompt that triggers a bash tool call, confirm the hook fires as expected.
-5. **Parallel-tool interaction:** Issue a prompt that triggers multiple tool calls in one turn. Confirm ToolPre fires serially before parallel dispatch and ToolPost fires serially after join — look at the event log.
+5. **Parallel-tool interaction:** Issue a prompt that triggers multiple tool calls in one turn. Confirm ToolPre fires serially before parallel dispatch and ToolPost fires serially after join: look at the event log.
 
 ---
 

@@ -1,10 +1,10 @@
-# Input Parser Fragmentation — Implementation Plan
+# Input Parser Fragmentation: Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task. Each task is one commit. Follow TDD for every task: write the failing test, watch it fail for the *right reason*, implement, watch it pass, commit.
 
 **Goal:** Stop the input parser from misinterpreting fragmented escape sequences. When the kernel delivers `ESC [` in one read and `1;5A` in the next, the parser must assemble them into `Ctrl+Up` instead of emitting `Alt+[` plus garbage.
 
-**Architecture:** Split `parseBytes` into two layers. The lower layer, `nextEventInBuf`, inspects a byte slice and returns `ParseResult` — one of `ok{event, consumed}`, `incomplete`, or `skip{consumed}`. The upper layer is a new `input.Parser` struct that buffers bytes across reads, tracks the monotonic timestamp of the oldest pending escape byte, and applies a 50 ms timeout: if an escape sequence hasn't completed by then, the parser emits bare `Escape` (consuming one byte) and the remainder becomes a fresh sequence. `EventOrchestrator` owns a single `Parser` and calls `parser.pollOnce(fd, now_ms)` once per tick instead of the old free-function `input.pollEvent(fd)`. The legacy `parseBytes` API stays as a thin wrapper for the 46 existing tests; behavior on incomplete inputs changes (null instead of an eager wrong answer), and two tests that pinned the bug get updated.
+**Architecture:** Split `parseBytes` into two layers. The lower layer, `nextEventInBuf`, inspects a byte slice and returns `ParseResult`, one of `ok{event, consumed}`, `incomplete`, or `skip{consumed}`. The upper layer is a new `input.Parser` struct that buffers bytes across reads, tracks the monotonic timestamp of the oldest pending escape byte, and applies a 50 ms timeout: if an escape sequence hasn't completed by then, the parser emits bare `Escape` (consuming one byte) and the remainder becomes a fresh sequence. `EventOrchestrator` owns a single `Parser` and calls `parser.pollOnce(fd, now_ms)` once per tick instead of the old free-function `input.pollEvent(fd)`. The legacy `parseBytes` API stays as a thin wrapper for the 46 existing tests; behavior on incomplete inputs changes (null instead of an eager wrong answer), and two tests that pinned the bug get updated.
 
 **Tech Stack:** Zig 0.15, `std.posix.read`, `std.time.milliTimestamp`. No new dependencies.
 
@@ -32,7 +32,7 @@ Today's parser at `src/input.zig:100-189`:
 
 - `pollEvent(fd)` reads up to 64 bytes into a stack buffer, then delegates to `parseBytes(buf[0..n])` and returns whatever comes out.
 - `parseBytes` matches `ESC` + printable in the 0x20..0x7E range as `Alt+<char>` (lines 129-135).
-- On fragmented delivery (`ESC [` in one read, `1;5A` in the next), `parseBytes` sees `[0x1b, '[']` and hits the Alt-char rule because `'['` (0x5B) is in the printable range. Wrong answer emitted; the follow-up bytes then parse as `1`, `;`, `5`, `A` — four more wrong keypresses.
+- On fragmented delivery (`ESC [` in one read, `1;5A` in the next), `parseBytes` sees `[0x1b, '[']` and hits the Alt-char rule because `'['` (0x5B) is in the printable range. Wrong answer emitted; the follow-up bytes then parse as `1`, `;`, `5`, `A`: four more wrong keypresses.
 
 The only way to fix this without guessing is to:
 
@@ -47,7 +47,7 @@ Design decision (already approved): the buffer lives inside a new `input.Parser`
 ## Task 1: Introduce `ParseResult` and failing `nextEventInBuf` tests
 
 **Files:**
-- Modify: `src/input.zig` — add types + tests only, no implementation yet.
+- Modify: `src/input.zig`: add types + tests only, no implementation yet.
 
 **Step 1: Add the `ParseResult` type**
 
@@ -172,7 +172,7 @@ test "nextEventInBuf: UTF-8 two-byte char returns ok with consumed=2" {
 }
 
 test "nextEventInBuf: truncated UTF-8 lead byte is incomplete" {
-    // 0xC3 says "two-byte sequence follows" but buffer ends — wait for more.
+    // 0xC3 says "two-byte sequence follows" but buffer ends, wait for more.
     try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{0xC3}));
 }
 
@@ -220,7 +220,7 @@ EOF
 ## Task 2: Implement `nextEventInBuf` and retarget `parseBytes`
 
 **Files:**
-- Modify: `src/input.zig` — replace the `@compileError` stub with a real body, and rewrite `parseBytes` to delegate.
+- Modify: `src/input.zig`: replace the `@compileError` stub with a real body, and rewrite `parseBytes` to delegate.
 
 **Step 1: Write a helper for CSI terminator scan**
 
@@ -234,7 +234,7 @@ fn findCsiFinal(buf: []const u8) ?usize {
     for (buf, 0..) |b, i| {
         // Intermediate/parameter bytes are 0x20..0x3F; final is 0x40..0x7E.
         if (b >= 0x40 and b <= 0x7E) return i;
-        // Anything below 0x20 inside a CSI is malformed — but we still
+        // Anything below 0x20 inside a CSI is malformed, but we still
         // consider the CSI complete at that point to avoid eating
         // arbitrary amounts of subsequent input. parseCsi will return
         // Event.none for malformed content.
@@ -256,7 +256,7 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
 
     // ESC-prefixed sequences
     if (first == 0x1b) {
-        if (buf.len == 1) return .incomplete; // bare ESC vs. prefix — caller decides via timeout
+        if (buf.len == 1) return .incomplete; // bare ESC vs. prefix, caller decides via timeout
 
         const second = buf[1];
 
@@ -286,7 +286,7 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
             } };
         }
 
-        // Anything else after ESC is unrecognised — emit bare ESC and
+        // Anything else after ESC is unrecognised, emit bare ESC and
         // let the caller re-try on the remainder.
         return .{ .ok = .{
             .event = Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } },
@@ -330,7 +330,7 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
     // UTF-8 multi-byte
     if (first >= 0x80) {
         const len = std.unicode.utf8ByteSequenceLength(first) catch {
-            // Invalid lead byte — drop one byte and let caller retry.
+            // Invalid lead byte, drop one byte and let caller retry.
             return .{ .skip = .{ .consumed = 1 } };
         };
         if (buf.len < len) return .incomplete;
@@ -366,13 +366,13 @@ pub fn parseBytes(buf: []const u8) ?Event {
 
 **Step 4: Delete the old CSI/UTF-8 logic inside parseBytes**
 
-The old body of `parseBytes` lives at lines 117-189 and is replaced by the one-liner above. Confirm that nothing references the removed code (there should be no change needed to `parseCsi`, `parseSs3`, `parseSgrMouse`, or the modifier helpers — they remain unchanged).
+The old body of `parseBytes` lives at lines 117-189 and is replaced by the one-liner above. Confirm that nothing references the removed code (there should be no change needed to `parseCsi`, `parseSs3`, `parseSgrMouse`, or the modifier helpers, they remain unchanged).
 
 **Step 5: Update tests whose semantics changed**
 
 The following tests assert the *old* buggy behaviour and must be updated:
 
-**Test at `src/input.zig:782-793` ("parse truncated CSI (ESC [) returns Alt+[")** — this is the bug. Replace entirely with:
+**Test at `src/input.zig:782-793` ("parse truncated CSI (ESC [) returns Alt+[")**, this is the bug. Replace entirely with:
 
 ```zig
 test "parseBytes: truncated CSI (ESC [) returns null (incomplete)" {
@@ -383,7 +383,7 @@ test "parseBytes: truncated CSI (ESC [) returns null (incomplete)" {
 }
 ```
 
-**Test at `src/input.zig:858-862` ("parse truncated SGR mouse returns none")** — this test currently expects `Event.none` to come back from `parseBytes`. Under the new semantics, `parseBytes` returns `null` on incomplete input. Replace the body:
+**Test at `src/input.zig:858-862` ("parse truncated SGR mouse returns none")**, this test currently expects `Event.none` to come back from `parseBytes`. Under the new semantics, `parseBytes` returns `null` on incomplete input. Replace the body:
 
 ```zig
 test "parseBytes: truncated SGR mouse returns null (incomplete)" {
@@ -391,7 +391,7 @@ test "parseBytes: truncated SGR mouse returns null (incomplete)" {
 }
 ```
 
-**Test at `src/input.zig:776-780` ("parse unrecognized CSI sequence returns none")** — `ESC [ x`. Under the new semantics `x` is a valid CSI final byte (0x78 is in 0x40..0x7E), so `parseCsi(&.{'x'})` is called and returns `Event.none` — which `parseBytes` then returns as `.none`. Keep the test, but update the source expectation to match:
+**Test at `src/input.zig:776-780` ("parse unrecognized CSI sequence returns none")**, `ESC [ x`. Under the new semantics `x` is a valid CSI final byte (0x78 is in 0x40..0x7E), so `parseCsi(&.{'x'})` is called and returns `Event.none`, which `parseBytes` then returns as `.none`. Keep the test, but update the source expectation to match:
 
 ```zig
 test "parseBytes: unrecognized CSI sequence returns none" {
@@ -400,7 +400,7 @@ test "parseBytes: unrecognized CSI sequence returns none" {
 }
 ```
 
-(This one may already pass without modification — run the suite first and only edit if it fails.)
+(This one may already pass without modification, run the suite first and only edit if it fails.)
 
 **Step 6: Run the full test suite**
 
@@ -408,7 +408,7 @@ test "parseBytes: unrecognized CSI sequence returns none" {
 zig build test 2>&1 | tail -30
 ```
 
-Expected: every `nextEventInBuf:` test passes. Every pre-existing `parse ...` test passes except the two updated above. Any failure that isn't one of those three tests — **stop and investigate.**
+Expected: every `nextEventInBuf:` test passes. Every pre-existing `parse ...` test passes except the two updated above. Any failure that isn't one of those three tests, **stop and investigate.**
 
 **Step 7: Run `zig fmt`**
 
@@ -439,7 +439,7 @@ EOF
 ## Task 3: Add `Parser` struct with buffering (no timeout yet)
 
 **Files:**
-- Modify: `src/input.zig` — add the `Parser` type and failing tests.
+- Modify: `src/input.zig`: add the `Parser` type and failing tests.
 
 **Step 1: Declare the Parser struct**
 
@@ -448,7 +448,7 @@ Insert after the `ParseResult` declaration:
 ```zig
 /// Maximum bytes the Parser will buffer while waiting for an escape
 /// sequence to complete. 128 is twice the max single-read size and
-/// leaves generous headroom — CSI sequences in the wild top out at
+/// leaves generous headroom, CSI sequences in the wild top out at
 /// ~20 bytes.
 const PARSER_BUF_SIZE = 128;
 
@@ -545,7 +545,7 @@ pub const Parser = struct {
 };
 ```
 
-**Step 2: Add tests for Parser buffering (no timeout paths yet — those come in Task 4)**
+**Step 2: Add tests for Parser buffering (no timeout paths yet, those come in Task 4)**
 
 Append:
 
@@ -567,7 +567,7 @@ test "Parser: fragmented CSI Ctrl+Up assembles across two feedBytes calls" {
     p.feedBytes(&.{ 0x1b, '[' }, 0);
     try std.testing.expect(p.nextEvent(0) == null); // incomplete, no timeout yet
 
-    // Second fragment: 1 ; 5 A — completes the sequence
+    // Second fragment: 1 ; 5 A, completes the sequence
     p.feedBytes(&.{ '1', ';', '5', 'A' }, 1);
     const ev = p.nextEvent(1).?;
     switch (ev) {
@@ -674,7 +674,7 @@ EOF
 ## Task 4: Add bare-Escape timeout tests and verify flush path
 
 **Files:**
-- Modify: `src/input.zig` — add tests that exercise the existing timeout path in `nextEvent`. (The timeout logic was already implemented in Task 3; this task is purely TDD verification with tests that *couldn't* pass until Task 3 landed.)
+- Modify: `src/input.zig`: add tests that exercise the existing timeout path in `nextEvent`. (The timeout logic was already implemented in Task 3; this task is purely TDD verification with tests that *couldn't* pass until Task 3 landed.)
 
 **Step 1: Add failing / verification tests**
 
@@ -695,7 +695,7 @@ test "Parser: bare ESC emitted after timeout expires" {
 }
 
 test "Parser: timeout flushes ESC but leaves trailing byte as its own event" {
-    // User pressed Escape, then '[' — not a CSI, two separate events.
+    // User pressed Escape, then '[', not a CSI, two separate events.
     // Because `[` is in the Alt+char range, without timeout the parser
     // would eagerly emit Alt+[. With timeout, bare-ESC then '[' plain.
     var p: Parser = .{};
@@ -793,8 +793,8 @@ EOF
 ## Task 5: Add `Parser.pollOnce` and swap EventOrchestrator to use it
 
 **Files:**
-- Modify: `src/input.zig` — add `pollOnce` method and a unit test that fakes `read` via a pipe.
-- Modify: `src/EventOrchestrator.zig` — replace the `input.pollEvent(STDIN_FILENO)` call at line 289 with `self.input_parser.pollOnce(STDIN_FILENO, std.time.milliTimestamp())`; add the field.
+- Modify: `src/input.zig`: add `pollOnce` method and a unit test that fakes `read` via a pipe.
+- Modify: `src/EventOrchestrator.zig`: replace the `input.pollEvent(STDIN_FILENO)` call at line 289 with `self.input_parser.pollOnce(STDIN_FILENO, std.time.milliTimestamp())`; add the field.
 
 **Step 1: Add `pollOnce` to `Parser`**
 
@@ -805,7 +805,7 @@ Append to the `Parser` struct body (inside the `pub const Parser = struct { ... 
     /// return the next event if one is ready (or produced by timeout).
     ///
     /// Safe to call in a polling loop. Returns null when no event is
-    /// available — the caller should poll the fd again later.
+    /// available, the caller should poll the fd again later.
     pub fn pollOnce(self: *Parser, fd: std.posix.fd_t, now_ms: i64) ?Event {
         var buf: [READ_BUF_SIZE]u8 = undefined;
         const n = std.posix.read(fd, &buf) catch |err| switch (err) {
@@ -935,11 +935,11 @@ zig build && ./zig-out/bin/zag
 
 Type:
 
-- Plain ASCII `abc` — each key appears instantly.
-- Arrow keys in Normal mode — cursor moves.
-- `Ctrl+Up`, `Ctrl+Down`, `Shift+Right`, `Shift+Tab` — each produces the correct key event (look at logs if you've enabled them).
-- `Escape` — single press exits to Normal mode within ~50 ms. This exercises the timeout path.
-- `Alt+a` — if your binding table has one, it still works.
+- Plain ASCII `abc`: each key appears instantly.
+- Arrow keys in Normal mode: cursor moves.
+- `Ctrl+Up`, `Ctrl+Down`, `Shift+Right`, `Shift+Tab`: each produces the correct key event (look at logs if you've enabled them).
+- `Escape`: single press exits to Normal mode within ~50 ms. This exercises the timeout path.
+- `Alt+a`: if your binding table has one, it still works.
 
 If anything misfires, the bug is probably in the Task 2 CSI terminator scan. Revisit `findCsiFinal`.
 
@@ -968,7 +968,7 @@ No code change. Document in the execution log (if any) that visual verification 
 ## Out of scope (explicit non-goals)
 
 1. **Bracketed paste mode.** `ESC [ 2 0 0 ~ ... ESC [ 2 0 1 ~` handling is a separate feature, not a fragmentation bug. Handle in a follow-up.
-2. **Focus reporting / OSC sequences.** Same — separate feature.
+2. **Focus reporting / OSC sequences.** Same: separate feature.
 3. **Kitty keyboard protocol.** The protocol adds new CSI sequences; as long as our `findCsiFinal` scanner finds the terminator, they'll parse correctly with no code change.
 4. **Configurable `escape_timeout_ms` from Lua.** The field is public and can be set after construction, but we do not add a Lua binding in this plan.
 5. **Unicode normalization in input.** Out of scope; the parser passes codepoints through unchanged.
@@ -979,7 +979,7 @@ No code change. Document in the execution log (if any) that visual verification 
 ## Done when
 
 - [ ] All 14 new `nextEventInBuf:` tests pass (Task 1+2)
-- [ ] All 6 `Parser:` buffering tests pass (Task 3) — including the overflow-reset test
+- [ ] All 6 `Parser:` buffering tests pass (Task 3): including the overflow-reset test
 - [ ] All 5 `Parser:` timeout tests pass (Task 4)
 - [ ] The pipe-fed `pollOnce` integration test passes (Task 5)
 - [ ] `EventOrchestrator.tick` uses `self.input_parser.pollOnce` and the old `input.pollEvent` is deleted (Task 5)

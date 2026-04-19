@@ -13,12 +13,12 @@
 ## Context summary
 
 **Current sleep sites to eliminate:**
-- `src/main.zig:631` — `posix.nanosleep(0, 10ms)` when idle (no input, no agent)
-- `src/main.zig:634` — `posix.nanosleep(0, 2ms)` when agent running but no input
+- `src/main.zig:631`: `posix.nanosleep(0, 10ms)` when idle (no input, no agent)
+- `src/main.zig:634`: `posix.nanosleep(0, 2ms)` when agent running but no input
 
 **Keep unchanged:**
-- `src/Screen.zig:331` — 1ms retry on stdout `WouldBlock` (separate concern, lowest priority)
-- `src/agent.zig:448` — 50ms in test tool (test-only, not in the loop)
+- `src/Screen.zig:331`: 1ms retry on stdout `WouldBlock` (separate concern, lowest priority)
+- `src/agent.zig:448`: 50ms in test tool (test-only, not in the loop)
 
 **Design decision: ONE global wake pipe**
 - Multiple `ConversationBuffer` instances can exist (`buffer` + `extra_panes`), each with its own `EventQueue`
@@ -38,9 +38,9 @@
 ## Task 1: Add a wake pipe module-level in main.zig
 
 **Files:**
-- Modify: `src/main.zig` — add wake pipe fds near line 88 (where `var buffer` lives)
-- Modify: `src/main.zig` — create pipe in `main()` near line 439 (after buffer init)
-- Modify: `src/main.zig` — close pipe on shutdown near line 719
+- Modify: `src/main.zig`: add wake pipe fds near line 88 (where `var buffer` lives)
+- Modify: `src/main.zig`: create pipe in `main()` near line 439 (after buffer init)
+- Modify: `src/main.zig`: close pipe on shutdown near line 719
 
 **Step 1: Add module-level fds**
 
@@ -96,7 +96,7 @@ EOF
 ## Task 2: Add optional wake_fd to EventQueue
 
 **Files:**
-- Modify: `src/AgentThread.zig` — add `wake_fd: ?std.posix.fd_t = null` to EventQueue, update push
+- Modify: `src/AgentThread.zig`: add `wake_fd: ?std.posix.fd_t = null` to EventQueue, update push
 
 **Step 1: Write the failing test**
 
@@ -196,7 +196,7 @@ EOF
 ## Task 3: Wire wake_write into ConversationBuffer's EventQueue
 
 **Files:**
-- Modify: `src/ConversationBuffer.zig` — `submitInput` sets queue.wake_fd after init
+- Modify: `src/ConversationBuffer.zig`: `submitInput` sets queue.wake_fd after init
 
 **Step 1: Modify submitInput**
 
@@ -243,14 +243,14 @@ In `src/main.zig`, find where the pipe was created (Task 1 Step 2). Add immediat
 buffer.wake_fd = wake_write;
 ```
 
-For `extra_panes`: they're created by a split command. Find the split handler and do the same. Grep: `pane.buffer = ` or `SplitPane{ .buffer`. (If no splits exist in the current test, skip — extra_panes get their wake_fd set when created.)
+For `extra_panes`: they're created by a split command. Find the split handler and do the same. Grep: `pane.buffer = ` or `SplitPane{ .buffer`. (If no splits exist in the current test, skip, extra_panes get their wake_fd set when created.)
 
 Actually, for extra_panes created later: find `extra_panes.append` calls. Wherever a new `SplitPane` is constructed, its `.buffer.wake_fd = wake_write` must be set. Look at `src/main.zig` for split-related code. Grep: `extra_panes.append`.
 
 **Step 3: Verify**
 
-Run: `zig build` — must compile.
-Run: `zig build test` — tests pass.
+Run: `zig build`, must compile.
+Run: `zig build test`, tests pass.
 
 **Step 4: Commit**
 
@@ -273,7 +273,7 @@ EOF
 ## Task 4: SIGWINCH handler writes to wake pipe
 
 **Files:**
-- Modify: `src/Terminal.zig` — add module-level wake_fd, update handler, add installer helper
+- Modify: `src/Terminal.zig`: add module-level wake_fd, update handler, add installer helper
 
 **Step 1: Add a module-level wake fd**
 
@@ -326,7 +326,7 @@ If `Terminal` isn't imported, check the existing import (should already be `cons
 
 **Step 4: Verify**
 
-Run: `zig build` — must compile on macOS (this machine) and Linux (CI if present).
+Run: `zig build`, must compile on macOS (this machine) and Linux (CI if present).
 
 To test SIGWINCH manually would need a running terminal. Build success is sufficient here.
 
@@ -351,7 +351,7 @@ EOF
 ## Task 5: Replace nanosleep with poll() in main loop
 
 **Files:**
-- Modify: `src/main.zig` — replace `if (maybe_event == null and resized == null)` block with poll()
+- Modify: `src/main.zig`: replace `if (maybe_event == null and resized == null)` block with poll()
 
 **Step 1: Understand the current shape**
 
@@ -509,7 +509,7 @@ ANTHROPIC_API_KEY=... zig build run
 - Verify the agent responds (streaming text appears)
 - Verify tool calls work if the model uses any
 - Verify the app is responsive to keystrokes during streaming
-- Monitor CPU with `top -pid $(pgrep zag)` — should be near 0% when idle, only spiking when the agent is generating
+- Monitor CPU with `top -pid $(pgrep zag)`: should be near 0% when idle, only spiking when the agent is generating
 
 **Step 4: Check that the segfault condition changes**
 
@@ -527,10 +527,10 @@ Otherwise skip.
 
 ## Open questions / follow-ups
 
-1. **Screen.zig:331 stdout backpressure sleep** — separate concern, can be replaced with `poll(stdout, POLLOUT)` later.
-2. **extra_panes wake_fd wiring** — if splits are supported today, audit every pane creation path in `main.zig` to ensure `.wake_fd = wake_write` is set. If splits aren't in active use yet, note it as a TODO.
-3. **SIGWINCH handler on macOS** — `std.c.write` is not explicitly documented as async-signal-safe by Apple, but POSIX guarantees `write()` itself is. Should be fine in practice.
-4. **If the segfault persists** — next step is node lifecycle logging (scoped `log.debug` in `appendNode` and `Node.deinit`) to catch the exact destroy path. Separate task.
+1. **Screen.zig:331 stdout backpressure sleep**: separate concern, can be replaced with `poll(stdout, POLLOUT)` later.
+2. **extra_panes wake_fd wiring**: if splits are supported today, audit every pane creation path in `main.zig` to ensure `.wake_fd = wake_write` is set. If splits aren't in active use yet, note it as a TODO.
+3. **SIGWINCH handler on macOS**: `std.c.write` is not explicitly documented as async-signal-safe by Apple, but POSIX guarantees `write()` itself is. Should be fine in practice.
+4. **If the segfault persists**: next step is node lifecycle logging (scoped `log.debug` in `appendNode` and `Node.deinit`) to catch the exact destroy path. Separate task.
 
 ---
 

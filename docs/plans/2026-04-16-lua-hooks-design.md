@@ -12,15 +12,15 @@ A Neovim-autocmd-flavored hook system, exposed as `zag.hook(event, opts, fn)`. H
 
 | Event | Fires | Payload | Pre can | Post can |
 |---|---|---|---|---|
-| `UserMessagePre` | Main, when user submits | `text` | veto, rewrite `text` | — |
-| `UserMessagePost` | Main, after queued | `text` | — | observe |
-| `TurnStart` | Agent, before LLM call | `turn_num`, `message_count` | observe | — |
-| `TurnEnd` | Agent, after LLM + tools | `turn_num`, `stop_reason`, `input_tokens`, `output_tokens` | — | observe |
-| `ToolPre` | Agent, before each tool (serial, before parallel fan-out) | `name`, `call_id`, `args` | veto, rewrite `args` | — |
-| `ToolPost` | Agent, after each tool (serial, after join) | `name`, `call_id`, `content`, `is_error`, `duration_ms` | — | rewrite `content`, `is_error` |
-| `TextDelta` | Main, during drain | `text` | — | observe (opt-in, high frequency) |
-| `AgentDone` | Main, agent finished cleanly | — | — | observe |
-| `AgentErr` | Main, agent errored | `message` | — | observe |
+| `UserMessagePre` | Main, when user submits | `text` | veto, rewrite `text` |, |
+| `UserMessagePost` | Main, after queued | `text` |, | observe |
+| `TurnStart` | Agent, before LLM call | `turn_num`, `message_count` | observe |, |
+| `TurnEnd` | Agent, after LLM + tools | `turn_num`, `stop_reason`, `input_tokens`, `output_tokens` |, | observe |
+| `ToolPre` | Agent, before each tool (serial, before parallel fan-out) | `name`, `call_id`, `args` | veto, rewrite `args` |, |
+| `ToolPost` | Agent, after each tool (serial, after join) | `name`, `call_id`, `content`, `is_error`, `duration_ms` |, | rewrite `content`, `is_error` |
+| `TextDelta` | Main, during drain | `text` |, | observe (opt-in, high frequency) |
+| `AgentDone` | Main, agent finished cleanly |, |, | observe |
+| `AgentErr` | Main, agent errored | `message` |, | observe |
 
 Pattern matching applies only to `ToolPre` / `ToolPost`. Format: missing / `*` matches all; exact string matches one; `"a,b,c"` matches any of the listed tools. No regex.
 
@@ -32,7 +32,7 @@ Lua only runs on the main thread. The `active_engine` threadlocal disappears. Cr
 AgentEvent = union(enum) {
     // existing one-way events
     text_delta, tool_start, tool_result, info, done, err, reset_assistant_text,
-    // new request events — each carries a reply slot
+    // new request events, each carries a reply slot
     hook_request: *Hooks.HookRequest,
     lua_tool_request: *Hooks.LuaToolRequest,
 };

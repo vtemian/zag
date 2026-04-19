@@ -41,7 +41,7 @@ Expected: `Switched to a new branch 'wip/compliance-fixes-2026-04-17'`.
 Run: `grep -n "Does not touch" src/ConversationBuffer.zig`
 Expected output includes:
 ```
-369:/// Does not touch `render_dirty` — the compositor repaints the prompt
+369:/// Does not touch `render_dirty`, the compositor repaints the prompt
 ```
 
 **Step 2: Apply edit**
@@ -51,7 +51,7 @@ Replace at `src/ConversationBuffer.zig:368-370`:
 Before:
 ```zig
 /// Append a single byte to the draft. No-op if the draft is full.
-/// Does not touch `render_dirty` — the compositor repaints the prompt
+/// Does not touch `render_dirty`, the compositor repaints the prompt
 /// every frame anyway.
 ```
 
@@ -490,7 +490,7 @@ const jsonl_path = std.fmt.bufPrint(&jsonl_path_buf, ...);
 Add one line at the end of `MEMORY.md`:
 
 ```
-- [_buf exception](feedback_buf_suffix_exception.md) — keep _buf on backing arrays paired with a bufPrint/realpath slice view
+- [_buf exception](feedback_buf_suffix_exception.md): keep _buf on backing arrays paired with a bufPrint/realpath slice view
 ```
 
 **Step 3: No build needed; commit memory changes outside the repo**

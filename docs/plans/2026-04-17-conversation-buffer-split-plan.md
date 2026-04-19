@@ -20,23 +20,23 @@
 
 ---
 
-## Phase 0 - Safety-net tests
+## Phase 0, Safety-net tests
 
 The test-coverage audit identified six behaviors that are untested today. They must be locked in **before** moving code so the refactor can prove it didn't break anything.
 
-### Task 0.1 - Branch and verify clean baseline
+### Task 0.1, Branch and verify clean baseline
 
 **Steps:**
 1. `git checkout -b wip/conversation-buffer-split`
-2. `zig build test 2>&1 | tail -5` - must exit 0
-3. `zig fmt --check .` - must exit 0
+2. `zig build test 2>&1 | tail -5`, must exit 0
+3. `zig fmt --check .`, must exit 0
 4. Commit nothing yet.
 
-### Task 0.2 - Add `submitInput` regression test
+### Task 0.2, Add `submitInput` regression test
 
 **File:** `src/ConversationBuffer.zig` (append to test block at end)
 
-**Step 1 - Write the test:**
+**Step 1, Write the test:**
 
 ```zig
 test "submitInput appends user message and user_message node" {
@@ -66,19 +66,19 @@ test "submitInput appends user message and user_message node" {
 }
 ```
 
-**Step 2 - Run, expect pass (behavior already exists):**
+**Step 2, Run, expect pass (behavior already exists):**
 
 ```
 zig build test 2>&1 | tail -10
 ```
 
-**Step 3 - If it fails, the test is wrong, not the code. Fix the test.**
+**Step 3, If it fails, the test is wrong, not the code. Fix the test.**
 
-### Task 0.3 - Add `loadFromEntries` + `rebuildMessages` regression tests
+### Task 0.3, Add `loadFromEntries` + `rebuildMessages` regression tests
 
 **File:** `src/ConversationBuffer.zig`
 
-**Step 1 - Write the tests:**
+**Step 1, Write the tests:**
 
 ```zig
 test "loadFromEntries builds node tree from session entries" {
@@ -144,13 +144,13 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
 }
 ```
 
-**Step 2 - Run:** `zig build test 2>&1 | tail -10` - should pass.
+**Step 2, Run:** `zig build test 2>&1 | tail -10`, should pass.
 
-### Task 0.4 - Add `handleAgentEvent` tool-correlation test
+### Task 0.4, Add `handleAgentEvent` tool-correlation test
 
 **File:** `src/ConversationBuffer.zig`
 
-**Step 1 - Write the test:**
+**Step 1, Write the test:**
 
 ```zig
 test "handleAgentEvent correlates tool_result to tool_start via call_id" {
@@ -189,13 +189,13 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
 }
 ```
 
-**Step 2 - Run and confirm pass.**
+**Step 2, Run and confirm pass.**
 
-### Task 0.5 - Add `restoreFromSession` round-trip test
+### Task 0.5, Add `restoreFromSession` round-trip test
 
 **File:** `src/ConversationBuffer.zig`
 
-**Step 1 - Write:**
+**Step 1, Write:**
 
 Use a real temp session file (test creates it, writes JSONL lines via raw file writes, then calls `restoreFromSession` on a fresh buffer). See `src/Session.zig` existing tests for the helper pattern.
 
@@ -229,13 +229,13 @@ test "restoreFromSession rebuilds both tree and messages" {
 
 If `SessionManager.init` or `createSession` APIs differ from this sketch, adapt to the actual API (confirmed in `src/Session.zig`).
 
-**Step 2 - Run, confirm pass.**
+**Step 2, Run, confirm pass.**
 
-### Task 0.6 - Add `drainEvents` lifecycle test
+### Task 0.6, Add `drainEvents` lifecycle test
 
 **File:** `src/ConversationBuffer.zig`
 
-**Step 1 - Write the test:**
+**Step 1, Write the test:**
 
 ```zig
 test "drainEvents joins thread and deinits queue on .done" {
@@ -264,9 +264,9 @@ test "drainEvents joins thread and deinits queue on .done" {
 }
 ```
 
-**Step 2 - Run, confirm pass.**
+**Step 2, Run, confirm pass.**
 
-### Task 0.7 - Commit
+### Task 0.7, Commit
 
 ```
 git add src/ConversationBuffer.zig
@@ -275,15 +275,15 @@ git commit -m "test: lock in ConversationBuffer behavior before split refactor"
 
 ---
 
-## Phase 1 - Extract `ConversationSession`
+## Phase 1, Extract `ConversationSession`
 
 Move the LLM-state + persistence concerns to a new file. `ConversationBuffer` temporarily composes a `*ConversationSession` so the diff stays minimal.
 
-### Task 1.1 - Create `src/ConversationSession.zig` scaffold
+### Task 1.1, Create `src/ConversationSession.zig` scaffold
 
 **File:** `src/ConversationSession.zig` (new)
 
-**Step 1 - Skeleton:**
+**Step 1, Skeleton:**
 
 ```zig
 //! ConversationSession: LLM conversation history and session persistence.
@@ -330,11 +330,11 @@ test "init and deinit" {
 }
 ```
 
-**Step 2 - Register the new file in `src/main.zig` refAllDecls test** (if one exists; otherwise no change needed - Zig discovers it via imports).
+**Step 2, Register the new file in `src/main.zig` refAllDecls test** (if one exists; otherwise no change needed, Zig discovers it via imports).
 
-**Step 3 - Run:** `zig build test`.
+**Step 3, Run:** `zig build test`.
 
-### Task 1.2 - Move `persistEvent` and `rebuildMessages` family to `ConversationSession`
+### Task 1.2, Move `persistEvent` and `rebuildMessages` family to `ConversationSession`
 
 **Move from `ConversationBuffer.zig`:**
 - `persistEvent(entry)` method (lines ~487-492)
@@ -349,9 +349,9 @@ test "init and deinit" {
 
 **In `ConversationBuffer.zig`:** delete the moved methods.
 
-**Step 1 - Move code.** Use `Edit` tool; no logic changes.
+**Step 1, Move code.** Use `Edit` tool; no logic changes.
 
-**Step 2 - Compile:** expect errors in `ConversationBuffer.zig` where `persistEvent` is still called. Fix by adding a `session: *ConversationSession` field to `ConversationBuffer` temporarily:
+**Step 2, Compile:** expect errors in `ConversationBuffer.zig` where `persistEvent` is still called. Fix by adding a `session: *ConversationSession` field to `ConversationBuffer` temporarily:
 
 ```zig
 // in ConversationBuffer's fields
@@ -366,9 +366,9 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8, session: *Conversat
 //   self.session.persistEvent(...)
 ```
 
-This is the "temporary composition" pattern - `ConversationBuffer` borrows the session until Phase 4 splits them at the orchestrator.
+This is the "temporary composition" pattern, `ConversationBuffer` borrows the session until Phase 4 splits them at the orchestrator.
 
-**Step 3 - Update ConversationBuffer tests to construct a session first.** Most tests become:
+**Step 3, Update ConversationBuffer tests to construct a session first.** Most tests become:
 
 ```zig
 var session = ConversationSession.init(allocator);
@@ -377,47 +377,47 @@ var cb = try ConversationBuffer.init(allocator, 0, "test", &session);
 defer cb.deinit();
 ```
 
-**Step 4 - Run:** `zig build test`. All existing tests pass with the new two-object init.
+**Step 4, Run:** `zig build test`. All existing tests pass with the new two-object init.
 
-**Step 5 - Commit:**
+**Step 5, Commit:**
 ```
 git add -A && git commit -m "session: extract ConversationSession (persistence + messages)"
 ```
 
-### Task 1.3 - Move `loadFromEntries` and `restoreFromSession`
+### Task 1.3, Move `loadFromEntries` and `restoreFromSession`
 
 **Move:**
-- `loadFromEntries(entries)` - wait. This one walks the entries and builds the **tree**, not messages. So it STAYS on `ConversationBuffer`. (Audit confirmed: `loadFromEntries` populates the node tree; `rebuildMessages` populates the messages list. Separate responsibilities.)
+- `loadFromEntries(entries)`, wait. This one walks the entries and builds the **tree**, not messages. So it STAYS on `ConversationBuffer`. (Audit confirmed: `loadFromEntries` populates the node tree; `rebuildMessages` populates the messages list. Separate responsibilities.)
 
-- `restoreFromSession(handle, allocator)` - this one calls both `loadFromEntries` AND `rebuildMessages`. It's a coordinator. It can live on `ConversationBuffer` and call `self.session.rebuildMessages(entries, allocator)`.
+- `restoreFromSession(handle, allocator)`, this one calls both `loadFromEntries` AND `rebuildMessages`. It's a coordinator. It can live on `ConversationBuffer` and call `self.session.rebuildMessages(entries, allocator)`.
 
 So for 1.3:
 
 - Keep `loadFromEntries` on `ConversationBuffer`.
 - Keep `restoreFromSession` on `ConversationBuffer`, change it to call `self.session.rebuildMessages(entries, allocator)`.
 
-**Step 1 - Edit `ConversationBuffer.restoreFromSession` to delegate message rebuild to the session.**
+**Step 1, Edit `ConversationBuffer.restoreFromSession` to delegate message rebuild to the session.**
 
-**Step 2 - Run tests.**
+**Step 2, Run tests.**
 
-**Step 3 - Commit:**
+**Step 3, Commit:**
 ```
 git commit -m "session: delegate message rebuild through ConversationSession"
 ```
 
-### Task 1.4 - Move `sessionSummaryInputs` / `extractFirstText` to `ConversationSession`
+### Task 1.4, Move `sessionSummaryInputs` / `extractFirstText` to `ConversationSession`
 
 These are pure functions over `self.messages`. They belong on the session.
 
-**Step 1 - Move both functions to `ConversationSession.zig`.**
+**Step 1, Move both functions to `ConversationSession.zig`.**
 
-**Step 2 - Update the one caller** (`EventOrchestrator.autoNameSession`, line ~720) from `cb.sessionSummaryInputs()` to `pane.session.sessionSummaryInputs()`. Since Phase 4 hasn't landed yet, callers still have `cb.session`, so write `cb.session.sessionSummaryInputs()` for now.
+**Step 2, Update the one caller** (`EventOrchestrator.autoNameSession`, line ~720) from `cb.sessionSummaryInputs()` to `pane.session.sessionSummaryInputs()`. Since Phase 4 hasn't landed yet, callers still have `cb.session`, so write `cb.session.sessionSummaryInputs()` for now.
 
-**Step 3 - Run tests. Commit.**
+**Step 3, Run tests. Commit.**
 
-### Task 1.5 - Move `submitInput`'s message-building half into `ConversationSession.appendUserMessage`
+### Task 1.5, Move `submitInput`'s message-building half into `ConversationSession.appendUserMessage`
 
-**Step 1 - Add to `ConversationSession`:**
+**Step 1, Add to `ConversationSession`:**
 
 ```zig
 /// Append a user message with one text ContentBlock.
@@ -431,24 +431,24 @@ pub fn appendUserMessage(self: *ConversationSession, text: []const u8) !void {
 }
 ```
 
-**Step 2 - Refactor `ConversationBuffer.submitInput`** to call `self.session.appendUserMessage(text)` + still append the view node + still persist. The `submitInput` method stays on `ConversationBuffer` because it coordinates view + session; the message half now lives on session.
+**Step 2, Refactor `ConversationBuffer.submitInput`** to call `self.session.appendUserMessage(text)` + still append the view node + still persist. The `submitInput` method stays on `ConversationBuffer` because it coordinates view + session; the message half now lives on session.
 
-**Step 3 - Run tests. Commit:**
+**Step 3, Run tests. Commit:**
 ```
 git commit -m "session: move appendUserMessage onto ConversationSession"
 ```
 
 ---
 
-## Phase 2 - Extract `AgentRunner`
+## Phase 2, Extract `AgentRunner`
 
 Move agent lifecycle + event coordination to a new file. `ConversationBuffer` temporarily composes `*AgentRunner` so existing API still works.
 
-### Task 2.1 - Create `src/AgentRunner.zig` scaffold
+### Task 2.1, Create `src/AgentRunner.zig` scaffold
 
 **File:** `src/AgentRunner.zig` (new)
 
-**Step 1 - Skeleton:**
+**Step 1, Skeleton:**
 
 ```zig
 //! AgentRunner: agent thread lifecycle and event coordination.
@@ -524,9 +524,9 @@ test {
 }
 ```
 
-**Step 2 - Build and ensure no compile errors.**
+**Step 2, Build and ensure no compile errors.**
 
-### Task 2.2 - Move streaming state fields out of `ConversationBuffer`
+### Task 2.2, Move streaming state fields out of `ConversationBuffer`
 
 From `ConversationBuffer.zig`, **delete:**
 - `pending_tool_calls`
@@ -536,9 +536,9 @@ From `ConversationBuffer.zig`, **delete:**
 
 These live on `AgentRunner` now.
 
-**Step 1 - Add back via composition.** Give `ConversationBuffer` a temporary `runner: *AgentRunner` field. Access shifts from `self.current_assistant_node` to `self.runner.current_assistant_node`. (Composition pattern like Phase 1.)
+**Step 1, Add back via composition.** Give `ConversationBuffer` a temporary `runner: *AgentRunner` field. Access shifts from `self.current_assistant_node` to `self.runner.current_assistant_node`. (Composition pattern like Phase 1.)
 
-**Step 2 - Update `ConversationBuffer.init` signature:**
+**Step 2, Update `ConversationBuffer.init` signature:**
 
 ```zig
 pub fn init(
@@ -550,9 +550,9 @@ pub fn init(
 ) !ConversationBuffer
 ```
 
-**Step 3 - Compile, fix access sites.** The bodies of `handleAgentEvent`, `drainEvents`, `dispatchHookRequests`, `cancelAgent`, `isAgentRunning`, `lastInfo`, `shutdown`, `resetCurrentAssistantText` now access runner state. Keep them on `ConversationBuffer` for now (body-preserving refactor) - just swap field paths.
+**Step 3, Compile, fix access sites.** The bodies of `handleAgentEvent`, `drainEvents`, `dispatchHookRequests`, `cancelAgent`, `isAgentRunning`, `lastInfo`, `shutdown`, `resetCurrentAssistantText` now access runner state. Keep them on `ConversationBuffer` for now (body-preserving refactor), just swap field paths.
 
-**Step 4 - Run tests.** Test setup becomes three-step:
+**Step 4, Run tests.** Test setup becomes three-step:
 
 ```zig
 var session = ConversationSession.init(allocator);
@@ -566,16 +566,16 @@ defer cb.deinit();
 runner.view = &cb;
 ```
 
-The init-ordering dance is ugly but temporary - Phase 4 cleans it up via `Pane`.
+The init-ordering dance is ugly but temporary, Phase 4 cleans it up via `Pane`.
 
-**Step 5 - Commit:**
+**Step 5, Commit:**
 ```
 git commit -m "runner: scaffold AgentRunner and move streaming state fields"
 ```
 
-### Task 2.3 - Move `handleAgentEvent` onto `AgentRunner`
+### Task 2.3, Move `handleAgentEvent` onto `AgentRunner`
 
-**Step 1 - Copy the body** of `ConversationBuffer.handleAgentEvent` into `AgentRunner.handleAgentEvent`. Swap access paths:
+**Step 1, Copy the body** of `ConversationBuffer.handleAgentEvent` into `AgentRunner.handleAgentEvent`. Swap access paths:
 
 - `self.current_assistant_node` → `self.current_assistant_node` (already on runner)
 - `self.pending_tool_calls` → `self.pending_tool_calls`
@@ -587,26 +587,26 @@ git commit -m "runner: scaffold AgentRunner and move streaming state fields"
 - `self.persistEvent(...)` → `self.session.persistEvent(...)`
 - `self.resetCurrentAssistantText()` → `self.resetCurrentAssistantText()` (also moved to runner)
 
-**Step 2 - Delete the method from `ConversationBuffer`.**
+**Step 2, Delete the method from `ConversationBuffer`.**
 
-**Step 3 - Update the ONE caller:** `ConversationBuffer.drainEvents` at the `self.handleAgentEvent(...)` line. Change to `self.runner.handleAgentEvent(...)`. (drainEvents still lives on ConversationBuffer in this task; it moves in 2.4.)
+**Step 3, Update the ONE caller:** `ConversationBuffer.drainEvents` at the `self.handleAgentEvent(...)` line. Change to `self.runner.handleAgentEvent(...)`. (drainEvents still lives on ConversationBuffer in this task; it moves in 2.4.)
 
-**Step 4 - Move `resetCurrentAssistantText` to `AgentRunner` too** (it mutates `current_assistant_node` which is runner state, and removes from view tree's root_children). After move, its body calls `self.view.root_children.orderedRemove(...)` - add a `removeNode(node)` helper to `ConversationBuffer` if the direct field access feels too tight.
+**Step 4, Move `resetCurrentAssistantText` to `AgentRunner` too** (it mutates `current_assistant_node` which is runner state, and removes from view tree's root_children). After move, its body calls `self.view.root_children.orderedRemove(...)`, add a `removeNode(node)` helper to `ConversationBuffer` if the direct field access feels too tight.
 
-**Step 5 - Run tests. Commit:**
+**Step 5, Run tests. Commit:**
 ```
 git commit -m "runner: move handleAgentEvent onto AgentRunner"
 ```
 
-### Task 2.4 - Move `drainEvents`, `dispatchHookRequests`, `cancelAgent`, `isAgentRunning`, `lastInfo` onto `AgentRunner`
+### Task 2.4, Move `drainEvents`, `dispatchHookRequests`, `cancelAgent`, `isAgentRunning`, `lastInfo` onto `AgentRunner`
 
 Bodies preserved verbatim; just swap access paths same as 2.3.
 
 **Note on `dispatchHookRequests`:** it's a static fn today (`pub fn dispatchHookRequests(queue: *EventQueue, engine: ?*LuaEngine) void`). Keep it static on `AgentRunner`, or make it a method. Keeping it static matches current behavior.
 
-**Step 1 - Move each method.**
+**Step 1, Move each method.**
 
-**Step 2 - Update orchestrator call sites:** `cb.drainEvents(...)` → `pane.runner.drainEvents(...)`. But Phase 4 is where orchestrator changes. In the interim, `ConversationBuffer` can expose shim methods that delegate to `self.runner`:
+**Step 2, Update orchestrator call sites:** `cb.drainEvents(...)` → `pane.runner.drainEvents(...)`. But Phase 4 is where orchestrator changes. In the interim, `ConversationBuffer` can expose shim methods that delegate to `self.runner`:
 
 ```zig
 pub fn drainEvents(self: *ConversationBuffer, allocator: Allocator) bool {
@@ -619,9 +619,9 @@ pub fn lastInfo(self: *const ConversationBuffer) []const u8 { return self.runner
 
 These shims exist only during Phase 2-3 and are removed in Phase 4.
 
-**Step 3 - Run tests. Commit.**
+**Step 3, Run tests. Commit.**
 
-### Task 2.5 - Move `submitInput`'s agent-coordination half onto `AgentRunner`
+### Task 2.5, Move `submitInput`'s agent-coordination half onto `AgentRunner`
 
 `submitInput` currently:
 1. Appends a user message to `messages` (session)
@@ -631,10 +631,10 @@ These shims exist only during Phase 2-3 and are removed in Phase 4.
 
 Split into:
 
-- `ConversationSession.appendUserMessage(text)` - (1), already exists from 1.5
-- `ConversationBuffer.appendUserNode(text)` - (2), new wrapper around `appendNode`
-- `ConversationSession.persistUserMessage(text)` - (3), new convenience wrapper over persistEvent
-- `AgentRunner.resetStreamingState()` - (4), new small helper
+- `ConversationSession.appendUserMessage(text)`, (1), already exists from 1.5
+- `ConversationBuffer.appendUserNode(text)`, (2), new wrapper around `appendNode`
+- `ConversationSession.persistUserMessage(text)`, (3), new convenience wrapper over persistEvent
+- `AgentRunner.resetStreamingState()`, (4), new small helper
 
 And a new top-level method on `AgentRunner`:
 
@@ -647,29 +647,29 @@ pub fn submitInput(self: *AgentRunner, text: []const u8, allocator: Allocator) !
 }
 ```
 
-(`persistUserMessage` swallows errors like the current `persistEvent` - best-effort.)
+(`persistUserMessage` swallows errors like the current `persistEvent`, best-effort.)
 
-**Step 1 - Add the new methods on session, view, runner.**
+**Step 1, Add the new methods on session, view, runner.**
 
-**Step 2 - Delete `ConversationBuffer.submitInput`.**
+**Step 2, Delete `ConversationBuffer.submitInput`.**
 
-**Step 3 - Add a shim on `ConversationBuffer.submitInput` that calls `self.runner.submitInput(text, allocator)`. Keep it during Phase 2-3; remove in Phase 4.**
+**Step 3, Add a shim on `ConversationBuffer.submitInput` that calls `self.runner.submitInput(text, allocator)`. Keep it during Phase 2-3; remove in Phase 4.**
 
-**Step 4 - Run tests. Commit.**
+**Step 4, Run tests. Commit.**
 
 ---
 
-## Phase 3 - Shrink `ConversationBuffer`
+## Phase 3, Shrink `ConversationBuffer`
 
 Remove the `session` and `runner` fields from `ConversationBuffer`. The shims from Phase 1-2 go away. `ConversationBuffer` becomes a pure view; orchestrator wires the three types together.
 
-### Task 3.1 - Prove the `Pane` struct works in a test
+### Task 3.1, Prove the `Pane` struct works in a test
 
 Before changing orchestrator, prove the composition pattern in a unit test.
 
 **File:** `src/EventOrchestrator.zig` (add to its test block)
 
-**Step 1 - Define `Pane` struct in `EventOrchestrator.zig`:**
+**Step 1, Define `Pane` struct in `EventOrchestrator.zig`:**
 
 ```zig
 pub const Pane = struct {
@@ -679,7 +679,7 @@ pub const Pane = struct {
 };
 ```
 
-**Step 2 - Add a test that constructs a Pane and verifies all three types coexist:**
+**Step 2, Add a test that constructs a Pane and verifies all three types coexist:**
 
 ```zig
 test "Pane composes view + session + runner" {
@@ -702,21 +702,21 @@ test "Pane composes view + session + runner" {
 }
 ```
 
-**Step 3 - This test fails because `ConversationBuffer.init` still expects `session` + `runner` args.** That's the forcing function for 3.2.
+**Step 3, This test fails because `ConversationBuffer.init` still expects `session` + `runner` args.** That's the forcing function for 3.2.
 
-### Task 3.2 - Remove composition fields from `ConversationBuffer`
+### Task 3.2, Remove composition fields from `ConversationBuffer`
 
-**Step 1 - Edit `ConversationBuffer.init` signature** to drop `session` and `runner`:
+**Step 1, Edit `ConversationBuffer.init` signature** to drop `session` and `runner`:
 
 ```zig
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer { ... }
 ```
 
-**Step 2 - Remove the `session` and `runner` fields from the struct.**
+**Step 2, Remove the `session` and `runner` fields from the struct.**
 
-**Step 3 - Remove the shims** (`drainEvents`, `cancelAgent`, `isAgentRunning`, `lastInfo`, `submitInput`) from `ConversationBuffer`. Callers will call `pane.runner.X(...)` in Phase 4.
+**Step 3, Remove the shims** (`drainEvents`, `cancelAgent`, `isAgentRunning`, `lastInfo`, `submitInput`) from `ConversationBuffer`. Callers will call `pane.runner.X(...)` in Phase 4.
 
-**Step 4 - Remove `restoreFromSession`?** Actually keep it, but it becomes a two-step coordinator on the `Pane`:
+**Step 4, Remove `restoreFromSession`?** Actually keep it, but it becomes a two-step coordinator on the `Pane`:
 
 ```zig
 // On EventOrchestrator or a free fn: orchestrator.restorePaneFromSession(pane, handle, allocator)
@@ -736,28 +736,28 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
 
 Delete `ConversationBuffer.restoreFromSession`.
 
-**Step 5 - Fix all tests** - they now construct the three types separately (like the Pane test in 3.1). Mechanical.
+**Step 5, Fix all tests**, they now construct the three types separately (like the Pane test in 3.1). Mechanical.
 
-**Step 6 - Run tests:**
+**Step 6, Run tests:**
 
 ```
 zig build test 2>&1 | tail -20
 ```
 
-**Step 7 - Commit:**
+**Step 7, Commit:**
 ```
 git commit -m "view: shrink ConversationBuffer to rendering-only concerns"
 ```
 
 ---
 
-## Phase 4 - Update callers
+## Phase 4, Update callers
 
-### Task 4.1 - `main.zig` creates all three
+### Task 4.1, `main.zig` creates all three
 
 **File:** `src/main.zig`
 
-**Step 1 - Replace:**
+**Step 1, Replace:**
 
 ```zig
 var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
@@ -785,17 +785,17 @@ const root_pane: EventOrchestrator.Pane = .{
 };
 ```
 
-**Step 2 - Session restoration:** replace `root_buffer.restoreFromSession(sh, allocator)` with `try EventOrchestrator.restorePane(root_pane, sh, allocator)`.
+**Step 2, Session restoration:** replace `root_buffer.restoreFromSession(sh, allocator)` with `try EventOrchestrator.restorePane(root_pane, sh, allocator)`.
 
-**Step 3 - Pass `root_pane` to orchestrator init** (see 4.2).
+**Step 3, Pass `root_pane` to orchestrator init** (see 4.2).
 
-**Step 4 - Run tests and build.**
+**Step 4, Run tests and build.**
 
-### Task 4.2 - `EventOrchestrator` holds `Pane`s
+### Task 4.2, `EventOrchestrator` holds `Pane`s
 
 **File:** `src/EventOrchestrator.zig`
 
-**Step 1 - Change config shape:**
+**Step 1, Change config shape:**
 
 ```zig
 pub const Config = struct {
@@ -805,7 +805,7 @@ pub const Config = struct {
 };
 ```
 
-**Step 2 - `extra_panes` field type changes:**
+**Step 2, `extra_panes` field type changes:**
 
 ```zig
 extra_panes: std.ArrayList(Pane),  // was: std.ArrayList(SplitPane)
@@ -813,7 +813,7 @@ extra_panes: std.ArrayList(Pane),  // was: std.ArrayList(SplitPane)
 
 If `SplitPane` existed before (per audit, it did), its fields collapse into `Pane` + any pane-specific state. Consolidate.
 
-**Step 3 - Update every call site** per the audit (35 of them):
+**Step 3, Update every call site** per the audit (35 of them):
 - `buffer.drainEvents(allocator)` → `pane.runner.drainEvents(allocator)`
 - `buffer.isAgentRunning()` → `pane.runner.isAgentRunning()`
 - `buffer.cancelAgent()` → `pane.runner.cancelAgent()`
@@ -824,7 +824,7 @@ If `SplitPane` existed before (per audit, it did), its fields collapse into `Pan
 - `buffer.render_dirty` → `pane.view.render_dirty` (still a direct field read; that's acceptable for the view)
 - `buffer.session_handle = h` → `pane.session.attachSession(h)`
 
-**Step 4 - `createSplitPane` allocates all three:**
+**Step 4, `createSplitPane` allocates all three:**
 
 ```zig
 fn createSplitPane(self: *EventOrchestrator) !Pane {
@@ -850,7 +850,7 @@ fn createSplitPane(self: *EventOrchestrator) !Pane {
 
 Register the pane in `extra_panes`. Return it.
 
-**Step 5 - `deinit` walks panes, calls deinit on all three:**
+**Step 5, `deinit` walks panes, calls deinit on all three:**
 
 ```zig
 for (self.extra_panes.items) |pane| {
@@ -865,25 +865,25 @@ for (self.extra_panes.items) |pane| {
 
 Order matters: runner first (joins the thread, drains queue), then session, then view.
 
-**Step 6 - Add `paneFromBuffer(b: Buffer) ?Pane`:** given a `Buffer` interface from `Layout.getFocusedLeaf()`, walk the pane list to find the matching `view` and return the Pane. Used to resolve focused pane from layout's leaf.
+**Step 6, Add `paneFromBuffer(b: Buffer) ?Pane`:** given a `Buffer` interface from `Layout.getFocusedLeaf()`, walk the pane list to find the matching `view` and return the Pane. Used to resolve focused pane from layout's leaf.
 
-**Step 7 - Run tests, build, manually check. Commit:**
+**Step 7, Run tests, build, manually check. Commit:**
 ```
 git commit -m "orchestrator: thread Pane through all ConversationBuffer call sites"
 ```
 
-### Task 4.3 - `Compositor.zig`: replace the downcast
+### Task 4.3, `Compositor.zig`: replace the downcast
 
 **File:** `src/Compositor.zig` (line ~277)
 
-**Step 1 - Locate the call site:**
+**Step 1, Locate the call site:**
 
 ```zig
 const cb = ConversationBuffer.fromBuffer(leaf.buffer);
 // reads cb.queue_active and cb.event_queue.dropped
 ```
 
-**Step 2 - Add helpers on `AgentRunner`:**
+**Step 2, Add helpers on `AgentRunner`:**
 
 ```zig
 pub fn queueActive(self: *const AgentRunner) bool { return self.queue_active; }
@@ -892,7 +892,7 @@ pub fn droppedEventCount(self: *const AgentRunner) u64 {
 }
 ```
 
-**Step 3 - Pass pane or runner reference into `Compositor.composite`.** Options:
+**Step 3, Pass pane or runner reference into `Compositor.composite`.** Options:
 
 (a) Add a pane-lookup callback: `Compositor.composite(layout, inputs, paneResolver)` where paneResolver is a fn pointer that takes `Buffer` and returns `?*AgentRunner`. Orchestrator passes a closure-like wrapper.
 
@@ -902,16 +902,16 @@ pub fn droppedEventCount(self: *const AgentRunner) u64 {
 
 Pick (c) for minimal diff: Compositor takes an `*EventOrchestrator` in init, stashes it, calls `self.orchestrator.paneFromBuffer(leaf.buffer)` at the site.
 
-**Step 4 - Run tests. Commit:**
+**Step 4, Run tests. Commit:**
 ```
 git commit -m "compositor: resolve dropped-event counter via pane lookup"
 ```
 
 ---
 
-## Phase 5 - Final verification
+## Phase 5, Final verification
 
-### Task 5.1 - Full test suite
+### Task 5.1, Full test suite
 
 ```
 zig build test 2>&1 | tail -20
@@ -919,7 +919,7 @@ zig build test 2>&1 | tail -20
 
 Must exit 0.
 
-### Task 5.2 - Formatting
+### Task 5.2, Formatting
 
 ```
 zig fmt --check .
@@ -927,11 +927,11 @@ zig fmt --check .
 
 Must exit 0. If not, `zig fmt .` and amend the Phase 5 commit.
 
-### Task 5.3 - Manual TUI smoke test
+### Task 5.3, Manual TUI smoke test
 
 Cannot be automated; requires eyes.
 
-1. `zig build run` - TUI starts.
+1. `zig build run`, TUI starts.
 2. Type `hello` + Enter. Agent should respond (assuming `ANTHROPIC_API_KEY` set).
 3. Observe spinner, streaming text, tool calls render correctly.
 4. Press Ctrl+C during streaming. Cancellation works.
@@ -939,11 +939,11 @@ Cannot be automated; requires eyes.
 6. Switch focus to split pane (Alt+l or normal mode `l`). Type a prompt. Agent runs in that pane.
 7. Observe status bar shows correct pane's info.
 8. Quit. No crashes on shutdown.
-9. Relaunch with `--last`. Session restores - messages visible, node tree populated.
+9. Relaunch with `--last`. Session restores, messages visible, node tree populated.
 
 If any step fails, file under Phase 6 (unplanned fixes) and iterate.
 
-### Task 5.4 - Commit coverage check
+### Task 5.4, Commit coverage check
 
 ```
 git log --oneline main..HEAD
@@ -964,7 +964,7 @@ Expected sequence:
 11. `orchestrator: thread Pane through all ConversationBuffer call sites`
 12. `compositor: resolve dropped-event counter via pane lookup`
 
-### Task 5.5 - PR or merge
+### Task 5.5, PR or merge
 
 Either open a PR against `main` with the design and plan docs referenced, or fast-forward merge if working solo. The branch is mergeable at any phase boundary if later phases slip.
 
