@@ -130,8 +130,104 @@ pub fn pollEvent(fd: std.posix.fd_t) ?Event {
 /// "got one". It is the primitive used by `Parser` for fragmentation
 /// handling and by the legacy `parseBytes` wrapper.
 pub fn nextEventInBuf(buf: []const u8) ParseResult {
-    _ = buf;
-    @compileError("not yet implemented");
+    if (buf.len == 0) return .incomplete;
+
+    const first = buf[0];
+
+    // ESC-prefixed sequences
+    if (first == 0x1b) {
+        if (buf.len == 1) return .incomplete; // bare ESC vs. prefix — caller decides via timeout
+
+        const second = buf[1];
+
+        // CSI: ESC [ ... <final>
+        if (second == '[') {
+            if (buf.len < 3) return .incomplete;
+            const body = buf[2..];
+            const final_offset = findCsiFinal(body) orelse return .incomplete;
+            const seq = body[0 .. final_offset + 1];
+            return .{ .ok = .{ .event = parseCsi(seq), .consumed = 2 + seq.len } };
+        }
+
+        // SS3: ESC O <letter>
+        if (second == 'O') {
+            if (buf.len < 3) return .incomplete;
+            return .{ .ok = .{ .event = parseSs3(buf[2]), .consumed = 3 } };
+        }
+
+        // Alt + printable ASCII
+        if (second >= 0x20 and second < 0x7f) {
+            return .{ .ok = .{
+                .event = Event{ .key = .{
+                    .key = .{ .char = second },
+                    .modifiers = .{ .alt = true },
+                } },
+                .consumed = 2,
+            } };
+        }
+
+        // Anything else after ESC is unrecognised — emit bare ESC and
+        // let the caller re-try on the remainder.
+        return .{ .ok = .{
+            .event = Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } },
+            .consumed = 1,
+        } };
+    }
+
+    // Ctrl+key combinations (0x01..0x1a)
+    if (first >= 0x01 and first <= 0x1a) {
+        const event: Event = switch (first) {
+            0x09 => .{ .key = .{ .key = .tab, .modifiers = KeyEvent.no_modifiers } },
+            0x0a, 0x0d => .{ .key = .{ .key = .enter, .modifiers = KeyEvent.no_modifiers } },
+            0x08 => .{ .key = .{ .key = .backspace, .modifiers = KeyEvent.no_modifiers } },
+            else => .{ .key = .{
+                .key = .{ .char = first + 'a' - 1 },
+                .modifiers = .{ .ctrl = true },
+            } },
+        };
+        return .{ .ok = .{ .event = event, .consumed = 1 } };
+    }
+
+    // DEL (backspace on most terminals)
+    if (first == 0x7f) {
+        return .{ .ok = .{
+            .event = Event{ .key = .{ .key = .backspace, .modifiers = KeyEvent.no_modifiers } },
+            .consumed = 1,
+        } };
+    }
+
+    // Printable ASCII
+    if (first >= 0x20 and first < 0x7f) {
+        return .{ .ok = .{
+            .event = Event{ .key = .{
+                .key = .{ .char = first },
+                .modifiers = KeyEvent.no_modifiers,
+            } },
+            .consumed = 1,
+        } };
+    }
+
+    // UTF-8 multi-byte
+    if (first >= 0x80) {
+        const len = std.unicode.utf8ByteSequenceLength(first) catch {
+            // Invalid lead byte — drop one byte and let caller retry.
+            return .{ .skip = .{ .consumed = 1 } };
+        };
+        if (buf.len < len) return .incomplete;
+        const codepoint = std.unicode.utf8Decode(buf[0..len]) catch {
+            return .{ .skip = .{ .consumed = len } };
+        };
+        return .{ .ok = .{
+            .event = Event{ .key = .{
+                .key = .{ .char = codepoint },
+                .modifiers = KeyEvent.no_modifiers,
+            } },
+            .consumed = len,
+        } };
+    }
+
+    // Unknown control byte (<0x20 but not ESC/Ctrl/Tab/Enter/Backspace handled above)
+    return .{ .skip = .{ .consumed = 1 } };
 }
 
 /// Parse a byte slice into an Event.
@@ -139,77 +235,10 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
 /// This is the core parsing logic, separated from I/O so it can be tested
 /// with synthetic byte sequences.
 pub fn parseBytes(buf: []const u8) ?Event {
-    if (buf.len == 0) return null;
-
-    const first = buf[0];
-
-    // ESC-prefixed sequences
-    if (first == 0x1b) {
-        // Bare escape (single byte)
-        if (buf.len == 1) {
-            return Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } };
-        }
-
-        // Alt + single character: ESC followed by a printable byte
-        if (buf.len == 2 and buf[1] >= 0x20 and buf[1] < 0x7f) {
-            return Event{ .key = .{
-                .key = .{ .char = buf[1] },
-                .modifiers = .{ .alt = true },
-            } };
-        }
-
-        // CSI sequences: ESC [
-        if (buf[1] == '[') {
-            return parseCsi(buf[2..]);
-        }
-
-        // SS3 sequences: ESC O (some terminals send arrow keys this way)
-        if (buf[1] == 'O' and buf.len >= 3) {
-            return parseSs3(buf[2]);
-        }
-
-        // Unrecognised escape sequence
-        return Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } };
-    }
-
-    // Ctrl+key combinations (0x01 to 0x1a, excluding special cases)
-    if (first >= 0x01 and first <= 0x1a) {
-        return switch (first) {
-            0x09 => Event{ .key = .{ .key = .tab, .modifiers = KeyEvent.no_modifiers } },
-            0x0a, 0x0d => Event{ .key = .{ .key = .enter, .modifiers = KeyEvent.no_modifiers } },
-            0x08 => Event{ .key = .{ .key = .backspace, .modifiers = KeyEvent.no_modifiers } },
-            else => Event{ .key = .{
-                .key = .{ .char = first + 'a' - 1 },
-                .modifiers = .{ .ctrl = true },
-            } },
-        };
-    }
-
-    // DEL (0x7f), backspace on most terminals
-    if (first == 0x7f) {
-        return Event{ .key = .{ .key = .backspace, .modifiers = KeyEvent.no_modifiers } };
-    }
-
-    // Printable ASCII
-    if (first >= 0x20 and first < 0x7f) {
-        return Event{ .key = .{
-            .key = .{ .char = first },
-            .modifiers = KeyEvent.no_modifiers,
-        } };
-    }
-
-    // UTF-8 multi-byte
-    if (first >= 0x80) {
-        const len = std.unicode.utf8ByteSequenceLength(first) catch return Event.none;
-        if (buf.len < len) return Event.none;
-        const codepoint = std.unicode.utf8Decode(buf[0..len]) catch return Event.none;
-        return Event{ .key = .{
-            .key = .{ .char = codepoint },
-            .modifiers = KeyEvent.no_modifiers,
-        } };
-    }
-
-    return Event.none;
+    return switch (nextEventInBuf(buf)) {
+        .ok => |o| o.event,
+        .incomplete, .skip => null,
+    };
 }
 
 /// Parse a CSI sequence (bytes after "ESC [").
@@ -399,6 +428,22 @@ fn decodeModifier(val: u16) KeyEvent.Modifiers {
     };
 }
 
+/// Scan forward from `start` in `buf` looking for an ECMA-48 CSI final
+/// byte in the range 0x40..0x7E. Returns the index of that byte, or
+/// null if the sequence is still growing.
+fn findCsiFinal(buf: []const u8) ?usize {
+    for (buf, 0..) |b, i| {
+        // Intermediate/parameter bytes are 0x20..0x3F; final is 0x40..0x7E.
+        if (b >= 0x40 and b <= 0x7E) return i;
+        // Anything below 0x20 inside a CSI is malformed — but we still
+        // consider the CSI complete at that point to avoid eating
+        // arbitrary amounts of subsequent input. parseCsi will return
+        // Event.none for malformed content.
+        if (b < 0x20) return i;
+    }
+    return null;
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -564,14 +609,12 @@ test "parse Backspace (0x7f)" {
     }
 }
 
-test "parse bare Escape" {
-    const event = parseBytes(&.{0x1b}) orelse return error.TestUnexpectedResult;
-    switch (event) {
-        .key => |k| {
-            try std.testing.expectEqual(KeyEvent.Key.escape, k.key);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+test "parseBytes: bare Escape returns null (incomplete, resolved by Parser timeout)" {
+    // A single 0x1b cannot be disambiguated from a CSI/SS3/Alt prefix
+    // until either more bytes arrive or the Parser's 50ms timeout
+    // fires. parseBytes exposes this as null; the Parser struct
+    // produces the bare-Escape event after the deadline.
+    try std.testing.expect(parseBytes(&.{0x1b}) == null);
 }
 
 test "parse Alt+a" {
@@ -767,22 +810,23 @@ test "parse End key (CSI F)" {
     }
 }
 
-test "parse invalid UTF-8 returns none" {
-    // 0xFF is never valid as a UTF-8 start byte
-    const event = parseBytes(&.{0xFF}) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(Event.none, event);
+test "parseBytes: invalid UTF-8 lead byte returns null (skip)" {
+    // 0xFF is never valid as a UTF-8 start byte. Under the new
+    // semantics parseBytes returns null while the Parser drops the
+    // byte and resyncs on the next readable byte.
+    try std.testing.expect(parseBytes(&.{0xFF}) == null);
 }
 
-test "parse truncated UTF-8 returns none" {
-    // 0xC3 starts a 2-byte sequence, but we only provide 1 byte
-    const event = parseBytes(&.{0xC3}) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(Event.none, event);
+test "parseBytes: truncated UTF-8 returns null (incomplete)" {
+    // 0xC3 starts a 2-byte sequence, but we only provide 1 byte; the
+    // parser waits for the continuation byte to arrive.
+    try std.testing.expect(parseBytes(&.{0xC3}) == null);
 }
 
-test "parse invalid UTF-8 continuation returns none" {
-    // 0xC3 expects a continuation byte (0x80..0xBF), but 0x00 is not one
-    const event = parseBytes(&.{ 0xC3, 0x00 }) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(Event.none, event);
+test "parseBytes: invalid UTF-8 continuation returns null (skip)" {
+    // 0xC3 expects a continuation byte (0x80..0xBF), but 0x00 is not
+    // one; parseBytes signals the garbage via null.
+    try std.testing.expect(parseBytes(&.{ 0xC3, 0x00 }) == null);
 }
 
 test "parse UTF-8 four-byte character (emoji)" {
@@ -803,17 +847,11 @@ test "parse unrecognized CSI sequence returns none" {
     try std.testing.expectEqual(Event.none, event);
 }
 
-test "parse truncated CSI (ESC [) returns Alt+[" {
-    // ESC [ with nothing after; only 2 bytes, so the Alt+char path matches
-    // before the CSI branch can fire (CSI requires a third byte)
-    const event = parseBytes(&.{ 0x1b, '[' }) orelse return error.TestUnexpectedResult;
-    switch (event) {
-        .key => |k| {
-            try std.testing.expectEqual(KeyEvent.Key{ .char = '[' }, k.key);
-            try std.testing.expectEqual(true, k.modifiers.alt);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+test "parseBytes: truncated CSI (ESC [) returns null (incomplete)" {
+    // Under the fragmentation-aware parser, a lone `ESC [` is not yet
+    // decidable. parseBytes exposes this as null; the Parser struct
+    // buffers and waits for more bytes or times out.
+    try std.testing.expect(parseBytes(&.{ 0x1b, '[' }) == null);
 }
 
 test "parse Backspace via 0x08" {
@@ -879,10 +917,8 @@ test "parse SS3 F4 (ESC O S)" {
     }
 }
 
-test "parse truncated SGR mouse returns none" {
-    // ESC [ < 0 ; 1 0 ; 5, missing M/m terminator
-    const event = parseBytes(&.{ 0x1b, '[', '<', '0', ';', '1', '0', ';', '5' }) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(Event.none, event);
+test "parseBytes: truncated SGR mouse returns null (incomplete)" {
+    try std.testing.expect(parseBytes(&.{ 0x1b, '[', '<', '0', ';', '1', '0', ';', '5' }) == null);
 }
 
 test "nextEventInBuf: empty buffer is incomplete" {
