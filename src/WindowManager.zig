@@ -32,8 +32,11 @@ const WindowManager = @This();
 /// view of a pane so callers needing all three compose them through this
 /// struct; each field is a borrowed pointer with coupled lifetimes.
 pub const Pane = struct {
+    /// Conversation buffer rendered for this pane.
     view: *ConversationBuffer,
+    /// Message history and turn state backing the view.
     session: *ConversationSession,
+    /// Agent worker driving LLM calls and tool execution for this pane.
     runner: *AgentRunner,
 };
 
@@ -78,6 +81,7 @@ next_scratch_id: u32 = 1,
 /// One-shot status message rendered on the input/status row, cleared on
 /// the next key event. Used for announces like `split to scratch 2`.
 transient_status: [64]u8 = undefined,
+/// Number of valid bytes in `transient_status`; zero means no message is active.
 transient_status_len: u8 = 0,
 /// Frame counter for animating the status bar spinner.
 spinner_frame: u8 = 0,
@@ -89,14 +93,23 @@ current_mode: Keymap.Mode = .insert,
 keymap_registry: Keymap.Registry = undefined,
 
 pub const Config = struct {
+    /// Heap allocator for runtime allocations owned by the manager.
     allocator: Allocator,
+    /// Cell grid and ANSI renderer (borrowed).
     screen: *Screen,
+    /// Window tree (splits + focus) (borrowed).
     layout: *Layout,
+    /// Renders layout into the screen grid (borrowed).
     compositor: *Compositor,
+    /// Primary conversation pane; its allocations are owned by main.zig.
     root_pane: Pane,
+    /// LLM provider for model calls and model ID lookups (borrowed).
     provider: *llm.ProviderResult,
+    /// Session manager for persistence, optional at the pointee (borrowed).
     session_mgr: *?Session.SessionManager,
+    /// Lua plugin engine, or null if Lua init failed (borrowed).
     lua_engine: ?*LuaEngine,
+    /// Write end of the wake pipe so agent workers can interrupt the main loop.
     wake_write_fd: posix.fd_t,
 };
 
