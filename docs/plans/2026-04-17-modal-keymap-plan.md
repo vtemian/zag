@@ -14,13 +14,13 @@
 
 ---
 
-## Task 1: Scaffold `Keymap.zig` — Mode, Action, KeySpec types
+## Task 1: Scaffold `Keymap.zig`: Mode, Action, KeySpec types
 
 **Files:**
 - Create: `src/Keymap.zig`
-- Modify: `src/main.zig` — add `_ = @import("Keymap.zig");` to the "imports compile" test block (currently around line 794-824).
+- Modify: `src/main.zig`: add `_ = @import("Keymap.zig");` to the "imports compile" test block (currently around line 794-824).
 
-**Step 1 — Write failing tests**
+**Step 1, Write failing tests**
 
 Put at the bottom of `Keymap.zig`:
 
@@ -42,15 +42,15 @@ test "parseActionName maps known and rejects unknown" {
 }
 ```
 
-**Step 2 — Run tests, expect compile failure**
+**Step 2, Run tests, expect compile failure**
 
 ```
 zig build test 2>&1 | head -15
 ```
 
-Expected: `error: unable to resolve 'Keymap'` (since the new file isn't imported yet) — add the import line to main.zig FIRST, then the error becomes "undeclared identifier Mode/Action".
+Expected: `error: unable to resolve 'Keymap'` (since the new file isn't imported yet), add the import line to main.zig FIRST, then the error becomes "undeclared identifier Mode/Action".
 
-**Step 3 — Create `src/Keymap.zig`**
+**Step 3, Create `src/Keymap.zig`**
 
 ```zig
 //! Vim-style modal keymap.
@@ -132,7 +132,7 @@ test {
 
 Add `_ = @import("Keymap.zig");` inside the "imports compile" test in main.zig.
 
-**Step 4 — Run tests, expect pass**
+**Step 4, Run tests, expect pass**
 
 ```
 zig build test
@@ -140,7 +140,7 @@ zig build test
 
 Exit 0. New tests pass.
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Keymap.zig src/main.zig
@@ -154,12 +154,12 @@ EOF
 
 ---
 
-## Task 2: `parseKeySpec` — vim-style key strings
+## Task 2: `parseKeySpec`: vim-style key strings
 
 **Files:**
 - Modify: `src/Keymap.zig`
 
-**Step 1 — Write failing tests**
+**Step 1, Write failing tests**
 
 ```zig
 test "parseKeySpec bare char" {
@@ -195,9 +195,9 @@ test "parseKeySpec rejects empty and malformed" {
 }
 ```
 
-**Step 2 — Run, expect undefined `parseKeySpec`.**
+**Step 2, Run, expect undefined `parseKeySpec`.**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 Append to `Keymap.zig`:
 
@@ -271,9 +271,9 @@ pub fn parseKeySpec(s: []const u8) ParseError!KeySpec {
 }
 ```
 
-**Step 4 — `zig build test` green. `zig fmt --check .` clean.**
+**Step 4, `zig build test` green. `zig fmt --check .` clean.**
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Keymap.zig
@@ -291,12 +291,12 @@ EOF
 
 ---
 
-## Task 3: `Registry` — store, lookup, defaults
+## Task 3: `Registry`: store, lookup, defaults
 
 **Files:**
 - Modify: `src/Keymap.zig`
 
-**Step 1 — Write failing tests**
+**Step 1, Write failing tests**
 
 ```zig
 test "Registry round-trip: register then lookup" {
@@ -345,9 +345,9 @@ test "loadDefaults installs the nine built-in bindings" {
 }
 ```
 
-**Step 2 — Run, expect undefined `Registry`.**
+**Step 2, Run, expect undefined `Registry`.**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 Append to `Keymap.zig`:
 
@@ -414,9 +414,9 @@ pub const Registry = struct {
 };
 ```
 
-**Step 4 — Tests green. Fmt clean.**
+**Step 4, Tests green. Fmt clean.**
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Keymap.zig
@@ -435,11 +435,11 @@ EOF
 **Files:**
 - Modify: `src/main.zig`
 
-**Step 1 — Test strategy**
+**Step 1, Test strategy**
 
 `handleKey` is integration-heavy (relies on module-level `layout`, `compositor`, `buffer`). Verification is manual for this task; commit after tests-still-green. Functional test comes in Task 8.
 
-**Step 2 — Add module-level state**
+**Step 2, Add module-level state**
 
 At the top of main.zig, near `var buffer: ConversationBuffer = undefined;` (around line 88-89):
 
@@ -463,7 +463,7 @@ defer keymap_registry.deinit();
 try keymap_registry.loadDefaults();
 ```
 
-**Step 3 — Rewrite `handleKey` to be mode-aware**
+**Step 3, Rewrite `handleKey` to be mode-aware**
 
 Replace the Alt branch (lines 241-260). New flow:
 
@@ -521,7 +521,7 @@ fn handleKey(
 
 Keep the existing enter/backspace/char/scroll handlers intact under the insert-mode path; just move them behind the `current_mode != .normal` guard. Do NOT delete them.
 
-**Step 4 — Implement `executeAction`**
+**Step 4, Implement `executeAction`**
 
 Near `doSplit`:
 
@@ -545,7 +545,7 @@ fn executeAction(action: Keymap.Action, ctx: *const AppContext) void {
 }
 ```
 
-**Step 5 — Run tests, fmt, commit**
+**Step 5, Run tests, fmt, commit**
 
 ```bash
 zig build test && zig fmt --check .
@@ -570,7 +570,7 @@ EOF
 **Files:**
 - Modify: `src/Theme.zig`
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "default theme exposes mode_insert and mode_normal highlights" {
@@ -584,9 +584,9 @@ test "default theme exposes mode_insert and mode_normal highlights" {
 
 Place in the existing test block at the bottom of `Theme.zig`.
 
-**Step 2 — Expect compile error (missing fields).**
+**Step 2, Expect compile error (missing fields).**
 
-**Step 3 — Add the highlights**
+**Step 3, Add the highlights**
 
 In `Theme.zig`, extend `Highlights`:
 
@@ -606,9 +606,9 @@ In `defaultTheme()`, add sensible defaults:
 
 Where `green` and `blue` are palette constants already in the file (or use the closest match; check existing highlights like `success` / `info` for available palette entries).
 
-**Step 4 — Run tests. Fmt clean.**
+**Step 4, Run tests. Fmt clean.**
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Theme.zig
@@ -628,7 +628,7 @@ EOF
 - Modify: `src/Compositor.zig`
 - Modify: `src/main.zig` (call site passing the new field)
 
-**Step 1 — Test strategy**
+**Step 1, Test strategy**
 
 Add a Compositor test that renders with each mode and asserts the first cell of the status line carries the expected codepoint (`[` open bracket) and the correct fg color.
 
@@ -657,9 +657,9 @@ test "status line paints mode indicator at column 0" {
 }
 ```
 
-**Step 2 — Expect compile error on `.mode = .normal`.**
+**Step 2, Expect compile error on `.mode = .normal`.**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 1. Add `mode: Keymap.Mode` field to `InputState` (in `Compositor.zig`, around line 29-40):
 
@@ -705,9 +705,9 @@ Adjust the call site in `composite()` to pass `mode` through. The `composite(&la
 
 4. In `main.zig`, update the single `compositor.composite(...)` call site to include `mode = current_mode,` in the InputState literal.
 
-**Step 4 — Tests green. Fmt clean.**
+**Step 4, Tests green. Fmt clean.**
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Compositor.zig src/main.zig
@@ -726,7 +726,7 @@ EOF
 **Files:**
 - Modify: `src/Compositor.zig`
 
-**Step 1 — Test**
+**Step 1, Test**
 
 ```zig
 test "input line shows normal-mode hint instead of prompt in normal mode" {
@@ -753,9 +753,9 @@ test "input line shows normal-mode hint instead of prompt in normal mode" {
 
 Important: verify the actual row number `drawInputLine` targets by reading the compositor code. The test should check the correct row.
 
-**Step 2 — Expect failure (prompt still shown).**
+**Step 2, Expect failure (prompt still shown).**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 In `drawInputLine` (around line 280), branch on `input.mode`:
 
@@ -776,11 +776,11 @@ fn drawInputLine(self: *Compositor, input: InputState) void {
 }
 ```
 
-Be careful: existing code may show `input.status` (e.g. "tokens: 42") first and only fall through to the `>` prompt if status is empty. In normal mode, the hint should take precedence over ANY other content — users need to see they are in normal mode above all else.
+Be careful: existing code may show `input.status` (e.g. "tokens: 42") first and only fall through to the `>` prompt if status is empty. In normal mode, the hint should take precedence over ANY other content, users need to see they are in normal mode above all else.
 
-**Step 4 — Tests green. Fmt clean.**
+**Step 4, Tests green. Fmt clean.**
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/Compositor.zig
@@ -803,7 +803,7 @@ EOF
 **Files:**
 - Modify: `src/main.zig` (test-only additions, guarded by `test` blocks)
 
-**Step 1 — Write a smoke test**
+**Step 1, Write a smoke test**
 
 At the bottom of `main.zig`:
 
@@ -841,9 +841,9 @@ test "mode transitions via handleKey" {
 
 If constructing a full `AppContext` is painful, instead extract a pure `modeAfterKey(mode, event, registry) -> Mode` helper and test that. Cleaner boundary.
 
-**Step 2 — Run, iterate until green.**
+**Step 2, Run, iterate until green.**
 
-**Step 3 — Commit**
+**Step 3, Commit**
 
 ```bash
 git add src/main.zig
@@ -863,7 +863,7 @@ EOF
 - Modify: `src/LuaEngine.zig`
 - Modify: `src/main.zig` (pass the registry pointer into the engine)
 
-**Step 1 — Write failing test**
+**Step 1, Write failing test**
 
 ```zig
 test "zag.keymap registers into the shared registry" {
@@ -895,9 +895,9 @@ test "zag.keymap registers into the shared registry" {
 }
 ```
 
-**Step 2 — Expect compile error (`keymap_registry` field missing on `LuaEngine`).**
+**Step 2, Expect compile error (`keymap_registry` field missing on `LuaEngine`).**
 
-**Step 3 — Implement**
+**Step 3, Implement**
 
 1. In `LuaEngine`, add `const Keymap = @import("Keymap.zig");` near the imports, and field:
    ```zig
@@ -967,16 +967,16 @@ test "zag.keymap registers into the shared registry" {
    }
    ```
 
-4. In `main.zig`, after creating `keymap_registry` and initializing LuaEngine, set `lua_engine.keymap_registry = &keymap_registry;` BEFORE the engine calls `loadUserConfig` — tricky because `loadUserConfig` happens inside `LuaEngine.init`. Options:
+4. In `main.zig`, after creating `keymap_registry` and initializing LuaEngine, set `lua_engine.keymap_registry = &keymap_registry;` BEFORE the engine calls `loadUserConfig`: tricky because `loadUserConfig` happens inside `LuaEngine.init`. Options:
    - a) Expose a new `LuaEngine.initWithKeymap(alloc, ?*Keymap.Registry)` variant.
    - b) Split `LuaEngine.init` into raw-init + `loadUserConfig` call; main.zig does init, sets the field, then calls `loadUserConfig` manually.
    - c) Move config loading later.
    
-   Choose (b) — smallest surface area. Add `pub fn loadUserConfig(self: *LuaEngine) void` that's currently inlined in `init`, make `init` stop calling it, and have main.zig call it after setting the field.
+   Choose (b), smallest surface area. Add `pub fn loadUserConfig(self: *LuaEngine) void` that's currently inlined in `init`, make `init` stop calling it, and have main.zig call it after setting the field.
 
-**Step 4 — Tests green. Fmt clean.**
+**Step 4, Tests green. Fmt clean.**
 
-**Step 5 — Commit**
+**Step 5, Commit**
 
 ```bash
 git add src/LuaEngine.zig src/main.zig
@@ -1000,7 +1000,7 @@ EOF
 - Modify: `README.md`
 - Create: `examples/keymap.lua`
 
-**Step 1 — Add keymap section to README**
+**Step 1, Add keymap section to README**
 
 Insert after the "Hooks" section. Three short paragraphs:
 
@@ -1017,7 +1017,7 @@ Link to `docs/plans/2026-04-17-modal-keymap-design.md`.
 
 Update "What's next" to remove "better keybindings" if it's there; note that modal+config landed.
 
-**Step 2 — `examples/keymap.lua`**
+**Step 2, `examples/keymap.lua`**
 
 ```lua
 -- Example keymap overrides. Drop into ~/.config/zag/config.lua or
@@ -1035,9 +1035,9 @@ zag.keymap("insert", "<C-q>", "close_window")
 zag.keymap("insert", "<C-n>", "enter_normal_mode")
 ```
 
-**Step 3 — Run tests + fmt.**
+**Step 3, Run tests + fmt.**
 
-**Step 4 — Commit**
+**Step 4, Commit**
 
 ```bash
 git add README.md examples/keymap.lua
@@ -1060,10 +1060,10 @@ EOF
    - `zig build run`
    - Start in insert mode, confirm `[INSERT]` in green on the status line and `> ` prompt.
    - Press Esc, confirm `[NORMAL]` in blue and `-- NORMAL --` help line replaces the prompt.
-   - Press `v` — pane splits vertically.
-   - Press `h`/`l` — focus moves between panes.
-   - Press `q` — focused pane closes.
-   - Press `i` — back to insert mode, typing works again.
+   - Press `v`: pane splits vertically.
+   - Press `h`/`l`: focus moves between panes.
+   - Press `q`: focused pane closes.
+   - Press `i`: back to insert mode, typing works again.
    - Ctrl+C still cancels/quits from either mode.
 5. **Config test:** write a throwaway `~/.config/zag/config.lua` with one override like `zag.keymap("normal", "x", "close_window")`, restart, confirm `x` now closes windows.
 
@@ -1072,8 +1072,8 @@ EOF
 ## Risks
 
 1. **Mode-state bugs if `handleKey` has multiple exit points.** Check every return-path retains a consistent mode. Keep `current_mode` mutations in `executeAction` only.
-2. **`drawInputLine` vs `drawStatusLine`** — both paint the last row; the input line wins. Verify the mode indicator from the status line isn't obscured when the input line renders. If it is, the indicator moves to the input line in normal mode (where it is already via the `-- NORMAL --` hint).
-3. **Keymap conflicts with input editing.** Ctrl+W should NOT fire keymap bindings in insert mode — it's a text-editing shortcut. Current plan gates it explicitly (Task 4 Step 3).
+2. **`drawInputLine` vs `drawStatusLine`**: both paint the last row; the input line wins. Verify the mode indicator from the status line isn't obscured when the input line renders. If it is, the indicator moves to the input line in normal mode (where it is already via the `-- NORMAL --` hint).
+3. **Keymap conflicts with input editing.** Ctrl+W should NOT fire keymap bindings in insert mode: it's a text-editing shortcut. Current plan gates it explicitly (Task 4 Step 3).
 4. **Lua config load order.** `keymap_registry` must exist and be bound to the engine BEFORE `loadUserConfig()` runs, otherwise `zag.keymap` calls from config.lua silently no-op.
 
 ---

@@ -20,7 +20,7 @@
 6. **Do not amend commits.** Create new commits.
 7. **Worktree Edit discipline.** When executing from `.worktrees/<branch>/`, always use fully qualified absolute paths in `Edit` calls and verify each change with `git diff` on the worktree plus `git status --short` on the main repo. See `feedback_worktree_edit_paths.md`.
 8. **Test-math rigor.** Mentally trace every test assertion against the proposed code before committing. If a trace contradicts the assertion, stop and fix the test or the plan before moving on.
-9. **No em dashes.** Use periods or semicolons; compound-word hyphens are fine. Verify with `grep -c "—"` on every touched file.
+9. **No em dashes.** Use periods or semicolons; compound-word hyphens are fine. Verify with `grep -c ","` on every touched file.
 10. **Preserve existing tests.** These are small fixes; do not delete or rewrite unrelated tests.
 
 ---

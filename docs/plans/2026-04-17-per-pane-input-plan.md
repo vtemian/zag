@@ -16,7 +16,7 @@
 - `src/ConversationBuffer.zig` gains draft storage + 5 helper methods (~40 LOC, +6 tests).
 - `src/EventOrchestrator.zig` loses its `typed` / `typed_len` fields and helper tests move untouched. Every keystroke-editing branch in `handleKey` routes to `self.getFocusedPane().view.draft` instead. (~30 LOC delta).
 - `src/Compositor.zig` loses `drawInputLine` entirely, gains `drawPanePrompts` + `drawPanePrompt` + `drawPanePromptsPass`; `InputState` drops four fields; `drawStatusLine` absorbs the metrics tail; `drawBufferContent` reserves the pane's bottom content row for the prompt (~120 LOC delta).
-- No changes to `Layout.zig`, `Theme.zig`, `AgentRunner.zig`, `Session.zig`, `Buffer.zig` (vtable unchanged — concrete access via existing `ConversationBuffer.fromBuffer`).
+- No changes to `Layout.zig`, `Theme.zig`, `AgentRunner.zig`, `Session.zig`, `Buffer.zig` (vtable unchanged: concrete access via existing `ConversationBuffer.fromBuffer`).
 
 **Invariant preserved per task.** `zig build test` exits 0, `zig fmt --check .` clean, `zig build run` smoke test still boots and accepts typing.
 
@@ -64,7 +64,7 @@ Normal mode on focused pane (no cursor, draft visible):
 **Files:**
 - Modify: `src/ConversationBuffer.zig`
 
-**Step 1 — Add the `MAX_DRAFT` constant.** Insert near the top of the file, right after the `log` declaration at line 16:
+**Step 1, Add the `MAX_DRAFT` constant.** Insert near the top of the file, right after the `log` declaration at line 16:
 
 ```zig
 /// Maximum bytes of in-progress draft a single pane can hold. Fixed so
@@ -72,7 +72,7 @@ Normal mode on focused pane (no cursor, draft visible):
 pub const MAX_DRAFT = 4096;
 ```
 
-**Step 2 — Write failing tests.** Append inside the inline test block at the end of the file (existing pattern uses `testing.allocator`, `init` + `defer deinit`, short names). Add after the last existing test:
+**Step 2, Write failing tests.** Append inside the inline test block at the end of the file (existing pattern uses `testing.allocator`, `init` + `defer deinit`, short names). Add after the last existing test:
 
 ```zig
 test "draft starts empty" {
@@ -142,7 +142,7 @@ test "clearDraft resets length to zero" {
 
 Run `zig build test`. Expected failures: undeclared field `draft`, `draft_len`, and undeclared methods on ConversationBuffer.
 
-**Step 3 — Add the fields to the struct.** Append to the field block (which ends around line 95, right after `renderer: NodeRenderer,`):
+**Step 3, Add the fields to the struct.** Append to the field block (which ends around line 95, right after `renderer: NodeRenderer,`):
 
 ```zig
 /// In-progress text the user is editing at this pane's prompt.
@@ -152,13 +152,13 @@ draft: [MAX_DRAFT]u8 = undefined,
 draft_len: usize = 0,
 ```
 
-**Step 4 — Add the 5 helper methods.** Insert above the `// -- Buffer interface ---` banner (around line 357):
+**Step 4, Add the 5 helper methods.** Insert above the `// -- Buffer interface ---` banner (around line 357):
 
 ```zig
 // -- Draft input --------------------------------------------------------
 
 /// Append a single byte to the draft. No-op if the draft is full.
-/// Does not touch `render_dirty` — the compositor repaints the prompt
+/// Does not touch `render_dirty`, the compositor repaints the prompt
 /// every frame anyway.
 pub fn appendToDraft(self: *ConversationBuffer, ch: u8) void {
     if (self.draft_len >= self.draft.len) return;
@@ -197,7 +197,7 @@ pub fn getDraft(self: *const ConversationBuffer) []const u8 {
 }
 ```
 
-**Step 5 — Run tests.** `zig build test` — all 6 new tests pass.
+**Step 5, Run tests.** `zig build test`, all 6 new tests pass.
 
 **Commit:** `conversation-buffer: add per-pane draft storage + helpers`
 
@@ -220,7 +220,7 @@ Per the Input-flow research: `typed` / `typed_len` has exactly these use sites, 
 - Line 503 (Backspace): `self.typed_len = inputDeleteBack(self.typed_len);`.
 - Line 507 (char): `self.typed_len = inputAppendChar(&self.typed, self.typed_len, @intCast(ch));`.
 
-**Step 1 — Delete fields and update module doc.** Remove lines 107-110. Update lines 5-9 from:
+**Step 1, Delete fields and update module doc.** Remove lines 107-110. Update lines 5-9 from:
 
 ```zig
 //! Ownership: the terminal, screen, layout, compositor, and root buffer
@@ -242,7 +242,7 @@ to (drop the `typed` mention since draft now lives per-pane):
 //! input (see ConversationBuffer.draft).
 ```
 
-**Step 2 — Initial render read (line 189).** `run()` starts with an initial `composite` call. Capture the focused conversation once and pass its draft:
+**Step 2, Initial render read (line 189).** `run()` starts with an initial `composite` call. Capture the focused conversation once and pass its draft:
 
 ```zig
 // Initial render
@@ -253,7 +253,7 @@ self.compositor.composite(self.layout, .{
 });
 ```
 
-**Step 3 — Tick read (line 339).** `tick()` already computes `const focused = self.getFocusedPane();` near line 330 (pre-existing). Replace:
+**Step 3, Tick read (line 339).** `tick()` already computes `const focused = self.getFocusedPane();` near line 330 (pre-existing). Replace:
 
 ```zig
 .text = self.typed[0..self.typed_len],
@@ -265,7 +265,7 @@ with:
 .text = focused.view.getDraft(),
 ```
 
-**Step 4 — handleKey edits.** At the top of the insert-mode fall-through (just before line 477's `switch (k.key)`), capture the focused view once to avoid repeating the lookup:
+**Step 4, handleKey edits.** At the top of the insert-mode fall-through (just before line 477's `switch (k.key)`), capture the focused view once to avoid repeating the lookup:
 
 ```zig
 // Route edits into the focused pane's draft.
@@ -274,7 +274,7 @@ const draft_view = self.getFocusedPane().view;
 
 Then replace the surrounding writes:
 
-- Line 459 (Ctrl+W branch, `if (ch == 'w' ...)`) — still reached via the `if (k.modifiers.ctrl)` block, which executes *before* we've captured `draft_view`. Capture inline:
+- Line 459 (Ctrl+W branch, `if (ch == 'w' ...)`): still reached via the `if (k.modifiers.ctrl)` block, which executes *before* we've captured `draft_view`. Capture inline:
 
 ```zig
 if (ch == 'w' and self.current_mode == .insert) {
@@ -284,13 +284,13 @@ if (ch == 'w' and self.current_mode == .insert) {
 }
 ```
 
-- Line 479 (Enter): `if (draft_view.draft_len == 0) return .none;` — use the captured view.
+- Line 479 (Enter): `if (draft_view.draft_len == 0) return .none;`: use the captured view.
 - Line 481: `const user_input = draft_view.draft[0..draft_view.draft_len];`.
 - Lines 486, 497 (after submit): `draft_view.clearDraft();`.
 - Line 503 (Backspace): `draft_view.deleteBackFromDraft();`.
 - Line 507 (char): `if (ch >= 0x20 and ch < 0x7f) draft_view.appendToDraft(@intCast(ch));`.
 
-**Step 5 — Drop `MAX_INPUT` and helper functions (optional, deferred).** The three pure helpers (`inputAppendChar`, `inputDeleteBack`, `inputDeleteWord`) and their 8 tests still compile and pass. The Ctrl+W branch above uses `inputDeleteWord` directly. We could migrate Ctrl+W to `v.deleteWordFromDraft()` to kill the helpers entirely; that's a nice cleanup but not required for this change. Decision: **migrate now** for consistency — replace the Ctrl+W branch with `v.deleteWordFromDraft()` and delete `inputAppendChar` / `inputDeleteBack` / `inputDeleteWord` + their 8 tests. They're superseded by the ConversationBuffer methods. `MAX_INPUT` constant can also go (replaced by `ConversationBuffer.MAX_DRAFT`).
+**Step 5, Drop `MAX_INPUT` and helper functions (optional, deferred).** The three pure helpers (`inputAppendChar`, `inputDeleteBack`, `inputDeleteWord`) and their 8 tests still compile and pass. The Ctrl+W branch above uses `inputDeleteWord` directly. We could migrate Ctrl+W to `v.deleteWordFromDraft()` to kill the helpers entirely; that's a nice cleanup but not required for this change. Decision: **migrate now** for consistency, replace the Ctrl+W branch with `v.deleteWordFromDraft()` and delete `inputAppendChar` / `inputDeleteBack` / `inputDeleteWord` + their 8 tests. They're superseded by the ConversationBuffer methods. `MAX_INPUT` constant can also go (replaced by `ConversationBuffer.MAX_DRAFT`).
 
 Concretely:
 - Delete lines 38-39 (`pub const MAX_INPUT = 4096;`).
@@ -300,7 +300,7 @@ Concretely:
 - Backspace becomes `draft_view.deleteBackFromDraft();`.
 - Char becomes `draft_view.appendToDraft(@intCast(ch));`.
 
-**Step 6 — Run tests.** `zig build test` — all remaining tests pass. `zig build run` (manual) — typing works, focus switch preserves drafts.
+**Step 6, Run tests.** `zig build test`, all remaining tests pass. `zig build run` (manual), typing works, focus switch preserves drafts.
 
 **Commit:** `orchestrator: route keystrokes to focused pane's draft`
 
@@ -313,7 +313,7 @@ Concretely:
 
 The Compositor-bottom-row research agent found: `drawStatusLine` at lines 360-414 is already ~90% of what we need. `drawInputLine` at lines 431-490 has to go. `InputState` drops four fields.
 
-**Step 1 — Trim `InputState`** at lines 37-51. New shape:
+**Step 1, Trim `InputState`** at lines 37-51. New shape:
 
 ```zig
 /// Global UI state passed to the compositor each frame.
@@ -328,7 +328,7 @@ pub const InputState = struct {
 
 Delete the `text`, `status`, `agent_running`, `spinner_frame` fields.
 
-**Step 2 — Move metrics into `drawStatusLine`.** Today `drawStatusLine` renders `{d:.1}ms` right-aligned, and `drawInputLine` renders `{d:.1}ms {d}fps` right-aligned (the input line runs last and overwrites). After removing `drawInputLine`, `drawStatusLine` owns metrics — append the fps suffix when `input.fps > 0`.
+**Step 2, Move metrics into `drawStatusLine`.** Today `drawStatusLine` renders `{d:.1}ms` right-aligned, and `drawInputLine` renders `{d:.1}ms {d}fps` right-aligned (the input line runs last and overwrites). After removing `drawInputLine`, `drawStatusLine` owns metrics, append the fps suffix when `input.fps > 0`.
 
 Replace the metrics block at lines 406-413 with:
 
@@ -356,11 +356,11 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
 
 Update the single caller in `composite()` accordingly.
 
-**Step 3 — Delete `drawInputLine`.** Remove lines ~421-490 (the whole function).
+**Step 3, Delete `drawInputLine`.** Remove lines ~421-490 (the whole function).
 
 Also remove the `drawInputLine` call block from `composite()` at lines ~86-90 (inside the "Input/status line: always redraw" block). The `drawStatusLine` block stays.
 
-**Step 4 — Update the orchestrator call sites** in `src/EventOrchestrator.zig`:
+**Step 4, Update the orchestrator call sites** in `src/EventOrchestrator.zig`:
 
 - `run()` initial render (~line 189) and `tick()` (~line 339) both construct `InputState`. Strip the deleted fields:
 
@@ -373,11 +373,11 @@ self.compositor.composite(self.layout, .{
 
 For `run()`'s initial render, use `0` for fps (same as today).
 
-- The `status = ...` computation at lines ~325-331 (involving `transient_status`, `agent_running`, `lastInfo`) loses its last reader. **Keep it for Task 4** — per-pane prompts will surface agent status inside each pane. Mark with a `// TODO: consumed by per-pane prompts in Task 4.` comment temporarily.
+- The `status = ...` computation at lines ~325-331 (involving `transient_status`, `agent_running`, `lastInfo`) loses its last reader. **Keep it for Task 4**: per-pane prompts will surface agent status inside each pane. Mark with a `// TODO: consumed by per-pane prompts in Task 4.` comment temporarily.
 
-**Step 5 — Update 3 tests.** The test-breakage inventory's rewrites for this task:
+**Step 5, Update 3 tests.** The test-breakage inventory's rewrites for this task:
 
-- `composite draws status line on last row` (Compositor.zig:550-580): today asserts `›` at (9,9) and ` ` at (9,10) — those were from drawInputLine overwriting drawStatusLine. Update to:
+- `composite draws status line on last row` (Compositor.zig:550-580): today asserts `›` at (9,9) and ` ` at (9,10): those were from drawInputLine overwriting drawStatusLine. Update to:
 
 ```zig
 // Last row is now the sole status line: `[INSERT] mybuf | 40x9`
@@ -428,9 +428,9 @@ test "status row in normal mode shows mode label and buffer name only" {
 
 - `input line shows status hint after mode label when status is set` (Compositor.zig:707-744): **DELETE**. The global status toast path is gone; if we want to revive it, we'll show it inside the focused pane's prompt row in Task 4.
 
-**Step 6 — Update the doc comment** on `drawStatusLine paints the mode indicator at column 0 (shadowed row)` (Compositor.zig:621-652). Remove the "(shadowed row)" framing — the shadowing doesn't happen anymore. Rename the test to `drawStatusLine paints the mode indicator at column 0`.
+**Step 6, Update the doc comment** on `drawStatusLine paints the mode indicator at column 0 (shadowed row)` (Compositor.zig:621-652). Remove the "(shadowed row)" framing, the shadowing doesn't happen anymore. Rename the test to `drawStatusLine paints the mode indicator at column 0`.
 
-**Step 7 — Run tests.** `zig build test` — everything passes. One test is renamed, two are deleted, one is added, one is updated.
+**Step 7, Run tests.** `zig build test`, everything passes. One test is renamed, two are deleted, one is added, one is updated.
 
 **Commit:** `compositor: collapse bottom row into a status-only drawStatusLine`
 
@@ -447,7 +447,7 @@ Per the geometry research:
 - Reserve the last content row for the prompt: prompt row = `rect.y + rect.height - 2`.
 - Conversation content rows shrink by 1 on the bottom: content_max_row = `rect.y + rect.height - 2` (exclusive upper bound on the conversation content y-range).
 
-**Step 1 — Write failing tests.** Append to the Compositor test block:
+**Step 1, Write failing tests.** Append to the Compositor test block:
 
 ```zig
 test "focused pane renders its draft with a block cursor at end" {
@@ -587,9 +587,9 @@ test "tiny pane (height 3) skips the prompt reservation" {
 }
 ```
 
-Run `zig build test` — all four fail (no drawPanePrompts exists).
+Run `zig build test`, all four fail (no drawPanePrompts exists).
 
-**Step 2 — Shrink conversation content area.** In `drawBufferContent` (around line 140), the content inset math. Today:
+**Step 2, Shrink conversation content area.** In `drawBufferContent` (around line 140), the content inset math. Today:
 
 ```zig
 if (outer.width < 3 or outer.height < 3) return;
@@ -614,7 +614,7 @@ const rect = Layout.Rect{
 };
 ```
 
-Also update `drawDirtyLeaves` (around line 115) so content-dirty clears don't wipe the prompt. The existing `clearRect` call already operates on `leaf.rect.height - 2` — shrink it by `reserve_prompt` too:
+Also update `drawDirtyLeaves` (around line 115) so content-dirty clears don't wipe the prompt. The existing `clearRect` call already operates on `leaf.rect.height - 2`, shrink it by `reserve_prompt` too:
 
 ```zig
 if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
@@ -628,7 +628,7 @@ if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
 }
 ```
 
-**Step 3 — Add `drawPanePrompts` family.** Insert after `drawPaneTitle` (around line 340). The pattern mirrors `drawFrames` / `drawFramesPass` from the focus-panes work:
+**Step 3, Add `drawPanePrompts` family.** Insert after `drawPaneTitle` (around line 340). The pattern mirrors `drawFrames` / `drawFramesPass` from the focus-panes work:
 
 ```zig
 /// Draw `› <draft>` plus a cursor (for the focused pane in insert mode)
@@ -701,7 +701,7 @@ fn drawPanePrompt(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf,
 }
 ```
 
-**Step 4 — Wire into `composite()`.** Add an unconditional call after the `drawStatusLine` block and after `drawDirtyLeaves` / `drawFrames`:
+**Step 4, Wire into `composite()`.** Add an unconditional call after the `drawStatusLine` block and after `drawDirtyLeaves` / `drawFrames`:
 
 ```zig
 // Per-pane prompts: repainted every frame because drafts change on
@@ -713,13 +713,13 @@ fn drawPanePrompt(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf,
 }
 ```
 
-**Step 5 — Move the `composite` call order.** The new ordering inside `composite`:
+**Step 5, Move the `composite` call order.** The new ordering inside `composite`:
 
 1. (layout_dirty path) `clear` → `drawAllLeaves` → `drawFrames`, OR (stable path) `drawDirtyLeaves`.
 2. `drawStatusLine(focused, input.mode, input.fps)`.
 3. `drawPanePrompts(root, focused, input.mode)`.
 
-**Step 6 — Clean up the `status` derivation in `EventOrchestrator.tick`.** With `drawInputLine` gone, the `status` computation (transient_status / lastInfo / "streaming...") has no consumer. Two options:
+**Step 6, Clean up the `status` derivation in `EventOrchestrator.tick`.** With `drawInputLine` gone, the `status` computation (transient_status / lastInfo / "streaming...") has no consumer. Two options:
 
 - **Option A:** Delete it entirely. Transient split-announces and agent streaming-info stop surfacing anywhere. Minimal change, but loses UX for `split → scratch 2` and `lastInfo`.
 - **Option B:** Surface it inside the focused pane's prompt row when the draft is empty. Preserves the announce UX but complicates `drawPanePrompt` (it has to know the global transient status).
@@ -756,13 +756,13 @@ if (focused and input.status.len > 0) {
 }
 ```
 
-- Orchestrator tick passes `status`, `agent_running`, `spinner_frame` back through `InputState` (they were never fully removed — Task 3 left them with a TODO; now that TODO closes).
+- Orchestrator tick passes `status`, `agent_running`, `spinner_frame` back through `InputState` (they were never fully removed: Task 3 left them with a TODO; now that TODO closes).
 
 This means Task 3's `InputState` slimdown goes from 2 fields to 5 fields. Update Task 3's Step 1, the two new tests (`status row in normal mode...`), and the call-sites accordingly.
 
-**Step 7 — Spinner per-pane (stretch, optional).** The research identified that `pane.runner.isAgentRunning()` is already per-pane. If we want a per-pane spinner (the ultimate goal), `drawPanePrompt` can query the pane from the buffer via `orchestrator.paneFromBuffer(leaf.buffer)` — but that requires threading the orchestrator pointer into the compositor. That's a bigger change. **Defer to a follow-up** — the chosen Option B above uses the global focused spinner, which is what the current UX offers.
+**Step 7, Spinner per-pane (stretch, optional).** The research identified that `pane.runner.isAgentRunning()` is already per-pane. If we want a per-pane spinner (the ultimate goal), `drawPanePrompt` can query the pane from the buffer via `orchestrator.paneFromBuffer(leaf.buffer)`, but that requires threading the orchestrator pointer into the compositor. That's a bigger change. **Defer to a follow-up**, the chosen Option B above uses the global focused spinner, which is what the current UX offers.
 
-**Step 8 — Run tests.** `zig build test` — all 4 new tests pass, the 3 tests updated in Task 3 continue to pass.
+**Step 8, Run tests.** `zig build test`, all 4 new tests pass, the 3 tests updated in Task 3 continue to pass.
 
 **Commit:** `compositor: render per-pane prompt with cursor inside focused pane`
 
@@ -775,17 +775,17 @@ This means Task 3's `InputState` slimdown goes from 2 fields to 5 fields. Update
 
 Per the test-breakage inventory, two tests from the focus-visible-panes work need their cursor coordinates updated:
 
-- `insert mode paints a block cursor at end of input text` (Compositor.zig:970-1006). Today it checks the cursor at `(last_row, 13)`, which was the global input row. After Task 4, the cursor is at the focused pane's prompt row. Delete this test — it's fully superseded by `focused pane renders its draft with a block cursor at end` added in Task 4.
+- `insert mode paints a block cursor at end of input text` (Compositor.zig:970-1006). Today it checks the cursor at `(last_row, 13)`, which was the global input row. After Task 4, the cursor is at the focused pane's prompt row. Delete this test: it's fully superseded by `focused pane renders its draft with a block cursor at end` added in Task 4.
 
-- `normal mode does not paint a block cursor` (Compositor.zig:1008-1048). Same story — superseded by `normal mode does not paint a block cursor in the focused pane` (Task 4). Delete.
+- `normal mode does not paint a block cursor` (Compositor.zig:1008-1048). Same story: superseded by `normal mode does not paint a block cursor in the focused pane` (Task 4). Delete.
 
-**Step 1 — Delete both tests.**
+**Step 1, Delete both tests.**
 
-**Step 2 — Run tests.** `zig build test` green. `zig fmt --check .` green.
+**Step 2, Run tests.** `zig build test` green. `zig fmt --check .` green.
 
 **Commit:** `compositor: delete superseded global-cursor tests`
 
-(Optional: fold this commit into Task 4 if the diff is small — two test deletions.)
+(Optional: fold this commit into Task 4 if the diff is small, two test deletions.)
 
 ---
 
@@ -793,13 +793,13 @@ Per the test-breakage inventory, two tests from the focus-visible-panes work nee
 
 **Files:** none (manual + CI).
 
-**Step 1 — Formatting.** `zig fmt --check .`. If noisy, `zig fmt .` and inspect the diff.
+**Step 1, Formatting.** `zig fmt --check .`. If noisy, `zig fmt .` and inspect the diff.
 
-**Step 2 — Full test suite.** `zig build test`. Every test passes; look out for leak reports from `testing.allocator` (the new `draft` field on ConversationBuffer could in principle leak a pointer — but it's a fixed array, so `testing.allocator` has nothing to track. Defensive check anyway.).
+**Step 2, Full test suite.** `zig build test`. Every test passes; look out for leak reports from `testing.allocator` (the new `draft` field on ConversationBuffer could in principle leak a pointer, but it's a fixed array, so `testing.allocator` has nothing to track. Defensive check anyway.).
 
-**Step 3 — Metrics build.** `zig build -Dmetrics=true`.
+**Step 3, Metrics build.** `zig build -Dmetrics=true`.
 
-**Step 4 — Visual smoke test.** Resume a session and walk through:
+**Step 4, Visual smoke test.** Resume a session and walk through:
 
 - `zig build run -- --last`. Single pane shows `› █` on its bottom content row when in insert mode.
 - Type `hello`. Characters appear inside the pane. Cursor block tracks end of text.
@@ -812,7 +812,7 @@ Per the test-breakage inventory, two tests from the focus-visible-panes work nee
 - Enter in the right pane submits its draft to the right pane's agent; the left pane's draft is unaffected.
 - q closes focused pane; prompts in remaining panes untouched.
 
-**Step 5 — Commit any final cleanup.**
+**Step 5, Commit any final cleanup.**
 
 ---
 

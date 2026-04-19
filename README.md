@@ -53,10 +53,10 @@ Zag is modal in the vim sense. Sessions start in **insert** mode (typing goes st
 
 Default normal-mode bindings:
 
-- `h` / `j` / `k` / `l` — focus the window in that direction
-- `v` / `s` — split vertically / horizontally
-- `q` — close the focused window
-- `i` — back to insert mode
+- `h` / `j` / `k` / `l`: focus the window in that direction
+- `v` / `s`: split vertically / horizontally
+- `q`: close the focused window
+- `i`: back to insert mode
 
 Rebind any key from `~/.config/zag/config.lua`:
 
