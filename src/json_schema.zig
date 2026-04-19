@@ -18,6 +18,7 @@ pub const ValidationError = error{
     NotAnObject,
     MissingRequiredField,
     WrongFieldType,
+    InvalidInput,
     MalformedSchema,
 } || std.mem.Allocator.Error || std.json.ParseError(std.json.Scanner);
 
@@ -73,7 +74,69 @@ pub fn validate(
                 else => return error.MalformedSchema,
             };
             if (!typeMatches(expected, value)) return error.WrongFieldType;
+
+            // Nested object: descend one level into declared properties and
+            // check each child's declared type against the actual value.
+            if (std.mem.eql(u8, expected, "object")) {
+                if (spec_obj.get("properties")) |nested_props| {
+                    const nested_obj = switch (nested_props) {
+                        .object => |o| o,
+                        else => return error.MalformedSchema,
+                    };
+                    const value_obj = switch (value) {
+                        .object => |o| o,
+                        else => return error.InvalidInput,
+                    };
+                    try validateNestedObject(nested_obj, value_obj);
+                }
+            }
+
+            // Array items: validate each element against items.type.
+            if (std.mem.eql(u8, expected, "array")) {
+                if (spec_obj.get("items")) |items_schema| {
+                    const items_obj = switch (items_schema) {
+                        .object => |o| o,
+                        else => return error.MalformedSchema,
+                    };
+                    const items_type_val = items_obj.get("type") orelse continue;
+                    const items_expected = switch (items_type_val) {
+                        .string => |s| s,
+                        else => return error.MalformedSchema,
+                    };
+                    const array_items = switch (value) {
+                        .array => |a| a.items,
+                        else => return error.InvalidInput,
+                    };
+                    for (array_items) |item| {
+                        if (!typeMatches(items_expected, item)) {
+                            return error.InvalidInput;
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Validate one nested level: each key present in the input object is checked
+/// against its declared `type` in the nested properties map. No further
+/// descent; deeper schemas are out of scope for this validator.
+fn validateNestedObject(
+    nested_props: std.json.ObjectMap,
+    input_obj: std.json.ObjectMap,
+) ValidationError!void {
+    for (input_obj.keys(), input_obj.values()) |name, value| {
+        const spec = nested_props.get(name) orelse continue;
+        const spec_obj = switch (spec) {
+            .object => |o| o,
+            else => return error.MalformedSchema,
+        };
+        const type_val = spec_obj.get("type") orelse continue;
+        const expected = switch (type_val) {
+            .string => |s| s,
+            else => return error.MalformedSchema,
+        };
+        if (!typeMatches(expected, value)) return error.InvalidInput;
     }
 }
 
@@ -135,4 +198,73 @@ test "non-array required is MalformedSchema" {
     ;
     const input = "{\"cmd\":\"ls\"}";
     try testing.expectError(error.MalformedSchema, validate(testing.allocator, schema, input));
+}
+
+test "validate: nested object property with wrong type rejected" {
+    const allocator = std.testing.allocator;
+
+    const schema =
+        \\{
+        \\  "type": "object",
+        \\  "properties": {
+        \\    "config": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "count": {"type": "integer"}
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const input =
+        \\{"config": {"count": "not a number"}}
+    ;
+
+    const result = validate(allocator, schema, input);
+    try std.testing.expectError(error.InvalidInput, result);
+}
+
+test "validate: array items type mismatch rejected" {
+    const allocator = std.testing.allocator;
+
+    const schema =
+        \\{
+        \\  "type": "object",
+        \\  "properties": {
+        \\    "names": {
+        \\      "type": "array",
+        \\      "items": {"type": "string"}
+        \\    }
+        \\  }
+        \\}
+    ;
+    const input =
+        \\{"names": [1, 2, 3]}
+    ;
+
+    const result = validate(allocator, schema, input);
+    try std.testing.expectError(error.InvalidInput, result);
+}
+
+test "validate: nested validation passes on well-formed input" {
+    const allocator = std.testing.allocator;
+
+    const schema =
+        \\{
+        \\  "type": "object",
+        \\  "properties": {
+        \\    "config": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "count": {"type": "integer"}
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const input =
+        \\{"config": {"count": 42}}
+    ;
+
+    try validate(allocator, schema, input);
 }
