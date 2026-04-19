@@ -90,6 +90,21 @@ pub const MouseEvent = struct {
     modifiers: KeyEvent.Modifiers,
 };
 
+/// Result of trying to parse one event from the head of a byte buffer.
+pub const ParseResult = union(enum) {
+    /// A complete event was parsed. `consumed` bytes should be dropped
+    /// from the front of the buffer before the next call.
+    ok: struct { event: Event, consumed: usize },
+    /// The buffer starts a valid sequence but more bytes are needed to
+    /// decide. The caller must not drop anything; it should read more
+    /// bytes and call again, or apply its timeout policy.
+    incomplete,
+    /// The buffer's first `consumed` bytes are garbage (invalid UTF-8
+    /// leading byte, ISO 2022 junk). Drop them and try again from the
+    /// new head.
+    skip: struct { consumed: usize },
+};
+
 /// Maximum bytes we read in a single poll, enough for any escape sequence.
 const READ_BUF_SIZE = 64;
 
@@ -108,6 +123,15 @@ pub fn pollEvent(fd: std.posix.fd_t) ?Event {
     };
     if (n == 0) return null;
     return parseBytes(buf[0..n]);
+}
+
+/// Try to parse one event from the head of `buf`. Unlike `parseBytes`,
+/// this function distinguishes between "incomplete", "garbage", and
+/// "got one". It is the primitive used by `Parser` for fragmentation
+/// handling and by the legacy `parseBytes` wrapper.
+pub fn nextEventInBuf(buf: []const u8) ParseResult {
+    _ = buf;
+    @compileError("not yet implemented");
 }
 
 /// Parse a byte slice into an Event.
@@ -859,4 +883,104 @@ test "parse truncated SGR mouse returns none" {
     // ESC [ < 0 ; 1 0 ; 5, missing M/m terminator
     const event = parseBytes(&.{ 0x1b, '[', '<', '0', ';', '1', '0', ';', '5' }) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(Event.none, event);
+}
+
+test "nextEventInBuf: empty buffer is incomplete" {
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{}));
+}
+
+test "nextEventInBuf: bare ESC is incomplete (must timeout to produce bare-ESC)" {
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{0x1b}));
+}
+
+test "nextEventInBuf: ESC + `[` alone is incomplete (CSI prefix without final byte)" {
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{ 0x1b, '[' }));
+}
+
+test "nextEventInBuf: ESC + `O` alone is incomplete (SS3 prefix)" {
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{ 0x1b, 'O' }));
+}
+
+test "nextEventInBuf: CSI params without final byte is incomplete" {
+    // ESC [ 1 ; 5  -- all digits and separators, no terminator letter
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{ 0x1b, '[', '1', ';', '5' }));
+}
+
+test "nextEventInBuf: SGR mouse without final M/m is incomplete" {
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{ 0x1b, '[', '<', '0', ';', '1', '0', ';', '5' }));
+}
+
+test "nextEventInBuf: complete CSI up arrow returns ok with consumed=3" {
+    const r = nextEventInBuf(&.{ 0x1b, '[', 'A' });
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(usize, 3), r.ok.consumed);
+    switch (r.ok.event) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key.up, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextEventInBuf: complete Ctrl+Up returns ok with consumed=6" {
+    const r = nextEventInBuf(&.{ 0x1b, '[', '1', ';', '5', 'A' });
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(usize, 6), r.ok.consumed);
+    switch (r.ok.event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.up, k.key);
+            try std.testing.expectEqual(true, k.modifiers.ctrl);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextEventInBuf: Alt+a (ESC a) returns ok with consumed=2" {
+    const r = nextEventInBuf(&.{ 0x1b, 'a' });
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(usize, 2), r.ok.consumed);
+    switch (r.ok.event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'a' }, k.key);
+            try std.testing.expectEqual(true, k.modifiers.alt);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextEventInBuf: plain ASCII 'A' returns ok with consumed=1" {
+    const r = nextEventInBuf(&.{ 'A', 'B', 'C' });
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(usize, 1), r.ok.consumed);
+    switch (r.ok.event) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextEventInBuf: UTF-8 two-byte char returns ok with consumed=2" {
+    const r = nextEventInBuf(&.{ 0xC3, 0xB1, 'x' });
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(usize, 2), r.ok.consumed);
+    switch (r.ok.event) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 0xF1 }, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextEventInBuf: truncated UTF-8 lead byte is incomplete" {
+    // 0xC3 says "two-byte sequence follows" but buffer ends — wait for more.
+    try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{0xC3}));
+}
+
+test "nextEventInBuf: invalid UTF-8 lead byte is skip(1)" {
+    const r = nextEventInBuf(&.{ 0xFF, 'A' });
+    try std.testing.expect(r == .skip);
+    try std.testing.expectEqual(@as(usize, 1), r.skip.consumed);
+}
+
+test "nextEventInBuf: ESC + '[' + arrow across fragmented calls still works when glued" {
+    // Simulating what the Parser will do after concatenating two reads.
+    const r = nextEventInBuf(&.{ 0x1b, '[', '1', ';', '5', 'A', 'X' });
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(usize, 6), r.ok.consumed);
+    // 'X' tail is untouched and becomes the next event.
 }
