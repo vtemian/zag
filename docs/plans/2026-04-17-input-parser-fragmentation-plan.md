@@ -4,7 +4,7 @@
 
 **Goal:** Stop the input parser from misinterpreting fragmented escape sequences. When the kernel delivers `ESC [` in one read and `1;5A` in the next, the parser must assemble them into `Ctrl+Up` instead of emitting `Alt+[` plus garbage.
 
-**Architecture:** Split `parseBytes` into two layers. The lower layer, `nextEventInBuf`, inspects a byte slice and returns `ParseResult` — one of `ok{event, consumed}`, `incomplete`, or `skip{consumed}`. The upper layer is a new `input.Parser` struct that buffers bytes across reads, tracks the monotonic timestamp of the oldest pending escape byte, and applies a 50 ms timeout: if an escape sequence hasn't completed by then, the parser emits bare `Escape` (consuming one byte) and the remainder becomes a fresh sequence. `EventOrchestrator` owns a single `Parser` and calls `parser.pollOnce(fd, now_ms)` once per tick instead of the old free-function `input.pollEvent(fd)`. The legacy `parseBytes` API stays as a thin wrapper for the 48 existing tests; behavior on incomplete inputs changes (null instead of an eager wrong answer), and the single test that pinned the bug gets updated.
+**Architecture:** Split `parseBytes` into two layers. The lower layer, `nextEventInBuf`, inspects a byte slice and returns `ParseResult` — one of `ok{event, consumed}`, `incomplete`, or `skip{consumed}`. The upper layer is a new `input.Parser` struct that buffers bytes across reads, tracks the monotonic timestamp of the oldest pending escape byte, and applies a 50 ms timeout: if an escape sequence hasn't completed by then, the parser emits bare `Escape` (consuming one byte) and the remainder becomes a fresh sequence. `EventOrchestrator` owns a single `Parser` and calls `parser.pollOnce(fd, now_ms)` once per tick instead of the old free-function `input.pollEvent(fd)`. The legacy `parseBytes` API stays as a thin wrapper for the 46 existing tests; behavior on incomplete inputs changes (null instead of an eager wrong answer), and two tests that pinned the bug get updated.
 
 **Tech Stack:** Zig 0.15, `std.posix.read`, `std.time.milliTimestamp`. No new dependencies.
 
@@ -21,6 +21,8 @@
 7. **Preserve the public `Event` union, `KeyEvent`, and `MouseEvent` types.** This plan does not change any consumer-visible type.
 8. **`parseBytes` stays public.** It keeps working for the "one complete sequence" use case (most existing tests). Callers that need fragmentation handling migrate to `Parser`.
 9. **No monotonic clock shenanigans.** Pass `now_ms: i64` in from the caller so tests can inject time. `std.time.milliTimestamp()` is fine for the real event loop.
+10. **Worktree Edit discipline.** When executing from `.worktrees/<branch>/`, always use fully qualified absolute paths in `Edit` calls and verify every change with `git diff` on the worktree plus `git status --short` on the main repo. See `feedback_worktree_edit_paths.md` memory. (Lesson from plan 1: a subagent's first relative-path `Edit` silently targeted main; the orphan had to be discarded before the branch merge.)
+11. **Test-math rigor.** Before committing any task that introduces test assertions, mentally trace the asserted values against the proposed code. Plan 1 shipped a test asserting `pos.col=3` that was unreachable under the code's `col + w > max_col` predicate, wasting a cycle. If a trace contradicts the plan's expected values, stop and fix the test (or the plan) before committing; if the fix is a deviation from the plan, document it in the commit body.
 
 ---
 
@@ -477,11 +479,21 @@ pub const Parser = struct {
     /// convention.
     escape_timeout_ms: i64 = 50,
 
-    /// Append bytes to the pending buffer. Silently drops overflow;
-    /// in practice overflow never happens because every pollOnce call
-    /// drains the buffer before reading more.
+    /// Append bytes to the pending buffer. On overflow (a pathological
+    /// terminal flooding a single sequence past PARSER_BUF_SIZE), the
+    /// pending buffer is reset to a clean state and the incoming bytes
+    /// start a fresh accumulation. Losing a single malformed sequence
+    /// is the right failure mode: the next readable byte resyncs the
+    /// parser, whereas silent truncation would wedge the UI on an
+    /// incomplete event that never completes.
     pub fn feedBytes(self: *Parser, bytes: []const u8, now_ms: i64) void {
         if (bytes.len == 0) return;
+        if (self.pending_len + bytes.len > self.pending.len) {
+            log.warn("pending buffer overflow ({d} + {d} > {d}), resetting parser state", .{
+                self.pending_len, bytes.len, self.pending.len,
+            });
+            self.pending_len = 0;
+        }
         if (self.pending_len == 0) self.pending_since_ms = now_ms;
         const room = self.pending.len - self.pending_len;
         const take = @min(room, bytes.len);
@@ -591,6 +603,25 @@ test "Parser: garbage byte skipped, event after it still parses" {
     var p: Parser = .{};
     p.feedBytes(&.{ 0xFF, 'A' }, 0);
     const ev = p.nextEvent(0).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: overflow resets pending then buffers new bytes fresh" {
+    // Pathological endpoint: flood beyond PARSER_BUF_SIZE. The pending
+    // buffer resets on overflow so the next readable byte can resync.
+    var p: Parser = .{};
+    var junk: [PARSER_BUF_SIZE]u8 = undefined;
+    @memset(&junk, '0');
+    p.feedBytes(&junk, 0);
+    try std.testing.expectEqual(@as(usize, PARSER_BUF_SIZE), p.pending_len);
+
+    // Feeding one more byte must reset, not silently drop.
+    p.feedBytes(&.{'A'}, 1);
+    try std.testing.expectEqual(@as(usize, 1), p.pending_len);
+    const ev = p.nextEvent(1).?;
     switch (ev) {
         .key => |k| try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key),
         else => return error.TestUnexpectedResult,
@@ -795,15 +826,14 @@ Append to the test block:
 
 ```zig
 test "Parser.pollOnce: fragmented CSI via a real pipe resolves to Ctrl+Up" {
-    const pipe = try std.posix.pipe();
+    // `pipe2` with the flag struct is the codebase idiom (see
+    // agent_events.zig, main.zig, Screen.zig). Prefer it over
+    // pipe + fcntl for portability across Zig 0.15's posix module.
+    const pipe = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
     const read_fd = pipe[0];
     const write_fd = pipe[1];
     defer std.posix.close(read_fd);
     defer std.posix.close(write_fd);
-
-    // Make the read end non-blocking so pollOnce can drain cleanly.
-    const flags = try std.posix.fcntl(read_fd, std.posix.F.GETFL, 0);
-    _ = try std.posix.fcntl(read_fd, std.posix.F.SETFL, flags | @as(u32, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK")));
 
     var p: Parser = .{};
 
@@ -824,7 +854,7 @@ test "Parser.pollOnce: fragmented CSI via a real pipe resolves to Ctrl+Up" {
 }
 ```
 
-Note: the `O_NONBLOCK` bit setting via `fcntl` above uses a portable expression for the flag. If that one-liner fails on your Zig version, swap to `std.posix.O.NONBLOCK` in an `@as(u32, _)` bitwise-or — the exact incantation depends on 0.15's `posix.O` layout. If it still doesn't compile, fall back to a `posix.pipe2(.{ .NONBLOCK = true })` form if available, or set `F.SETFL` with the numeric constant 0x800 (Linux) conditionally on the OS. This is a test-only concern.
+Note: `pipe2` with the flag struct is the Zig 0.15 idiom already used at `src/agent_events.zig:296`, `src/main.zig:214`, and `src/Screen.zig:1159`. The read end is non-blocking from creation so `pollOnce`'s `read` catches `WouldBlock` and returns zero.
 
 **Step 3: Swap the EventOrchestrator call site**
 
@@ -942,13 +972,14 @@ No code change. Document in the execution log (if any) that visual verification 
 3. **Kitty keyboard protocol.** The protocol adds new CSI sequences; as long as our `findCsiFinal` scanner finds the terminator, they'll parse correctly with no code change.
 4. **Configurable `escape_timeout_ms` from Lua.** The field is public and can be set after construction, but we do not add a Lua binding in this plan.
 5. **Unicode normalization in input.** Out of scope; the parser passes codepoints through unchanged.
+6. **Dead-FD recovery.** `pollOnce` logs and returns null on non-`WouldBlock` read errors, matching the existing `input.pollEvent`'s behavior. A broken fd (EBADF from a prematurely-closed stdin, terminal crash) will make the event loop spin at poll-rate. Same failure mode as today; promoting this to an error path is a separate terminal-lifecycle plan.
 
 ---
 
 ## Done when
 
 - [ ] All 14 new `nextEventInBuf:` tests pass (Task 1+2)
-- [ ] All 5 `Parser:` buffering tests pass (Task 3)
+- [ ] All 6 `Parser:` buffering tests pass (Task 3) — including the overflow-reset test
 - [ ] All 5 `Parser:` timeout tests pass (Task 4)
 - [ ] The pipe-fed `pollOnce` integration test passes (Task 5)
 - [ ] `EventOrchestrator.tick` uses `self.input_parser.pollOnce` and the old `input.pollEvent` is deleted (Task 5)
