@@ -1,10 +1,10 @@
-# EventOrchestrator Split — Implementation Plan
+# EventOrchestrator Split Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task. Each task is one commit. Follow TDD for every task: write the failing test, watch it fail for the *right reason*, implement, watch it pass, commit. Between tasks the tree must compile green and `zig build test` must pass.
 
 **Goal:** Decompose the 1112-line `EventOrchestrator.zig` into three cooperating modules. `WindowManager` owns layout, panes, focus, compositor coordination, session auto-naming, and UI status messages. `AgentSupervisor` owns per-pane agent lifecycle (queue, cancel flag, thread spawn, hook dispatch routing). `EventOrchestrator` shrinks to a thin coordinator that owns the event loop, input parsing, and dispatch between the two sub-modules.
 
-**Architecture:** Follow the two-sub-modules-plus-coordinator shape agreed in the design decision. Both sub-modules are borrowed-pointer-owned by `EventOrchestrator` (not boxed separately, because their lifetimes match). No reverse pointers: neither sub-module holds a pointer back to the coordinator. When an input event is dispatched, `EventOrchestrator` calls methods on `WindowManager` and `AgentSupervisor` directly; sub-modules never call back up. Hook dispatch keeps its current shape — the coordinator holds the Lua engine pointer, the supervisor drains hook events each tick and passes them to the engine via a borrowed reference.
+**Architecture:** Follow the two-sub-modules-plus-coordinator shape agreed in the design decision. Both sub-modules are borrowed-pointer-owned by `EventOrchestrator` (not boxed separately, because their lifetimes match). No reverse pointers: neither sub-module holds a pointer back to the coordinator. When an input event is dispatched, `EventOrchestrator` calls methods on `WindowManager` and `AgentSupervisor` directly; sub-modules never call back up. Hook dispatch keeps its current shape; the coordinator holds the Lua engine pointer, the supervisor drains hook events each tick and passes them to the engine via a borrowed reference.
 
 **Tech Stack:** Zig 0.15, no new dependencies. This is pure extraction-and-rewiring: no new behaviour, no new types beyond the two new module structs.
 
@@ -18,9 +18,36 @@
 4. **Run `zig fmt --check .` before every commit.**
 5. **Commit message format:** `<subsystem>: <imperative, <70 chars>`. Examples: `agent-supervisor: extract queue lifecycle from orchestrator`.
 6. **Do not amend commits.** Create new commits.
-7. **No behaviour changes.** This plan moves code; it does not fix bugs or add features. If you find a bug, document it and do not fix it in this plan — add a follow-up task.
+7. **No behaviour changes.** This plan moves code; it does not fix bugs or add features. If you find a bug, document it and do not fix it in this plan; add a follow-up task.
 8. **Between phases, the tree compiles and runs.** Every phase ends at a stable green state so work can pause between phases.
-9. **Borrowed pointers only.** Neither `WindowManager` nor `AgentSupervisor` owns its backing state — the coordinator passes pointers in. This matches how `EventOrchestrator` already treats `terminal`, `screen`, `layout`, `compositor`.
+9. **Borrowed pointers only.** Neither `WindowManager` nor `AgentSupervisor` owns its backing state; the coordinator passes pointers in. This matches how `EventOrchestrator` already treats `terminal`, `screen`, `layout`, `compositor`.
+10. **Worktree Edit discipline.** When executing from `.worktrees/<branch>/`, always use fully qualified absolute paths in `Edit` calls, and verify each change with `git diff` on the worktree plus `git status --short` on the main repo. Subagents have been observed silently targeting the main repo with relative paths; the orphan must be discarded immediately. See `feedback_worktree_edit_paths.md`.
+11. **Test-math rigor.** Before committing any task, mentally trace assertions against the proposed code. If a trace contradicts the plan's expected values or if compilation fails on a signature mismatch, stop and fix before committing. Document any deviation in the commit body.
+12. **No dashes in new comments or commit bodies.** Use periods or semicolons; compound-word hyphens are fine. The plan text itself was already scrubbed; keep it that way in your edits.
+13. **Plan prerequisites landed.** Plans 1 (grapheme fusion), 2 (input parser fragmentation), 3 (provider Request reshape) are all merged to main. This means:
+    - `EventOrchestrator` already has an `input_parser: input.Parser = .{}` field near `wake_write_fd` and uses `pollTimeoutMs` in `tick` (plan 2).
+    - `generateSessionName` builds a `llm.Request` struct and calls `self.provider.provider.call(&req)` (plan 3).
+    - `src/providers/serialize.zig` is gone; each provider is self-contained (plan 3).
+    - Line numbers in this plan's text drift +3 to +5 from what is written. Use grep to locate methods by name rather than trusting a specific line number.
+14. **AgentRunner API reference.** The real API (verified against `src/AgentRunner.zig`):
+    - `pub fn cancelAgent(self: *AgentRunner) void` at line ~101; cancel flag only.
+    - `pub fn shutdown(self: *AgentRunner) void` at line ~82; cancel + join + queue deinit, idempotent.
+    - `pub fn deinit(self: *AgentRunner) void` at line ~73; chains to `shutdown()` then frees pending map.
+    - `pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void` at line ~155; free function, NOT a method on the runner.
+    - Field is `event_queue`, not `queue`. Both `runner.event_queue.wake_fd` (on the queue) and a separate `runner.wake_fd` exist; the supervisor writes to the former. `runner.wake_fd` at line ~39 is legacy and unused on the hot path (remove in a cleanup pass post-split; not in this plan).
+15. **AgentThread.spawn signature.** The real signature (verified against `src/AgentThread.zig:37`):
+    ```zig
+    pub fn spawn(
+        provider: llm.Provider,
+        messages: *std.ArrayList(types.Message),
+        registry: *const tools.Registry,
+        allocator: Allocator,
+        queue: *EventQueue,
+        cancel: *CancelFlag,
+        lua_engine: ?*LuaEngine.LuaEngine,
+    ) !std.Thread
+    ```
+    Seven parameters. No `system_prompt`. Messages is a pointer to `std.ArrayList(types.Message)`, not a slice. System-prompt assembly happens inside the messages list at call-site time.
 
 ---
 
@@ -37,13 +64,13 @@
 - Pane storage (`extra_panes`, `next_buffer_id`, `next_scratch_id`)
 - Frame-local UI (`transient_status`, `spinner_frame`)
 
-Four unrelated responsibilities in one file. The cost isn't size alone — it's the implicit ordering between initialization steps (queue must be allocated before `wake_fd` wired, which must happen before `cancel_flag` reset, which must happen before thread spawn), and the mixing of "I own this" with "I borrow this" across the same field list.
+Four unrelated responsibilities in one file. The cost isn't size alone; it's the implicit ordering between initialization steps (queue must be allocated before `wake_fd` wired, which must happen before `cancel_flag` reset, which must happen before thread spawn), and the mixing of "I own this" with "I borrow this" across the same field list.
 
 The split: `WindowManager` gets layout/panes/focus/UI. `AgentSupervisor` gets queue lifecycle + thread supervision + shutdown. `EventOrchestrator` becomes the thin I/O-loop + input-dispatch layer that asks the other two to do things.
 
 ---
 
-## Phase 1 — AgentSupervisor
+## Phase 1: AgentSupervisor
 
 Goal: extract per-pane agent lifecycle into a dedicated module with a clean API. Three commits. Phase ends at a green tree.
 
@@ -51,7 +78,7 @@ Goal: extract per-pane agent lifecycle into a dedicated module with a clean API.
 
 **Files:**
 - Create: `src/AgentSupervisor.zig`
-- Modify: `src/EventOrchestrator.zig` — no behavioural change yet; just add a `supervisor` field and wire it in init/deinit (empty body for now).
+- Modify: `src/EventOrchestrator.zig`; no behavioural change yet; just add a `supervisor` field and wire it in init/deinit (empty body for now).
 
 **Step 1: Create the new module**
 
@@ -68,6 +95,7 @@ const Allocator = std.mem.Allocator;
 
 const AgentRunner = @import("AgentRunner.zig");
 const AgentThread = @import("AgentThread.zig");
+const agent_events = @import("agent_events.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
@@ -116,19 +144,17 @@ pub fn init(
 pub fn submit(
     self: *AgentSupervisor,
     runner: *AgentRunner,
-    system_prompt: []const u8,
-    messages: []const types.Message,
-    tool_defs: []const types.ToolDefinition,
+    messages: *std.ArrayList(types.Message),
 ) !void {
     if (runner.isAgentRunning()) return; // idempotent: drop duplicate submits
 
-    runner.event_queue = try AgentThread.EventQueue.initBounded(self.allocator, 256);
+    runner.event_queue = try agent_events.EventQueue.initBounded(self.allocator, 256);
     errdefer {
-        runner.event_queue.deinit(self.allocator);
+        runner.event_queue.deinit();
         runner.queue_active = false;
     }
 
-    runner.queue.wake_fd = self.wake_write_fd;
+    runner.event_queue.wake_fd = self.wake_write_fd;
     runner.queue_active = true;
     runner.lua_engine = self.lua_engine;
     runner.cancel_flag.store(false, .release);
@@ -141,7 +167,6 @@ pub fn submit(
         &runner.event_queue,
         &runner.cancel_flag,
         self.lua_engine,
-        system_prompt,
     );
 }
 ```
@@ -211,7 +236,7 @@ EOF
 ### Task 1.2: Add `drainHooks()` and `shutdownAll()` to AgentSupervisor
 
 **Files:**
-- Modify: `src/AgentSupervisor.zig` — add the two methods.
+- Modify: `src/AgentSupervisor.zig`; add the two methods.
 
 **Step 1: Add `drainHooks`**
 
@@ -224,31 +249,37 @@ Append inside the module:
 pub fn drainHooks(self: *AgentSupervisor, runner: *AgentRunner) void {
     const engine = self.lua_engine orelse return;
     if (!runner.queue_active) return;
-    runner.dispatchHookRequests(&runner.event_queue, engine);
+    AgentRunner.dispatchHookRequests(&runner.event_queue, engine);
 }
 ```
+
+Note: `AgentRunner.dispatchHookRequests` is a free function in `src/AgentRunner.zig:155` with signature `(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void`. Call it as the namespaced function, not as a method on the runner value.
 
 **Step 2: Add `shutdownAll`**
 
 Append:
 
 ```zig
-/// Cancel and join every runner in the provided slice. Each runner's
-/// own deinit is the caller's responsibility; this method only drives
-/// the cancel/join phase so it can happen before any pane buffers are
-/// freed.
+/// Cancel every runner cooperatively in a first pass, then `shutdown()`
+/// each one in a second pass to join its thread and deinit its queue.
+/// Splitting the loop means all agents start winding down before any
+/// single join blocks, which matters when a tool call is slow.
+///
+/// `AgentRunner.shutdown()` is idempotent (guards on `queue_active` and
+/// `agent_thread`), so a subsequent `runner.deinit()` in the
+/// orchestrator's extra-panes loop is safe: the second call is a no-op.
 pub fn shutdownAll(self: *AgentSupervisor, runners: []const *AgentRunner) void {
     _ = self;
     for (runners) |runner| {
         runner.cancelAgent();
     }
     for (runners) |runner| {
-        runner.joinAgentThread();
+        runner.shutdown();
     }
 }
 ```
 
-(If `joinAgentThread` doesn't yet exist on `AgentRunner`, check the existing shutdown path — the join may be part of `deinit`. If so, call `runner.deinit()` here instead and document the ownership implication, or add a `joinOnly` method on AgentRunner in a tiny prep commit before this one.)
+Rationale: `AgentRunner` today exposes `cancelAgent()` (line 101; cancel flag only) and `shutdown()` (line 82; cancel + join + queue deinit, idempotent). There is no separate `joinAgentThread()`. Using `shutdown()` is correct and safe because it is guarded; the extra-panes loop in `EventOrchestrator.deinit` that also calls `runner.deinit()` (which chains to `shutdown()`) will no-op on the second pass.
 
 **Step 3: Run tests**
 
@@ -267,7 +298,7 @@ agent-supervisor: add drainHooks and shutdownAll methods
 
 drainHooks wraps AgentRunner.dispatchHookRequests behind a null-safe
 check for the Lua engine. shutdownAll cancels then joins a batch of
-runners, used by the orchestrator's deinit path. No caller yet —
+runners, used by the orchestrator's deinit path. No caller yet;
 wired in the next commit.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -280,7 +311,7 @@ EOF
 ### Task 1.3: Wire `AgentSupervisor` into EventOrchestrator
 
 **Files:**
-- Modify: `src/EventOrchestrator.zig` — add `supervisor` field, construct in init, delegate in `onUserInputSubmitted`, replace inline queue code.
+- Modify: `src/EventOrchestrator.zig`; add `supervisor` field, construct in init, delegate in `onUserInputSubmitted`, replace inline queue code.
 
 **Step 1: Add the field**
 
@@ -318,15 +349,10 @@ Find `onUserInputSubmitted` (starts around line 744). The current body has the m
 Replace that entire sequence with a single call:
 
 ```zig
-    try self.supervisor.submit(
-        pane.runner,
-        prompt,
-        messages,
-        tool_defs,
-    );
+    try self.supervisor.submit(pane.runner, messages);
 ```
 
-where `prompt`, `messages`, `tool_defs` are whatever the existing code was passing to `AgentThread.spawn`. If the orchestrator was also building the prompt / gathering messages before the spawn call, keep that code in place — only the queue-spawn ritual moves.
+where `messages` is the `*std.ArrayList(types.Message)` that the existing code was passing to `AgentThread.spawn`. Keep in place any code that builds the prompt, records `submitInput`, fires hooks, resolves `tool_defs`, etc.; only the queue-spawn ritual moves. Note that `supervisor.submit`'s signature is `(runner, messages)`; it no longer threads `system_prompt` or `tool_defs` because `AgentThread.spawn` itself does not accept them (those are assembled upstream into the messages list and the provider's request shape).
 
 The `errdefer` concern raised in the architectural review is now AgentSupervisor's problem. Supervisor.submit's `errdefer { runner.event_queue.deinit(self.allocator); runner.queue_active = false; }` is the fix.
 
@@ -351,13 +377,16 @@ pub fn shutdownAgents(self: *EventOrchestrator) void {
 
 **Step 5: Replace hook-drain plumbing**
 
-Find `drainPane` (around line 735) which calls `runner.dispatchHookRequests(queue, engine)` or similar. Replace with:
+Find `drainPane` (around line ~739). Today it calls `runner.drainEvents(...)`, and `AgentRunner.drainEvents` internally calls `dispatchHookRequests` first, then drains non-hook events. The hook-dispatch half is what `supervisor.drainHooks` wraps; the non-hook drain (which pushes events to the UI) stays on the runner.
+
+Insert a call to `supervisor.drainHooks` immediately before the existing `drainEvents`:
 
 ```zig
     self.supervisor.drainHooks(pane.runner);
+    // existing drainEvents + auto-name-trigger logic continues
 ```
 
-(Check the exact shape — if `drainPane` also does non-hook drain work, keep that part.)
+Double-dispatch is a concern: `drainEvents` calls `dispatchHookRequests` internally too. The internal call still happens each tick; the new explicit `supervisor.drainHooks` call gives the supervisor a discoverable entry point for hook dispatch without breaking the runner's existing internal path. A cleanup pass (post-split) should remove the duplicate once callers route through the supervisor. Document this as a known follow-up in the commit body and do not refactor `AgentRunner.drainEvents` in this plan.
 
 **Step 6: Run the full suite**
 
@@ -373,7 +402,7 @@ Expected: green.
 zig build && ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./zig-out/bin/zag
 ```
 
-Type a message, press Enter. Agent should spawn, respond, complete. Press Ctrl+C during a response — agent should cancel. Close with `/quit`. No leaks, no hangs.
+Type a message, press Enter. Agent should spawn, respond, complete. Press Ctrl+C during a response; agent should cancel. Close with `/quit`. No leaks, no hangs.
 
 **Step 8: Commit**
 
@@ -395,7 +424,7 @@ EOF
 
 ---
 
-## Phase 2 — WindowManager
+## Phase 2: WindowManager
 
 Goal: extract layout/panes/focus/UI into a dedicated module. Four commits. Between each task the tree compiles and tests pass. The methods move in logical groups; implementation bodies are copied verbatim and only call-site forwarders change in `EventOrchestrator`.
 
@@ -403,7 +432,7 @@ Goal: extract layout/panes/focus/UI into a dedicated module. Four commits. Betwe
 
 **Files:**
 - Create: `src/WindowManager.zig`
-- Modify: `src/EventOrchestrator.zig` — remove the migrated fields, add a `window_manager: WindowManager` field.
+- Modify: `src/EventOrchestrator.zig`; remove the migrated fields, add a `window_manager: WindowManager` field.
 
 **Step 1: Create the module with its state fields**
 
@@ -413,7 +442,7 @@ Write `src/WindowManager.zig`:
 //! Layout, panes, focus, and frame-local UI state. Owns the tree of
 //! windows, the list of extra panes (root lives elsewhere), the
 //! keymap registry, and the transient-status + spinner counters. Does
-//! not own terminal/screen/compositor or the Lua engine — those are
+//! not own terminal/screen/compositor or the Lua engine; those are
 //! borrowed from the coordinator.
 
 const std = @import("std");
@@ -592,7 +621,7 @@ window-manager: extract state fields into dedicated module
 Layout, compositor, root_pane, extra_panes, keymap registry, and
 frame-local UI counters (transient_status, spinner_frame,
 current_mode) now live on WindowManager. EventOrchestrator holds a
-single window_manager field. No method moves yet — those follow in
+single window_manager field. No method moves yet; those follow in
 the next three commits.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -605,8 +634,8 @@ EOF
 ### Task 2.2: Move window operations to WindowManager
 
 **Files:**
-- Modify: `src/WindowManager.zig` — add the methods.
-- Modify: `src/EventOrchestrator.zig` — delete the methods, add forwarding stubs where input dispatch still needs them.
+- Modify: `src/WindowManager.zig`; add the methods.
+- Modify: `src/EventOrchestrator.zig`; delete the methods, add forwarding stubs where input dispatch still needs them.
 
 **Step 1: Move these methods (cut from EventOrchestrator, paste into WindowManager, adapt to use `self.` instead of the old orchestrator-prefixed access)**
 
@@ -614,7 +643,7 @@ Moves in this order (match line numbers in `src/EventOrchestrator.zig` as of thi
 
 - `handleResize` (line 624) → WindowManager.handleResize
 - `doFocus` (line 516) → WindowManager.doFocus
-- `executeAction` (line 496) → WindowManager.executeAction (stays because it mutates mode/layout/compositor — all WindowManager's)
+- `executeAction` (line 496) → WindowManager.executeAction (stays because it mutates mode/layout/compositor; all WindowManager's)
 - `getFocusedPane` (line 874) → WindowManager.getFocusedPane
 - `paneFromBuffer` (line 882) → WindowManager.paneFromBuffer
 - `doSplit` (line 631) → WindowManager.doSplit
@@ -685,8 +714,8 @@ EOF
 ### Task 2.3: Move UI status and /perf command handling to WindowManager
 
 **Files:**
-- Modify: `src/WindowManager.zig` — add the methods.
-- Modify: `src/EventOrchestrator.zig` — forward `/perf` handling from `handleCommand`.
+- Modify: `src/WindowManager.zig`; add the methods.
+- Modify: `src/EventOrchestrator.zig`; forward `/perf` handling from `handleCommand`.
 
 **Step 1: Move these methods**
 
@@ -695,7 +724,7 @@ EOF
 - `showPerfStats` (line 585) → WindowManager.showPerfStats
 - `dumpTraceFile` (line 608) → WindowManager.dumpTraceFile
 
-Each uses `self.root_pane` — adapt to `self.root_pane` on WindowManager.
+Each uses `self.root_pane`; adapt to `self.root_pane` on WindowManager.
 
 **Step 2: Wire the forwarder in `handleCommand`**
 
@@ -736,8 +765,8 @@ EOF
 ### Task 2.4: Move session auto-naming to WindowManager
 
 **Files:**
-- Modify: `src/WindowManager.zig` — add the methods.
-- Modify: `src/EventOrchestrator.zig` — delete the methods, forward the call.
+- Modify: `src/WindowManager.zig`; add the methods.
+- Modify: `src/EventOrchestrator.zig`; delete the methods, forward the call.
 
 **Step 1: Move these methods**
 
@@ -745,7 +774,7 @@ EOF
 - `generateSessionName` (line 831) → WindowManager.generateSessionName
 - `drainPane` (line 735) → WindowManager.drainPane (the non-agent-supervisor part)
 
-`generateSessionName` calls `self.provider.provider.call(...)` — keep that; WindowManager already has `provider`. Post-Provider-reshape (if Plan 3 has landed), build a `Request` struct first.
+`generateSessionName` calls `self.provider.provider.call(...)`; keep that; WindowManager already has `provider`. Post-Provider-reshape (if Plan 3 has landed), build a `Request` struct first.
 
 `drainPane`'s supervisor part (hook dispatch) already delegates to `self.supervisor.drainHooks(pane.runner)` after Task 1.3. The rest of `drainPane` (e.g. triggering auto-naming after first turn completes) moves here.
 
@@ -788,15 +817,15 @@ EOF
 
 ---
 
-## Phase 3 — Coordinator trim and main.zig wiring
+## Phase 3: Coordinator trim and main.zig wiring
 
 Goal: `EventOrchestrator` is now a thin coordinator. Update main.zig to match. Two commits.
 
 ### Task 3.1: Finalize the coordinator shape and update main.zig
 
 **Files:**
-- Modify: `src/EventOrchestrator.zig` — final field list + Config shape.
-- Modify: `src/main.zig` — construction order.
+- Modify: `src/EventOrchestrator.zig`; final field list + Config shape.
+- Modify: `src/main.zig`; construction order.
 
 **Step 1: Audit `EventOrchestrator` fields**
 
@@ -804,7 +833,7 @@ After Phase 2 the coordinator should hold:
 
 - `allocator`
 - `terminal` (I/O lifecycle)
-- `screen` (render target — shared with WindowManager, both borrow)
+- `screen` (render target; shared with WindowManager, both borrow)
 - `stdout_file`
 - `wake_read_fd`, `wake_write_fd`
 - `counting` (metrics wrapper)
@@ -812,7 +841,7 @@ After Phase 2 the coordinator should hold:
 - `registry` (passed through to sub-modules)
 - `session_mgr` (passed through)
 - `lua_engine` (passed through; used for hook dispatch routing through AgentSupervisor)
-- `input_parser: input.Parser` (from the input-parser-fragmentation plan — add only if that plan has landed)
+- `input_parser: input.Parser` (from the input-parser-fragmentation plan; add only if that plan has landed)
 - `window_manager: WindowManager`
 - `supervisor: AgentSupervisor`
 
@@ -838,7 +867,7 @@ var orchestrator = try EventOrchestrator.init(.{
 });
 ```
 
-After this plan, the Config struct passed to `EventOrchestrator.init` is smaller (no layout/compositor/root_pane — those go into WindowManager internally). But `init` still needs them to build `WindowManager`. Easiest shape: keep Config identical to today. The internal restructure is hidden.
+After this plan, the Config struct passed to `EventOrchestrator.init` is smaller (no layout/compositor/root_pane; those go into WindowManager internally). But `init` still needs them to build `WindowManager`. Easiest shape: keep Config identical to today. The internal restructure is hidden.
 
 If the Lua engine needs a pointer to the `keymap_registry` (main.zig:349 today: `eng.keymap_registry = &orchestrator.keymap_registry`), update to:
 
@@ -846,7 +875,7 @@ If the Lua engine needs a pointer to the `keymap_registry` (main.zig:349 today: 
 eng.keymap_registry = &orchestrator.window_manager.keymap_registry;
 ```
 
-Also check `compositor.orchestrator = &orchestrator` wiring (main.zig:342) — if the compositor was reaching into orchestrator for per-pane diagnostics via `orchestrator.paneFromBuffer`, redirect to `orchestrator.window_manager.paneFromBuffer`.
+Also check `compositor.orchestrator = &orchestrator` wiring (main.zig:342); if the compositor was reaching into orchestrator for per-pane diagnostics via `orchestrator.paneFromBuffer`, redirect to `orchestrator.window_manager.paneFromBuffer`.
 
 **Step 4: Run tests**
 
@@ -898,7 +927,7 @@ EOF
 wc -l src/EventOrchestrator.zig src/WindowManager.zig src/AgentSupervisor.zig
 ```
 
-Expected: `EventOrchestrator.zig` ≈ 250-350 lines (down from 1112). `WindowManager.zig` ≈ 500-600 lines. `AgentSupervisor.zig` ≈ 150-200 lines. If `EventOrchestrator.zig` is still over 500 lines, something didn't move cleanly — investigate before closing the plan.
+Expected: `EventOrchestrator.zig` ≈ 250-350 lines (down from 1112). `WindowManager.zig` ≈ 500-600 lines. `AgentSupervisor.zig` ≈ 150-200 lines. If `EventOrchestrator.zig` is still over 500 lines, something didn't move cleanly; investigate before closing the plan.
 
 **Step 2: Confirm zero cross-module reverse pointers**
 
@@ -910,7 +939,7 @@ Expected: zero hits (neither sub-module references the coordinator).
 
 **Step 3: Confirm error-defer completeness in `AgentSupervisor.submit`**
 
-Read `src/AgentSupervisor.zig` and verify every allocation has its `errdefer`. The review called this out as incomplete on the pre-split version — confirm the fix landed.
+Read `src/AgentSupervisor.zig` and verify every allocation has its `errdefer`. The review called this out as incomplete on the pre-split version; confirm the fix landed.
 
 **Step 4: Run the full suite one more time**
 
@@ -942,5 +971,5 @@ No commit. If any of the above steps flagged a follow-up, write it down as a new
 - [ ] Zero reverse pointers: `grep -n "orchestrator" src/WindowManager.zig src/AgentSupervisor.zig` returns nothing
 - [ ] All tests pass (`zig build test`)
 - [ ] Build is clean (`zig fmt --check .`)
-- [ ] Manual smoke-test: type, split, focus, run tool, cancel, quit — all work
+- [ ] Manual smoke-test: type, split, focus, run tool, cancel, quit; all work
 - [ ] 9 commits on the branch, one per task (plus Task 3.2 may have zero)
