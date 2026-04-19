@@ -158,16 +158,24 @@ fn callLlm(
         .ctx = &stream_ctx,
         .on_event = &streamEventToQueue,
     };
-    return provider.callStreaming(
-        prompt,
-        messages,
-        tool_defs,
-        allocator,
-        callback,
-        cancel,
-    ) catch |streaming_err| {
+    const stream_req = llm.StreamRequest{
+        .system_prompt = prompt,
+        .messages = messages,
+        .tool_definitions = tool_defs,
+        .allocator = allocator,
+        .callback = callback,
+        .cancel = cancel,
+    };
+
+    return provider.callStreaming(&stream_req) catch |streaming_err| {
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
-        const fallback = try provider.call(prompt, messages, tool_defs, allocator);
+        const req = llm.Request{
+            .system_prompt = prompt,
+            .messages = messages,
+            .tool_definitions = tool_defs,
+            .allocator = allocator,
+        };
+        const fallback = try provider.call(&req);
         // If streaming already rendered partial text, discard it so the
         // full fallback response doesn't appear concatenated to the partial.
         if (stream_ctx.text_count > 0) {

@@ -36,70 +36,52 @@ pub const AnthropicSerializer = struct {
 
     fn callImpl(
         ptr: *anyopaque,
-        system_prompt: []const u8,
-        messages: []const types.Message,
-        tool_definitions: []const types.ToolDefinition,
-        allocator: Allocator,
+        req: *const llm.Request,
     ) llm.ProviderError!types.LlmResponse {
-        return callImplInner(ptr, system_prompt, messages, tool_definitions, allocator) catch |err|
-            return llm.mapProviderError(err);
+        return callImplInner(ptr, req) catch |err| return llm.mapProviderError(err);
     }
 
     fn callImplInner(
         ptr: *anyopaque,
-        system_prompt: []const u8,
-        messages: []const types.Message,
-        tool_definitions: []const types.ToolDefinition,
-        allocator: Allocator,
+        req: *const llm.Request,
     ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
-        defer allocator.free(body);
+        const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        defer req.allocator.free(body);
 
-        var headers = try llm.buildHeaders(self.endpoint, self.api_key, allocator);
-        defer llm.freeHeaders(self.endpoint, &headers, allocator);
+        var headers = try llm.buildHeaders(self.endpoint, self.api_key, req.allocator);
+        defer llm.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const response_bytes = try llm.httpPostJson(self.endpoint.url, body, headers.items, allocator);
-        defer allocator.free(response_bytes);
+        const response_bytes = try llm.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
+        defer req.allocator.free(response_bytes);
 
-        return parseResponse(response_bytes, allocator);
+        return parseResponse(response_bytes, req.allocator);
     }
 
     fn callStreamingImpl(
         ptr: *anyopaque,
-        system_prompt: []const u8,
-        messages: []const types.Message,
-        tool_definitions: []const types.ToolDefinition,
-        allocator: Allocator,
-        callback: llm.StreamCallback,
-        cancel: *std.atomic.Value(bool),
+        req: *const llm.StreamRequest,
     ) llm.ProviderError!types.LlmResponse {
-        return callStreamingImplInner(ptr, system_prompt, messages, tool_definitions, allocator, callback, cancel) catch |err|
-            return llm.mapProviderError(err);
+        return callStreamingImplInner(ptr, req) catch |err| return llm.mapProviderError(err);
     }
 
     fn callStreamingImplInner(
         ptr: *anyopaque,
-        system_prompt: []const u8,
-        messages: []const types.Message,
-        tool_definitions: []const types.ToolDefinition,
-        allocator: Allocator,
-        callback: llm.StreamCallback,
-        cancel: *std.atomic.Value(bool),
+        req: *const llm.StreamRequest,
     ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildStreamingRequestBody(self.model, system_prompt, messages, tool_definitions, allocator);
-        defer allocator.free(body);
+        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        defer req.allocator.free(body);
 
-        var headers = try llm.buildHeaders(self.endpoint, self.api_key, allocator);
-        defer llm.freeHeaders(self.endpoint, &headers, allocator);
+        var headers = try llm.buildHeaders(self.endpoint, self.api_key, req.allocator);
+        defer llm.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const stream = try llm.StreamingResponse.create(self.endpoint.url, body, headers.items, allocator);
+        const stream = try llm.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
         defer stream.destroy();
 
-        return parseSseStream(stream, allocator, callback, cancel);
+        return parseSseStream(stream, req.allocator, req.callback, req.cancel);
     }
 };
 

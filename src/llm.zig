@@ -333,53 +333,27 @@ pub const Provider = struct {
         /// Send a conversation and return the parsed response.
         call: *const fn (
             ptr: *anyopaque,
-            system_prompt: []const u8,
-            messages: []const types.Message,
-            tool_definitions: []const types.ToolDefinition,
-            allocator: Allocator,
+            req: *const Request,
         ) ProviderError!types.LlmResponse,
 
-        /// Streaming variant: invokes `callback.on_event` for each SSE event.
-        /// Assembles and returns the final LlmResponse when stream ends.
-        /// Checks cancel flag periodically; returns partial response if cancelled.
+        /// Streaming variant: invokes `req.callback.on_event` for each
+        /// SSE event. Assembles and returns the final LlmResponse when
+        /// the stream ends or is cancelled.
         call_streaming: *const fn (
             ptr: *anyopaque,
-            system_prompt: []const u8,
-            messages: []const types.Message,
-            tool_definitions: []const types.ToolDefinition,
-            allocator: Allocator,
-            callback: StreamCallback,
-            cancel: *std.atomic.Value(bool),
+            req: *const StreamRequest,
         ) ProviderError!types.LlmResponse,
 
         /// Human-readable provider name (for logging and display).
         name: []const u8,
     };
 
-    /// Send a conversation to the LLM and return the response.
-    pub fn call(
-        self: Provider,
-        system_prompt: []const u8,
-        messages: []const types.Message,
-        tool_definitions: []const types.ToolDefinition,
-        allocator: Allocator,
-    ) ProviderError!types.LlmResponse {
-        return self.vtable.call(self.ptr, system_prompt, messages, tool_definitions, allocator);
+    pub fn call(self: Provider, req: *const Request) ProviderError!types.LlmResponse {
+        return self.vtable.call(self.ptr, req);
     }
 
-    /// Streaming variant: sends a conversation and invokes `callback.on_event`
-    /// for each incremental event. Returns the fully assembled LlmResponse when
-    /// the stream completes or is cancelled.
-    pub fn callStreaming(
-        self: Provider,
-        system_prompt: []const u8,
-        messages: []const types.Message,
-        tool_definitions: []const types.ToolDefinition,
-        allocator: Allocator,
-        callback: StreamCallback,
-        cancel: *std.atomic.Value(bool),
-    ) ProviderError!types.LlmResponse {
-        return self.vtable.call_streaming(self.ptr, system_prompt, messages, tool_definitions, allocator, callback, cancel);
+    pub fn callStreaming(self: Provider, req: *const StreamRequest) ProviderError!types.LlmResponse {
+        return self.vtable.call_streaming(self.ptr, req);
     }
 };
 
@@ -910,15 +884,12 @@ test "Provider vtable call dispatches correctly" {
 
         fn callImpl(
             ptr: *anyopaque,
-            _: []const u8,
-            _: []const types.Message,
-            _: []const types.ToolDefinition,
-            alloc: Allocator,
+            req: *const Request,
         ) ProviderError!types.LlmResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
-            const content = try alloc.alloc(types.ContentBlock, 1);
-            const text = try alloc.dupe(u8, "test response");
+            const content = try req.allocator.alloc(types.ContentBlock, 1);
+            const text = try req.allocator.dupe(u8, "test response");
             content[0] = .{ .text = .{ .text = text } };
             return .{
                 .content = content,
@@ -930,14 +901,15 @@ test "Provider vtable call dispatches correctly" {
 
         fn callStreamingImpl(
             ptr: *anyopaque,
-            system_prompt: []const u8,
-            messages: []const types.Message,
-            tool_definitions: []const types.ToolDefinition,
-            alloc: Allocator,
-            _: StreamCallback,
-            _: *std.atomic.Value(bool),
+            req: *const StreamRequest,
         ) ProviderError!types.LlmResponse {
-            return callImpl(ptr, system_prompt, messages, tool_definitions, alloc);
+            const fallback_req = Request{
+                .system_prompt = req.system_prompt,
+                .messages = req.messages,
+                .tool_definitions = req.tool_definitions,
+                .allocator = req.allocator,
+            };
+            return callImpl(ptr, &fallback_req);
         }
 
         fn provider(self: *@This()) Provider {
@@ -948,7 +920,13 @@ test "Provider vtable call dispatches correctly" {
     var test_impl: TestProvider = .{};
     const p = test_impl.provider();
 
-    const response = try p.call("system", &.{}, &.{}, allocator);
+    const req = Request{
+        .system_prompt = "system",
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const response = try p.call(&req);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), test_impl.call_count);
@@ -978,29 +956,21 @@ test "Provider callStreaming dispatches to vtable" {
 
         fn callImplUnused(
             _: *anyopaque,
-            _: []const u8,
-            _: []const types.Message,
-            _: []const types.ToolDefinition,
-            _: Allocator,
+            _: *const Request,
         ) ProviderError!types.LlmResponse {
             unreachable;
         }
 
         fn callStreamingImpl(
             ptr: *anyopaque,
-            _: []const u8,
-            _: []const types.Message,
-            _: []const types.ToolDefinition,
-            alloc: Allocator,
-            callback: StreamCallback,
-            _: *std.atomic.Value(bool),
+            req: *const StreamRequest,
         ) ProviderError!types.LlmResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.stream_count += 1;
-            callback.on_event(callback.ctx, .{ .text_delta = "hello" });
-            callback.on_event(callback.ctx, .done);
-            const content = try alloc.alloc(types.ContentBlock, 1);
-            const text = try alloc.dupe(u8, "hello");
+            req.callback.on_event(req.callback.ctx, .{ .text_delta = "hello" });
+            req.callback.on_event(req.callback.ctx, .done);
+            const content = try req.allocator.alloc(types.ContentBlock, 1);
+            const text = try req.allocator.dupe(u8, "hello");
             content[0] = .{ .text = .{ .text = text } };
             return .{
                 .content = content,
@@ -1020,7 +990,15 @@ test "Provider callStreaming dispatches to vtable" {
 
     var cancel = std.atomic.Value(bool).init(false);
     const callback: StreamCallback = .{ .ctx = &counter, .on_event = &Counter.onEvent };
-    const response = try p.callStreaming("system", &.{}, &.{}, allocator, callback, &cancel);
+    const stream_req = StreamRequest{
+        .system_prompt = "system",
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = allocator,
+        .callback = callback,
+        .cancel = &cancel,
+    };
+    const response = try p.callStreaming(&stream_req);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), test_impl.stream_count);

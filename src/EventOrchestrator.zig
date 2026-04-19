@@ -851,12 +851,13 @@ fn generateSessionName(
         .{ .role = .assistant, .content = assistant_content },
     };
 
-    const response = try self.provider.provider.call(
-        "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        &summary_msgs,
-        &.{},
-        allocator,
-    );
+    const req = llm.Request{
+        .system_prompt = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
+        .messages = &summary_msgs,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const response = try self.provider.provider.call(&req);
     defer response.deinit(allocator);
 
     allocator.free(user_content);
