@@ -347,6 +347,7 @@ pub fn main() !void {
     // the tools collected during config.lua make it into the dispatch registry.
     if (lua_engine) |*eng| {
         eng.keymap_registry = &orchestrator.window_manager.keymap_registry;
+        eng.input_parser = &orchestrator.input_parser;
         eng.loadUserConfig();
         eng.registerTools(&registry) catch |err| {
             log.warn("failed to register lua tools: {}", .{err});
