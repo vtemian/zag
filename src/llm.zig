@@ -111,11 +111,17 @@ pub const Request = struct {
 /// cancellation token. Kept as its own type (not an optional inside
 /// `Request`) so the vtable signature remains unambiguous.
 pub const StreamRequest = struct {
+    /// System prompt prepended to the conversation. Steers model behavior.
     system_prompt: []const u8,
+    /// Conversation history sent to the model, oldest first.
     messages: []const types.Message,
+    /// Tools the model may call during this turn.
     tool_definitions: []const types.ToolDefinition,
+    /// Allocator used for any per-request scratch buffers the provider needs.
     allocator: Allocator,
+    /// Handler invoked for each streamed event. Owns no request state.
     callback: StreamCallback,
+    /// Cancellation flag polled by the provider to abort mid-stream.
     cancel: *std.atomic.Value(bool),
 };
 
