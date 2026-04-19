@@ -544,9 +544,15 @@ pub fn executeTools(
         if (maybe_handle) |h| h.join();
     }
 
-    // Build ContentBlock slice from results
+    // Build ContentBlock slice from results. Each appended block owns its
+    // tool_use_id and content slices; on a mid-loop failure we must free
+    // the interior strings of already-appended blocks, not just the list
+    // backing array.
     var result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-    errdefer result_blocks.deinit(allocator);
+    errdefer {
+        for (result_blocks.items) |block| block.freeOwned(allocator);
+        result_blocks.deinit(allocator);
+    }
 
     for (results, 0..) |r, i| {
         const msg_content = try allocator.dupe(u8, r.content);
