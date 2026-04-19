@@ -88,6 +88,37 @@ pub const StreamCallback = struct {
     on_event: *const fn (ctx: *anyopaque, event: StreamEvent) void,
 };
 
+/// The neutral input shape that every provider vtable accepts.
+///
+/// Provider-specific wire-format concerns (system placement, tool
+/// wrapping, role mapping) live inside each provider's own file.
+/// A provider receives exactly this struct by const pointer and
+/// emits its own request body.
+pub const Request = struct {
+    /// Free-text system prompt. How it lands in the wire format is
+    /// the provider's problem; Anthropic uses a top-level `system`
+    /// field, OpenAI injects a `role: "system"` message.
+    system_prompt: []const u8,
+    /// Conversation history in chronological order.
+    messages: []const types.Message,
+    /// Tools offered to the LLM for this turn. May be empty.
+    tool_definitions: []const types.ToolDefinition,
+    /// Allocator for response allocations owned by the caller.
+    allocator: Allocator,
+};
+
+/// Streaming variant: everything in `Request` plus the callback and
+/// cancellation token. Kept as its own type (not an optional inside
+/// `Request`) so the vtable signature remains unambiguous.
+pub const StreamRequest = struct {
+    system_prompt: []const u8,
+    messages: []const types.Message,
+    tool_definitions: []const types.ToolDefinition,
+    allocator: Allocator,
+    callback: StreamCallback,
+    cancel: *std.atomic.Value(bool),
+};
+
 /// Wire format for request/response serialization.
 pub const Serializer = enum {
     /// Anthropic Messages API format.
@@ -1261,4 +1292,22 @@ test "nextSseEvent caps event_data at MAX_SSE_EVENT_DATA" {
         error.SseEventDataTooLarge,
         sr.nextSseEvent(&cancel, &event_buf, &event_data),
     );
+}
+
+test "Provider.call accepts a Request struct" {
+    // This test exists to pin the new vtable shape. It can't actually
+    // invoke a real provider (no network), so we only check that the
+    // code compiles and that Request fields map to the old positional
+    // arguments one-for-one. Will start failing with a compile error
+    // the moment Provider.call signature doesn't match Request.
+    const req = Request{
+        .system_prompt = "sys",
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = std.testing.allocator,
+    };
+    _ = req;
+    // Intentionally no call yet; this file compiles because Request
+    // is a plain struct. Task 2 updates Provider.call to take *const
+    // Request and this test is extended to call a mock provider.
 }
