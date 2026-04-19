@@ -42,7 +42,7 @@ pub fn execute(
         return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
     }
 
-    // Count occurrences
+    // Count verbatim occurrences.
     var count: u32 = 0;
     var pos: usize = 0;
     while (pos <= content.len - input.old_text.len) {
@@ -54,21 +54,70 @@ pub fn execute(
         }
     }
 
-    if (count == 0) {
-        return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
-    }
+    // Splice bounds in the original content. For a verbatim match these are
+    // simply (idx, idx + old_text.len); for the CRLF fallback we compute them
+    // from the normalized offset map.
+    var splice_start: usize = 0;
+    var splice_end: usize = 0;
 
-    if (count > 1) {
+    if (count == 1) {
+        splice_start = std.mem.indexOf(u8, content, input.old_text) orelse unreachable;
+        splice_end = splice_start + input.old_text.len;
+    } else if (count == 0) {
+        // CRLF fallback: a Windows file ("\r\n") combined with LF-supplied
+        // old_text (the LLM's natural output) fails verbatim match. Retry
+        // against a CRLF-normalized view of both sides. Also covers the
+        // inverse case (CRLF old_text against an LF file).
+        const normalized = normalizeCrlf(allocator, content) catch return types.oomResult();
+        defer allocator.free(normalized.bytes);
+        defer allocator.free(normalized.offset_of);
+
+        const normalized_old = normalizeCrlfBytes(allocator, input.old_text) catch return types.oomResult();
+        defer allocator.free(normalized_old);
+
+        // If normalization produced no change on either side we already
+        // searched this space; no point re-scanning.
+        const changed = normalized.bytes.len != content.len or normalized_old.len != input.old_text.len;
+        if (!changed) {
+            return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
+        }
+
+        if (normalized_old.len > normalized.bytes.len) {
+            return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
+        }
+
+        var n_count: u32 = 0;
+        var n_pos: usize = 0;
+        var first_n_start: usize = 0;
+        while (n_pos <= normalized.bytes.len - normalized_old.len) {
+            if (std.mem.eql(u8, normalized.bytes[n_pos .. n_pos + normalized_old.len], normalized_old)) {
+                if (n_count == 0) first_n_start = n_pos;
+                n_count += 1;
+                n_pos += normalized_old.len;
+            } else {
+                n_pos += 1;
+            }
+        }
+
+        if (n_count == 0) {
+            return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
+        }
+        if (n_count > 1) {
+            const msg = std.fmt.allocPrint(allocator, "error: old_text found {d} times in '{s}' after CRLF normalization. Provide more surrounding context to make the match unique.", .{ n_count, input.path }) catch return types.oomResult();
+            return .{ .content = msg, .is_error = true };
+        }
+
+        splice_start = normalized.offset_of[first_n_start];
+        splice_end = normalized.offset_of[first_n_start + normalized_old.len];
+    } else {
         const msg = std.fmt.allocPrint(allocator, "error: old_text found {d} times in '{s}'. Provide more surrounding context to make the match unique.", .{ count, input.path }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     }
 
-    // Single occurrence, replace
-    const idx = std.mem.indexOf(u8, content, input.old_text) orelse unreachable;
     const new_content = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        content[0..idx],
+        content[0..splice_start],
         input.new_text,
-        content[idx + input.old_text.len ..],
+        content[splice_end..],
     }) catch return types.oomResult();
     defer allocator.free(new_content);
 
@@ -110,6 +159,66 @@ pub const tool = types.Tool{
     .definition = definition,
     .execute = &execute,
 };
+
+/// A CRLF-normalized view of a byte slice with a map back to the original.
+///
+/// `offset_of[i]` gives the byte offset in the ORIGINAL content that
+/// corresponds to the start of `bytes[i]`. `offset_of.len == bytes.len + 1`
+/// so callers can ask about the one-past-end position too.
+const NormalizedView = struct {
+    bytes: []u8,
+    offset_of: []usize,
+};
+
+/// Replace every "\r\n" with "\n", producing a view and an offset map back
+/// to the original content. Callers own both returned slices.
+fn normalizeCrlf(allocator: Allocator, content: []const u8) !NormalizedView {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try bytes.ensureTotalCapacity(allocator, content.len);
+
+    var offset_of: std.ArrayList(usize) = .empty;
+    errdefer offset_of.deinit(allocator);
+    try offset_of.ensureTotalCapacity(allocator, content.len + 1);
+
+    var i: usize = 0;
+    while (i < content.len) {
+        try offset_of.append(allocator, i);
+        if (i + 1 < content.len and content[i] == '\r' and content[i + 1] == '\n') {
+            try bytes.append(allocator, '\n');
+            i += 2;
+        } else {
+            try bytes.append(allocator, content[i]);
+            i += 1;
+        }
+    }
+    try offset_of.append(allocator, content.len);
+
+    return .{
+        .bytes = try bytes.toOwnedSlice(allocator),
+        .offset_of = try offset_of.toOwnedSlice(allocator),
+    };
+}
+
+/// Like `normalizeCrlf` but without the offset map; used for the search
+/// pattern where we only need the normalized bytes.
+fn normalizeCrlfBytes(allocator: Allocator, old_text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, old_text.len);
+
+    var i: usize = 0;
+    while (i < old_text.len) {
+        if (i + 1 < old_text.len and old_text[i] == '\r' and old_text[i + 1] == '\n') {
+            try out.append(allocator, '\n');
+            i += 2;
+        } else {
+            try out.append(allocator, old_text[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -179,4 +288,64 @@ test "multiple matches returns error" {
 
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "2 times") != null);
+}
+
+test "edit: CRLF file matches LF-supplied old_text" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/zag-test-edit-crlf.txt";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        try file.writeAll("hello\r\nworld\r\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // old_text uses LF (the way the LLM naturally supplies text).
+    const input = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\": \"{s}\", \"old_text\": \"hello\\nworld\", \"new_text\": \"goodbye\\nworld\"}}",
+        .{tmp_path},
+    );
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    try std.testing.expect(!result.is_error);
+
+    // Verify the file was rewritten. Line endings of the untouched tail
+    // must be preserved; the replacement's line ending matches the
+    // new_text (LF).
+    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings("goodbye\nworld\r\n", written);
+}
+
+test "edit: LF file with LF old_text continues to work (no regression)" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/zag-test-edit-lf-nr.txt";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        try file.writeAll("hello\nworld\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const input = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\": \"{s}\", \"old_text\": \"hello\", \"new_text\": \"goodbye\"}}",
+        .{tmp_path},
+    );
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    try std.testing.expect(!result.is_error);
+
+    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings("goodbye\nworld\n", written);
 }
