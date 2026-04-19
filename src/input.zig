@@ -201,27 +201,28 @@ pub const Parser = struct {
         self.pending_len = tail;
         self.pending_since_ms = now_ms;
     }
+
+    /// Non-blocking read from `fd`, feed into the pending buffer, then
+    /// return the next event if one is ready (or produced by timeout).
+    ///
+    /// Safe to call in a polling loop. Returns null when no event is
+    /// available — the caller should poll the fd again later.
+    pub fn pollOnce(self: *Parser, fd: std.posix.fd_t, now_ms: i64) ?Event {
+        var buf: [READ_BUF_SIZE]u8 = undefined;
+        const n = std.posix.read(fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => blk: {
+                log.warn("unexpected read error: {}", .{err});
+                break :blk 0;
+            },
+        };
+        if (n > 0) self.feedBytes(buf[0..n], now_ms);
+        return self.nextEvent(now_ms);
+    }
 };
 
 /// Maximum bytes we read in a single poll, enough for any escape sequence.
 const READ_BUF_SIZE = 64;
-
-/// Read and parse a single event from the given file descriptor (non-blocking).
-///
-/// Returns `null` when the read returns `WouldBlock` or zero bytes (nothing available).
-/// Returns `.none` only for genuinely unrecognised sequences.
-pub fn pollEvent(fd: std.posix.fd_t) ?Event {
-    var buf: [READ_BUF_SIZE]u8 = undefined;
-    const n = std.posix.read(fd, &buf) catch |err| switch (err) {
-        error.WouldBlock => return null,
-        else => {
-            log.warn("unexpected read error: {}", .{err});
-            return null;
-        },
-    };
-    if (n == 0) return null;
-    return parseBytes(buf[0..n]);
-}
 
 /// Try to parse one event from the head of `buf`. Unlike `parseBytes`,
 /// this function distinguishes between "incomplete", "garbage", and
@@ -1283,4 +1284,32 @@ test "Parser: pending_since_ms resets after event is consumed" {
     // Advance the clock past the deadline and flush bare-ESC.
     const ev = p.nextEvent(51).?;
     try std.testing.expectEqual(KeyEvent.Key.escape, ev.key.key);
+}
+
+test "Parser.pollOnce: fragmented CSI via a real pipe resolves to Ctrl+Up" {
+    // `pipe2` with the flag struct is the codebase idiom (see
+    // agent_events.zig, main.zig, Screen.zig). Prefer it over
+    // pipe + fcntl for portability across Zig 0.15's posix module.
+    const pipe = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const read_fd = pipe[0];
+    const write_fd = pipe[1];
+    defer std.posix.close(read_fd);
+    defer std.posix.close(write_fd);
+
+    var p: Parser = .{};
+
+    // Write the first fragment.
+    _ = try std.posix.write(write_fd, &.{ 0x1b, '[' });
+    try std.testing.expect(p.pollOnce(read_fd, 0) == null);
+
+    // Write the rest.
+    _ = try std.posix.write(write_fd, &.{ '1', ';', '5', 'A' });
+    const ev = p.pollOnce(read_fd, 1).?;
+    switch (ev) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.up, k.key);
+            try std.testing.expectEqual(true, k.modifiers.ctrl);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

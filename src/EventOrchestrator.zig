@@ -104,6 +104,9 @@ wake_read_fd: posix.fd_t,
 /// agent workers can wake the main loop from arbitrary threads. Main owns
 /// the fd; the orchestrator only stores it for split-pane wiring.
 wake_write_fd: posix.fd_t,
+/// Persistent escape-sequence parser. Outlives a single poll cycle
+/// so fragmented CSI/SS3 sequences assemble correctly.
+input_parser: input.Parser = .{},
 
 /// Extra panes created by splits, tracked for cleanup.
 extra_panes: std.ArrayList(PaneEntry) = .empty,
@@ -286,7 +289,7 @@ fn tick(
     }
 
     // Poll for input (outside frame span, so wait doesn't count)
-    const maybe_event = input.pollEvent(posix.STDIN_FILENO);
+    const maybe_event = self.input_parser.pollOnce(posix.STDIN_FILENO, std.time.milliTimestamp());
 
     // Check for terminal resize (SIGWINCH)
     const resized = self.terminal.checkResize();
