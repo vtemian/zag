@@ -42,8 +42,8 @@ pub fn validate(
         else => return error.NotAnObject,
     };
 
-    if (schema_obj.get("required")) |req_list| {
-        const items = switch (req_list) {
+    if (schema_obj.get("required")) |required| {
+        const items = switch (required) {
             .array => |a| a.items,
             else => return error.MalformedSchema,
         };
