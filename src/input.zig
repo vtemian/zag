@@ -107,7 +107,7 @@ pub const ParseResult = union(enum) {
 
 /// Maximum bytes the Parser will buffer while waiting for an escape
 /// sequence to complete. 128 is twice the max single-read size and
-/// leaves generous headroom — CSI sequences in the wild top out at
+/// leaves generous headroom. CSI sequences in the wild top out at
 /// ~20 bytes.
 const PARSER_BUF_SIZE = 128;
 
@@ -206,7 +206,7 @@ pub const Parser = struct {
     /// return the next event if one is ready (or produced by timeout).
     ///
     /// Safe to call in a polling loop. Returns null when no event is
-    /// available — the caller should poll the fd again later.
+    /// available; the caller should poll the fd again later.
     pub fn pollOnce(self: *Parser, fd: std.posix.fd_t, now_ms: i64) ?Event {
         var buf: [READ_BUF_SIZE]u8 = undefined;
         const n = std.posix.read(fd, &buf) catch |err| switch (err) {
@@ -224,7 +224,7 @@ pub const Parser = struct {
     /// returning, given the parser's current pending state?
     ///
     /// Returns null when the parser has no pending bytes starting with
-    /// ESC — in that case the caller should block indefinitely (or on
+    /// ESC. In that case the caller should block indefinitely (or on
     /// other fd activity). Otherwise returns the remaining escape
     /// timeout clamped to [0, escape_timeout_ms]; the caller passes this
     /// to `poll` so the bare-ESC timeout actually fires when no new
@@ -253,7 +253,7 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
 
     // ESC-prefixed sequences
     if (first == 0x1b) {
-        if (buf.len == 1) return .incomplete; // bare ESC vs. prefix — caller decides via timeout
+        if (buf.len == 1) return .incomplete; // bare ESC vs. prefix; caller decides via timeout
 
         const second = buf[1];
 
@@ -283,7 +283,7 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
             } };
         }
 
-        // Anything else after ESC is unrecognised — emit bare ESC and
+        // Anything else after ESC is unrecognised; emit bare ESC and
         // let the caller re-try on the remainder.
         return .{ .ok = .{
             .event = Event{ .key = .{ .key = .escape, .modifiers = KeyEvent.no_modifiers } },
@@ -327,7 +327,7 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
     // UTF-8 multi-byte
     if (first >= 0x80) {
         const len = std.unicode.utf8ByteSequenceLength(first) catch {
-            // Invalid lead byte — drop one byte and let caller retry.
+            // Invalid lead byte: drop one byte and let caller retry.
             return .{ .skip = .{ .consumed = 1 } };
         };
         if (buf.len < len) return .incomplete;
@@ -552,7 +552,7 @@ fn findCsiFinal(buf: []const u8) ?usize {
     for (buf, 0..) |b, i| {
         // Intermediate/parameter bytes are 0x20..0x3F; final is 0x40..0x7E.
         if (b >= 0x40 and b <= 0x7E) return i;
-        // Anything below 0x20 inside a CSI is malformed — but we still
+        // Anything below 0x20 inside a CSI is malformed, but we still
         // consider the CSI complete at that point to avoid eating
         // arbitrary amounts of subsequent input. parseCsi will return
         // Event.none for malformed content.
@@ -1120,7 +1120,7 @@ test "nextEventInBuf: UTF-8 two-byte char returns ok with consumed=2" {
 }
 
 test "nextEventInBuf: truncated UTF-8 lead byte is incomplete" {
-    // 0xC3 says "two-byte sequence follows" but buffer ends — wait for more.
+    // 0xC3 says "two-byte sequence follows" but buffer ends; wait for more.
     try std.testing.expectEqual(ParseResult.incomplete, nextEventInBuf(&.{0xC3}));
 }
 
@@ -1155,7 +1155,7 @@ test "Parser: fragmented CSI Ctrl+Up assembles across two feedBytes calls" {
     p.feedBytes(&.{ 0x1b, '[' }, 0);
     try std.testing.expect(p.nextEvent(0) == null); // incomplete, no timeout yet
 
-    // Second fragment: 1 ; 5 A — completes the sequence
+    // Second fragment: 1 ; 5 A. Completes the sequence
     p.feedBytes(&.{ '1', ';', '5', 'A' }, 1);
     const ev = p.nextEvent(1).?;
     switch (ev) {
@@ -1239,7 +1239,7 @@ test "Parser: bare ESC emitted after timeout expires" {
 }
 
 test "Parser: timeout flushes ESC but leaves trailing byte as its own event" {
-    // User pressed Escape, then '[' — not a CSI, two separate events.
+    // User pressed Escape, then '['. Not a CSI, two separate events.
     // Because `[` is in the Alt+char range, without timeout the parser
     // would eagerly emit Alt+[. With timeout, bare-ESC then '[' plain.
     var p: Parser = .{};
