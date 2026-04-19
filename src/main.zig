@@ -346,7 +346,7 @@ pub fn main() !void {
     // land before any keys are dispatched. Tool registration follows so
     // the tools collected during config.lua make it into the dispatch registry.
     if (lua_engine) |*eng| {
-        eng.keymap_registry = &orchestrator.keymap_registry;
+        eng.keymap_registry = &orchestrator.window_manager.keymap_registry;
         eng.loadUserConfig();
         eng.registerTools(&registry) catch |err| {
             log.warn("failed to register lua tools: {}", .{err});
