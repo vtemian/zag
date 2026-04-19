@@ -28,6 +28,7 @@ const Theme = @import("Theme.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const AgentSupervisor = @import("AgentSupervisor.zig");
+const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const types = @import("types.zig");
@@ -47,26 +48,10 @@ const Action = enum { none, quit, redraw };
 /// Result of handling a slash command.
 const CommandResult = enum { handled, quit, not_a_command };
 
-/// The three objects that together form a conversation pane: the view
-/// (rendering), the session (LLM message + persistence state), and the
-/// runner (agent thread + event coordination). Callers that need all
-/// three compose them through this struct; each field is a borrowed
-/// pointer and the three lifetimes are coupled.
-pub const Pane = struct {
-    view: *ConversationBuffer,
-    session: *ConversationSession,
-    runner: *AgentRunner,
-};
-
-/// A registered pane plus the persistence handle that keeps it tied to
-/// an on-disk session. The orchestrator owns each `PaneEntry`: deinit
-/// frees the three Pane objects plus the handle in the right order.
-pub const PaneEntry = struct {
-    /// The composed view/session/runner for this pane.
-    pane: Pane,
-    /// Session handle for persistence, or null if persistence is unavailable.
-    session_handle: ?*Session.SessionHandle = null,
-};
+/// Re-exported from WindowManager: view + session + runner composition.
+pub const Pane = WindowManager.Pane;
+/// Re-exported from WindowManager: pane + persistence handle tuple.
+pub const PaneEntry = WindowManager.PaneEntry;
 
 // -- Fields ------------------------------------------------------------------
 
@@ -76,14 +61,6 @@ allocator: Allocator,
 terminal: *Terminal,
 /// Cell grid and ANSI renderer.
 screen: *Screen,
-/// Window tree (splits + focus).
-layout: *Layout,
-/// Renders layout into the screen grid.
-compositor: *Compositor,
-/// The primary (root) conversation pane: view + session + runner, all
-/// borrowed from main. The orchestrator does not own the underlying
-/// allocations for this pane; it does for every entry in `extra_panes`.
-root_pane: Pane,
 /// LLM provider for model calls and model ID lookups.
 provider: *llm.ProviderResult,
 /// Tool registry for dispatching tool calls.
@@ -108,29 +85,9 @@ wake_write_fd: posix.fd_t,
 /// so fragmented CSI/SS3 sequences assemble correctly.
 input_parser: input.Parser = .{},
 
-/// Extra panes created by splits, tracked for cleanup.
-extra_panes: std.ArrayList(PaneEntry) = .empty,
-/// Counter for creating new buffers when splitting windows.
-next_buffer_id: u32 = 1,
-/// Rolling label counter for scratch panes. First split produces
-/// `scratch 1`; increments each time `createSplitPane` runs.
-next_scratch_id: u32 = 1,
-/// One-shot status message rendered on the input/status row, cleared on
-/// the next key event. Used for announces like `split → scratch 2`.
-transient_status: [64]u8 = undefined,
-transient_status_len: u8 = 0,
-/// Frame counter for animating the status bar spinner.
-spinner_frame: u8 = 0,
-/// Global editing mode. Insert = typing into input buffer;
-/// Normal = keymap bindings fire, typing is disabled.
-///
-/// v1 is deliberately global (not per-buffer): window-management
-/// commands are global, and a shared mode keeps the UX predictable.
-/// Focus-switching between panes does not reset the mode.
-current_mode: Keymap.Mode = .insert,
-/// Keymap registry. Built from defaults in `init`; Lua config can
-/// register overrides via `zag.keymap()` before `loadUserConfig` runs.
-keymap_registry: Keymap.Registry = undefined,
+/// Window, pane, and frame-local UI state. Layout/compositor/root_pane
+/// live here so the orchestrator stays a pure event coordinator.
+window_manager: WindowManager = undefined,
 /// Per-pane agent lifecycle supervisor.
 supervisor: AgentSupervisor = undefined,
 
@@ -176,9 +133,6 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .allocator = cfg.allocator,
         .terminal = cfg.terminal,
         .screen = cfg.screen,
-        .layout = cfg.layout,
-        .compositor = cfg.compositor,
-        .root_pane = cfg.root_pane,
         .provider = cfg.provider,
         .registry = cfg.registry,
         .session_mgr = cfg.session_mgr,
@@ -188,6 +142,18 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .wake_read_fd = cfg.wake_read_fd,
         .wake_write_fd = cfg.wake_write_fd,
     };
+    self.window_manager = try WindowManager.init(.{
+        .allocator = cfg.allocator,
+        .screen = cfg.screen,
+        .layout = cfg.layout,
+        .compositor = cfg.compositor,
+        .root_pane = cfg.root_pane,
+        .provider = cfg.provider,
+        .session_mgr = cfg.session_mgr,
+        .lua_engine = cfg.lua_engine,
+        .wake_write_fd = cfg.wake_write_fd,
+    });
+    errdefer self.window_manager.deinit();
     self.supervisor = AgentSupervisor.init(
         cfg.allocator,
         cfg.wake_write_fd,
@@ -195,9 +161,6 @@ pub fn init(cfg: Config) !EventOrchestrator {
         cfg.provider,
         cfg.registry,
     );
-    self.keymap_registry = Keymap.Registry.init(cfg.allocator);
-    errdefer self.keymap_registry.deinit();
-    try self.keymap_registry.loadDefaults();
     return self;
 }
 
@@ -208,25 +171,11 @@ pub fn init(cfg: Config) !EventOrchestrator {
 /// unconditionally prevents use-after-free on extra pane buffers whose agent
 /// threads are still live.
 pub fn deinit(self: *EventOrchestrator) void {
+    // Shutdown order matters: shutdownAgents joins worker threads that
+    // hold live pointers into every pane's buffer. Only after those are
+    // joined is it safe to let WindowManager.deinit free pane storage.
     self.shutdownAgents();
-    for (self.extra_panes.items) |entry| {
-        if (entry.session_handle) |sh| {
-            sh.close();
-            self.allocator.destroy(sh);
-        }
-        // Runner first: it joins the agent thread and drains the event
-        // queue. The session and view may be read by the worker right up
-        // until the join completes, so freeing them before shutdown would
-        // race on the worker's last frame.
-        entry.pane.runner.deinit();
-        self.allocator.destroy(entry.pane.runner);
-        entry.pane.view.deinit();
-        self.allocator.destroy(entry.pane.view);
-        entry.pane.session.deinit();
-        self.allocator.destroy(entry.pane.session);
-    }
-    self.extra_panes.deinit(self.allocator);
-    self.keymap_registry.deinit();
+    self.window_manager.deinit();
 }
 
 // -- Event loop --------------------------------------------------------------
@@ -240,9 +189,9 @@ pub fn run(self: *EventOrchestrator) !void {
     var running = true;
 
     // Initial render
-    self.compositor.composite(self.layout, .{
+    self.window_manager.compositor.composite(self.window_manager.layout, .{
         .fps = 0,
-        .mode = self.current_mode,
+        .mode = self.window_manager.current_mode,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
         // Backpressure on the terminal fd: frame is dropped, the next
@@ -355,41 +304,41 @@ fn tick(
     }
 
     // Drain agent events from every pane
-    self.drainPane(self.root_pane);
-    for (self.extra_panes.items) |entry| {
+    self.drainPane(self.window_manager.root_pane);
+    for (self.window_manager.extra_panes.items) |entry| {
         self.drainPane(entry.pane);
     }
 
     // Check if any pane has pending visual changes
-    const any_dirty = self.root_pane.view.render_dirty or for (self.extra_panes.items) |entry| {
+    const any_dirty = self.window_manager.root_pane.view.render_dirty or for (self.window_manager.extra_panes.items) |entry| {
         if (entry.pane.view.render_dirty) break true;
     } else false;
 
     // Spinner ticks only when actual events arrive
     if (any_dirty) {
-        self.spinner_frame = (self.spinner_frame +% 1) % @as(u8, spinner_chars.len);
+        self.window_manager.spinner_frame = (self.window_manager.spinner_frame +% 1) % @as(u8, spinner_chars.len);
     }
 
     // Skip composite+render when nothing visual changed
-    const frame_dirty = any_dirty or self.compositor.layout_dirty or
+    const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
         (maybe_event != null and maybe_event.? != .mouse);
 
     if (!frame_dirty) return;
 
     const focused = self.getFocusedPane();
     const agent_running = focused.runner.isAgentRunning();
-    const status = if (self.transient_status_len > 0)
-        self.transient_status[0..self.transient_status_len]
+    const status = if (self.window_manager.transient_status_len > 0)
+        self.window_manager.transient_status[0..self.window_manager.transient_status_len]
     else if (agent_running) blk: {
         const info = focused.runner.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
-    self.compositor.composite(self.layout, .{
+    self.window_manager.compositor.composite(self.window_manager.layout, .{
         .fps = current_fps.*,
-        .mode = self.current_mode,
+        .mode = self.window_manager.current_mode,
         .status = status,
         .agent_running = agent_running,
-        .spinner_frame = self.spinner_frame,
+        .spinner_frame = self.window_manager.spinner_frame,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
         // Backpressure on the terminal fd: frame is dropped, the next
@@ -412,7 +361,7 @@ fn tick(
 fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // Any keystroke dismisses the transient status so split announces
     // disappear as soon as the user does anything.
-    self.transient_status_len = 0;
+    self.window_manager.transient_status_len = 0;
 
     // Ctrl+C is always-on regardless of mode: it's the universal escape
     // hatch (cancel a running agent, or quit the app).
@@ -430,7 +379,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 // Ctrl+W is an input-editing shortcut, so it only fires
                 // in insert mode. Normal mode falls through to the
                 // keymap registry (or ignored).
-                if (ch == 'w' and self.current_mode == .insert) {
+                if (ch == 'w' and self.window_manager.current_mode == .insert) {
                     const v = self.getFocusedPane().view;
                     v.deleteWordFromDraft();
                     return .redraw;
@@ -441,13 +390,13 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     }
 
     // Keymap dispatch: run the bound action if any.
-    if (self.keymap_registry.lookup(self.current_mode, k)) |action| {
+    if (self.window_manager.keymap_registry.lookup(self.window_manager.current_mode, k)) |action| {
         self.executeAction(action);
         return .redraw;
     }
 
     // Normal mode ignores unbound keys (no typing, no accidental side effects).
-    if (self.current_mode == .normal) return .none;
+    if (self.window_manager.current_mode == .normal) return .none;
 
     // Insert mode: regular input-line editing. Route all edits into the
     // focused pane's draft so focus-switching preserves per-pane text.
@@ -486,14 +435,14 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
             }
         },
         .page_up => {
-            if (self.layout.getFocusedLeaf()) |l| {
+            if (self.window_manager.layout.getFocusedLeaf()) |l| {
                 const half = l.rect.height / 2;
                 const cur = l.buffer.getScrollOffset();
                 l.buffer.setScrollOffset(cur +| if (half > 0) half else 1);
             }
         },
         .page_down => {
-            if (self.layout.getFocusedLeaf()) |l| {
+            if (self.window_manager.layout.getFocusedLeaf()) |l| {
                 const half = l.rect.height / 2;
                 const cur = l.buffer.getScrollOffset();
                 l.buffer.setScrollOffset(if (cur > half) cur - half else 0);
@@ -515,20 +464,20 @@ fn executeAction(self: *EventOrchestrator, action: Keymap.Action) void {
         .split_vertical => self.doSplit(.vertical),
         .split_horizontal => self.doSplit(.horizontal),
         .close_window => {
-            self.layout.closeWindow();
-            self.layout.recalculate(self.screen.width, self.screen.height);
-            self.compositor.layout_dirty = true;
+            self.window_manager.layout.closeWindow();
+            self.window_manager.layout.recalculate(self.screen.width, self.screen.height);
+            self.window_manager.compositor.layout_dirty = true;
         },
-        .enter_insert_mode => self.current_mode = .insert,
-        .enter_normal_mode => self.current_mode = .normal,
+        .enter_insert_mode => self.window_manager.current_mode = .insert,
+        .enter_normal_mode => self.window_manager.current_mode = .normal,
     }
 }
 
 /// Shift focus to the neighbouring pane and mark the compositor dirty so
 /// the focused / unfocused frame styling repaints.
 fn doFocus(self: *EventOrchestrator, dir: Layout.FocusDirection) void {
-    self.layout.focusDirection(dir);
-    self.compositor.layout_dirty = true;
+    self.window_manager.layout.focusDirection(dir);
+    self.window_manager.compositor.layout_dirty = true;
 }
 
 /// Compute the mode the system should be in after `event` is processed,
@@ -576,7 +525,7 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 /// the underlying allocation failure and logs it; callers don't need to
 /// propagate status-message errors.
 fn appendStatus(self: *EventOrchestrator, text: []const u8) void {
-    _ = self.root_pane.view.appendNode(null, .status, text) catch |err|
+    _ = self.window_manager.root_pane.view.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
 }
 
@@ -636,38 +585,38 @@ fn dumpTraceFile(self: *EventOrchestrator) void {
 /// Resize screen and layout.
 fn handleResize(self: *EventOrchestrator, cols: u16, rows: u16) !void {
     try self.screen.resize(cols, rows);
-    self.layout.recalculate(cols, rows);
-    self.compositor.layout_dirty = true;
+    self.window_manager.layout.recalculate(cols, rows);
+    self.window_manager.compositor.layout_dirty = true;
 }
 
 /// Split the focused window, creating a new pane with its own session.
 fn doSplit(self: *EventOrchestrator, direction: Layout.SplitDirection) void {
     // Capture the label that createSplitPane is about to consume so the
     // announce below matches the new pane's name.
-    const scratch_id = self.next_scratch_id;
+    const scratch_id = self.window_manager.next_scratch_id;
     const pane = self.createSplitPane() catch |err| {
         log.warn("split pane creation failed: {}", .{err});
         return;
     };
     const b = pane.view.buf();
     const split = switch (direction) {
-        .vertical => self.layout.splitVertical(0.5, b),
-        .horizontal => self.layout.splitHorizontal(0.5, b),
+        .vertical => self.window_manager.layout.splitVertical(0.5, b),
+        .horizontal => self.window_manager.layout.splitHorizontal(0.5, b),
     };
     split catch |err| {
         log.warn("split failed: {}", .{err});
         return;
     };
-    self.layout.recalculate(self.screen.width, self.screen.height);
-    self.compositor.layout_dirty = true;
+    self.window_manager.layout.recalculate(self.screen.width, self.screen.height);
+    self.window_manager.compositor.layout_dirty = true;
 
     // The new pane is ready to be typed into. Drop back to insert mode so
     // the user can start a conversation without an extra `i` keystroke,
     // even if the split was triggered from normal mode.
-    self.current_mode = modeAfterSplit();
+    self.window_manager.current_mode = modeAfterSplit();
 
     // Transient announce; cleared on the next key event.
-    self.transient_status_len = formatSplitAnnounce(&self.transient_status, scratch_id);
+    self.window_manager.transient_status_len = formatSplitAnnounce(&self.window_manager.transient_status, scratch_id);
 }
 
 /// A freshly created pane is almost always going to be typed into, so we
@@ -696,11 +645,11 @@ fn createSplitPane(self: *EventOrchestrator) !Pane {
     errdefer cs.deinit();
 
     var name_scratch: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.window_manager.next_scratch_id}) catch "scratch";
 
     const cb = try self.allocator.create(ConversationBuffer);
     errdefer self.allocator.destroy(cb);
-    cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
+    cb.* = try ConversationBuffer.init(self.allocator, self.window_manager.next_buffer_id, name);
     errdefer cb.deinit();
 
     const runner = try self.allocator.create(AgentRunner);
@@ -714,17 +663,17 @@ fn createSplitPane(self: *EventOrchestrator) !Pane {
     runner.wake_fd = self.wake_write_fd;
     runner.lua_engine = self.lua_engine;
 
-    self.next_buffer_id += 1;
-    self.next_scratch_id += 1;
+    self.window_manager.next_buffer_id += 1;
+    self.window_manager.next_scratch_id += 1;
 
     const pane: Pane = .{ .view = cb, .session = cs, .runner = runner };
 
     // Register the entry before attaching the session handle so any
     // subsequent `paneFromBuffer` call already sees this pane.
-    try self.extra_panes.append(self.allocator, .{ .pane = pane });
+    try self.window_manager.extra_panes.append(self.allocator, .{ .pane = pane });
 
     const sh = self.attachSession(pane);
-    self.extra_panes.items[self.extra_panes.items.len - 1].session_handle = sh;
+    self.window_manager.extra_panes.items[self.window_manager.extra_panes.items.len - 1].session_handle = sh;
 
     return pane;
 }
@@ -864,16 +813,16 @@ fn generateSessionName(
 /// no focused leaf or the focused leaf's buffer is not owned by any pane
 /// (should not happen in practice; the fallback keeps UI code total).
 fn getFocusedPane(self: *EventOrchestrator) Pane {
-    const leaf = self.layout.getFocusedLeaf() orelse return self.root_pane;
-    return self.paneFromBuffer(leaf.buffer) orelse self.root_pane;
+    const leaf = self.window_manager.layout.getFocusedLeaf() orelse return self.window_manager.root_pane;
+    return self.paneFromBuffer(leaf.buffer) orelse self.window_manager.root_pane;
 }
 
 /// Look up the pane whose view backs `b`. Returns null if no registered
 /// pane matches, which Compositor and any other reader should treat as a
 /// soft failure rather than a crash.
 pub fn paneFromBuffer(self: *EventOrchestrator, b: Buffer) ?Pane {
-    if (self.root_pane.view.buf().ptr == b.ptr) return self.root_pane;
-    for (self.extra_panes.items) |entry| {
+    if (self.window_manager.root_pane.view.buf().ptr == b.ptr) return self.window_manager.root_pane;
+    for (self.window_manager.extra_panes.items) |entry| {
         if (entry.pane.view.buf().ptr == b.ptr) return entry.pane;
     }
     return null;
@@ -885,8 +834,8 @@ pub fn shutdownAgents(self: *EventOrchestrator) void {
     var runners: std.ArrayList(*AgentRunner) = .empty;
     defer runners.deinit(self.allocator);
 
-    runners.append(self.allocator, self.root_pane.runner) catch return;
-    for (self.extra_panes.items) |entry| {
+    runners.append(self.allocator, self.window_manager.root_pane.runner) catch return;
+    for (self.window_manager.extra_panes.items) |entry| {
         runners.append(self.allocator, entry.pane.runner) catch return;
     }
     self.supervisor.shutdownAll(runners.items);
