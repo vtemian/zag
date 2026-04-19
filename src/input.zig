@@ -1205,3 +1205,82 @@ test "Parser: bare-ESC from a single byte without timeout returns null" {
     try std.testing.expect(p.nextEvent(10) == null);
     try std.testing.expect(p.nextEvent(59) == null); // under the 50ms deadline
 }
+
+test "Parser: bare ESC emitted after timeout expires" {
+    var p: Parser = .{};
+    p.feedBytes(&.{0x1b}, 0);
+    // At exactly the deadline, flush.
+    const ev = p.nextEvent(50).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key.escape, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+    // Buffer is now empty.
+    try std.testing.expect(p.nextEvent(100) == null);
+}
+
+test "Parser: timeout flushes ESC but leaves trailing byte as its own event" {
+    // User pressed Escape, then '[' — not a CSI, two separate events.
+    // Because `[` is in the Alt+char range, without timeout the parser
+    // would eagerly emit Alt+[. With timeout, bare-ESC then '[' plain.
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, '[' }, 0);
+
+    // Before the deadline: still incomplete (we can't tell yet whether
+    // a CSI completes).
+    try std.testing.expect(p.nextEvent(10) == null);
+
+    // After the deadline: flush ESC, leaving '[' in the buffer.
+    const esc = p.nextEvent(60).?;
+    try std.testing.expectEqual(KeyEvent.Key.escape, esc.key.key);
+
+    // Now '[' parses as plain printable.
+    const bracket = p.nextEvent(60).?;
+    switch (bracket) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = '[' }, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: fragmented arrival within timeout window does NOT flush ESC" {
+    // Simulate a slow link: ESC arrives at t=0, [ at t=30, A at t=45.
+    // We must NOT emit bare-ESC anywhere in between.
+    var p: Parser = .{};
+    p.feedBytes(&.{0x1b}, 0);
+    try std.testing.expect(p.nextEvent(10) == null);
+    p.feedBytes(&.{'['}, 30);
+    try std.testing.expect(p.nextEvent(30) == null);
+    p.feedBytes(&.{'A'}, 45);
+    const ev = p.nextEvent(45).?;
+    switch (ev) {
+        .key => |k| try std.testing.expectEqual(KeyEvent.Key.up, k.key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: Alt+a under timeout still works (two bytes arrive together)" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, 'a' }, 0);
+    const ev = p.nextEvent(0).?;
+    switch (ev) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'a' }, k.key);
+            try std.testing.expectEqual(true, k.modifiers.alt);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: pending_since_ms resets after event is consumed" {
+    var p: Parser = .{};
+    // First, an event that consumes immediately.
+    p.feedBytes(&.{ 'A', 0x1b }, 0);
+    _ = p.nextEvent(0).?; // 'A'
+    // Now buffer has only 0x1b; pending_since_ms must have advanced to now_ms=0.
+    // Advance the clock past the deadline and flush bare-ESC.
+    const ev = p.nextEvent(51).?;
+    try std.testing.expectEqual(KeyEvent.Key.escape, ev.key.key);
+}
