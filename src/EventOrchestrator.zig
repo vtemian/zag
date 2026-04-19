@@ -20,7 +20,6 @@ const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationSession = @import("ConversationSession.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
@@ -31,7 +30,6 @@ const AgentSupervisor = @import("AgentSupervisor.zig");
 const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
-const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const build_options = @import("build_options");
 
@@ -306,10 +304,13 @@ fn tick(
         }
     }
 
-    // Drain agent events from every pane
-    self.drainPane(self.window_manager.root_pane);
+    // Drain agent events from every pane. Supervisor handles hook dispatch;
+    // WindowManager handles UI-side drain + session auto-naming.
+    self.supervisor.drainHooks(self.window_manager.root_pane.runner);
+    self.window_manager.drainPane(self.window_manager.root_pane);
     for (self.window_manager.extra_panes.items) |entry| {
-        self.drainPane(entry.pane);
+        self.supervisor.drainHooks(entry.pane.runner);
+        self.window_manager.drainPane(entry.pane);
     }
 
     // Check if any pane has pending visual changes
@@ -479,14 +480,6 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 
 // -- Helpers -----------------------------------------------------------------
 
-/// Drain a pane's agent events and auto-name its session on first completion.
-fn drainPane(self: *EventOrchestrator, pane: Pane) void {
-    self.supervisor.drainHooks(pane.runner);
-    if (pane.runner.drainEvents(self.allocator)) {
-        self.autoNameSession(pane);
-    }
-}
-
 /// Record the user's input on `pane`, then spawn an agent thread to respond.
 /// The pane owns the conversation data (view + session); the orchestrator
 /// owns the worker and the surrounding hook dance.
@@ -531,68 +524,6 @@ fn onUserInputSubmitted(
     if (pane.runner.isAgentRunning()) return;
 
     try self.supervisor.submit(pane.runner, &pane.session.messages);
-}
-
-/// If `pane` has a session without a name and enough conversation to summarize,
-/// ask the provider for a 3-5 word title and rename the session.
-/// Best-effort: any failure is logged and swallowed.
-fn autoNameSession(self: *EventOrchestrator, pane: Pane) void {
-    const sh = pane.session.session_handle orelse return;
-    if (sh.meta.name_len > 0) return;
-
-    const inputs = pane.session.sessionSummaryInputs() orelse return;
-
-    const summary = self.generateSessionName(inputs) catch |err| {
-        log.debug("auto-name failed: {}", .{err});
-        return;
-    };
-    defer self.allocator.free(summary);
-
-    sh.rename(summary) catch |err| {
-        log.warn("session rename failed: {}", .{err});
-    };
-}
-
-/// Send a minimal LLM request to summarize the first exchange in 3-5 words.
-fn generateSessionName(
-    self: *EventOrchestrator,
-    inputs: ConversationSession.SessionSummaryInputs,
-) ![]const u8 {
-    const allocator = self.allocator;
-
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = inputs.user_text } };
-
-    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(assistant_content);
-    assistant_content[0] = .{ .text = .{ .text = inputs.assistant_text } };
-
-    var summary_msgs = [_]types.Message{
-        .{ .role = .user, .content = user_content },
-        .{ .role = .assistant, .content = assistant_content },
-    };
-
-    const req = llm.Request{
-        .system_prompt = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        .messages = &summary_msgs,
-        .tool_definitions = &.{},
-        .allocator = allocator,
-    };
-    const response = try self.provider.provider.call(&req);
-    defer response.deinit(allocator);
-
-    allocator.free(user_content);
-    allocator.free(assistant_content);
-
-    for (response.content) |block| {
-        switch (block) {
-            .text => |t| return try allocator.dupe(u8, t.text),
-            else => {},
-        }
-    }
-
-    return error.NoResponseText;
 }
 
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
