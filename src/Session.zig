@@ -325,7 +325,16 @@ pub const SessionHandle = struct {
             log.err("failed to write newline: {}", .{e});
             return e;
         };
-        w.interface.flush() catch {};
+        w.interface.flush() catch |e| {
+            log.err("failed to flush entry: {}", .{e});
+            return e;
+        };
+        // Force the write to disk so a power-loss or disk-full crash
+        // cannot leave the UI showing text that is not durable.
+        self.file.sync() catch |e| {
+            log.err("failed to fsync session file: {}", .{e});
+            return e;
+        };
 
         self.meta.message_count += 1;
         self.meta.updated = entry.timestamp;
@@ -800,6 +809,21 @@ test "writeMetaFile and readMetaFile round-trip" {
     try std.testing.expectEqual(@as(i64, 1000), loaded.created);
     try std.testing.expectEqual(@as(i64, 2000), loaded.updated);
     try std.testing.expectEqual(@as(u32, 5), loaded.message_count);
+}
+
+test "File.sync runs without error on a fresh file" {
+    // Proxy pin for the fsync added to appendEntry. We cannot assert that
+    // a sync actually flushed to disk without a platform-specific probe,
+    // so we assert only that the API is usable on a normal file: the
+    // precondition for the production path to run without error on a
+    // healthy filesystem.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("sync-probe", .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{\"type\":\"user_message\"}\n");
+    try file.sync();
 }
 
 test "writeMetaFile replaces any stale .tmp via atomic rename" {
