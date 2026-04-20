@@ -191,14 +191,18 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
         0;
     const lines_needed = visible_end - visible_start;
 
-    // Request only the visible range from the buffer
+    // Request only the visible range from the buffer. Under the split
+    // allocator contract both args are `self.allocator` until the per-frame
+    // arena is introduced by Compositor's init/deinit pair.
     var visible_lines_span = trace.span("get_visible_lines");
-    var lines = buf.getVisibleLines(self.allocator, self.theme, visible_start, lines_needed) catch {
+    var lines = buf.getVisibleLines(self.allocator, self.allocator, self.theme, visible_start, lines_needed) catch {
         visible_lines_span.end();
         return;
     };
     visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
-    defer Theme.freeStyledLines(&lines, self.allocator);
+    // Span text is borrowed and spans arrays are cache-owned; the output
+    // list only needs its backing freed.
+    defer lines.deinit(self.allocator);
 
     // Write styled lines to screen
     var cur_row = content_y;
