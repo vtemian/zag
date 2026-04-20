@@ -86,7 +86,9 @@ pub const Pool = struct {
         while (self.popJob()) |job| {
             // Dispatch based on job.kind - filled in by later phases.
             // For now, pass through to completions to prove the plumbing.
-            self.completions.push(job) catch {};
+            self.completions.push(job) catch {
+                _ = self.completions.dropped.fetchAdd(1, .monotonic);
+            };
         }
     }
 };
@@ -115,6 +117,30 @@ test "Pool.submit rejects after shutdown is signalled" {
 
     var job = Job{};
     try testing.expectError(error.PoolShuttingDown, pool.submit(&job));
+}
+
+test "worker bumps completions.dropped when ring is full" {
+    const alloc = testing.allocator;
+    var completions = try CompletionQueue.init(alloc, 1);
+    defer completions.deinit();
+
+    const pool = try Pool.init(alloc, 2, &completions);
+    defer pool.deinit();
+
+    var j1 = Job{};
+    var j2 = Job{};
+    var j3 = Job{};
+    try pool.submit(&j1);
+    try pool.submit(&j2);
+    try pool.submit(&j3);
+
+    // Wait long enough for workers to process all three.
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    try testing.expect(completions.dropped.load(.monotonic) >= 2);
+
+    // Drain the one survivor so deinit doesn't leak test expectations.
+    _ = completions.pop();
 }
 
 test "Pool submit routes job to worker and posts to completion queue" {
