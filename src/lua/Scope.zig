@@ -195,7 +195,12 @@ test "Scope.cancel invokes job aborters" {
         }
     };
     var ctx = Ctx{};
-    var job = Job{ .aborter = .{ .ctx = @ptrCast(&ctx), .abort_fn = Ctx.fire } };
+    var job = Job{
+        .kind = .{ .sleep = .{ .ms = 0 } },
+        .thread_ref = 0,
+        .scope = root,
+        .aborter = .{ .ctx = @ptrCast(&ctx), .abort_fn = Ctx.fire },
+    };
     try root.registerJob(&job);
     defer root.unregisterJob(&job);
 

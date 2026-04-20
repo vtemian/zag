@@ -18,8 +18,14 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
 
     // Build a minimal Job the worker can run. Sleep(0) is fine.
     // But our Pool currently has no sleep dispatch — workerLoop just
-    // pass-through pushes to completions. Use a bare Job{}.
-    var job = Job{};
+    // pass-through pushes to completions. Use a stub job.
+    const root = try Scope.init(testing.allocator, null);
+    defer root.deinit();
+    var job = Job{
+        .kind = .{ .sleep = .{ .ms = 0 } },
+        .thread_ref = 0,
+        .scope = root,
+    };
     try eng.io_pool.?.submit(&job);
 
     // Wait for wake byte
@@ -50,8 +56,14 @@ test "resumeFromJob drains completion queue and frees the job" {
 
     // resumeFromJob takes ownership of the Job via allocator.destroy, so
     // the Job must be heap-allocated on the same allocator.
+    const root = try Scope.init(testing.allocator, null);
+    defer root.deinit();
     const job = try testing.allocator.create(Job);
-    job.* = Job{};
+    job.* = Job{
+        .kind = .{ .sleep = .{ .ms = 0 } },
+        .thread_ref = 0,
+        .scope = root,
+    };
     try eng.io_pool.?.submit(job);
 
     // Wait for the worker's pass-through push to land in completions.
