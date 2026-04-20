@@ -23,8 +23,9 @@ pub const Error = error{NoLogPath};
 pub fn initWithPath(path: []const u8) !void {
     deinit();
 
-    // O_APPEND so writes are atomic across threads/processes without
-    // seek races. O_CREAT creates with 0644 if the file does not exist.
+    // O_APPEND keeps each writeAll atomic for a single call under PIPE_BUF
+    // on both macOS and Linux; the process-local mutex serialises larger
+    // writes. Zag is single-process-per-instance, so this is sufficient.
     const fd = try posix.open(path, .{
         .ACCMODE = .WRONLY,
         .APPEND = true,
@@ -62,7 +63,7 @@ pub fn handler(
 
     var scratch: [4096]u8 = undefined;
     const scope_prefix = if (scope == .default) "default" else @tagName(scope);
-    const prefix = formatPrefix(scratch[0..64], scope_prefix, @tagName(level)) catch return;
+    const prefix = formatPrefix(scratch[0..128], scope_prefix, @tagName(level)) catch return;
     const body = std.fmt.bufPrint(scratch[prefix.len..], format ++ "\n", args) catch return;
     const total = scratch[0 .. prefix.len + body.len];
 
