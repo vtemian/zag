@@ -114,11 +114,15 @@ pub const LuaEngine = struct {
         /// Retired + freed in retireTask; joiners resumed with (true, nil)
         /// or (nil, "cancelled") based on self.scope.isCancelled at retirement.
         joiners: std.ArrayList(i32) = .empty,
-        /// Arena holding argv/cwd/env strings for an in-flight zag.cmd.
-        /// Null when the task isn't currently waiting on a cmd_exec job.
-        /// Cleaned up by resumeFromJob after the result is pushed onto the
-        /// coroutine stack (Lua has copied the data via pushString by then).
-        cmd_arena: ?*std.heap.ArenaAllocator = null,
+        /// Arena holding caller-side strings (argv/cwd/env for zag.cmd,
+        /// url/headers for zag.http.get, and so on) for an in-flight
+        /// primitive Job. Null when the task isn't currently waiting on a
+        /// pool-submitted job. Cleaned up by resumeFromJob after the
+        /// result is pushed onto the coroutine stack (Lua has copied the
+        /// data via pushString by then). Only one primitive is in flight
+        /// per task at a time — Lua coroutines are single-stack — so a
+        /// single slot suffices across cmd_exec/http_get/future kinds.
+        primitive_arena: ?*std.heap.ArenaAllocator = null,
     };
 
     /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
@@ -271,6 +275,16 @@ pub const LuaEngine = struct {
         lua.setField(-2, "__call"); // mt.__call = fn; [zag_table, cmd_table, mt]
         lua.setMetatable(-2); // setmetatable(cmd_table, mt); [zag_table, cmd_table]
         lua.setField(-2, "cmd"); // zag.cmd = cmd_table; [zag_table]
+
+        // zag.http — plain namespace table for HTTP primitives. Not
+        // callable; users always go through zag.http.get/post/stream.
+        // Stack after this block: [zag_table].
+        lua.newTable(); // [zag_table, http_table]
+        lua.pushFunction(zlua.wrap(zagHttpGetFn));
+        lua.setField(-2, "get"); // zag.http.get = fn; [zag_table, http_table]
+        // zag.http.post lands in Task 7.3.
+        // zag.http.stream lands in Task 7.4.
+        lua.setField(-2, "http"); // zag.http = http_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -446,7 +460,7 @@ pub const LuaEngine = struct {
 
         // Stage argv/opts strings in a per-task arena so cleanup is one call
         // regardless of how many argv entries there are. Arena is owned by
-        // Task.cmd_arena once it's attached; prior to that we own it here.
+        // Task.primitive_arena once it's attached; prior to that we own it here.
         const arena_ptr = engine.allocator.create(std.heap.ArenaAllocator) catch {
             co.raiseErrorStr("zag.cmd arena alloc failed", .{});
         };
@@ -601,14 +615,14 @@ pub const LuaEngine = struct {
             .scope = task.scope,
         };
         task.pending_job = job;
-        task.cmd_arena = arena_ptr;
+        task.primitive_arena = arena_ptr;
 
         if (task.scope.isCancelled()) {
             arena_ptr.deinit();
             engine.allocator.destroy(arena_ptr);
             engine.allocator.destroy(job);
             task.pending_job = null;
-            task.cmd_arena = null;
+            task.primitive_arena = null;
             co.pushNil();
             _ = co.pushString("cancelled");
             return 2;
@@ -619,7 +633,153 @@ pub const LuaEngine = struct {
             engine.allocator.destroy(arena_ptr);
             engine.allocator.destroy(job);
             task.pending_job = null;
-            task.cmd_arena = null;
+            task.primitive_arena = null;
+            co.pushNil();
+            _ = co.pushString("io_error: submit failed");
+            return 2;
+        };
+
+        co.yield(0);
+        // yield is noreturn on Lua 5.4.
+    }
+
+    /// `zag.http.get(url, opts?)` — synchronous-looking HTTP GET. Yields
+    /// the coroutine until the worker finishes the request, then resumes
+    /// with (response, nil) on success or (nil, err) on failure.
+    /// `response` is a table `{status=int, headers=table, body=string}`;
+    /// in v1 `headers` is always an empty table (see primitives/http.zig).
+    ///
+    /// `opts` is an optional table with:
+    ///   - `headers`: map of string->string request headers
+    ///   - `timeout_ms`: int, plumbed through but NOT enforced in v1
+    ///   - `follow_redirects`: bool, default true (std.http handles up to 3)
+    fn zagHttpGetFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("zag.http.get must be called inside zag.async/hook/keymap", .{});
+        }
+
+        // zag.http.get is a plain function (not __call on a table), so
+        // arg 1 is the URL and arg 2 the opts table.
+        const url_raw = co.checkString(1);
+        const opts_idx: i32 = 2;
+
+        // Stage url + headers in a per-task arena so they survive the
+        // yield. Arena is owned by Task.primitive_arena once attached;
+        // until then we own it here and clean up on every error path.
+        const arena_ptr = engine.allocator.create(std.heap.ArenaAllocator) catch {
+            co.raiseErrorStr("zag.http.get arena alloc failed", .{});
+        };
+        arena_ptr.* = std.heap.ArenaAllocator.init(engine.allocator);
+        const arena = arena_ptr.allocator();
+
+        const url = arena.dupe(u8, url_raw) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.http.get url dupe failed", .{});
+        };
+
+        var timeout_ms: u64 = 30_000;
+        var follow_redirects: bool = true;
+        // Header list backed by the arena so we don't deinit it separately.
+        var headers_list: std.ArrayList(async_job.HttpHeader) = .empty;
+
+        if (co.isTable(opts_idx)) {
+            _ = co.getField(opts_idx, "timeout_ms");
+            if (co.isInteger(-1)) {
+                const v = co.toInteger(-1) catch 30_000;
+                timeout_ms = if (v < 0) 0 else @intCast(v);
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "follow_redirects");
+            if (!co.isNil(-1)) {
+                follow_redirects = co.toBoolean(-1);
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "headers");
+            if (co.isTable(-1)) {
+                // Iterate headers table: pushNil seeds the key, next()
+                // leaves (key, value) on the stack each iteration.
+                co.pushNil();
+                while (co.next(-2)) {
+                    // Stack: [..., headers_table, key, value]
+                    if (!co.isString(-2) or !co.isString(-1)) {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.get headers entries must be string->string", .{});
+                    }
+                    const k = co.toString(-2) catch "";
+                    const v = co.toString(-1) catch "";
+                    const name = arena.dupe(u8, k) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.get header dupe failed", .{});
+                    };
+                    const val = arena.dupe(u8, v) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.get header dupe failed", .{});
+                    };
+                    headers_list.append(arena, .{ .name = name, .value = val }) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.get headers append failed", .{});
+                    };
+                    co.pop(1); // pop value, keep key for next iteration
+                }
+            }
+            co.pop(1); // pop headers table (or nil)
+        }
+
+        // toOwnedSlice transfers the ArrayList items into a plain slice;
+        // since the list used the arena, the slice itself is arena-owned
+        // and dies with the arena.
+        const headers_slice = headers_list.toOwnedSlice(arena) catch &.{};
+
+        const task = engine.taskForCoroutine(co) orelse {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.http.get: no task for this coroutine", .{});
+        };
+
+        const job = engine.allocator.create(async_job.Job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.http.get job alloc failed", .{});
+        };
+        job.* = .{
+            .kind = .{ .http_get = .{
+                .url = url,
+                .headers = headers_slice,
+                .timeout_ms = timeout_ms,
+                .follow_redirects = follow_redirects,
+            } },
+            .thread_ref = task.thread_ref,
+            .scope = task.scope,
+        };
+        task.pending_job = job;
+        task.primitive_arena = arena_ptr;
+
+        if (task.scope.isCancelled()) {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.primitive_arena = null;
+            co.pushNil();
+            _ = co.pushString("cancelled");
+            return 2;
+        }
+
+        engine.io_pool.?.submit(job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.primitive_arena = null;
             co.pushNil();
             _ = co.pushString("io_error: submit failed");
             return 2;
@@ -2241,12 +2401,12 @@ pub const LuaEngine = struct {
         self.allocator.destroy(job);
 
         // Result strings have been copied onto the coroutine stack; the
-        // per-task cmd arena (argv/cwd copies) is safe to free here, before
-        // the coroutine resumes and reuses the task.
-        if (task.cmd_arena) |a| {
+        // per-task primitive arena (argv/cwd/url/headers) is safe to free
+        // here, before the coroutine resumes and reuses the task.
+        if (task.primitive_arena) |a| {
             a.deinit();
             self.allocator.destroy(a);
-            task.cmd_arena = null;
+            task.primitive_arena = null;
         }
 
         self.resumeTask(task, num_values);
@@ -2359,12 +2519,12 @@ pub const LuaEngine = struct {
                 return 2;
             },
             .http_get => {
-                // Placeholder — Task 7.2 replaces this with the real
-                // zag.http.get binding that pushes a response table.
-                // For now, free the worker-owned body/headers and
-                // surface a clear "not wired" error so a caller who
-                // somehow submits http_get today sees a predictable
-                // failure instead of a silent leak.
+                // On success the worker populated job.result.http with
+                // a heap-allocated body (on engine allocator). In v1
+                // `headers` is always empty (see primitives/http.zig);
+                // the iteration loop below is a no-op today but already
+                // handles the eventual Task 7.5 case where the worker
+                // fills in real response headers.
                 const r = blk: {
                     if (job.result) |res| switch (res) {
                         .http => |hr| break :blk hr,
@@ -2374,18 +2534,37 @@ pub const LuaEngine = struct {
                     _ = co.pushString("io_error: http_get missing result");
                     return 2;
                 };
+
+                co.newTable();
+                co.pushInteger(@intCast(r.status));
+                co.setField(-2, "status");
+                _ = co.pushString(r.body);
+                co.setField(-2, "body");
+
+                // headers subtable: lowercase-keyed name -> value. Zero
+                // entries in v1, but the loop is cheap and future-proof.
+                // pushString/setTable (not setField) because h.name is
+                // a plain slice, not a sentinel-terminated string.
+                co.newTable();
+                for (r.headers) |h| {
+                    _ = co.pushString(h.name);
+                    _ = co.pushString(h.value);
+                    co.setTable(-3);
+                }
+                co.setField(-2, "headers");
+
+                // Lua copied the bytes via pushString; worker-owned
+                // slices can go back to the allocator. Guard the
+                // outer-slice free so the v1 `&.{}` sentinel (no backing
+                // allocation) doesn't hit the allocator.
                 self.allocator.free(r.body);
                 for (r.headers) |h| {
                     self.allocator.free(h.name);
                     self.allocator.free(h.value);
                 }
-                // In v1 the worker always returns an empty headers
-                // slice (see primitives/http.zig). Guard the free so
-                // a `&.{}` with undefined pointer doesn't reach the
-                // allocator.
                 if (r.headers.len > 0) self.allocator.free(r.headers);
+
                 co.pushNil();
-                _ = co.pushString("io_error: zag.http.get Lua binding not yet wired");
                 return 2;
             },
         }
@@ -2474,7 +2653,7 @@ pub const LuaEngine = struct {
     /// snapshot. Joiners resume with (true, nil) on normal completion or
     /// (nil, "cancelled") if the retiring task's scope was cancelled.
     fn retireTask(self: *LuaEngine, task: *Task) void {
-        if (task.cmd_arena) |a| {
+        if (task.primitive_arena) |a| {
             a.deinit();
             self.allocator.destroy(a);
             // task about to be destroyed — no need to null the field
@@ -4105,4 +4284,90 @@ test "zag.cmd.kill on a spawned child exits it with the signal" {
     eng.lua.pop(1);
 
     try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.http.get fetches from a local test server" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Canned HTTP/1.1 server: kernel picks the port, thread serves one
+    // request then exits. Same pattern as primitives/http.zig's test.
+    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: 14\r\n" ++
+                "Content-Type: text/plain\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n" ++
+                "hello from lua";
+            conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    try eng.lua.doString(
+        \\function test_http(url)
+        \\  local r, err = zag.http.get(url)
+        \\  _http_err_is_nil = (err == nil)
+        \\  if r then
+        \\    _http_status = r.status
+        \\    _http_body = r.body
+        \\    _http_headers_is_table = (type(r.headers) == "table")
+        \\  end
+        \\end
+    );
+
+    _ = try eng.lua.getGlobal("test_http");
+    _ = eng.lua.pushString(url);
+    _ = try eng.spawnCoroutine(1, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_http_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    _ = try eng.lua.getGlobal("_http_status");
+    try std.testing.expectEqual(@as(i64, 200), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+
+    _ = try eng.lua.getGlobal("_http_body");
+    const body = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, body, "hello from lua") != null);
+    eng.lua.pop(1);
+
+    _ = try eng.lua.getGlobal("_http_headers_is_table");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }
