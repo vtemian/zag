@@ -156,11 +156,25 @@ pub fn deinit(self: *WindowManager) void {
 
 // -- Window management -------------------------------------------------------
 
-/// Resize screen and layout.
+/// Resize screen and layout, then notify every leaf's buffer of its new rect.
 pub fn handleResize(self: *WindowManager, cols: u16, rows: u16) !void {
     try self.screen.resize(cols, rows);
     self.layout.recalculate(cols, rows);
     self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+}
+
+/// Walk all visible leaves and forward each leaf's current rect to the
+/// buffer it displays via the buffer's vtable. Safe to call after any
+/// layout mutation (resize, split, close) as long as the layout has
+/// been recalculated.
+fn notifyLeafRects(self: *WindowManager) void {
+    var leaves: [64]*Layout.LayoutNode = undefined;
+    var count: usize = 0;
+    self.layout.visibleLeaves(&leaves, &count);
+    for (leaves[0..count]) |node| {
+        node.leaf.buffer.onResize(node.leaf.rect);
+    }
 }
 
 /// Shift focus to the neighbouring pane and mark the compositor dirty so
@@ -184,6 +198,7 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
             self.layout.closeWindow();
             self.layout.recalculate(self.screen.width, self.screen.height);
             self.compositor.layout_dirty = true;
+            self.notifyLeafRects();
         },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
@@ -230,6 +245,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     };
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
 
     // The new pane is ready to be typed into. Drop back to insert mode so
     // the user can start a conversation without an extra `i` keystroke,
