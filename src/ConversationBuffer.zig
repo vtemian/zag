@@ -7,9 +7,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
+const Layout = @import("Layout.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
+const input = @import("input.zig");
 
 const ConversationBuffer = @This();
 
@@ -397,6 +399,18 @@ pub fn getDraft(self: *const ConversationBuffer) []const u8 {
     return self.draft[0..self.draft_len];
 }
 
+/// Copy the current draft into `dest` and clear it. Returns a slice of
+/// `dest` for the copied bytes. Used by the submit pipeline so the
+/// orchestrator never touches the draft's internal representation.
+/// Caller's buffer must be at least `MAX_DRAFT` bytes.
+pub fn consumeDraft(self: *ConversationBuffer, dest: []u8) []const u8 {
+    const n = self.draft_len;
+    std.debug.assert(dest.len >= n);
+    @memcpy(dest[0..n], self.draft[0..n]);
+    self.draft_len = 0;
+    return dest[0..n];
+}
+
 // -- Buffer interface --------------------------------------------------------
 
 /// Create a Buffer interface from this ConversationBuffer.
@@ -418,6 +432,10 @@ const vtable: Buffer.VTable = .{
     .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
+    .handleKey = bufHandleKey,
+    .onResize = bufOnResize,
+    .onFocus = bufOnFocus,
+    .onMouse = bufOnMouse,
 };
 
 fn bufGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
@@ -460,6 +478,64 @@ fn bufIsDirty(ptr: *anyopaque) bool {
 fn bufClearDirty(ptr: *anyopaque) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     self.render_dirty = false;
+}
+
+/// Handle a key event aimed at the buffer's in-progress draft. The
+/// orchestrator strips universal shortcuts (Ctrl+C) and keymap bindings
+/// before this runs, so everything here is insert-mode editing of the
+/// draft buffer. Enter and page_up/page_down stay on the orchestrator
+/// because they touch the submit pipeline and the layout's focused
+/// leaf's scroll offset, neither of which belongs to the view alone.
+pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleResult {
+    if (ev.modifiers.ctrl) {
+        switch (ev.key) {
+            .char => |ch| {
+                if (ch == 'w') {
+                    self.deleteWordFromDraft();
+                    return .consumed;
+                }
+            },
+            else => {},
+        }
+        return .passthrough;
+    }
+    switch (ev.key) {
+        .backspace => {
+            self.deleteBackFromDraft();
+            return .consumed;
+        },
+        .char => |ch| {
+            if (ch >= 0x20 and ch < 0x7f) {
+                self.appendToDraft(@intCast(ch));
+                return .consumed;
+            }
+            return .passthrough;
+        },
+        else => return .passthrough,
+    }
+}
+
+fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return self.handleKey(ev);
+}
+
+fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
+    _ = ptr;
+    _ = rect;
+}
+
+fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
+    _ = ptr;
+    _ = focused;
+}
+
+fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) Buffer.HandleResult {
+    _ = ptr;
+    _ = ev;
+    _ = local_x;
+    _ = local_y;
+    return .passthrough;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -871,4 +947,88 @@ test "clearDraft resets length to zero" {
     cb.clearDraft();
     try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
     try std.testing.expectEqualStrings("", cb.getDraft());
+}
+
+test "handleKey appends printable chars to the draft" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("a", cb.getDraft());
+}
+
+test "handleKey on backspace deletes one char" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hi") |ch| cb.appendToDraft(ch);
+    const r = cb.handleKey(.{ .key = .backspace, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("h", cb.getDraft());
+}
+
+test "handleKey on Ctrl+W deletes the trailing word" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hello world") |ch| cb.appendToDraft(ch);
+    const r = cb.handleKey(.{ .key = .{ .char = 'w' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("hello", cb.getDraft());
+}
+
+test "handleKey returns passthrough for Enter (orchestrator retains the submit path)" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const r = cb.handleKey(.{ .key = .enter, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+}
+
+test "handleKey returns passthrough for unrelated ctrl chords" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+}
+
+test "consumeDraft snapshots into dest and clears" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hello") |ch| cb.appendToDraft(ch);
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = cb.consumeDraft(&scratch);
+    try std.testing.expectEqualStrings("hello", taken);
+    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
+    try std.testing.expectEqualStrings("", cb.getDraft());
+}
+
+test "consumeDraft on empty returns empty slice" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = cb.consumeDraft(&scratch);
+    try std.testing.expectEqual(@as(usize, 0), taken.len);
+}
+
+test "handleKey dispatches through the Buffer interface" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const b = cb.buf();
+    const r = b.handleKey(.{ .key = .{ .char = 'Z' }, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("Z", cb.getDraft());
 }
