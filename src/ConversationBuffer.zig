@@ -7,9 +7,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
+const Layout = @import("Layout.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
+const input = @import("input.zig");
 
 const ConversationBuffer = @This();
 
@@ -418,6 +420,10 @@ const vtable: Buffer.VTable = .{
     .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
+    .handleKey = bufHandleKey,
+    .onResize = bufOnResize,
+    .onFocus = bufOnFocus,
+    .onMouse = bufOnMouse,
 };
 
 fn bufGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
@@ -460,6 +466,30 @@ fn bufIsDirty(ptr: *anyopaque) bool {
 fn bufClearDirty(ptr: *anyopaque) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     self.render_dirty = false;
+}
+
+fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
+    _ = ptr;
+    _ = ev;
+    return .passthrough;
+}
+
+fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
+    _ = ptr;
+    _ = rect;
+}
+
+fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
+    _ = ptr;
+    _ = focused;
+}
+
+fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) Buffer.HandleResult {
+    _ = ptr;
+    _ = ev;
+    _ = local_x;
+    _ = local_y;
+    return .passthrough;
 }
 
 // -- Tests -------------------------------------------------------------------
