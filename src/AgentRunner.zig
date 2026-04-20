@@ -11,8 +11,12 @@ const log = std.log.scoped(.agent_runner);
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationSession = @import("ConversationSession.zig");
 const agent_events = @import("agent_events.zig");
+const AgentThread = @import("AgentThread.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Hooks = @import("Hooks.zig");
+const llm = @import("llm.zig");
+const tools = @import("tools.zig");
+const types = @import("types.zig");
 const Node = ConversationBuffer.Node;
 
 const AgentRunner = @This();
@@ -100,6 +104,72 @@ pub fn isAgentRunning(self: *const AgentRunner) bool {
 /// to wait for the thread to exit.
 pub fn cancelAgent(self: *AgentRunner) void {
     self.cancel_flag.store(true, .release);
+}
+
+/// Spawn-time borrows needed by `submit`. Bundled so callers only pass
+/// one argument and so we can grow the set without rippling signatures.
+pub const SpawnDeps = struct {
+    /// Heap allocator for queue storage, event-owned bytes, and dup on err.
+    allocator: Allocator,
+    /// Write end of the main-loop wake pipe. Copied into every spawn so
+    /// agent workers can interrupt poll() from any thread.
+    wake_write_fd: std.posix.fd_t,
+    /// Shared Lua engine used to service hook/tool round-trips on the
+    /// main thread. Null when Lua init failed.
+    lua_engine: ?*LuaEngine,
+    /// Provider used by the agent loop for LLM calls.
+    provider: llm.Provider,
+    /// Tool registry dispatched from the agent loop.
+    registry: *const tools.Registry,
+};
+
+/// Spawn an agent thread for this runner. Assumes `submitInput` has
+/// already recorded the user turn. Idempotent: a second call while the
+/// agent is running is a no-op.
+///
+/// Fragile-ordering enforcement: this function is the only place that
+/// knows the order of queue init, wake_fd, lua_engine, cancel reset,
+/// spawn. Callers just call submit().
+pub fn submit(
+    self: *AgentRunner,
+    messages: *std.ArrayList(types.Message),
+    deps: SpawnDeps,
+) !void {
+    if (self.isAgentRunning()) return;
+
+    self.event_queue = try agent_events.EventQueue.initBounded(deps.allocator, 256);
+    errdefer {
+        self.event_queue.deinit();
+        self.queue_active = false;
+    }
+
+    self.event_queue.wake_fd = deps.wake_write_fd;
+    self.queue_active = true;
+    self.lua_engine = deps.lua_engine;
+    self.cancel_flag.store(false, .release);
+
+    self.agent_thread = try AgentThread.spawn(
+        deps.provider,
+        messages,
+        deps.registry,
+        deps.allocator,
+        &self.event_queue,
+        &self.cancel_flag,
+        deps.lua_engine,
+    );
+}
+
+/// Cancel every runner cooperatively in a first pass, then `shutdown()`
+/// each one in a second pass to join its thread and deinit its queue.
+/// Splitting the loop means all agents start winding down before any
+/// single join blocks, which matters when a tool call is slow.
+///
+/// `AgentRunner.shutdown()` is idempotent (guards on `queue_active` and
+/// `agent_thread`), so a subsequent `runner.deinit()` is safe: the
+/// second call is a no-op.
+pub fn shutdownAll(runners: []const *AgentRunner) void {
+    for (runners) |runner| runner.cancelAgent();
+    for (runners) |runner| runner.shutdown();
 }
 
 /// Return the last info/status message (e.g., token counts) captured by
