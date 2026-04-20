@@ -51,20 +51,10 @@ fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
 const file_log = @import("file_log.zig");
 pub const std_options: std.Options = .{ .logFn = file_log.handler };
 
-/// Module-level root session: owns the LLM message history and persistence
-/// handle for the primary conversation.
-var root_session: ConversationSession = undefined;
-/// Module-level root buffer for the primary conversation pane.
-var root_buffer: ConversationBuffer = undefined;
-/// Module-level root agent runner: owns the primary conversation's agent
-/// thread, event queue, and streaming state. Phase 4 collapses this with
-/// the buffer and session into a single `Pane` value.
-var root_runner: AgentRunner = undefined;
-
-/// Append a plain text line to the root buffer as a status node. Used for
+/// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
-fn appendOutputText(text: []const u8) !void {
-    _ = try root_buffer.appendNode(null, .status, text);
+fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
+    _ = try view.appendNode(null, .status, text);
 }
 
 /// Set a file descriptor to non-blocking mode.
@@ -75,7 +65,7 @@ fn setNonBlocking(fd: posix.fd_t) !void {
 }
 
 /// Post the welcome banner or a resume notice to the root buffer.
-fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
+fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
 
@@ -89,7 +79,7 @@ fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHa
             \\Type a message and press Enter. Ctrl+C or /quit to exit.
             \\Esc = normal mode, i = insert mode. In normal: h/j/k/l focus, v/s split, q close. /model to show model.
         , .{ model_id, cwd }) catch "Welcome to zag";
-        try appendOutputText(welcome);
+        try appendStatusLine(view, welcome);
         return;
     }
 
@@ -100,8 +90,8 @@ fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHa
             "Resumed session {s} ({d} messages)",
             .{ sh.id[0..sh.id_len], sh.meta.message_count },
         ) catch "Resumed session";
-        try appendOutputText(resume_msg);
-        try appendOutputText("");
+        try appendStatusLine(view, resume_msg);
+        try appendStatusLine(view, "");
     }
 }
 
@@ -127,13 +117,13 @@ pub fn main() !void {
     };
     defer file_log.deinit();
 
-    root_session = ConversationSession.init(allocator);
+    var root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
 
-    root_buffer = try ConversationBuffer.init(allocator, 0, "session");
+    var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
     defer root_buffer.deinit();
 
-    root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
+    var root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
     defer root_runner.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
@@ -239,7 +229,7 @@ pub fn main() !void {
 
     layout.recalculate(screen.width, screen.height);
 
-    try postStartupBanner(resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
+    try postStartupBanner(&root_buffer, resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
     // -- Hand off to the orchestrator ----------------------------------------
     var orchestrator = try EventOrchestrator.init(.{
@@ -296,18 +286,14 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-test "appendOutputText creates a status node" {
+test "appendStatusLine creates a status node on the given view" {
     const allocator = std.testing.allocator;
-    root_session = ConversationSession.init(allocator);
-    defer root_session.deinit();
-    root_buffer = try ConversationBuffer.init(allocator, 0, "test");
-    defer root_buffer.deinit();
-    root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
-    defer root_runner.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "test");
+    defer view.deinit();
 
-    try appendOutputText("hello world");
+    try appendStatusLine(&view, "hello world");
 
-    try std.testing.expectEqual(@as(usize, 1), root_buffer.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.status, root_buffer.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("hello world", root_buffer.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), view.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("hello world", view.root_children.items[0].content.items);
 }
