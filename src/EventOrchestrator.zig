@@ -3,10 +3,10 @@
 //! and hands them off via init() + run().
 //!
 //! Ownership: the terminal, screen, layout, compositor, and root buffer
-//! are created in main() and held here as pointers - their lifetimes
+//! are created in main() and held here as pointers. Their lifetimes
 //! exceed the orchestrator's. The orchestrator itself owns the extra
 //! split panes, the keymap registry, and frame-local counters
-//! (spinner, fps, transient status). Each pane owns its own draft
+//! (spinner, transient status). Each pane owns its own draft
 //! input (see ConversationBuffer.draft).
 
 const std = @import("std");
@@ -32,14 +32,11 @@ const log = std.log.scoped(.orchestrator);
 
 const EventOrchestrator = @This();
 
-/// Characters for the animated spinner.
-const spinner_chars = "|/-\\";
-
 /// Action returned from event handling to the main loop.
 const Action = enum { none, quit, redraw };
 
-/// Result of handling a slash command.
-const CommandResult = enum { handled, quit, not_a_command };
+/// Re-exported from WindowManager: result of handling a slash command.
+const CommandResult = WindowManager.CommandResult;
 
 /// Re-exported from WindowManager: view + session + runner composition.
 pub const Pane = WindowManager.Pane;
@@ -57,9 +54,6 @@ allocator: Allocator,
 terminal: *Terminal,
 /// Cell grid and ANSI renderer.
 screen: *Screen,
-/// LLM provider. Used for the /model command status line; the sub-modules
-/// hold their own pointer for model calls and model ID lookups.
-provider: *llm.ProviderResult,
 /// Lua plugin engine. Used for user-input hooks routed on the main thread;
 /// the supervisor holds its own pointer for worker-side hook dispatch.
 lua_engine: ?*LuaEngine,
@@ -119,7 +113,6 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .allocator = cfg.allocator,
         .terminal = cfg.terminal,
         .screen = cfg.screen,
-        .provider = cfg.provider,
         .lua_engine = cfg.lua_engine,
         .stdout_file = cfg.stdout_file,
         .wake_read_fd = cfg.wake_read_fd,
@@ -224,33 +217,28 @@ fn tick(
     // Poll for input (outside frame span, so wait doesn't count)
     const maybe_event = self.input_parser.pollOnce(posix.STDIN_FILENO, std.time.milliTimestamp());
 
-    // Check for terminal resize (SIGWINCH)
-    const resized = self.terminal.checkResize();
-    if (resized) |new_size| {
+    // Resize: merge SIGWINCH and in-band CSI sources so handleResize
+    // is called at most once per tick.
+    const sigwinch_size = self.terminal.checkResize();
+    const input_size: ?Terminal.Size = if (maybe_event) |ev| switch (ev) {
+        .resize => |sz| blk: {
+            self.terminal.size = .{ .rows = sz.rows, .cols = sz.cols };
+            break :blk .{ .cols = sz.cols, .rows = sz.rows };
+        },
+        else => null,
+    } else null;
+
+    if (input_size orelse sigwinch_size) |new_size| {
         try self.window_manager.handleResize(new_size.cols, new_size.rows);
     }
 
-    // Start frame timing (only for frames that do real work)
-    trace.frameStart();
-
-    var frame_span = trace.span("frame");
-    defer {
-        frame_span.end();
-        trace.frameEnd();
-    }
-
     if (maybe_event) |event| {
-        // Resize needs screen/term locals, handle inline
-        if (event == .resize) {
-            const sz = event.resize;
-            self.terminal.size = .{ .rows = sz.rows, .cols = sz.cols };
-            try self.window_manager.handleResize(sz.cols, sz.rows);
-        } else {
-            const action = switch (event) {
-                .key => |k| self.handleKey(k),
-                else => Action.none,
-            };
-            if (action == .quit) running.* = false;
+        switch (event) {
+            .resize => {},
+            .key => |k| {
+                if (self.handleKey(k) == .quit) running.* = false;
+            },
+            else => {},
         }
     }
 
@@ -270,7 +258,7 @@ fn tick(
 
     // Spinner ticks only when actual events arrive
     if (any_dirty) {
-        self.window_manager.spinner_frame = (self.window_manager.spinner_frame +% 1) % @as(u8, spinner_chars.len);
+        self.window_manager.spinner_frame = (self.window_manager.spinner_frame +% 1) % @as(u8, WindowManager.spinner_chars.len);
     }
 
     // Skip composite+render when nothing visual changed
@@ -278,6 +266,13 @@ fn tick(
         (maybe_event != null and maybe_event.? != .mouse);
 
     if (!frame_dirty) return;
+
+    trace.frameStart();
+    var frame_span = trace.span("frame");
+    defer {
+        frame_span.end();
+        trace.frameEnd();
+    }
 
     const focused = self.window_manager.getFocusedPane();
     const agent_running = focused.runner.isAgentRunning();
@@ -316,13 +311,14 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // disappear as soon as the user does anything.
     self.window_manager.transient_status_len = 0;
 
+    const focused = self.window_manager.getFocusedPane();
+
     // Ctrl+C is always-on regardless of mode: it's the universal escape
     // hatch (cancel a running agent, or quit the app).
     if (k.modifiers.ctrl) {
         switch (k.key) {
             .char => |ch| {
                 if (ch == 'c') {
-                    const focused = self.window_manager.getFocusedPane();
                     if (focused.runner.isAgentRunning()) {
                         focused.runner.cancelAgent();
                         return .none;
@@ -333,8 +329,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 // in insert mode. Normal mode falls through to the
                 // keymap registry (or ignored).
                 if (ch == 'w' and self.window_manager.current_mode == .insert) {
-                    const v = self.window_manager.getFocusedPane().view;
-                    v.deleteWordFromDraft();
+                    focused.view.deleteWordFromDraft();
                     return .redraw;
                 }
             },
@@ -353,38 +348,36 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 
     // Insert mode: regular input-line editing. Route all edits into the
     // focused pane's draft so focus-switching preserves per-pane text.
-    const draft_view = self.window_manager.getFocusedPane().view;
     switch (k.key) {
         .enter => {
-            if (draft_view.draft_len == 0) return .none;
+            if (focused.view.draft_len == 0) return .none;
 
-            const user_input = draft_view.draft[0..draft_view.draft_len];
+            const user_input = focused.view.draft[0..focused.view.draft_len];
 
             switch (self.handleCommand(user_input)) {
                 .quit => return .quit,
                 .handled => {
-                    draft_view.clearDraft();
+                    focused.view.clearDraft();
                     return .redraw;
                 },
                 .not_a_command => {
-                    const focused = self.window_manager.getFocusedPane();
                     if (focused.runner.isAgentRunning()) return .none;
 
                     self.onUserInputSubmitted(focused, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
                         return .none;
                     };
-                    draft_view.clearDraft();
+                    focused.view.clearDraft();
                     return .redraw;
                 },
             }
         },
         .backspace => {
-            draft_view.deleteBackFromDraft();
+            focused.view.deleteBackFromDraft();
         },
         .char => |ch| {
             if (ch >= 0x20 and ch < 0x7f) {
-                draft_view.appendToDraft(@intCast(ch));
+                focused.view.appendToDraft(@intCast(ch));
             }
         },
         .page_up => {
@@ -406,25 +399,9 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     return .redraw;
 }
 
-/// Try to handle input as a slash command. Returns .not_a_command if it isn't one.
+/// Try to handle input as a slash command. Delegates to WindowManager.
 fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
-    if (std.mem.eql(u8, command, "/quit") or std.mem.eql(u8, command, "/q")) {
-        return .quit;
-    }
-
-    if (std.mem.eql(u8, command, "/perf") or std.mem.eql(u8, command, "/perf-dump")) {
-        self.window_manager.handlePerfCommand(command);
-        return .handled;
-    }
-
-    if (std.mem.eql(u8, command, "/model")) {
-        var scratch: [128]u8 = undefined;
-        const model_info = std.fmt.bufPrint(&scratch, "model: {s}", .{self.provider.model_id}) catch "model: unknown";
-        self.window_manager.appendStatus(model_info);
-        return .handled;
-    }
-
-    return .not_a_command;
+    return self.window_manager.handleCommand(command);
 }
 
 // -- Helpers -----------------------------------------------------------------
