@@ -239,6 +239,7 @@ fn tick(
             .key => |k| {
                 if (self.handleKey(k) == .quit) running.* = false;
             },
+            .mouse => |m| self.handleMouse(m),
             else => {},
         }
     }
@@ -402,6 +403,29 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 /// Try to handle input as a slash command. Delegates to WindowManager.
 fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
     return self.window_manager.handleCommand(command);
+}
+
+/// Route a mouse event to the pane under the pointer. Coordinates are
+/// 1-based in `input.MouseEvent` (SGR convention); the layout's rects
+/// are 0-based, so translate before the hit test. Events outside any
+/// leaf are dropped.
+fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
+    if (ev.x == 0 or ev.y == 0) return;
+    const screen_x: u16 = ev.x - 1;
+    const screen_y: u16 = ev.y - 1;
+
+    var leaves: [64]*Layout.LayoutNode = undefined;
+    var count: usize = 0;
+    self.window_manager.layout.visibleLeaves(&leaves, &count);
+    for (leaves[0..count]) |node| {
+        const rect = node.leaf.rect;
+        if (screen_x < rect.x or screen_x >= rect.x + rect.width) continue;
+        if (screen_y < rect.y or screen_y >= rect.y + rect.height) continue;
+        const local_x = screen_x - rect.x;
+        const local_y = screen_y - rect.y;
+        _ = node.leaf.buffer.onMouse(ev, local_x, local_y);
+        return;
+    }
 }
 
 // -- Helpers -----------------------------------------------------------------
