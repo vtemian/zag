@@ -46,6 +46,12 @@ const sandbox_strip =
     \\os = { date = _date, time = _time, clock = _clock }
 ;
 
+/// Pure-Lua concurrency combinators (zag.all, zag.race, zag.timeout) built
+/// on zag.spawn / task:join / task:cancel / zag.sleep. Embedded at compile
+/// time so plugins always get the same implementation regardless of
+/// sandbox state (the Zig-side doString call bypasses the `load` strip).
+const combinators_src = @embedFile("lua/combinators.lua");
+
 /// A tool defined in Lua via `zag.tool()`.
 pub const LuaTool = struct {
     /// Tool name (owned, heap-allocated).
@@ -167,6 +173,13 @@ pub const LuaEngine = struct {
         var keymap_registry = Keymap.Registry.init(allocator);
         errdefer keymap_registry.deinit();
         try keymap_registry.loadDefaults();
+
+        // Install pure-Lua combinators that build on zag.spawn / :join /
+        // :cancel / zag.sleep. These have to run after the primitive
+        // bindings exist but don't depend on any engine state.
+        lua.doString(combinators_src) catch |err| {
+            log.warn("failed to load lua combinators: {}", .{err});
+        };
 
         return LuaEngine{
             .lua = lua,
@@ -4479,6 +4492,185 @@ test "task:join returns (nil, 'cancelled') when target is cancelled" {
     const err_str = try eng.lua.toString(-1);
     try std.testing.expect(std.mem.eql(u8, err_str, "cancelled"));
     eng.lua.pop(1);
+    eng.lua.pop(1);
+}
+
+test "zag.all collects results in input order" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Three workers sleep out-of-order and return distinct strings. zag.all
+    // must still place them back in the original input slots (1 -> "a",
+    // 2 -> "b", 3 -> "c") regardless of retirement order.
+    try eng.lua.doString(
+        \\function test_all()
+        \\  local r = zag.all({
+        \\    function() zag.sleep(10); return "a" end,
+        \\    function() zag.sleep(5); return "b" end,
+        \\    function() zag.sleep(20); return "c" end,
+        \\  })
+        \\  _all_count = #r
+        \\  _all_1 = r[1].value
+        \\  _all_2 = r[2].value
+        \\  _all_3 = r[3].value
+        \\  _all_err1_is_nil = (r[1].err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_all");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_all_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_all_1");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "a"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_all_2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "b"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_all_3");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "c"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_all_err1_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.race returns fastest value and reports winning index" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Middle worker is the shortest; it should win and losers get cancelled
+    // before they return their strings.
+    try eng.lua.doString(
+        \\function test_race()
+        \\  local v, err, idx = zag.race({
+        \\    function() zag.sleep(50); return "slow" end,
+        \\    function() zag.sleep(5); return "fast" end,
+        \\    function() zag.sleep(100); return "slower" end,
+        \\  })
+        \\  _race_winner = v
+        \\  _race_err_is_nil = (err == nil)
+        \\  _race_idx = idx
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_race");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_race_winner");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "fast"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_race_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_race_idx");
+    try std.testing.expectEqual(@as(i64, 2), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.timeout returns err='timeout' when fn overshoots deadline" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // 50ms deadline vs 1000ms sleep: the timer fires first and cancels
+    // the worker. zag.timeout should surface (nil, "timeout").
+    try eng.lua.doString(
+        \\function test_timeout()
+        \\  local v, err = zag.timeout(50, function()
+        \\    zag.sleep(1000)
+        \\    return "late"
+        \\  end)
+        \\  _to_v_is_nil = (v == nil)
+        \\  _to_err = err
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_timeout");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_to_v_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_to_err");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "timeout"));
+    eng.lua.pop(1);
+}
+
+test "zag.timeout passes through value when fn beats deadline" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // fn sleeps well inside the 500ms deadline. zag.timeout must return
+    // ("quick", nil) and drop the timer without firing.
+    try eng.lua.doString(
+        \\function test_timeout_win()
+        \\  local v, err = zag.timeout(500, function()
+        \\    zag.sleep(10)
+        \\    return "quick"
+        \\  end)
+        \\  _tow_v = v
+        \\  _tow_err_is_nil = (err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_timeout_win");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_tow_v");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "quick"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_tow_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
 }
 
