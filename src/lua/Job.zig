@@ -63,6 +63,19 @@ pub const CmdWaitDoneSpec = struct {
     code: i32,
 };
 
+/// Completion payload for one `CmdHandle:lines()` iteration. The
+/// CmdHandle helper thread either pulled a newline-terminated segment
+/// out of the child's stdout or observed EOF. `pushJobResultOntoStack`
+/// is responsible for freeing `line` (if non-null) after `pushString`
+/// has copied the bytes into Lua.
+pub const CmdReadLineDoneSpec = struct {
+    /// Next line from stdout (without the trailing '\n'). Heap-
+    /// allocated on the engine allocator; ownership transfers to
+    /// `pushJobResultOntoStack`. `null` means EOF — the iterator
+    /// Lua-side returns nil and the `for` loop ends.
+    line: ?[]const u8,
+};
+
 /// What the worker should do with this job. The scheduler fills this in
 /// before submit.
 pub const JobKind = union(enum) {
@@ -72,6 +85,10 @@ pub const JobKind = union(enum) {
     /// Tells the main thread to resume the coroutine waiting in
     /// `CmdHandle:wait()` with the captured exit code.
     cmd_wait_done: CmdWaitDoneSpec,
+    /// Posted by a CmdHandle helper thread for each `:lines()`
+    /// iteration. Resumes the coroutine with the next line or nil at
+    /// EOF. Not submitted to the pool.
+    cmd_read_line_done: CmdReadLineDoneSpec,
     // http/fs land in later phases
 };
 

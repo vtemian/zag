@@ -42,6 +42,12 @@ pub const HelperCmd = union(enum) {
     /// owns the `Child`) so that the kill cannot race against the
     /// kernel recycling the PID after `child.wait()` returns.
     kill: struct { signo: u8 },
+    /// Read the next line from the child's stdout. Helper blocks in
+    /// `child.stdout.?.read` (filling `stdout_buf`) until a newline
+    /// appears in the buffer or the pipe hits EOF, then posts a
+    /// `.cmd_read_line_done` job addressed to `thread_ref`. Drives
+    /// `CmdHandle:lines()`.
+    read_line: struct { thread_ref: i32 },
     /// Shut the helper down. Sent by `shutdownAndCleanup`. Helper
     /// breaks out of its loop; main joins the thread.
     shutdown,
@@ -100,6 +106,15 @@ pub const CmdHandle = struct {
     /// (matching `cmd.zig` convention: `-N` = terminated by signal N).
     exit_code: ?i32 = null,
 
+    /// Line-buffered bytes read from `child.stdout` by the helper
+    /// thread but not yet handed to Lua. Owned by the helper thread
+    /// (no locking — only `runReadLine` mutates it, and only one read
+    /// is in flight at a time because the helper serialises commands).
+    stdout_buf: std.ArrayList(u8) = .empty,
+    /// Set once `child.stdout.read` returned 0 (EOF). Sticky — once
+    /// true, subsequent `:lines()` iterations return nil.
+    stdout_eof: bool = false,
+
     pub const METATABLE_NAME = "zag.CmdHandle";
 
     /// Parsed subset of `zag.cmd.spawn` opts. For 6.4a we handle only
@@ -109,6 +124,17 @@ pub const CmdHandle = struct {
         cwd: ?[]const u8 = null,
         env_mode: job_mod.CmdExecEnvMode = .inherit,
         env_map: ?std.process.EnvMap = null,
+        /// When true, stdout is a pipe and `:lines()` reads from it.
+        /// When false (default), stdout is routed to `/dev/null` and
+        /// `:lines()` surfaces `io_error: stdout not captured`. Keeping
+        /// the default at `.Ignore` means children that never get read
+        /// can't stall on a full pipe buffer.
+        capture_stdout: bool = false,
+        /// Symmetric to `capture_stdout`. Reserved for a future
+        /// `:stderr_lines()` / merged-stream opt; for 6.4b the helper
+        /// thread doesn't drain stderr, so enabling this on a chatty
+        /// child will eventually block the child's stderr writes.
+        capture_stderr: bool = false,
     };
 
     /// Spawn a child and start the helper thread. On success the
@@ -136,14 +162,16 @@ pub const CmdHandle = struct {
             .child = std.process.Child.init(argv, alloc),
             .helper = undefined,
         };
-        // Route stdio to /dev/null by default for 6.4a. `.Close` would
-        // hand EBADF to any child that writes a startup banner (see
+        // Route stdio to /dev/null by default. `.Close` would hand
+        // EBADF to any child that writes a startup banner (see
         // /bin/echo, which exits non-zero when stdout is closed);
         // `.Inherit` would spam the host process's terminal during
-        // tests. `:lines` and `:write` in 6.4b/6.4c opt into `.Pipe`.
+        // tests. `capture_stdout`/`capture_stderr` in `opts` opt into
+        // `.Pipe` for `:lines()` / a future `:stderr_lines()`; `:write`
+        // in 6.4c will add `capture_stdin`.
         self.child.stdin_behavior = .Ignore;
-        self.child.stdout_behavior = .Ignore;
-        self.child.stderr_behavior = .Ignore;
+        self.child.stdout_behavior = if (opts.capture_stdout) .Pipe else .Ignore;
+        self.child.stderr_behavior = if (opts.capture_stderr) .Pipe else .Ignore;
         if (opts.cwd) |c| self.child.cwd = c;
 
         switch (opts.env_mode) {
@@ -200,6 +228,7 @@ pub const CmdHandle = struct {
                 .shutdown => return,
                 .wait => |w| self.runWait(w.thread_ref),
                 .kill => |k| self.runKill(k.signo),
+                .read_line => |rl| self.runReadLine(rl.thread_ref),
             }
         }
     }
@@ -213,6 +242,152 @@ pub const CmdHandle = struct {
         std.posix.kill(self.child.id, signo) catch |err| {
             log.debug("cmd:kill helper kill failed: {s}", .{@errorName(err)});
         };
+    }
+
+    /// Helper-side implementation of `:lines()` — pull one line out of
+    /// the child's stdout. Either drains `stdout_buf` (populated by a
+    /// previous read that picked up more than one line at a time) or
+    /// blocks in `child.stdout.?.read` until a newline appears or the
+    /// pipe hits EOF. Posts a `.cmd_read_line_done` job with the line
+    /// (or nil at EOF) so the main thread can resume the coroutine.
+    ///
+    /// If the caller spawned without `capture_stdout = true`, the
+    /// child has no stdout pipe; surface an `io_error` instead of
+    /// silently returning nil so the mistake is visible.
+    fn runReadLine(self: *CmdHandle, thread_ref: i32) void {
+        const stdout = self.child.stdout orelse {
+            self.postReadLineDoneErr(thread_ref, "stdout not captured");
+            return;
+        };
+
+        // Fast path: a previous read already buffered a complete line.
+        if (self.popLineFromBuf()) |line| {
+            self.postReadLineDone(thread_ref, line);
+            return;
+        }
+        // Or we already saw EOF and there's nothing left buffered.
+        if (self.stdout_eof) {
+            self.postReadLineDone(thread_ref, null);
+            return;
+        }
+
+        // Pull bytes until a newline lands in the buffer or the pipe
+        // drains. `std.fs.File.read` blocks; that's fine because the
+        // helper thread exists precisely to absorb that block.
+        while (true) {
+            var chunk: [4096]u8 = undefined;
+            const n = stdout.read(&chunk) catch |err| {
+                log.warn("read_line: stdout read failed: {s}", .{@errorName(err)});
+                self.stdout_eof = true;
+                self.postReadLineDone(thread_ref, null);
+                return;
+            };
+            if (n == 0) {
+                self.stdout_eof = true;
+                // A trailing partial line (bytes after the last '\n'
+                // with no terminating newline before EOF) should be
+                // returned as the final line rather than silently
+                // dropped — callers iterating `for line in h:lines()`
+                // expect to see every byte the child wrote.
+                if (self.popLineFromBuf()) |line| {
+                    self.postReadLineDone(thread_ref, line);
+                } else if (self.stdout_buf.items.len > 0) {
+                    const line = self.alloc.dupe(u8, self.stdout_buf.items) catch {
+                        self.postReadLineDoneErr(thread_ref, "oom");
+                        return;
+                    };
+                    self.stdout_buf.clearRetainingCapacity();
+                    self.postReadLineDone(thread_ref, line);
+                } else {
+                    self.postReadLineDone(thread_ref, null);
+                }
+                return;
+            }
+            self.stdout_buf.appendSlice(self.alloc, chunk[0..n]) catch {
+                self.postReadLineDoneErr(thread_ref, "oom");
+                return;
+            };
+            if (self.popLineFromBuf()) |line| {
+                self.postReadLineDone(thread_ref, line);
+                return;
+            }
+        }
+    }
+
+    /// Extract the first newline-terminated line from `stdout_buf` (if
+    /// any) as a heap-duplicated slice the consumer must free. Shifts
+    /// the buffer to drop the line + its trailing '\n'. Returns null
+    /// when no complete line is buffered.
+    fn popLineFromBuf(self: *CmdHandle) ?[]const u8 {
+        const nl = std.mem.indexOfScalar(u8, self.stdout_buf.items, '\n') orelse return null;
+        const line = self.alloc.dupe(u8, self.stdout_buf.items[0..nl]) catch return null;
+        const remaining = self.stdout_buf.items[nl + 1 ..];
+        std.mem.copyForwards(u8, self.stdout_buf.items, remaining);
+        self.stdout_buf.shrinkRetainingCapacity(remaining.len);
+        return line;
+    }
+
+    /// Post the read-line completion back to main. `line == null`
+    /// encodes EOF; `line != null` transfers ownership of the
+    /// heap-allocated slice to `pushJobResultOntoStack`, which frees
+    /// it after `pushString` copies the bytes into Lua.
+    ///
+    /// `thread_ref == 0` is not expected on the read path today (only
+    /// the GC-forced reap uses 0, and it submits wait/shutdown, never
+    /// read_line) but we still free the slice so a mistaken zero
+    /// doesn't leak.
+    fn postReadLineDone(self: *CmdHandle, thread_ref: i32, line: ?[]const u8) void {
+        if (thread_ref == 0) {
+            if (line) |l| self.alloc.free(l);
+            return;
+        }
+        const job = self.alloc.create(Job) catch |err| {
+            log.err("cmd_read_line_done job alloc failed: {s}", .{@errorName(err)});
+            if (line) |l| self.alloc.free(l);
+            return;
+        };
+        job.* = .{
+            .kind = .{ .cmd_read_line_done = .{ .line = line } },
+            .thread_ref = thread_ref,
+            .scope = self.root_scope,
+        };
+        while (true) {
+            self.completions.push(job) catch |err| switch (err) {
+                error.QueueFull => {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+
+    /// Post a failure variant of the read-line completion. Uses
+    /// `ErrTag.io_error` with a human-readable detail so the coroutine
+    /// receives `(nil, "io_error: <msg>")` when the pipe is missing or
+    /// the helper allocator is exhausted.
+    fn postReadLineDoneErr(self: *CmdHandle, thread_ref: i32, err_msg: []const u8) void {
+        if (thread_ref == 0) return;
+        const job = self.alloc.create(Job) catch |err| {
+            log.err("cmd_read_line_done err job alloc failed: {s}", .{@errorName(err)});
+            return;
+        };
+        job.* = .{
+            .kind = .{ .cmd_read_line_done = .{ .line = null } },
+            .thread_ref = thread_ref,
+            .scope = self.root_scope,
+            .err_tag = .io_error,
+            .err_detail = self.alloc.dupe(u8, err_msg) catch null,
+        };
+        while (true) {
+            self.completions.push(job) catch |err| switch (err) {
+                error.QueueFull => {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+            };
+            return;
+        }
     }
 
     /// Helper-side implementation of `:wait`. Blocks on `child.wait()`,
@@ -327,6 +502,7 @@ pub const CmdHandle = struct {
         // coroutine is suspended waiting for this handle.
 
         self.queue.deinit(self.alloc);
+        self.stdout_buf.deinit(self.alloc);
         self.arena.deinit();
         self.alloc.destroy(self.arena);
         self.alloc.destroy(self);

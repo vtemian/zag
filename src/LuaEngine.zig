@@ -707,6 +707,16 @@ pub const LuaEngine = struct {
             }
             co.pop(1);
 
+            // capture_stdout / capture_stderr toggle `.Pipe` vs
+            // `.Ignore`. Accept any truthy Lua value; default (false)
+            // keeps stdio routed to /dev/null.
+            _ = co.getField(opts_idx, "capture_stdout");
+            opts.capture_stdout = co.toBoolean(-1);
+            co.pop(1);
+            _ = co.getField(opts_idx, "capture_stderr");
+            opts.capture_stderr = co.toBoolean(-1);
+            co.pop(1);
+
             // env vs env_extra. Same rules as zag.cmd: mutually
             // exclusive; env replaces, env_extra overlays on top of
             // the inherited environment.
@@ -817,6 +827,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "wait");
         lua.pushFunction(zlua.wrap(cmdHandleKill));
         lua.setField(-2, "kill");
+        lua.pushFunction(zlua.wrap(cmdHandleLines));
+        lua.setField(-2, "lines");
         // __index = self so `h:wait()` dispatches to wait(h).
         lua.pushValue(-1);
         lua.setField(-2, "__index");
@@ -945,6 +957,88 @@ pub const LuaEngine = struct {
             log.debug("cmd:kill submit failed: {s}", .{@errorName(err)});
         };
         return 0;
+    }
+
+    /// `CmdHandle:lines()` — returns a Lua iterator function. Used in
+    /// a generic `for` loop:
+    ///
+    ///     for line in h:lines() do print(line) end
+    ///
+    /// Each iteration yields the calling coroutine until the helper
+    /// thread has a full newline-terminated segment from the child's
+    /// stdout (or hits EOF). Yields nil at EOF, which ends the `for`.
+    ///
+    /// Requires `capture_stdout = true` at spawn time; otherwise
+    /// iterator invocations fail with `io_error: stdout not captured`.
+    ///
+    /// v1 limitation: the helper thread blocks in `read()` while a
+    /// line is pending, so `:wait`/`:kill` commands queued during a
+    /// pending `:lines` iteration won't be serviced until that read
+    /// returns. Use scope cancellation (which SIGKILLs the child and
+    /// drops the pipe → EOF) to interrupt a stuck iterator.
+    ///
+    /// v1 limitation: a single handle's line buffer is shared across
+    /// all `:lines()` iterators — calling `:lines()` twice and
+    /// interleaving reads will split lines across iterators. Treat
+    /// `:lines()` as "one consumer per handle".
+    fn cmdHandleLines(co: *Lua) i32 {
+        // Validate the handle up front so misuse (calling on a dead
+        // handle) errors here rather than at first iteration.
+        const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        _ = ud.ptr orelse {
+            co.raiseErrorStr("cmd:lines: invalid handle", .{});
+        };
+
+        // Build a closure that captures the handle userdata as its
+        // single upvalue. The `for` loop in Lua calls this closure
+        // repeatedly with no arguments — it recovers the handle from
+        // the upvalue on each call.
+        co.pushValue(1);
+        co.pushClosure(zlua.wrap(cmdHandleLinesIter), 1);
+        return 1;
+    }
+
+    /// Iterator closure produced by `cmdHandleLines`. Recovers the
+    /// handle from upvalue(1), submits a `.read_line` helper command,
+    /// and yields the caller. The corresponding `.cmd_read_line_done`
+    /// job resumes the coroutine with either the line string or nil
+    /// (EOF), which is what Lua's generic-for expects.
+    fn cmdHandleLinesIter(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+
+        // Retrieve the handle userdata from upvalue slot 1. zlua maps
+        // `lua_upvalueindex(i)` through `Lua.upvalueIndex(i)`; we use
+        // the returned pseudo-index with `checkUserdata` to validate
+        // the metatable.
+        const ud = co.checkUserdata(CmdHandleUd, Lua.upvalueIndex(1), CmdHandleUd.METATABLE_NAME);
+        const h = ud.ptr orelse {
+            co.raiseErrorStr("cmd:lines: invalid handle", .{});
+        };
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("cmd:lines iterator must be called inside a coroutine", .{});
+        }
+
+        // Fast path: EOF already observed with nothing buffered. Lua's
+        // generic-for ends as soon as we return nil, so callers who
+        // finish iterating then call once more (e.g. in a retry loop)
+        // don't pay a helper round-trip.
+        if (h.stdout_eof and h.stdout_buf.items.len == 0) {
+            co.pushNil();
+            return 1;
+        }
+
+        const task = engine.taskForCoroutine(co) orelse {
+            co.raiseErrorStr("cmd:lines: no task for this coroutine", .{});
+        };
+
+        h.submit(.{ .read_line = .{ .thread_ref = task.thread_ref } }) catch {
+            co.pushNil();
+            _ = co.pushString("io_error: cmd:lines submit failed");
+            return 2;
+        };
+
+        co.yield(0);
     }
 
     /// `__gc` metamethod — Lua calls this when the userdata becomes
@@ -1971,6 +2065,12 @@ pub const LuaEngine = struct {
     pub fn resumeFromJob(self: *LuaEngine, job: *async_job.Job) !void {
         const task = self.tasks.get(job.thread_ref) orelse {
             if (job.err_detail) |d| self.allocator.free(d);
+            // Free owned payload slices that would otherwise leak when
+            // the task vanished before we could push them onto Lua.
+            switch (job.kind) {
+                .cmd_read_line_done => |r| if (r.line) |l| self.allocator.free(l),
+                else => {},
+            }
             self.allocator.destroy(job);
             return;
         };
@@ -2061,6 +2161,22 @@ pub const LuaEngine = struct {
                 // already reaped by the helper thread; nothing else to
                 // clean up here.
                 co.pushInteger(w.code);
+                co.pushNil();
+                return 2;
+            },
+            .cmd_read_line_done => |r| {
+                // CmdHandle:lines() iterator resumes with (line, nil)
+                // on success and (nil, nil) at EOF — `for line in
+                // h:lines()` reads the first return value and stops on
+                // nil. An err_tag would have been handled above via
+                // the generic `(nil, "io_error: ...")` path.
+                if (r.line) |l| {
+                    _ = co.pushString(l);
+                    self.allocator.free(l);
+                    co.pushNil();
+                    return 2;
+                }
+                co.pushNil();
                 co.pushNil();
                 return 2;
             },
@@ -3573,4 +3689,54 @@ test "zag.cmd.spawn GC without :wait reaps child cleanly" {
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
     // Reaching here without testing.allocator reporting leaks means
     // the SIGKILL + helper-reap + join path closed every resource.
+}
+
+test "zag.cmd.spawn :lines yields lines then nil at EOF" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_lines()
+        \\  local h = zag.cmd.spawn({ "/bin/sh", "-c", "echo a; echo b; echo c" },
+        \\                         { capture_stdout = true })
+        \\  local lines = {}
+        \\  for line in h:lines() do
+        \\    table.insert(lines, line)
+        \\  end
+        \\  _lines_count = #lines
+        \\  _lines_1 = lines[1]
+        \\  _lines_2 = lines[2]
+        \\  _lines_3 = lines[3]
+        \\  h:wait()
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_lines");
+    _ = try eng.spawnCoroutine(0, null);
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_lines_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_lines_1");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "a"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_lines_2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "b"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_lines_3");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "c"));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
 }
