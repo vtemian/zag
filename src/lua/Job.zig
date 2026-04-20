@@ -80,6 +80,54 @@ pub const CmdWriteDoneSpec = struct {
 /// helper is done closing the pipe so Lua can resume.
 pub const CmdCloseStdinDoneSpec = struct {};
 
+/// A single HTTP request/response header. Ownership depends on the
+/// direction: request headers (in `HttpGetSpec.headers`) are borrowed
+/// from the Lua binding's arena; response headers (in `HttpResult`) are
+/// heap-allocated on the engine allocator and freed by
+/// `pushJobResultOntoStack` after being copied into Lua.
+pub const HttpHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Argv/headers/timeout payload for an `http_get` job. The worker never
+/// mutates these fields; they're pinned by the caller's arena until
+/// `resumeFromJob` fires.
+pub const HttpGetSpec = struct {
+    /// Fully-qualified URL (http:// or https://). Borrowed from the
+    /// caller's arena.
+    url: []const u8,
+    /// Extra request headers. Slice + each header's name/value are
+    /// borrowed from the caller's arena.
+    headers: []const HttpHeader = &.{},
+    /// Wall-clock deadline in milliseconds. 0 disables the timeout.
+    /// Note: Zig 0.15 `std.http.Client` exposes no clean cancel
+    /// primitive, so today this is best-effort — the worker honours it
+    /// at scope.cancel checkpoints, but a request blocked in TCP
+    /// recv will not be interrupted until the socket-close aborter
+    /// gains teeth in Task 7.5.
+    timeout_ms: u64 = 30_000,
+    /// Follow 3xx redirects. When true, std.http.Client handles up to
+    /// three hops transparently.
+    follow_redirects: bool = true,
+};
+
+/// Success payload for an `http_get` job. `body` and the backing slice
+/// of `headers` (plus each header's name/value) are heap-allocated on
+/// the engine allocator and must be freed by `pushJobResultOntoStack`
+/// after being copied into Lua.
+pub const HttpResult = struct {
+    /// HTTP status code (e.g. 200, 404).
+    status: u16,
+    /// Response headers, lowercase-keyed. In v1 this is always empty —
+    /// Zig 0.15 `std.http.Client.fetch` does not expose response
+    /// headers in a convenient form. Task 7.2's Lua binding pushes an
+    /// empty table for now.
+    headers: []const HttpHeader,
+    /// Response body bytes.
+    body: []const u8,
+};
+
 /// Completion payload for one `CmdHandle:lines()` iteration. The
 /// CmdHandle helper thread either pulled a newline-terminated segment
 /// out of the child's stdout or observed EOF. `pushJobResultOntoStack`
@@ -113,7 +161,9 @@ pub const JobKind = union(enum) {
     /// Posted by a CmdHandle helper thread after `:close_stdin()`.
     /// Resumes the coroutine with `(true, nil)`. Not pool-submitted.
     cmd_close_stdin_done: CmdCloseStdinDoneSpec,
-    // http/fs land in later phases
+    /// One-shot HTTP GET. Worker lives in `primitives/http.zig`.
+    http_get: HttpGetSpec,
+    // fs lands in a later phase
 };
 
 /// Success payload handed back to the coroutine on resume. `.empty` means
@@ -121,6 +171,7 @@ pub const JobKind = union(enum) {
 pub const JobResult = union(enum) {
     empty,
     cmd_exec: CmdExecResult,
+    http: HttpResult,
 };
 
 /// Stable string tag surfaced to Lua on failure. The strings are part of

@@ -2358,6 +2358,36 @@ pub const LuaEngine = struct {
                 co.pushNil();
                 return 2;
             },
+            .http_get => {
+                // Placeholder — Task 7.2 replaces this with the real
+                // zag.http.get binding that pushes a response table.
+                // For now, free the worker-owned body/headers and
+                // surface a clear "not wired" error so a caller who
+                // somehow submits http_get today sees a predictable
+                // failure instead of a silent leak.
+                const r = blk: {
+                    if (job.result) |res| switch (res) {
+                        .http => |hr| break :blk hr,
+                        else => {},
+                    };
+                    co.pushNil();
+                    _ = co.pushString("io_error: http_get missing result");
+                    return 2;
+                };
+                self.allocator.free(r.body);
+                for (r.headers) |h| {
+                    self.allocator.free(h.name);
+                    self.allocator.free(h.value);
+                }
+                // In v1 the worker always returns an empty headers
+                // slice (see primitives/http.zig). Guard the free so
+                // a `&.{}` with undefined pointer doesn't reach the
+                // allocator.
+                if (r.headers.len > 0) self.allocator.free(r.headers);
+                co.pushNil();
+                _ = co.pushString("io_error: zag.http.get Lua binding not yet wired");
+                return 2;
+            },
         }
     }
 
