@@ -38,8 +38,6 @@ layout_dirty: bool = true,
 
 /// Global UI state passed to the compositor each frame.
 pub const InputState = struct {
-    /// Current FPS (shown when metrics enabled).
-    fps: u32,
     /// Current editing mode; rendered as the `[INSERT]`/`[NORMAL]`
     /// label in the bottom status row.
     mode: Keymap.Mode,
@@ -90,7 +88,7 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
     {
         var s = trace.span("status_line");
         defer s.end();
-        self.drawStatusLine(focused, input.mode, input.fps);
+        self.drawStatusLine(focused, input.mode);
     }
 
     // Per-pane prompts: repainted every frame because drafts change on
@@ -476,7 +474,7 @@ fn fitName(dest: []u8, name: []const u8, max: u16) []const u8 {
 }
 
 /// Draw the status line on the last row using the theme status_line highlight.
-fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Keymap.Mode, fps: u32) void {
+fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Keymap.Mode) void {
     const last_row = self.screen.height - 1;
     const resolved = Theme.resolve(self.theme.highlights.status_line, self.theme);
 
@@ -521,18 +519,19 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
         }
     }
 
-    // When metrics are enabled, show the last frame time (and fps if set)
-    // right-aligned on the status row.
+    // When metrics are enabled, show frame time, live/peak heap, and
+    // allocs/frame right-aligned on the status row.
     if (trace.enabled) {
-        const frame_us = trace.getLastFrameTimeUs();
-        const frame_ms = @as(f64, @floatFromInt(frame_us)) / 1000.0;
-        var scratch: [32]u8 = undefined;
-        const time_label = if (fps > 0)
-            std.fmt.bufPrint(&scratch, "{d:.1}ms {d}fps", .{ frame_ms, fps }) catch return
-        else
-            std.fmt.bufPrint(&scratch, "{d:.1}ms", .{frame_ms}) catch return;
-        const time_col = self.screen.width -| @as(u16, @intCast(time_label.len)) -| 1;
-        _ = self.screen.writeStr(last_row, time_col, time_label, resolved.screen_style, resolved.fg);
+        const stats = trace.getFrameAllocStats();
+        const frame_ms = @as(f64, @floatFromInt(stats.frame_us)) / 1000.0;
+        const live_kb = @as(f64, @floatFromInt(stats.live_bytes)) / 1024.0;
+        const peak_kb = @as(f64, @floatFromInt(stats.peak_bytes)) / 1024.0;
+        var scratch: [80]u8 = undefined;
+        const label = std.fmt.bufPrint(&scratch, "{d:.1}ms {d:.0}K/{d:.0}K {d}a", .{
+            frame_ms, live_kb, peak_kb, stats.allocs,
+        }) catch return;
+        const label_col = self.screen.width -| @as(u16, @intCast(label.len)) -| 1;
+        _ = self.screen.writeStr(last_row, label_col, label, resolved.screen_style, resolved.fg);
     }
 }
 
@@ -573,7 +572,7 @@ test "composite with empty layout does not crash" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 }
 
 test "composite writes buffer content at leaf rect with padding" {
@@ -599,7 +598,7 @@ test "composite writes buffer content at leaf rect with padding" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     // Frame shifts content by +1 row / +1 col; content row is 1, content col is 1 + pad_h.
@@ -630,7 +629,7 @@ test "composite draws status line on last row" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // Last row is now the sole status line: `[INSERT] mybuf | 40x9`
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
@@ -673,7 +672,7 @@ test "composite skips clean buffer leaves" {
     layout.recalculate(40, 10);
 
     // First composite: buffer is dirty, content should appear
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
@@ -682,7 +681,7 @@ test "composite skips clean buffer leaves" {
     screen.getCell(1, 1 + pad_h + 2).codepoint = 'Z';
 
     // Second composite: buffer is clean (clearDirty was called), so leaf is skipped.
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // The 'Z' survives because the clean leaf was not redrawn.
     try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
@@ -711,7 +710,7 @@ test "drawStatusLine paints the mode indicator at column 0" {
     layout.recalculate(40, 10);
 
     const focused = layout.focused orelse layout.root.?;
-    compositor.drawStatusLine(focused, .normal, 0);
+    compositor.drawStatusLine(focused, .normal);
 
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(9, 1).codepoint);
@@ -735,7 +734,7 @@ test "status row in normal mode shows mode label and buffer name only" {
     try layout.setRoot(cb.buf());
     layout.recalculate(80, 10);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .normal });
+    compositor.composite(&layout, .{ .mode = .normal });
 
     const last_row = screen.height - 1;
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
@@ -765,7 +764,7 @@ test "composite draws rounded frame around a single pane" {
     try layout.setRoot(cb.buf());
     layout.recalculate(20, 6);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // Corners at pane bounds (screen height 6 reserves row 5 for status,
     // so the pane rect is 20x5 - bottom edge lives on row 4).
@@ -805,7 +804,7 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
     // can check the focused/unfocused contrast on the left/right pair.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     const focused = Theme.resolve(theme.highlights.border_focused, &theme);
     const plain = Theme.resolve(theme.highlights.border, &theme);
@@ -843,7 +842,7 @@ test "focused pane title has inverse style, unfocused is plain" {
     // Focus followed the split; refocus left so `a` is the focused pane.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // Find the `a` name glyph in the focused pane's top edge (cols 0..19).
     var found_focused_a = false;
@@ -889,7 +888,7 @@ test "title is suppressed when pane width is below 6" {
     try layout.setRoot(cb.buf());
     layout.recalculate(5, 6);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // No cell on the top row should carry a name character.
     var saw_name_char = false;
@@ -925,7 +924,7 @@ test "long titles are truncated with ellipsis" {
     try layout.setRoot(cb.buf());
     layout.recalculate(12, 6);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     var saw_ellipsis = false;
     for (0..12) |c| {
@@ -957,7 +956,7 @@ test "focused pane renders its draft with a block cursor at end" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 8);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // Pane is 40x7 (8 rows minus 1 for global status row).
     // Prompt row = rect.y + rect.height - 2 = 5.
@@ -996,14 +995,14 @@ test "cursor bg does not bleed across keystrokes" {
 
     // Frame 1: user types "hi". Cursor lands at col 6 with accent bg.
     for ("hi") |ch| cb.appendToDraft(ch);
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 
     // Frame 2: user types one more char. New cursor at col 7. The cell
     // at col 6 now holds the glyph `s` (from "his") and MUST have
     // default bg - no accent smear.
     cb.appendToDraft('s');
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
     try std.testing.expectEqual(@as(u21, 's'), screen.getCellConst(5, 6).codepoint);
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
     // New cursor at col 7 picks up the accent.
@@ -1012,7 +1011,7 @@ test "cursor bg does not bleed across keystrokes" {
     // Frame 3: delete back to "hi". Col 7's old cursor cell must also
     // reset to default bg - nothing trailing off the right of the draft.
     cb.deleteBackFromDraft();
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 7).bg, Screen.Color.default));
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 }
@@ -1044,7 +1043,7 @@ test "unfocused pane shows its draft without a cursor block" {
     // pane (cb2) is the unfocused one whose prompt row we inspect below.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     // Right pane rect is (x=20, width=20). Prompt row = 5. Content col = 20+1+1 = 22.
     try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(5, 22).codepoint);
@@ -1080,7 +1079,7 @@ test "normal mode does not paint a block cursor in the focused pane" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 8);
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .normal });
+    compositor.composite(&layout, .{ .mode = .normal });
 
     // Prompt row = 5. Draft shows but no cursor block.
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(5, 4).codepoint);
@@ -1116,7 +1115,7 @@ test "tiny pane (height 3) skips the prompt reservation" {
     // Pane rect = 20x3 (4 rows - 1 for status). Too small for a prompt row,
     // so the composite must not crash and must not draw a prompt glyph.
 
-    compositor.composite(&layout, .{ .fps = 0, .mode = .insert });
+    compositor.composite(&layout, .{ .mode = .insert });
 
     var saw_prompt = false;
     for (0..screen.height) |r| for (0..screen.width) |c| {

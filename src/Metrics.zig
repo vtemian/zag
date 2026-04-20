@@ -176,6 +176,27 @@ pub inline fn getLastFrameTimeUs() u64 {
     return last_frame_dur_us;
 }
 
+/// Snapshot of allocation metrics for the status bar.
+pub const FrameAllocStats = struct {
+    frame_us: u64,
+    live_bytes: u64,
+    peak_bytes: u64,
+    allocs: u32,
+};
+
+/// Return the current allocation metrics for display. All zeroes when
+/// metrics are disabled or no counting allocator is wired.
+pub inline fn getFrameAllocStats() FrameAllocStats {
+    if (!enabled) return .{ .frame_us = 0, .live_bytes = 0, .peak_bytes = 0, .allocs = 0 };
+    const c = counting_state orelse return .{ .frame_us = last_frame_dur_us, .live_bytes = 0, .peak_bytes = 0, .allocs = 0 };
+    return .{
+        .frame_us = last_frame_dur_us,
+        .live_bytes = c.current_bytes,
+        .peak_bytes = c.peak_bytes,
+        .allocs = c.alloc_count,
+    };
+}
+
 /// Aggregate statistics computed from the ring buffer on demand.
 pub const Stats = struct {
     /// Number of frame spans in the sample.
