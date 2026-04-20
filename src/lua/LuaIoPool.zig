@@ -127,6 +127,7 @@ fn executeJob(alloc: Allocator, job: *Job) void {
         },
         .cmd_exec => @import("primitives/cmd.zig").executeExec(alloc, job),
         .http_get => @import("primitives/http.zig").executeHttpGet(alloc, job),
+        .http_post => @import("primitives/http.zig").executeHttpPost(alloc, job),
         // CmdHandle helper threads synthesise these kinds directly
         // onto the completion queue; the pool never dispatches them.
         // Seeing one here is a programmer bug.

@@ -49,16 +49,63 @@ pub const AbortCtx = struct {
 /// set. Never both. Never neither.
 pub fn executeHttpGet(alloc: Allocator, job: *Job) void {
     const spec = job.kind.http_get;
+    executeHttpImpl(alloc, job, .{
+        .method = .GET,
+        .url = spec.url,
+        .headers = spec.headers,
+        .body = null,
+        .content_type = "",
+        .follow_redirects = spec.follow_redirects,
+    });
+}
 
+/// Execute an `http_post` job. Same pre/post-request lifecycle as
+/// `executeHttpGet`; the only differences are method `.POST`, a
+/// request body forwarded via `std.http.Client.fetch.payload`, and an
+/// optional injected `Content-Type` header.
+pub fn executeHttpPost(alloc: Allocator, job: *Job) void {
+    const spec = job.kind.http_post;
+    executeHttpImpl(alloc, job, .{
+        .method = .POST,
+        .url = spec.url,
+        .headers = spec.headers,
+        .body = spec.body,
+        .content_type = spec.content_type,
+        .follow_redirects = spec.follow_redirects,
+    });
+}
+
+/// Per-call view over `HttpGetSpec` / `HttpPostSpec`. Stays private to
+/// this file; kept to a handful of fields so the shared worker below
+/// doesn't have to reach into a specific JobKind variant.
+const HttpImplArgs = struct {
+    method: std.http.Method,
+    url: []const u8,
+    headers: []const job_mod.HttpHeader,
+    /// `null` means no request body (GET). An empty slice means
+    /// "POST with zero-length body" and still goes through the payload
+    /// path, so std.http writes a `Content-Length: 0` header.
+    body: ?[]const u8,
+    /// Injected `Content-Type` value when non-empty AND the caller did
+    /// not already set one in `headers`. Empty string disables
+    /// injection entirely (caller is explicit about content-type).
+    content_type: []const u8,
+    follow_redirects: bool,
+};
+
+/// Shared worker body. Responsible for scope.registerJob + aborter +
+/// `std.http.Client.fetch` + post-fetch cancel re-check. GET and POST
+/// differ only in the HttpImplArgs they pass in.
+fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
     // Pre-request cancel check: no point dialing if we're already gone.
     if (job.scope.isCancelled()) {
         job.err_tag = .cancelled;
         return;
     }
 
-    const uri = std.Uri.parse(spec.url) catch {
+    const uri = std.Uri.parse(args.url) catch {
         job.err_tag = .invalid_uri;
-        job.err_detail = alloc.dupe(u8, spec.url) catch null;
+        job.err_detail = alloc.dupe(u8, args.url) catch null;
         return;
     };
 
@@ -90,16 +137,27 @@ pub fn executeHttpGet(alloc: Allocator, job: *Job) void {
 
     // Convert spec headers to std.http.Header. Slice is freed on
     // return; the name/value bytes are borrowed from the caller's
-    // arena and stay live.
+    // arena and stay live. Reserve +1 slot in case we inject a
+    // Content-Type.
     var std_headers: std.ArrayList(std.http.Header) = .empty;
     defer std_headers.deinit(alloc);
-    std_headers.ensureTotalCapacity(alloc, spec.headers.len) catch {
+    std_headers.ensureTotalCapacity(alloc, args.headers.len + 1) catch {
         job.err_tag = .io_error;
         job.err_detail = alloc.dupe(u8, "header alloc failed") catch null;
         return;
     };
-    for (spec.headers) |h| {
+    var caller_set_content_type = false;
+    for (args.headers) |h| {
         std_headers.appendAssumeCapacity(.{ .name = h.name, .value = h.value });
+        if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+            caller_set_content_type = true;
+        }
+    }
+    if (args.body != null and args.content_type.len > 0 and !caller_set_content_type) {
+        std_headers.appendAssumeCapacity(.{
+            .name = "Content-Type",
+            .value = args.content_type,
+        });
     }
 
     // Accumulate body into an engine-owned slice. Mirrors
@@ -108,17 +166,18 @@ pub fn executeHttpGet(alloc: Allocator, job: *Job) void {
     // Every early-exit path below does its own explicit `out.deinit()`.
     var out: std.io.Writer.Allocating = .init(alloc);
 
-    const redirect: std.http.Client.Request.RedirectBehavior = if (spec.follow_redirects)
+    const redirect: std.http.Client.Request.RedirectBehavior = if (args.follow_redirects)
         @enumFromInt(3)
     else
         .unhandled;
 
     const fetch_result = client.fetch(.{
         .location = .{ .uri = uri },
-        .method = .GET,
+        .method = args.method,
         .extra_headers = std_headers.items,
         .redirect_behavior = redirect,
         .response_writer = &out.writer,
+        .payload = args.body,
     }) catch |err| {
         out.deinit();
         // If scope was cancelled during the request, surface that
