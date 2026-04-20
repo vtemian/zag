@@ -963,7 +963,7 @@ pub const LuaEngine = struct {
 
     /// Hook for agent threads to bind this engine as their active Lua context.
     /// Currently a no-op: Lua tool execution round-trips through the main thread
-    /// via `AgentThread.lua_request_queue`, so no per-thread engine pointer is
+    /// via `tools.lua_request_queue`, so no per-thread engine pointer is
     /// needed. Kept as an extension point for future per-thread Lua states.
     pub fn activate(self: *LuaEngine) void {
         _ = self;
@@ -1376,7 +1376,7 @@ test "fireHook invokes Lua callback for matching event" {
 }
 
 test "end-to-end: config file to registry execution" {
-    const AgentThread = @import("AgentThread.zig");
+    const agent_events = @import("agent_events.zig");
     const AgentRunner = @import("AgentRunner.zig");
 
     var engine = try LuaEngine.init(std.testing.allocator);
@@ -1418,12 +1418,12 @@ test "end-to-end: config file to registry execution" {
     // Lua tools now round-trip via the event queue; spawn a pump thread
     // that services `lua_tool_request` events off the queue and dispatches
     // them through dispatchHookRequests, which is the production path.
-    var queue = try AgentThread.EventQueue.initBounded(std.testing.allocator, 16);
+    var queue = try agent_events.EventQueue.initBounded(std.testing.allocator, 16);
     defer queue.deinit();
 
     var stop = std.atomic.Value(bool).init(false);
     const pump_thread = try std.Thread.spawn(.{}, struct {
-        fn pump(q: *AgentThread.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng);
                 std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -1437,8 +1437,8 @@ test "end-to-end: config file to registry execution" {
         pump_thread.join();
     }
 
-    AgentThread.lua_request_queue = &queue;
-    defer AgentThread.lua_request_queue = null;
+    tools_mod.lua_request_queue = &queue;
+    defer tools_mod.lua_request_queue = null;
 
     // Execute through the full registry path (luaToolExecute -> queue -> dispatcher -> executeTool)
     const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator, null);
