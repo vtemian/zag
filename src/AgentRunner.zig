@@ -281,7 +281,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 .entry_type = .assistant_text,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
-            });
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
         },
         .tool_start => |ev| {
             defer allocator.free(ev.name);
@@ -300,7 +303,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 .entry_type = .tool_call,
                 .tool_name = ev.name,
                 .timestamp = std.time.milliTimestamp(),
-            });
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
         },
         .tool_result => |result| {
             defer allocator.free(result.content);
@@ -321,7 +327,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 .content = result.content,
                 .is_error = result.is_error,
                 .timestamp = std.time.milliTimestamp(),
-            });
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
         },
         .info => |text| {
             defer allocator.free(text);
@@ -349,7 +358,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 .entry_type = .err,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
-            });
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
         },
         // These round-trip events are normally consumed by
         // `dispatchHookRequests` before the drain sees them. If one slips
