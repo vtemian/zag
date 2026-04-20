@@ -525,12 +525,25 @@ fn writeMetaFile(path: []const u8, meta: *const Meta) !void {
 
     const json = stream.getWritten();
     const cwd = std.fs.cwd();
-    const file = try cwd.createFile(path, .{ .truncate = true });
-    defer file.close();
-    var write_scratch: [256]u8 = undefined;
-    var file_w = file.writer(&write_scratch);
-    try file_w.interface.writeAll(json);
-    try file_w.interface.flush();
+
+    // Write to <path>.tmp, fsync, then atomic-rename onto <path>. POSIX
+    // rename is atomic within a filesystem, so readers see either the
+    // old bytes or the fully-written new bytes, never a partial write.
+    var tmp_path_buf: [512]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch
+        return error.PathTooLong;
+
+    {
+        const tmp_file = try cwd.createFile(tmp_path, .{ .truncate = true });
+        defer tmp_file.close();
+        var write_scratch: [256]u8 = undefined;
+        var file_w = tmp_file.writer(&write_scratch);
+        try file_w.interface.writeAll(json);
+        try file_w.interface.flush();
+        try tmp_file.sync();
+    }
+
+    try cwd.rename(tmp_path, path);
 }
 
 /// Read and parse a .meta.json file into a Meta struct.
@@ -787,4 +800,43 @@ test "writeMetaFile and readMetaFile round-trip" {
     try std.testing.expectEqual(@as(i64, 1000), loaded.created);
     try std.testing.expectEqual(@as(i64, 2000), loaded.updated);
     try std.testing.expectEqual(@as(u32, 5), loaded.message_count);
+}
+
+test "writeMetaFile replaces any stale .tmp via atomic rename" {
+    // Plant a stale .tmp left by a hypothetical crashed run, then call
+    // writeMetaFile. A rename-based implementation consumes the tmp onto
+    // the final path, so the .tmp must not exist afterward. A direct
+    // truncate implementation would leave the planted tmp in place and
+    // fail this test.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var meta_path_buf: [512]u8 = undefined;
+    const meta_path = try std.fmt.bufPrint(&meta_path_buf, "{s}/stale.meta.json", .{tmp_path});
+    var stale_path_buf: [512]u8 = undefined;
+    const stale_path = try std.fmt.bufPrint(&stale_path_buf, "{s}/stale.meta.json.tmp", .{tmp_path});
+
+    // Plant the stale tmp.
+    try std.fs.cwd().writeFile(.{ .sub_path = stale_path, .data = "stale bytes\n" });
+
+    var meta = Meta{ .created = 1, .updated = 2, .message_count = 1 };
+    const id = "abcd";
+    @memcpy(meta.id[0..id.len], id);
+    meta.id_len = @intCast(id.len);
+
+    try writeMetaFile(meta_path, &meta);
+
+    // After a rename-based write, the tmp should no longer exist.
+    const stat_result = std.fs.cwd().statFile(stale_path);
+    try std.testing.expectError(error.FileNotFound, stat_result);
+
+    // The final file must be the freshly written content.
+    const loaded = try readMetaFile(meta_path, allocator);
+    try std.testing.expectEqualStrings(id, loaded.idSlice());
+    try std.testing.expectEqual(@as(u32, 1), loaded.message_count);
 }
