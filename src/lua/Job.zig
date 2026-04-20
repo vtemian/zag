@@ -100,12 +100,11 @@ pub const HttpGetSpec = struct {
     /// Extra request headers. Slice + each header's name/value are
     /// borrowed from the caller's arena.
     headers: []const HttpHeader = &.{},
-    /// Wall-clock deadline in milliseconds. 0 disables the timeout.
-    /// Note: Zig 0.15 `std.http.Client` exposes no clean cancel
-    /// primitive, so today this is best-effort — the worker honours it
-    /// at scope.cancel checkpoints, but a request blocked in TCP
-    /// recv will not be interrupted until the socket-close aborter
-    /// gains teeth in Task 7.5.
+    /// Reserved for Task 7.5; NOT enforced in v1. The worker has only a
+    /// pre-request cancel checkpoint today — once std.http.Client.fetch
+    /// is called, the request runs to whatever transport-level timeout
+    /// std.http uses internally. Plumbed through so the Lua binding can
+    /// accept the opt without errors.
     timeout_ms: u64 = 30_000,
     /// Follow 3xx redirects. When true, std.http.Client handles up to
     /// three hops transparently.

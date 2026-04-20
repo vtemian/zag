@@ -104,8 +104,9 @@ pub fn executeHttpGet(alloc: Allocator, job: *Job) void {
 
     // Accumulate body into an engine-owned slice. Mirrors
     // `llm.zig:486` (`var out: std.io.Writer.Allocating = .init(alloc)`).
+    // No errdefer: this function returns void, so errdefer never fires.
+    // Every early-exit path below does its own explicit `out.deinit()`.
     var out: std.io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
 
     const redirect: std.http.Client.Request.RedirectBehavior = if (spec.follow_redirects)
         @enumFromInt(3)
@@ -165,7 +166,19 @@ pub fn executeHttpGet(alloc: Allocator, job: *Job) void {
         return;
     };
 
+    // Post-fetch cancel re-check: a fast local server can return 200
+    // before the aborter sees scope.cancel. Honour "cancel is
+    // authoritative" — discard the body and surface .cancelled instead
+    // of silently reporting the successful response. Matches
+    // primitives/cmd.zig's pattern.
+    if (job.scope.isCancelled() or abort_ctx.cancelled.load(.acquire)) {
+        out.deinit();
+        job.err_tag = .cancelled;
+        return;
+    }
+
     const body = out.toOwnedSlice() catch {
+        out.deinit();
         job.err_tag = .io_error;
         job.err_detail = alloc.dupe(u8, "body alloc failed") catch null;
         return;
