@@ -100,3 +100,26 @@ test "Pool starts and shuts down cleanly" {
     const pool = try Pool.init(alloc, 2, &completions);
     pool.deinit();
 }
+
+test "Pool submit routes job to worker and posts to completion queue" {
+    const alloc = testing.allocator;
+    var completions = try CompletionQueue.init(alloc, 16);
+    defer completions.deinit();
+
+    const pool = try Pool.init(alloc, 2, &completions);
+    defer pool.deinit();
+
+    var job = Job{};
+    try pool.submit(&job);
+
+    // Poll the completion queue for up to 1s
+    const deadline = std.time.milliTimestamp() + 1000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (completions.pop()) |got| {
+            try testing.expectEqual(&job, got);
+            return;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.JobNeverCompleted;
+}
