@@ -48,6 +48,15 @@ pub const HelperCmd = union(enum) {
     /// `.cmd_read_line_done` job addressed to `thread_ref`. Drives
     /// `CmdHandle:lines()`.
     read_line: struct { thread_ref: i32 },
+    /// Write bytes to the child's stdin. `data` is owned on the engine
+    /// allocator (duped by the Lua binding); helper frees it after the
+    /// write attempt completes. Posts a `.cmd_write_done` job
+    /// addressed to `thread_ref`. Drives `CmdHandle:write()`.
+    write: struct { thread_ref: i32, data: []const u8 },
+    /// Close the child's stdin pipe so readers in the child see EOF.
+    /// Posts a `.cmd_close_stdin_done` job addressed to `thread_ref`.
+    /// Drives `CmdHandle:close_stdin()`.
+    close_stdin: struct { thread_ref: i32 },
     /// Shut the helper down. Sent by `shutdownAndCleanup`. Helper
     /// breaks out of its loop; main joins the thread.
     shutdown,
@@ -134,6 +143,12 @@ pub const CmdHandle = struct {
         /// the default at `.Ignore` means children that never get read
         /// can't stall on a full pipe buffer.
         capture_stdout: bool = false,
+        /// When true, stdin is a pipe and `:write()` feeds it. When
+        /// false (default), stdin is `.Ignore` (routed to /dev/null)
+        /// and `:write()` surfaces `io_error: stdin not captured or
+        /// already closed`. Keeping the default at `.Ignore` matches
+        /// the stdout policy: no pipe until a caller asks for it.
+        capture_stdin: bool = false,
         /// Maximum bytes buffered for a single line before the
         /// `:lines()` reader gives up and surfaces `io_error: line
         /// exceeded max_line_bytes`. Guards against a misbehaving
@@ -179,7 +194,7 @@ pub const CmdHandle = struct {
         // the Lua binding rejects `capture_stderr = true` at spawn
         // rather than silently letting a chatty child stall on a full
         // stderr pipe the helper never drains.
-        self.child.stdin_behavior = .Ignore;
+        self.child.stdin_behavior = if (opts.capture_stdin) .Pipe else .Ignore;
         self.child.stdout_behavior = if (opts.capture_stdout) .Pipe else .Ignore;
         self.child.stderr_behavior = .Ignore;
         if (opts.cwd) |c| self.child.cwd = c;
@@ -239,6 +254,8 @@ pub const CmdHandle = struct {
                 .wait => |w| self.runWait(w.thread_ref),
                 .kill => |k| self.runKill(k.signo),
                 .read_line => |rl| self.runReadLine(rl.thread_ref),
+                .write => |w| self.runWrite(w.thread_ref, w.data),
+                .close_stdin => |cs| self.runCloseStdin(cs.thread_ref),
             }
         }
     }
@@ -411,6 +428,121 @@ pub const CmdHandle = struct {
         }
     }
 
+    /// Helper-side implementation of `:write(data)` — push bytes into
+    /// the child's stdin. `data` is owned on `self.alloc` by the
+    /// binding; we free it unconditionally (success or failure) once
+    /// the write attempt completes so a failed write doesn't leak.
+    ///
+    /// Uses `File.writeAll` which loops internally on short writes;
+    /// the expected failure mode is EPIPE after the child closed its
+    /// read end, which surfaces as `io_error: BrokenPipe` to Lua.
+    fn runWrite(self: *CmdHandle, thread_ref: i32, data: []const u8) void {
+        defer self.alloc.free(data);
+
+        const stdin = self.child.stdin orelse {
+            self.postWriteDoneErr(thread_ref, "stdin not captured or already closed");
+            return;
+        };
+
+        stdin.writeAll(data) catch |err| {
+            self.postWriteDoneErr(thread_ref, @errorName(err));
+            return;
+        };
+
+        self.postWriteDone(thread_ref, data.len);
+    }
+
+    /// Helper-side implementation of `:close_stdin()` — close the
+    /// child's stdin pipe so its readers see EOF. Idempotent: if
+    /// stdin has already been closed (either by a previous call or
+    /// because it was never opened), we still post a `done` completion
+    /// so the coroutine resumes rather than hanging.
+    fn runCloseStdin(self: *CmdHandle, thread_ref: i32) void {
+        if (self.child.stdin) |stdin| {
+            stdin.close();
+            self.child.stdin = null;
+        }
+        self.postCloseStdinDone(thread_ref);
+    }
+
+    /// Post a successful `.cmd_write_done` job back to main. Mirrors
+    /// `postReadLineDone`: spin-retry on QueueFull so a momentarily
+    /// full completion queue doesn't drop the completion and hang the
+    /// suspended coroutine.
+    fn postWriteDone(self: *CmdHandle, thread_ref: i32, bytes_written: usize) void {
+        if (thread_ref == 0) return;
+        const job = self.alloc.create(Job) catch |err| {
+            log.err("cmd_write_done job alloc failed: {s}", .{@errorName(err)});
+            return;
+        };
+        job.* = .{
+            .kind = .{ .cmd_write_done = .{ .bytes_written = bytes_written } },
+            .thread_ref = thread_ref,
+            .scope = self.root_scope,
+        };
+        while (true) {
+            self.completions.push(job) catch |err| switch (err) {
+                error.QueueFull => {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+
+    /// Post a failure variant of `.cmd_write_done`. Surfaces as
+    /// `(nil, "io_error: <detail>")` to the waiting coroutine via the
+    /// generic `err_tag` branch in `pushJobResultOntoStack`.
+    fn postWriteDoneErr(self: *CmdHandle, thread_ref: i32, err_msg: []const u8) void {
+        if (thread_ref == 0) return;
+        const job = self.alloc.create(Job) catch |err| {
+            log.err("cmd_write_done err job alloc failed: {s}", .{@errorName(err)});
+            return;
+        };
+        job.* = .{
+            .kind = .{ .cmd_write_done = .{ .bytes_written = 0 } },
+            .thread_ref = thread_ref,
+            .scope = self.root_scope,
+            .err_tag = .io_error,
+            .err_detail = self.alloc.dupe(u8, err_msg) catch null,
+        };
+        while (true) {
+            self.completions.push(job) catch |err| switch (err) {
+                error.QueueFull => {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+
+    /// Post a `.cmd_close_stdin_done` job. Always succeeds from the
+    /// coroutine's perspective — closing a pipe doesn't fail in any
+    /// way the caller can recover from.
+    fn postCloseStdinDone(self: *CmdHandle, thread_ref: i32) void {
+        if (thread_ref == 0) return;
+        const job = self.alloc.create(Job) catch |err| {
+            log.err("cmd_close_stdin_done job alloc failed: {s}", .{@errorName(err)});
+            return;
+        };
+        job.* = .{
+            .kind = .{ .cmd_close_stdin_done = .{} },
+            .thread_ref = thread_ref,
+            .scope = self.root_scope,
+        };
+        while (true) {
+            self.completions.push(job) catch |err| switch (err) {
+                error.QueueFull => {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+
     /// Helper-side implementation of `:wait`. Blocks on `child.wait()`,
     /// stores the code on the handle, and posts a completion job
     /// addressed to `thread_ref` so `resumeFromJob` wakes the coroutine.
@@ -521,6 +653,20 @@ pub const CmdHandle = struct {
         // already completed. That can't happen in practice — __gc
         // only fires when no Lua reference remains, which means no
         // coroutine is suspended waiting for this handle.
+
+        // Drain any HelperCmds that were queued but never dispatched
+        // before the helper returned from .shutdown. Only `.write`
+        // carries an owned payload today — free it so teardown doesn't
+        // leak. The helper is already joined so no further appends can
+        // race this drain; the lock is just discipline.
+        self.queue_mu.lock();
+        for (self.queue.items) |cmd| {
+            switch (cmd) {
+                .write => |w| self.alloc.free(w.data),
+                else => {},
+            }
+        }
+        self.queue_mu.unlock();
 
         self.queue.deinit(self.alloc);
         self.stdout_buf.deinit(self.alloc);

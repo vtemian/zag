@@ -713,6 +713,13 @@ pub const LuaEngine = struct {
             _ = co.getField(opts_idx, "capture_stdout");
             opts.capture_stdout = co.toBoolean(-1);
             co.pop(1);
+            // capture_stdin mirrors capture_stdout for the stdin pipe.
+            // Required to call `:write(data)` — without it the child's
+            // stdin is `.Ignore` and writes surface `io_error: stdin
+            // not captured or already closed`.
+            _ = co.getField(opts_idx, "capture_stdin");
+            opts.capture_stdin = co.toBoolean(-1);
+            co.pop(1);
             // capture_stderr is not yet implemented: the helper thread
             // doesn't drain stderr, so a chatty child with a full
             // stderr pipe would stall forever. Reject at spawn time
@@ -861,6 +868,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "kill");
         lua.pushFunction(zlua.wrap(cmdHandleLines));
         lua.setField(-2, "lines");
+        lua.pushFunction(zlua.wrap(cmdHandleWrite));
+        lua.setField(-2, "write");
+        lua.pushFunction(zlua.wrap(cmdHandleCloseStdin));
+        lua.setField(-2, "close_stdin");
         // __index = self so `h:wait()` dispatches to wait(h).
         lua.pushValue(-1);
         lua.setField(-2, "__index");
@@ -1071,6 +1082,72 @@ pub const LuaEngine = struct {
         };
 
         // yield is noreturn on Lua 5.4; no reachable return statement.
+        co.yield(0);
+    }
+
+    /// `CmdHandle:write(data)` — feeds `data` to the child's stdin
+    /// pipe. Must be called from inside a coroutine; yields until the
+    /// helper thread finishes writing (or errors with EPIPE because
+    /// the child closed the read end). Requires `capture_stdin = true`
+    /// at spawn time, otherwise returns `(nil, "io_error: stdin not
+    /// captured or already closed")` via the helper.
+    fn cmdHandleWrite(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+        const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        const h = ud.ptr orelse {
+            co.raiseErrorStr("cmd:write: invalid handle", .{});
+        };
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("cmd:write must be called inside a coroutine", .{});
+        }
+
+        const data = co.checkString(2);
+
+        const owned = engine.allocator.dupe(u8, data) catch {
+            co.raiseErrorStr("cmd:write alloc failed", .{});
+        };
+
+        const task = engine.taskForCoroutine(co) orelse {
+            engine.allocator.free(owned);
+            co.raiseErrorStr("cmd:write: no task for this coroutine", .{});
+        };
+
+        h.submit(.{ .write = .{ .thread_ref = task.thread_ref, .data = owned } }) catch |err| {
+            engine.allocator.free(owned);
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "cmd:write submit failed: {s}", .{@errorName(err)}) catch "cmd:write submit failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+
+        co.yield(0);
+    }
+
+    /// `CmdHandle:close_stdin()` — closes the child's stdin pipe so
+    /// readers in the child see EOF. Idempotent helper-side. Must be
+    /// called from inside a coroutine; yields until the helper
+    /// confirms the close.
+    fn cmdHandleCloseStdin(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+        const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        const h = ud.ptr orelse {
+            co.raiseErrorStr("cmd:close_stdin: invalid handle", .{});
+        };
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("cmd:close_stdin must be called inside a coroutine", .{});
+        }
+
+        const task = engine.taskForCoroutine(co) orelse {
+            co.raiseErrorStr("cmd:close_stdin: no task for this coroutine", .{});
+        };
+
+        h.submit(.{ .close_stdin = .{ .thread_ref = task.thread_ref } }) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "cmd:close_stdin submit failed: {s}", .{@errorName(err)}) catch "cmd:close_stdin submit failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+
         co.yield(0);
     }
 
@@ -2210,6 +2287,24 @@ pub const LuaEngine = struct {
                     return 2;
                 }
                 co.pushNil();
+                co.pushNil();
+                return 2;
+            },
+            .cmd_write_done => {
+                // CmdHandle:write() resumes with (true, nil) on
+                // success. Failure surfaces as (nil, "io_error: ...")
+                // via the generic err_tag branch above; bytes_written
+                // isn't exposed to Lua because `writeAll` loops
+                // internally so a successful return means full write.
+                co.pushBoolean(true);
+                co.pushNil();
+                return 2;
+            },
+            .cmd_close_stdin_done => {
+                // CmdHandle:close_stdin() resumes with (true, nil).
+                // No failure path — close doesn't surface errors the
+                // caller can act on.
+                co.pushBoolean(true);
                 co.pushNil();
                 return 2;
             },
@@ -3810,5 +3905,68 @@ test "zag.cmd.spawn :lines errors when stdout not captured" {
     const err_str = try eng.lua.toString(-1);
     try std.testing.expect(std.mem.startsWith(u8, err_str, "io_error"));
     eng.lua.pop(1);
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.spawn :write feeds stdin, :close_stdin causes cat to exit" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_write()
+        \\  local h = zag.cmd.spawn({ "/bin/cat" }, {
+        \\    capture_stdin = true,
+        \\    capture_stdout = true,
+        \\  })
+        \\  local ok, werr = h:write("hello")
+        \\  _write_ok = ok
+        \\  _write_err_is_nil = (werr == nil)
+        \\  local cok, cerr = h:close_stdin()
+        \\  _close_ok = cok
+        \\  _close_err_is_nil = (cerr == nil)
+        \\  local collected = {}
+        \\  for line in h:lines() do
+        \\    table.insert(collected, line)
+        \\  end
+        \\  _write_count = #collected
+        \\  _write_line1 = collected[1]
+        \\  h:wait()
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_write");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_write_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_write_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_close_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_close_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_write_count");
+    try std.testing.expectEqual(@as(i64, 1), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_write_line1");
+    try std.testing.expectEqualStrings("hello", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+
     try eng.lua.doString("collectgarbage('collect')");
 }
