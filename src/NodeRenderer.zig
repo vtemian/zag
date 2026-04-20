@@ -18,9 +18,27 @@ const MarkdownParser = @import("MarkdownParser.zig");
 
 const NodeRenderer = @This();
 
+/// Static prefix strings attached to rendered lines. Shared across frames
+/// and buffers because their bytes never change; span text is a borrowed
+/// slice into these constants.
+///
+/// `indent_pad_max` is the worst-case indentation slice. `splitAndAppendIndented`
+/// asserts its `indent_count` fits within this buffer so the slice access
+/// is in-bounds.
+const Prefixes = struct {
+    const user = "> ";
+    const tool_call = "[tool] ";
+    const err = "error: ";
+    const separator = "---";
+    const indent_pad_max = " " ** 64;
+};
+
 /// Function signature for a custom node renderer.
-/// Appends one or more StyledLines to `lines`. Each line's spans are
-/// allocated via `allocator` and owned by the caller.
+///
+/// Appends one or more StyledLines to `lines`. The renderer must uphold
+/// the StyledSpan borrowed-slice contract: span text bytes must outlive
+/// the span (for example, by slicing `node.content.items` or returning
+/// a static string). The caller does not free span text.
 pub const RenderFn = *const fn (
     node: *const Node,
     lines: *std.ArrayList(StyledLine),
@@ -105,7 +123,8 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     };
 }
 
-/// Create a StyledLine with two spans.
+/// Create a StyledLine with two spans. Span text is borrowed: caller
+/// guarantees `text1` and `text2` outlive the returned line.
 fn twoSpanLine(
     allocator: Allocator,
     text1: []const u8,
@@ -113,13 +132,9 @@ fn twoSpanLine(
     text2: []const u8,
     style2: Theme.CellStyle,
 ) !StyledLine {
-    const owned1 = try allocator.dupe(u8, text1);
-    errdefer allocator.free(owned1);
-    const owned2 = try allocator.dupe(u8, text2);
-    errdefer allocator.free(owned2);
     const spans = try allocator.alloc(StyledSpan, 2);
-    spans[0] = .{ .text = owned1, .style = style1 };
-    spans[1] = .{ .text = owned2, .style = style2 };
+    spans[0] = .{ .text = text1, .style = style1 };
+    spans[1] = .{ .text = text2, .style = style2 };
     return .{ .spans = spans };
 }
 
@@ -154,6 +169,8 @@ fn splitAndAppend(
 }
 
 /// Split content on newlines, prepending an indent string to each line.
+/// `indent_count` must not exceed `Prefixes.indent_pad_max.len`; the
+/// padding span text slices that interned buffer directly.
 fn splitAndAppendIndented(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
@@ -161,19 +178,17 @@ fn splitAndAppendIndented(
     style: Theme.CellStyle,
     indent_count: u16,
 ) !void {
+    std.debug.assert(indent_count <= Prefixes.indent_pad_max.len);
+    const padding = Prefixes.indent_pad_max[0..indent_count];
+
     var rest: []const u8 = content;
     while (rest.len > 0) {
         const nl = std.mem.indexOfScalar(u8, rest, '\n');
         const segment = if (nl) |n| rest[0..n] else rest;
 
-        const padding = try allocator.alloc(u8, indent_count);
-        @memset(padding, ' ');
-
-        const owned_seg = try allocator.dupe(u8, segment);
-        errdefer allocator.free(owned_seg);
         const spans = try allocator.alloc(StyledSpan, 2);
         spans[0] = .{ .text = padding, .style = .{} };
-        spans[1] = .{ .text = owned_seg, .style = style };
+        spans[1] = .{ .text = segment, .style = style };
         try lines.append(allocator, .{ .spans = spans });
 
         rest = if (nl) |n| rest[n + 1 ..] else &.{};
@@ -196,7 +211,7 @@ fn renderDefault(
     switch (node.node_type) {
         .user_message => {
             const style = theme.highlights.user_message;
-            try splitAndAppend(lines, allocator, content, style, "> ", style);
+            try splitAndAppend(lines, allocator, content, style, Prefixes.user, style);
             return;
         },
         .assistant_text => {
@@ -210,7 +225,7 @@ fn renderDefault(
         },
         .tool_call => {
             const style = theme.highlights.tool_call;
-            try lines.append(allocator, try twoSpanLine(allocator, "[tool] ", style, content, style));
+            try lines.append(allocator, try twoSpanLine(allocator, Prefixes.tool_call, style, content, style));
             return;
         },
         .tool_result => {
@@ -219,12 +234,12 @@ fn renderDefault(
         },
         .err => {
             const style = theme.highlights.err;
-            try lines.append(allocator, try twoSpanLine(allocator, "error: ", style, content, style));
+            try lines.append(allocator, try twoSpanLine(allocator, Prefixes.err, style, content, style));
             return;
         },
         .separator => {
             const style = theme.highlights.status;
-            try lines.append(allocator, try Theme.singleSpanLine(allocator, "---", style));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.separator, style));
             return;
         },
     }
@@ -560,10 +575,10 @@ test "custom override replaces default renderer" {
         ) !void {
             _ = node;
             _ = theme;
-            const text = try alloc.dupe(u8, "CUSTOM RENDERED");
-            errdefer alloc.free(text);
+            // Static literal satisfies the borrowed-slice contract with no
+            // allocation at all.
             const spans = try alloc.alloc(StyledSpan, 1);
-            spans[0] = .{ .text = text, .style = .{} };
+            spans[0] = .{ .text = "CUSTOM RENDERED", .style = .{} };
             try lines.append(alloc, .{ .spans = spans });
         }
     }.render;

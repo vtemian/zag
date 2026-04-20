@@ -208,11 +208,8 @@ pub fn main() !void {
 
     var theme = Theme.defaultTheme();
 
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
 
     const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
 
