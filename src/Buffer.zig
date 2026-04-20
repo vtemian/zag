@@ -7,6 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Theme = @import("Theme.zig");
+const Layout = @import("Layout.zig");
+const input = @import("input.zig");
 
 const Buffer = @This();
 
@@ -14,6 +16,11 @@ const Buffer = @This();
 ptr: *anyopaque,
 /// Function table for this buffer implementation.
 vtable: *const VTable,
+
+/// Dispatch result for key/mouse handling. `consumed` means the buffer
+/// fully handled the event; `passthrough` means the buffer declined,
+/// letting the caller fall through to its default handling.
+pub const HandleResult = enum { consumed, passthrough };
 
 pub const VTable = struct {
     /// Render the buffer content to styled display lines.
@@ -53,6 +60,29 @@ pub const VTable = struct {
 
     /// Clear the dirty flag after compositing.
     clearDirty: *const fn (ptr: *anyopaque) void,
+
+    /// Dispatch a key event to the buffer. Implementors that don't care
+    /// about input return `.passthrough` so the caller can fall back to
+    /// its default handling. The orchestrator drives keymap dispatch and
+    /// universal shortcuts (Ctrl+C, slash commands) above this call.
+    handleKey: *const fn (ptr: *anyopaque, ev: input.KeyEvent) HandleResult,
+
+    /// Notify the buffer that its pane's rect has changed. Buffers that
+    /// care about wrap width or viewport height react here; others no-op.
+    onResize: *const fn (ptr: *anyopaque, rect: Layout.Rect) void,
+
+    /// Notify the buffer that it has gained or lost focus. Buffers that
+    /// want to toggle cursor state or pause rendering react here.
+    onFocus: *const fn (ptr: *anyopaque, focused: bool) void,
+
+    /// Dispatch a mouse event to the buffer with pane-local coordinates.
+    /// `local_x` and `local_y` are relative to the pane's top-left.
+    onMouse: *const fn (
+        ptr: *anyopaque,
+        ev: input.MouseEvent,
+        local_x: u16,
+        local_y: u16,
+    ) HandleResult,
 };
 
 /// Render the buffer's content to styled display lines. See `VTable.getVisibleLines`
@@ -96,6 +126,26 @@ pub fn clearDirty(self: Buffer) void {
     self.vtable.clearDirty(self.ptr);
 }
 
+/// Dispatch a key event to the buffer. See `VTable.handleKey`.
+pub fn handleKey(self: Buffer, ev: input.KeyEvent) HandleResult {
+    return self.vtable.handleKey(self.ptr, ev);
+}
+
+/// Notify the buffer that its pane's rect has changed.
+pub fn onResize(self: Buffer, rect: Layout.Rect) void {
+    self.vtable.onResize(self.ptr, rect);
+}
+
+/// Notify the buffer that it has gained or lost focus.
+pub fn onFocus(self: Buffer, focused: bool) void {
+    self.vtable.onFocus(self.ptr, focused);
+}
+
+/// Dispatch a mouse event to the buffer with pane-local coordinates.
+pub fn onMouse(self: Buffer, ev: input.MouseEvent, local_x: u16, local_y: u16) HandleResult {
+    return self.vtable.onMouse(self.ptr, ev, local_x, local_y);
+}
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -126,6 +176,22 @@ test "Buffer vtable dispatches correctly" {
             }.f),
             .clearDirty = @ptrCast(&struct {
                 fn f(_: *anyopaque) void {}
+            }.f),
+            .handleKey = @ptrCast(&struct {
+                fn f(_: *anyopaque, _: input.KeyEvent) HandleResult {
+                    return .passthrough;
+                }
+            }.f),
+            .onResize = @ptrCast(&struct {
+                fn f(_: *anyopaque, _: Layout.Rect) void {}
+            }.f),
+            .onFocus = @ptrCast(&struct {
+                fn f(_: *anyopaque, _: bool) void {}
+            }.f),
+            .onMouse = @ptrCast(&struct {
+                fn f(_: *anyopaque, _: input.MouseEvent, _: u16, _: u16) HandleResult {
+                    return .passthrough;
+                }
             }.f),
         };
 
