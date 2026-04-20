@@ -13,5 +13,6 @@ test {
     _ = @import("LuaIoPool.zig");
     _ = @import("primitives/cmd.zig");
     _ = @import("primitives/cmd_handle.zig");
+    _ = @import("primitives/http.zig");
     _ = @import("integration_test.zig");
 }
