@@ -28,7 +28,7 @@ What actually runs today:
 
 ```bash
 zig build                          # build (Zig 0.15+)
-zig build run                      # run (model from config.lua, fallback: anthropic/claude-sonnet-4-20250514)
+zig build run                      # run (model via config.lua, fallback: anthropic/claude-sonnet-4-20250514)
 zig build test                     # run tests
 zig build -Dmetrics=true           # compile in performance tracing
 zig fmt --check .                  # formatting check
@@ -39,20 +39,21 @@ zig build run -- --last            # resume the most recent one
 
 ## Configuration
 
-Zag reads two files on startup. Both are optional; a fresh install will run against Anthropic as long as `~/.config/zag/auth.json` has a key for it.
+Zag reads two files on startup, both under `~/.config/zag/`:
 
-`~/.config/zag/config.lua` declares enabled providers and the default model:
+- `config.lua` (optional). Sets the default model and declares provider names. The provider declarations are validated today but not yet load-bearing; the active provider is whatever prefix you put on `zag.set_default_model()`.
+- `auth.json` (required for any non-Ollama provider). Holds API keys. Create by hand and chmod `0600`.
+
+A fresh install with no `config.lua` runs against the fallback model `anthropic/claude-sonnet-4-20250514`; it still needs an `anthropic` entry in `auth.json`.
+
+Example `config.lua`:
 
 ```lua
-zag.provider { name = "anthropic" }
-zag.provider { name = "openai" }
-zag.provider { name = "openrouter" }
-zag.provider { name = "ollama" }
-
 zag.set_default_model("openai/gpt-4o")
+zag.provider { name = "openai" }
 ```
 
-`~/.config/zag/auth.json` holds provider API keys. Create it by hand and chmod it to `0600`; Ollama needs no entry.
+Example `auth.json`:
 
 ```json
 {
