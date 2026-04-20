@@ -1,3 +1,14 @@
+//! Fixed-size worker pool that executes blocking Lua primitive jobs
+//! off the main thread.
+//!
+//! Workers pull jobs off a FIFO queue, run the kind-specific executor
+//! (sleep, subprocess, HTTP, filesystem), and post the finished job
+//! onto a `LuaCompletionQueue` that wakes the main-thread orchestrator
+//! via an eventfd/pipe. The pool owns no Lua state and never touches
+//! the coroutine it is unblocking; that separation keeps the Lua VM
+//! single-threaded while letting primitives block without stalling
+//! the agent loop.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
@@ -143,7 +154,7 @@ fn executeJob(alloc: Allocator, job: *Job) void {
 
 const testing = std.testing;
 
-/// Minimal Job literal for pool plumbing tests — these tests only care
+/// Minimal Job literal for pool plumbing tests. These tests only care
 /// about pointer routing through the pool, not kind dispatch semantics.
 fn stubJob(scope: *Scope) Job {
     return .{

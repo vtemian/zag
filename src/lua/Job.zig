@@ -1,3 +1,15 @@
+//! Job descriptor shared between the Lua engine, the IO pool, and the
+//! completion queue.
+//!
+//! Every async primitive a plugin calls (`zag.sleep`, `zag.cmd`,
+//! `zag.http.get`, `zag.fs.*`, long-lived handle ops) is staged as a
+//! `Job`: a tagged `JobKind` union plus a `*Scope`, an optional
+//! `Aborter`, and result / error slots. Workers fill one side of the
+//! result union and post the job back onto `LuaCompletionQueue`, where
+//! the main thread drains it and resumes the waiting coroutine. The
+//! struct is held by pointer throughout so the aborter can reach it
+//! from arbitrary threads.
+
 const std = @import("std");
 
 pub const Aborter = struct {
@@ -65,8 +77,8 @@ pub const CmdWaitDoneSpec = struct {
 
 /// Completion payload for a `CmdHandle:write()` call. The helper
 /// thread has attempted the write and (on success) drained the
-/// buffer. Short writes from `File.writeAll` aren't possible — the
-/// function loops internally — so `bytes_written` equals the
+/// buffer. Short writes from `File.writeAll` aren't possible (the
+/// function loops internally), so `bytes_written` equals the
 /// requested length on success. On failure the Job carries an
 /// `err_tag` of `.io_error` instead of a result.
 pub const CmdWriteDoneSpec = struct {
@@ -76,7 +88,7 @@ pub const CmdWriteDoneSpec = struct {
 };
 
 /// Completion payload for a `CmdHandle:close_stdin()` call. No data
-/// flows back to the coroutine — the completion just signals the
+/// flows back to the coroutine; the completion just signals the
 /// helper is done closing the pipe so Lua can resume.
 pub const CmdCloseStdinDoneSpec = struct {};
 
@@ -101,7 +113,7 @@ pub const HttpGetSpec = struct {
     /// borrowed from the caller's arena.
     headers: []const HttpHeader = &.{},
     /// Reserved for Task 7.5; NOT enforced in v1. The worker has only a
-    /// pre-request cancel checkpoint today — once std.http.Client.fetch
+    /// pre-request cancel checkpoint today. Once std.http.Client.fetch
     /// is called, the request runs to whatever transport-level timeout
     /// std.http uses internally. Plumbed through so the Lua binding can
     /// accept the opt without errors.
@@ -128,7 +140,7 @@ pub const HttpPostSpec = struct {
     /// Empty slice is valid and means "POST with no body".
     body: []const u8 = &.{},
     /// MIME type for `body`. Empty string means "don't inject a
-    /// Content-Type header — let caller-provided headers speak for
+    /// Content-Type header; let caller-provided headers speak for
     /// themselves (or let the server infer nothing)". Borrowed.
     content_type: []const u8 = "",
     /// Reserved for Task 7.5; see HttpGetSpec.timeout_ms.
@@ -145,7 +157,7 @@ pub const HttpPostSpec = struct {
 pub const HttpResult = struct {
     /// HTTP status code (e.g. 200, 404).
     status: u16,
-    /// Response headers, lowercase-keyed. In v1 this is always empty —
+    /// Response headers, lowercase-keyed. In v1 this is always empty;
     /// Zig 0.15 `std.http.Client.fetch` does not expose response
     /// headers in a convenient form. Task 7.2's Lua binding pushes an
     /// empty table for now.
@@ -162,7 +174,7 @@ pub const HttpResult = struct {
 pub const CmdReadLineDoneSpec = struct {
     /// Next line from stdout (without the trailing '\n'). Heap-
     /// allocated on the engine allocator; ownership transfers to
-    /// `pushJobResultOntoStack`. `null` means EOF — the iterator
+    /// `pushJobResultOntoStack`. `null` means EOF; the iterator
     /// Lua-side returns nil and the `for` loop ends.
     line: ?[]const u8,
 };
@@ -176,7 +188,7 @@ pub const HttpStreamLineDoneSpec = struct {
     /// Next line from the response body (without the trailing '\n';
     /// a trailing '\r' is also stripped so SSE "\r\n" framing arrives
     /// clean). Heap-allocated on the engine allocator. `null` means
-    /// end-of-stream — the iterator returns nil and the `for` loop
+    /// end-of-stream; the iterator returns nil and the `for` loop
     /// ends.
     line: ?[]const u8,
 };
@@ -296,12 +308,12 @@ pub const JobKind = union(enum) {
     /// One-shot HTTP GET. Worker lives in `primitives/http.zig`.
     http_get: HttpGetSpec,
     /// One-shot HTTP POST. Worker lives in `primitives/http.zig`.
-    /// Shares `JobResult.http` with `http_get` — status/body shape is
+    /// Shares `JobResult.http` with `http_get`; status/body shape is
     /// identical, only the request side differs.
     http_post: HttpPostSpec,
     /// Posted by an HttpStreamHandle helper thread for each `:lines()`
     /// iteration. Resumes the coroutine with the next line or nil at
-    /// EOF. Not pool-submitted — the helper thread synthesises these
+    /// EOF. Not pool-submitted; the helper thread synthesises these
     /// directly onto the completion queue.
     http_stream_line_done: HttpStreamLineDoneSpec,
     /// Filesystem primitives backed by std.fs.cwd() on a worker thread.

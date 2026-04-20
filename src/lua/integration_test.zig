@@ -17,7 +17,7 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
     eng.completions.?.wake_fd = fds[1];
 
     // Build a minimal Job the worker can run. Sleep(0) is fine.
-    // But our Pool currently has no sleep dispatch — workerLoop just
+    // But our Pool currently has no sleep dispatch; workerLoop just
     // pass-through pushes to completions. Use a stub job.
     const root = try Scope.init(testing.allocator, null);
     defer root.deinit();

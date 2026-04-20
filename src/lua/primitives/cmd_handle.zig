@@ -14,7 +14,7 @@
 //!   coroutine.
 //!
 //! Why a per-handle thread instead of reusing the pool? The child must
-//! outlive any single pool operation — multiple `:wait`/`:kill`/`:lines`
+//! outlive any single pool operation. Multiple `:wait`/`:kill`/`:lines`
 //! calls from Lua have to see the same `Child`. Parking a pool worker for
 //! the lifetime of the child would remove it from the pool. A per-handle
 //! thread scales with the number of spawned processes rather than
@@ -117,10 +117,10 @@ pub const CmdHandle = struct {
 
     /// Line-buffered bytes read from `child.stdout` by the helper
     /// thread but not yet handed to Lua. Owned by the helper thread
-    /// (no locking — only `runReadLine` mutates it, and only one read
+    /// (no locking: only `runReadLine` mutates it, and only one read
     /// is in flight at a time because the helper serialises commands).
     stdout_buf: std.ArrayList(u8) = .empty,
-    /// Set once `child.stdout.read` returned 0 (EOF). Sticky — once
+    /// Set once `child.stdout.read` returned 0 (EOF). Sticky: once
     /// true, subsequent `:lines()` iterations return nil.
     stdout_eof: bool = false,
     /// Mirrors `SpawnOpts.max_line_bytes`. Consulted in `runReadLine`
@@ -163,7 +163,7 @@ pub const CmdHandle = struct {
     /// On failure the arena is freed here; nothing leaks.
     ///
     /// argv slices and the EnvMap are expected to already live inside
-    /// the arena — caller stages them there before calling.
+    /// the arena; caller stages them there before calling.
     pub fn init(
         alloc: Allocator,
         completions: *completion_mod.Queue,
@@ -190,7 +190,7 @@ pub const CmdHandle = struct {
         // `.Inherit` would spam the host process's terminal during
         // tests. `capture_stdout` in `opts` opts into `.Pipe` for
         // `:lines()`; `:write` in 6.4c will add `capture_stdin`.
-        // stderr is always `.Ignore` until `:stderr_lines()` exists —
+        // stderr is always `.Ignore` until `:stderr_lines()` exists;
         // the Lua binding rejects `capture_stderr = true` at spawn
         // rather than silently letting a chatty child stall on a full
         // stderr pipe the helper never drains.
@@ -222,7 +222,7 @@ pub const CmdHandle = struct {
         self.helper = try std.Thread.spawn(.{}, helperLoop, .{self});
         // Name the helper for nicer debugger/`ps -M` output. setName
         // can fail on some OSes (permissions, unsupported); ignore
-        // and log at debug — the helper still works unnamed.
+        // and log at debug; the helper still works unnamed.
         self.helper.setName("zag.cmd_handle") catch |err| {
             log.debug("cmd_handle helper setName failed: {s}", .{@errorName(err)});
         };
@@ -271,7 +271,7 @@ pub const CmdHandle = struct {
         };
     }
 
-    /// Helper-side implementation of `:lines()` — pull one line out of
+    /// Helper-side implementation of `:lines()`. Pull one line out of
     /// the child's stdout. Either drains `stdout_buf` (populated by a
     /// previous read that picked up more than one line at a time) or
     /// blocks in `child.stdout.?.read` until a newline appears or the
@@ -314,7 +314,7 @@ pub const CmdHandle = struct {
                 // A trailing partial line (bytes after the last '\n'
                 // with no terminating newline before EOF) should be
                 // returned as the final line rather than silently
-                // dropped — callers iterating `for line in h:lines()`
+                // dropped; callers iterating `for line in h:lines()`
                 // expect to see every byte the child wrote.
                 if (self.popLineFromBuf()) |line| {
                     self.postReadLineDone(thread_ref, line);
@@ -428,7 +428,7 @@ pub const CmdHandle = struct {
         }
     }
 
-    /// Helper-side implementation of `:write(data)` — push bytes into
+    /// Helper-side implementation of `:write(data)`. Push bytes into
     /// the child's stdin. `data` is owned on `self.alloc` by the
     /// binding; we free it unconditionally (success or failure) once
     /// the write attempt completes so a failed write doesn't leak.
@@ -452,7 +452,7 @@ pub const CmdHandle = struct {
         self.postWriteDone(thread_ref, data.len);
     }
 
-    /// Helper-side implementation of `:close_stdin()` — close the
+    /// Helper-side implementation of `:close_stdin()`. Close the
     /// child's stdin pipe so its readers see EOF. Idempotent: if
     /// stdin has already been closed (either by a previous call or
     /// because it was never opened), we still post a `done` completion
@@ -519,7 +519,7 @@ pub const CmdHandle = struct {
     }
 
     /// Post a `.cmd_close_stdin_done` job. Always succeeds from the
-    /// coroutine's perspective — closing a pipe doesn't fail in any
+    /// coroutine's perspective. Closing a pipe doesn't fail in any
     /// way the caller can recover from.
     fn postCloseStdinDone(self: *CmdHandle, thread_ref: i32) void {
         if (thread_ref == 0) return;
@@ -614,7 +614,7 @@ pub const CmdHandle = struct {
     /// Called by the Lua userdata __gc metamethod. Idempotent. Ensures
     /// the child is reaped and the helper thread is joined before we
     /// free memory. If `:wait` was never called, we SIGKILL and wait
-    /// synchronously on the main thread — ugly but the alternative is
+    /// synchronously on the main thread. Ugly, but the alternative is
     /// leaking a process.
     pub fn shutdownAndCleanup(self: *CmdHandle) void {
         if (self.shut_down) return;
@@ -646,17 +646,17 @@ pub const CmdHandle = struct {
 
         // Drain any posted jobs that Lua never got to consume. With
         // thread_ref == 0 (from the GC path) `resumeFromJob` will
-        // look up task 0, fail, and free the job — so leaving them in
+        // look up task 0, fail, and free the job, so leaving them in
         // the queue is safe. But for jobs posted BEFORE GC (the
         // user's :wait call that they never awaited a resume for),
         // thread_ref is valid and main will resume a coroutine that
-        // already completed. That can't happen in practice — __gc
+        // already completed. That can't happen in practice; __gc
         // only fires when no Lua reference remains, which means no
         // coroutine is suspended waiting for this handle.
 
         // Drain any HelperCmds that were queued but never dispatched
         // before the helper returned from .shutdown. Only `.write`
-        // carries an owned payload today — free it so teardown doesn't
+        // carries an owned payload today, so free it so teardown doesn't
         // leak. The helper is already joined so no further appends can
         // race this drain; the lock is just discipline.
         self.queue_mu.lock();

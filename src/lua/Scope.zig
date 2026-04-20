@@ -1,3 +1,13 @@
+//! Structured-concurrency cancel scope for the Lua plugin runtime.
+//!
+//! Scopes form a parent/child tree that mirrors coroutine spawning. A
+//! `cancel()` cascades to every descendant scope, fires any registered
+//! job aborters (close sockets, SIGKILL children), and stops at scopes
+//! marked `shielded`. Every yielding primitive checks its scope before
+//! suspending and again on resume, which gives cancellation a bounded
+//! latency that does not depend on the provider or the syscall in
+//! flight.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;

@@ -25,7 +25,7 @@ Zag looks for plugins under `~/.config/zag`:
 | -------------------------------- | ---------------------------------------------------------------------- |
 | `~/.config/zag/config.lua`       | Top-level entry point. Runs once at startup.                           |
 | `~/.config/zag/lua/`             | Module path for `require()`. Files in here are loadable by name.       |
-| `~/.config/zag/lua/foo/init.lua` | `require("foo")` — standard Lua package layout.                        |
+| `~/.config/zag/lua/foo/init.lua` | `require("foo")`: standard Lua package layout.                        |
 
 Config failures are logged (scope `.lua_user`) and swallowed; a missing `config.lua` is not an error.
 
@@ -35,7 +35,7 @@ Every hook callback, every `zag.spawn` body, every keymap action runs inside an 
 
 Two practical implications:
 
-- Async primitives can only be called from inside a context that runs in a coroutine — that is, a hook, a keymap action, a `zag.spawn` body, a `zag.detach` body, or a tool's `execute` function. Calling `zag.sleep(100)` from plain `config.lua` top-level is an error because there is no coroutine to yield.
+- Async primitives can only be called from inside a context that runs in a coroutine; that is, a hook, a keymap action, a `zag.spawn` body, a `zag.detach` body, or a tool's `execute` function. Calling `zag.sleep(100)` from plain `config.lua` top-level is an error because there is no coroutine to yield.
 - Ordering inside one coroutine is sequential. `zag.http.get(a); zag.http.get(b)` fetches `a` first, waits, then fetches `b`. If you want concurrency, spawn multiple coroutines with `zag.spawn` and join them with `zag.all` or `zag.race`.
 
 ## Hook events
@@ -46,13 +46,13 @@ Register with `zag.hook(event, opts_or_fn, fn)`. `event` is a PascalCase string.
 | ------------------ | -------------------------------------------------------------------------------- | ----------------------------------------- | -------- |
 | `ToolPre`          | `name`, `call_id`, `args` (decoded table)                                        | `args` (table → re-serialized as JSON)    | yes      |
 | `ToolPost`         | `name`, `call_id`, `content`, `is_error`, `duration_ms`                          | `content`, `is_error`                     | no       |
-| `TurnStart`        | `turn_num`, `message_count`                                                      | —                                         | no       |
-| `TurnEnd`          | `turn_num`, `stop_reason`, `input_tokens`, `output_tokens`                       | —                                         | no       |
+| `TurnStart`        | `turn_num`, `message_count`                                                      | (none)                                    | no       |
+| `TurnEnd`          | `turn_num`, `stop_reason`, `input_tokens`, `output_tokens`                       | (none)                                    | no       |
 | `UserMessagePre`   | `text`                                                                           | `text`                                    | yes      |
-| `UserMessagePost`  | `text`                                                                           | —                                         | no       |
-| `TextDelta`        | `text`                                                                           | —                                         | no       |
-| `AgentDone`        | (empty)                                                                          | —                                         | no       |
-| `AgentErr`         | `message`                                                                        | —                                         | no       |
+| `UserMessagePost`  | `text`                                                                           | (none)                                    | no       |
+| `TextDelta`        | `text`                                                                           | (none)                                    | no       |
+| `AgentDone`        | (empty)                                                                          | (none)                                    | no       |
+| `AgentErr`         | `message`                                                                        | (none)                                    | no       |
 
 Pattern filters match the tool name for `ToolPre` / `ToolPost`. Accepted syntaxes:
 
@@ -195,9 +195,9 @@ Issue a GET. Returns `{ status, headers, body }` or `(nil, err)`.
 
 `opts` fields:
 
-- `headers` — table of string → string request headers.
-- `follow_redirects` — bool, default true.
-- `timeout_ms` — integer (plumbed but not enforced in v1; use `zag.timeout` or scope cancel).
+- `headers`: table of string → string request headers.
+- `follow_redirects`: bool, default true.
+- `timeout_ms`: integer (plumbed but not enforced in v1; use `zag.timeout` or scope cancel).
 
 ```lua
 local res, err = zag.http.get("https://api.github.com/zen", {
@@ -211,8 +211,8 @@ zag.log.info("zen: %s", res.body)
 
 Same shape as `get`, plus:
 
-- `body` — string or table. A table is auto-JSON-encoded and the default `Content-Type: application/json` is set unless overridden.
-- `content_type` — override content type for string bodies.
+- `body`: string or table. A table is auto-JSON-encoded and the default `Content-Type: application/json` is set unless overridden.
+- `content_type`: override content type for string bodies.
 
 ```lua
 local res = zag.http.post("https://httpbin.org/post", {
@@ -241,12 +241,12 @@ Run a subprocess to completion. Returns `{ code, stdout, stderr, truncated }` or
 
 `opts` fields:
 
-- `cwd` — working directory.
-- `timeout_ms` — deadline in milliseconds (`0` means no timeout).
-- `max_output_bytes` — cap captured stdout+stderr (`0` means unbounded).
-- `stdin` — string fed to the child on stdin.
-- `env` — table that **replaces** the inherited environment.
-- `env_extra` — table **overlaid** on the inherited environment.
+- `cwd`: working directory.
+- `timeout_ms`: deadline in milliseconds (`0` means no timeout).
+- `max_output_bytes`: cap captured stdout+stderr (`0` means unbounded).
+- `stdin`: string fed to the child on stdin.
+- `env`: table that **replaces** the inherited environment.
+- `env_extra`: table **overlaid** on the inherited environment.
 
 `env` and `env_extra` are mutually exclusive. `truncated` is `true` when `max_output_bytes` was hit.
 
@@ -263,12 +263,12 @@ Start a subprocess and get a handle back immediately. Returns `(CmdHandle, nil)`
 
 Handle methods:
 
-- `:pid()` — the child's pid.
-- `:wait()` — yield until exit; returns `{ code }` or `(nil, err)`.
-- `:lines()` — iterator over stdout lines.
-- `:write(data)` — write bytes to stdin.
-- `:close_stdin()` — close the stdin pipe.
-- `:kill(sig)` — send a signal. The kill is queued behind any in-flight read; for immediate interruption, use scope cancellation.
+- `:pid()`: the child's pid.
+- `:wait()`: yield until exit; returns `{ code }` or `(nil, err)`.
+- `:lines()`: iterator over stdout lines.
+- `:write(data)`: write bytes to stdin.
+- `:close_stdin()`: close the stdin pipe.
+- `:kill(sig)`: send a signal. The kill is queued behind any in-flight read; for immediate interruption, use scope cancellation.
 
 ```lua
 local proc, err = zag.cmd.spawn({ "tail", "-f", "/var/log/system.log" })
@@ -320,11 +320,11 @@ Synchronous bool. Does not yield. Cheap enough to call in tight loops.
 
 Start a new coroutine. Returns a `TaskHandle`:
 
-- `:cancel()` — cancel the task's scope.
-- `:done()` — bool, true once the coroutine has retired.
-- `:join()` — yield until retirement. Returns `(true, nil)` or `(nil, err)`.
+- `:cancel()`: cancel the task's scope.
+- `:done()`: bool, true once the coroutine has retired.
+- `:join()`: yield until retirement. Returns `(true, nil)` or `(nil, err)`.
 
-`join()` does not propagate the target coroutine's Lua return values — close over a shared table if you need results.
+`join()` does not propagate the target coroutine's Lua return values; close over a shared table if you need results.
 
 ### `zag.detach(fn, args...)`
 
@@ -393,7 +393,7 @@ zag.hook("ToolPre", { pattern = "bash" }, function(evt)
 end)
 ```
 
-Remember the 500 ms hook budget — the policy call must finish within that window or the hook is cancelled and the tool call proceeds unchecked (fail-open behavior). If your policy service is slow, cache its decisions in a top-level background task.
+Remember the 500 ms hook budget; the policy call must finish within that window or the hook is cancelled and the tool call proceeds unchecked (fail-open behavior). If your policy service is slow, cache its decisions in a top-level background task.
 
 ### Periodic background work via `zag.detach`
 
@@ -462,13 +462,13 @@ end)
 Lua logs go to scope `.lua_user`. Launch zag with the env vars that route that scope to your file log, or run `zig build -Dmetrics=true` for verbose tracing. Plain `print` from Lua also works and shows up in stderr.
 
 **My long-running hook is being cancelled.**
-Hooks have a 500 ms wall-clock budget. Move the slow work into a top-level `zag.detach` that caches state, and have the hook consult the cache. Alternatively, if you truly need a long hook, raise the budget from Zig via `LuaEngine.setHookBudgetMs(ms)` — there is no Lua-facing configuration for this in v1.
+Hooks have a 500 ms wall-clock budget. Move the slow work into a top-level `zag.detach` that caches state, and have the hook consult the cache. Alternatively, if you truly need a long hook, raise the budget from Zig via `LuaEngine.setHookBudgetMs(ms)`: there is no Lua-facing configuration for this in v1.
 
 **Ctrl+C killed my background task.**
 Ctrl+C cancels the active agent turn's scope. Tasks spawned inside hooks or keymap callbacks inherit that scope, so they die with it. Tasks spawned from top-level `config.lua` parent under the engine root scope and survive.
 
 **A primitive returned `"cancelled"` unexpectedly.**
-Something up the scope chain cancelled. Most often it is the hook budget, a `zag.timeout` expiring, or the user hitting Ctrl+C. Check `err == "cancelled"` and bail cleanly; do not retry in a loop — the scope is gone, and the next yield in the same coroutine will return `"cancelled"` again.
+Something up the scope chain cancelled. Most often it is the hook budget, a `zag.timeout` expiring, or the user hitting Ctrl+C. Check `err == "cancelled"` and bail cleanly; do not retry in a loop; the scope is gone, and the next yield in the same coroutine will return `"cancelled"` again.
 
 **`zag.sleep must be called inside zag.async/hook/keymap`.**
 You called an async primitive from a non-coroutine context (usually plain `config.lua` top-level). Wrap the work in `zag.detach(function() ... end)` if it should run once in the background, or move it into a hook.
@@ -478,8 +478,8 @@ Tool registration happens during `config.lua` load. If `config.lua` errors befor
 
 ## See also
 
-- [`examples/hooks.lua`](../../examples/hooks.lua) — tool veto, args rewrite, post-hook redaction, turn logging.
-- [`examples/keymap.lua`](../../examples/keymap.lua) — custom key bindings.
-- [`examples/policy-hook.lua`](./examples/policy-hook.lua) — remote policy service in a `ToolPre` hook.
-- [`examples/git-status.lua`](./examples/git-status.lua) — run git and log repository state on every turn.
-- [`examples/file-watcher.lua`](./examples/file-watcher.lua) — background mtime poller using `zag.detach`.
+- [`examples/hooks.lua`](../../examples/hooks.lua): tool veto, args rewrite, post-hook redaction, turn logging.
+- [`examples/keymap.lua`](../../examples/keymap.lua): custom key bindings.
+- [`examples/policy-hook.lua`](./examples/policy-hook.lua): remote policy service in a `ToolPre` hook.
+- [`examples/git-status.lua`](./examples/git-status.lua): run git and log repository state on every turn.
+- [`examples/file-watcher.lua`](./examples/file-watcher.lua): background mtime poller using `zag.detach`.

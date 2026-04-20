@@ -1,3 +1,14 @@
+//! Thread-safe ring buffer that carries completed Jobs from worker
+//! threads and helper threads back onto the main Lua thread.
+//!
+//! Workers push finished jobs under a mutex; the main thread drains
+//! them in the orchestrator's event loop and resumes the owning
+//! coroutine via `resumeFromJob`. An eventfd/pipe `wake_fd` is written
+//! on every push so the orchestrator's poll wakes immediately instead
+//! of relying on a timeout. Overflow is tracked via `dropped` rather
+//! than blocking producers, since blocking a worker inside the lock
+//! would stall the whole pool.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
@@ -54,7 +65,7 @@ pub const Queue = struct {
 
 const testing = std.testing;
 
-/// Minimal Job literal for queue plumbing tests — we only care about
+/// Minimal Job literal for queue plumbing tests. We only care about
 /// pointer identity, not kind semantics.
 fn stubJob(scope: *Scope) Job {
     return .{
