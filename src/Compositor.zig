@@ -23,10 +23,17 @@ const Compositor = @This();
 
 /// The screen grid to write into.
 screen: *Screen,
-/// Allocator for temporary allocations during compositing.
+/// Long-lived allocator used for per-buffer caches (e.g. ConversationBuffer
+/// per-node rendered-line cache).
 allocator: Allocator,
 /// Design system for colors, highlights, spacing, and borders.
 theme: *const Theme,
+/// Per-frame arena reset at the top of every `composite` call. Backs the
+/// output list returned from `Buffer.getVisibleLines` so the renderer
+/// does no per-line allocation on cache-hit frames. Retains capacity
+/// across frames, so the usual steady-state is zero `os.mmap` calls per
+/// frame.
+frame_arena: std.heap.ArenaAllocator,
 /// Orchestrator handle used to resolve pane-scoped diagnostics (e.g. the
 /// dropped-event counter on AgentRunner) from a focused leaf's Buffer.
 /// Null when running outside an orchestrator, which disables those
@@ -35,6 +42,21 @@ orchestrator: ?*EventOrchestrator = null,
 /// Whether the layout changed (resize/split/close) and borders need redrawing.
 /// The caller sets this; composite clears it.
 layout_dirty: bool = true,
+
+/// Create a Compositor with a fresh per-frame arena.
+pub fn init(screen: *Screen, allocator: Allocator, theme: *const Theme) Compositor {
+    return .{
+        .screen = screen,
+        .allocator = allocator,
+        .theme = theme,
+        .frame_arena = std.heap.ArenaAllocator.init(allocator),
+    };
+}
+
+/// Release the frame arena. Buffers and screen are owned elsewhere.
+pub fn deinit(self: *Compositor) void {
+    self.frame_arena.deinit();
+}
 
 /// Global UI state passed to the compositor each frame.
 pub const InputState = struct {
@@ -54,6 +76,12 @@ pub const InputState = struct {
 /// Only redraws leaves whose buffer is dirty. Always redraws the input/status row.
 /// On layout changes (layout_dirty), clears the full screen and redraws everything.
 pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) void {
+    // Reset per-frame arena: the previous frame's output lists and any
+    // spans arrays allocated for non-cached buffer paths are released
+    // in bulk. Cache-owned allocations live on `self.allocator` and are
+    // unaffected.
+    _ = self.frame_arena.reset(.retain_capacity);
+
     const root = layout.root orelse return;
     const focused = layout.focused orelse root;
 
@@ -191,18 +219,15 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
         0;
     const lines_needed = visible_end - visible_start;
 
-    // Request only the visible range from the buffer. Under the split
-    // allocator contract both args are `self.allocator` until the per-frame
-    // arena is introduced by Compositor's init/deinit pair.
+    // Request only the visible range from the buffer. The output list
+    // backing lives on the per-frame arena; spans and their text are
+    // cache-owned or borrowed into content.items.
     var visible_lines_span = trace.span("get_visible_lines");
-    var lines = buf.getVisibleLines(self.allocator, self.allocator, self.theme, visible_start, lines_needed) catch {
+    const lines = buf.getVisibleLines(self.frame_arena.allocator(), self.allocator, self.theme, visible_start, lines_needed) catch {
         visible_lines_span.end();
         return;
     };
     visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
-    // Span text is borrowed and spans arrays are cache-owned; the output
-    // list only needs its backing freed.
-    defer lines.deinit(self.allocator);
 
     // Write styled lines to screen
     var cur_row = content_y;
@@ -566,12 +591,9 @@ test "composite with empty layout does not crash" {
 
     const theme = Theme.defaultTheme();
 
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -586,12 +608,9 @@ test "composite writes buffer content at leaf rect with padding" {
 
     const theme = Theme.defaultTheme();
 
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
@@ -618,12 +637,9 @@ test "composite draws status line on last row" {
 
     const theme = Theme.defaultTheme();
 
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
@@ -659,12 +675,9 @@ test "composite skips clean buffer leaves" {
 
     const theme = Theme.defaultTheme();
 
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
@@ -698,12 +711,9 @@ test "drawStatusLine paints the mode indicator at column 0" {
 
     const theme = Theme.defaultTheme();
 
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
@@ -725,12 +735,9 @@ test "status row in normal mode shows mode label and buffer name only" {
     var screen = try Screen.init(allocator, 80, 10);
     defer screen.deinit();
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
     var layout = Layout.init(allocator);
@@ -753,12 +760,9 @@ test "composite draws rounded frame around a single pane" {
     defer screen.deinit();
 
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
     defer cb.deinit();
@@ -786,12 +790,9 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
     defer screen.deinit();
 
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb1 = try ConversationBuffer.init(allocator, 0, "left");
     defer cb1.deinit();
@@ -825,12 +826,9 @@ test "focused pane title has inverse style, unfocused is plain" {
     defer screen.deinit();
 
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb1 = try ConversationBuffer.init(allocator, 0, "aa");
     defer cb1.deinit();
@@ -877,12 +875,9 @@ test "title is suppressed when pane width is below 6" {
     defer screen.deinit();
 
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "longname");
     defer cb.deinit();
@@ -912,12 +907,9 @@ test "long titles are truncated with ellipsis" {
     defer screen.deinit();
 
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     // available = 12 - 6 = 6 glyphs for the name -> truncates "verylongname" to "veryl…"
     var cb = try ConversationBuffer.init(allocator, 0, "verylongname");
@@ -945,12 +937,9 @@ test "focused pane renders its draft with a block cursor at end" {
     var screen = try Screen.init(allocator, 40, 8);
     defer screen.deinit();
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
     for ("hi") |ch| cb.appendToDraft(ch);
@@ -983,12 +972,9 @@ test "cursor bg does not bleed across keystrokes" {
     var screen = try Screen.init(allocator, 40, 8);
     defer screen.deinit();
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
 
@@ -1025,12 +1011,9 @@ test "unfocused pane shows its draft without a cursor block" {
     var screen = try Screen.init(allocator, 40, 8);
     defer screen.deinit();
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
     var cb1 = try ConversationBuffer.init(allocator, 0, "a");
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "b");
@@ -1068,12 +1051,9 @@ test "normal mode does not paint a block cursor in the focused pane" {
     var screen = try Screen.init(allocator, 40, 8);
     defer screen.deinit();
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
     for ("hi") |ch| cb.appendToDraft(ch);
@@ -1107,12 +1087,9 @@ test "composite twice produces identical screen content" {
     defer screen.deinit();
 
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
 
     var cb = try ConversationBuffer.init(allocator, 0, "twice");
     defer cb.deinit();
@@ -1149,12 +1126,9 @@ test "tiny pane (height 3) skips the prompt reservation" {
     var screen = try Screen.init(allocator, 20, 4);
     defer screen.deinit();
     const theme = Theme.defaultTheme();
-    var compositor = Compositor{
-        .screen = &screen,
-        .allocator = allocator,
-        .theme = &theme,
-        .layout_dirty = true,
-    };
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
     for ("hi") |ch| cb.appendToDraft(ch);
