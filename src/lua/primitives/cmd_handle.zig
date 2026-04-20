@@ -167,6 +167,12 @@ pub const CmdHandle = struct {
         }
 
         self.helper = try std.Thread.spawn(.{}, helperLoop, .{self});
+        // Name the helper for nicer debugger/`ps -M` output. setName
+        // can fail on some OSes (permissions, unsupported); ignore
+        // and log at debug — the helper still works unnamed.
+        self.helper.setName("zag.cmd_handle") catch |err| {
+            log.debug("cmd_handle helper setName failed: {s}", .{@errorName(err)});
+        };
         return self;
     }
 

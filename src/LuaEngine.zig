@@ -858,8 +858,31 @@ pub const LuaEngine = struct {
         // Atomic transition .running -> .waiting. Fails if another
         // coroutine is already suspended in :wait or the child has
         // already exited (the fast path above catches the latter, but
-        // another thread could have won the race).
+        // the helper could have reaped between our fast-path load and
+        // this CAS).
         if (!h.claimWaitSlot()) {
+            // Re-check state to distinguish "another coroutine is
+            // waiting" from "child was reaped between our fast-path
+            // load and this CAS". Only the latter is recoverable;
+            // fall through to the fast-path return with the code.
+            const now_state = h.state.load(.acquire);
+            if (now_state == .exited) {
+                if (h.exit_code) |c| {
+                    co.pushInteger(c);
+                    co.pushNil();
+                    return 2;
+                }
+                // `.exited` with no code stored shouldn't happen —
+                // `runWait` always stores a code before the release
+                // store. Defensive: surface as io_error so the caller
+                // can see something went wrong.
+                co.pushNil();
+                _ = co.pushString("io_error: handle in .exited with no exit_code");
+                return 2;
+            }
+            // State must be .waiting (we never transition .running
+            // -> .running, and .exited is handled above). Another
+            // coroutine is the waiter; reject this call.
             co.raiseErrorStr("cmd:wait already has a waiting coroutine", .{});
         }
 
@@ -876,12 +899,26 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `CmdHandle:kill(signal)` — deliver a signal to the child. Does
-    /// not yield; the call routes the kill through the helper thread
-    /// (which also owns `child.wait()`) so the signal cannot race the
-    /// kernel recycling the child's PID after reap. Known signals:
-    /// TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT. Calling
-    /// after `:wait()` has returned is a no-op.
+    /// `CmdHandle:kill(signal)` — deliver a signal to the child.
+    ///
+    /// Routed through the helper thread to eliminate the PID-recycle race
+    /// that would exist if we called `std.posix.kill` directly from main
+    /// (the helper could reap between our state-read and our syscall,
+    /// letting the kernel recycle the PID under us).
+    ///
+    /// Limitation: if a `:wait` is already in flight on this handle (the
+    /// helper is blocked in `child.wait()`), this kill sits in the queue
+    /// until the child self-exits, at which point `runKill` sees
+    /// `.exited` and no-ops. So `:kill` cannot interrupt a pending
+    /// `:wait` from another coroutine. To force termination while another
+    /// coroutine is awaiting, cancel that coroutine's scope instead —
+    /// scope cancellation fires the Job aborter, which `SIGKILL`s the
+    /// child directly without going through the helper queue.
+    ///
+    /// Known signals: TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT.
+    /// Calling after `:wait()` has returned is a no-op.
+    ///
+    /// Arg 1: handle userdata. Arg 2: signal name string. Returns nothing.
     fn cmdHandleKill(lua: *Lua) i32 {
         const ud = lua.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
         const h = ud.ptr orelse {
@@ -898,9 +935,12 @@ pub const LuaEngine = struct {
             return 0;
         }
 
-        // Route through the helper so the kill is serialised with the
-        // helper's `child.wait()` call. If a wait is already queued
-        // the kill still lands first (FIFO order on the queue).
+        // Route through the helper so the kill is serialised with
+        // `child.wait()` (prevents the PID-recycle race). Note: if a
+        // wait is already executing on the helper, the helper is
+        // blocked in `child.wait()` and won't pop this kill until the
+        // child exits — by which point `runKill` sees `.exited` and
+        // no-ops. Use scope cancellation for force-kill while waiting.
         h.submit(.{ .kill = .{ .signo = signo } }) catch |err| {
             log.debug("cmd:kill submit failed: {s}", .{@errorName(err)});
         };
