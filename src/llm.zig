@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const auth = @import("auth.zig");
 const Allocator = std.mem.Allocator;
 
 pub const anthropic = @import("providers/anthropic.zig");
@@ -141,8 +142,6 @@ pub const Endpoint = struct {
     serializer: Serializer,
     /// Full URL for chat completions.
     url: []const u8,
-    /// Env var holding the API key. Null if no auth needed.
-    key_env: ?[]const u8,
     /// How to send the API key in HTTP headers.
     auth: Auth,
     /// Additional HTTP headers sent with every request.
@@ -172,8 +171,6 @@ pub const Endpoint = struct {
         errdefer allocator.free(name);
         const url = try allocator.dupe(u8, self.url);
         errdefer allocator.free(url);
-        const key_env = if (self.key_env) |k| try allocator.dupe(u8, k) else null;
-        errdefer if (key_env) |k| allocator.free(k);
 
         const headers = try allocator.alloc(Header, self.headers.len);
         errdefer allocator.free(headers);
@@ -194,7 +191,6 @@ pub const Endpoint = struct {
             .name = name,
             .serializer = self.serializer,
             .url = url,
-            .key_env = key_env,
             .auth = self.auth,
             .headers = headers,
         };
@@ -207,7 +203,6 @@ pub const Endpoint = struct {
             allocator.free(h.value);
         }
         allocator.free(self.headers);
-        if (self.key_env) |k| allocator.free(k);
         allocator.free(self.url);
         allocator.free(self.name);
     }
@@ -218,7 +213,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "anthropic",
         .serializer = .anthropic,
         .url = "https://api.anthropic.com/v1/messages",
-        .key_env = "ANTHROPIC_API_KEY",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
     },
@@ -226,7 +220,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "openai",
         .serializer = .openai,
         .url = "https://api.openai.com/v1/chat/completions",
-        .key_env = "OPENAI_API_KEY",
         .auth = .bearer,
         .headers = &.{},
     },
@@ -234,7 +227,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "openrouter",
         .serializer = .openai,
         .url = "https://openrouter.ai/api/v1/chat/completions",
-        .key_env = "OPENROUTER_API_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
     },
@@ -242,7 +234,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "groq",
         .serializer = .openai,
         .url = "https://api.groq.com/openai/v1/chat/completions",
-        .key_env = "GROQ_API_KEY",
         .auth = .bearer,
         .headers = &.{},
     },
@@ -250,11 +241,19 @@ const builtin_endpoints = [_]Endpoint{
         .name = "ollama",
         .serializer = .openai,
         .url = "http://localhost:11434/v1/chat/completions",
-        .key_env = null,
         .auth = .none,
         .headers = &.{},
     },
 };
+
+/// True if `name` matches any entry in `builtin_endpoints`. Used by the Lua
+/// binding `zag.provider{ name = "..." }` to fail loud on typos at load time.
+pub fn isBuiltinEndpointName(name: []const u8) bool {
+    for (&builtin_endpoints) |ep| {
+        if (std.mem.eql(u8, ep.name, name)) return true;
+    }
+    return false;
+}
 
 /// Runtime registry of LLM endpoints. Seeded with built-ins, extensible at runtime.
 pub const Registry = struct {
@@ -418,31 +417,41 @@ pub const ProviderResult = struct {
     }
 };
 
-/// Create a provider from the ZAG_MODEL environment variable.
-/// Reads the model string, initializes the endpoint registry, looks up the
-/// provider, and returns everything bundled in a single ProviderResult.
-pub fn createProviderFromEnv(allocator: Allocator) !ProviderResult {
-    const model_id = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
-        try allocator.dupe(u8, "anthropic/claude-sonnet-4-20250514");
+/// Create a provider from Lua-populated config.
+///
+/// `default_model` is the model string the user set via
+/// `zag.set_default_model("prov/id")` (null falls back to
+/// `anthropic/claude-sonnet-4-20250514`). The api key is read out of
+/// `auth_file_path` (normally `~/.config/zag/auth.json`) via `auth.getApiKey`.
+/// Endpoints whose `auth` discriminator is `.none` (e.g. Ollama) skip the
+/// credential lookup entirely. The returned `ProviderResult` owns the duped
+/// model string, the duped api key, the endpoint registry, and the serializer
+/// state.
+pub fn createProviderFromLuaConfig(
+    default_model: ?[]const u8,
+    auth_file_path: []const u8,
+    allocator: Allocator,
+) !ProviderResult {
+    const model_id = try allocator.dupe(u8, default_model orelse "anthropic/claude-sonnet-4-20250514");
     errdefer allocator.free(model_id);
 
     var registry = try Registry.init(allocator);
     errdefer registry.deinit();
 
-    return createProviderWithRegistry(model_id, registry, allocator);
-}
-
-/// Create a provider from an explicit model string and registry.
-/// Takes ownership of both model_id and registry on success.
-fn createProviderWithRegistry(model_id: []const u8, registry: Registry, allocator: Allocator) !ProviderResult {
     const spec = parseModelString(model_id);
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
-    const api_key = if (endpoint.key_env) |env|
-        std.process.getEnvVarOwned(allocator, env) catch return error.MissingApiKey
-    else
-        try allocator.dupe(u8, "");
+    const api_key: []const u8 = switch (endpoint.auth) {
+        .none => try allocator.dupe(u8, ""),
+        .x_api_key, .bearer => blk: {
+            var auth_file = try auth.loadAuthFile(allocator, auth_file_path);
+            defer auth_file.deinit();
+            const borrowed = (try auth_file.getApiKey(spec.provider_name)) orelse
+                return error.MissingCredential;
+            break :blk try allocator.dupe(u8, borrowed);
+        },
+    };
     errdefer allocator.free(api_key);
 
     switch (endpoint.serializer) {
@@ -848,7 +857,6 @@ test "Endpoint.dupe creates independent copy" {
         .name = "test",
         .serializer = .openai,
         .url = "https://example.com",
-        .key_env = "TEST_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
     };
@@ -858,7 +866,6 @@ test "Endpoint.dupe creates independent copy" {
 
     try std.testing.expectEqualStrings("test", duped.name);
     try std.testing.expectEqualStrings("https://example.com", duped.url);
-    try std.testing.expectEqualStrings("TEST_KEY", duped.key_env.?);
     try std.testing.expectEqual(Serializer.openai, duped.serializer);
     try std.testing.expectEqual(Endpoint.Auth.bearer, duped.auth);
     try std.testing.expectEqual(@as(usize, 1), duped.headers.len);
@@ -868,25 +875,6 @@ test "Endpoint.dupe creates independent copy" {
     // Verify independence: pointers must differ
     try std.testing.expect(original.name.ptr != duped.name.ptr);
     try std.testing.expect(original.url.ptr != duped.url.ptr);
-}
-
-test "Endpoint.dupe handles null key_env" {
-    const allocator = std.testing.allocator;
-
-    const original = Endpoint{
-        .name = "ollama",
-        .serializer = .openai,
-        .url = "http://localhost:11434/v1/chat/completions",
-        .key_env = null,
-        .auth = .none,
-        .headers = &.{},
-    };
-
-    const duped = try original.dupe(allocator);
-    defer duped.free(allocator);
-
-    try std.testing.expectEqual(@as(?[]const u8, null), duped.key_env);
-    try std.testing.expectEqual(@as(usize, 0), duped.headers.len);
 }
 
 test {
@@ -1053,15 +1041,116 @@ test "parseModelString handles nested slashes for openrouter" {
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", result.model_id);
 }
 
-test "createProviderWithRegistry returns UnknownProvider for unsupported provider" {
+test "createProviderFromLuaConfig reads model from engine and key from auth.json" {
     const allocator = std.testing.allocator;
-    const model = try allocator.dupe(u8, "fakeprovider/some-model");
-    var registry = try Registry.init(allocator);
-    const result = createProviderWithRegistry(model, registry, allocator);
-    // On error, ownership stays with us
-    defer allocator.free(model);
-    defer registry.deinit();
-    try std.testing.expectError(error.UnknownProvider, result);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "openai": { "type": "api_key", "key": "sk-openai-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var result = try createProviderFromLuaConfig("openai/gpt-4o", auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("openai/gpt-4o", result.model_id);
+    try std.testing.expectEqualStrings("sk-openai-test", result.api_key);
+    try std.testing.expectEqual(Serializer.openai, result.serializer);
+}
+
+test "createProviderFromLuaConfig uses hardcoded fallback when default_model unset" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "anthropic": { "type": "api_key", "key": "sk-ant-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var result = try createProviderFromLuaConfig(null, auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", result.model_id);
+    try std.testing.expectEqualStrings("sk-ant-test", result.api_key);
+    try std.testing.expectEqual(Serializer.anthropic, result.serializer);
+}
+
+test "createProviderFromLuaConfig returns MissingCredential when provider not in auth.json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "anthropic": { "type": "api_key", "key": "sk-ant-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    try std.testing.expectError(
+        error.MissingCredential,
+        createProviderFromLuaConfig("openai/gpt-4o", auth_path, allocator),
+    );
+}
+
+test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints" {
+    // Ollama has Endpoint.auth = .none. Even with no auth.json present we must
+    // succeed and hand back an empty api_key string.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var result = try createProviderFromLuaConfig("ollama/llama3", auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("ollama/llama3", result.model_id);
+    try std.testing.expectEqualStrings("", result.api_key);
+    try std.testing.expectEqual(Serializer.openai, result.serializer);
+}
+
+test "createProviderFromLuaConfig returns UnknownProvider for unsupported provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    try std.testing.expectError(
+        error.UnknownProvider,
+        createProviderFromLuaConfig("fakeprovider/some-model", auth_path, allocator),
+    );
 }
 
 test "ResponseBuilder assembles text and tool_use blocks" {
@@ -1141,7 +1230,6 @@ test "Registry initializes with built-in endpoints" {
     const ollama = registry.find("ollama");
     try std.testing.expect(ollama != null);
     try std.testing.expectEqual(Endpoint.Auth.none, ollama.?.auth);
-    try std.testing.expectEqual(@as(?[]const u8, null), ollama.?.key_env);
 
     try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("unknown"));
 }
@@ -1159,7 +1247,6 @@ test "buildHeaders creates correct auth for bearer endpoint" {
         .name = "test",
         .serializer = .openai,
         .url = "https://example.com",
-        .key_env = "TEST_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
     };
@@ -1177,7 +1264,6 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
         .name = "test",
         .serializer = .anthropic,
         .url = "https://example.com",
-        .key_env = "TEST_KEY",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
     };
@@ -1195,7 +1281,6 @@ test "buildHeaders handles no-auth endpoint" {
         .name = "ollama",
         .serializer = .openai,
         .url = "http://localhost:11434/v1/chat/completions",
-        .key_env = null,
         .auth = .none,
         .headers = &.{},
     };
@@ -1347,4 +1432,18 @@ test "Provider.call accepts a Request struct" {
     // Intentionally no call yet; this file compiles because Request
     // is a plain struct. Task 2 updates Provider.call to take *const
     // Request and this test is extended to call a mock provider.
+}
+
+test "isBuiltinEndpointName recognizes built-in providers" {
+    try std.testing.expect(isBuiltinEndpointName("anthropic"));
+    try std.testing.expect(isBuiltinEndpointName("openai"));
+    try std.testing.expect(isBuiltinEndpointName("openrouter"));
+    try std.testing.expect(isBuiltinEndpointName("groq"));
+    try std.testing.expect(isBuiltinEndpointName("ollama"));
+}
+
+test "isBuiltinEndpointName rejects unknown names" {
+    try std.testing.expect(!isBuiltinEndpointName("bogus"));
+    try std.testing.expect(!isBuiltinEndpointName(""));
+    try std.testing.expect(!isBuiltinEndpointName("ANTHROPIC"));
 }

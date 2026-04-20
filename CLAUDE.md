@@ -6,27 +6,41 @@ Zag is a composable agent development environment built in Zig. The window syste
 ## Build & run
 ```bash
 zig build                    # build
-zig build run                # run (default: anthropic/claude-sonnet-4-20250514)
+zig build run                # run (default model from config.lua, fallback: anthropic/claude-sonnet-4-20250514)
 zig build test               # run tests
 zig build -Dmetrics=true     # enable performance tracing
 zig fmt --check .            # check formatting
-
-ZAG_MODEL="openai/gpt-4o" zig build run                            # use OpenAI
-ZAG_MODEL="anthropic/claude-sonnet-4-20250514" zig build run        # use Claude (default)
-ZAG_MODEL="openrouter/anthropic/claude-sonnet-4" zig build run      # use OpenRouter
-ZAG_MODEL="ollama/llama3" zig build run                             # use local Ollama
 
 zig build run -- --session=<id>   # resume specific session
 zig build run -- --last           # resume most recent session
 ```
 
-Requires: Zig 0.15+. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, etc. depending on provider.
+Requires: Zig 0.15+. Dependencies: ziglua (Lua 5.4, compiled from source).
 
-Dependencies: ziglua (Lua 5.4, compiled from source).
+## Configuration
 
-## Plugin config
-~/.config/zag/config.lua     # User configuration (optional)
-~/.config/zag/lua/           # Plugin modules loaded via require()
+Two files, both optional, both under `~/.config/zag/`.
+
+`config.lua` declares providers and the default model:
+
+```lua
+zag.provider { name = "anthropic" }
+zag.provider { name = "openai" }
+zag.set_default_model("openai/gpt-4o")
+```
+
+`auth.json` holds provider API keys. Create by hand, chmod `0600`; Ollama is keyless.
+
+```json
+{
+  "anthropic":  { "type": "api_key", "key": "sk-ant-..." },
+  "openai":     { "type": "api_key", "key": "sk-..." },
+  "openrouter": { "type": "api_key", "key": "sk-or-..." },
+  "groq":       { "type": "api_key", "key": "gsk_..." }
+}
+```
+
+Plugin modules load from `~/.config/zag/lua/?.lua` via `require()`.
 
 ## Zig coding standards (learned from Ghostty)
 
