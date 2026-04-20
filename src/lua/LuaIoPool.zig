@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
+const Scope = @import("Scope.zig").Scope;
 const CompletionQueue = @import("LuaCompletionQueue.zig").Queue;
 
 pub const Pool = struct {
@@ -106,6 +107,16 @@ pub const Pool = struct {
 
 const testing = std.testing;
 
+/// Minimal Job literal for pool plumbing tests — these tests only care
+/// about pointer routing through the pool, not kind dispatch semantics.
+fn stubJob(scope: *Scope) Job {
+    return .{
+        .kind = .{ .sleep = .{ .ms = 0 } },
+        .thread_ref = 0,
+        .scope = scope,
+    };
+}
+
 test "Pool starts and shuts down cleanly" {
     const alloc = testing.allocator;
     var completions = try CompletionQueue.init(alloc, 16);
@@ -117,6 +128,8 @@ test "Pool starts and shuts down cleanly" {
 
 test "Pool.submit rejects after shutdown is signalled" {
     const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
     var completions = try CompletionQueue.init(alloc, 16);
     defer completions.deinit();
 
@@ -126,21 +139,23 @@ test "Pool.submit rejects after shutdown is signalled" {
     // Signal shutdown manually before submit
     pool.shutdown.store(true, .release);
 
-    var job = Job{};
+    var job = stubJob(root);
     try testing.expectError(error.PoolShuttingDown, pool.submit(&job));
 }
 
 test "worker bumps completions.dropped when ring is full" {
     const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
     var completions = try CompletionQueue.init(alloc, 1);
     defer completions.deinit();
 
     const pool = try Pool.init(alloc, 2, &completions);
     defer pool.deinit();
 
-    var j1 = Job{};
-    var j2 = Job{};
-    var j3 = Job{};
+    var j1 = stubJob(root);
+    var j2 = stubJob(root);
+    var j3 = stubJob(root);
     try pool.submit(&j1);
     try pool.submit(&j2);
     try pool.submit(&j3);
@@ -176,13 +191,15 @@ test "Pool init errdefer cleans up partial workers on spawn failure" {
 
 test "Pool submit routes job to worker and posts to completion queue" {
     const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
     var completions = try CompletionQueue.init(alloc, 16);
     defer completions.deinit();
 
     const pool = try Pool.init(alloc, 2, &completions);
     defer pool.deinit();
 
-    var job = Job{};
+    var job = stubJob(root);
     try pool.submit(&job);
 
     // Poll the completion queue for up to 1s

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
+const Scope = @import("Scope.zig").Scope;
 
 pub const Queue = struct {
     alloc: Allocator,
@@ -53,14 +54,26 @@ pub const Queue = struct {
 
 const testing = std.testing;
 
+/// Minimal Job literal for queue plumbing tests — we only care about
+/// pointer identity, not kind semantics.
+fn stubJob(scope: *Scope) Job {
+    return .{
+        .kind = .{ .sleep = .{ .ms = 0 } },
+        .thread_ref = 0,
+        .scope = scope,
+    };
+}
+
 test "Queue push/pop FIFO order" {
     const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
     var q = try Queue.init(alloc, 4);
     defer q.deinit();
 
-    var j1 = Job{};
-    var j2 = Job{};
-    var j3 = Job{};
+    var j1 = stubJob(root);
+    var j2 = stubJob(root);
+    var j3 = stubJob(root);
     try q.push(&j1);
     try q.push(&j2);
     try q.push(&j3);
@@ -73,12 +86,14 @@ test "Queue push/pop FIFO order" {
 
 test "Queue push returns QueueFull when capacity exceeded" {
     const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
     var q = try Queue.init(alloc, 2);
     defer q.deinit();
 
-    var j1 = Job{};
-    var j2 = Job{};
-    var j3 = Job{};
+    var j1 = stubJob(root);
+    var j2 = stubJob(root);
+    var j3 = stubJob(root);
     try q.push(&j1);
     try q.push(&j2);
     try testing.expectError(error.QueueFull, q.push(&j3));
@@ -86,6 +101,8 @@ test "Queue push returns QueueFull when capacity exceeded" {
 
 test "Queue.push writes one byte to wake_fd" {
     const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
     var q = try Queue.init(alloc, 4);
     defer q.deinit();
 
@@ -94,7 +111,7 @@ test "Queue.push writes one byte to wake_fd" {
     defer std.posix.close(fds[1]);
 
     q.wake_fd = fds[1];
-    var j = Job{};
+    var j = stubJob(root);
     try q.push(&j);
 
     var buf: [4]u8 = undefined;
