@@ -178,10 +178,23 @@ fn notifyLeafRects(self: *WindowManager) void {
 }
 
 /// Shift focus to the neighbouring pane and mark the compositor dirty so
-/// the focused / unfocused frame styling repaints.
+/// the focused / unfocused frame styling repaints. If the layout swapped
+/// focus to a different leaf, notify both sides via `buffer.onFocus`.
 pub fn doFocus(self: *WindowManager, dir: Layout.FocusDirection) void {
+    const prev = self.layout.getFocusedLeaf();
     self.layout.focusDirection(dir);
     self.compositor.layout_dirty = true;
+    const next = self.layout.getFocusedLeaf();
+    notifyFocusSwap(prev, next);
+}
+
+/// Fire `onFocus(false)` on `prev` and `onFocus(true)` on `next` when the
+/// two are distinct. Extracted so every layout path that moves focus
+/// (navigation, split, close) routes through one place.
+fn notifyFocusSwap(prev: ?*Layout.LayoutNode.Leaf, next: ?*Layout.LayoutNode.Leaf) void {
+    if (prev == next) return;
+    if (prev) |p| p.buffer.onFocus(false);
+    if (next) |n| n.buffer.onFocus(true);
 }
 
 /// Run a keymap-bound Action. Mutating mode, layout, or compositor state
@@ -195,10 +208,12 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
         .split_vertical => self.doSplit(.vertical),
         .split_horizontal => self.doSplit(.horizontal),
         .close_window => {
+            const prev = self.layout.getFocusedLeaf();
             self.layout.closeWindow();
             self.layout.recalculate(self.screen.width, self.screen.height);
             self.compositor.layout_dirty = true;
             self.notifyLeafRects();
+            notifyFocusSwap(prev, self.layout.getFocusedLeaf());
         },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
@@ -230,6 +245,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     // Capture the label that createSplitPane is about to consume so the
     // announce below matches the new pane's name.
     const scratch_id = self.next_scratch_id;
+    const prev_focus = self.layout.getFocusedLeaf();
     const pane = self.createSplitPane() catch |err| {
         log.warn("split pane creation failed: {}", .{err});
         return;
@@ -246,6 +262,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
+    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // The new pane is ready to be typed into. Drop back to insert mode so
     // the user can start a conversation without an extra `i` keystroke,
