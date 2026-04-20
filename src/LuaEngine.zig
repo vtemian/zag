@@ -1433,9 +1433,24 @@ pub const LuaEngine = struct {
             }
             return 2;
         }
-        _ = self;
         switch (job.kind) {
             .sleep => {
+                co.pushBoolean(true);
+                co.pushNil();
+                return 2;
+            },
+            .cmd_exec => {
+                // Task 6.2 wires the proper result table (code/stdout/stderr/
+                // truncated). For now push a placeholder and free the owned
+                // buffers so cmd_exec jobs routed through the pool don't leak
+                // when the eventual binding isn't yet reading them.
+                if (job.result) |r| switch (r) {
+                    .cmd_exec => |cr| {
+                        self.allocator.free(cr.stdout);
+                        self.allocator.free(cr.stderr);
+                    },
+                    else => {},
+                };
                 co.pushBoolean(true);
                 co.pushNil();
                 return 2;

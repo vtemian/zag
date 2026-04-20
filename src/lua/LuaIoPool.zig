@@ -100,7 +100,7 @@ pub const Pool = struct {
             if (job.scope.isCancelled()) {
                 job.err_tag = .cancelled;
             } else {
-                executeJob(job);
+                executeJob(self.alloc, job);
             }
             self.completions.push(job) catch {
                 _ = self.completions.dropped.fetchAdd(1, .monotonic);
@@ -112,7 +112,7 @@ pub const Pool = struct {
 /// Dispatch a job based on its kind. Module-scope so it can be exercised
 /// without instantiating a Pool. Each variant is responsible for filling
 /// either job.result (success) or job.err_tag (failure), not both.
-fn executeJob(job: *Job) void {
+fn executeJob(alloc: Allocator, job: *Job) void {
     switch (job.kind) {
         .sleep => |s| {
             const deadline = std.time.milliTimestamp() + @as(i64, @intCast(s.ms));
@@ -125,6 +125,7 @@ fn executeJob(job: *Job) void {
             }
             job.result = .empty;
         },
+        .cmd_exec => @import("primitives/cmd.zig").executeExec(alloc, job),
     }
 }
 

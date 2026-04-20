@@ -11,5 +11,6 @@ test {
     _ = @import("Job.zig");
     _ = @import("LuaCompletionQueue.zig");
     _ = @import("LuaIoPool.zig");
+    _ = @import("primitives/cmd.zig");
     _ = @import("integration_test.zig");
 }
