@@ -6,7 +6,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
-const AgentThread = @import("AgentThread.zig");
+const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const LuaEngine = @import("LuaEngine.zig");
 const Allocator = std.mem.Allocator;
@@ -53,14 +53,14 @@ fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]c
 /// Runs the streaming agent loop: call LLM, execute tools, repeat until
 /// the model produces a text-only response or the cancel flag is set.
 /// Pushes events to the queue for UI updates. Returns errors to the caller
-/// (AgentThread handles the error boundary and .done signal).
+/// (AgentRunner.threadMain handles the error boundary and .done signal).
 pub fn runLoopStreaming(
     messages: *std.ArrayList(types.Message),
     registry: *const tools.Registry,
     provider: llm.Provider,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
@@ -119,8 +119,8 @@ pub fn runLoopStreaming(
 fn fireLifecycleHook(
     lua_engine: ?*LuaEngine.LuaEngine,
     payload: *Hooks.HookPayload,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
 ) void {
     if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) return;
     var req = Hooks.HookRequest.init(payload);
@@ -138,7 +138,7 @@ fn fireLifecycleHook(
 /// allocator, and running text_delta count on the caller's stack so a second
 /// thread entering `callLlm` cannot stomp on it.
 const StreamContext = struct {
-    queue: *AgentThread.EventQueue,
+    queue: *agent_events.EventQueue,
     allocator: Allocator,
     text_count: u32 = 0,
 };
@@ -150,8 +150,8 @@ fn callLlm(
     messages: []const types.Message,
     tool_defs: []const types.ToolDefinition,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
 ) !types.LlmResponse {
     var stream_ctx: StreamContext = .{ .queue = queue, .allocator = allocator };
     const callback: llm.StreamCallback = .{
@@ -199,7 +199,7 @@ fn callLlm(
 }
 
 /// Push token usage info to the UI queue.
-fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *AgentThread.EventQueue) !void {
+fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *agent_events.EventQueue) !void {
     var scratch: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
     const duped = try allocator.dupe(u8, msg);
@@ -239,8 +239,8 @@ const ToolCallContext = struct {
     tool_call: types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
     results: []ToolCallResult,
     lua_engine: ?*LuaEngine.LuaEngine,
 };
@@ -275,8 +275,8 @@ fn firePreHook(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
 ) !PreHookOutcome {
     // No engine or no hooks registered -> proceed immediately without a
     // main-thread round-trip. Keeps unit tests that lack a dispatcher from
@@ -320,8 +320,8 @@ fn firePostHook(
     tc: types.ContentBlock.ToolUse,
     elapsed_ms: u64,
     result: ToolCallResult,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
 ) !PostHookOutcome {
     // No engine or no hooks registered -> skip round-trip. Same rationale
     // as firePreHook: avoid deadlocks in dispatcher-less tests and useless
@@ -362,8 +362,8 @@ fn runToolStep(
     tc: types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
 ) !ToolCallResult {
     if (cancel.load(.acquire)) return error.Cancelled;
@@ -485,8 +485,8 @@ pub fn executeTools(
     tool_calls: []const types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
 ) ![]types.ContentBlock {
     if (tool_calls.len == 0) return &.{};
@@ -572,8 +572,8 @@ fn executeToolsSingle(
     tc: types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
     allocator: Allocator,
-    queue: *AgentThread.EventQueue,
-    cancel: *AgentThread.CancelFlag,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
 ) ![]types.ContentBlock {
     const step = try runToolStep(tc, registry, allocator, queue, cancel, lua_engine);
@@ -601,7 +601,7 @@ fn executeToolsSingle(
 fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
     const stream_ctx: *StreamContext = @ptrCast(@alignCast(ctx));
     const alloc = stream_ctx.allocator;
-    const agent_event: AgentThread.AgentEvent = switch (event) {
+    const agent_event: agent_events.AgentEvent = switch (event) {
         .text_delta => |t| blk: {
             const duped = alloc.dupe(u8, t) catch return;
             stream_ctx.text_count += 1;
@@ -740,8 +740,8 @@ fn freeToolResults(blocks: []types.ContentBlock, allocator: Allocator) void {
 }
 
 /// Helper: drain and discard all events from a queue, freeing owned strings.
-fn drainAndFreeQueue(queue: *AgentThread.EventQueue, allocator: Allocator) void {
-    var buf: [64]AgentThread.AgentEvent = undefined;
+fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void {
+    var buf: [64]agent_events.AgentEvent = undefined;
     while (true) {
         const count = queue.drain(&buf);
         if (count == 0) break;
@@ -777,10 +777,10 @@ test "single tool call runs inline without threading" {
     defer registry.deinit();
     try registry.register(echo_fast_tool);
 
-    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
+    var queue = try agent_events.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
-    var cancel = AgentThread.CancelFlag.init(false);
+    var cancel = agent_events.CancelFlag.init(false);
 
     const tool_calls = [_]types.ContentBlock.ToolUse{
         .{ .id = "call_1", .name = "echo_fast", .input_raw = "{}" },
@@ -809,10 +809,10 @@ test "parallel execution preserves result order" {
     try registry.register(echo_slow_tool);
     try registry.register(echo_fast_tool);
 
-    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
+    var queue = try agent_events.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
-    var cancel = AgentThread.CancelFlag.init(false);
+    var cancel = agent_events.CancelFlag.init(false);
 
     // Mix slow and fast tools: order must be preserved regardless of finish time
     const tool_calls = [_]types.ContentBlock.ToolUse{
@@ -852,10 +852,10 @@ test "parallel execution is faster than sequential" {
     defer registry.deinit();
     try registry.register(echo_slow_tool);
 
-    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
+    var queue = try agent_events.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
-    var cancel = AgentThread.CancelFlag.init(false);
+    var cancel = agent_events.CancelFlag.init(false);
 
     // Three slow tools (50ms each). Sequential would take ~150ms.
     // Parallel should take ~50ms + overhead.
@@ -888,11 +888,11 @@ test "cancel flag is respected in parallel execution" {
     defer registry.deinit();
     try registry.register(echo_slow_tool);
 
-    var queue = try AgentThread.EventQueue.initBounded(allocator, 256);
+    var queue = try agent_events.EventQueue.initBounded(allocator, 256);
     defer queue.deinit();
 
     // Set cancel before execution
-    var cancel = AgentThread.CancelFlag.init(true);
+    var cancel = agent_events.CancelFlag.init(true);
 
     const tool_calls = [_]types.ContentBlock.ToolUse{
         .{ .id = "call_1", .name = "echo_slow", .input_raw = "{}" },
@@ -950,16 +950,16 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
         .{ .id = "call_2", .name = "read", .input_raw = "{\"path\":\"zag-hook-e2e.txt\"}" },
     };
 
-    var queue = try AgentThread.EventQueue.initBounded(alloc, 256);
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
     defer queue.deinit();
-    var cancel = AgentThread.CancelFlag.init(false);
+    var cancel = agent_events.CancelFlag.init(false);
 
     // Pump thread: services hook_request and lua_tool_request events off the
     // queue. `dispatchHookRequests` handles both; only one registered tool
     // (read) is Zig, so lua_tool_request won't fire here, but the pump stays
     // agnostic.
     const Pump = struct {
-        fn pump(q: *AgentThread.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng);
                 std.Thread.sleep(1 * std.time.ns_per_ms);

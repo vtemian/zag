@@ -133,7 +133,7 @@ src/
     anthropic.zig   Anthropic Messages API serializer
     openai.zig      OpenAI Chat Completions serializer
   types.zig         Message, ContentBlock, ToolCall, ToolResult
-  AgentThread.zig   background agent thread with event queue
+  AgentRunner.zig   per-pane agent lifecycle: thread, queue, cancel, event drain
   Session.zig       JSONL session persistence and management
   LuaEngine.zig     Lua plugin engine (config loading, tool bridging)
   Buffer.zig        runtime-polymorphic buffer interface (ptr+vtable)

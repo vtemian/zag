@@ -3,8 +3,9 @@
 //! The agent thread produces `AgentEvent`s into a bounded `EventQueue`;
 //! the main thread drains them each frame. A `CancelFlag` lets the main
 //! thread request cooperative cancellation. These types live here (rather
-//! than in `AgentThread.zig`) so observers - like `ConversationBuffer` -
-//! can reference them without pulling in the spawn machinery.
+//! than beside the spawn machinery in `AgentRunner.zig`) so observers -
+//! like `ConversationBuffer` - can reference them without pulling in the
+//! thread-spawning code.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -439,7 +439,7 @@ fn dumpTraceFile(self: *WindowManager) void {
 }
 
 /// Drain a pane's agent events and auto-name its session on first completion.
-/// Hook dispatch is the coordinator's responsibility (see AgentSupervisor.drainHooks).
+/// Hook dispatch is folded into AgentRunner.drainEvents (dispatchHookRequests).
 pub fn drainPane(self: *WindowManager, pane: Pane) void {
     if (pane.runner.drainEvents(self.allocator)) {
         self.autoNameSession(pane);
