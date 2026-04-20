@@ -23,7 +23,6 @@ const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
-const AgentSupervisor = @import("AgentSupervisor.zig");
 const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const trace = @import("Metrics.zig");
@@ -54,8 +53,8 @@ allocator: Allocator,
 terminal: *Terminal,
 /// Cell grid and ANSI renderer.
 screen: *Screen,
-/// Lua plugin engine. Used for user-input hooks routed on the main thread;
-/// the supervisor holds its own pointer for worker-side hook dispatch.
+/// Lua plugin engine. Used for user-input hooks routed on the main thread
+/// and forwarded to each runner on submit for worker-side hook dispatch.
 lua_engine: ?*LuaEngine,
 /// Where to write the rendered screen.
 stdout_file: std.fs.File,
@@ -63,6 +62,13 @@ stdout_file: std.fs.File,
 /// agent-thread event pushes and SIGWINCH can interrupt its wait without a
 /// busy-wait sleep.
 wake_read_fd: posix.fd_t,
+/// Write end of the wake pipe, forwarded to each runner on submit so
+/// agent workers can wake poll() from arbitrary threads.
+wake_write_fd: posix.fd_t,
+/// LLM provider borrowed from main for model calls in agent runs.
+provider: *llm.ProviderResult,
+/// Tool registry borrowed from main for tool dispatch in agent runs.
+registry: *const tools.Registry,
 /// Persistent escape-sequence parser. Outlives a single poll cycle
 /// so fragmented CSI/SS3 sequences assemble correctly.
 input_parser: input.Parser = .{},
@@ -70,8 +76,6 @@ input_parser: input.Parser = .{},
 /// Window, pane, and frame-local UI state. Layout/compositor/root_pane
 /// live here so the orchestrator stays a pure event coordinator.
 window_manager: WindowManager = undefined,
-/// Per-pane agent lifecycle supervisor.
-supervisor: AgentSupervisor = undefined,
 
 // -- Construction ------------------------------------------------------------
 
@@ -116,6 +120,9 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .lua_engine = cfg.lua_engine,
         .stdout_file = cfg.stdout_file,
         .wake_read_fd = cfg.wake_read_fd,
+        .wake_write_fd = cfg.wake_write_fd,
+        .provider = cfg.provider,
+        .registry = cfg.registry,
     };
     self.window_manager = try WindowManager.init(.{
         .allocator = cfg.allocator,
@@ -129,13 +136,6 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .wake_write_fd = cfg.wake_write_fd,
     });
     errdefer self.window_manager.deinit();
-    self.supervisor = AgentSupervisor.init(
-        cfg.allocator,
-        cfg.wake_write_fd,
-        cfg.lua_engine,
-        cfg.provider,
-        cfg.registry,
-    );
     return self;
 }
 
@@ -244,8 +244,7 @@ fn tick(
 
     // Drain agent events from every pane. AgentRunner.drainEvents calls
     // dispatchHookRequests first thing, which is the sole owner of hook
-    // dispatch at the tick boundary. AgentSupervisor.drainHooks stays on
-    // the module for callers that want hook dispatch without a full drain.
+    // dispatch at the tick boundary.
     self.window_manager.drainPane(self.window_manager.root_pane);
     for (self.window_manager.extra_panes.items) |entry| {
         self.window_manager.drainPane(entry.pane);
@@ -449,7 +448,13 @@ fn onUserInputSubmitted(
 
     if (pane.runner.isAgentRunning()) return;
 
-    try self.supervisor.submit(pane.runner, &pane.session.messages);
+    try pane.runner.submit(&pane.session.messages, .{
+        .allocator = self.allocator,
+        .wake_write_fd = self.wake_write_fd,
+        .lua_engine = self.lua_engine,
+        .provider = self.provider.provider,
+        .registry = self.registry,
+    });
 }
 
 /// Shutdown all agent threads (root + every extra pane). Called from deinit()
@@ -472,7 +477,7 @@ pub fn shutdownAgents(self: *EventOrchestrator) void {
         buf[len] = entry.pane.runner;
         len += 1;
     }
-    self.supervisor.shutdownAll(buf[0..len]);
+    AgentRunner.shutdownAll(buf[0..len]);
 }
 
 /// Compile-time cap on the shutdown runner list; see shutdownAgents.
