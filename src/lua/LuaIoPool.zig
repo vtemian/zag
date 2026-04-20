@@ -129,7 +129,7 @@ fn executeJob(alloc: Allocator, job: *Job) void {
         // CmdHandle helper threads synthesise these kinds directly
         // onto the completion queue; the pool never dispatches them.
         // Seeing one here is a programmer bug.
-        .cmd_wait_done, .cmd_read_line_done => unreachable,
+        .cmd_wait_done, .cmd_read_line_done, .cmd_write_done, .cmd_close_stdin_done => unreachable,
     }
 }
 

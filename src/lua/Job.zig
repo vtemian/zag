@@ -63,6 +63,23 @@ pub const CmdWaitDoneSpec = struct {
     code: i32,
 };
 
+/// Completion payload for a `CmdHandle:write()` call. The helper
+/// thread has attempted the write and (on success) drained the
+/// buffer. Short writes from `File.writeAll` aren't possible — the
+/// function loops internally — so `bytes_written` equals the
+/// requested length on success. On failure the Job carries an
+/// `err_tag` of `.io_error` instead of a result.
+pub const CmdWriteDoneSpec = struct {
+    /// Number of bytes successfully written. Equal to the requested
+    /// slice length on success; 0 on failure (check `err_tag`).
+    bytes_written: usize,
+};
+
+/// Completion payload for a `CmdHandle:close_stdin()` call. No data
+/// flows back to the coroutine — the completion just signals the
+/// helper is done closing the pipe so Lua can resume.
+pub const CmdCloseStdinDoneSpec = struct {};
+
 /// Completion payload for one `CmdHandle:lines()` iteration. The
 /// CmdHandle helper thread either pulled a newline-terminated segment
 /// out of the child's stdout or observed EOF. `pushJobResultOntoStack`
@@ -89,6 +106,13 @@ pub const JobKind = union(enum) {
     /// iteration. Resumes the coroutine with the next line or nil at
     /// EOF. Not submitted to the pool.
     cmd_read_line_done: CmdReadLineDoneSpec,
+    /// Posted by a CmdHandle helper thread after a `:write()` call
+    /// completes. Resumes the coroutine with `(true, nil)` on success
+    /// or `(nil, "io_error: ...")` on failure. Not pool-submitted.
+    cmd_write_done: CmdWriteDoneSpec,
+    /// Posted by a CmdHandle helper thread after `:close_stdin()`.
+    /// Resumes the coroutine with `(true, nil)`. Not pool-submitted.
+    cmd_close_stdin_done: CmdCloseStdinDoneSpec,
     // http/fs land in later phases
 };
 
