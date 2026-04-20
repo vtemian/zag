@@ -70,31 +70,45 @@ pub const Scope = struct {
         }
     }
 
-    // TODO: if alloc.dupe or snapshot alloc fails after CAS succeeded, scope is
-    // half-cancelled: children won't have aborters fired. Cooperative isCancelled()
-    // still returns true via parent walk, but workers blocked in syscalls rely on
-    // aborters. Accept as best-effort for now; document publicly if plugin code
-    // needs to know.
     pub fn cancel(self: *Scope, reason: []const u8) Allocator.Error!void {
-        // CAS active -> cancelling; idempotent second-cancel no-op
-        if (self.state.cmpxchgStrong(.active, .cancelling, .acq_rel, .acquire) != null) {
-            return;
-        }
-        // Store reason duped into scope's allocator so caller doesn't need to keep it alive
-        self.reason = try self.alloc.dupe(u8, reason);
+        // Pre-allocate everything BEFORE the CAS so the only fallible operations
+        // happen while state is still .active. If any alloc fails, caller sees
+        // OOM with the scope untouched and can retry. Only once all resources
+        // are in hand do we flip state; on CAS loss (another thread cancelled
+        // first) we free our resources and return idempotently.
+        const reason_dupe = try self.alloc.dupe(u8, reason);
+        errdefer self.alloc.free(reason_dupe);
 
-        // Snapshot jobs and children under one lock, act outside lock to avoid
-        // deadlock when an aborter or child.cancel touches shared state.
         self.mu.lock();
-        const jobs_snap = try self.alloc.alloc(*Job, self.jobs.items.len);
+        const jobs_snap = self.alloc.alloc(*Job, self.jobs.items.len) catch |err| {
+            self.mu.unlock();
+            return err;
+        };
+        errdefer self.alloc.free(jobs_snap);
+        const children_snap = self.alloc.alloc(*Scope, self.children.items.len) catch |err| {
+            self.mu.unlock();
+            return err;
+        };
+        errdefer self.alloc.free(children_snap);
         @memcpy(jobs_snap, self.jobs.items);
-        const children_snap = try self.alloc.alloc(*Scope, self.children.items.len);
         @memcpy(children_snap, self.children.items);
         self.mu.unlock();
+
+        // CAS active -> cancelling; lost CAS means someone else already cancelled.
+        if (self.state.cmpxchgStrong(.active, .cancelling, .acq_rel, .acquire) != null) {
+            self.alloc.free(reason_dupe);
+            self.alloc.free(jobs_snap);
+            self.alloc.free(children_snap);
+            return;
+        }
+
+        // We own the cancel. Publish reason and act outside the lock. No more
+        // fallible ops past this point: aborter fires and cascade swallows errors.
+        self.reason = reason_dupe;
         defer self.alloc.free(jobs_snap);
         defer self.alloc.free(children_snap);
 
-        // Fire aborters on all registered jobs (outside lock).
+        // Fire aborters on all registered jobs.
         for (jobs_snap) |j| j.abort();
 
         // Cascade to non-shielded children only: a shielded subtree stays
@@ -213,4 +227,32 @@ test "shielded scope's own cancel still works" {
     try shield.cancel("local");
     try testing.expect(shield.isCancelled());
     try testing.expect(!root.isCancelled());
+}
+
+test "Scope.cancel leaves state active when dupe fails" {
+    // Allow Scope.init to complete (1 alloc for the struct), then fail the
+    // very next alloc (the reason dupe inside cancel).
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    const root = try Scope.init(fa.allocator(), null);
+    defer root.deinit();
+
+    try testing.expectError(error.OutOfMemory, root.cancel("boom"));
+    try testing.expect(!root.isCancelled());
+    try testing.expect(root.reason == null);
+}
+
+test "Scope.cancel leaves state active when snapshot alloc fails" {
+    // Root init = 1 alloc. Child init = 1 alloc + 1 alloc for parent's
+    // children backing array growth = 3 total. Cancel's dupe = alloc 4.
+    // Snapshot alloc = alloc 5 -> fail there.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+    const root = try Scope.init(fa.allocator(), null);
+    defer root.deinit();
+    const child = try Scope.init(fa.allocator(), root);
+    defer child.deinit();
+
+    try testing.expectError(error.OutOfMemory, root.cancel("boom"));
+    try testing.expect(!root.isCancelled());
+    try testing.expect(!child.isCancelled()); // cascade never happened
+    try testing.expect(root.reason == null);
 }
