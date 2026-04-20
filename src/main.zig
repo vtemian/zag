@@ -50,6 +50,13 @@ fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
 const file_log = @import("file_log.zig");
 pub const std_options: std.Options = .{ .logFn = file_log.handler };
 
+// auth.zig is referenced here so `zig test` picks up its inline test
+// block via transitive import discovery. Task 6 (createProviderFromLuaConfig)
+// will replace this with a real call-site.
+comptime {
+    _ = @import("auth.zig");
+}
+
 /// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
 fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
