@@ -79,6 +79,13 @@ pub const LuaEngine = struct {
     /// tune the bare-Escape deadline at config-load time. Null when the
     /// engine is exercised standalone in tests.
     input_parser: ?*input.Parser = null,
+    /// Provider names the user declared via `zag.provider{ name = "..." }`.
+    /// Owned (each entry duped into `allocator`). Populated during `loadUserConfig`,
+    /// read once by `llm.createProviderFromLuaConfig` at startup.
+    enabled_providers: std.ArrayList([]const u8),
+    /// Default model string set via `zag.set_default_model("prov/id")`.
+    /// Owned. Null if the user didn't set one — factory falls back to a hardcoded default.
+    default_model: ?[]const u8 = null,
 
     /// Create a new LuaEngine. Sets up the VM and installs the `zag.*`
     /// globals but does NOT load user config. Callers must wire any
@@ -108,6 +115,7 @@ pub const LuaEngine = struct {
             .allocator = allocator,
             .tools = .empty,
             .hook_registry = Hooks.Registry.init(allocator),
+            .enabled_providers = .empty,
         };
     }
 
@@ -150,6 +158,9 @@ pub const LuaEngine = struct {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
         self.hook_registry.deinit();
+        for (self.enabled_providers.items) |name| self.allocator.free(name);
+        self.enabled_providers.deinit(self.allocator);
+        if (self.default_model) |m| self.allocator.free(m);
         if (self.pending_cancel_reason) |r| self.allocator.free(r);
         self.lua.deinit();
     }
@@ -1097,6 +1108,13 @@ test "LuaEngine init and deinit" {
     const val = try engine.lua.toInteger(-1);
     engine.lua.pop(1);
     try std.testing.expectEqual(@as(i64, 2), val);
+}
+
+test "LuaEngine.init initializes provider config state" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    try std.testing.expectEqual(@as(usize, 0), engine.enabled_providers.items.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
 }
 
 test "zag.tool() collects tool definitions" {
