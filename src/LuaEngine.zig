@@ -411,6 +411,10 @@ pub const LuaEngine = struct {
     ///
     /// Opts handled here: `cwd`, `timeout_ms`, `max_output_bytes`. `stdin`,
     /// `env_extra`, `env_replace` are wired in Task 6.3.
+    ///
+    /// Sentinel semantics (match `Job.zig`): `timeout_ms = 0` means "no
+    /// timeout, wait indefinitely"; `max_output_bytes = 0` means "unbounded
+    /// capture".
     fn zagCmdCallFn(co: *Lua) i32 {
         const engine = getEngineFromState(co);
 
@@ -470,7 +474,11 @@ pub const LuaEngine = struct {
             _ = co.getField(opts_idx, "cwd");
             if (co.isString(-1)) {
                 const s = co.toString(-1) catch "";
-                opts_cwd = arena.dupe(u8, s) catch null;
+                opts_cwd = arena.dupe(u8, s) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.cmd opts.cwd dupe failed", .{});
+                };
             }
             co.pop(1);
 
@@ -1720,6 +1728,12 @@ pub const LuaEngine = struct {
     /// snapshot. Joiners resume with (true, nil) on normal completion or
     /// (nil, "cancelled") if the retiring task's scope was cancelled.
     fn retireTask(self: *LuaEngine, task: *Task) void {
+        if (task.cmd_arena) |a| {
+            a.deinit();
+            self.allocator.destroy(a);
+            // task about to be destroyed — no need to null the field
+        }
+
         const was_cancelled = task.scope.isCancelled();
 
         // Snapshot joiners so we can safely tear down the task's state while
