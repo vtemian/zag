@@ -668,3 +668,28 @@ test "link inside text" {
     try expectSpanUnderline(lines.items[0].spans, 1);
     try expectSpanText(lines.items[0].spans, 2, " here");
 }
+
+test "span text content matches across multiple parses" {
+    // Regression pin: equality-under-re-parse is the contract we rely on
+    // after the borrowed-slice flip. Parse twice from the same input and
+    // verify the styled text content matches byte-for-byte.
+    const allocator = std.testing.allocator;
+    const theme = Theme.defaultTheme();
+    const input = "plain `code` **bold**";
+
+    var lines1: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines1, allocator);
+    try parseLines(input, &lines1, allocator, &theme);
+
+    var lines2: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines2, allocator);
+    try parseLines(input, &lines2, allocator, &theme);
+
+    try std.testing.expectEqual(lines1.items.len, lines2.items.len);
+    for (lines1.items, lines2.items) |a, b| {
+        try std.testing.expectEqual(a.spans.len, b.spans.len);
+        for (a.spans, b.spans) |sa, sb| {
+            try std.testing.expectEqualStrings(sa.text, sb.text);
+        }
+    }
+}
