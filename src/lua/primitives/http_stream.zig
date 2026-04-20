@@ -14,9 +14,10 @@
 //!   completion queue.
 //!
 //! v1 scope: GET only (body-less), no headers/status accessors on the
-//! handle, no keep-alive reuse, no auto-retry. `:close()` signals
-//! shutdown; depending on std.http internals it may not interrupt an
-//! in-flight recv — callers can use scope cancellation for that.
+//! handle, no keep-alive reuse, no auto-retry. `:close()` calls
+//! `posix.shutdown(fd, .both)` on the underlying socket so a helper
+//! thread blocked in `body_reader.stream(...)` returns immediately
+//! with an EOS/IO-error and the handle shuts down promptly.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -97,6 +98,12 @@ pub const HttpStreamHandle = struct {
 
     /// Observable state. .running until `:close()` or `__gc` flips it.
     state: std.atomic.Value(State) = .init(.running),
+    /// Guards against double-shutdown from racing `:close()` and
+    /// `shutdownAndCleanup`. Set the first time we issue
+    /// `posix.shutdown` on the connection fd; subsequent attempts
+    /// short-circuit. The fd remains valid (just half-closed) until
+    /// `client.deinit` in `shutdownAndCleanup` runs the actual close.
+    socket_shutdown_done: std.atomic.Value(bool) = .init(false),
 
     /// Line-buffered bytes read from `body_reader` but not yet handed
     /// to Lua. Owned by the helper thread (no locking — only
@@ -468,19 +475,30 @@ pub const HttpStreamHandle = struct {
         }
     }
 
-    /// Caller-invoked close. Flips state so any in-flight read posts
-    /// nil on completion, queues a shutdown so the helper unblocks.
-    /// Does NOT join here — `shutdownAndCleanup` owns the join.
-    ///
-    /// v1 limitation: once the helper is already blocked inside
-    /// `body_reader.stream(...)`, closing the state flag does not
-    /// interrupt that syscall. It returns only after the server closes
-    /// the connection (or the OS times the socket out). This is the
-    /// same aborter no-op we have on non-streaming http.get and gets
-    /// addressed in Task 7.5.
+    /// Caller-invoked close. Flips state, shuts the socket down (so a
+    /// helper currently blocked inside `body_reader.stream(...)` wakes
+    /// up with an IO error), then queues a shutdown command so the
+    /// helper exits its main loop cleanly. Does NOT join here —
+    /// `shutdownAndCleanup` owns the join.
     pub fn close(self: *HttpStreamHandle) void {
         self.state.store(.closed, .release);
+        self.shutdownSocket();
         self.submit(.shutdown) catch {};
+    }
+
+    /// Issue `posix.shutdown(fd, .both)` on the connection's socket,
+    /// idempotently. Wakes a blocked recv in the helper thread in
+    /// microseconds — the in-flight `body_reader.stream(...)` returns
+    /// `error.ConnectionResetByPeer` or similar, which the helper
+    /// buckets into the EOS path. The fd itself stays valid until
+    /// `client.deinit` calls close on it in `shutdownAndCleanup`.
+    fn shutdownSocket(self: *HttpStreamHandle) void {
+        if (self.socket_shutdown_done.swap(true, .acq_rel)) return;
+        const conn = self.req.connection orelse return;
+        const stream = conn.stream_reader.getStream();
+        std.posix.shutdown(stream.handle, .both) catch |err| {
+            log.debug("http_stream shutdown: {s}", .{@errorName(err)});
+        };
     }
 
     /// Called from the Lua userdata `__gc` metamethod. Idempotent.
@@ -491,6 +509,13 @@ pub const HttpStreamHandle = struct {
         self.shut_down = true;
 
         self.state.store(.closed, .release);
+        // Shut the socket down first so any helper blocked in
+        // `body_reader.stream(...)` returns right away. Without this
+        // `helper.join()` below would wait for the blocked syscall
+        // (bounded by whatever timeout std.http / the OS applies),
+        // which on a GC-triggered cleanup could hang the whole
+        // engine thread.
+        self.shutdownSocket();
         self.submit(.shutdown) catch {};
         self.helper.join();
 
@@ -510,3 +535,112 @@ pub const HttpStreamHandle = struct {
         self.alloc.destroy(self);
     }
 };
+
+// ----- tests -----
+
+const testing = std.testing;
+const completion_queue = @import("../LuaCompletionQueue.zig");
+
+// Regression test for Task 7.5. `:close()` must shut the TCP socket
+// down so the helper thread's blocked `body_reader.stream(...)`
+// returns right away. Without the shutdown, close + join would
+// block for whatever the server takes to close the connection
+// (here: 10s). With it, close + join return in well under 1s.
+test "HttpStreamHandle close interrupts blocked helper read" {
+    const alloc = testing.allocator;
+    const root = try @import("../Scope.zig").Scope.init(alloc, null);
+    defer root.deinit();
+
+    var completions = try completion_queue.Queue.init(alloc, 16);
+    defer {
+        while (completions.pop()) |j| alloc.destroy(j);
+        completions.deinit();
+    }
+
+    // Server that sends a partial response (one chunk with one line)
+    // and then holds the connection open without sending more bytes
+    // for 10 seconds. The helper thread will read the first line
+    // successfully, then block waiting for the next one.
+    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+
+            // Chunked transfer so the body is open-ended. Send one
+            // chunk carrying "line1\n", then stall.
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Transfer-Encoding: chunked\r\n" ++
+                "\r\n" ++
+                "6\r\nline1\n\r\n";
+            conn.stream.writeAll(resp) catch return;
+
+            // Hold the connection open; the test's `:close()` will
+            // cause shutdown on the client side, which shows up here
+            // as a read of 0 bytes. Sleep is the simplest way to say
+            // "don't send anything else". Capped well above the 1s
+            // deadline the test enforces.
+            std.Thread.sleep(10 * std.time.ns_per_s);
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const arena_ptr = try alloc.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(alloc);
+    const url_dup = try arena_ptr.allocator().dupe(u8, url);
+
+    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup);
+
+    // Kick off one read_line. The helper will pull "line1" from the
+    // buffered response, post the line back, and loop into another
+    // recv() that blocks because the server is sleeping.
+    try handle.submit(.{ .read_line = .{ .thread_ref = 42 } });
+    // Wait for that first completion before racing :close(). Poll
+    // rather than sleep blindly so the test isn't timing-fragile on
+    // slow CI.
+    const poll_start = std.time.milliTimestamp();
+    while (true) {
+        if (completions.pop()) |j| {
+            if (j.kind.http_stream_line_done.line) |l| alloc.free(l);
+            alloc.destroy(j);
+            break;
+        }
+        if (std.time.milliTimestamp() - poll_start > 2000) return error.TestTimedOutBeforeFirstLine;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    // Kick a SECOND read_line — this one will block because the
+    // server hasn't sent another line. The helper is now in a
+    // blocked recv() inside body_reader.stream.
+    try handle.submit(.{ .read_line = .{ .thread_ref = 43 } });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // The actual measurement: close() + shutdownAndCleanup() must
+    // return in well under 1s. Without the socket shutdown the
+    // helper.join() call inside shutdownAndCleanup would wait for
+    // the 10s server sleep to elapse.
+    const close_start = std.time.milliTimestamp();
+    handle.close();
+    handle.shutdownAndCleanup();
+    const elapsed_ms = std.time.milliTimestamp() - close_start;
+
+    try testing.expect(elapsed_ms < 1000);
+}
