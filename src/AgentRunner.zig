@@ -11,7 +11,7 @@ const log = std.log.scoped(.agent_runner);
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationSession = @import("ConversationSession.zig");
 const agent_events = @import("agent_events.zig");
-const AgentThread = @import("AgentThread.zig");
+const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Hooks = @import("Hooks.zig");
 const llm = @import("llm.zig");
@@ -148,7 +148,7 @@ pub fn submit(
     self.lua_engine = deps.lua_engine;
     self.cancel_flag.store(false, .release);
 
-    self.agent_thread = try AgentThread.spawn(
+    self.agent_thread = try std.Thread.spawn(.{}, threadMain, .{
         deps.provider,
         messages,
         deps.registry,
@@ -156,7 +156,42 @@ pub fn submit(
         &self.event_queue,
         &self.cancel_flag,
         deps.lua_engine,
-    );
+    });
+}
+
+/// Background agent thread entry point. Runs the agent loop and
+/// guarantees `.done` is always pushed to the queue, converting any
+/// errors into `.err` events. Drops on QueueFull are counted on the
+/// queue and surfaced in the UI; they are not fatal to the loop.
+fn threadMain(
+    provider: llm.Provider,
+    messages: *std.ArrayList(types.Message),
+    registry: *const tools.Registry,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+    lua_engine: ?*LuaEngine,
+) void {
+    // Bind the queue so worker threads can round-trip Lua tool calls and
+    // hooks back to the main thread for serialised execution.
+    tools.lua_request_queue = queue;
+    defer tools.lua_request_queue = null;
+    if (lua_engine) |eng| eng.activate();
+    defer if (lua_engine) |eng| eng.deactivate();
+
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
+        // Dup because the event sits in the queue until drained and
+        // @errorName points into .rodata. On a dup failure the drop is
+        // recorded on the queue counter and .done is still pushed so the
+        // UI returns to idle rather than getting stuck.
+        const duped_err = allocator.dupe(u8, @errorName(err)) catch {
+            _ = queue.dropped.fetchAdd(1, .monotonic);
+            queue.tryPush(allocator, .done);
+            return;
+        };
+        queue.tryPush(allocator, .{ .err = duped_err });
+    };
+    queue.tryPush(allocator, .done);
 }
 
 /// Cancel every runner cooperatively in a first pass, then `shutdown()`
