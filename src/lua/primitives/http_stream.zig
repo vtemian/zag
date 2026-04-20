@@ -31,9 +31,10 @@ const log = std.log.scoped(.lua_http_stream);
 /// Only two today — a `:lines()` iteration driver and the shutdown
 /// signal used by `:close()` / `__gc`.
 pub const HelperCmd = union(enum) {
-    /// Read the next line from the response body. Helper blocks in
-    /// `body_reader.readSliceShort` (filling `line_buf`) until '\n'
-    /// appears or the stream ends, then posts a
+    /// Read the next line from the response body. Helper fills
+    /// `line_buf` via `body_reader.stream(&fixed, .limited(...))` —
+    /// the only EOS-safe interface std.http exposes — and loops until
+    /// '\n' appears or `isStreamEnded` flips. Posts a
     /// `.http_stream_line_done` job addressed to `thread_ref`.
     read_line: struct { thread_ref: i32 },
     /// Break out of the helper loop. Sent by `shutdownAndCleanup`.
@@ -101,8 +102,10 @@ pub const HttpStreamHandle = struct {
     /// to Lua. Owned by the helper thread (no locking — only
     /// `runReadLine` touches it, and commands are serialised).
     line_buf: std.ArrayList(u8) = .empty,
-    /// Set once `body_reader.readSliceShort` returned 0 (EOF) or the
-    /// helper gave up. Sticky — subsequent `:lines()` return nil.
+    /// Set once `body_reader.stream(...)` returned `error.EndOfStream`
+    /// (or `isStreamEnded` flipped true, or the helper gave up on an
+    /// I/O error). Sticky — subsequent `:lines()` return nil once any
+    /// buffered trailing partial line has been flushed.
     eof: bool = false,
 
     pub const METATABLE_NAME = "zag.HttpStreamHandle";
@@ -259,10 +262,11 @@ pub const HttpStreamHandle = struct {
     }
 
     /// Helper-side `:lines()` iteration. Either drains `line_buf` (the
-    /// previous read may have pulled more than one line) or blocks in
-    /// `body_reader.readSliceShort` until '\n' lands or the stream
-    /// ends. Posts a `.http_stream_line_done` job with the line (or
-    /// nil at EOF) so main can resume the coroutine.
+    /// previous read may have pulled more than one line) or pumps
+    /// `body_reader.stream(&fixed, .limited(...))` until '\n' lands
+    /// or `isStreamEnded` gates us off. Posts a
+    /// `.http_stream_line_done` job with the line (or nil at EOF) so
+    /// main can resume the coroutine.
     fn runReadLine(self: *HttpStreamHandle, thread_ref: i32) void {
         // If the caller already closed us, short-circuit to EOF so
         // `for line in s:lines() do ... end` ends cleanly.
@@ -277,6 +281,21 @@ pub const HttpStreamHandle = struct {
             return;
         }
         if (self.eof) {
+            // Flush a trailing partial line (content-length body whose
+            // final byte wasn't '\n') before we start returning nil.
+            // Earlier paths that set `eof` already drain `line_buf`,
+            // but keeping this defensive branch means a future EOS
+            // code path that forgets to flush can't silently drop the
+            // caller's last line.
+            if (self.line_buf.items.len > 0) {
+                const line = self.alloc.dupe(u8, self.line_buf.items) catch {
+                    self.postLineDoneErr(thread_ref, "oom");
+                    return;
+                };
+                self.line_buf.clearRetainingCapacity();
+                self.postLineDone(thread_ref, line);
+                return;
+            }
             self.postLineDone(thread_ref, null);
             return;
         }
@@ -454,7 +473,7 @@ pub const HttpStreamHandle = struct {
     /// Does NOT join here — `shutdownAndCleanup` owns the join.
     ///
     /// v1 limitation: once the helper is already blocked inside
-    /// `body_reader.readSliceShort`, closing the state flag does not
+    /// `body_reader.stream(...)`, closing the state flag does not
     /// interrupt that syscall. It returns only after the server closes
     /// the connection (or the OS times the socket out). This is the
     /// same aborter no-op we have on non-streaming http.get and gets
