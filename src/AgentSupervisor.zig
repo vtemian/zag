@@ -7,13 +7,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const AgentRunner = @import("AgentRunner.zig");
-const AgentThread = @import("AgentThread.zig");
-const agent_events = @import("agent_events.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
-const Hooks = @import("Hooks.zig");
 
 const log = std.log.scoped(.agent_supervisor);
 
@@ -59,28 +56,13 @@ pub fn submit(
     runner: *AgentRunner,
     messages: *std.ArrayList(types.Message),
 ) !void {
-    if (runner.isAgentRunning()) return; // idempotent: drop duplicate submits
-
-    runner.event_queue = try agent_events.EventQueue.initBounded(self.allocator, 256);
-    errdefer {
-        runner.event_queue.deinit();
-        runner.queue_active = false;
-    }
-
-    runner.event_queue.wake_fd = self.wake_write_fd;
-    runner.queue_active = true;
-    runner.lua_engine = self.lua_engine;
-    runner.cancel_flag.store(false, .release);
-
-    runner.agent_thread = try AgentThread.spawn(
-        self.provider.provider,
-        messages,
-        self.registry,
-        self.allocator,
-        &runner.event_queue,
-        &runner.cancel_flag,
-        self.lua_engine,
-    );
+    return runner.submit(messages, .{
+        .allocator = self.allocator,
+        .wake_write_fd = self.wake_write_fd,
+        .lua_engine = self.lua_engine,
+        .provider = self.provider.provider,
+        .registry = self.registry,
+    });
 }
 
 /// Drain pending hook requests on `runner`'s queue by calling into
@@ -102,12 +84,7 @@ pub fn drainHooks(self: *AgentSupervisor, runner: *AgentRunner) void {
 /// orchestrator's extra-panes loop is safe: the second call is a no-op.
 pub fn shutdownAll(self: *AgentSupervisor, runners: []const *AgentRunner) void {
     _ = self;
-    for (runners) |runner| {
-        runner.cancelAgent();
-    }
-    for (runners) |runner| {
-        runner.shutdown();
-    }
+    AgentRunner.shutdownAll(runners);
 }
 
 // Tests.
