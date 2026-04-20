@@ -409,8 +409,10 @@ pub const LuaEngine = struct {
     /// it. When invoked as `zag.cmd(argv, opts)`, Lua passes the table as
     /// arg 1 and the user arguments as args 2+.
     ///
-    /// Opts handled here: `cwd`, `timeout_ms`, `max_output_bytes`. `stdin`,
-    /// `env_extra`, `env_replace` are wired in Task 6.3.
+    /// Opts handled here: `cwd`, `timeout_ms`, `max_output_bytes`, `stdin`,
+    /// `env`, `env_extra`. `env` replaces the inherited env entirely;
+    /// `env_extra` overlays entries on top of the inherited env. Passing
+    /// both is a user error.
     ///
     /// Sentinel semantics (match `Job.zig`): `timeout_ms = 0` means "no
     /// timeout, wait indefinitely"; `max_output_bytes = 0` means "unbounded
@@ -469,6 +471,9 @@ pub const LuaEngine = struct {
         var opts_cwd: ?[]const u8 = null;
         var timeout_ms: u64 = 30_000;
         var max_output: usize = 10 * 1024 * 1024;
+        var opts_stdin: ?[]const u8 = null;
+        var opts_env_mode: async_job.CmdExecEnvMode = .inherit;
+        var opts_env_map: ?std.process.EnvMap = null;
 
         if (co.isTable(opts_idx)) {
             _ = co.getField(opts_idx, "cwd");
@@ -495,6 +500,74 @@ pub const LuaEngine = struct {
                 max_output = if (v < 0) 0 else @intCast(v);
             }
             co.pop(1);
+
+            // stdin: string piped to the child's stdin. The worker closes
+            // the pipe once the bytes are drained. Staged in the arena so
+            // its lifetime matches the job.
+            _ = co.getField(opts_idx, "stdin");
+            if (co.isString(-1)) {
+                const s = co.toString(-1) catch "";
+                opts_stdin = arena.dupe(u8, s) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.cmd opts.stdin dupe failed", .{});
+                };
+            }
+            co.pop(1);
+
+            // env vs env_extra. `env` replaces inherited env entirely;
+            // `env_extra` overlays on top. Passing both is a user error —
+            // the two policies would fight for the same child.env_map.
+            const has_env = blk: {
+                _ = co.getField(opts_idx, "env");
+                const is_table = co.isTable(-1);
+                co.pop(1);
+                break :blk is_table;
+            };
+            const has_env_extra = blk: {
+                _ = co.getField(opts_idx, "env_extra");
+                const is_table = co.isTable(-1);
+                co.pop(1);
+                break :blk is_table;
+            };
+
+            if (has_env and has_env_extra) {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd: opts.env and opts.env_extra are mutually exclusive", .{});
+            }
+
+            if (has_env or has_env_extra) {
+                opts_env_mode = if (has_env) .replace else .extend;
+                // Init with the arena allocator: EnvMap owns key/value
+                // copies internally, and the arena owns the EnvMap's
+                // backing storage. The worker never frees either — Task
+                // cleanup deinits the arena after resumeFromJob.
+                opts_env_map = std.process.EnvMap.init(arena);
+
+                const field_name: [:0]const u8 = if (has_env) "env" else "env_extra";
+                _ = co.getField(opts_idx, field_name);
+                // Iterate: push nil key, next(table) leaves (key, value)
+                // on stack until it returns false.
+                co.pushNil();
+                while (co.next(-2)) {
+                    // Stack: [..., env_table, key, value]
+                    if (!co.isString(-2) or !co.isString(-1)) {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.cmd opts.env entries must be string->string", .{});
+                    }
+                    const k = co.toString(-2) catch "";
+                    const v = co.toString(-1) catch "";
+                    opts_env_map.?.put(k, v) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.cmd opts.env put failed", .{});
+                    };
+                    co.pop(1); // pop value; keep key for next iteration
+                }
+                co.pop(1); // pop env_table
+            }
         }
 
         const task = engine.taskForCoroutine(co) orelse {
@@ -512,6 +585,9 @@ pub const LuaEngine = struct {
             .kind = .{ .cmd_exec = .{
                 .argv = argv,
                 .cwd = opts_cwd,
+                .stdin_bytes = opts_stdin,
+                .env_mode = opts_env_mode,
+                .env_map = opts_env_map,
                 .timeout_ms = timeout_ms,
                 .max_output_bytes = max_output,
             } },
@@ -2890,4 +2966,118 @@ test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
     _ = try eng.lua.getGlobal("_cmd_truncated");
     try std.testing.expect(!eng.lua.toBoolean(-1));
     eng.lua.pop(1);
+}
+
+test "zag.cmd stdin piped to /bin/cat echoes back" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_cat()
+        \\  local r, err = zag.cmd({ "/bin/cat" }, { stdin = "piped-input" })
+        \\  _cat_err_is_nil = (err == nil)
+        \\  if r then _cat_stdout = r.stdout end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_cat");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_cat_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cat_stdout");
+    const s = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.eql(u8, s, "piped-input"));
+    eng.lua.pop(1);
+}
+
+test "zag.cmd env_extra sets env var visible to child" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_env()
+        \\  local r, err = zag.cmd({ "/bin/sh", "-c", "echo $ZAG_TEST_VAR" }, {
+        \\    env_extra = { ZAG_TEST_VAR = "hello-env" },
+        \\  })
+        \\  _env_err_is_nil = (err == nil)
+        \\  if r then _env_stdout = r.stdout end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_env");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_env_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_env_stdout");
+    const s = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, s, "hello-env"));
+    eng.lua.pop(1);
+}
+
+test "zag.cmd timeout_ms kills long-running process" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_timeout()
+        \\  local r, err = zag.cmd({ "/bin/sleep", "10" }, { timeout_ms = 100 })
+        \\  _to_r_is_nil = (r == nil)
+        \\  _to_err = err
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_timeout");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const start = std.time.milliTimestamp();
+    const deadline = start + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    const elapsed = std.time.milliTimestamp() - start;
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_to_r_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_to_err");
+    const err_str = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, err_str, "timeout"));
+    eng.lua.pop(1);
+    // Must NOT have waited the full 10s.
+    try std.testing.expect(elapsed < 2000);
 }
