@@ -301,6 +301,7 @@ test {
     // Every module in the project is reached transitively via EventOrchestrator
     // + ConversationBuffer + tools, so refAllDecls covers the whole graph.
     @import("std").testing.refAllDecls(@This());
+    _ = @import("lua/mod.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
