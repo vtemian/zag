@@ -176,8 +176,6 @@ fn threadMain(
     // hooks back to the main thread for serialised execution.
     tools.lua_request_queue = queue;
     defer tools.lua_request_queue = null;
-    if (lua_engine) |eng| eng.activate();
-    defer if (lua_engine) |eng| eng.deactivate();
 
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
         // Dup because the event sits in the queue until drained and
@@ -277,10 +275,11 @@ pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine
         switch (ev) {
             .hook_request => |req| {
                 if (engine) |eng| {
-                    eng.fireHook(req.payload) catch |err| {
+                    const veto = eng.fireHook(req.payload) catch |err| blk: {
                         log.warn("hook dispatch failed: {}", .{err});
+                        break :blk null;
                     };
-                    if (eng.takeCancel()) |reason| {
+                    if (veto) |reason| {
                         req.cancelled = true;
                         req.cancel_reason = reason;
                     }
@@ -370,7 +369,11 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             defer allocator.free(text);
             if (self.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text } };
-                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+                // Observer-only event; discard any return from fireHook.
+                _ = eng.fireHook(&payload) catch |err| blk: {
+                    log.warn("hook failed: {}", .{err});
+                    break :blk null;
+                };
             }
             if (self.current_assistant_node) |node| {
                 self.view.appendToNode(node, text) catch |err| {
@@ -447,7 +450,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         .done => {
             if (self.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .agent_done = {} };
-                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+                _ = eng.fireHook(&payload) catch |err| blk: {
+                    log.warn("hook failed: {}", .{err});
+                    break :blk null;
+                };
             }
             self.current_assistant_node = null;
         },
@@ -456,7 +462,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             defer allocator.free(text);
             if (self.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
-                eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+                _ = eng.fireHook(&payload) catch |err| blk: {
+                    log.warn("hook failed: {}", .{err});
+                    break :blk null;
+                };
             }
             _ = self.view.appendNode(null, .err, text) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
             self.session.persistEvent(.{
@@ -727,7 +736,7 @@ test "text_delta fires post-hook with text" {
     );
 
     var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = "chunk!" } };
-    try engine.fireHook(&payload);
+    _ = try engine.fireHook(&payload);
 
     _ = try engine.lua.getGlobal("last_delta");
     try std.testing.expectEqualStrings("chunk!", try engine.lua.toString(-1));

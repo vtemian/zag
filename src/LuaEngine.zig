@@ -77,11 +77,14 @@ pub const LuaEngine = struct {
     tools: std.ArrayList(LuaTool),
     /// Hook registry, populated by `zag.hook()` calls from Lua.
     hook_registry: Hooks.Registry,
-    /// Set by `applyHookReturn` when a hook returns `{ cancel = true }`.
-    /// Consumed and reset by `takeCancel()` after fireHook returns.
+    /// Internal veto channel between `applyHookReturn` /
+    /// `applyHookReturnFromCoroutine` (which inspect the callback return
+    /// table) and `fireHook` (which consumes the flag before returning
+    /// the reason to its caller). Not part of the public API — clients
+    /// read veto via the `?[]const u8` return value of `fireHook`.
     pending_cancel: bool = false,
-    /// Optional reason string allocated via `self.allocator`. Owned by
-    /// the caller of `takeCancel()` once handed off.
+    /// Reason string allocated via `self.allocator`. Ownership transfers
+    /// to `fireHook`'s caller when `fireHook` returns it.
     pending_cancel_reason: ?[]const u8 = null,
     /// Keymap registry owned by the engine. Populated with built-in
     /// defaults during `init()`; `zag.keymap()` calls from `config.lua`
@@ -2455,15 +2458,19 @@ pub const LuaEngine = struct {
 
     // -- Hook dispatch ---------------------------------------------------------
 
-    /// Fire all hooks matching the payload's event kind.
-    /// Called from the main thread (the only thread permitted to touch Lua).
-    /// Mutates `payload` in place if a hook returns a rewrite.
-    /// A hook that raises is logged and skipped; subsequent hooks still run.
-    pub fn fireHook(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
+    /// Fire every hook matching `payload`'s event kind from the main
+    /// thread (the only thread permitted to touch Lua). Mutates `payload`
+    /// in place when a hook returns a rewrite; a hook that raises is
+    /// logged and skipped while subsequent hooks still run.
+    ///
+    /// Returns the veto reason (owned by the caller, freed via
+    /// `self.allocator`) if a veto-capable hook returned `{ cancel = true }`;
+    /// returns null for observer-only events or when no hook vetoed.
+    pub fn fireHook(self: *LuaEngine, payload: *Hooks.HookPayload) !?[]const u8 {
         // Fast path: no hooks registered at all. Avoids any Lua VM
         // interaction on the streaming hot path (e.g. TextDelta firing
         // once per token).
-        if (self.hook_registry.hooks.items.len == 0) return;
+        if (self.hook_registry.hooks.items.len == 0) return null;
 
         // When the async runtime isn't up (standalone tests), fall back
         // to the legacy synchronous protectedCall path. Hook bodies in
@@ -2471,7 +2478,7 @@ pub const LuaEngine = struct {
         // the tests that exercise cancel/rewrite semantics only.
         if (self.io_pool == null) {
             try self.fireHookSync(payload);
-            return;
+            return self.consumePendingCancel();
         }
 
         const pattern_key = hookPatternKey(payload.*);
@@ -2526,6 +2533,8 @@ pub const LuaEngine = struct {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
+
+        return self.consumePendingCancel();
     }
 
     /// Return true if any thread_ref in `refs` is still registered as a
@@ -2813,10 +2822,12 @@ pub const LuaEngine = struct {
         }
     }
 
-    /// Read-and-reset the pending cancel state set by a veto hook. The
-    /// returned slice (if non-null) is allocated via `self.allocator`
-    /// and owned by the caller.
-    pub fn takeCancel(self: *LuaEngine) ?[]const u8 {
+    /// Read-and-reset the internal veto channel populated by
+    /// `applyHookReturn` / `applyHookReturnFromCoroutine`. Called by
+    /// `fireHook` (and only `fireHook`) once all dispatched callbacks
+    /// have retired. The returned slice, if non-null, is allocated via
+    /// `self.allocator` and ownership passes to the caller.
+    fn consumePendingCancel(self: *LuaEngine) ?[]const u8 {
         if (!self.pending_cancel) return null;
         self.pending_cancel = false;
         const reason = self.pending_cancel_reason;
@@ -3618,19 +3629,6 @@ pub const LuaEngine = struct {
             self.resumeTask(joiner, 2);
         }
     }
-
-    /// Hook for agent threads to bind this engine as their active Lua context.
-    /// Currently a no-op: Lua tool execution round-trips through the main thread
-    /// via `tools.lua_request_queue`, so no per-thread engine pointer is
-    /// needed. Kept as an extension point for future per-thread Lua states.
-    pub fn activate(self: *LuaEngine) void {
-        _ = self;
-    }
-
-    /// Symmetric counterpart to `activate()`. Currently a no-op; see `activate`.
-    pub fn deactivate(self: *LuaEngine) void {
-        _ = self;
-    }
 };
 
 // -- Tests -------------------------------------------------------------------
@@ -4190,7 +4188,7 @@ test "fireHook invokes Lua callback for matching event" {
     );
 
     var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 42, .message_count = 3 } };
-    try engine.fireHook(&payload);
+    _ = try engine.fireHook(&payload);
 
     _ = engine.lua.getGlobal("hook_fired_for") catch {};
     try std.testing.expectEqual(@as(i64, 42), try engine.lua.toInteger(-1));
@@ -4286,8 +4284,7 @@ test "fireHook applies veto" {
         .args_json = "{\"command\":\"rm -rf /\"}",
         .args_rewrite = null,
     } };
-    try engine.fireHook(&payload);
-    const reason = engine.takeCancel();
+    const reason = try engine.fireHook(&payload);
     try std.testing.expect(reason != null);
     defer std.testing.allocator.free(reason.?);
     try std.testing.expectEqualStrings("no rm", reason.?);
@@ -4310,7 +4307,7 @@ test "fireHook applies args rewrite" {
         .args_json = "{\"command\":\"ls\"}",
         .args_rewrite = null,
     } };
-    try engine.fireHook(&payload);
+    try std.testing.expectEqual(@as(?[]const u8, null), try engine.fireHook(&payload));
     try std.testing.expect(payload.tool_pre.args_rewrite != null);
     defer std.testing.allocator.free(payload.tool_pre.args_rewrite.?);
     try std.testing.expect(std.mem.indexOf(u8, payload.tool_pre.args_rewrite.?, "echo safe") != null);
@@ -4332,8 +4329,7 @@ test "UserMessagePre can veto submission" {
         .text = "/secret thing",
         .text_rewrite = null,
     } };
-    try engine.fireHook(&payload);
-    const reason = engine.takeCancel();
+    const reason = try engine.fireHook(&payload);
     try std.testing.expect(reason != null);
     defer std.testing.allocator.free(reason.?);
     try std.testing.expectEqualStrings("blocked", reason.?);
@@ -4353,7 +4349,7 @@ test "UserMessagePre can rewrite text" {
         .text = "hi",
         .text_rewrite = null,
     } };
-    try engine.fireHook(&payload);
+    try std.testing.expectEqual(@as(?[]const u8, null), try engine.fireHook(&payload));
     try std.testing.expect(payload.user_message_pre.text_rewrite != null);
     defer std.testing.allocator.free(payload.user_message_pre.text_rewrite.?);
     try std.testing.expectEqualStrings("expanded: hi", payload.user_message_pre.text_rewrite.?);
@@ -4380,7 +4376,7 @@ test "hook body can call zag.sleep and complete" {
         .args_json = "{}",
         .args_rewrite = null,
     } };
-    try eng.fireHook(&payload);
+    _ = try eng.fireHook(&payload);
 
     _ = try eng.lua.getGlobal("_hook_fired");
     try std.testing.expect(eng.lua.toBoolean(-1));

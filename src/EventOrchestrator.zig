@@ -484,8 +484,11 @@ fn onUserInputSubmitted(
             .text = text,
             .text_rewrite = null,
         } };
-        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
-        if (eng.takeCancel()) |reason| {
+        const veto = eng.fireHook(&payload) catch |err| blk: {
+            log.warn("hook failed: {}", .{err});
+            break :blk null;
+        };
+        if (veto) |reason| {
             defer self.allocator.free(reason);
             _ = try pane.view.appendNode(null, .err, reason);
             return;
@@ -500,7 +503,12 @@ fn onUserInputSubmitted(
 
     if (self.lua_engine) |eng| {
         var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
-        eng.fireHook(&payload) catch |err| log.warn("hook failed: {}", .{err});
+        // Observer-only event; discard any stray veto (applyHookReturn
+        // warns and ignores cancel for non-veto payload kinds).
+        _ = eng.fireHook(&payload) catch |err| blk: {
+            log.warn("hook failed: {}", .{err});
+            break :blk null;
+        };
     }
 
     if (pane.runner.isAgentRunning()) return;
