@@ -188,3 +188,29 @@ test "Scope.cancel invokes job aborters" {
     try root.cancel("kill");
     try testing.expect(ctx.fired);
 }
+
+test "shielded scope ignores parent cancel" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+    const shield = try Scope.init(alloc, root);
+    defer shield.deinit();
+    shield.shielded = true;
+
+    try root.cancel("outer");
+    try testing.expect(root.isCancelled());
+    try testing.expect(!shield.isCancelled()); // shielded from parent
+}
+
+test "shielded scope's own cancel still works" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+    const shield = try Scope.init(alloc, root);
+    defer shield.deinit();
+    shield.shielded = true;
+
+    try shield.cancel("local");
+    try testing.expect(shield.isCancelled());
+    try testing.expect(!root.isCancelled());
+}
