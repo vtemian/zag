@@ -47,81 +47,13 @@ fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
     return .new_session;
 }
 
-/// Override the default std.log handler to suppress all log output in TUI mode.
-/// Writing to stderr corrupts the alternate screen buffer, so logs land in the
-/// root buffer as status nodes instead.
-pub const std_options: std.Options = .{ .logFn = tuiLogHandler };
+const file_log = @import("file_log.zig");
+pub const std_options: std.Options = .{ .logFn = file_log.handler };
 
-var tui_active: bool = false;
-
-/// Per-thread re-entry guard for `tuiLogHandler`. The handler calls
-/// `root_buffer.appendNode` which allocates through the shared GPA. If a
-/// log fires from inside an allocator path on the same thread (e.g. from
-/// a `catch |err| log.warn(...)` branch that was itself reached from
-/// inside an alloc), the nested `appendNode` call would try to re-acquire
-/// the GPA mutex this thread already holds and Zig's debug allocator
-/// would panic with "Deadlock detected". The guard detects the re-entry
-/// and routes the log through `std.debug.print` (mutex-protected, non-
-/// allocating) so the message isn't silently dropped.
-threadlocal var in_log_handler: bool = false;
-
-/// Serialises `tuiLogHandler`'s access to `root_buffer` across threads.
-/// Agent threads log from arbitrary code paths; without this mutex two
-/// concurrent log calls would race on `root_children.append`.
-var log_mutex: std.Thread.Mutex = .{};
-
-/// Module-level root session: owns the LLM message history and persistence
-/// handle for the primary conversation.
-var root_session: ConversationSession = undefined;
-/// Module-level root buffer. Shared with tuiLogHandler so log output lands in
-/// the same place the user reads messages.
-var root_buffer: ConversationBuffer = undefined;
-/// Module-level root agent runner: owns the primary conversation's agent
-/// thread, event queue, and streaming state. Phase 4 collapses this with
-/// the buffer and session into a single `Pane` value.
-var root_runner: AgentRunner = undefined;
-
-fn tuiLogHandler(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    _ = level;
-    const scope_prefix = if (scope == .default) "" else @tagName(scope) ++ ": ";
-
-    if (!tui_active) {
-        const stderr = std.fs.File.stderr();
-        var stderr_scratch: [256]u8 = undefined;
-        var w = stderr.writer(&stderr_scratch);
-        w.interface.print(scope_prefix ++ format ++ "\n", args) catch {};
-        w.interface.flush() catch {};
-        return;
-    }
-
-    // Re-entry: a log fired while this handler was already running on
-    // this thread. Route to stderr via `std.debug.print` instead of
-    // calling `appendNode` again - the GPA mutex is still held by the
-    // outer alloc and a nested alloc would panic with "Deadlock detected".
-    if (in_log_handler) {
-        std.debug.print("zag log (reentrant): " ++ scope_prefix ++ format ++ "\n", args);
-        return;
-    }
-    in_log_handler = true;
-    defer in_log_handler = false;
-
-    log_mutex.lock();
-    defer log_mutex.unlock();
-
-    var scratch: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&scratch, scope_prefix ++ format, args) catch return;
-    _ = root_buffer.appendNode(null, .status, msg) catch {};
-}
-
-/// Append a plain text line to the root buffer as a status node. Used for
+/// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
-fn appendOutputText(text: []const u8) !void {
-    _ = try root_buffer.appendNode(null, .status, text);
+fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
+    _ = try view.appendNode(null, .status, text);
 }
 
 /// Set a file descriptor to non-blocking mode.
@@ -132,7 +64,7 @@ fn setNonBlocking(fd: posix.fd_t) !void {
 }
 
 /// Post the welcome banner or a resume notice to the root buffer.
-fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
+fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
 
@@ -146,7 +78,7 @@ fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHa
             \\Type a message and press Enter. Ctrl+C or /quit to exit.
             \\Esc = normal mode, i = insert mode. In normal: h/j/k/l focus, v/s split, q close. /model to show model.
         , .{ model_id, cwd }) catch "Welcome to zag";
-        try appendOutputText(welcome);
+        try appendStatusLine(view, welcome);
         return;
     }
 
@@ -157,8 +89,8 @@ fn postStartupBanner(resume_id: ?[]const u8, session_handle: ?*Session.SessionHa
             "Resumed session {s} ({d} messages)",
             .{ sh.id[0..sh.id_len], sh.meta.message_count },
         ) catch "Resumed session";
-        try appendOutputText(resume_msg);
-        try appendOutputText("");
+        try appendStatusLine(view, resume_msg);
+        try appendStatusLine(view, "");
     }
 }
 
@@ -171,13 +103,20 @@ pub fn main() !void {
 
     const allocator = trace.wrapAllocator(gpa.allocator());
 
-    root_session = ConversationSession.init(allocator);
+    file_log.init(allocator) catch |err| {
+        // Best-effort: if the log file can't be opened, continue without
+        // logging. Print once to stderr so the user knows.
+        std.debug.print("zag: file logger disabled ({s})\n", .{@errorName(err)});
+    };
+    defer file_log.deinit();
+
+    var root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
 
-    root_buffer = try ConversationBuffer.init(allocator, 0, "session");
+    var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
     defer root_buffer.deinit();
 
-    root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
+    var root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
     defer root_runner.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
@@ -262,11 +201,7 @@ pub fn main() !void {
 
     // -- Enter TUI mode ------------------------------------------------------
     var term = try Terminal.init();
-    tui_active = true;
-    defer {
-        tui_active = false;
-        term.deinit();
-    }
+    defer term.deinit();
 
     var screen = try Screen.init(allocator, term.size.cols, term.size.rows);
     defer screen.deinit();
@@ -287,7 +222,7 @@ pub fn main() !void {
 
     layout.recalculate(screen.width, screen.height);
 
-    try postStartupBanner(resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
+    try postStartupBanner(&root_buffer, resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
     // -- Hand off to the orchestrator ----------------------------------------
     var orchestrator = try EventOrchestrator.init(.{
@@ -343,18 +278,14 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-test "appendOutputText creates a status node" {
+test "appendStatusLine creates a status node on the given view" {
     const allocator = std.testing.allocator;
-    root_session = ConversationSession.init(allocator);
-    defer root_session.deinit();
-    root_buffer = try ConversationBuffer.init(allocator, 0, "test");
-    defer root_buffer.deinit();
-    root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
-    defer root_runner.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "test");
+    defer view.deinit();
 
-    try appendOutputText("hello world");
+    try appendStatusLine(&view, "hello world");
 
-    try std.testing.expectEqual(@as(usize, 1), root_buffer.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.status, root_buffer.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("hello world", root_buffer.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), view.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("hello world", view.root_children.items[0].content.items);
 }
