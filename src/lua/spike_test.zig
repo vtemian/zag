@@ -108,3 +108,39 @@ test "spike: Zig C-closure can yield back to scheduler" {
     try testing.expectEqualStrings("woke", final);
     co.pop(num_results);
 }
+
+test "spike: runtime error in coroutine returns LuaRuntime, msg readable" {
+    const alloc = testing.allocator;
+    const lua = try Lua.init(alloc);
+    defer lua.deinit();
+    lua.openLibs();
+
+    // A function whose body raises a Lua runtime error.
+    try lua.doString(
+        \\function crasher()
+        \\  error("oops")
+        \\end
+    );
+
+    _ = try lua.getGlobal("crasher");
+    try testing.expect(lua.isFunction(-1));
+
+    const co = lua.newThread();
+    // After newThread main stack is [crasher, thread]; swap so crasher is on top,
+    // then xMove pops crasher into the coroutine stack.
+    lua.insert(-2);
+    lua.xMove(co, 1);
+    const co_ref = try lua.ref(zlua.registry_index);
+    defer lua.unref(zlua.registry_index, co_ref);
+
+    // Resuming the coroutine should surface the runtime error as error.LuaRuntime.
+    var num_results: i32 = 0;
+    try testing.expectError(error.LuaRuntime, co.resumeThread(lua, 0, &num_results));
+
+    // On a runtime error the error object is on top of the coroutine's stack
+    // (not the main state's). Lua prefixes the message with `file:line: `, so
+    // substring-match for the body.
+    const msg = try co.toString(-1);
+    try testing.expect(std.mem.indexOf(u8, msg, "oops") != null);
+    co.pop(1);
+}
