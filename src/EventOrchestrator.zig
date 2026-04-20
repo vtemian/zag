@@ -3,7 +3,7 @@
 //! and hands them off via init() + run().
 //!
 //! Ownership: the terminal, screen, layout, compositor, and root buffer
-//! are created in main() and held here as pointers - their lifetimes
+//! are created in main() and held here as pointers. Their lifetimes
 //! exceed the orchestrator's. The orchestrator itself owns the extra
 //! split panes, the keymap registry, and frame-local counters
 //! (spinner, transient status). Each pane owns its own draft
