@@ -50,3 +50,61 @@ test "spike: create coroutine, resume, it yields, resume again, it finishes" {
     try testing.expectEqual(@as(i64, 42), final);
     co.pop(num_results);
 }
+
+/// Zig C-closure that yields back to the scheduler.
+/// Reads an integer argument (discarded in this spike), pushes a marker string,
+/// and calls `yield`, which is `noreturn` on Lua 5.4.
+fn spikeSleep(co: *Lua) i32 {
+    _ = co.toInteger(1) catch 0;
+    _ = co.pushString("yielded");
+    co.yield(1);
+}
+
+test "spike: Zig C-closure can yield back to scheduler" {
+    const alloc = testing.allocator;
+    const lua = try Lua.init(alloc);
+    defer lua.deinit();
+    lua.openLibs();
+
+    // Build a `zag` global table exposing `sleep = spikeSleep`.
+    lua.newTable();
+    lua.pushFunction(zlua.wrap(spikeSleep));
+    lua.setField(-2, "sleep");
+    lua.setGlobal("zag");
+
+    // User Lua calls into the Zig C-closure via the global table.
+    try lua.doString(
+        \\function userfn()
+        \\  return zag.sleep(100)
+        \\end
+    );
+
+    _ = try lua.getGlobal("userfn");
+    try testing.expect(lua.isFunction(-1));
+
+    const co = lua.newThread();
+    // After newThread main stack is [userfn, thread]; swap so userfn is on top,
+    // then xMove pops userfn into the coroutine stack.
+    lua.insert(-2);
+    lua.xMove(co, 1);
+    const co_ref = try lua.ref(zlua.registry_index);
+    defer lua.unref(zlua.registry_index, co_ref);
+
+    // First resume: userfn calls zag.sleep(100); Zig yields "yielded".
+    var num_results: i32 = 0;
+    var status = try co.resumeThread(lua, 0, &num_results);
+    try testing.expectEqual(zlua.ResumeStatus.yield, status);
+    try testing.expectEqual(@as(i32, 1), num_results);
+    const yielded = try co.toString(-1);
+    try testing.expectEqualStrings("yielded", yielded);
+    co.pop(num_results);
+
+    // Second resume: scheduler pushes "woke" as the value of the yield expression.
+    _ = co.pushString("woke");
+    status = try co.resumeThread(lua, 1, &num_results);
+    try testing.expectEqual(zlua.ResumeStatus.ok, status);
+    try testing.expectEqual(@as(i32, 1), num_results);
+    const final = try co.toString(-1);
+    try testing.expectEqualStrings("woke", final);
+    co.pop(num_results);
+}
