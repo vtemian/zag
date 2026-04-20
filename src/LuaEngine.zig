@@ -130,6 +130,13 @@ pub const LuaEngine = struct {
         /// per task at a time — Lua coroutines are single-stack — so a
         /// single slot suffices across cmd_exec/http_get/future kinds.
         primitive_arena: ?*std.heap.ArenaAllocator = null,
+        /// When non-null, this task is running a hook callback. On the
+        /// final `.ok` resume (coroutine returns), resumeTask reads the
+        /// top-of-stack return value (if it's a table) and applies it
+        /// to the payload via `applyHookReturnFromCoroutine`. Pointer
+        /// is borrowed — the `fireHook` caller owns the payload and
+        /// keeps it alive across the drain loop.
+        hook_payload: ?*Hooks.HookPayload = null,
     };
 
     /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
@@ -2458,7 +2465,22 @@ pub const LuaEngine = struct {
         // once per token).
         if (self.hook_registry.hooks.items.len == 0) return;
 
+        // When the async runtime isn't up (standalone tests), fall back
+        // to the legacy synchronous protectedCall path. Hook bodies in
+        // that mode cannot call yielding primitives; that's fine for
+        // the tests that exercise cancel/rewrite semantics only.
+        if (self.io_pool == null) {
+            try self.fireHookSync(payload);
+            return;
+        }
+
         const pattern_key = hookPatternKey(payload.*);
+
+        // Spawn each matching hook as a coroutine. Each gets its own
+        // scope (child of root_scope) so per-hook cancellation propagates
+        // cleanly. We collect thread_refs so we can wait for retirement.
+        var spawned: std.ArrayList(i32) = .empty;
+        defer spawned.deinit(self.allocator);
 
         var it = self.hook_registry.iterMatching(payload.kind(), pattern_key);
         while (it.next()) |hook| {
@@ -2470,21 +2492,85 @@ pub const LuaEngine = struct {
                 self.lua.pop(1); // pop fn
                 continue;
             };
-            // Call: 1 arg (payload table), up to 1 return (rewrite table or nil).
-            self.lua.protectedCall(.{ .args = 1, .results = 1 }) catch |err| {
-                const msg = self.lua.toString(-1) catch "<unprintable>";
-                log.warn("hook for {s} raised: {} ({s})", .{ @tagName(payload.kind()), err, msg });
-                self.lua.pop(1); // pop error message
+            // spawnHookCoroutine consumes [fn, payload] from main stack
+            // and tags the Task with the payload pointer BEFORE the
+            // first resume — so hooks that complete synchronously (no
+            // yields) still have their return table captured in
+            // resumeTask's ok-branch.
+            const thread_ref = self.spawnHookCoroutine(1, null, payload) catch |err| {
+                log.warn("hook spawn failed for {s}: {}", .{ @tagName(payload.kind()), err });
                 continue;
             };
-            // Stack: [return_value]. If it's a table, apply rewrite.
-            if (self.lua.isTable(-1)) {
-                self.applyHookReturn(payload) catch |err| {
-                    log.warn("hook return for {s} failed to apply: {}", .{ @tagName(payload.kind()), err });
+            // If the hook retired during the spawn's first resume, its
+            // return value has already been applied; nothing to wait on.
+            if (self.tasks.contains(thread_ref)) {
+                spawned.append(self.allocator, thread_ref) catch |err| {
+                    log.warn("hook spawn tracking alloc failed: {}", .{err});
                 };
             }
-            self.lua.pop(1); // pop return value
         }
+
+        // Drive the completion drain until every spawned hook retires.
+        // Non-hook coroutines may also complete during this loop — we
+        // resume them too since the main event loop is parked here.
+        while (self.anyHookAlive(spawned.items)) {
+            if (self.completions.?.pop()) |job| {
+                self.resumeFromJob(job) catch |err| {
+                    log.warn("hook drain resumeFromJob failed: {}", .{err});
+                };
+            } else {
+                // Idle sleep. Workers post to the completion queue from
+                // other threads; 1ms is short enough to keep latency low
+                // on short hook bodies and long enough to avoid burning
+                // a core on slow primitives.
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    /// Return true if any thread_ref in `refs` is still registered as a
+    /// live task. Used by the hook drain loop to know when to stop.
+    fn anyHookAlive(self: *LuaEngine, refs: []const i32) bool {
+        for (refs) |r| {
+            if (self.tasks.contains(r)) return true;
+        }
+        return false;
+    }
+
+    /// Legacy synchronous hook dispatch via protectedCall. Used only
+    /// when initAsync hasn't run (standalone tests). Hook bodies that
+    /// try to call yielding primitives in this mode will error out,
+    /// which is fine — that combination is never exercised in tests.
+    fn fireHookSync(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
+        const pattern_key = hookPatternKey(payload.*);
+        var it = self.hook_registry.iterMatching(payload.kind(), pattern_key);
+        while (it.next()) |hook| {
+            try self.fireHookSingle(hook.lua_ref, payload);
+        }
+    }
+
+    /// Invoke a single hook callback synchronously via protectedCall.
+    /// The caller is responsible for ensuring `lua_ref` resolves to a
+    /// Lua function registered via `zag.hook()`.
+    fn fireHookSingle(self: *LuaEngine, lua_ref: i32, payload: *Hooks.HookPayload) !void {
+        _ = self.lua.rawGetIndex(zlua.registry_index, lua_ref);
+        self.pushPayloadAsTable(payload.*) catch |err| {
+            log.warn("hook payload marshalling failed for {s}: {}", .{ @tagName(payload.kind()), err });
+            self.lua.pop(1);
+            return;
+        };
+        self.lua.protectedCall(.{ .args = 1, .results = 1 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "<unprintable>";
+            log.warn("hook for {s} raised: {} ({s})", .{ @tagName(payload.kind()), err, msg });
+            self.lua.pop(1);
+            return;
+        };
+        if (self.lua.isTable(-1)) {
+            self.applyHookReturn(payload) catch |err| {
+                log.warn("hook return for {s} failed to apply: {}", .{ @tagName(payload.kind()), err });
+            };
+        }
+        self.lua.pop(1);
     }
 
     /// Key used for pattern matching against a hook's pattern.
@@ -2646,6 +2732,82 @@ pub const LuaEngine = struct {
                     p.is_error_rewrite = self.lua.toBoolean(-1);
                 }
                 self.lua.pop(1);
+            },
+            else => {},
+        }
+    }
+
+    /// Like `applyHookReturn` but reads the return table from a
+    /// coroutine's stack (`co`) instead of the main Lua stack. Used by
+    /// `resumeTask` when a hook coroutine retires with a return value.
+    /// Table sits at the top of `co`; it is NOT popped here — the
+    /// caller (resumeTask) pops via `co.pop(num_results)`.
+    fn applyHookReturnFromCoroutine(
+        self: *LuaEngine,
+        co: *Lua,
+        payload: *Hooks.HookPayload,
+    ) !void {
+        _ = co.getField(-1, "cancel");
+        const cancel = co.isBoolean(-1) and co.toBoolean(-1);
+        co.pop(1);
+
+        if (cancel) {
+            const veto_allowed = switch (payload.*) {
+                .tool_pre, .user_message_pre => true,
+                else => false,
+            };
+            if (!veto_allowed) {
+                log.warn("hook returned cancel=true for observer-only event {s}; ignored", .{@tagName(payload.kind())});
+                return;
+            }
+            self.pending_cancel = true;
+            _ = co.getField(-1, "reason");
+            if (co.isString(-1)) {
+                if (co.toString(-1)) |reason_text| {
+                    if (self.pending_cancel_reason) |old| self.allocator.free(old);
+                    self.pending_cancel_reason = self.allocator.dupe(u8, reason_text) catch null;
+                } else |_| {}
+            }
+            co.pop(1);
+            return;
+        }
+
+        switch (payload.*) {
+            .tool_pre => |*p| {
+                _ = co.getField(-1, "args");
+                if (co.isTable(-1)) {
+                    const rewrite = try luaTableToJson(co, -1, self.allocator);
+                    if (p.args_rewrite) |old| self.allocator.free(old);
+                    p.args_rewrite = rewrite;
+                }
+                co.pop(1);
+            },
+            .user_message_pre => |*p| {
+                _ = co.getField(-1, "text");
+                if (co.isString(-1)) {
+                    if (co.toString(-1)) |t| {
+                        const rewrite = try self.allocator.dupe(u8, t);
+                        if (p.text_rewrite) |old| self.allocator.free(old);
+                        p.text_rewrite = rewrite;
+                    } else |_| {}
+                }
+                co.pop(1);
+            },
+            .tool_post => |*p| {
+                _ = co.getField(-1, "content");
+                if (co.isString(-1)) {
+                    if (co.toString(-1)) |c| {
+                        const rewrite = try self.allocator.dupe(u8, c);
+                        if (p.content_rewrite) |old| self.allocator.free(old);
+                        p.content_rewrite = rewrite;
+                    } else |_| {}
+                }
+                co.pop(1);
+                _ = co.getField(-1, "is_error");
+                if (co.isBoolean(-1)) {
+                    p.is_error_rewrite = co.toBoolean(-1);
+                }
+                co.pop(1);
             },
             else => {},
         }
@@ -3305,6 +3467,29 @@ pub const LuaEngine = struct {
     /// before this function returns. Callers that need to know whether
     /// the task is still alive should check `self.tasks.get(ref) != null`.
     pub fn spawnCoroutine(self: *LuaEngine, nargs: i32, parent_scope: ?*async_scope.Scope) !i32 {
+        return self.spawnCoroutineTagged(nargs, parent_scope, null);
+    }
+
+    /// Variant of spawnCoroutine that attaches a hook payload pointer
+    /// to the Task before the first resume. This is required so that
+    /// hooks which run to completion synchronously (no yields) still
+    /// have their return table captured in resumeTask's ok-branch.
+    /// A plain spawn-then-tag races against that synchronous retire.
+    pub fn spawnHookCoroutine(
+        self: *LuaEngine,
+        nargs: i32,
+        parent_scope: ?*async_scope.Scope,
+        payload: *Hooks.HookPayload,
+    ) !i32 {
+        return self.spawnCoroutineTagged(nargs, parent_scope, payload);
+    }
+
+    fn spawnCoroutineTagged(
+        self: *LuaEngine,
+        nargs: i32,
+        parent_scope: ?*async_scope.Scope,
+        hook_payload: ?*Hooks.HookPayload,
+    ) !i32 {
         std.debug.assert(self.io_pool != null); // initAsync must have run
 
         const parent = parent_scope orelse self.root_scope.?;
@@ -3327,6 +3512,7 @@ pub const LuaEngine = struct {
             .co = co,
             .thread_ref = thread_ref,
             .scope = scope,
+            .hook_payload = hook_payload,
         };
 
         try self.tasks.put(thread_ref, task);
@@ -3355,6 +3541,17 @@ pub const LuaEngine = struct {
         };
         switch (status) {
             .ok => {
+                // If this task is running a hook callback, peek its
+                // return value before we pop. Veto/rewrite tables live
+                // on `co`'s stack top and must be consumed here — the
+                // coroutine retires in a moment and the values disappear.
+                if (task.hook_payload) |hp| {
+                    if (num_results >= 1 and task.co.isTable(-1)) {
+                        self.applyHookReturnFromCoroutine(task.co, hp) catch |err| {
+                            log.warn("hook return apply failed: {}", .{err});
+                        };
+                    }
+                }
                 task.co.pop(num_results);
                 self.retireTask(task);
             },
@@ -4160,6 +4357,34 @@ test "UserMessagePre can rewrite text" {
     try std.testing.expect(payload.user_message_pre.text_rewrite != null);
     defer std.testing.allocator.free(payload.user_message_pre.text_rewrite.?);
     try std.testing.expectEqualStrings("expanded: hi", payload.user_message_pre.text_rewrite.?);
+}
+
+test "hook body can call zag.sleep and complete" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\_G._hook_fired = false
+        \\zag.hook("ToolPre", { pattern = "bash" }, function(evt)
+        \\  zag.sleep(5)
+        \\  _G._hook_fired = true
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "x",
+        .args_json = "{}",
+        .args_rewrite = null,
+    } };
+    try eng.fireHook(&payload);
+
+    _ = try eng.lua.getGlobal("_hook_fired");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }
 
 test "zag.keymap registers into the engine-owned registry" {
