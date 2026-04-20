@@ -401,8 +401,6 @@ fn runToolStep(
             defer if (maybe_rewrite) |r| allocator.free(r);
             const effective_input = maybe_rewrite orelse tc.input_raw;
 
-            log.info("executing tool: {s}", .{tc.name});
-
             {
                 const start_name = try allocator.dupe(u8, tc.name);
                 errdefer allocator.free(start_name);
@@ -530,7 +528,6 @@ pub fn executeTools(
             .results = results,
             .lua_engine = lua_engine,
         };
-        log.info("spawning tool thread: {s}", .{tc.name});
         handles[i] = std.Thread.spawn(.{}, executeOneToolCall, .{&contexts[i]}) catch |err| {
             log.err("failed to spawn tool thread: {s}", .{@errorName(err)});
             // Execute inline as fallback
