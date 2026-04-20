@@ -325,16 +325,15 @@ pub const SessionHandle = struct {
             log.err("failed to write newline: {}", .{e});
             return e;
         };
-        w.interface.flush() catch |e| {
-            log.err("failed to flush entry: {}", .{e});
-            return e;
-        };
+        // Flush and fsync propagate errors to the caller so the UI can
+        // warn the user that persistence has broken. Logging happens at
+        // the call site (e.g. AgentRunner) rather than here to avoid
+        // double-logging and to keep test output pristine when a test
+        // exercises the error path.
+        try w.interface.flush();
         // Force the write to disk so a power-loss or disk-full crash
         // cannot leave the UI showing text that is not durable.
-        self.file.sync() catch |e| {
-            log.err("failed to fsync session file: {}", .{e});
-            return e;
-        };
+        try self.file.sync();
 
         self.meta.message_count += 1;
         self.meta.updated = entry.timestamp;
