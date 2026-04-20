@@ -6,4 +6,5 @@ pub const Scope = @import("Scope.zig").Scope;
 test {
     _ = @import("spike_test.zig");
     _ = @import("Scope.zig");
+    _ = @import("Job.zig");
 }

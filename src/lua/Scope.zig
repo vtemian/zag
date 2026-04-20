@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const Job = @import("Job.zig").Job;
 
 pub const State = enum(u8) { active, cancelling, done };
 
@@ -8,7 +9,7 @@ pub const Scope = struct {
     alloc: Allocator,
     parent: ?*Scope,
     children: std.ArrayList(*Scope) = .empty,
-    jobs: std.ArrayList(*anyopaque) = .empty, // *Job later; opaque avoids circular import
+    jobs: std.ArrayList(*Job) = .empty,
     state: std.atomic.Value(State) = .init(.active),
     reason: ?[]const u8 = null, // owned by alloc when set via cancel
     shielded: bool = false,
@@ -52,6 +53,28 @@ pub const Scope = struct {
         return false;
     }
 
+    pub fn registerJob(self: *Scope, job: *Job) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.jobs.append(self.alloc, job);
+    }
+
+    pub fn unregisterJob(self: *Scope, job: *Job) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.jobs.items, 0..) |j, i| {
+            if (j == job) {
+                _ = self.jobs.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    // TODO: if alloc.dupe or snapshot alloc fails after CAS succeeded, scope is
+    // half-cancelled: children won't have aborters fired. Cooperative isCancelled()
+    // still returns true via parent walk, but workers blocked in syscalls rely on
+    // aborters. Accept as best-effort for now; document publicly if plugin code
+    // needs to know.
     pub fn cancel(self: *Scope, reason: []const u8) Allocator.Error!void {
         // CAS active -> cancelling; idempotent second-cancel no-op
         if (self.state.cmpxchgStrong(.active, .cancelling, .acq_rel, .acquire) != null) {
@@ -60,14 +83,25 @@ pub const Scope = struct {
         // Store reason duped into scope's allocator so caller doesn't need to keep it alive
         self.reason = try self.alloc.dupe(u8, reason);
 
-        // Snapshot children under lock, cascade outside lock
+        // Snapshot jobs and children under one lock, act outside lock to avoid
+        // deadlock when an aborter or child.cancel touches shared state.
         self.mu.lock();
-        const snapshot = try self.alloc.alloc(*Scope, self.children.items.len);
-        defer self.alloc.free(snapshot);
-        @memcpy(snapshot, self.children.items);
+        const jobs_snap = try self.alloc.alloc(*Job, self.jobs.items.len);
+        @memcpy(jobs_snap, self.jobs.items);
+        const children_snap = try self.alloc.alloc(*Scope, self.children.items.len);
+        @memcpy(children_snap, self.children.items);
         self.mu.unlock();
+        defer self.alloc.free(jobs_snap);
+        defer self.alloc.free(children_snap);
 
-        for (snapshot) |child| {
+        // Fire aborters on all registered jobs (outside lock).
+        for (jobs_snap) |j| j.abort();
+
+        // Cascade to non-shielded children only: a shielded subtree stays
+        // entirely .active across a parent-cancel wave, matching the behavior
+        // isCancelled() already implements for shielded reads.
+        for (children_snap) |child| {
+            if (child.shielded) continue;
             child.cancel(reason) catch |err| {
                 std.log.scoped(.scope).warn("cascade cancel failed: {}", .{err});
             };
@@ -132,4 +166,25 @@ test "Scope.cancel cascades from root to all descendants" {
     try testing.expectEqualStrings("boom", root.reason.?);
     try testing.expectEqualStrings("boom", child.reason.?);
     try testing.expectEqualStrings("boom", grand.reason.?);
+}
+
+test "Scope.cancel invokes job aborters" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    const Ctx = struct {
+        fired: bool = false,
+        fn fire(ctx: *anyopaque) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.fired = true;
+        }
+    };
+    var ctx = Ctx{};
+    var job = Job{ .aborter = .{ .ctx = @ptrCast(&ctx), .abort_fn = Ctx.fire } };
+    try root.registerJob(&job);
+    defer root.unregisterJob(&job);
+
+    try root.cancel("kill");
+    try testing.expect(ctx.fired);
 }
