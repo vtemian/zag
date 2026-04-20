@@ -16,8 +16,9 @@ const CellStyle = Theme.CellStyle;
 ///
 /// Splits `text` on newlines, recognizes block-level constructs (code fences,
 /// headings, lists, horizontal rules) and inline formatting (bold, italic,
-/// inline code, links). Each produced StyledLine has its span text duped via
-/// `allocator`; the caller frees via `Theme.freeStyledLines`.
+/// inline code, links). Produced StyledSpan text is a borrowed slice into
+/// `text` itself; the caller must keep `text` alive for the span's lifetime
+/// and frees the spans arrays via `Theme.freeStyledLines`.
 pub fn parseLines(
     text: []const u8,
     lines: *std.ArrayList(StyledLine),
@@ -155,16 +156,16 @@ fn listLine(
     theme: *const Theme,
 ) !StyledLine {
     const inline_line = try parseInline(allocator, item_text, theme);
-    // Prepend the bullet span
     const total = 1 + inline_line.spans.len;
     const spans = try allocator.alloc(StyledSpan, total);
     errdefer allocator.free(spans);
 
-    const owned_prefix = try allocator.dupe(u8, prefix);
-    spans[0] = .{ .text = owned_prefix, .style = theme.highlights.md_list_bullet };
+    spans[0] = .{ .text = prefix, .style = theme.highlights.md_list_bullet };
     @memcpy(spans[1..], inline_line.spans);
 
-    // Free the inline span array (but not the text -- it's now owned by our new array)
+    // The inline spans array has been copied into our new array; release
+    // the old backing allocation. Span text bytes are borrowed, not owned,
+    // so they are not touched.
     allocator.free(inline_line.spans);
 
     return .{ .spans = spans };
@@ -200,8 +201,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             const close = findClosingBacktick(line, i + 1);
             if (close) |end| {
                 const code_text = line[i + 1 .. end];
-                const owned = try allocator.dupe(u8, code_text);
-                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_code_inline });
+                try spans.append(allocator, .{ .text = code_text, .style = theme.highlights.md_code_inline });
                 i = end + 1;
                 continue;
             }
@@ -213,8 +213,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             const close = findClosingDouble(line, i + 2, '*');
             if (close) |end| {
                 const bold_text = line[i + 2 .. end];
-                const owned = try allocator.dupe(u8, bold_text);
-                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_bold });
+                try spans.append(allocator, .{ .text = bold_text, .style = theme.highlights.md_bold });
                 i = end + 2;
                 continue;
             }
@@ -226,8 +225,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             const close = findClosingSingle(line, i + 1, '*');
             if (close) |end| {
                 const italic_text = line[i + 1 .. end];
-                const owned = try allocator.dupe(u8, italic_text);
-                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_italic });
+                try spans.append(allocator, .{ .text = italic_text, .style = theme.highlights.md_italic });
                 i = end + 1;
                 continue;
             }
@@ -236,8 +234,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
         // Link: [text](url)
         if (line[i] == '[') {
             if (parseLink(line, i)) |link| {
-                const owned = try allocator.dupe(u8, link.text);
-                try spans.append(allocator, .{ .text = owned, .style = theme.highlights.md_link });
+                try spans.append(allocator, .{ .text = link.text, .style = theme.highlights.md_link });
                 i = link.end;
                 continue;
             }
@@ -251,8 +248,7 @@ fn parseInline(allocator: Allocator, line: []const u8, theme: *const Theme) !Sty
             i += 1;
         }
         const plain = line[start..i];
-        const owned = try allocator.dupe(u8, plain);
-        try spans.append(allocator, .{ .text = owned, .style = default_style });
+        try spans.append(allocator, .{ .text = plain, .style = default_style });
     }
 
     if (spans.items.len == 0) {
@@ -667,4 +663,29 @@ test "link inside text" {
     try expectSpanText(lines.items[0].spans, 1, "docs");
     try expectSpanUnderline(lines.items[0].spans, 1);
     try expectSpanText(lines.items[0].spans, 2, " here");
+}
+
+test "span text content matches across multiple parses" {
+    // Regression pin: equality-under-re-parse is the contract we rely on
+    // after the borrowed-slice flip. Parse twice from the same input and
+    // verify the styled text content matches byte-for-byte.
+    const allocator = std.testing.allocator;
+    const theme = Theme.defaultTheme();
+    const input = "plain `code` **bold**";
+
+    var lines1: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines1, allocator);
+    try parseLines(input, &lines1, allocator, &theme);
+
+    var lines2: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines2, allocator);
+    try parseLines(input, &lines2, allocator, &theme);
+
+    try std.testing.expectEqual(lines1.items.len, lines2.items.len);
+    for (lines1.items, lines2.items) |a, b| {
+        try std.testing.expectEqual(a.spans.len, b.spans.len);
+        for (a.spans, b.spans) |sa, sb| {
+            try std.testing.expectEqualStrings(sa.text, sb.text);
+        }
+    }
 }

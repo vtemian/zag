@@ -17,10 +17,17 @@ vtable: *const VTable,
 
 pub const VTable = struct {
     /// Render the buffer content to styled display lines.
-    /// `skip` lines are skipped from the top; `max_lines` limits how many are returned.
+    ///
+    /// `frame_alloc` backs the output list and any per-frame span arrays;
+    /// it is expected to be a reset-per-frame arena so no per-line free is
+    /// required. `cache_alloc` backs long-lived per-buffer caches (e.g.
+    /// ConversationBuffer's per-node rendered-line cache) and must outlive
+    /// the buffer. `skip` lines are dropped from the top; `max_lines`
+    /// bounds the return count.
     getVisibleLines: *const fn (
         ptr: *anyopaque,
-        allocator: Allocator,
+        frame_alloc: Allocator,
+        cache_alloc: Allocator,
         theme: *const Theme,
         skip: usize,
         max_lines: usize,
@@ -48,9 +55,10 @@ pub const VTable = struct {
     clearDirty: *const fn (ptr: *anyopaque) void,
 };
 
-/// Render the buffer's content to styled display lines.
-pub fn getVisibleLines(self: Buffer, allocator: Allocator, theme: *const Theme, skip: usize, max_lines: usize) !std.ArrayList(Theme.StyledLine) {
-    return self.vtable.getVisibleLines(self.ptr, allocator, theme, skip, max_lines);
+/// Render the buffer's content to styled display lines. See `VTable.getVisibleLines`
+/// for the split-allocator contract.
+pub fn getVisibleLines(self: Buffer, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) !std.ArrayList(Theme.StyledLine) {
+    return self.vtable.getVisibleLines(self.ptr, frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
 /// Return the buffer's human-readable name.
@@ -121,7 +129,7 @@ test "Buffer vtable dispatches correctly" {
             }.f),
         };
 
-        fn getVisibleLinesImpl(_: *anyopaque, _: Allocator, _: *const Theme, _: usize, _: usize) anyerror!std.ArrayList(Theme.StyledLine) {
+        fn getVisibleLinesImpl(_: *anyopaque, _: Allocator, _: Allocator, _: *const Theme, _: usize, _: usize) anyerror!std.ArrayList(Theme.StyledLine) {
             return .empty;
         }
         fn getNameImpl(ptr: *anyopaque) []const u8 {
@@ -155,4 +163,8 @@ test "Buffer vtable dispatches correctly" {
 
     b.setScrollOffset(10);
     try std.testing.expectEqual(@as(u32, 10), b.getScrollOffset());
+
+    var lines = try b.getVisibleLines(std.testing.allocator, std.testing.allocator, &Theme.defaultTheme(), 0, 10);
+    defer lines.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), lines.items.len);
 }
