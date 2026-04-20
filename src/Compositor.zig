@@ -1093,6 +1093,53 @@ test "normal mode does not paint a block cursor in the focused pane" {
     try std.testing.expect(!any_bg);
 }
 
+test "composite twice produces identical screen content" {
+    // Regression pin for the renderer ownership flip: no visual regression
+    // across back-to-back frames. Forces layout_dirty on the second frame
+    // so both paths in drawAllLeaves/drawDirtyLeaves produce the same
+    // cell content for a buffer whose content spans styled spans.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 10);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor{
+        .screen = &screen,
+        .allocator = allocator,
+        .theme = &theme,
+        .layout_dirty = true,
+    };
+
+    var cb = try ConversationBuffer.init(allocator, 0, "twice");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hello");
+    _ = try cb.appendNode(null, .assistant_text, "**bold** and `code`");
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 10);
+
+    compositor.composite(&layout, .{ .mode = .insert });
+
+    // Snapshot the first frame's cell codepoints.
+    const cell_count: usize = @as(usize, screen.width) * @as(usize, screen.height);
+    const snapshot1 = try allocator.alloc(u21, cell_count);
+    defer allocator.free(snapshot1);
+    for (0..screen.height) |r| for (0..screen.width) |c| {
+        snapshot1[r * screen.width + c] = screen.getCellConst(@intCast(r), @intCast(c)).codepoint;
+    };
+
+    // Force a full redraw and composite again.
+    compositor.layout_dirty = true;
+    compositor.composite(&layout, .{ .mode = .insert });
+
+    for (0..screen.height) |r| for (0..screen.width) |c| {
+        const cp = screen.getCellConst(@intCast(r), @intCast(c)).codepoint;
+        try std.testing.expectEqual(snapshot1[r * screen.width + c], cp);
+    };
+}
+
 test "tiny pane (height 3) skips the prompt reservation" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 20, 4);

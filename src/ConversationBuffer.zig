@@ -670,6 +670,35 @@ test "getVisibleLines reflects new nodes after appendNode" {
     try std.testing.expectEqual(@as(usize, 2), lines2.items.len);
 }
 
+test "getVisibleLines output survives node content realloc" {
+    // Regression pin for the borrowed-slice cache: after the flip, cache
+    // entries reference slices into node.content.items. Appending to the
+    // content can realloc the buffer. The cache must be version-checked
+    // and discarded before any dangling slice is dereferenced.
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "realloc-test");
+    defer cb.deinit();
+
+    const node = try cb.appendNode(null, .assistant_text, "hi");
+
+    const theme = Theme.defaultTheme();
+
+    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    Theme.freeStyledLines(&lines1, allocator);
+
+    // Force capacity growth with a large append.
+    const big = "z" ** 4096;
+    try cb.appendToNode(node, big);
+
+    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    defer Theme.freeStyledLines(&lines2, allocator);
+
+    const text = try lines2.items[0].toText(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "hiz"));
+    try std.testing.expectEqual(@as(usize, 2 + big.len), text.len);
+}
+
 test "clear invalidates line cache" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test");
