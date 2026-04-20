@@ -173,12 +173,11 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
         return;
     };
     defer {
-        // Order matters. First clear the connection pointer so a
-        // cancel in flight sees null and skips the shutdown. Then
-        // clear the aborter field so a stale aborter snapshot
-        // holding a pointer into this stack frame hits a null and
-        // no-ops. Finally remove from the scope's job list.
-        abort_ctx.clearConnection();
+        // Clear the aborter field so a stale aborter snapshot holding
+        // a pointer into this stack frame hits a null and no-ops.
+        // Then remove from the scope's job list. The connection
+        // pointer is cleared by the req.deinit() defer below, before
+        // req.deinit releases the connection back to the pool.
         job.aborter = null;
         job.scope.unregisterJob(job);
     }
@@ -206,19 +205,41 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
         });
     }
 
-    const redirect: std.http.Client.Request.RedirectBehavior = if (args.follow_redirects)
+    // Redirect policy mirrors `std.http.Client.fetch` (Client.zig:1786):
+    // a request with a body cannot auto-follow 307/308 because we can't
+    // safely replay the payload. We force `.unhandled` in that case; the
+    // caller surfaces `error.RedirectRequiresResend` as .http_error and
+    // decides what to do.
+    const has_body = args.body != null;
+    const redirect: std.http.Client.Request.RedirectBehavior = if (has_body)
+        .unhandled
+    else if (args.follow_redirects)
         @enumFromInt(3)
     else
         .unhandled;
 
-    // Open the connection and build the request.
+    // Open the connection and build the request. `accept_encoding = .omit`
+    // suppresses std.http's default `gzip, deflate, identity`; we don't
+    // decompress here (v1 surfaces raw bytes), so letting servers reply
+    // with gzip would hand Lua callers corrupt strings. Same choice as
+    // http_stream.zig:176 and llm.zig:569.
     var req = client.request(args.method, uri, .{
         .redirect_behavior = redirect,
         .extra_headers = std_headers.items,
+        .headers = .{
+            .accept_encoding = .omit,
+        },
     }) catch |err| {
         return mapAndStoreErr(alloc, job, &abort_ctx, err);
     };
-    defer req.deinit();
+    defer {
+        // Clear the connection pointer BEFORE req.deinit releases the
+        // connection back to the pool. Keeps abort_ctx.connection from
+        // pointing at a freed (or reused) Connection struct if a cancel
+        // fires during or after cleanup.
+        abort_ctx.clearConnection();
+        req.deinit();
+    }
 
     // Publish the connection to the aborter. From here on, a
     // `scope.cancel` will call `posix.shutdown` on this fd and wake

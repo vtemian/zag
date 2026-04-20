@@ -103,7 +103,7 @@ pub const HttpStreamHandle = struct {
     /// `posix.shutdown` on the connection fd; subsequent attempts
     /// short-circuit. The fd remains valid (just half-closed) until
     /// `client.deinit` in `shutdownAndCleanup` runs the actual close.
-    socket_shutdown_done: std.atomic.Value(bool) = .init(false),
+    shutdown_done: std.atomic.Value(bool) = .init(false),
 
     /// Line-buffered bytes read from `body_reader` but not yet handed
     /// to Lua. Owned by the helper thread (no locking — only
@@ -493,7 +493,7 @@ pub const HttpStreamHandle = struct {
     /// buckets into the EOS path. The fd itself stays valid until
     /// `client.deinit` calls close on it in `shutdownAndCleanup`.
     fn shutdownSocket(self: *HttpStreamHandle) void {
-        if (self.socket_shutdown_done.swap(true, .acq_rel)) return;
+        if (self.shutdown_done.swap(true, .acq_rel)) return;
         const conn = self.req.connection orelse return;
         const stream = conn.stream_reader.getStream();
         std.posix.shutdown(stream.handle, .both) catch |err| {
