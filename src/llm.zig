@@ -63,8 +63,8 @@ pub fn mapProviderError(err: anyerror) ProviderError {
 const MAX_SSE_EVENT_DATA: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Streaming event emitted by call_streaming for incremental response delivery.
-/// Defined here (rather than in AgentThread) so the provider VTable can reference
-/// it without creating a circular dependency.
+/// Defined here (rather than beside the agent loop) so the provider VTable can
+/// reference it without creating a circular dependency.
 pub const StreamEvent = union(enum) {
     /// Partial text from the LLM response.
     text_delta: []const u8,
