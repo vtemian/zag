@@ -141,8 +141,6 @@ pub const Endpoint = struct {
     serializer: Serializer,
     /// Full URL for chat completions.
     url: []const u8,
-    /// Env var holding the API key. Null if no auth needed.
-    key_env: ?[]const u8,
     /// How to send the API key in HTTP headers.
     auth: Auth,
     /// Additional HTTP headers sent with every request.
@@ -172,8 +170,6 @@ pub const Endpoint = struct {
         errdefer allocator.free(name);
         const url = try allocator.dupe(u8, self.url);
         errdefer allocator.free(url);
-        const key_env = if (self.key_env) |k| try allocator.dupe(u8, k) else null;
-        errdefer if (key_env) |k| allocator.free(k);
 
         const headers = try allocator.alloc(Header, self.headers.len);
         errdefer allocator.free(headers);
@@ -194,7 +190,6 @@ pub const Endpoint = struct {
             .name = name,
             .serializer = self.serializer,
             .url = url,
-            .key_env = key_env,
             .auth = self.auth,
             .headers = headers,
         };
@@ -207,7 +202,6 @@ pub const Endpoint = struct {
             allocator.free(h.value);
         }
         allocator.free(self.headers);
-        if (self.key_env) |k| allocator.free(k);
         allocator.free(self.url);
         allocator.free(self.name);
     }
@@ -218,7 +212,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "anthropic",
         .serializer = .anthropic,
         .url = "https://api.anthropic.com/v1/messages",
-        .key_env = "ANTHROPIC_API_KEY",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
     },
@@ -226,7 +219,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "openai",
         .serializer = .openai,
         .url = "https://api.openai.com/v1/chat/completions",
-        .key_env = "OPENAI_API_KEY",
         .auth = .bearer,
         .headers = &.{},
     },
@@ -234,7 +226,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "openrouter",
         .serializer = .openai,
         .url = "https://openrouter.ai/api/v1/chat/completions",
-        .key_env = "OPENROUTER_API_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
     },
@@ -242,7 +233,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "groq",
         .serializer = .openai,
         .url = "https://api.groq.com/openai/v1/chat/completions",
-        .key_env = "GROQ_API_KEY",
         .auth = .bearer,
         .headers = &.{},
     },
@@ -250,7 +240,6 @@ const builtin_endpoints = [_]Endpoint{
         .name = "ollama",
         .serializer = .openai,
         .url = "http://localhost:11434/v1/chat/completions",
-        .key_env = null,
         .auth = .none,
         .headers = &.{},
     },
@@ -448,10 +437,8 @@ fn createProviderWithRegistry(model_id: []const u8, registry: Registry, allocato
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
-    const api_key = if (endpoint.key_env) |env|
-        std.process.getEnvVarOwned(allocator, env) catch return error.MissingApiKey
-    else
-        try allocator.dupe(u8, "");
+    // TODO(env-to-lua Task 6): replaced by auth.resolveCredential lookup.
+    const api_key = try allocator.dupe(u8, "");
     errdefer allocator.free(api_key);
 
     switch (endpoint.serializer) {
@@ -857,7 +844,6 @@ test "Endpoint.dupe creates independent copy" {
         .name = "test",
         .serializer = .openai,
         .url = "https://example.com",
-        .key_env = "TEST_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
     };
@@ -867,7 +853,6 @@ test "Endpoint.dupe creates independent copy" {
 
     try std.testing.expectEqualStrings("test", duped.name);
     try std.testing.expectEqualStrings("https://example.com", duped.url);
-    try std.testing.expectEqualStrings("TEST_KEY", duped.key_env.?);
     try std.testing.expectEqual(Serializer.openai, duped.serializer);
     try std.testing.expectEqual(Endpoint.Auth.bearer, duped.auth);
     try std.testing.expectEqual(@as(usize, 1), duped.headers.len);
@@ -877,25 +862,6 @@ test "Endpoint.dupe creates independent copy" {
     // Verify independence: pointers must differ
     try std.testing.expect(original.name.ptr != duped.name.ptr);
     try std.testing.expect(original.url.ptr != duped.url.ptr);
-}
-
-test "Endpoint.dupe handles null key_env" {
-    const allocator = std.testing.allocator;
-
-    const original = Endpoint{
-        .name = "ollama",
-        .serializer = .openai,
-        .url = "http://localhost:11434/v1/chat/completions",
-        .key_env = null,
-        .auth = .none,
-        .headers = &.{},
-    };
-
-    const duped = try original.dupe(allocator);
-    defer duped.free(allocator);
-
-    try std.testing.expectEqual(@as(?[]const u8, null), duped.key_env);
-    try std.testing.expectEqual(@as(usize, 0), duped.headers.len);
 }
 
 test {
@@ -1150,7 +1116,6 @@ test "Registry initializes with built-in endpoints" {
     const ollama = registry.find("ollama");
     try std.testing.expect(ollama != null);
     try std.testing.expectEqual(Endpoint.Auth.none, ollama.?.auth);
-    try std.testing.expectEqual(@as(?[]const u8, null), ollama.?.key_env);
 
     try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("unknown"));
 }
@@ -1168,7 +1133,6 @@ test "buildHeaders creates correct auth for bearer endpoint" {
         .name = "test",
         .serializer = .openai,
         .url = "https://example.com",
-        .key_env = "TEST_KEY",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
     };
@@ -1186,7 +1150,6 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
         .name = "test",
         .serializer = .anthropic,
         .url = "https://example.com",
-        .key_env = "TEST_KEY",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
     };
@@ -1204,7 +1167,6 @@ test "buildHeaders handles no-auth endpoint" {
         .name = "ollama",
         .serializer = .openai,
         .url = "http://localhost:11434/v1/chat/completions",
-        .key_env = null,
         .auth = .none,
         .headers = &.{},
     };
