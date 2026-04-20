@@ -1150,10 +1150,93 @@ pub const LuaEngine = struct {
     /// The stub destroys the job so tests don't leak; Phase 4 wires real
     /// lua_resume via thread_ref lookup in self.tasks.
     pub fn resumeFromJob(self: *LuaEngine, job: *async_job.Job) !void {
-        // TODO(Phase 4): find task via self.tasks.get(job.thread_ref),
-        // push result values onto task.co, call task.co.resumeThread(...).
+        // TODO(Phase 4.4): find task via self.tasks.get(job.thread_ref),
+        // push result values onto task.co, call self.resumeTask(task, n).
         // For now, free the job so the orchestrator drain doesn't leak it.
         self.allocator.destroy(job);
+    }
+
+    /// Creates a coroutine for the Lua function + `nargs` arguments that are
+    /// already on top of `self.lua`'s stack. Layout expected before call:
+    /// `[fn, arg1, ..., argN]`. The stack is fully consumed — caller must
+    /// not touch the main stack at those slots after this returns.
+    ///
+    /// Returns the registry ref used as the `Task`'s key. NOTE: if the
+    /// coroutine completes synchronously (.ok) or errors on the first
+    /// resume, `retireTask` removes it from `self.tasks` and frees it
+    /// before this function returns. Callers that need to know whether
+    /// the task is still alive should check `self.tasks.get(ref) != null`.
+    pub fn spawnCoroutine(self: *LuaEngine, nargs: i32, parent_scope: ?*async_scope.Scope) !i32 {
+        std.debug.assert(self.io_pool != null); // initAsync must have run
+
+        const parent = parent_scope orelse self.root_scope.?;
+        const scope = try async_scope.Scope.init(self.allocator, parent);
+        errdefer scope.deinit();
+
+        const co = self.lua.newThread();
+        // After newThread main stack is [fn, arg1, ..., argN, thread].
+        // Rotate thread down below fn+args: [thread, fn, arg1, ..., argN].
+        self.lua.insert(-(nargs + 2));
+        // Move fn+args to the coroutine; main stack is now [thread].
+        self.lua.xMove(co, nargs + 1);
+        // Pop thread off main and stash it in the registry.
+        const thread_ref = try self.lua.ref(zlua.registry_index);
+        errdefer self.lua.unref(zlua.registry_index, thread_ref);
+
+        const task = try self.allocator.create(Task);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .co = co,
+            .thread_ref = thread_ref,
+            .scope = scope,
+        };
+
+        try self.tasks.put(thread_ref, task);
+        // From here on `task` is owned by `self.tasks`; any further cleanup
+        // flows through retireTask. resumeTask is infallible from the
+        // caller's POV, so no errdefer needs to fire past this point.
+
+        self.resumeTask(task, nargs);
+        return thread_ref;
+    }
+
+    /// Drive a task's coroutine one step. On `.ok` the coroutine has
+    /// returned and is retired immediately. On `.yield` the task is
+    /// left in the map for a later resume (from `resumeFromJob`). On
+    /// error the message is logged and the task is retired. Never
+    /// propagates an error to the caller — scheduler work runs on the
+    /// main thread and there is no meaningful recovery path.
+    fn resumeTask(self: *LuaEngine, task: *Task, num_args_on_co: i32) void {
+        var num_results: i32 = 0;
+        const status = task.co.resumeThread(self.lua, num_args_on_co, &num_results) catch |err| {
+            const msg = task.co.toString(-1) catch "<no msg>";
+            log.warn("coroutine errored: {s}: {s}", .{ @errorName(err), msg });
+            task.co.pop(1);
+            self.retireTask(task);
+            return;
+        };
+        switch (status) {
+            .ok => {
+                task.co.pop(num_results);
+                self.retireTask(task);
+            },
+            .yield => {
+                // Yielded values sit on `co` — the binding that yielded
+                // owns their interpretation. zag.sleep yields 0 values
+                // today; pop defensively so we never leak stack slots.
+                task.co.pop(num_results);
+            },
+        }
+    }
+
+    /// Remove a task from the active set: unregister, unref the thread
+    /// from the Lua registry (letting the GC reclaim the coroutine),
+    /// tear down the scope, and free the Task allocation.
+    fn retireTask(self: *LuaEngine, task: *Task) void {
+        _ = self.tasks.remove(task.thread_ref);
+        self.lua.unref(zlua.registry_index, task.thread_ref);
+        task.scope.deinit();
+        self.allocator.destroy(task);
     }
 
     /// Hook for agent threads to bind this engine as their active Lua context.
@@ -1313,6 +1396,21 @@ test "LuaEngine.deinitAsync is safe without initAsync" {
     defer eng.deinit();
     // Never call initAsync. deinitAsync must tolerate this.
     eng.deinitAsync();
+}
+
+test "spawnCoroutine runs a synchronous Lua function to completion" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString("function fast() return 42 end");
+    _ = try eng.lua.getGlobal("fast");
+    _ = try eng.spawnCoroutine(0, null);
+
+    // Synchronous completion retires the task immediately; tasks map is empty.
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
 }
 
 test "zag.tool() collects tool definitions" {
