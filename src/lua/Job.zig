@@ -53,11 +53,25 @@ pub const CmdExecResult = struct {
     truncated: bool,
 };
 
+/// Completion payload for a long-lived `CmdHandle:wait()`. The helper
+/// thread that owns the Child has already reaped it and captured the
+/// exit status; the main thread only needs the code to push onto the
+/// waiting coroutine.
+pub const CmdWaitDoneSpec = struct {
+    /// Exit status: 0+ for normal exit, negative (-N) for termination by
+    /// signal N. -1 when the Term was unknown/stopped.
+    code: i32,
+};
+
 /// What the worker should do with this job. The scheduler fills this in
 /// before submit.
 pub const JobKind = union(enum) {
     sleep: struct { ms: u64 },
     cmd_exec: CmdExecSpec,
+    /// Posted by a CmdHandle helper thread, not submitted to the pool.
+    /// Tells the main thread to resume the coroutine waiting in
+    /// `CmdHandle:wait()` with the captured exit code.
+    cmd_wait_done: CmdWaitDoneSpec,
     // http/fs land in later phases
 };
 

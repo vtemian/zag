@@ -126,6 +126,10 @@ fn executeJob(alloc: Allocator, job: *Job) void {
             job.result = .empty;
         },
         .cmd_exec => @import("primitives/cmd.zig").executeExec(alloc, job),
+        // CmdHandle helper threads synthesise this kind directly onto
+        // the completion queue; the pool never dispatches one. If we
+        // ever see it here it's a programmer bug.
+        .cmd_wait_done => unreachable,
     }
 }
 
