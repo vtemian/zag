@@ -242,6 +242,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "provider");
         lua.pushFunction(zlua.wrap(zagSleepFn));
         lua.setField(-2, "sleep");
+        lua.pushFunction(zlua.wrap(zagSpawnFn));
+        lua.setField(-2, "spawn");
+        lua.pushFunction(zlua.wrap(zagDetachFn));
+        lua.setField(-2, "detach");
         lua.setGlobal("zag");
     }
 
@@ -316,6 +320,60 @@ pub const LuaEngine = struct {
 
         co.yield(0);
         // yield is noreturn on Lua 5.4.
+    }
+
+    /// `zag.spawn(fn, args...)` — starts a new coroutine and returns a
+    /// TaskHandle userdata. If the caller is itself running inside a task
+    /// (a hook, keymap, or another spawned coroutine), the new task's
+    /// scope is parented to the caller's scope so agent-level cancellation
+    /// cascades into children. Top-level callers (e.g. config.lua) spawn
+    /// under `engine.root_scope`.
+    fn zagSpawnFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+        const nargs = co.getTop() - 1; // first arg is fn
+        if (nargs < 0) co.raiseErrorStr("zag.spawn: missing fn", .{});
+        if (!co.isFunction(1)) co.raiseErrorStr("zag.spawn: arg 1 must be function", .{});
+
+        const parent: ?*async_scope.Scope = if (engine.taskForCoroutine(co)) |t| t.scope else null;
+
+        // spawnCoroutine operates on `engine.lua`'s stack. When zag.spawn
+        // is called from inside another coroutine, [fn, args...] live on
+        // `co`'s stack; move them to the main state first.
+        if (co != engine.lua) {
+            co.xMove(engine.lua, nargs + 1);
+        }
+
+        const thread_ref = engine.spawnCoroutine(nargs, parent) catch |err| {
+            co.raiseErrorStr("zag.spawn failed: %s", .{@errorName(err).ptr});
+        };
+
+        // Push the TaskHandle userdata on `co`'s stack — that's where the
+        // caller expects zag.spawn's return value.
+        const h = co.newUserdata(TaskHandle, 0);
+        h.* = .{ .thread_ref = thread_ref, .engine = engine };
+        _ = co.getMetatableRegistry(TaskHandle.METATABLE_NAME);
+        co.setMetatable(-2);
+        return 1;
+    }
+
+    /// `zag.detach(fn, args...)` — fire-and-forget spawn. Same scope
+    /// parenting rules as `zag.spawn`, but returns nothing; the caller
+    /// has no handle and cannot cancel or join the child.
+    fn zagDetachFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+        const nargs = co.getTop() - 1;
+        if (nargs < 0) co.raiseErrorStr("zag.detach: missing fn", .{});
+        if (!co.isFunction(1)) co.raiseErrorStr("zag.detach: arg 1 must be function", .{});
+
+        const parent: ?*async_scope.Scope = if (engine.taskForCoroutine(co)) |t| t.scope else null;
+
+        if (co != engine.lua) {
+            co.xMove(engine.lua, nargs + 1);
+        }
+        _ = engine.spawnCoroutine(nargs, parent) catch |err| {
+            co.raiseErrorStr("zag.detach failed: %s", .{@errorName(err).ptr});
+        };
+        return 0;
     }
 
     /// Call once during LuaEngine.init after openLibs to register the
@@ -2330,4 +2388,86 @@ test "TaskHandle metatable is registered at engine init" {
     eng.lua.pop(1);
 
     eng.lua.pop(1); // pop the metatable
+}
+
+test "zag.spawn returns handle and :done() flips after sleep completes" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Parent spawns a short-sleeping child, checks :done() immediately
+    // (must be false while child sleeps), then sleeps long enough for the
+    // child to retire and re-checks :done() (must be true).
+    try eng.lua.doString(
+        \\function outer()
+        \\  local t = zag.spawn(function()
+        \\    zag.sleep(5)
+        \\  end)
+        \\  _outer_initial_done = t:done()
+        \\  zag.sleep(50)
+        \\  _outer_final_done = t:done()
+        \\end
+    );
+
+    _ = try eng.lua.getGlobal("outer");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_outer_initial_done");
+    try std.testing.expect(!eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_outer_final_done");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.detach spawns a fire-and-forget coroutine" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // zag.detach returns nothing; the child side-effect (setting
+    // _detach_ran) is the only evidence it ran.
+    try eng.lua.doString(
+        \\function outer()
+        \\  _detach_rv_count = select('#', zag.detach(function()
+        \\    zag.sleep(1)
+        \\    _detach_ran = true
+        \\  end))
+        \\  zag.sleep(50)
+        \\end
+    );
+
+    _ = try eng.lua.getGlobal("outer");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_detach_rv_count");
+    try std.testing.expectEqual(@as(i64, 0), eng.lua.toInteger(-1) catch unreachable);
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_detach_ran");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }
