@@ -21,7 +21,6 @@ const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const trace = @import("Metrics.zig");
 const EventOrchestrator = @import("EventOrchestrator.zig");
-const build_options = @import("build_options");
 
 const log = std.log.scoped(.main);
 
@@ -170,13 +169,7 @@ pub fn main() !void {
 
     trace.init();
 
-    // When metrics are on, wrap the GPA with a counting allocator so we can
-    // report per-frame alloc counts.
-    var counting = if (build_options.metrics)
-        trace.CountingAllocator{ .inner = gpa.allocator() }
-    else {};
-
-    const allocator = if (build_options.metrics) counting.allocator() else gpa.allocator();
+    const allocator = trace.wrapAllocator(gpa.allocator());
 
     root_session = ConversationSession.init(allocator);
     defer root_session.deinit();
@@ -309,7 +302,6 @@ pub fn main() !void {
         .session_mgr = &session_mgr,
         .lua_engine = if (lua_engine) |*eng| eng else null,
         .stdout_file = stdout_file,
-        .counting = if (build_options.metrics) &counting else null,
         .wake_read_fd = wake_read,
         .wake_write_fd = wake_write,
     });

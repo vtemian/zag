@@ -129,6 +129,16 @@ pub inline fn frameStart() void {
     }
 }
 
+/// Record that a frame completed, reading counters from the module-level
+/// counting allocator. Resets per-frame counters for the next frame.
+/// No-op when metrics are disabled or no counting allocator is wired.
+pub inline fn frameEnd() void {
+    if (!enabled) return;
+    const c = &(counting_state orelse return);
+    frameEndWithAllocs(c.alloc_count, c.alloc_bytes, c.peak_bytes);
+    c.resetFrame();
+}
+
 /// Record that a frame completed, updating cumulative stats.
 /// Call after the frame's span has been ended so its dur_us is populated.
 pub inline fn frameEndWithAllocs(allocs: u32, alloc_bytes: u64, cur_peak: u64) void {
@@ -293,6 +303,18 @@ pub fn dump(path: []const u8) !usize {
     return count;
 }
 
+/// Module-level counting allocator, initialized by `wrapAllocator`.
+var counting_state: ?CountingAllocator = null;
+
+/// Wrap an allocator with per-frame counting. Returns the wrapped
+/// allocator when metrics are enabled, or the original when disabled.
+/// Must be called before any `frameEnd` call.
+pub fn wrapAllocator(inner: std.mem.Allocator) std.mem.Allocator {
+    if (!enabled) return inner;
+    counting_state = CountingAllocator{ .inner = inner };
+    return counting_state.?.allocator();
+}
+
 /// Reset all global state. Called at startup or in tests.
 pub fn init() void {
     if (!enabled) return;
@@ -303,6 +325,7 @@ pub fn init() void {
     total_frame_count = 0;
     peak_memory_bytes = 0;
     session_start = null;
+    counting_state = null;
 }
 
 /// Wraps an allocator to count allocations and frees per frame.

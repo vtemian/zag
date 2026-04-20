@@ -27,7 +27,6 @@ const AgentSupervisor = @import("AgentSupervisor.zig");
 const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const trace = @import("Metrics.zig");
-const build_options = @import("build_options");
 
 const log = std.log.scoped(.orchestrator);
 
@@ -66,8 +65,6 @@ provider: *llm.ProviderResult,
 lua_engine: ?*LuaEngine,
 /// Where to write the rendered screen.
 stdout_file: std.fs.File,
-/// Allocator wrapper used when metrics are enabled (for per-frame alloc counts).
-counting: ?*trace.CountingAllocator,
 /// Read end of the wake pipe. The orchestrator polls this alongside stdin so
 /// agent-thread event pushes and SIGWINCH can interrupt its wait without a
 /// busy-wait sleep.
@@ -109,8 +106,6 @@ pub const Config = struct {
     lua_engine: ?*LuaEngine,
     /// Where to write the rendered screen.
     stdout_file: std.fs.File,
-    /// Allocator wrapper for per-frame alloc counts; non-null with -Dmetrics.
-    counting: ?*trace.CountingAllocator,
     /// Read end of the wake pipe; polled alongside stdin so agent events
     /// and SIGWINCH can interrupt poll() without a busy-wait.
     wake_read_fd: posix.fd_t,
@@ -127,7 +122,6 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .provider = cfg.provider,
         .lua_engine = cfg.lua_engine,
         .stdout_file = cfg.stdout_file,
-        .counting = cfg.counting,
         .wake_read_fd = cfg.wake_read_fd,
     };
     self.window_manager = try WindowManager.init(.{
@@ -246,22 +240,11 @@ fn tick(
 
     // Start frame timing (only for frames that do real work)
     trace.frameStart();
-    if (build_options.metrics) {
-        if (self.counting) |c| c.resetFrame();
-    }
 
     var frame_span = trace.span("frame");
     defer {
         frame_span.end();
-        if (build_options.metrics) {
-            if (self.counting) |c| {
-                trace.frameEndWithAllocs(
-                    c.alloc_count,
-                    c.alloc_bytes,
-                    c.peak_bytes,
-                );
-            }
-        }
+        trace.frameEnd();
     }
 
     // Update FPS counter
