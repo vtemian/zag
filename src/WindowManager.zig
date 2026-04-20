@@ -28,6 +28,9 @@ const log = std.log.scoped(.window_manager);
 
 const WindowManager = @This();
 
+/// Characters for the animated spinner.
+pub const spinner_chars = "|/-\\";
+
 /// Pane composition: view + session + runner. Mirrors the coordinator's
 /// view of a pane so callers needing all three compose them through this
 /// struct; each field is a borrowed pointer with coupled lifetimes.
@@ -349,6 +352,31 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
         allocator.free(pane.view.name);
         pane.view.name = try allocator.dupe(u8, handle.meta.nameSlice());
     }
+}
+
+/// Result of handling a slash command.
+pub const CommandResult = enum { handled, quit, not_a_command };
+
+/// Try to handle input as a slash command. Returns .not_a_command if
+/// the input doesn't match any known command.
+pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
+    if (std.mem.eql(u8, command, "/quit") or std.mem.eql(u8, command, "/q")) {
+        return .quit;
+    }
+
+    if (std.mem.eql(u8, command, "/perf") or std.mem.eql(u8, command, "/perf-dump")) {
+        self.handlePerfCommand(command);
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, command, "/model")) {
+        var scratch: [128]u8 = undefined;
+        const model_info = std.fmt.bufPrint(&scratch, "model: {s}", .{self.provider.model_id}) catch "model: unknown";
+        self.appendStatus(model_info);
+        return .handled;
+    }
+
+    return .not_a_command;
 }
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
