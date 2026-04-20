@@ -1,8 +1,9 @@
 //! Layout, panes, focus, and frame-local UI state. Owns the tree of
-//! windows, the list of extra panes (root lives elsewhere), the
-//! keymap registry, and the transient-status + spinner counters. Does
-//! not own terminal/screen/compositor or the Lua engine; those are
-//! borrowed from the coordinator.
+//! windows, the list of extra panes (root lives elsewhere), and the
+//! transient-status + spinner counters. The keymap registry is owned
+//! by the Lua engine and accessed via `keymapRegistry()`. Does not own
+//! terminal/screen/compositor or the Lua engine; those are borrowed
+//! from the coordinator.
 
 const std = @import("std");
 const posix = std.posix;
@@ -91,9 +92,6 @@ spinner_frame: u8 = 0,
 /// Global editing mode. Insert = typing into input buffer;
 /// Normal = keymap bindings fire, typing is disabled.
 current_mode: Keymap.Mode = .insert,
-/// Keymap registry. Built from defaults in `init`; Lua config can
-/// register overrides via `zag.keymap()` before `loadUserConfig` runs.
-keymap_registry: Keymap.Registry = undefined,
 
 pub const Config = struct {
     /// Heap allocator for runtime allocations owned by the manager.
@@ -117,7 +115,7 @@ pub const Config = struct {
 };
 
 pub fn init(cfg: Config) !WindowManager {
-    var self = WindowManager{
+    return .{
         .allocator = cfg.allocator,
         .screen = cfg.screen,
         .layout = cfg.layout,
@@ -128,10 +126,13 @@ pub fn init(cfg: Config) !WindowManager {
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
     };
-    self.keymap_registry = Keymap.Registry.init(cfg.allocator);
-    errdefer self.keymap_registry.deinit();
-    try self.keymap_registry.loadDefaults();
-    return self;
+}
+
+/// Borrow the keymap registry from the Lua engine. Null when Lua init
+/// failed; callers fall back to mode-default dispatch in that case.
+pub fn keymapRegistry(self: *WindowManager) ?*Keymap.Registry {
+    const engine = self.lua_engine orelse return null;
+    return engine.keymapRegistry();
 }
 
 /// Release every extra pane's resources. Agent threads must be shut down
@@ -151,7 +152,6 @@ pub fn deinit(self: *WindowManager) void {
         self.allocator.destroy(entry.pane.session);
     }
     self.extra_panes.deinit(self.allocator);
-    self.keymap_registry.deinit();
 }
 
 // -- Window management -------------------------------------------------------
