@@ -468,10 +468,44 @@ fn bufClearDirty(ptr: *anyopaque) void {
     self.render_dirty = false;
 }
 
+/// Handle a key event aimed at the buffer's in-progress draft. The
+/// orchestrator strips universal shortcuts (Ctrl+C) and keymap bindings
+/// before this runs, so everything here is insert-mode editing of the
+/// draft buffer. Enter and page_up/page_down stay on the orchestrator
+/// because they touch the submit pipeline and the layout's focused
+/// leaf's scroll offset, neither of which belongs to the view alone.
+pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleResult {
+    if (ev.modifiers.ctrl) {
+        switch (ev.key) {
+            .char => |ch| {
+                if (ch == 'w') {
+                    self.deleteWordFromDraft();
+                    return .consumed;
+                }
+            },
+            else => {},
+        }
+        return .passthrough;
+    }
+    switch (ev.key) {
+        .backspace => {
+            self.deleteBackFromDraft();
+            return .consumed;
+        },
+        .char => |ch| {
+            if (ch >= 0x20 and ch < 0x7f) {
+                self.appendToDraft(@intCast(ch));
+                return .consumed;
+            }
+            return .passthrough;
+        },
+        else => return .passthrough,
+    }
+}
+
 fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
-    _ = ptr;
-    _ = ev;
-    return .passthrough;
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return self.handleKey(ev);
 }
 
 fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
@@ -901,4 +935,65 @@ test "clearDraft resets length to zero" {
     cb.clearDraft();
     try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
     try std.testing.expectEqualStrings("", cb.getDraft());
+}
+
+test "handleKey appends printable chars to the draft" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("a", cb.getDraft());
+}
+
+test "handleKey on backspace deletes one char" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hi") |ch| cb.appendToDraft(ch);
+    const r = cb.handleKey(.{ .key = .backspace, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("h", cb.getDraft());
+}
+
+test "handleKey on Ctrl+W deletes the trailing word" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hello world") |ch| cb.appendToDraft(ch);
+    const r = cb.handleKey(.{ .key = .{ .char = 'w' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("hello", cb.getDraft());
+}
+
+test "handleKey returns passthrough for Enter (orchestrator retains the submit path)" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const r = cb.handleKey(.{ .key = .enter, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+}
+
+test "handleKey returns passthrough for unrelated ctrl chords" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+}
+
+test "handleKey dispatches through the Buffer interface" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const b = cb.buf();
+    const r = b.handleKey(.{ .key = .{ .char = 'Z' }, .modifiers = .{} });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("Z", cb.getDraft());
 }
