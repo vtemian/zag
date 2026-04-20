@@ -9,6 +9,12 @@ pub const Aborter = struct {
     }
 };
 
+/// Policy for building the child process environment.
+/// - `inherit`: the child sees the parent's env untouched.
+/// - `replace`: use `env_map` verbatim; nothing is inherited.
+/// - `extend`: start from the parent env and overlay `env_map` on top.
+pub const CmdExecEnvMode = enum { inherit, replace, extend };
+
 /// Argv/env/timeout/output-cap payload for a cmd_exec job. Kept outside
 /// the union because it's bigger than the other variants and is easier to
 /// read as its own type.
@@ -20,7 +26,7 @@ pub const CmdExecSpec = struct {
     /// Working directory for the child. Borrowed from the caller.
     cwd: ?[]const u8 = null,
     /// How to construct the child's environment.
-    env_mode: enum { inherit, replace, extend } = .inherit,
+    env_mode: CmdExecEnvMode = .inherit,
     /// Optional env overrides. Semantics depend on env_mode.
     env_map: ?std.process.EnvMap = null,
     /// Bytes to write to the child's stdin before draining output. Borrowed

@@ -54,8 +54,38 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
     child.stderr_behavior = .Pipe;
     if (spec.cwd) |c| child.cwd = c;
     if (spec.stdin_bytes != null) child.stdin_behavior = .Pipe;
-    // env_map/env_mode: deliberately not wired here; binding layer (6.2)
-    // will populate child.env_map from the spec.
+
+    // Env handling. `merged_env` only exists in the `.extend` path; its
+    // lifetime must outlive `child.spawn` and the poll loop since
+    // `child.env_map` borrows its storage. A single defer at function
+    // scope handles cleanup on every return path.
+    var merged_env: ?std.process.EnvMap = null;
+    defer if (merged_env) |*m| m.deinit();
+
+    switch (spec.env_mode) {
+        .inherit => {},
+        .replace => {
+            if (spec.env_map) |*m| child.env_map = m;
+        },
+        .extend => {
+            if (spec.env_map) |extras| {
+                var sys_env = std.process.getEnvMap(alloc) catch |err| {
+                    job.err_tag = .io_error;
+                    job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
+                    return;
+                };
+                defer sys_env.deinit();
+
+                merged_env = std.process.EnvMap.init(alloc);
+                var it = sys_env.iterator();
+                while (it.next()) |e| merged_env.?.put(e.key_ptr.*, e.value_ptr.*) catch {};
+                var it2 = extras.iterator();
+                while (it2.next()) |e| merged_env.?.put(e.key_ptr.*, e.value_ptr.*) catch {};
+
+                child.env_map = &merged_env.?;
+            }
+        },
+    }
 
     child.spawn() catch |err| {
         job.err_tag = .spawn_failed;
