@@ -167,6 +167,20 @@ pub const CmdReadLineDoneSpec = struct {
     line: ?[]const u8,
 };
 
+/// Completion payload for one `HttpStreamHandle:lines()` iteration.
+/// The helper thread either pulled a newline-terminated segment out
+/// of the response body or observed EOF. Same ownership rules as
+/// `CmdReadLineDoneSpec`: `pushJobResultOntoStack` frees `line` after
+/// copying into Lua.
+pub const HttpStreamLineDoneSpec = struct {
+    /// Next line from the response body (without the trailing '\n';
+    /// a trailing '\r' is also stripped so SSE "\r\n" framing arrives
+    /// clean). Heap-allocated on the engine allocator. `null` means
+    /// end-of-stream — the iterator returns nil and the `for` loop
+    /// ends.
+    line: ?[]const u8,
+};
+
 /// What the worker should do with this job. The scheduler fills this in
 /// before submit.
 pub const JobKind = union(enum) {
@@ -193,6 +207,11 @@ pub const JobKind = union(enum) {
     /// Shares `JobResult.http` with `http_get` — status/body shape is
     /// identical, only the request side differs.
     http_post: HttpPostSpec,
+    /// Posted by an HttpStreamHandle helper thread for each `:lines()`
+    /// iteration. Resumes the coroutine with the next line or nil at
+    /// EOF. Not pool-submitted — the helper thread synthesises these
+    /// directly onto the completion queue.
+    http_stream_line_done: HttpStreamLineDoneSpec,
     // fs lands in a later phase
 };
 
