@@ -186,7 +186,7 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
                     try std.json.Stringify.value(tr.content, .{}, w);
                     try w.writeAll("}");
                 },
-                else => {},
+                else => log.warn("writeMessage: dropping non-tool_result block in tool_result message", .{}),
             }
         }
         return;
@@ -196,19 +196,14 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
         try w.writeAll("{\"role\":\"assistant\"");
 
         if (has_text) {
-            try w.writeAll(",\"content\":");
-            var first_text = true;
+            try w.writeAll(",\"content\":\"");
             for (msg.content) |block| {
                 switch (block) {
-                    .text => |t| {
-                        if (first_text) {
-                            try std.json.Stringify.value(t.text, .{}, w);
-                            first_text = false;
-                        }
-                    },
+                    .text => |t| try types.writeJsonStringContents(w, t.text),
                     else => {},
                 }
             }
+            try w.writeAll("\"");
         } else {
             try w.writeAll(",\"content\":null");
         }
@@ -789,6 +784,69 @@ test "openai writeMessage flattens tool_use into tool_calls" {
     try std.testing.expectEqual(@as(usize, 1), tc.items.len);
     try std.testing.expectEqualStrings("call_001", tc.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("function", tc.items[0].object.get("type").?.string);
+}
+
+test "openai writeMessage preserves all text blocks when interleaved with tool_use" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 4);
+    defer allocator.free(content);
+    content[0] = .{ .text = .{ .text = "hello " } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{\"path\":\"/a\"}",
+    } };
+    content[2] = .{ .text = .{ .text = "world" } };
+    content[3] = .{ .tool_use = .{
+        .id = "call_002",
+        .name = "read",
+        .input_raw = "{\"path\":\"/b\"}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    try std.testing.expectEqualStrings("hello world", root.get("content").?.string);
+
+    const tc = root.get("tool_calls").?.array;
+    try std.testing.expectEqual(@as(usize, 2), tc.items.len);
+    try std.testing.expectEqualStrings("call_001", tc.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("read", tc.items[0].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("call_002", tc.items[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("read", tc.items[1].object.get("function").?.object.get("name").?.string);
+}
+
+test "openai writeMessage concatenates multiple pure-text blocks" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .text = .{ .text = "foo" } };
+    content[1] = .{ .text = .{ .text = "bar" } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    try std.testing.expectEqualStrings("foobar", root.get("content").?.string);
 }
 
 test "openai writeMessage emits tool role for tool_result" {
