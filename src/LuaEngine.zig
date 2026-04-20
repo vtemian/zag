@@ -110,6 +110,17 @@ pub const LuaEngine = struct {
         pending_job: ?*async_job.Job = null,
     };
 
+    /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
+    /// (resolvable against self.tasks) and a pointer back to the engine so
+    /// methods can mutate state. thread_ref == 0 means the handle outlived
+    /// its task (retired); methods no-op in that case.
+    pub const TaskHandle = struct {
+        thread_ref: i32,
+        engine: *LuaEngine,
+
+        pub const METATABLE_NAME = "zag.TaskHandle";
+    };
+
     /// Create a new LuaEngine. Sets up the VM, installs the `zag.*`
     /// globals, and populates the keymap registry with built-in defaults.
     /// Does NOT load user config; callers invoke `loadUserConfig` for that
@@ -133,6 +144,7 @@ pub const LuaEngine = struct {
         }
 
         injectZagGlobal(lua);
+        try registerTaskHandleMt(lua);
 
         var keymap_registry = Keymap.Registry.init(allocator);
         errdefer keymap_registry.deinit();
@@ -304,6 +316,54 @@ pub const LuaEngine = struct {
 
         co.yield(0);
         // yield is noreturn on Lua 5.4.
+    }
+
+    /// Call once during LuaEngine.init after openLibs to register the
+    /// TaskHandle metatable so userdata created from zag.spawn can find
+    /// methods via __index.
+    fn registerTaskHandleMt(lua: *Lua) !void {
+        try lua.newMetatable(TaskHandle.METATABLE_NAME);
+        lua.pushFunction(zlua.wrap(taskHandleCancel));
+        lua.setField(-2, "cancel");
+        lua.pushFunction(zlua.wrap(taskHandleJoin));
+        lua.setField(-2, "join");
+        lua.pushFunction(zlua.wrap(taskHandleDone));
+        lua.setField(-2, "done");
+        // __index = self so method calls work: handle:cancel() -> cancel(handle)
+        lua.pushValue(-1);
+        lua.setField(-2, "__index");
+        lua.pop(1);
+    }
+
+    /// TaskHandle:cancel() — marks the task's scope for cancellation.
+    /// No-op if task already retired.
+    fn taskHandleCancel(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const h = lua.checkUserdata(TaskHandle, 1, TaskHandle.METATABLE_NAME);
+        if (h.thread_ref == 0) return 0;
+        const task = engine.tasks.get(h.thread_ref) orelse return 0;
+        task.scope.cancel("task:cancel") catch |err| {
+            log.warn("task:cancel allocator failed: {}", .{err});
+        };
+        return 0;
+    }
+
+    /// TaskHandle:done() -> bool. True iff task is no longer in engine.tasks.
+    fn taskHandleDone(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const h = lua.checkUserdata(TaskHandle, 1, TaskHandle.METATABLE_NAME);
+        const done = h.thread_ref == 0 or engine.tasks.get(h.thread_ref) == null;
+        lua.pushBoolean(done);
+        return 1;
+    }
+
+    /// TaskHandle:join() -> (true, nil). STUB for Task 5.1; real yielding
+    /// implementation lands in Task 5.3.
+    fn taskHandleJoin(lua: *Lua) i32 {
+        // TODO(Phase 5.3): yield caller task until target retires.
+        lua.pushBoolean(true);
+        lua.pushNil();
+        return 2;
     }
 
     /// Store a pointer to this engine in the Lua registry so C callbacks can find it.
@@ -2243,4 +2303,31 @@ test "zag.provider requires a name field" {
         error.LuaRuntime,
         engine.lua.doString("zag.provider { }"),
     );
+}
+
+test "TaskHandle metatable is registered at engine init" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    // Retrieve the metatable by name; should be a table.
+    _ = eng.lua.getMetatableRegistry(LuaEngine.TaskHandle.METATABLE_NAME);
+    try std.testing.expect(eng.lua.isTable(-1));
+
+    // Verify __index is set (the metatable itself, per our registration)
+    _ = eng.lua.getField(-1, "__index");
+    try std.testing.expect(eng.lua.isTable(-1));
+    eng.lua.pop(1);
+
+    // Verify cancel/join/done fields exist as functions
+    _ = eng.lua.getField(-1, "cancel");
+    try std.testing.expect(eng.lua.isFunction(-1));
+    eng.lua.pop(1);
+    _ = eng.lua.getField(-1, "join");
+    try std.testing.expect(eng.lua.isFunction(-1));
+    eng.lua.pop(1);
+    _ = eng.lua.getField(-1, "done");
+    try std.testing.expect(eng.lua.isFunction(-1));
+    eng.lua.pop(1);
+
+    eng.lua.pop(1); // pop the metatable
 }
