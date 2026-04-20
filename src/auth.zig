@@ -170,7 +170,7 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
 }
 
 /// Emit `file` as `{ "provider": { "type": "api_key", "key": "..." }, ... }`.
-/// Order is the hash map's iteration order — stable enough for a config
+/// Order is the hash map's iteration order; stable enough for a config
 /// file that humans will re-read but not sort-critical.
 fn writeAuthJson(w: *std.Io.Writer, file: AuthFile) !void {
     try w.writeAll("{\n");
@@ -271,7 +271,7 @@ test "getApiKey returns null for missing provider" {
     try std.testing.expectEqual(@as(?[]const u8, null), try file.getApiKey("openai"));
 }
 
-test "getApiKey returns error.WrongCredentialType for oauth entry" {
+test "loadAuthFile rejects oauth entries with UnknownCredentialType" {
     // Option (b) from the plan: the loader rejects an oauth entry at load
     // time with `error.UnknownCredentialType` because OAuth storage lands in
     // a later plan. The test preseeds raw JSON and asserts the load error
