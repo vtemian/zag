@@ -164,15 +164,10 @@ pub fn deinit(self: *EventOrchestrator) void {
 
 /// Drive the event loop until the user quits or the terminal dies.
 pub fn run(self: *EventOrchestrator) !void {
-    // FPS tracking: count frames rendered per second
-    var fps_timer = std.time.Instant.now() catch null;
-    var fps_frame_count: u32 = 0;
-    var current_fps: u32 = 0;
     var running = true;
 
     // Initial render
     self.window_manager.compositor.composite(self.window_manager.layout, .{
-        .fps = 0,
         .mode = self.window_manager.current_mode,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
@@ -183,7 +178,7 @@ pub fn run(self: *EventOrchestrator) !void {
     };
 
     while (running) {
-        try self.tick(&running, &fps_timer, &fps_frame_count, &current_fps);
+        try self.tick(&running);
     }
 }
 
@@ -204,9 +199,6 @@ fn drainWakePipe(fd: posix.fd_t) void {
 fn tick(
     self: *EventOrchestrator,
     running: *bool,
-    fps_timer: *?std.time.Instant,
-    fps_frame_count: *u32,
-    current_fps: *u32,
 ) !void {
     // Block until stdin or the wake pipe has data. The wake pipe is written
     // by agent threads on every EventQueue.push and by the SIGWINCH handler
@@ -245,18 +237,6 @@ fn tick(
     defer {
         frame_span.end();
         trace.frameEnd();
-    }
-
-    // Update FPS counter
-    fps_frame_count.* += 1;
-    if (fps_timer.*) |start| {
-        const now = std.time.Instant.now() catch start;
-        const elapsed_ns = now.since(start);
-        if (elapsed_ns >= std.time.ns_per_s) {
-            current_fps.* = fps_frame_count.*;
-            fps_frame_count.* = 0;
-            fps_timer.* = std.time.Instant.now() catch null;
-        }
     }
 
     if (maybe_event) |event| {
@@ -308,7 +288,6 @@ fn tick(
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
     self.window_manager.compositor.composite(self.window_manager.layout, .{
-        .fps = current_fps.*,
         .mode = self.window_manager.current_mode,
         .status = status,
         .agent_running = agent_running,
