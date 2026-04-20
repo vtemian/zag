@@ -256,12 +256,13 @@ pub fn main() !void {
     // this after orchestrator construction so the pointer is stable.
     compositor.orchestrator = &orchestrator;
 
-    // Now that the orchestrator owns the keymap registry, wire its pointer
-    // onto the lua engine and load user config so `zag.keymap()` overrides
-    // land before any keys are dispatched. Tool registration follows so
-    // the tools collected during config.lua make it into the dispatch registry.
+    // Wire the orchestrator-owned input parser onto the engine and load
+    // user config. The keymap registry is owned by the engine itself;
+    // `zag.keymap()` overrides land directly on it, and the window
+    // manager reads through `keymapRegistry()` on every key event. Tool
+    // registration follows so config-registered tools reach the dispatch
+    // registry.
     if (lua_engine) |*eng| {
-        eng.keymap_registry = &orchestrator.window_manager.keymap_registry;
         eng.input_parser = &orchestrator.input_parser;
         eng.loadUserConfig();
         eng.registerTools(&registry) catch |err| {

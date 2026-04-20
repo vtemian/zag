@@ -5,8 +5,9 @@
 //! Ownership: the terminal, screen, layout, compositor, and root buffer
 //! are created in main() and held here as pointers. Their lifetimes
 //! exceed the orchestrator's. The orchestrator itself owns the extra
-//! split panes, the keymap registry, and frame-local counters
-//! (spinner, transient status). Each pane owns its own draft
+//! split panes and frame-local counters (spinner, transient status).
+//! The keymap registry lives on the Lua engine and is accessed via
+//! `window_manager.keymapRegistry()`. Each pane owns its own draft
 //! input (see ConversationBuffer.draft).
 
 const std = @import("std");
@@ -333,10 +334,14 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         }
     }
 
-    // Keymap dispatch: run the bound action if any.
-    if (self.window_manager.keymap_registry.lookup(self.window_manager.current_mode, k)) |action| {
-        self.window_manager.executeAction(action);
-        return .redraw;
+    // Keymap dispatch: run the bound action if any. The registry lives
+    // on the Lua engine; when Lua init failed there is no registry so
+    // the key passes through to the mode-default logic below.
+    if (self.window_manager.keymapRegistry()) |registry| {
+        if (registry.lookup(self.window_manager.current_mode, k)) |action| {
+            self.window_manager.executeAction(action);
+            return .redraw;
+        }
     }
 
     // Normal mode ignores unbound keys (no typing, no accidental side effects).

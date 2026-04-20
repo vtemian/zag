@@ -70,11 +70,11 @@ pub const LuaEngine = struct {
     /// Optional reason string allocated via `self.allocator`. Owned by
     /// the caller of `takeCancel()` once handed off.
     pending_cancel_reason: ?[]const u8 = null,
-    /// Optional pointer to the shared keymap registry. The orchestrator
-    /// sets this after `init()` and before `loadUserConfig()` so
-    /// `zag.keymap()` calls from `config.lua` land in the same registry
-    /// that dispatches keys.
-    keymap_registry: ?*Keymap.Registry = null,
+    /// Keymap registry owned by the engine. Populated with built-in
+    /// defaults during `init()`; `zag.keymap()` calls from `config.lua`
+    /// overwrite entries here, and the window manager reads from it via
+    /// `keymapRegistry()` when dispatching keys.
+    keymap_registry: Keymap.Registry,
     /// Optional pointer to the input parser. Wired from main.zig after
     /// orchestrator construction so `zag.set_escape_timeout_ms()` can
     /// tune the bare-Escape deadline at config-load time. Null when the
@@ -88,9 +88,10 @@ pub const LuaEngine = struct {
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
 
-    /// Create a new LuaEngine. Sets up the VM and installs the `zag.*`
-    /// globals but does NOT load user config. Callers must wire any
-    /// pointers (e.g. `keymap_registry`) and then call `loadUserConfig`.
+    /// Create a new LuaEngine. Sets up the VM, installs the `zag.*`
+    /// globals, and populates the keymap registry with built-in defaults.
+    /// Does NOT load user config; callers invoke `loadUserConfig` for that
+    /// so `zag.keymap()` overrides land on top of the defaults.
     ///
     /// Callers who drive the VM directly via `self.lua.doString(...)` and
     /// invoke `zag.*` functions MUST call `self.storeSelfPointer()` first,
@@ -111,13 +112,25 @@ pub const LuaEngine = struct {
 
         injectZagGlobal(lua);
 
+        var keymap_registry = Keymap.Registry.init(allocator);
+        errdefer keymap_registry.deinit();
+        try keymap_registry.loadDefaults();
+
         return LuaEngine{
             .lua = lua,
             .allocator = allocator,
             .tools = .empty,
             .hook_registry = Hooks.Registry.init(allocator),
             .enabled_providers = .empty,
+            .keymap_registry = keymap_registry,
         };
+    }
+
+    /// Borrow the engine's keymap registry. The window manager reads
+    /// this on every keypress; `zag.keymap()` writes through the same
+    /// pointer during `loadUserConfig`.
+    pub fn keymapRegistry(self: *LuaEngine) *Keymap.Registry {
+        return &self.keymap_registry;
     }
 
     /// Resolve ~/.config/zag paths, set plugin search path, load config.lua.
@@ -163,6 +176,7 @@ pub const LuaEngine = struct {
         self.enabled_providers.deinit(self.allocator);
         if (self.default_model) |m| self.allocator.free(m);
         if (self.pending_cancel_reason) |r| self.allocator.free(r);
+        self.keymap_registry.deinit();
         self.lua.deinit();
     }
 
@@ -389,9 +403,8 @@ pub const LuaEngine = struct {
     }
 
     /// Zig function backing `zag.keymap(mode, key, action)`.
-    /// Writes a binding into `engine.keymap_registry` if the engine has
-    /// one attached; otherwise logs a warning and no-ops so that test
-    /// harnesses without a registry don't crash.
+    /// Writes a binding into `engine.keymap_registry`. The registry is
+    /// owned by the engine and always present, so no null check is needed.
     fn zagKeymapFn(lua: *Lua) !i32 {
         return zagKeymapFnInner(lua) catch |err| {
             log.err("zag.keymap() failed: {}", .{err});
@@ -441,11 +454,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        const registry = engine.keymap_registry orelse {
-            log.warn("zag.keymap(): no registry bound; binding ignored", .{});
-            return 0;
-        };
-        try registry.register(mode, spec, action);
+        try engine.keymap_registry.register(mode, spec, action);
         return 0;
     }
 
@@ -1643,14 +1652,10 @@ test "UserMessagePre can rewrite text" {
     try std.testing.expectEqualStrings("expanded: hi", payload.user_message_pre.text_rewrite.?);
 }
 
-test "zag.keymap registers into the shared registry" {
+test "zag.keymap registers into the engine-owned registry" {
     const alloc = std.testing.allocator;
-    var registry = Keymap.Registry.init(alloc);
-    defer registry.deinit();
-
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
-    engine.keymap_registry = &registry;
     engine.storeSelfPointer();
 
     try engine.lua.doString(
@@ -1658,6 +1663,7 @@ test "zag.keymap registers into the shared registry" {
         \\zag.keymap("normal", "<C-q>", "close_window")
     );
 
+    const registry = engine.keymapRegistry();
     try std.testing.expectEqual(
         Keymap.Action.focus_right,
         registry.lookup(.normal, .{ .key = .{ .char = 'w' }, .modifiers = .{} }).?,
@@ -1668,6 +1674,21 @@ test "zag.keymap registers into the shared registry" {
             .key = .{ .char = 'q' },
             .modifiers = .{ .ctrl = true },
         }).?,
+    );
+}
+
+test "LuaEngine init populates keymap defaults" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    const registry = engine.keymapRegistry();
+    try std.testing.expectEqual(
+        Keymap.Action.focus_left,
+        registry.lookup(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }).?,
+    );
+    try std.testing.expectEqual(
+        Keymap.Action.enter_insert_mode,
+        registry.lookup(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }).?,
     );
 }
 
