@@ -72,8 +72,8 @@ pub fn runLoopStreaming(
     // Bind the Lua-tool queue for this thread so `executeToolsSingle` (which
     // runs inline on the agent thread) can round-trip Lua-defined tools to the
     // main thread. Worker threads in `executeOneToolCall` set this themselves.
-    AgentThread.lua_request_queue = queue;
-    defer AgentThread.lua_request_queue = null;
+    tools.lua_request_queue = queue;
+    defer tools.lua_request_queue = null;
 
     var turn_num: u32 = 0;
     while (true) {
@@ -455,8 +455,8 @@ fn runToolStep(
 fn executeOneToolCall(ctx: *const ToolCallContext) void {
     // Worker threads that invoke Lua-defined tools need the queue pointer
     // so `tools.luaToolExecute` can round-trip the call to the main thread.
-    AgentThread.lua_request_queue = ctx.queue;
-    defer AgentThread.lua_request_queue = null;
+    tools.lua_request_queue = ctx.queue;
+    defer tools.lua_request_queue = null;
 
     const step = runToolStep(
         ctx.tool_call,
@@ -978,8 +978,8 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
 
     // Bind the Lua-tool threadlocal in case a Lua tool slips into the
     // registry in a later refactor. Not strictly required today.
-    AgentThread.lua_request_queue = &queue;
-    defer AgentThread.lua_request_queue = null;
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
 
     const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine);
     defer freeToolResults(blocks, alloc);
