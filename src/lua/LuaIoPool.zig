@@ -96,14 +96,37 @@ pub const Pool = struct {
     fn workerLoop(self: *Pool, worker_id: usize) void {
         _ = worker_id;
         while (self.popJob()) |job| {
-            // Dispatch based on job.kind - filled in by later phases.
-            // For now, pass through to completions to prove the plumbing.
+            // Honor cancel if scope already cancelled before worker picks up
+            if (job.scope.isCancelled()) {
+                job.err_tag = .cancelled;
+            } else {
+                executeJob(job);
+            }
             self.completions.push(job) catch {
                 _ = self.completions.dropped.fetchAdd(1, .monotonic);
             };
         }
     }
 };
+
+/// Dispatch a job based on its kind. Module-scope so it can be exercised
+/// without instantiating a Pool. Each variant is responsible for filling
+/// either job.result (success) or job.err_tag (failure), not both.
+fn executeJob(job: *Job) void {
+    switch (job.kind) {
+        .sleep => |s| {
+            const deadline = std.time.milliTimestamp() + @as(i64, @intCast(s.ms));
+            while (std.time.milliTimestamp() < deadline) {
+                if (job.scope.isCancelled()) {
+                    job.err_tag = .cancelled;
+                    return;
+                }
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            job.result = .empty;
+        },
+    }
+}
 
 const testing = std.testing;
 
@@ -199,6 +222,9 @@ test "Pool submit routes job to worker and posts to completion queue" {
     const pool = try Pool.init(alloc, 2, &completions);
     defer pool.deinit();
 
+    // Zero-ms sleep exercises the minimal dispatch path: executeJob's while
+    // loop exits immediately on the first deadline check, so the worker
+    // sets result.empty and pushes the same Job pointer back.
     var job = stubJob(root);
     try pool.submit(&job);
 
@@ -207,9 +233,87 @@ test "Pool submit routes job to worker and posts to completion queue" {
     while (std.time.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expectEqual(&job, got);
+            try testing.expect(got.err_tag == null);
+            try testing.expect(got.result != null);
+            try testing.expect(got.result.? == .empty);
             return;
         }
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
     return error.JobNeverCompleted;
+}
+
+test "Pool executes sleep job" {
+    const alloc = testing.allocator;
+    var completions = try CompletionQueue.init(alloc, 16);
+    defer completions.deinit();
+
+    const pool = try Pool.init(alloc, 2, &completions);
+    defer pool.deinit();
+
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    var job = Job{
+        .kind = .{ .sleep = .{ .ms = 20 } },
+        .thread_ref = 0,
+        .scope = root,
+    };
+
+    const start = std.time.milliTimestamp();
+    try pool.submit(&job);
+
+    const deadline = start + 500;
+    while (std.time.milliTimestamp() < deadline) {
+        if (completions.pop()) |got| {
+            try testing.expectEqual(&job, got);
+            try testing.expect(got.err_tag == null);
+            try testing.expect(got.result != null);
+            try testing.expect(got.result.? == .empty);
+            const elapsed = std.time.milliTimestamp() - start;
+            try testing.expect(elapsed >= 20);
+            return;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.SleepJobNeverCompleted;
+}
+
+test "Pool sleep honors cancellation before dispatch" {
+    const alloc = testing.allocator;
+    var completions = try CompletionQueue.init(alloc, 16);
+    defer completions.deinit();
+
+    const pool = try Pool.init(alloc, 2, &completions);
+    defer pool.deinit();
+
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    // Cancel before submit: worker should short-circuit and mark cancelled
+    // without entering executeJob's sleep loop.
+    try root.cancel("test-cancel");
+
+    var job = Job{
+        .kind = .{ .sleep = .{ .ms = 1000 } },
+        .thread_ref = 0,
+        .scope = root,
+    };
+
+    const start = std.time.milliTimestamp();
+    try pool.submit(&job);
+
+    const deadline = start + 500;
+    while (std.time.milliTimestamp() < deadline) {
+        if (completions.pop()) |got| {
+            try testing.expect(got.err_tag != null);
+            try testing.expect(got.err_tag.? == .cancelled);
+            try testing.expect(got.result == null);
+            const elapsed = std.time.milliTimestamp() - start;
+            try testing.expect(elapsed < 100);
+            return;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.CancelledJobNeverCompleted;
 }
