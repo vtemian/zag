@@ -16,6 +16,11 @@ const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
 
+const async_pool = @import("lua/LuaIoPool.zig");
+const async_completions = @import("lua/LuaCompletionQueue.zig");
+const async_scope = @import("lua/Scope.zig");
+const async_job = @import("lua/Job.zig");
+
 /// Whether the Lua sandbox strips dangerous globals before user code runs.
 /// A shared plugin marketplace should never be one `os.execute("rm -rf ~")`
 /// away from disaster. Override with `-Dlua_sandbox=false` for local debugging.
@@ -90,19 +95,19 @@ pub const LuaEngine = struct {
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
     /// Worker pool for blocking I/O primitives called from Lua coroutines.
-    io_pool: ?*@import("lua/LuaIoPool.zig").Pool = null,
+    io_pool: ?*async_pool.Pool = null,
     /// Completion queue drained each tick to resume waiting coroutines.
-    completions: ?*@import("lua/LuaCompletionQueue.zig").Queue = null,
+    completions: ?*async_completions.Queue = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
-    tasks: std.AutoHashMap(i32, *Task) = undefined,
+    tasks: std.AutoHashMap(i32, *Task),
     /// Root scope (parent of all agent/hook scopes).
-    root_scope: ?*@import("lua/Scope.zig").Scope = null,
+    root_scope: ?*async_scope.Scope = null,
 
     pub const Task = struct {
         co: *Lua,
         thread_ref: i32,
-        scope: *@import("lua/Scope.zig").Scope,
-        pending_job: ?*@import("lua/Job.zig").Job = null,
+        scope: *async_scope.Scope,
+        pending_job: ?*async_job.Job = null,
     };
 
     /// Create a new LuaEngine. Sets up the VM, installs the `zag.*`
@@ -140,6 +145,7 @@ pub const LuaEngine = struct {
             .hook_registry = Hooks.Registry.init(allocator),
             .enabled_providers = .empty,
             .keymap_registry = keymap_registry,
+            .tasks = std.AutoHashMap(i32, *Task).init(allocator),
         };
     }
 
@@ -1093,24 +1099,21 @@ pub const LuaEngine = struct {
     /// and root scope. Must be called after `init()` and before any Lua code
     /// tries to spawn coroutines. Failure rolls back partial state.
     pub fn initAsync(self: *LuaEngine, num_workers: usize, capacity: usize) !void {
-        const Queue = @import("lua/LuaCompletionQueue.zig").Queue;
-        const Pool = @import("lua/LuaIoPool.zig").Pool;
-        const Scope = @import("lua/Scope.zig").Scope;
+        std.debug.assert(self.io_pool == null);
 
-        const completions = try self.allocator.create(Queue);
+        const completions = try self.allocator.create(async_completions.Queue);
         errdefer self.allocator.destroy(completions);
-        completions.* = try Queue.init(self.allocator, capacity);
+        completions.* = try async_completions.Queue.init(self.allocator, capacity);
         errdefer completions.deinit();
 
-        const pool = try Pool.init(self.allocator, num_workers, completions);
+        const pool = try async_pool.Pool.init(self.allocator, num_workers, completions);
         errdefer pool.deinit();
 
-        const root = try Scope.init(self.allocator, null);
+        const root = try async_scope.Scope.init(self.allocator, null);
         errdefer root.deinit();
 
         self.io_pool = pool;
         self.completions = completions;
-        self.tasks = std.AutoHashMap(i32, *Task).init(self.allocator);
         self.root_scope = root;
     }
 
@@ -1130,8 +1133,9 @@ pub const LuaEngine = struct {
             self.allocator.destroy(c);
             self.completions = null;
         }
-        // tasks map: any leftover Tasks are leaked — this is a bug that would
-        // indicate a coroutine wasn't properly retired. Assert.
+        // tasks map: any leftover Tasks indicate a coroutine wasn't properly retired.
+        // Log a warning — strict assertion would abort release builds on buggy
+        // shutdown paths, which is worse than a noisy log line.
         if (self.tasks.count() > 0) {
             std.log.scoped(.lua).warn("deinitAsync: {d} tasks still alive", .{self.tasks.count()});
         }
@@ -1291,6 +1295,13 @@ test "LuaEngine initAsync and deinitAsync work" {
     var eng = try LuaEngine.init(std.testing.allocator);
     defer eng.deinit();
     try eng.initAsync(2, 16);
+    eng.deinitAsync();
+}
+
+test "LuaEngine.deinitAsync is safe without initAsync" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    // Never call initAsync. deinitAsync must tolerate this.
     eng.deinitAsync();
 }
 
