@@ -73,15 +73,31 @@ pub fn executeRead(alloc: Allocator, job: *Job) void {
         job.err_detail = alloc.dupe(u8, "OOM") catch null;
         return;
     };
-    errdefer alloc.free(bytes);
 
-    _ = file.readAll(bytes) catch |err| {
+    // `stat()` and `readAll()` aren't atomic: a concurrent writer may
+    // truncate the file between the two calls, leaving the tail of
+    // `bytes` uninitialized. Capture the actual count and resize so we
+    // never surface uninitialized memory to Lua.
+    const n = file.readAll(bytes) catch |err| {
         alloc.free(bytes);
         setFsErr(alloc, job, err);
         return;
     };
 
-    job.result = .{ .fs_read = .{ .bytes = bytes } };
+    if (n < bytes.len) {
+        if (alloc.dupe(u8, bytes[0..n])) |actual| {
+            alloc.free(bytes);
+            job.result = .{ .fs_read = .{ .bytes = actual } };
+        } else |_| {
+            // OOM on the smaller allocation is extremely unlikely. Zero
+            // the tail so the oversized slice is at least well-defined,
+            // then hand back the original allocation.
+            @memset(bytes[n..], 0);
+            job.result = .{ .fs_read = .{ .bytes = bytes } };
+        }
+    } else {
+        job.result = .{ .fs_read = .{ .bytes = bytes } };
+    }
 }
 
 /// Write-or-append. Overwrite mode truncates; append mode opens-or-
