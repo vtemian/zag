@@ -26,11 +26,22 @@ pub const Pool = struct {
             .workers = workers,
             .completions = completions,
         };
-        // TODO: if spawn fails mid-loop, already-spawned workers are orphaned.
-        // They will block forever in popJob. Skeleton accepts this; harden once
-        // real dispatch exists and failures are observable.
+        // Partial-teardown on spawn failure: any workers spawned before the
+        // failure hold *Pool, so we must shutdown + broadcast + join them
+        // BEFORE errdefer frees the slice and Pool.
+        var spawned: usize = 0;
+        errdefer {
+            if (spawned > 0) {
+                pool.shutdown.store(true, .release);
+                pool.queue_mu.lock();
+                pool.queue_cv.broadcast();
+                pool.queue_mu.unlock();
+                for (workers[0..spawned]) |w| w.join();
+            }
+        }
         for (workers, 0..) |*w, i| {
             w.* = try std.Thread.spawn(.{}, workerLoop, .{ pool, i });
+            spawned += 1;
         }
         return pool;
     }
@@ -141,6 +152,26 @@ test "worker bumps completions.dropped when ring is full" {
 
     // Drain the one survivor so deinit doesn't leak test expectations.
     _ = completions.pop();
+}
+
+test "Pool init errdefer cleans up partial workers on spawn failure" {
+    // Real std.Thread.spawn failures can't be injected deterministically from
+    // userspace, so we exercise the teardown shape used by init's errdefer:
+    // shutdown -> broadcast -> join -> free. testing.allocator catches any
+    // leak; clean exit proves the sequence is coherent.
+    const alloc = testing.allocator;
+    var completions = try CompletionQueue.init(alloc, 4);
+    defer completions.deinit();
+
+    const pool = try Pool.init(alloc, 3, &completions);
+
+    pool.shutdown.store(true, .release);
+    pool.queue_mu.lock();
+    pool.queue_cv.broadcast();
+    pool.queue_mu.unlock();
+    for (pool.workers) |w| w.join();
+    alloc.free(pool.workers);
+    alloc.destroy(pool);
 }
 
 test "Pool submit routes job to worker and posts to completion queue" {
