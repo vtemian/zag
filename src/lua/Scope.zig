@@ -51,6 +51,28 @@ pub const Scope = struct {
         if (self.parent) |p| return p.isCancelled();
         return false;
     }
+
+    pub fn cancel(self: *Scope, reason: []const u8) Allocator.Error!void {
+        // CAS active -> cancelling; idempotent second-cancel no-op
+        if (self.state.cmpxchgStrong(.active, .cancelling, .acq_rel, .acquire) != null) {
+            return;
+        }
+        // Store reason duped into scope's allocator so caller doesn't need to keep it alive
+        self.reason = try self.alloc.dupe(u8, reason);
+
+        // Snapshot children under lock, cascade outside lock
+        self.mu.lock();
+        const snapshot = try self.alloc.alloc(*Scope, self.children.items.len);
+        defer self.alloc.free(snapshot);
+        @memcpy(snapshot, self.children.items);
+        self.mu.unlock();
+
+        for (snapshot) |child| {
+            child.cancel(reason) catch |err| {
+                std.log.scoped(.scope).warn("cascade cancel failed: {}", .{err});
+            };
+        }
+    }
 };
 
 test "Scope init/deinit link and unlink with parent" {
@@ -73,4 +95,21 @@ test "Scope.isCancelled defaults to false" {
     const root = try Scope.init(alloc, null);
     defer root.deinit();
     try testing.expect(!root.isCancelled());
+}
+
+test "Scope.cancel sets state and reason idempotently" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    try testing.expect(!root.isCancelled());
+
+    try root.cancel("first");
+    try testing.expect(root.isCancelled());
+    try testing.expectEqualStrings("first", root.reason.?);
+
+    // Second cancel is idempotent: state already non-active, reason unchanged.
+    try root.cancel("second");
+    try testing.expect(root.isCancelled());
+    try testing.expectEqualStrings("first", root.reason.?);
 }
