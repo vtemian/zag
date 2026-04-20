@@ -399,6 +399,18 @@ pub fn getDraft(self: *const ConversationBuffer) []const u8 {
     return self.draft[0..self.draft_len];
 }
 
+/// Copy the current draft into `dest` and clear it. Returns a slice of
+/// `dest` for the copied bytes. Used by the submit pipeline so the
+/// orchestrator never touches the draft's internal representation.
+/// Caller's buffer must be at least `MAX_DRAFT` bytes.
+pub fn consumeDraft(self: *ConversationBuffer, dest: []u8) []const u8 {
+    const n = self.draft_len;
+    std.debug.assert(dest.len >= n);
+    @memcpy(dest[0..n], self.draft[0..n]);
+    self.draft_len = 0;
+    return dest[0..n];
+}
+
 // -- Buffer interface --------------------------------------------------------
 
 /// Create a Buffer interface from this ConversationBuffer.
@@ -985,6 +997,29 @@ test "handleKey returns passthrough for unrelated ctrl chords" {
 
     const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
     try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+}
+
+test "consumeDraft snapshots into dest and clears" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    for ("hello") |ch| cb.appendToDraft(ch);
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = cb.consumeDraft(&scratch);
+    try std.testing.expectEqualStrings("hello", taken);
+    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
+    try std.testing.expectEqualStrings("", cb.getDraft());
+}
+
+test "consumeDraft on empty returns empty slice" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = cb.consumeDraft(&scratch);
+    try std.testing.expectEqual(@as(usize, 0), taken.len);
 }
 
 test "handleKey dispatches through the Buffer interface" {

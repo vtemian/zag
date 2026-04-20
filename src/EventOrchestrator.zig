@@ -19,6 +19,7 @@ const input = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const AgentRunner = @import("AgentRunner.zig");
+const ConversationBuffer = @import("ConversationBuffer.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
@@ -302,10 +303,12 @@ fn tick(
 ///
 /// Dispatch order:
 ///   1. Ctrl+C (mode-independent): cancel running agent, else quit.
-///   2. Ctrl+W in insert mode: delete-word on the input buffer.
-///   3. Keymap lookup against (current_mode, k). If found, run the action.
-///   4. Normal mode with no binding: silently ignore.
-///   5. Insert mode fall-through: Enter/Backspace/char/page_up/page_down.
+///   2. Keymap lookup against (current_mode, k). If found, run the action.
+///   3. Normal mode with no binding: silently ignore.
+///   4. Insert mode: Enter routes through handleCommand (slash commands)
+///      or the submit pipeline; page_up/page_down scroll the focused
+///      leaf. Everything else delegates to the focused buffer via the
+///      vtable, which owns draft editing.
 fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // Any keystroke dismisses the transient status so split announces
     // disappear as soon as the user does anything.
@@ -325,13 +328,6 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                     }
                     return .quit;
                 }
-                // Ctrl+W is an input-editing shortcut, so it only fires
-                // in insert mode. Normal mode falls through to the
-                // keymap registry (or ignored).
-                if (ch == 'w' and self.window_manager.current_mode == .insert) {
-                    focused.view.deleteWordFromDraft();
-                    return .redraw;
-                }
             },
             else => {},
         }
@@ -346,38 +342,36 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // Normal mode ignores unbound keys (no typing, no accidental side effects).
     if (self.window_manager.current_mode == .normal) return .none;
 
-    // Insert mode: regular input-line editing. Route all edits into the
-    // focused pane's draft so focus-switching preserves per-pane text.
+    // Insert mode: Enter and page nav stay on the orchestrator because
+    // they touch the submit pipeline and the layout's focused leaf;
+    // everything else (printable chars, Backspace, Ctrl+W) delegates to
+    // the focused buffer, which owns draft editing through its vtable.
     switch (k.key) {
         .enter => {
-            if (focused.view.draft_len == 0) return .none;
+            const draft = focused.view.getDraft();
+            if (draft.len == 0) return .none;
 
-            const user_input = focused.view.draft[0..focused.view.draft_len];
-
-            switch (self.handleCommand(user_input)) {
+            // Commands fire regardless of agent state; a running agent
+            // blocks only a fresh user turn. Peek the draft first;
+            // consume (copy + clear) once we know submission will proceed.
+            switch (self.handleCommand(draft)) {
                 .quit => return .quit,
                 .handled => {
-                    focused.view.clearDraft();
+                    var scratch: [ConversationBuffer.MAX_DRAFT]u8 = undefined;
+                    _ = focused.view.consumeDraft(&scratch);
                     return .redraw;
                 },
                 .not_a_command => {
                     if (focused.runner.isAgentRunning()) return .none;
 
+                    var scratch: [ConversationBuffer.MAX_DRAFT]u8 = undefined;
+                    const user_input = focused.view.consumeDraft(&scratch);
                     self.onUserInputSubmitted(focused, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
                         return .none;
                     };
-                    focused.view.clearDraft();
                     return .redraw;
                 },
-            }
-        },
-        .backspace => {
-            focused.view.deleteBackFromDraft();
-        },
-        .char => |ch| {
-            if (ch >= 0x20 and ch < 0x7f) {
-                focused.view.appendToDraft(@intCast(ch));
             }
         },
         .page_up => {
@@ -386,6 +380,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 const cur = l.buffer.getScrollOffset();
                 l.buffer.setScrollOffset(cur +| if (half > 0) half else 1);
             }
+            return .redraw;
         },
         .page_down => {
             if (self.window_manager.layout.getFocusedLeaf()) |l| {
@@ -393,10 +388,15 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 const cur = l.buffer.getScrollOffset();
                 l.buffer.setScrollOffset(if (cur > half) cur - half else 0);
             }
+            return .redraw;
         },
-        else => {},
+        else => {
+            return switch (focused.view.buf().handleKey(k)) {
+                .consumed => .redraw,
+                .passthrough => .none,
+            };
+        },
     }
-    return .redraw;
 }
 
 /// Try to handle input as a slash command. Delegates to WindowManager.
