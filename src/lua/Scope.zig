@@ -113,3 +113,23 @@ test "Scope.cancel sets state and reason idempotently" {
     try testing.expect(root.isCancelled());
     try testing.expectEqualStrings("first", root.reason.?);
 }
+
+test "Scope.cancel cascades from root to all descendants" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+    const child = try Scope.init(alloc, root);
+    defer child.deinit();
+    const grand = try Scope.init(alloc, child);
+    defer grand.deinit();
+
+    try root.cancel("boom");
+    try testing.expect(root.isCancelled());
+    try testing.expect(child.isCancelled());
+    try testing.expect(grand.isCancelled());
+
+    // Reason is duped independently for each child
+    try testing.expectEqualStrings("boom", root.reason.?);
+    try testing.expectEqualStrings("boom", child.reason.?);
+    try testing.expectEqualStrings("boom", grand.reason.?);
+}
