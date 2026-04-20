@@ -349,7 +349,9 @@ pub const LuaEngine = struct {
         }
 
         const thread_ref = engine.spawnCoroutine(nargs, parent) catch |err| {
-            co.raiseErrorStr("zag.spawn failed: %s", .{@errorName(err).ptr});
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.spawn failed: {s}", .{@errorName(err)}) catch "zag.spawn failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
         };
 
         // Push the TaskHandle userdata on `co`'s stack — that's where the
@@ -376,7 +378,9 @@ pub const LuaEngine = struct {
             co.xMove(engine.lua, nargs + 1);
         }
         _ = engine.spawnCoroutine(nargs, parent) catch |err| {
-            co.raiseErrorStr("zag.detach failed: %s", .{@errorName(err).ptr});
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.detach failed: {s}", .{@errorName(err)}) catch "zag.detach failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
         };
         return 0;
     }
@@ -436,6 +440,17 @@ pub const LuaEngine = struct {
             co.raiseErrorStr("task:join must be called inside a coroutine", .{});
         }
 
+        // Resolve the caller's task up-front so the self-join guard fires
+        // regardless of whether the target is still live or already retired —
+        // a silent self-join would otherwise yield forever (retireTask only
+        // runs when the coroutine exits).
+        const my_task = engine.taskForCoroutine(co) orelse {
+            co.raiseErrorStr("task:join: no task for this coroutine", .{});
+        };
+        if (my_task.thread_ref == h.thread_ref) {
+            co.raiseErrorStr("task:join: cannot join self (would deadlock)", .{});
+        }
+
         // Already retired? Return (true, nil) synchronously. Cancel info died
         // with the task; callers that need that distinction must race via
         // :done() before :join() or use their own completion signal.
@@ -447,11 +462,10 @@ pub const LuaEngine = struct {
 
         // Register ourselves as a joiner on the target, then yield. Retirement
         // of the target pushes results on our stack and resumes us.
-        const my_task = engine.taskForCoroutine(co) orelse {
-            co.raiseErrorStr("task:join: no task for this coroutine", .{});
-        };
         target.joiners.append(engine.allocator, my_task.thread_ref) catch |err| {
-            co.raiseErrorStr("task:join: %s", .{@errorName(err).ptr});
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "task:join: {s}", .{@errorName(err)}) catch "task:join: append failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
         };
         co.yield(0);
         // yield is noreturn on Lua 5.4.
