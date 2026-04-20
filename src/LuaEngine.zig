@@ -4767,6 +4767,90 @@ test "zag.http.get fetches from a local test server" {
     eng.lua.pop(1);
 }
 
+// Regression test for Task 7.5 fix: std.http defaults Accept-Encoding to
+// "gzip, deflate, identity". We force .omit in the inlined request() opts
+// because we don't decompress; otherwise servers would hand us gzipped
+// bytes and Lua callers would see garbage. The test captures the request
+// bytes server-side and asserts Accept-Encoding is absent.
+test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    // Capture the received request bytes so the test can assert which
+    // headers the client sent. Shared by-pointer with the server
+    // thread; lifetime is bounded by the server_thread.join() defer.
+    const Captured = struct {
+        request_bytes: [8192]u8 = undefined,
+        request_len: usize = 0,
+    };
+    var captured = Captured{};
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server, cap: *Captured) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+
+            var total: usize = 0;
+            while (total < cap.request_bytes.len) {
+                const n = conn.stream.read(cap.request_bytes[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, cap.request_bytes[0..total], "\r\n\r\n") != null) break;
+            }
+            cap.request_len = total;
+
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: 2\r\n" ++
+                "Content-Type: text/plain\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n" ++
+                "ok";
+            conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    try eng.lua.doString(
+        \\function test_ae(url)
+        \\  local r, err = zag.http.get(url)
+        \\  _ae_err_is_nil = (err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_ae");
+    _ = eng.lua.pushString(url);
+    _ = try eng.spawnCoroutine(1, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_ae_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    const req = captured.request_bytes[0..captured.request_len];
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(req, "Accept-Encoding:") == null);
+}
+
 test "zag.http.post sends body and parses response" {
     var eng = try LuaEngine.init(std.testing.allocator);
     defer eng.deinit();
