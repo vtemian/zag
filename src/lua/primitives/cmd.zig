@@ -131,11 +131,15 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
             return;
         }
 
-        // Bound each pollTimeout by both the 50ms cancel cadence AND the
-        // remaining deadline so a timeout fires on the next iteration even
-        // if the child is totally silent.
-        const remaining_ns: u64 = @intCast(@as(i64, @intCast(deadline_ms - now_ms)) * std.time.ns_per_ms);
-        const tick_ns: u64 = @min(poll_interval_ns, remaining_ns);
+        // Poll for 50ms at a time, re-check deadline each iteration. If the
+        // deadline is less than 50ms away, the next iteration's
+        // `now_ms >= deadline_ms` branch handles it — shrinking the poll
+        // timeout to the exact remainder buys nothing and, when
+        // `timeout_ms == 0` makes deadline_ms == maxInt(i64), the
+        // `(deadline_ms - now_ms) * ns_per_ms` multiplication overflows.
+        // Overshoot of up to 50ms past the deadline is fine for a
+        // best-effort process timeout.
+        const tick_ns: u64 = poll_interval_ns;
 
         const more = poller.pollTimeout(tick_ns) catch |err| {
             std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
@@ -156,7 +160,19 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
             }
         }
 
-        if (!more) break;
+        if (!more) {
+            // Re-check cancel AFTER pollTimeout returns: the aborter's SIGKILL
+            // is what caused the pipes to EOF, so falling through to the
+            // success path would misreport a cancelled run as exit code -9.
+            // The top-of-loop check can't catch this because pollTimeout
+            // returning !more skips straight to break.
+            if (job.scope.isCancelled()) {
+                _ = child.wait() catch {};
+                job.err_tag = .cancelled;
+                return;
+            }
+            break;
+        }
     }
 
     // The child is either naturally done (!more) or we killed it for
@@ -263,4 +279,72 @@ test "executeExec honors scope cancel" {
     try testing.expect(job.err_tag.? == .cancelled);
     try testing.expect(job.result == null);
     try testing.expect(elapsed < 200); // way under the /bin/sleep 5s
+}
+
+test "executeExec timeout=0 runs without panic and reaps short command" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    var argv_storage = [_][]const u8{ "/bin/echo", "no-timeout" };
+    var job = Job{
+        .kind = .{
+            .cmd_exec = .{
+                .argv = argv_storage[0..],
+                .timeout_ms = 0, // disabled
+            },
+        },
+        .thread_ref = 0,
+        .scope = root,
+    };
+    executeExec(alloc, &job);
+
+    try testing.expect(job.err_tag == null);
+    const r = job.result.?.cmd_exec;
+    defer alloc.free(r.stdout);
+    defer alloc.free(r.stderr);
+    try testing.expectEqual(@as(i32, 0), r.code);
+    try testing.expect(std.mem.startsWith(u8, r.stdout, "no-timeout"));
+}
+
+test "executeExec cancels in-flight child via aborter" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    var argv_storage = [_][]const u8{ "/bin/sleep", "5" };
+    var job = Job{
+        .kind = .{
+            .cmd_exec = .{
+                .argv = argv_storage[0..],
+                .timeout_ms = 30_000, // comfortably more than 5s so timeout doesn't save us
+            },
+        },
+        .thread_ref = 0,
+        .scope = root,
+    };
+
+    const worker = struct {
+        fn run(alloc_: std.mem.Allocator, j: *Job) void {
+            executeExec(alloc_, j);
+        }
+    };
+
+    const start = std.time.milliTimestamp();
+    const thread = try std.Thread.spawn(.{}, worker.run, .{ alloc, &job });
+
+    // Give the worker enough time to actually spawn /bin/sleep
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // Cancel — should invoke Job.aborter which SIGKILLs the child
+    try root.cancel("test");
+
+    thread.join();
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try testing.expect(job.err_tag != null);
+    try testing.expect(job.err_tag.? == .cancelled);
+    try testing.expect(job.result == null);
+    // Must have terminated far short of the 5s sleep and well before 30s timeout.
+    try testing.expect(elapsed < 1000);
 }
