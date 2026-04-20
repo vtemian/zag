@@ -125,27 +125,6 @@ fn appendOutputText(text: []const u8) !void {
     _ = try root_buffer.appendNode(null, .status, text);
 }
 
-/// Resolve the session for this run: load an existing one or create a new one.
-/// Returns null if persistence is unavailable or all attempts fail.
-fn initSession(session_mgr: *?Session.SessionManager, resume_id: ?[]const u8, model_id: []const u8) ?Session.SessionHandle {
-    const mgr = &(session_mgr.* orelse return null);
-
-    if (resume_id) |id| {
-        return mgr.loadSession(id) catch |err| {
-            log.warn("session load failed, starting new: {}", .{err});
-            return mgr.createSession(model_id) catch |err2| {
-                log.warn("session creation fallback failed: {}", .{err2});
-                return null;
-            };
-        };
-    }
-
-    return mgr.createSession(model_id) catch |err| {
-        log.warn("session creation failed: {}", .{err});
-        return null;
-    };
-}
-
 /// Set a file descriptor to non-blocking mode.
 fn setNonBlocking(fd: posix.fd_t) !void {
     const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
@@ -270,7 +249,7 @@ pub fn main() !void {
         },
     };
 
-    var session_handle = initSession(&session_mgr, resume_id, provider.model_id);
+    var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(resume_id, provider.model_id) else null;
     defer if (session_handle) |*sh| sh.close();
 
     const root_pane: EventOrchestrator.Pane = .{
