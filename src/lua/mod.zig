@@ -15,5 +15,6 @@ test {
     _ = @import("primitives/cmd_handle.zig");
     _ = @import("primitives/http.zig");
     _ = @import("primitives/http_stream.zig");
+    _ = @import("primitives/fs.zig");
     _ = @import("integration_test.zig");
 }

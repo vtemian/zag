@@ -128,6 +128,12 @@ fn executeJob(alloc: Allocator, job: *Job) void {
         .cmd_exec => @import("primitives/cmd.zig").executeExec(alloc, job),
         .http_get => @import("primitives/http.zig").executeHttpGet(alloc, job),
         .http_post => @import("primitives/http.zig").executeHttpPost(alloc, job),
+        .fs_read => @import("primitives/fs.zig").executeRead(alloc, job),
+        .fs_write => @import("primitives/fs.zig").executeWrite(alloc, job),
+        .fs_mkdir => @import("primitives/fs.zig").executeMkdir(alloc, job),
+        .fs_remove => @import("primitives/fs.zig").executeRemove(alloc, job),
+        .fs_list => @import("primitives/fs.zig").executeList(alloc, job),
+        .fs_stat => @import("primitives/fs.zig").executeStat(alloc, job),
         // CmdHandle helper threads synthesise these kinds directly
         // onto the completion queue; the pool never dispatches them.
         // Seeing one here is a programmer bug.
