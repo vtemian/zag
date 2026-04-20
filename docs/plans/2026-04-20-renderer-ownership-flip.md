@@ -423,3 +423,38 @@ test: update getVisibleLines callers for split allocator signature
 ```
 
 8 commits. Each small, each independently testable.
+
+## Addendum (2026-04-20, during execution)
+
+The staged commit plan is not independently testable: Step 1 removes
+`StyledLine.deinit` bytes-freeing while Step 2 removes the producer dupes
+that depended on that freeing. The testing allocator treats a mid-way
+state as a leak and refuses to pass tests.
+
+Similarly, Step 2d's cache simplification and Step 3's allocator split
+are coupled: the cache's `spans` pointers must be owned by a separate
+long-lived allocator from the per-frame output list. Between the two
+steps the output list and the cache would share spans pointers under a
+single allocator, and a `StyledLine.deinit` sweep over the output on
+teardown would double-free the cache.
+
+Adopted execution order: collapse Steps 1, 2a, 2b, 2c, 2d, and 3 into a
+single atomic commit titled `theme: flip StyledSpan ownership contract
+to borrowed slice`. Steps 4 (Compositor arena) and 5 (test updates) then
+commit independently. Total commits (including the docs copy and the
+Step 0 pin): 5 instead of the plan's 8.
+
+Extra design notes surfaced during execution:
+
+- `freeStyledLines` now has two callers with different ownership
+  regimes. Renderer unit tests own the spans arrays they produce and
+  rely on the per-line deinit. `Buffer.getVisibleLines` callers receive
+  cache-owned spans and must only free the list backing. Rather than
+  split the helper, it retains the "free everything" meaning and the
+  buffer callers switch to `lines.deinit(alloc)` directly. A doc
+  comment on `freeStyledLines` spells out the boundary.
+- `collectVisibleLines` renders into a `cache_alloc`-backed scratch
+  list, transfers ownership to the cache, and then appends cached
+  `StyledLine` values into the `frame_alloc`-backed output. This keeps
+  each ArrayList's backing on a single allocator (mixing allocators on
+  one unmanaged ArrayList is undefined behavior).
