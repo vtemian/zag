@@ -273,6 +273,25 @@ pub const SessionManager = struct {
         const id = list[0].idSlice();
         return try self.allocator.dupe(u8, id);
     }
+
+    /// Load an existing session or fall back to creating a new one.
+    /// Returns null only when both attempts fail.
+    pub fn loadOrCreate(self: *SessionManager, resume_id: ?[]const u8, model_id: []const u8) ?SessionHandle {
+        if (resume_id) |id| {
+            return self.loadSession(id) catch |err| {
+                log.warn("session load failed, starting new: {}", .{err});
+                return self.createSession(model_id) catch |err2| {
+                    log.warn("session creation fallback failed: {}", .{err2});
+                    return null;
+                };
+            };
+        }
+
+        return self.createSession(model_id) catch |err| {
+            log.warn("session creation failed: {}", .{err});
+            return null;
+        };
+    }
 };
 
 /// Handle to an open session for appending entries.
