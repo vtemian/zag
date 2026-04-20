@@ -89,6 +89,21 @@ pub const LuaEngine = struct {
     /// Default model string set via `zag.set_default_model("prov/id")`.
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
+    /// Worker pool for blocking I/O primitives called from Lua coroutines.
+    io_pool: ?*@import("lua/LuaIoPool.zig").Pool = null,
+    /// Completion queue drained each tick to resume waiting coroutines.
+    completions: ?*@import("lua/LuaCompletionQueue.zig").Queue = null,
+    /// Registry of active coroutines keyed by thread ref. Drives resume.
+    tasks: std.AutoHashMap(i32, *Task) = undefined,
+    /// Root scope (parent of all agent/hook scopes).
+    root_scope: ?*@import("lua/Scope.zig").Scope = null,
+
+    pub const Task = struct {
+        co: *Lua,
+        thread_ref: i32,
+        scope: *@import("lua/Scope.zig").Scope,
+        pending_job: ?*@import("lua/Job.zig").Job = null,
+    };
 
     /// Create a new LuaEngine. Sets up the VM, installs the `zag.*`
     /// globals, and populates the keymap registry with built-in defaults.
@@ -1074,6 +1089,59 @@ pub const LuaEngine = struct {
         };
     }
 
+    /// Spin up the async runtime: completion queue, I/O worker pool, task map,
+    /// and root scope. Must be called after `init()` and before any Lua code
+    /// tries to spawn coroutines. Failure rolls back partial state.
+    pub fn initAsync(self: *LuaEngine, num_workers: usize, capacity: usize) !void {
+        const Queue = @import("lua/LuaCompletionQueue.zig").Queue;
+        const Pool = @import("lua/LuaIoPool.zig").Pool;
+        const Scope = @import("lua/Scope.zig").Scope;
+
+        const completions = try self.allocator.create(Queue);
+        errdefer self.allocator.destroy(completions);
+        completions.* = try Queue.init(self.allocator, capacity);
+        errdefer completions.deinit();
+
+        const pool = try Pool.init(self.allocator, num_workers, completions);
+        errdefer pool.deinit();
+
+        const root = try Scope.init(self.allocator, null);
+        errdefer root.deinit();
+
+        self.io_pool = pool;
+        self.completions = completions;
+        self.tasks = std.AutoHashMap(i32, *Task).init(self.allocator);
+        self.root_scope = root;
+    }
+
+    /// Tear down the async runtime in the reverse order of `initAsync`. Safe
+    /// to call only if `initAsync` succeeded (mirrors the init/deinit pair
+    /// pattern). Must run BEFORE `deinit()` since workers may hold references
+    /// into the completion queue.
+    pub fn deinitAsync(self: *LuaEngine) void {
+        // Order matters: stop the pool (which joins workers, so no more pushes
+        // to completions) before tearing down completions.
+        if (self.io_pool) |p| {
+            p.deinit();
+            self.io_pool = null;
+        }
+        if (self.completions) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+            self.completions = null;
+        }
+        // tasks map: any leftover Tasks are leaked — this is a bug that would
+        // indicate a coroutine wasn't properly retired. Assert.
+        if (self.tasks.count() > 0) {
+            std.log.scoped(.lua).warn("deinitAsync: {d} tasks still alive", .{self.tasks.count()});
+        }
+        self.tasks.deinit();
+        if (self.root_scope) |s| {
+            s.deinit();
+            self.root_scope = null;
+        }
+    }
+
     /// Hook for agent threads to bind this engine as their active Lua context.
     /// Currently a no-op: Lua tool execution round-trips through the main thread
     /// via `tools.lua_request_queue`, so no per-thread engine pointer is
@@ -1217,6 +1285,13 @@ test "LuaEngine.init initializes provider config state" {
     defer engine.deinit();
     try std.testing.expectEqual(@as(usize, 0), engine.enabled_providers.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
+}
+
+test "LuaEngine initAsync and deinitAsync work" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    try eng.initAsync(2, 16);
+    eng.deinitAsync();
 }
 
 test "zag.tool() collects tool definitions" {

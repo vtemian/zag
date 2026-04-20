@@ -285,6 +285,21 @@ pub fn main() !void {
         };
     }
 
+    // Bring up the Lua async runtime (worker pool, completion queue, root
+    // scope). Deferred teardown runs before `eng.deinit()` thanks to LIFO
+    // ordering so workers stop referencing queue memory before the Lua
+    // state (and the allocator it shares) goes away. The `io_pool` check
+    // gates the defer so a failed initAsync doesn't try to deinit an
+    // uninitialized `tasks` map.
+    if (lua_engine) |*eng| {
+        eng.initAsync(4, 256) catch |err| {
+            log.warn("lua async runtime init failed: {}", .{err});
+        };
+    }
+    defer if (lua_engine) |*eng| {
+        if (eng.io_pool != null) eng.deinitAsync();
+    };
+
     try orchestrator.run();
 
     // Auto-dump trace on exit when metrics are enabled
