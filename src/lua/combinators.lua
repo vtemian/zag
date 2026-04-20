@@ -1,6 +1,29 @@
--- Concurrency combinators implemented in pure Lua on top of zag.spawn,
--- task:join, task:cancel, and zag.sleep. Loaded at engine init after the
--- primitive bindings are installed.
+-- Concurrency combinators and log wrappers implemented in pure Lua on
+-- top of the zag.* primitives. Loaded at engine init after the primitive
+-- bindings are installed.
+
+-- zag.log.{debug,info,warn,err}
+-- Printf-style wrappers around the private zag._log_* bindings. Using
+-- string.format in Lua keeps the Zig side trivial (single-string logger
+-- call) and lets plugin authors write the usual `zag.log.info("x=%d", x)`.
+-- With no format args we skip string.format so `zag.log.info("hi %q")`
+-- from a user who didn't mean it as a format string doesn't explode.
+local function wrap_log(fn)
+  return function(fmt, ...)
+    if select("#", ...) == 0 then
+      fn(tostring(fmt))
+    else
+      fn(string.format(fmt, ...))
+    end
+  end
+end
+
+zag.log = {
+  debug = wrap_log(zag._log_debug),
+  info = wrap_log(zag._log_info),
+  warn = wrap_log(zag._log_warn),
+  err = wrap_log(zag._log_err),
+}
 --
 -- Design note: task:join() is a completion signal and does not propagate
 -- the target coroutine's Lua return values (v1 limitation). These

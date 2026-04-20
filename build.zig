@@ -6,11 +6,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const metrics_enabled = b.option(bool, "metrics", "Enable performance metrics") orelse false;
+    // Lua sandbox is off by default: config.lua is user-owned code, same
+    // trust model as Neovim's init.lua. Opt in via `-Dlua_sandbox=true`
+    // when running untrusted plugins.
     const lua_sandbox_enabled = b.option(
         bool,
         "lua_sandbox",
         "Restrict Lua plugins: strip os/io/debug/package/require etc.",
-    ) orelse true;
+    ) orelse false;
 
     // Shared build options module for comptime feature flags
     const build_options = b.addOptions();

@@ -24,8 +24,10 @@ const cmd_handle_mod = @import("lua/primitives/cmd_handle.zig");
 const http_stream_mod = @import("lua/primitives/http_stream.zig");
 
 /// Whether the Lua sandbox strips dangerous globals before user code runs.
-/// A shared plugin marketplace should never be one `os.execute("rm -rf ~")`
-/// away from disaster. Override with `-Dlua_sandbox=false` for local debugging.
+/// Off by default: `config.lua` is user-owned code (same trust model as
+/// Neovim's init.lua / VSCode extensions), so Lua plugins get full access
+/// to os/io/debug/package/require. Enable with `-Dlua_sandbox=true` when
+/// running untrusted plugins from a shared marketplace.
 pub const sandbox_enabled = build_options.lua_sandbox;
 
 /// Lua bootstrap that preserves a minimal safe subset of `os`
@@ -113,6 +115,12 @@ pub const LuaEngine = struct {
     tasks: std.AutoHashMap(i32, *Task),
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
+    /// Per-hook wall-clock budget (ms). Hooks that exceed it are cancelled
+    /// on the next completion drain. Default 500ms: long enough for an HTTP
+    /// round-trip inside a hook body, short enough that a stuck hook doesn't
+    /// wedge the agent loop. 0 disables the budget. Configure via
+    /// `LuaEngine.setHookBudgetMs`.
+    hook_budget_ms: i64 = 500,
 
     pub const Task = struct {
         co: *Lua,
@@ -140,6 +148,15 @@ pub const LuaEngine = struct {
         /// is borrowed — the `fireHook` caller owns the payload and
         /// keeps it alive across the drain loop.
         hook_payload: ?*Hooks.HookPayload = null,
+        /// Wall-clock timestamp (ms since epoch) when this task was
+        /// spawned. Only meaningful when `budget_ms` is non-null; the
+        /// hook drain uses `now - started_at_ms` against `budget_ms`
+        /// to decide whether to cancel.
+        started_at_ms: i64 = 0,
+        /// Per-task budget snapshot in milliseconds. Copied from
+        /// `engine.hook_budget_ms` at spawn time so later config changes
+        /// don't affect in-flight hooks. Null for non-hook tasks.
+        budget_ms: ?i64 = null,
     };
 
     /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
@@ -333,6 +350,20 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagFsExistsFn));
         lua.setField(-2, "exists");
         lua.setField(-2, "fs"); // zag.fs = fs_table; [zag_table]
+
+        // Private log entrypoints consumed by the Lua-side wrappers in
+        // combinators.lua. User code calls `zag.log.info(fmt, ...)`; the
+        // Lua wrapper runs string.format and hands the result to these.
+        lua.pushFunction(zlua.wrap(zagLogDebugFn));
+        lua.setField(-2, "_log_debug");
+        lua.pushFunction(zlua.wrap(zagLogInfoFn));
+        lua.setField(-2, "_log_info");
+        lua.pushFunction(zlua.wrap(zagLogWarnFn));
+        lua.setField(-2, "_log_warn");
+        lua.pushFunction(zlua.wrap(zagLogErrFn));
+        lua.setField(-2, "_log_err");
+        lua.pushFunction(zlua.wrap(zagNotifyFn));
+        lua.setField(-2, "notify");
 
         lua.setGlobal("zag");
     }
@@ -2456,6 +2487,85 @@ pub const LuaEngine = struct {
         return 0;
     }
 
+    // -- zag.log / zag.notify --------------------------------------------------
+
+    /// Scoped logger used by `zag.log.*` and `zag.notify`. Separate scope
+    /// from `.lua` so plugin authors can filter their output distinctly
+    /// from engine-internal diagnostics.
+    const user_log = std.log.scoped(.lua_user);
+
+    fn zagLogDebugFn(co: *Lua) i32 {
+        const msg = co.checkString(1);
+        user_log.debug("{s}", .{msg});
+        return 0;
+    }
+
+    fn zagLogInfoFn(co: *Lua) i32 {
+        const msg = co.checkString(1);
+        user_log.info("{s}", .{msg});
+        return 0;
+    }
+
+    fn zagLogWarnFn(co: *Lua) i32 {
+        const msg = co.checkString(1);
+        user_log.warn("{s}", .{msg});
+        return 0;
+    }
+
+    fn zagLogErrFn(co: *Lua) i32 {
+        const msg = co.checkString(1);
+        user_log.err("{s}", .{msg});
+        return 0;
+    }
+
+    /// `zag.notify(msg, opts?)` — v1 routes to `.lua_user` as an info line
+    /// prefixed with `[notify]`. A future phase will push these onto a
+    /// compositor notification queue and render them in the TUI; for now
+    /// plugin authors get a log-level signal they can see.
+    fn zagNotifyFn(co: *Lua) i32 {
+        const msg = co.checkString(1);
+        // opts at slot 2 is optional and currently ignored. Peek `level`
+        // so typos surface in type-of-value errors later if we add it.
+        if (co.isTable(2)) {
+            _ = co.getField(2, "level");
+            co.pop(1);
+        }
+        user_log.info("[notify] {s}", .{msg});
+        return 0;
+    }
+
+    // -- Hook budget -----------------------------------------------------------
+
+    /// Set the per-hook wall-clock budget in milliseconds. Hook coroutines
+    /// that run longer than this have their scope cancelled so the next
+    /// yielding primitive returns `(nil, "budget_exceeded")`. Zero disables
+    /// the budget entirely.
+    pub fn setHookBudgetMs(self: *LuaEngine, ms: i64) void {
+        self.hook_budget_ms = ms;
+    }
+
+    /// Walk every live hook task; for each whose wall-clock elapsed since
+    /// spawn exceeds `hook_budget_ms`, cancel its scope with reason
+    /// "budget_exceeded". Next yield on that coroutine surfaces the
+    /// cancellation as the `budget_exceeded` err tag. Safe to call
+    /// repeatedly — `Scope.cancel` is idempotent.
+    fn enforceHookBudget(self: *LuaEngine) void {
+        if (self.hook_budget_ms <= 0) return;
+        const now = std.time.milliTimestamp();
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            const task = entry.value_ptr.*;
+            if (task.hook_payload == null) continue;
+            const budget = task.budget_ms orelse continue;
+            if (budget <= 0) continue;
+            if (now - task.started_at_ms < budget) continue;
+            if (task.scope.isCancelled()) continue;
+            task.scope.cancel("budget_exceeded") catch |err| {
+                log.warn("hook budget cancel failed: {}", .{err});
+            };
+        }
+    }
+
     // -- Hook dispatch ---------------------------------------------------------
 
     /// Fire every hook matching `payload`'s event kind from the main
@@ -2520,7 +2630,15 @@ pub const LuaEngine = struct {
         // Drive the completion drain until every spawned hook retires.
         // Non-hook coroutines may also complete during this loop — we
         // resume them too since the main event loop is parked here.
+        //
+        // enforceHookBudget runs on each iteration: it's cheap (single
+        // pass over tasks, a handful in practice) and catches runaways
+        // whose budget expires while they're parked on a slow primitive.
+        // A completion is required to actually resume the coroutine and
+        // surface the `budget_exceeded` tag, so we let the idle sleep
+        // tick the loop forward for the worker-abort round-trip.
         while (self.anyHookAlive(spawned.items)) {
+            self.enforceHookBudget();
             if (self.completions.?.pop()) |job| {
                 self.resumeFromJob(job) catch |err| {
                     log.warn("hook drain resumeFromJob failed: {}", .{err});
@@ -3524,6 +3642,8 @@ pub const LuaEngine = struct {
             .thread_ref = thread_ref,
             .scope = scope,
             .hook_payload = hook_payload,
+            .started_at_ms = if (hook_payload != null) std.time.milliTimestamp() else 0,
+            .budget_ms = if (hook_payload != null) self.hook_budget_ms else null,
         };
 
         try self.tasks.put(thread_ref, task);
@@ -6304,4 +6424,139 @@ test "zag.fs.exists returns true for present file, false for missing" {
     _ = try eng.lua.getGlobal("_ex_no_result");
     try std.testing.expect(!eng.lua.toBoolean(-1));
     eng.lua.pop(1);
+}
+
+test "zag.log.{debug,info} and zag.notify run without error" {
+    // Only exercise debug/info/notify here — the Zig test runner flags
+    // any .warn/.err emitted during a test as a logged error, which
+    // would make a "does the binding call without raising" assertion
+    // impossible to pass. warn/err wire to the same std.log machinery
+    // via identical wrapper code, so covering them adds no signal.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+
+    try eng.lua.doString(
+        \\_log_ran = false
+        \\zag.log.debug("debug message")
+        \\zag.log.info("hello %s", "world")
+        \\zag.log.info("zero-arg info")
+        \\zag.notify("notification")
+        \\zag.notify("with opts", { level = "warn" })
+        \\_log_ran = true
+    );
+
+    _ = try eng.lua.getGlobal("_log_ran");
+    defer eng.lua.pop(1);
+    try std.testing.expect(eng.lua.toBoolean(-1));
+}
+
+test "zag.log.warn and zag.log.err bindings exist and are callable" {
+    // Separate test that silences warn/err so we can verify the
+    // bindings are wired without tripping the test runner's
+    // logged-error detector.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+
+    // Only call warn (log_level.err silences it). We verify err is
+    // callable by checking the type in Lua, without actually emitting.
+    try eng.lua.doString(
+        \\zag.log.warn("silenced warn %d", 1)
+        \\_err_kind = type(zag.log.err)
+    );
+    _ = try eng.lua.getGlobal("_err_kind");
+    defer eng.lua.pop(1);
+    try std.testing.expectEqualStrings("function", try eng.lua.toString(-1));
+}
+
+test "zag.log.info accepts non-format strings without raising" {
+    // A message that happens to contain a % character but no format
+    // args must not be passed through string.format (which would raise
+    // "invalid option '%q' to 'format'"). The wrapper short-circuits
+    // to tostring when there are zero extra args.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+
+    try eng.lua.doString("zag.log.info('100%% done')");
+}
+
+test "hook budget cancels a runaway coroutine" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Tight budget + long sleep: enforceHookBudget cancels the scope
+    // well before the sleep would naturally return.
+    eng.setHookBudgetMs(30);
+
+    try eng.lua.doString(
+        \\_hook_result = nil
+        \\zag.hook("ToolPre", { pattern = "bash" }, function(evt)
+        \\  local ok, err = zag.sleep(10000)
+        \\  _hook_result = err or "completed"
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "x",
+        .args_json = "{}",
+        .args_rewrite = null,
+    } };
+
+    const start = std.time.milliTimestamp();
+    _ = try eng.fireHook(&payload);
+    const elapsed = std.time.milliTimestamp() - start;
+
+    // Budget is 30ms; enforcement + worker abort round-trip should
+    // finish well under 5 seconds (and nowhere near 10s).
+    try std.testing.expect(elapsed < 5000);
+
+    _ = try eng.lua.getGlobal("_hook_result");
+    defer eng.lua.pop(1);
+    const got = try eng.lua.toString(-1);
+    // The cancel reason propagates from Scope as "cancelled: budget_exceeded"
+    // or similar. Either the err tag string or the "cancelled" prefix is
+    // acceptable — both prove the budget fired.
+    try std.testing.expect(
+        std.mem.indexOf(u8, got, "cancelled") != null or
+            std.mem.indexOf(u8, got, "budget_exceeded") != null,
+    );
+}
+
+test "hook budget leaves fast hooks alone" {
+    // Regression: if the budget is effectively disabled (0), a long
+    // sleep inside a hook must be allowed to complete. This also
+    // guards against enforceHookBudget mistakenly cancelling healthy
+    // hooks that just happen to be in the tasks map.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    eng.setHookBudgetMs(0); // disabled
+
+    try eng.lua.doString(
+        \\_fast_ran = false
+        \\zag.hook("TurnStart", function(evt)
+        \\  zag.sleep(5)
+        \\  _fast_ran = true
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .turn_start = .{ .turn_num = 1, .message_count = 0 } };
+    _ = try eng.fireHook(&payload);
+
+    _ = try eng.lua.getGlobal("_fast_ran");
+    defer eng.lua.pop(1);
+    try std.testing.expect(eng.lua.toBoolean(-1));
 }
