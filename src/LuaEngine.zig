@@ -179,6 +179,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "keymap");
         lua.pushFunction(zlua.wrap(zagSetEscapeTimeoutMsFn));
         lua.setField(-2, "set_escape_timeout_ms");
+        lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
+        lua.setField(-2, "set_default_model");
         lua.setGlobal("zag");
     }
 
@@ -469,6 +471,36 @@ pub const LuaEngine = struct {
             return 0;
         };
         parser.escape_timeout_ms = ms;
+        return 0;
+    }
+
+    /// Zig function backing `zag.set_default_model("prov/id")`.
+    /// Stores the duped string into `engine.default_model`, freeing any
+    /// prior value. Non-string arguments warn-log and return `error.LuaError`
+    /// (which `zlua.wrap` surfaces as a Lua runtime error to the caller).
+    /// We reject numbers explicitly because Lua 5.4 silently coerces them
+    /// through `toString`.
+    fn zagSetDefaultModelFn(lua: *Lua) !i32 {
+        if (lua.typeOf(1) != .string) {
+            log.warn("zag.set_default_model(): arg 1 must be a string", .{});
+            return error.LuaError;
+        }
+        const model = lua.toString(1) catch {
+            log.warn("zag.set_default_model(): arg 1 must be a string", .{});
+            return error.LuaError;
+        };
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.set_default_model(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        const owned = try engine.allocator.dupe(u8, model);
+        if (engine.default_model) |old| engine.allocator.free(old);
+        engine.default_model = owned;
         return 0;
     }
 
@@ -1606,4 +1638,39 @@ test "zag.set_escape_timeout_ms rejects negative" {
 
     const result = engine.lua.doString("zag.set_escape_timeout_ms(-10)");
     try std.testing.expectError(error.LuaRuntime, result);
+}
+
+test "zag.set_default_model stores the owned string" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.set_default_model(\"openai/gpt-4o\")");
+
+    try std.testing.expect(engine.default_model != null);
+    try std.testing.expectEqualStrings("openai/gpt-4o", engine.default_model.?);
+}
+
+test "zag.set_default_model replaces prior value without leaking" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.set_default_model("first/model")
+        \\zag.set_default_model("second/model")
+    );
+    try std.testing.expectEqualStrings("second/model", engine.default_model.?);
+}
+
+test "zag.set_default_model rejects non-string argument" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // `zlua.wrap` surfaces returned Zig errors as Lua runtime errors,
+    // which `doString` reports as `error.LuaRuntime` (same mapping as
+    // `zag.set_escape_timeout_ms rejects negative`).
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.set_default_model(42)"),
+    );
 }
