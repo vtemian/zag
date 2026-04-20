@@ -166,48 +166,49 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
 /// Walk the tree and return styled display lines for the visible range.
 /// `skip` lines are omitted from the top; at most `max_lines` are returned.
 /// Nodes that fall entirely outside the range are not rendered.
+///
+/// `frame_alloc` backs the output `ArrayList(StyledLine)` and is expected
+/// to be a per-frame arena: the caller does not free individual spans.
+/// `cache_alloc` backs cache entries that persist across frames (the
+/// per-node `cached_lines` and each cache entry's `spans` array). On
+/// cache hit the output list shares its `spans` pointers with the cache;
+/// because those pointers are cache-owned, callers must not free them
+/// via `StyledLine.deinit` — reset the frame arena instead.
 pub fn getVisibleLines(
     self: *const ConversationBuffer,
-    allocator: Allocator,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
     theme: *const Theme,
     skip: usize,
     max_lines: usize,
 ) !std.ArrayList(Theme.StyledLine) {
     var lines: std.ArrayList(Theme.StyledLine) = .empty;
-    errdefer Theme.freeStyledLines(&lines, allocator);
+    errdefer lines.deinit(frame_alloc);
 
     var skipped: usize = 0;
     var collected: usize = 0;
 
     for (self.root_children.items) |node| {
         if (collected >= max_lines) break;
-        try collectVisibleLines(node, allocator, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
+        try collectVisibleLines(node, frame_alloc, cache_alloc, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
     }
 
     return lines;
 }
 
-/// Clone a StyledLine: allocate new spans array and dupe each span's text.
-/// On partial failure, all already-duped texts and the spans array are freed.
-fn cloneStyledLine(allocator: Allocator, source: Theme.StyledLine) !Theme.StyledLine {
-    const spans = try allocator.alloc(Theme.StyledSpan, source.spans.len);
-    var filled: usize = 0;
-    errdefer {
-        for (spans[0..filled]) |s| allocator.free(@constCast(s.text));
-        allocator.free(spans);
-    }
-    for (source.spans, 0..) |span, i| {
-        spans[i] = .{ .text = try allocator.dupe(u8, span.text), .style = span.style };
-        filled += 1;
-    }
-    return .{ .spans = spans };
-}
-
 /// Recursive helper: render a node and its non-collapsed children,
 /// respecting the skip/max_lines window. Uses per-node cache when available.
+///
+/// Under the StyledSpan borrowed-slice contract the cache stores the
+/// rendered `StyledLine` values directly; the spans arrays are allocated
+/// via `cache_alloc` (long-lived) and span text bytes are borrowed slices
+/// into `content.items`. Version mismatch discards the cache before any
+/// borrowed slice is dereferenced. The output list backing uses
+/// `frame_alloc` and shares spans pointers with the cache.
 fn collectVisibleLines(
     node: *const Node,
-    allocator: Allocator,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
     renderer: *const NodeRenderer,
     lines: *std.ArrayList(Theme.StyledLine),
     theme: *const Theme,
@@ -221,74 +222,60 @@ fn collectVisibleLines(
     const node_lines = renderer.lineCountForNode(node);
 
     if (skipped.* + node_lines <= skip) {
-        // Entire node falls before the visible window; skip without rendering
         skipped.* += node_lines;
     } else {
         // Cache is a transparent optimization; constCast is safe here
         const node_mut = @as(*Node, @constCast(node));
 
         if (node_mut.cached_lines != null and node_mut.cached_version == node.content_version) {
-            // Cache hit: clone cached lines into the output (caller owns these copies)
             const cached = node_mut.cached_lines.?;
             const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
             const available = if (skip_from_node < cached.len) cached.len - skip_from_node else 0;
             const take = @min(available, max_lines - collected.*);
 
             for (cached[skip_from_node .. skip_from_node + take]) |cached_line| {
-                const cloned = try cloneStyledLine(allocator, cached_line);
-                errdefer cloned.deinit(allocator);
-                try lines.append(allocator, cloned);
+                try lines.append(frame_alloc, cached_line);
             }
 
             skipped.* += node_lines;
             collected.* = lines.items.len;
         } else {
-            // Cache miss: render, then store a copy in the cache
-            const before = lines.items.len;
-            try renderer.render(node, lines, allocator, theme);
-            const produced = lines.items.len - before;
+            // Render into a scratch list backed by `cache_alloc`. The
+            // resulting slice of StyledLines becomes the cache entry; we
+            // also append each line into the caller's `lines` list via
+            // `frame_alloc` (so the output backing has a single allocator).
+            var scratch: std.ArrayList(Theme.StyledLine) = .empty;
+            errdefer scratch.deinit(cache_alloc);
+            try renderer.render(node, &scratch, cache_alloc, theme);
+            const produced = scratch.items.len;
 
-            // Build cache: clone the rendered lines into node-owned storage.
-            // On partial clone failure, already-cloned entries leak (OOM territory).
-            node_mut.clearCache(allocator);
-            const cache_copy = try allocator.alloc(Theme.StyledLine, produced);
-            for (lines.items[before .. before + produced], 0..) |line, i| {
-                cache_copy[i] = try cloneStyledLine(allocator, line);
-            }
-            node_mut.cached_lines = cache_copy;
+            node_mut.clearCache(cache_alloc);
+            node_mut.cached_lines = try scratch.toOwnedSlice(cache_alloc);
             node_mut.cached_version = node.content_version;
 
-            // Apply skip/limit trimming to the output lines
+            const cached = node_mut.cached_lines.?;
             const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
-            if (skip_from_node > 0 and skip_from_node < produced) {
-                for (lines.items[before .. before + skip_from_node]) |line| line.deinit(allocator);
-                const remaining = produced - skip_from_node;
-                std.mem.copyForwards(
-                    Theme.StyledLine,
-                    lines.items[before .. before + remaining],
-                    lines.items[before + skip_from_node .. before + produced],
-                );
-                lines.shrinkRetainingCapacity(before + remaining);
-            } else if (skip_from_node >= produced) {
-                for (lines.items[before..]) |line| line.deinit(allocator);
-                lines.shrinkRetainingCapacity(before);
+            if (skip_from_node >= produced) {
+                // Whole node falls before the window; nothing to emit.
+            } else {
+                const first = skip_from_node;
+                const available = produced - first;
+                const budget = max_lines - collected.*;
+                const take = @min(available, budget);
+                for (cached[first .. first + take]) |cached_line| {
+                    try lines.append(frame_alloc, cached_line);
+                }
             }
 
             skipped.* += node_lines;
             collected.* = lines.items.len;
-
-            if (collected.* > max_lines) {
-                for (lines.items[max_lines..]) |line| line.deinit(allocator);
-                lines.shrinkRetainingCapacity(max_lines);
-                collected.* = max_lines;
-            }
         }
     }
 
     if (!node.collapsed) {
         for (node.children.items) |child| {
             if (collected.* >= max_lines) return;
-            try collectVisibleLines(child, allocator, renderer, lines, theme, skip, max_lines, skipped, collected);
+            try collectVisibleLines(child, frame_alloc, cache_alloc, renderer, lines, theme, skip, max_lines, skipped, collected);
         }
     }
 }
@@ -433,9 +420,9 @@ const vtable: Buffer.VTable = .{
     .clearDirty = bufClearDirty,
 };
 
-fn bufGetVisibleLines(ptr: *anyopaque, allocator: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
+fn bufGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.getVisibleLines(allocator, theme, skip, max_lines);
+    return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
 fn bufGetName(ptr: *anyopaque) []const u8 {
@@ -515,8 +502,8 @@ test "getVisibleLines returns rendered lines" {
     _ = try cb.appendNode(null, .separator, "");
 
     const theme = Theme.defaultTheme();
-    var lines = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines, allocator);
+    var lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines.deinit(allocator);
 
     try std.testing.expect(lines.items.len >= 2);
     const line0 = try lines.items[0].toText(allocator);
@@ -564,8 +551,8 @@ test "getVisibleLines with range skips off-screen nodes" {
     const theme = Theme.defaultTheme();
 
     // Request only lines 1..3 (skip line0, take 2, skip line3+line4)
-    var lines = try cb.getVisibleLines(allocator, &theme, 1, 2);
-    defer Theme.freeStyledLines(&lines, allocator);
+    var lines = try cb.getVisibleLines(allocator, allocator, &theme, 1, 2);
+    defer lines.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
 
@@ -604,15 +591,15 @@ test "getVisibleLines returns consistent results when content unchanged" {
     const theme = Theme.defaultTheme();
 
     // First call
-    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines1, allocator);
+    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines1.deinit(allocator);
 
     const text1 = try lines1.items[0].toText(allocator);
     defer allocator.free(text1);
 
     // Second call (should use cache)
-    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines2, allocator);
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
 
     const text2 = try lines2.items[0].toText(allocator);
     defer allocator.free(text2);
@@ -631,15 +618,15 @@ test "getVisibleLines reflects new content after appendToNode" {
     const theme = Theme.defaultTheme();
 
     // Populate cache
-    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    Theme.freeStyledLines(&lines1, allocator);
+    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    lines1.deinit(allocator);
 
     // Mutate: append to node
     try cb.appendToNode(node, " world");
 
     // Cache should be invalidated for this node
-    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines2, allocator);
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
 
     const text = try lines2.items[0].toText(allocator);
     defer allocator.free(text);
@@ -656,17 +643,17 @@ test "getVisibleLines reflects new nodes after appendNode" {
     const theme = Theme.defaultTheme();
 
     // Populate cache
-    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
     const lines1_len = lines1.items.len;
-    Theme.freeStyledLines(&lines1, allocator);
+    lines1.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), lines1_len);
 
     // Add new node
     _ = try cb.appendNode(null, .user_message, "second");
 
     // Should include both nodes
-    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines2, allocator);
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), lines2.items.len);
 }
 
@@ -683,15 +670,15 @@ test "getVisibleLines output survives node content realloc" {
 
     const theme = Theme.defaultTheme();
 
-    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    Theme.freeStyledLines(&lines1, allocator);
+    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    lines1.deinit(allocator);
 
     // Force capacity growth with a large append.
     const big = "z" ** 4096;
     try cb.appendToNode(node, big);
 
-    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines2, allocator);
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
 
     const text = try lines2.items[0].toText(allocator);
     defer allocator.free(text);
@@ -708,15 +695,15 @@ test "clear invalidates line cache" {
 
     const theme = Theme.defaultTheme();
 
-    var lines1 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
+    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
     const lines1_len = lines1.items.len;
-    Theme.freeStyledLines(&lines1, allocator);
+    lines1.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), lines1_len);
 
     cb.clear();
 
-    var lines2 = try cb.getVisibleLines(allocator, &theme, 0, std.math.maxInt(usize));
-    defer Theme.freeStyledLines(&lines2, allocator);
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), lines2.items.len);
 }
 

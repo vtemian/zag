@@ -163,6 +163,11 @@ pub const StyledSpan = struct {
 };
 
 /// A styled line: a sequence of spans that together form one visual line.
+///
+/// Ownership contract: `StyledSpan.text` is a borrowed slice. The producer
+/// guarantees the bytes stay valid for at least one frame and for the
+/// lifetime of any cache entry that holds the span. The consumer never
+/// frees `text`.
 pub const StyledLine = struct {
     /// Ordered spans composing this line.
     spans: []const StyledSpan,
@@ -180,25 +185,31 @@ pub const StyledLine = struct {
         return buf;
     }
 
-    /// Free all memory owned by this styled line: span text and span array.
+    /// Free memory owned by this styled line. Under the borrowed-slice
+    /// contract only the spans array is owned; span text lifetimes are
+    /// managed by whoever produced them (node content, static strings,
+    /// frame arena).
     pub fn deinit(self: StyledLine, allocator: std.mem.Allocator) void {
-        for (self.spans) |span| allocator.free(span.text);
         allocator.free(self.spans);
     }
 };
 
-/// Free all StyledLines in a list, including their span text and span arrays.
+/// Free a list of locally-produced StyledLines. Use this only when the
+/// caller owns each line's spans array directly (e.g. a test that drives
+/// the renderer and keeps the result). When lines come from
+/// `Buffer.getVisibleLines`, their spans arrays are owned by the buffer's
+/// per-node cache — call `lines.deinit(alloc)` instead.
 pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: std.mem.Allocator) void {
     for (lines.items) |line| line.deinit(allocator);
     lines.deinit(allocator);
 }
 
-/// Create a StyledLine with a single span. Text is duped; caller owns the result.
+/// Create a StyledLine with a single span. Caller is responsible for
+/// keeping `text` alive for the span's lifetime (frame arena, static
+/// string, or cache-owned bytes).
 pub fn singleSpanLine(allocator: std.mem.Allocator, text: []const u8, style: CellStyle) !StyledLine {
-    const owned = try allocator.dupe(u8, text);
-    errdefer allocator.free(owned);
     const spans = try allocator.alloc(StyledSpan, 1);
-    spans[0] = .{ .text = owned, .style = style };
+    spans[0] = .{ .text = text, .style = style };
     return .{ .spans = spans };
 }
 
