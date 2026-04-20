@@ -295,6 +295,12 @@ pub fn main() !void {
         eng.initAsync(4, 256) catch |err| {
             log.warn("lua async runtime init failed: {}", .{err});
         };
+        // Share the orchestrator's wake pipe so Lua workers wake the main
+        // loop the same way agent-event pushes do. initAsync runs after
+        // orchestrator construction, so `wakeWriteFd()` is valid here; if
+        // initAsync failed above, `completions` is null and the assignment
+        // is a no-op.
+        if (eng.completions) |c| c.wake_fd = orchestrator.wakeWriteFd();
     }
     defer if (lua_engine) |*eng| eng.deinitAsync();
 

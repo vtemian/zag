@@ -66,7 +66,9 @@ stdout_file: std.fs.File,
 /// busy-wait sleep.
 wake_read_fd: posix.fd_t,
 /// Write end of the wake pipe, forwarded to each runner on submit so
-/// agent workers can wake poll() from arbitrary threads.
+/// agent workers can wake poll() from arbitrary threads. Also exposed via
+/// `wakeWriteFd()` to subsystems wired up after orchestrator construction
+/// (Lua async completions) so they can signal the same pipe.
 wake_write_fd: posix.fd_t,
 /// LLM provider borrowed from main for model calls in agent runs.
 provider: *llm.ProviderResult,
@@ -137,6 +139,14 @@ pub fn init(cfg: Config) !EventOrchestrator {
     });
     errdefer self.window_manager.deinit();
     return self;
+}
+
+/// Expose the shared wake-pipe write end for subsystems that need to signal
+/// the main loop from worker threads (e.g. the Lua async completion queue).
+/// Borrowed, not owned: the fd stays open as long as main.zig's `defer
+/// posix.close` hasn't run.
+pub fn wakeWriteFd(self: *EventOrchestrator) std.posix.fd_t {
+    return self.wake_write_fd;
 }
 
 /// Release the orchestrator's owned extra panes. Root buffer is owned by main.
