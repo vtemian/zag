@@ -197,6 +197,19 @@ fn drainWakePipe(fd: posix.fd_t) void {
     }
 }
 
+/// Drain every finished Lua async job from the completion queue and hand it
+/// to the engine for coroutine resume. Runs once per tick before per-pane
+/// hook dispatch so any hook that fires later sees the resumed coroutine's
+/// observable state.
+fn drainLuaCompletions(eng: *LuaEngine) void {
+    const completions = eng.completions orelse return;
+    while (completions.pop()) |job| {
+        eng.resumeFromJob(job) catch |err| {
+            std.log.scoped(.lua).warn("resume from job failed: {}", .{err});
+        };
+    }
+}
+
 /// One iteration of the event loop: poll input, handle resize, drain agent
 /// events, composite, render. Sets `running` to false on quit.
 fn tick(
@@ -252,6 +265,12 @@ fn tick(
             .mouse => |m| self.handleMouse(m),
             else => {},
         }
+    }
+
+    // Drain Lua async completions before per-pane work so coroutine results
+    // are visible to any hook that runs during this tick.
+    if (self.lua_engine) |eng| {
+        drainLuaCompletions(eng);
     }
 
     // Drain agent events from every pane. AgentRunner.drainEvents calls
