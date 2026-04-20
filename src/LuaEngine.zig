@@ -4952,3 +4952,142 @@ test "zag.http.stream yields response lines then nil at EOF" {
 
     try eng.lua.doString("collectgarbage('collect')");
 }
+
+test "zag.http.stream flushes trailing partial line on EOS" {
+    // Regression: server replies with content-length body whose final
+    // byte is NOT '\n'. runReadLine's fast-path used to see
+    // `self.eof == true` after the stream-ended branch and return nil
+    // while `line_buf` still held "c". The fast path now flushes the
+    // partial tail as the final line before signalling EOF.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var server_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try server_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            // Body is "a\nb\nc" — 5 bytes, no trailing newline.
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Content-Type: text/plain\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n" ++
+                "a\nb\nc";
+            conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    try eng.lua.doString(
+        \\function test_partial(url)
+        \\  local s, err = zag.http.stream(url)
+        \\  if err then _partial_err = err; return end
+        \\  local lines = {}
+        \\  for line in s:lines() do
+        \\    table.insert(lines, line)
+        \\  end
+        \\  s:close()
+        \\  _partial_count = #lines
+        \\  _partial_1 = lines[1]
+        \\  _partial_2 = lines[2]
+        \\  _partial_3 = lines[3]
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_partial");
+    _ = eng.lua.pushString(url);
+    _ = try eng.spawnCoroutine(1, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    _ = try eng.lua.getGlobal("_partial_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_partial_1");
+    try std.testing.expectEqualStrings("a", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_partial_2");
+    try std.testing.expectEqualStrings("b", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_partial_3");
+    try std.testing.expectEqualStrings("c", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
+    // Regression: child prints "a\nb\nc" with no trailing newline.
+    // The read_line path must surface "c" as the final line before
+    // returning nil at EOF — not silently drop it.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_partial_cmd()
+        \\  local h = zag.cmd.spawn({ "/bin/sh", "-c", "printf 'a\nb\nc'" },
+        \\                         { capture_stdout = true })
+        \\  local lines = {}
+        \\  for line in h:lines() do
+        \\    table.insert(lines, line)
+        \\  end
+        \\  _cmd_partial_count = #lines
+        \\  _cmd_partial_1 = lines[1]
+        \\  _cmd_partial_2 = lines[2]
+        \\  _cmd_partial_3 = lines[3]
+        \\  h:wait()
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_partial_cmd");
+    _ = try eng.spawnCoroutine(0, null);
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_cmd_partial_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cmd_partial_1");
+    try std.testing.expectEqualStrings("a", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cmd_partial_2");
+    try std.testing.expectEqualStrings("b", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cmd_partial_3");
+    try std.testing.expectEqualStrings("c", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
+}
