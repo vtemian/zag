@@ -256,6 +256,15 @@ const builtin_endpoints = [_]Endpoint{
     },
 };
 
+/// True if `name` matches any entry in `builtin_endpoints`. Used by the Lua
+/// binding `zag.provider{ name = "..." }` to fail loud on typos at load time.
+pub fn isBuiltinEndpointName(name: []const u8) bool {
+    for (&builtin_endpoints) |ep| {
+        if (std.mem.eql(u8, ep.name, name)) return true;
+    }
+    return false;
+}
+
 /// Runtime registry of LLM endpoints. Seeded with built-ins, extensible at runtime.
 pub const Registry = struct {
     /// All registered endpoints (built-in and runtime-added).
@@ -1347,4 +1356,18 @@ test "Provider.call accepts a Request struct" {
     // Intentionally no call yet; this file compiles because Request
     // is a plain struct. Task 2 updates Provider.call to take *const
     // Request and this test is extended to call a mock provider.
+}
+
+test "isBuiltinEndpointName recognizes built-in providers" {
+    try std.testing.expect(isBuiltinEndpointName("anthropic"));
+    try std.testing.expect(isBuiltinEndpointName("openai"));
+    try std.testing.expect(isBuiltinEndpointName("openrouter"));
+    try std.testing.expect(isBuiltinEndpointName("groq"));
+    try std.testing.expect(isBuiltinEndpointName("ollama"));
+}
+
+test "isBuiltinEndpointName rejects unknown names" {
+    try std.testing.expect(!isBuiltinEndpointName("bogus"));
+    try std.testing.expect(!isBuiltinEndpointName(""));
+    try std.testing.expect(!isBuiltinEndpointName("ANTHROPIC"));
 }

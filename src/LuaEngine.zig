@@ -11,6 +11,7 @@ const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const input = @import("input.zig");
+const llm = @import("llm.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -181,6 +182,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_escape_timeout_ms");
         lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
         lua.setField(-2, "set_default_model");
+        lua.pushFunction(zlua.wrap(zagProviderFn));
+        lua.setField(-2, "provider");
         lua.setGlobal("zag");
     }
 
@@ -501,6 +504,59 @@ pub const LuaEngine = struct {
         const owned = try engine.allocator.dupe(u8, model);
         if (engine.default_model) |old| engine.allocator.free(old);
         engine.default_model = owned;
+        return 0;
+    }
+
+    /// Zig function backing `zag.provider{ name = "..." }`.
+    /// Validates `name` against `llm.builtin_endpoints` and appends the duped
+    /// string to `engine.enabled_providers`. Unknown names, missing `name`
+    /// field, non-string `name`, and empty `name` all return `error.LuaError`
+    /// which `zlua.wrap` surfaces as a Lua runtime error.
+    fn zagProviderFn(lua: *Lua) !i32 {
+        if (!lua.isTable(1)) {
+            log.warn("zag.provider() expects a table argument", .{});
+            return error.LuaError;
+        }
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.provider(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        _ = lua.getField(1, "name");
+        // Reject missing `name` (nil) and non-string values explicitly; Lua 5.4
+        // would otherwise coerce numbers through `toString`.
+        if (lua.typeOf(-1) != .string) {
+            lua.pop(1);
+            log.warn("zag.provider(): 'name' field must be a string", .{});
+            return error.LuaError;
+        }
+        const name = lua.toString(-1) catch {
+            lua.pop(1);
+            log.warn("zag.provider(): 'name' field must be a string", .{});
+            return error.LuaError;
+        };
+
+        if (name.len == 0) {
+            lua.pop(1);
+            log.warn("zag.provider(): 'name' must not be empty", .{});
+            return error.LuaError;
+        }
+
+        if (!llm.isBuiltinEndpointName(name)) {
+            log.warn("zag.provider(): unknown provider '{s}'", .{name});
+            lua.pop(1);
+            return error.LuaError;
+        }
+
+        const owned = try engine.allocator.dupe(u8, name);
+        errdefer engine.allocator.free(owned);
+        lua.pop(1);
+
+        try engine.enabled_providers.append(engine.allocator, owned);
         return 0;
     }
 
@@ -1672,5 +1728,40 @@ test "zag.set_default_model rejects non-string argument" {
     try std.testing.expectError(
         error.LuaRuntime,
         engine.lua.doString("zag.set_default_model(42)"),
+    );
+}
+
+test "zag.provider registers an enabled provider by name" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider { name = "openai" }
+        \\zag.provider { name = "anthropic" }
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), engine.enabled_providers.items.len);
+    try std.testing.expectEqualStrings("openai", engine.enabled_providers.items[0]);
+    try std.testing.expectEqualStrings("anthropic", engine.enabled_providers.items[1]);
+}
+
+test "zag.provider rejects unknown provider names" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.provider { name = \"bogus\" }"),
+    );
+}
+
+test "zag.provider requires a name field" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.provider { }"),
     );
 }
