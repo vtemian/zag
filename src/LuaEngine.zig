@@ -84,7 +84,7 @@ pub const LuaEngine = struct {
     /// read once by `llm.createProviderFromLuaConfig` at startup.
     enabled_providers: std.ArrayList([]const u8),
     /// Default model string set via `zag.set_default_model("prov/id")`.
-    /// Owned. Null if the user didn't set one — factory falls back to a hardcoded default.
+    /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
 
     /// Create a new LuaEngine. Sets up the VM and installs the `zag.*`
