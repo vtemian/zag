@@ -111,6 +111,33 @@ pub const HttpGetSpec = struct {
     follow_redirects: bool = true,
 };
 
+/// Argv/headers/body/timeout payload for an `http_post` job. Same
+/// shape as `HttpGetSpec` plus a request body and its content-type.
+/// The worker never mutates these fields; they're pinned by the
+/// caller's arena until `resumeFromJob` fires.
+pub const HttpPostSpec = struct {
+    /// Fully-qualified URL (http:// or https://). Borrowed from the
+    /// caller's arena.
+    url: []const u8,
+    /// Extra request headers. Slice + each header's name/value are
+    /// borrowed from the caller's arena. The worker appends a
+    /// `Content-Type` header derived from `content_type` only if the
+    /// caller did not already set one here.
+    headers: []const HttpHeader = &.{},
+    /// Raw request body bytes. Borrowed from the caller's arena.
+    /// Empty slice is valid and means "POST with no body".
+    body: []const u8 = &.{},
+    /// MIME type for `body`. Empty string means "don't inject a
+    /// Content-Type header — let caller-provided headers speak for
+    /// themselves (or let the server infer nothing)". Borrowed.
+    content_type: []const u8 = "",
+    /// Reserved for Task 7.5; see HttpGetSpec.timeout_ms.
+    timeout_ms: u64 = 30_000,
+    /// Follow 3xx redirects. When true, std.http.Client handles up to
+    /// three hops transparently.
+    follow_redirects: bool = true,
+};
+
 /// Success payload for an `http_get` job. `body` and the backing slice
 /// of `headers` (plus each header's name/value) are heap-allocated on
 /// the engine allocator and must be freed by `pushJobResultOntoStack`
@@ -162,6 +189,10 @@ pub const JobKind = union(enum) {
     cmd_close_stdin_done: CmdCloseStdinDoneSpec,
     /// One-shot HTTP GET. Worker lives in `primitives/http.zig`.
     http_get: HttpGetSpec,
+    /// One-shot HTTP POST. Worker lives in `primitives/http.zig`.
+    /// Shares `JobResult.http` with `http_get` — status/body shape is
+    /// identical, only the request side differs.
+    http_post: HttpPostSpec,
     // fs lands in a later phase
 };
 

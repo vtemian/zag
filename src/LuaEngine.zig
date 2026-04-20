@@ -282,7 +282,8 @@ pub const LuaEngine = struct {
         lua.newTable(); // [zag_table, http_table]
         lua.pushFunction(zlua.wrap(zagHttpGetFn));
         lua.setField(-2, "get"); // zag.http.get = fn; [zag_table, http_table]
-        // zag.http.post lands in Task 7.3.
+        lua.pushFunction(zlua.wrap(zagHttpPostFn));
+        lua.setField(-2, "post"); // zag.http.post = fn; [zag_table, http_table]
         // zag.http.stream lands in Task 7.4.
         lua.setField(-2, "http"); // zag.http = http_table; [zag_table]
 
@@ -754,6 +755,191 @@ pub const LuaEngine = struct {
             .kind = .{ .http_get = .{
                 .url = url,
                 .headers = headers_slice,
+                .timeout_ms = timeout_ms,
+                .follow_redirects = follow_redirects,
+            } },
+            .thread_ref = task.thread_ref,
+            .scope = task.scope,
+        };
+        task.pending_job = job;
+        task.primitive_arena = arena_ptr;
+
+        if (task.scope.isCancelled()) {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.primitive_arena = null;
+            co.pushNil();
+            _ = co.pushString("cancelled");
+            return 2;
+        }
+
+        engine.io_pool.?.submit(job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.primitive_arena = null;
+            co.pushNil();
+            _ = co.pushString("io_error: submit failed");
+            return 2;
+        };
+
+        co.yield(0);
+        // yield is noreturn on Lua 5.4.
+    }
+
+    /// `zag.http.post(url, opts?)` — synchronous-looking HTTP POST.
+    /// Mirrors `zag.http.get` plus a request body.
+    ///
+    /// `opts` adds (over `get`):
+    ///   - `body`: string (raw bytes) OR table (auto-encoded to JSON).
+    ///     Missing / nil is equivalent to an empty body.
+    ///   - `content_type`: string. Overrides the defaults below.
+    ///
+    /// Content-Type behaviour (only applied when `body` is non-nil):
+    ///   - Caller-supplied `headers["Content-Type"]` wins unconditionally.
+    ///   - Else, `opts.content_type` if set.
+    ///   - Else, `"application/json"` when the body came from a table.
+    ///   - Else (string body, no hint), no Content-Type is injected —
+    ///     the caller didn't ask for one.
+    fn zagHttpPostFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("zag.http.post must be called inside zag.async/hook/keymap", .{});
+        }
+
+        const url_raw = co.checkString(1);
+        const opts_idx: i32 = 2;
+
+        const arena_ptr = engine.allocator.create(std.heap.ArenaAllocator) catch {
+            co.raiseErrorStr("zag.http.post arena alloc failed", .{});
+        };
+        arena_ptr.* = std.heap.ArenaAllocator.init(engine.allocator);
+        const arena = arena_ptr.allocator();
+
+        const url = arena.dupe(u8, url_raw) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.http.post url dupe failed", .{});
+        };
+
+        var timeout_ms: u64 = 30_000;
+        var follow_redirects: bool = true;
+        var headers_list: std.ArrayList(async_job.HttpHeader) = .empty;
+        var body_slice: []const u8 = "";
+        var body_was_table = false;
+        var has_body = false;
+        var content_type: []const u8 = "";
+
+        if (co.isTable(opts_idx)) {
+            _ = co.getField(opts_idx, "timeout_ms");
+            if (co.isInteger(-1)) {
+                const v = co.toInteger(-1) catch 30_000;
+                timeout_ms = if (v < 0) 0 else @intCast(v);
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "follow_redirects");
+            if (!co.isNil(-1)) {
+                follow_redirects = co.toBoolean(-1);
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "content_type");
+            if (co.isString(-1)) {
+                const s = co.toString(-1) catch "";
+                content_type = arena.dupe(u8, s) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.post content_type dupe failed", .{});
+                };
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "headers");
+            if (co.isTable(-1)) {
+                co.pushNil();
+                while (co.next(-2)) {
+                    if (!co.isString(-2) or !co.isString(-1)) {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.post headers entries must be string->string", .{});
+                    }
+                    const k = co.toString(-2) catch "";
+                    const v = co.toString(-1) catch "";
+                    const name = arena.dupe(u8, k) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.post header dupe failed", .{});
+                    };
+                    const val = arena.dupe(u8, v) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.post header dupe failed", .{});
+                    };
+                    headers_list.append(arena, .{ .name = name, .value = val }) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.http.post headers append failed", .{});
+                    };
+                    co.pop(1);
+                }
+            }
+            co.pop(1); // pop headers table (or nil)
+
+            // Body is string OR table. Table → JSON-encoded via
+            // luaValueToJson; string → raw bytes; nil → no body.
+            _ = co.getField(opts_idx, "body");
+            if (co.isTable(-1)) {
+                body_was_table = true;
+                has_body = true;
+                const json = luaTableToJson(co, -1, arena) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.post body JSON encode failed", .{});
+                };
+                body_slice = json;
+            } else if (co.isString(-1)) {
+                has_body = true;
+                const s = co.toString(-1) catch "";
+                body_slice = arena.dupe(u8, s) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.post body dupe failed", .{});
+                };
+            }
+            co.pop(1); // pop body
+        }
+
+        // Default Content-Type only for table bodies when the caller
+        // didn't give us an explicit hint. String bodies stay opaque
+        // unless opts.content_type (or headers["Content-Type"]) is set.
+        if (has_body and body_was_table and content_type.len == 0) {
+            content_type = "application/json";
+        }
+
+        const headers_slice = headers_list.toOwnedSlice(arena) catch &.{};
+
+        const task = engine.taskForCoroutine(co) orelse {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.http.post: no task for this coroutine", .{});
+        };
+
+        const job = engine.allocator.create(async_job.Job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.http.post job alloc failed", .{});
+        };
+        job.* = .{
+            .kind = .{ .http_post = .{
+                .url = url,
+                .headers = headers_slice,
+                .body = body_slice,
+                .content_type = content_type,
                 .timeout_ms = timeout_ms,
                 .follow_redirects = follow_redirects,
             } },
@@ -2518,7 +2704,7 @@ pub const LuaEngine = struct {
                 co.pushNil();
                 return 2;
             },
-            .http_get => {
+            .http_get, .http_post => {
                 // On success the worker populated job.result.http with
                 // a heap-allocated body (on engine allocator). In v1
                 // `headers` is always empty (see primitives/http.zig);
@@ -2531,7 +2717,7 @@ pub const LuaEngine = struct {
                         else => {},
                     };
                     co.pushNil();
-                    _ = co.pushString("io_error: http_get missing result");
+                    _ = co.pushString("io_error: http missing result");
                     return 2;
                 };
 
@@ -4369,5 +4555,111 @@ test "zag.http.get fetches from a local test server" {
 
     _ = try eng.lua.getGlobal("_http_headers_is_table");
     try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.http.post sends body and parses response" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    // Echo server: read the request (crude but OK for small bodies
+    // under a single MSS), grab everything after `\r\n\r\n`, send it
+    // back as the response body. No Content-Length on the request
+    // side means we also accept chunked-less small payloads.
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [8192]u8 = undefined;
+            var total: usize = 0;
+            // Headers first
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            const header_end = (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") orelse return) + 4;
+
+            // Parse Content-Length to know when the body is fully read.
+            var content_length: usize = 0;
+            const headers_view = buf[0..header_end];
+            if (std.mem.indexOf(u8, headers_view, "Content-Length:")) |cl_idx| {
+                const line_end = std.mem.indexOfScalarPos(u8, headers_view, cl_idx, '\r') orelse header_end;
+                const value = std.mem.trim(u8, headers_view[cl_idx + "Content-Length:".len .. line_end], " \t");
+                content_length = std.fmt.parseInt(usize, value, 10) catch 0;
+            }
+
+            // Keep reading until we have the full body.
+            while ((total - header_end) < content_length and total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+            }
+
+            const body = buf[header_end..total];
+            var resp_buf: [8192]u8 = undefined;
+            const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+            conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    try eng.lua.doString(
+        \\function test_post(url)
+        \\  local r, err = zag.http.post(url, {
+        \\    body = { hello = "world", n = 42 },
+        \\    headers = { ["X-Test"] = "on" },
+        \\  })
+        \\  _post_err_is_nil = (err == nil)
+        \\  if r then
+        \\    _post_status = r.status
+        \\    _post_body = r.body
+        \\  end
+        \\end
+    );
+
+    _ = try eng.lua.getGlobal("test_post");
+    _ = eng.lua.pushString(url);
+    _ = try eng.spawnCoroutine(1, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_post_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    _ = try eng.lua.getGlobal("_post_status");
+    try std.testing.expectEqual(@as(i64, 200), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+
+    _ = try eng.lua.getGlobal("_post_body");
+    const body = try eng.lua.toString(-1);
+    // Server echoes the body. The Lua→JSON encoder doesn't guarantee
+    // key order, so just check the encoded object contains both
+    // key/value pairs somewhere.
+    try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "world") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "42") != null);
     eng.lua.pop(1);
 }
