@@ -9,19 +9,57 @@ pub const Aborter = struct {
     }
 };
 
+/// Argv/env/timeout/output-cap payload for a cmd_exec job. Kept outside
+/// the union because it's bigger than the other variants and is easier to
+/// read as its own type.
+pub const CmdExecSpec = struct {
+    /// Argv slice; item 0 is the program. Owned by the caller (Lua binding
+    /// sets up an arena that lives until resumeFromJob). Worker does not
+    /// free.
+    argv: []const []const u8,
+    /// Working directory for the child. Borrowed from the caller.
+    cwd: ?[]const u8 = null,
+    /// How to construct the child's environment.
+    env_mode: enum { inherit, replace, extend } = .inherit,
+    /// Optional env overrides. Semantics depend on env_mode.
+    env_map: ?std.process.EnvMap = null,
+    /// Bytes to write to the child's stdin before draining output. Borrowed
+    /// from the caller. null means no stdin pipe is opened.
+    stdin_bytes: ?[]const u8 = null,
+    /// Wall-clock deadline in milliseconds. 0 disables the timeout.
+    timeout_ms: u64 = 30_000,
+    /// Per-stream cap. 0 = unbounded. Applied to stdout and stderr
+    /// independently; hitting either sets CmdExecResult.truncated.
+    max_output_bytes: usize = 10 * 1024 * 1024,
+};
+
+/// Success payload for a cmd_exec job. stdout/stderr are heap-allocated on
+/// the worker's allocator and must be freed by resumeFromJob after being
+/// pushed onto the coroutine stack.
+pub const CmdExecResult = struct {
+    /// Process exit status. Negative values encode termination by signal
+    /// (-N == SIGN). -1 means unknown / unexpected term variant.
+    code: i32,
+    stdout: []const u8,
+    stderr: []const u8,
+    /// True when either stream hit max_output_bytes before the child was
+    /// done writing.
+    truncated: bool,
+};
+
 /// What the worker should do with this job. The scheduler fills this in
-/// before submit. Only `.sleep` exists today; cmd/http/fs land in later
-/// phases.
+/// before submit.
 pub const JobKind = union(enum) {
     sleep: struct { ms: u64 },
-    // other variants added in Phase 6+
+    cmd_exec: CmdExecSpec,
+    // http/fs land in later phases
 };
 
 /// Success payload handed back to the coroutine on resume. `.empty` means
 /// "no meaningful value" (sleep returns nothing).
 pub const JobResult = union(enum) {
     empty,
-    // others added in Phase 6+
+    cmd_exec: CmdExecResult,
 };
 
 /// Stable string tag surfaced to Lua on failure. The strings are part of
