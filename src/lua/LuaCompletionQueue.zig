@@ -83,3 +83,22 @@ test "Queue push returns QueueFull when capacity exceeded" {
     try q.push(&j2);
     try testing.expectError(error.QueueFull, q.push(&j3));
 }
+
+test "Queue.push writes one byte to wake_fd" {
+    const alloc = testing.allocator;
+    var q = try Queue.init(alloc, 4);
+    defer q.deinit();
+
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+
+    q.wake_fd = fds[1];
+    var j = Job{};
+    try q.push(&j);
+
+    var buf: [4]u8 = undefined;
+    const n = try std.posix.read(fds[0], &buf);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(u8, 1), buf[0]);
+}
