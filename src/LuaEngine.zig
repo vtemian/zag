@@ -264,6 +264,8 @@ pub const LuaEngine = struct {
         lua.newTable(); // [zag_table, cmd_table]
         lua.pushFunction(zlua.wrap(zagCmdSpawnFn));
         lua.setField(-2, "spawn"); // zag.cmd.spawn = fn; [zag_table, cmd_table]
+        lua.pushFunction(zlua.wrap(zagCmdKillFn));
+        lua.setField(-2, "kill"); // zag.cmd.kill = fn; [zag_table, cmd_table]
         lua.newTable(); // [zag_table, cmd_table, mt]
         lua.pushFunction(zlua.wrap(zagCmdCallFn));
         lua.setField(-2, "__call"); // mt.__call = fn; [zag_table, cmd_table, mt]
@@ -858,6 +860,37 @@ pub const LuaEngine = struct {
         return 1;
     }
 
+    /// `zag.cmd.kill(pid, signal)` — send a POSIX signal to an arbitrary
+    /// PID. Sync (no yield), useful for plugins that track external
+    /// processes (from pidfiles, other tools, etc.) without going through
+    /// a CmdHandle. Returns true on success, `(nil, err_string)` on
+    /// failure. Unknown signal names raise a Lua error.
+    ///
+    /// Signal names: TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT
+    /// (same set as `CmdHandle:kill`; shares `signalNameToNum`).
+    fn zagCmdKillFn(co: *Lua) i32 {
+        // Registered as a plain function on zag.cmd, so args start at
+        // stack slot 1 (no callable-table receiver to skip).
+        const pid_raw = co.checkInteger(1);
+        const sig_name = co.checkString(2);
+
+        const signo = cmd_handle_mod.signalNameToNum(sig_name) orelse {
+            co.raiseErrorStr("zag.cmd.kill: unknown signal (valid: TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT)", .{});
+        };
+
+        const pid: std.posix.pid_t = @intCast(pid_raw);
+        std.posix.kill(pid, signo) catch |err| {
+            co.pushNil();
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "{s}", .{@errorName(err)}) catch "kill failed";
+            _ = co.pushString(msg);
+            return 2;
+        };
+
+        co.pushBoolean(true);
+        return 1;
+    }
+
     /// Register the CmdHandle metatable so userdata returned from
     /// `zag.cmd.spawn` carries `:wait`, `:kill`, and `__gc`.
     fn registerCmdHandleMt(lua: *Lua) !void {
@@ -872,6 +905,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "write");
         lua.pushFunction(zlua.wrap(cmdHandleCloseStdin));
         lua.setField(-2, "close_stdin");
+        lua.pushFunction(zlua.wrap(cmdHandlePid));
+        lua.setField(-2, "pid");
         // __index = self so `h:wait()` dispatches to wait(h).
         lua.pushValue(-1);
         lua.setField(-2, "__index");
@@ -1000,6 +1035,21 @@ pub const LuaEngine = struct {
             log.debug("cmd:kill submit failed: {s}", .{@errorName(err)});
         };
         return 0;
+    }
+
+    /// `CmdHandle:pid()` — return the child's PID as an integer. Useful
+    /// when feeding the PID into `zag.cmd.kill` or external tools. The
+    /// PID is stable for the handle's lifetime (until the child is
+    /// reaped by `:wait()` or `__gc`); calling after reap still returns
+    /// the recorded value, but signalling it risks hitting a recycled
+    /// PID — don't.
+    fn cmdHandlePid(co: *Lua) i32 {
+        const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        const h = ud.ptr orelse {
+            co.raiseErrorStr("cmd:pid: invalid handle", .{});
+        };
+        co.pushInteger(@intCast(h.child.id));
+        return 1;
     }
 
     /// `CmdHandle:lines()` — returns a Lua iterator function. Used in
@@ -3966,6 +4016,62 @@ test "zag.cmd.spawn :write feeds stdin, :close_stdin causes cat to exit" {
     eng.lua.pop(1);
     _ = try eng.lua.getGlobal("_write_line1");
     try std.testing.expectEqualStrings("hello", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.kill on a spawned child exits it with the signal" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Spawn /bin/sleep, grab its PID via h:pid(), send KILL through the
+    // sync zag.cmd.kill primitive, and let h:wait() reap the corpse.
+    // A signal-killed child surfaces a negative exit code.
+    try eng.lua.doString(
+        \\function test_kill()
+        \\  local h = zag.cmd.spawn({ "/bin/sleep", "30" })
+        \\  local pid = h:pid()
+        \\  _kill_pid_positive = (pid ~= nil and pid > 0)
+        \\  local ok, err = zag.cmd.kill(pid, "KILL")
+        \\  _kill_ok = ok
+        \\  _kill_err_is_nil = (err == nil)
+        \\  local code, werr = h:wait()
+        \\  _kill_wait_code = code
+        \\  _kill_werr_is_nil = (werr == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_kill");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_kill_pid_positive");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_kill_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_kill_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_kill_wait_code");
+    const code = try eng.lua.toInteger(-1);
+    try std.testing.expect(code < 0); // signal-killed convention
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_kill_werr_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
 
     try eng.lua.doString("collectgarbage('collect')");
