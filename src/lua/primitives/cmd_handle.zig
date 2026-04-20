@@ -38,6 +38,10 @@ pub const HelperCmd = union(enum) {
     /// `thread_ref` set to the Lua coroutine that was suspended in
     /// `:wait()`.
     wait: struct { thread_ref: i32 },
+    /// Deliver a signal to the child. Routed through the helper (which
+    /// owns the `Child`) so that the kill cannot race against the
+    /// kernel recycling the PID after `child.wait()` returns.
+    kill: struct { signo: u8 },
     /// Shut the helper down. Sent by `shutdownAndCleanup`. Helper
     /// breaks out of its loop; main joins the thread.
     shutdown,
@@ -48,8 +52,11 @@ pub const HelperCmd = union(enum) {
 /// the main thread's `:wait` fast path to check "already exited?"
 /// without locking.
 pub const State = enum(u8) {
-    /// Child is alive (or at least, helper has not yet reaped it).
+    /// Child is alive and no `:wait` has been submitted yet.
     running,
+    /// A `:wait` is in flight on the helper thread. Second `:wait`
+    /// calls must error out instead of queuing a duplicate reap.
+    waiting,
     /// `child.wait()` returned; `exit_code` is populated. Terminal.
     exited,
 };
@@ -92,11 +99,6 @@ pub const CmdHandle = struct {
     /// Process exit status: 0+ for normal exit, negative for signals
     /// (matching `cmd.zig` convention: `-N` = terminated by signal N).
     exit_code: ?i32 = null,
-
-    /// Registry ref of a coroutine currently suspended inside `:wait()`.
-    /// Null when no one is waiting. v1 limits to a single joiner; a
-    /// second `:wait()` raises "already waiting".
-    wait_thread_ref: ?i32 = null,
 
     pub const METATABLE_NAME = "zag.CmdHandle";
 
@@ -191,8 +193,20 @@ pub const CmdHandle = struct {
             switch (cmd) {
                 .shutdown => return,
                 .wait => |w| self.runWait(w.thread_ref),
+                .kill => |k| self.runKill(k.signo),
             }
         }
+    }
+
+    /// Helper-side signal delivery. Runs on the same thread that owns
+    /// `child.wait()`, so we cannot race the kernel recycling the PID
+    /// after reap: if `.exited` is already set, the wait has completed
+    /// and we skip the kill entirely.
+    fn runKill(self: *CmdHandle, signo: u8) void {
+        if (self.state.load(.acquire) == .exited) return;
+        std.posix.kill(self.child.id, signo) catch |err| {
+            log.debug("cmd:kill helper kill failed: {s}", .{@errorName(err)});
+        };
     }
 
     /// Helper-side implementation of `:wait`. Blocks on `child.wait()`,
@@ -221,6 +235,15 @@ pub const CmdHandle = struct {
         if (thread_ref != 0) self.postWaitDone(thread_ref);
     }
 
+    /// Attempt to transition the state atomically from `.running` to
+    /// `.waiting`. Returns true if this caller owns the single wait
+    /// slot; false if another `:wait` is already in flight or the
+    /// child has already exited. The Lua binding uses this to reject
+    /// concurrent waiters without a separate thread_ref field.
+    pub fn claimWaitSlot(self: *CmdHandle) bool {
+        return self.state.cmpxchgStrong(.running, .waiting, .acq_rel, .acquire) == null;
+    }
+
     /// Allocate and post a .cmd_wait_done Job back to the main thread.
     /// On alloc failure we log and drop the post; the coroutine will
     /// hang forever, which surfaces the bug rather than hiding it.
@@ -240,10 +263,18 @@ pub const CmdHandle = struct {
             .scope = self.root_scope,
         };
 
-        self.completions.push(job) catch |err| {
-            log.err("cmd_wait_done push failed: {s}", .{@errorName(err)});
-            self.alloc.destroy(job);
-        };
+        // A QueueFull drop would hang the suspended coroutine forever;
+        // the helper has nothing else to do, so spin-retry with a 1ms
+        // backoff until the main thread drains a slot.
+        while (true) {
+            self.completions.push(job) catch |err| switch (err) {
+                error.QueueFull => {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+            };
+            return;
+        }
     }
 
     /// Called by the Lua userdata __gc metamethod. Idempotent. Ensures
@@ -255,21 +286,21 @@ pub const CmdHandle = struct {
         if (self.shut_down) return;
         self.shut_down = true;
 
-        if (self.state.load(.acquire) == .running) {
-            // No one ever called :wait — force termination. SIGKILL the
-            // child, then enqueue a wait on the helper so the child is
-            // properly reaped.
-            std.posix.kill(self.child.id, std.posix.SIG.KILL) catch |err| {
-                log.debug("gc kill failed: {s}", .{@errorName(err)});
-            };
-            // Can't post a completion (Lua is tearing down, thread_ref
-            // may be invalid) so we wait inline from here — but the
-            // helper thread owns the Child, so we route through it.
-            self.submit(.{ .wait = .{ .thread_ref = 0 } }) catch {};
+        // Route a SIGKILL through the helper (it owns the Child and
+        // won't race against reap) and ensure the wait is actually
+        // dispatched so the child is reaped before we free. If a
+        // `:wait` was already submitted (`.waiting`) we only need to
+        // deliver the kill; otherwise we also enqueue the wait.
+        const s = self.state.load(.acquire);
+        if (s != .exited) {
+            self.submit(.{ .kill = .{ .signo = std.posix.SIG.KILL } }) catch {};
+            if (s == .running) {
+                self.submit(.{ .wait = .{ .thread_ref = 0 } }) catch {};
+            }
             // Spin until helper marks .exited. Bounded: the child has
             // been SIGKILLed. If this ever hangs, the process is
             // uninterruptible (D state) and we have a bigger problem.
-            while (self.state.load(.acquire) == .running) {
+            while (self.state.load(.acquire) != .exited) {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
@@ -303,6 +334,11 @@ pub fn signalNameToNum(name: []const u8) ?u8 {
     if (std.mem.eql(u8, name, "KILL")) return std.posix.SIG.KILL;
     if (std.mem.eql(u8, name, "INT")) return std.posix.SIG.INT;
     if (std.mem.eql(u8, name, "HUP")) return std.posix.SIG.HUP;
+    if (std.mem.eql(u8, name, "QUIT")) return std.posix.SIG.QUIT;
+    if (std.mem.eql(u8, name, "USR1")) return std.posix.SIG.USR1;
+    if (std.mem.eql(u8, name, "USR2")) return std.posix.SIG.USR2;
+    if (std.mem.eql(u8, name, "STOP")) return std.posix.SIG.STOP;
+    if (std.mem.eql(u8, name, "CONT")) return std.posix.SIG.CONT;
     return null;
 }
 
@@ -313,5 +349,10 @@ test "signalNameToNum maps the common signals" {
     try testing.expectEqual(@as(?u8, std.posix.SIG.KILL), signalNameToNum("KILL"));
     try testing.expectEqual(@as(?u8, std.posix.SIG.INT), signalNameToNum("INT"));
     try testing.expectEqual(@as(?u8, std.posix.SIG.HUP), signalNameToNum("HUP"));
+    try testing.expectEqual(@as(?u8, std.posix.SIG.QUIT), signalNameToNum("QUIT"));
+    try testing.expectEqual(@as(?u8, std.posix.SIG.USR1), signalNameToNum("USR1"));
+    try testing.expectEqual(@as(?u8, std.posix.SIG.USR2), signalNameToNum("USR2"));
+    try testing.expectEqual(@as(?u8, std.posix.SIG.STOP), signalNameToNum("STOP"));
+    try testing.expectEqual(@as(?u8, std.posix.SIG.CONT), signalNameToNum("CONT"));
     try testing.expect(signalNameToNum("BOGUS") == null);
 }
