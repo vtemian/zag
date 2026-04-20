@@ -1,7 +1,7 @@
 //! Long-lived streaming HTTP GET handle for `zag.http.stream`. Where
 //! `zag.http.get` accumulates the whole body into one slice,
 //! `HttpStreamHandle` keeps the response open and hands back one line
-//! per call to `:lines()` — handy for SSE, NDJSON, and any other
+//! per call to `:lines()`, handy for SSE, NDJSON, and any other
 //! line-oriented API that wants to deliver events as they happen.
 //!
 //! Ownership model mirrors `CmdHandle`:
@@ -29,12 +29,12 @@ const Scope = @import("../Scope.zig").Scope;
 const log = std.log.scoped(.lua_http_stream);
 
 /// Command enqueued from main onto the helper thread's internal queue.
-/// Only two today — a `:lines()` iteration driver and the shutdown
+/// Only two today: a `:lines()` iteration driver and the shutdown
 /// signal used by `:close()` / `__gc`.
 pub const HelperCmd = union(enum) {
     /// Read the next line from the response body. Helper fills
-    /// `line_buf` via `body_reader.stream(&fixed, .limited(...))` —
-    /// the only EOS-safe interface std.http exposes — and loops until
+    /// `line_buf` via `body_reader.stream(&fixed, .limited(...))`
+    /// (the only EOS-safe interface std.http exposes), and loops until
     /// '\n' appears or `isStreamEnded` flips. Posts a
     /// `.http_stream_line_done` job addressed to `thread_ref`.
     read_line: struct { thread_ref: i32 },
@@ -46,7 +46,7 @@ pub const HelperCmd = union(enum) {
 /// by the helper between commands so a pending `:read_line` hits EOF
 /// promptly once the caller asks for close.
 pub const State = enum(u8) {
-    /// Normal operation — helper is willing to read.
+    /// Normal operation: helper is willing to read.
     running,
     /// `:close()` (or GC) has flipped this; helper should wind down.
     closed,
@@ -62,19 +62,19 @@ pub const HttpStreamHandle = struct {
     /// Borrowed root scope. Embedded in posted jobs so `resumeFromJob`
     /// has a scope to key off; the stream handle is not registered
     /// with the scope for cancel purposes in v1 (no socket-close
-    /// aborter yet — same limitation as `zag.http.get`).
+    /// aborter yet, same limitation as `zag.http.get`).
     root_scope: *Scope,
     /// Arena holding the url copy for the request's lifetime.
     arena: *std.heap.ArenaAllocator,
 
-    /// Long-lived HTTP client — owns the connection pool for this
+    /// Long-lived HTTP client. Owns the connection pool for this
     /// single request. Kept alive for the request's lifetime.
     client: std.http.Client,
     /// In-flight streaming request. Produced by `client.request`,
     /// consumed by `sendBodiless` + `receiveHead`.
     req: std.http.Client.Request,
     /// Transfer buffer that the body reader writes into. The body
-    /// reader holds a pointer into this field — must stay pinned for
+    /// reader holds a pointer into this field, so it must stay pinned for
     /// the handle's lifetime, which is why the handle is heap-alloc'd.
     transfer_buf: [8192]u8 = undefined,
     /// Body reader borrowed from `req` after `receiveHead`. Helper
@@ -106,19 +106,19 @@ pub const HttpStreamHandle = struct {
     shutdown_done: std.atomic.Value(bool) = .init(false),
 
     /// Line-buffered bytes read from `body_reader` but not yet handed
-    /// to Lua. Owned by the helper thread (no locking — only
+    /// to Lua. Owned by the helper thread (no locking: only
     /// `runReadLine` touches it, and commands are serialised).
     line_buf: std.ArrayList(u8) = .empty,
     /// Set once `body_reader.stream(...)` returned `error.EndOfStream`
     /// (or `isStreamEnded` flipped true, or the helper gave up on an
-    /// I/O error). Sticky — subsequent `:lines()` return nil once any
+    /// I/O error). Sticky: subsequent `:lines()` return nil once any
     /// buffered trailing partial line has been flushed.
     eof: bool = false,
 
     pub const METATABLE_NAME = "zag.HttpStreamHandle";
 
     /// Maximum bytes buffered before we give up on a line. Same 1 MiB
-    /// heuristic the CmdHandle uses — defends against a malicious
+    /// heuristic the CmdHandle uses; defends against a malicious
     /// server that streams megabytes with no newline.
     pub const MAX_LINE_BYTES: usize = 1 * 1024 * 1024;
 
@@ -135,7 +135,7 @@ pub const HttpStreamHandle = struct {
     };
 
     /// Open a streaming GET connection up to receiveHead, then launch
-    /// the helper. Blocks the caller until headers are in — documented
+    /// the helper. Blocks the caller until headers are in; documented
     /// design knob: receiveHead is done on the calling thread, so a
     /// slow server shows up as latency at `zag.http.stream()` time.
     ///
@@ -171,7 +171,7 @@ pub const HttpStreamHandle = struct {
             .redirect_behavior = @enumFromInt(3),
             .keep_alive = false,
             .headers = .{
-                // Compressed bodies would defeat the line reader —
+                // Compressed bodies would defeat the line reader;
                 // body_reader would see gzip bytes, not text lines.
                 .accept_encoding = .omit,
             },
@@ -197,7 +197,7 @@ pub const HttpStreamHandle = struct {
         // Request's connection. Since self.req is pinned (we live on
         // the heap) and response.reader() returns a pointer that
         // tracks the request's internal state, the borrow outlives
-        // the local `response` value — that's the same pattern
+        // the local `response` value. That's the same pattern
         // StreamingResponse in llm.zig relies on.
         self.body_reader = response.reader(&self.transfer_buf);
 
@@ -308,7 +308,7 @@ pub const HttpStreamHandle = struct {
         }
 
         // Pull bytes until we have a newline or we've drained the
-        // body. We can't use `readSliceShort` here — std.http's
+        // body. We can't use `readSliceShort` here; std.http's
         // content-length body reader will assertion-fail if we call
         // it after it has internally flipped state to `.ready`, and
         // `readSliceShort` loops internally in a way that tramples
@@ -319,7 +319,7 @@ pub const HttpStreamHandle = struct {
         while (true) {
             // Clean-state fast path: if the reader has already flipped
             // past .body_remaining_* (or the response had no body at
-            // all), nothing left to pull — drain `line_buf` as final
+            // all), nothing left to pull; drain `line_buf` as final
             // line(s) then transition to EOF.
             if (isStreamEnded(&self.req.reader)) {
                 self.eof = true;
@@ -341,7 +341,7 @@ pub const HttpStreamHandle = struct {
             var chunk: [4096]u8 = undefined;
             var fixed: std.Io.Writer = .fixed(&chunk);
             // `limit` tracks bytes-remaining for this slot. A single
-            // `stream` call may return fewer bytes than requested —
+            // `stream` call may return fewer bytes than requested;
             // that's fine, the outer while loops back.
             const n = self.body_reader.stream(&fixed, .limited(chunk.len)) catch |err| switch (err) {
                 error.EndOfStream => blk: {
@@ -478,7 +478,7 @@ pub const HttpStreamHandle = struct {
     /// Caller-invoked close. Flips state, shuts the socket down (so a
     /// helper currently blocked inside `body_reader.stream(...)` wakes
     /// up with an IO error), then queues a shutdown command so the
-    /// helper exits its main loop cleanly. Does NOT join here —
+    /// helper exits its main loop cleanly. Does NOT join here;
     /// `shutdownAndCleanup` owns the join.
     pub fn close(self: *HttpStreamHandle) void {
         self.state.store(.closed, .release);
@@ -488,7 +488,7 @@ pub const HttpStreamHandle = struct {
 
     /// Issue `posix.shutdown(fd, .both)` on the connection's socket,
     /// idempotently. Wakes a blocked recv in the helper thread in
-    /// microseconds — the in-flight `body_reader.stream(...)` returns
+    /// microseconds; the in-flight `body_reader.stream(...)` returns
     /// `error.ConnectionResetByPeer` or similar, which the helper
     /// buckets into the EOS path. The fd itself stays valid until
     /// `client.deinit` calls close on it in `shutdownAndCleanup`.
@@ -547,6 +547,7 @@ const completion_queue = @import("../LuaCompletionQueue.zig");
 // block for whatever the server takes to close the connection
 // (here: 10s). With it, close + join return in well under 1s.
 test "HttpStreamHandle close interrupts blocked helper read" {
+    std.testing.log_level = .err;
     const alloc = testing.allocator;
     const root = try @import("../Scope.zig").Scope.init(alloc, null);
     defer root.deinit();
@@ -627,7 +628,7 @@ test "HttpStreamHandle close interrupts blocked helper read" {
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
 
-    // Kick a SECOND read_line — this one will block because the
+    // Kick a SECOND read_line. This one will block because the
     // server hasn't sent another line. The helper is now in a
     // blocked recv() inside body_reader.stream.
     try handle.submit(.{ .read_line = .{ .thread_ref = 43 } });

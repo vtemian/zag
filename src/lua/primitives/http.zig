@@ -50,7 +50,7 @@ pub const AbortCtx = struct {
     /// cancel hitting before `setConnection` flips `cancelled` only;
     /// the worker's post-request checkpoint catches that and aborts
     /// the transfer. A cancel hitting after `clearConnection` is a
-    /// no-op on the socket — the normal cleanup path owns it.
+    /// no-op on the socket; the normal cleanup path owns it.
     connection: std.atomic.Value(?*std.http.Client.Connection) = .init(null),
     /// Prevents double-shutdown. `posix.shutdown` is idempotent in
     /// practice on Linux/macOS (second call returns ENOTCONN), but
@@ -246,7 +246,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
     // up any blocked recv inside `sendBody`/`receiveHead`/the body
     // drain below. `req.connection` can be null in theory (the
     // docstring says "null when the connection is released") but
-    // right after `request()` succeeded it's always populated — see
+    // right after `request()` succeeded it's always populated. See
     // std.http.Client.request line ~1702.
     if (req.connection) |conn| {
         abort_ctx.setConnection(conn);
@@ -282,7 +282,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
     };
 
     // Accumulate body into an engine-owned slice. Mirrors
-    // `llm.zig`'s StreamingResponse pattern. No errdefer — every
+    // `llm.zig`'s StreamingResponse pattern. No errdefer; every
     // early-exit below calls `out.deinit()` explicitly.
     var out: std.io.Writer.Allocating = .init(alloc);
 
@@ -298,7 +298,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
     };
 
     // Post-fetch cancel re-check: a fast local server can return 200
-    // before the aborter fires. Cancel wins — discard the body and
+    // before the aborter fires. Cancel wins: discard the body and
     // surface .cancelled instead of reporting a successful response.
     // Matches `primitives/cmd.zig`'s pattern.
     if (job.scope.isCancelled() or abort_ctx.cancelled.load(.acquire)) {
@@ -325,7 +325,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
 
 /// Shared error-to-ErrTag mapping. Called from every spot the request
 /// pipeline can fail. If the scope has been cancelled by the time we
-/// get here, that takes precedence — we report `.cancelled` rather
+/// get here, that takes precedence; we report `.cancelled` rather
 /// than whatever transport error the abort woke up (ConnectionResetByPeer,
 /// SocketNotConnected, ReadFailed, etc.).
 fn mapAndStoreErr(alloc: Allocator, job: *Job, abort_ctx: *AbortCtx, err: anyerror) void {
@@ -380,7 +380,7 @@ test "executeHttpGet fetches from a local test server" {
     const root = try Scope.init(alloc, null);
     defer root.deinit();
 
-    // Listen on 127.0.0.1:0 — kernel picks a free port.
+    // Listen on 127.0.0.1:0; kernel picks a free port.
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try listen_addr.listen(.{ .reuse_address = true });
     defer server.deinit();

@@ -1,7 +1,7 @@
 //! Filesystem primitives for `zag.fs`. Each worker wraps the matching
 //! `std.fs.cwd()` operation, maps the Zig error set onto the stable
 //! ErrTag strings we expose to Lua (`not_found`, `permission_denied`,
-//! `io_error`), and — for read/list/stat — hands back a heap-owned
+//! `io_error`), and (for read/list/stat) hands back a heap-owned
 //! result slice for `pushJobResultOntoStack` to copy into Lua and free.
 //!
 //! Worker-side only. Runs on a `LuaIoPool` worker thread, so it must
@@ -84,25 +84,28 @@ pub fn executeRead(alloc: Allocator, job: *Job) void {
         return;
     };
 
-    if (n < bytes.len) {
-        if (alloc.dupe(u8, bytes[0..n])) |actual| {
-            alloc.free(bytes);
-            job.result = .{ .fs_read = .{ .bytes = actual } };
-        } else |_| {
-            // OOM on the smaller allocation is extremely unlikely. Zero
-            // the tail so the oversized slice is at least well-defined,
-            // then hand back the original allocation.
-            @memset(bytes[n..], 0);
-            job.result = .{ .fs_read = .{ .bytes = bytes } };
-        }
-    } else {
-        job.result = .{ .fs_read = .{ .bytes = bytes } };
+    job.result = .{ .fs_read = .{ .bytes = shrinkOrZeroPad(alloc, bytes, n) } };
+}
+
+/// Handle the `stat`/`readAll` race: if a concurrent writer truncated
+/// the file after we sized the buffer, return a correctly-sized copy.
+/// On OOM (vanishingly unlikely for a shrink) we zero the tail and
+/// hand back the oversized allocation so Lua never sees uninitialised
+/// memory. Caller owns the returned slice via `alloc`.
+fn shrinkOrZeroPad(alloc: Allocator, bytes: []u8, n: usize) []const u8 {
+    if (n >= bytes.len) return bytes;
+    if (alloc.dupe(u8, bytes[0..n])) |actual| {
+        alloc.free(bytes);
+        return actual;
+    } else |_| {
+        @memset(bytes[n..], 0);
+        return bytes;
     }
 }
 
 /// Write-or-append. Overwrite mode truncates; append mode opens-or-
 /// creates without truncating and seeks to the end before writing.
-/// Success returns `JobResult.empty` — the Lua binding pushes
+/// Success returns `JobResult.empty`; the Lua binding pushes
 /// `(true, nil)`.
 pub fn executeWrite(alloc: Allocator, job: *Job) void {
     const spec = job.kind.fs_write;
@@ -253,7 +256,7 @@ pub fn executeList(alloc: Allocator, job: *Job) void {
 }
 
 /// stat a path without following the last component's symlink (well,
-/// std.fs.cwd().statFile follows symlinks — matches POSIX `stat(2)`).
+/// std.fs.cwd().statFile follows symlinks, matching POSIX `stat(2)`).
 /// Returns a value struct; nothing heap-allocated to free.
 pub fn executeStat(alloc: Allocator, job: *Job) void {
     const spec = job.kind.fs_stat;

@@ -82,7 +82,7 @@ pub const LuaEngine = struct {
     /// Internal veto channel between `applyHookReturn` /
     /// `applyHookReturnFromCoroutine` (which inspect the callback return
     /// table) and `fireHook` (which consumes the flag before returning
-    /// the reason to its caller). Not part of the public API — clients
+    /// the reason to its caller). Not part of the public API; clients
     /// read veto via the `?[]const u8` return value of `fireHook`.
     pending_cancel: bool = false,
     /// Reason string allocated via `self.allocator`. Ownership transfers
@@ -138,14 +138,14 @@ pub const LuaEngine = struct {
         /// pool-submitted job. Cleaned up by resumeFromJob after the
         /// result is pushed onto the coroutine stack (Lua has copied the
         /// data via pushString by then). Only one primitive is in flight
-        /// per task at a time — Lua coroutines are single-stack — so a
+        /// per task at a time (Lua coroutines are single-stack), so a
         /// single slot suffices across cmd_exec/http_get/future kinds.
         primitive_arena: ?*std.heap.ArenaAllocator = null,
         /// When non-null, this task is running a hook callback. On the
         /// final `.ok` resume (coroutine returns), resumeTask reads the
         /// top-of-stack return value (if it's a table) and applies it
         /// to the payload via `applyHookReturnFromCoroutine`. Pointer
-        /// is borrowed — the `fireHook` caller owns the payload and
+        /// is borrowed; the `fireHook` caller owns the payload and
         /// keeps it alive across the drain loop.
         hook_payload: ?*Hooks.HookPayload = null,
         /// Wall-clock timestamp (ms since epoch) when this task was
@@ -318,7 +318,7 @@ pub const LuaEngine = struct {
         lua.setMetatable(-2); // setmetatable(cmd_table, mt); [zag_table, cmd_table]
         lua.setField(-2, "cmd"); // zag.cmd = cmd_table; [zag_table]
 
-        // zag.http — plain namespace table for HTTP primitives. Not
+        // zag.http; plain namespace table for HTTP primitives. Not
         // callable; users always go through zag.http.get/post/stream.
         // Stack after this block: [zag_table].
         lua.newTable(); // [zag_table, http_table]
@@ -330,7 +330,7 @@ pub const LuaEngine = struct {
         lua.setField(-2, "stream"); // zag.http.stream = fn; [zag_table, http_table]
         lua.setField(-2, "http"); // zag.http = http_table; [zag_table]
 
-        // zag.fs — plain namespace table for filesystem primitives.
+        // zag.fs; plain namespace table for filesystem primitives.
         // All async entries yield the coroutine; `exists` is sync.
         lua.newTable(); // [zag_table, fs_table]
         lua.pushFunction(zlua.wrap(zagFsReadFn));
@@ -412,7 +412,7 @@ pub const LuaEngine = struct {
         };
 
         // Early-cancel short-circuit: scope already cancelled, don't bother
-        // with a Job round-trip — hand back (nil, "cancelled") synchronously.
+        // with a Job round-trip; hand back (nil, "cancelled") synchronously.
         if (task.scope.isCancelled()) {
             co.pushNil();
             _ = co.pushString("cancelled");
@@ -441,7 +441,7 @@ pub const LuaEngine = struct {
         // yield is noreturn on Lua 5.4.
     }
 
-    /// `zag.spawn(fn, args...)` — starts a new coroutine and returns a
+    /// `zag.spawn(fn, args...)`: starts a new coroutine and returns a
     /// TaskHandle userdata. If the caller is itself running inside a task
     /// (a hook, keymap, or another spawned coroutine), the new task's
     /// scope is parented to the caller's scope so agent-level cancellation
@@ -468,7 +468,7 @@ pub const LuaEngine = struct {
             co.raiseErrorStr("%s", .{msg.ptr});
         };
 
-        // Push the TaskHandle userdata on `co`'s stack — that's where the
+        // Push the TaskHandle userdata on `co`'s stack; that's where the
         // caller expects zag.spawn's return value.
         const h = co.newUserdata(TaskHandle, 0);
         h.* = .{ .thread_ref = thread_ref, .engine = engine };
@@ -477,7 +477,7 @@ pub const LuaEngine = struct {
         return 1;
     }
 
-    /// `zag.detach(fn, args...)` — fire-and-forget spawn. Same scope
+    /// `zag.detach(fn, args...)`: fire-and-forget spawn. Same scope
     /// parenting rules as `zag.spawn`, but returns nothing; the caller
     /// has no handle and cannot cancel or join the child.
     fn zagDetachFn(co: *Lua) i32 {
@@ -499,7 +499,7 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// `zag.cmd(argv, opts?)` — run a subprocess to completion and return a
+    /// `zag.cmd(argv, opts?)`: run a subprocess to completion and return a
     /// result table `{ code, stdout, stderr, truncated }` on success or
     /// `(nil, err_tag)` on failure. Yields until the worker pool finishes.
     ///
@@ -615,7 +615,7 @@ pub const LuaEngine = struct {
             co.pop(1);
 
             // env vs env_extra. `env` replaces inherited env entirely;
-            // `env_extra` overlays on top. Passing both is a user error —
+            // `env_extra` overlays on top. Passing both is a user error;
             // the two policies would fight for the same child.env_map.
             const has_env = blk: {
                 _ = co.getField(opts_idx, "env");
@@ -640,7 +640,7 @@ pub const LuaEngine = struct {
                 opts_env_mode = if (has_env) .replace else .extend;
                 // Init with the arena allocator: EnvMap owns key/value
                 // copies internally, and the arena owns the EnvMap's
-                // backing storage. The worker never frees either — Task
+                // backing storage. The worker never frees either; Task
                 // cleanup deinits the arena after resumeFromJob.
                 opts_env_map = std.process.EnvMap.init(arena);
 
@@ -722,7 +722,7 @@ pub const LuaEngine = struct {
         // yield is noreturn on Lua 5.4.
     }
 
-    /// `zag.http.get(url, opts?)` — synchronous-looking HTTP GET. Yields
+    /// `zag.http.get(url, opts?)`: synchronous-looking HTTP GET. Yields
     /// the coroutine until the worker finishes the request, then resumes
     /// with (response, nil) on success or (nil, err) on failure.
     /// `response` is a table `{status=int, headers=table, body=string}`;
@@ -868,7 +868,7 @@ pub const LuaEngine = struct {
         // yield is noreturn on Lua 5.4.
     }
 
-    /// `zag.http.post(url, opts?)` — synchronous-looking HTTP POST.
+    /// `zag.http.post(url, opts?)`: synchronous-looking HTTP POST.
     /// Mirrors `zag.http.get` plus a request body.
     ///
     /// `opts` adds (over `get`):
@@ -880,7 +880,7 @@ pub const LuaEngine = struct {
     ///   - Caller-supplied `headers["Content-Type"]` wins unconditionally.
     ///   - Else, `opts.content_type` if set.
     ///   - Else, `"application/json"` when the body came from a table.
-    ///   - Else (string body, no hint), no Content-Type is injected —
+    ///   - Else (string body, no hint), no Content-Type is injected;
     ///     the caller didn't ask for one.
     fn zagHttpPostFn(co: *Lua) i32 {
         const engine = getEngineFromState(co);
@@ -1069,11 +1069,11 @@ pub const LuaEngine = struct {
         pub const METATABLE_NAME = cmd_handle_mod.CmdHandle.METATABLE_NAME;
     };
 
-    /// `zag.cmd.spawn(argv, opts?)` — spawn a long-lived child process
+    /// `zag.cmd.spawn(argv, opts?)`: spawn a long-lived child process
     /// and return a `CmdHandle` userdata. For 6.4a `opts` honours
     /// `cwd`, `env`, and `env_extra` (same semantics as `zag.cmd`);
     /// `stdin`, `max_output_bytes`, and `timeout_ms` are intentionally
-    /// absent — they belong to `:write`/`:lines`/per-op deadlines
+    /// absent; they belong to `:write`/`:lines`/per-op deadlines
     /// implemented in 6.4b/6.4c.
     fn zagCmdSpawnFn(co: *Lua) i32 {
         const engine = getEngineFromState(co);
@@ -1140,7 +1140,7 @@ pub const LuaEngine = struct {
             opts.capture_stdout = co.toBoolean(-1);
             co.pop(1);
             // capture_stdin mirrors capture_stdout for the stdin pipe.
-            // Required to call `:write(data)` — without it the child's
+            // Required to call `:write(data)`: without it the child's
             // stdin is `.Ignore` and writes surface `io_error: stdin
             // not captured or already closed`.
             _ = co.getField(opts_idx, "capture_stdin");
@@ -1258,7 +1258,7 @@ pub const LuaEngine = struct {
         // Pre-allocate the userdata slot with a null pointer and attach
         // the metatable BEFORE calling CmdHandle.init. If newUserdata or
         // setMetatable longjmps (Lua OOM), the child/helper thread have
-        // not been created yet — nothing to leak. If they succeed and
+        // not been created yet; nothing to leak. If they succeed and
         // init later fails, __gc runs on a null-ptr userdata and is a
         // no-op; we clean up the arena inline and raise the error.
         const ud = co.newUserdata(CmdHandleUd, 0);
@@ -1284,7 +1284,7 @@ pub const LuaEngine = struct {
         return 1;
     }
 
-    /// `zag.cmd.kill(pid, signal)` — send a POSIX signal to an arbitrary
+    /// `zag.cmd.kill(pid, signal)`: send a POSIX signal to an arbitrary
     /// PID. Sync (no yield), useful for plugins that track external
     /// processes (from pidfiles, other tools, etc.) without going through
     /// a CmdHandle. Returns true on success, `(nil, err_string)` on
@@ -1339,7 +1339,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
     }
 
-    /// `CmdHandle:wait()` — yield the caller's coroutine until the
+    /// `CmdHandle:wait()`: yield the caller's coroutine until the
     /// child exits; resume with (code, nil). Signal-killed children
     /// return a negative code (e.g. -9 for SIGKILL). If the child has
     /// already exited, returns synchronously.
@@ -1386,7 +1386,7 @@ pub const LuaEngine = struct {
                     co.pushNil();
                     return 2;
                 }
-                // `.exited` with no code stored shouldn't happen —
+                // `.exited` with no code stored shouldn't happen;
                 // `runWait` always stores a code before the release
                 // store. Defensive: surface as io_error so the caller
                 // can see something went wrong.
@@ -1413,7 +1413,7 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `CmdHandle:kill(signal)` — deliver a signal to the child.
+    /// `CmdHandle:kill(signal)`: deliver a signal to the child.
     ///
     /// Routed through the helper thread to eliminate the PID-recycle race
     /// that would exist if we called `std.posix.kill` directly from main
@@ -1425,7 +1425,7 @@ pub const LuaEngine = struct {
     /// until the child self-exits, at which point `runKill` sees
     /// `.exited` and no-ops. So `:kill` cannot interrupt a pending
     /// `:wait` from another coroutine. To force termination while another
-    /// coroutine is awaiting, cancel that coroutine's scope instead —
+    /// coroutine is awaiting, cancel that coroutine's scope instead;
     /// scope cancellation fires the Job aborter, which `SIGKILL`s the
     /// child directly without going through the helper queue.
     ///
@@ -1445,7 +1445,7 @@ pub const LuaEngine = struct {
         };
 
         if (h.state.load(.acquire) == .exited) {
-            // Child already reaped — nothing to signal.
+            // Child already reaped; nothing to signal.
             return 0;
         }
 
@@ -1453,7 +1453,7 @@ pub const LuaEngine = struct {
         // `child.wait()` (prevents the PID-recycle race). Note: if a
         // wait is already executing on the helper, the helper is
         // blocked in `child.wait()` and won't pop this kill until the
-        // child exits — by which point `runKill` sees `.exited` and
+        // child exits; by which point `runKill` sees `.exited` and
         // no-ops. Use scope cancellation for force-kill while waiting.
         h.submit(.{ .kill = .{ .signo = signo } }) catch |err| {
             log.debug("cmd:kill submit failed: {s}", .{@errorName(err)});
@@ -1461,12 +1461,12 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// `CmdHandle:pid()` — return the child's PID as an integer. Useful
+    /// `CmdHandle:pid()`: return the child's PID as an integer. Useful
     /// when feeding the PID into `zag.cmd.kill` or external tools. The
     /// PID is stable for the handle's lifetime (until the child is
     /// reaped by `:wait()` or `__gc`); calling after reap still returns
     /// the recorded value, but signalling it risks hitting a recycled
-    /// PID — don't.
+    /// PID, so don't.
     fn cmdHandlePid(co: *Lua) i32 {
         const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
         const h = ud.ptr orelse {
@@ -1476,7 +1476,7 @@ pub const LuaEngine = struct {
         return 1;
     }
 
-    /// `CmdHandle:lines()` — returns a Lua iterator function. Used in
+    /// `CmdHandle:lines()`: returns a Lua iterator function. Used in
     /// a generic `for` loop:
     ///
     ///     for line in h:lines() do print(line) end
@@ -1495,7 +1495,7 @@ pub const LuaEngine = struct {
     /// drops the pipe → EOF) to interrupt a stuck iterator.
     ///
     /// v1 limitation: a single handle's line buffer is shared across
-    /// all `:lines()` iterators — calling `:lines()` twice and
+    /// all `:lines()` iterators; calling `:lines()` twice and
     /// interleaving reads will split lines across iterators. Treat
     /// `:lines()` as "one consumer per handle".
     fn cmdHandleLines(co: *Lua) i32 {
@@ -1508,7 +1508,7 @@ pub const LuaEngine = struct {
 
         // Build a closure that captures the handle userdata as its
         // single upvalue. The `for` loop in Lua calls this closure
-        // repeatedly with no arguments — it recovers the handle from
+        // repeatedly with no arguments; it recovers the handle from
         // the upvalue on each call.
         co.pushValue(1);
         co.pushClosure(zlua.wrap(cmdHandleLinesIter), 1);
@@ -1559,7 +1559,7 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `CmdHandle:write(data)` — feeds `data` to the child's stdin
+    /// `CmdHandle:write(data)`: feeds `data` to the child's stdin
     /// pipe. Must be called from inside a coroutine; yields until the
     /// helper thread finishes writing (or errors with EPIPE because
     /// the child closed the read end). Requires `capture_stdin = true`
@@ -1597,7 +1597,7 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `CmdHandle:close_stdin()` — closes the child's stdin pipe so
+    /// `CmdHandle:close_stdin()`: closes the child's stdin pipe so
     /// readers in the child see EOF. Idempotent helper-side. Must be
     /// called from inside a coroutine; yields until the helper
     /// confirms the close.
@@ -1625,14 +1625,14 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `__gc` metamethod — Lua calls this when the userdata becomes
+    /// `__gc` metamethod; Lua calls this when the userdata becomes
     /// unreachable. Idempotent cleanup: SIGKILL + reap the child if
     /// still running, join the helper thread, free the handle. If the
     /// user called `:wait()` properly this is a cheap no-op.
     fn cmdHandleGc(lua: *Lua) i32 {
         const ud = lua.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
         // Null ptr is the "spawn failed between newUserdata and
-        // CmdHandle.init" case — nothing was created, nothing to tear
+        // CmdHandle.init" case; nothing was created, nothing to tear
         // down.
         const h = ud.ptr orelse return 0;
         h.shutdownAndCleanup();
@@ -1650,7 +1650,7 @@ pub const LuaEngine = struct {
         pub const METATABLE_NAME = http_stream_mod.HttpStreamHandle.METATABLE_NAME;
     };
 
-    /// `zag.http.stream(url, opts?)` — open a streaming GET and return
+    /// `zag.http.stream(url, opts?)`: open a streaming GET and return
     /// a handle userdata with `:lines()` and `:close()`.
     ///
     /// `opts` is reserved for future use; v1 accepts the arg so
@@ -1690,7 +1690,7 @@ pub const LuaEngine = struct {
         // Pre-create the userdata with a null ptr + metatable BEFORE
         // HttpStreamHandle.init, so a Lua longjmp between newUserdata
         // and setMetatable can't land on a typed userdata without a
-        // __gc — same pattern as zag.cmd.spawn.
+        // __gc; same pattern as zag.cmd.spawn.
         const ud = co.newUserdata(HttpStreamHandleUd, 0);
         ud.* = .{ .ptr = null };
         _ = co.getMetatableRegistry(HttpStreamHandleUd.METATABLE_NAME);
@@ -1703,7 +1703,7 @@ pub const LuaEngine = struct {
             arena_ptr,
             url,
         ) catch |err| {
-            // Init failed before the helper thread launched — arena
+            // Init failed before the helper thread launched; arena
             // is still ours, free it and surface an error tuple. The
             // userdata already on top of the stack stays a null-ptr
             // shell; its __gc is a no-op.
@@ -1745,7 +1745,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
     }
 
-    /// `HttpStreamHandle:lines()` — returns a Lua iterator function
+    /// `HttpStreamHandle:lines()`: returns a Lua iterator function
     /// closing over the handle. Idiomatic use:
     ///
     ///     for line in s:lines() do print(line) end
@@ -1800,14 +1800,14 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `HttpStreamHandle:close()` — abort the stream early. Flips the
+    /// `HttpStreamHandle:close()`: abort the stream early. Flips the
     /// state flag and signals the helper to shut down; the helper
     /// thread is joined only at `__gc` time (or explicit teardown)
     /// because close() runs on the Lua-facing main thread and we
     /// don't want to block Lua on a possibly-stuck recv.
     ///
     /// v1 limitation: if the helper is already blocked inside
-    /// `body_reader.read`, close does not interrupt that syscall —
+    /// `body_reader.read`, close does not interrupt that syscall;
     /// it returns only when the server closes its end of the socket
     /// or the kernel times the connection out. Task 7.5 will wire a
     /// real socket-close aborter.
@@ -1832,7 +1832,7 @@ pub const LuaEngine = struct {
     /// Shared prelude for every async `zag.fs.*` binding. Validates we're
     /// inside a yieldable coroutine, stages the path string in a per-task
     /// arena, and returns the arena + dup'd path so the caller can build
-    /// its Job spec on top. Any failure raises a Lua error — the returned
+    /// its Job spec on top. Any failure raises a Lua error; the returned
     /// arena is only valid on success.
     ///
     /// The arena is attached to the Task in `submitFsJob`. Until then the
@@ -1929,7 +1929,7 @@ pub const LuaEngine = struct {
         // yield is noreturn on Lua 5.4.
     }
 
-    /// `zag.fs.read(path)` — read a whole file. Yields until the worker
+    /// `zag.fs.read(path)`: read a whole file. Yields until the worker
     /// finishes, then resumes with `(bytes, nil)` or `(nil, err)`.
     fn zagFsReadFn(co: *Lua) i32 {
         const staged = fsStagePath(co, "zag.fs.read");
@@ -1938,7 +1938,7 @@ pub const LuaEngine = struct {
         } }, "zag.fs.read");
     }
 
-    /// Shared body for `zag.fs.write` and `zag.fs.append` — identical
+    /// Shared body for `zag.fs.write` and `zag.fs.append`: identical
     /// except for the `mode` field on the job spec.
     fn zagFsWriteImpl(co: *Lua, comptime mode: enum { overwrite, append }) i32 {
         const op_name = switch (mode) {
@@ -1962,17 +1962,17 @@ pub const LuaEngine = struct {
         } }, op_name);
     }
 
-    /// `zag.fs.write(path, content)` — overwrite-or-create.
+    /// `zag.fs.write(path, content)`: overwrite-or-create.
     fn zagFsWriteFn(co: *Lua) i32 {
         return zagFsWriteImpl(co, .overwrite);
     }
 
-    /// `zag.fs.append(path, content)` — open-or-create, seek to end, write.
+    /// `zag.fs.append(path, content)`: open-or-create, seek to end, write.
     fn zagFsAppendFn(co: *Lua) i32 {
         return zagFsWriteImpl(co, .append);
     }
 
-    /// `zag.fs.mkdir(path, { parents = false })` — `parents=true` walks
+    /// `zag.fs.mkdir(path, { parents = false })`: `parents=true` walks
     /// the chain (mkdir -p), false requires the parent to exist.
     fn zagFsMkdirFn(co: *Lua) i32 {
         const staged = fsStagePath(co, "zag.fs.mkdir");
@@ -1988,7 +1988,7 @@ pub const LuaEngine = struct {
         } }, "zag.fs.mkdir");
     }
 
-    /// `zag.fs.remove(path, { recursive = false })` — delete a file, an
+    /// `zag.fs.remove(path, { recursive = false })`: delete a file, an
     /// empty directory, or (with recursive=true) an entire tree.
     fn zagFsRemoveFn(co: *Lua) i32 {
         const staged = fsStagePath(co, "zag.fs.remove");
@@ -2004,7 +2004,7 @@ pub const LuaEngine = struct {
         } }, "zag.fs.remove");
     }
 
-    /// `zag.fs.list(dir)` — list a directory's immediate children as an
+    /// `zag.fs.list(dir)`: list a directory's immediate children as an
     /// array of `{name=string, kind=string}` (kind is file/dir/symlink/
     /// other).
     fn zagFsListFn(co: *Lua) i32 {
@@ -2014,7 +2014,7 @@ pub const LuaEngine = struct {
         } }, "zag.fs.list");
     }
 
-    /// `zag.fs.stat(path)` — returns `{kind, size, mtime_ms, mode}` on
+    /// `zag.fs.stat(path)`: returns `{kind, size, mtime_ms, mode}` on
     /// success.
     fn zagFsStatFn(co: *Lua) i32 {
         const staged = fsStagePath(co, "zag.fs.stat");
@@ -2023,7 +2023,7 @@ pub const LuaEngine = struct {
         } }, "zag.fs.stat");
     }
 
-    /// `zag.fs.exists(path)` — SYNC; returns a bool and never yields or
+    /// `zag.fs.exists(path)`: SYNC; returns a bool and never yields or
     /// errors. A filesystem `access` syscall on a missing file is
     /// cheaper than round-tripping through the worker pool, and a bool
     /// return keeps callsites ergonomic (`if zag.fs.exists(p) then`).
@@ -2054,7 +2054,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
     }
 
-    /// TaskHandle:cancel() — marks the task's scope for cancellation.
+    /// TaskHandle:cancel(): marks the task's scope for cancellation.
     /// No-op if task already retired.
     fn taskHandleCancel(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
@@ -2079,7 +2079,7 @@ pub const LuaEngine = struct {
     /// TaskHandle:join() -> (true, nil) on target's success or (nil, "cancelled")
     /// if target was cancelled. Must be called inside a coroutine (yields).
     ///
-    /// Known limitation: target's Lua return values are NOT forwarded — join is
+    /// Known limitation: target's Lua return values are NOT forwarded; join is
     /// a completion signal, not a value-transfer. Propagating values across
     /// coroutines requires a registry-backed serializer, out of scope for v1.
     /// Callers that need return values should write to a closed-over upvalue
@@ -2093,7 +2093,7 @@ pub const LuaEngine = struct {
         }
 
         // Resolve the caller's task up-front so the self-join guard fires
-        // regardless of whether the target is still live or already retired —
+        // regardless of whether the target is still live or already retired;
         // a silent self-join would otherwise yield forever (retireTask only
         // runs when the coroutine exits).
         const my_task = engine.taskForCoroutine(co) orelse {
@@ -2518,7 +2518,7 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// `zag.notify(msg, opts?)` — v1 routes to `.lua_user` as an info line
+    /// `zag.notify(msg, opts?)`: v1 routes to `.lua_user` as an info line
     /// prefixed with `[notify]`. A future phase will push these onto a
     /// compositor notification queue and render them in the TUI; for now
     /// plugin authors get a log-level signal they can see.
@@ -2548,7 +2548,7 @@ pub const LuaEngine = struct {
     /// spawn exceeds `hook_budget_ms`, cancel its scope with reason
     /// "budget_exceeded". Next yield on that coroutine surfaces the
     /// cancellation as the `budget_exceeded` err tag. Safe to call
-    /// repeatedly — `Scope.cancel` is idempotent.
+    /// repeatedly; `Scope.cancel` is idempotent.
     fn enforceHookBudget(self: *LuaEngine) void {
         if (self.hook_budget_ms <= 0) return;
         const now = std.time.milliTimestamp();
@@ -2611,7 +2611,7 @@ pub const LuaEngine = struct {
             };
             // spawnHookCoroutine consumes [fn, payload] from main stack
             // and tags the Task with the payload pointer BEFORE the
-            // first resume — so hooks that complete synchronously (no
+            // first resume; so hooks that complete synchronously (no
             // yields) still have their return table captured in
             // resumeTask's ok-branch.
             const thread_ref = self.spawnHookCoroutine(1, null, payload) catch |err| {
@@ -2628,7 +2628,7 @@ pub const LuaEngine = struct {
         }
 
         // Drive the completion drain until every spawned hook retires.
-        // Non-hook coroutines may also complete during this loop — we
+        // Non-hook coroutines may also complete during this loop; we
         // resume them too since the main event loop is parked here.
         //
         // enforceHookBudget runs on each iteration: it's cheap (single
@@ -2667,7 +2667,7 @@ pub const LuaEngine = struct {
     /// Legacy synchronous hook dispatch via protectedCall. Used only
     /// when initAsync hasn't run (standalone tests). Hook bodies that
     /// try to call yielding primitives in this mode will error out,
-    /// which is fine — that combination is never exercised in tests.
+    /// which is fine; that combination is never exercised in tests.
     fn fireHookSync(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
         const pattern_key = hookPatternKey(payload.*);
         var it = self.hook_registry.iterMatching(payload.kind(), pattern_key);
@@ -2867,7 +2867,7 @@ pub const LuaEngine = struct {
     /// Like `applyHookReturn` but reads the return table from a
     /// coroutine's stack (`co`) instead of the main Lua stack. Used by
     /// `resumeTask` when a hook coroutine retires with a return value.
-    /// Table sits at the top of `co`; it is NOT popped here — the
+    /// Table sits at the top of `co` and is NOT popped here; the
     /// caller (resumeTask) pops via `co.pop(num_results)`.
     fn applyHookReturnFromCoroutine(
         self: *LuaEngine,
@@ -3276,7 +3276,7 @@ pub const LuaEngine = struct {
             self.completions = null;
         }
         // tasks map: any leftover Tasks indicate a coroutine wasn't properly retired.
-        // Log a warning — strict assertion would abort release builds on buggy
+        // Log a warning; strict assertion would abort release builds on buggy
         // shutdown paths, which is worse than a noisy log line.
         if (self.tasks.count() > 0) {
             std.log.scoped(.lua).warn("deinitAsync: {d} tasks still alive", .{self.tasks.count()});
@@ -3359,7 +3359,7 @@ pub const LuaEngine = struct {
             },
             .cmd_exec => {
                 // On success worker populated job.result.cmd_exec. Null
-                // result with no err_tag is a worker bug — surface a generic
+                // result with no err_tag is a worker bug; surface a generic
                 // io_error rather than faulting so the coroutine can observe it.
                 const r = blk: {
                     if (job.result) |res| switch (res) {
@@ -3399,7 +3399,7 @@ pub const LuaEngine = struct {
             },
             .cmd_read_line_done => |r| {
                 // CmdHandle:lines() iterator resumes with (line, nil)
-                // on success and (nil, nil) at EOF — `for line in
+                // on success and (nil, nil) at EOF; `for line in
                 // h:lines()` reads the first return value and stops on
                 // nil. An err_tag would have been handled above via
                 // the generic `(nil, "io_error: ...")` path.
@@ -3425,14 +3425,14 @@ pub const LuaEngine = struct {
             },
             .cmd_close_stdin_done => {
                 // CmdHandle:close_stdin() resumes with (true, nil).
-                // No failure path — close doesn't surface errors the
+                // No failure path; close doesn't surface errors the
                 // caller can act on.
                 co.pushBoolean(true);
                 co.pushNil();
                 return 2;
             },
             .http_stream_line_done => |r| {
-                // HttpStreamHandle:lines() iterator — same shape as
+                // HttpStreamHandle:lines() iterator; same shape as
                 // cmd_read_line_done: (line, nil) on a line, (nil,
                 // nil) at EOF. err_tag (io_error, oom) goes through
                 // the generic `(nil, "io_error: ...")` branch above.
@@ -3587,7 +3587,7 @@ pub const LuaEngine = struct {
 
     /// Creates a coroutine for the Lua function + `nargs` arguments that are
     /// already on top of `self.lua`'s stack. Layout expected before call:
-    /// `[fn, arg1, ..., argN]`. The stack is fully consumed — caller must
+    /// `[fn, arg1, ..., argN]`. The stack is fully consumed; caller must
     /// not touch the main stack at those slots after this returns.
     ///
     /// Returns the registry ref used as the `Task`'s key. NOTE: if the
@@ -3659,7 +3659,7 @@ pub const LuaEngine = struct {
     /// returned and is retired immediately. On `.yield` the task is
     /// left in the map for a later resume (from `resumeFromJob`). On
     /// error the message is logged and the task is retired. Never
-    /// propagates an error to the caller — scheduler work runs on the
+    /// propagates an error to the caller; scheduler work runs on the
     /// main thread and there is no meaningful recovery path.
     fn resumeTask(self: *LuaEngine, task: *Task, num_args_on_co: i32) void {
         var num_results: i32 = 0;
@@ -3674,7 +3674,7 @@ pub const LuaEngine = struct {
             .ok => {
                 // If this task is running a hook callback, peek its
                 // return value before we pop. Veto/rewrite tables live
-                // on `co`'s stack top and must be consumed here — the
+                // on `co`'s stack top and must be consumed here; the
                 // coroutine retires in a moment and the values disappear.
                 if (task.hook_payload) |hp| {
                     if (num_results >= 1 and task.co.isTable(-1)) {
@@ -3687,7 +3687,7 @@ pub const LuaEngine = struct {
                 self.retireTask(task);
             },
             .yield => {
-                // Yielded values sit on `co` — the binding that yielded
+                // Yielded values sit on `co`: the binding that yielded
                 // owns their interpretation. zag.sleep yields 0 values
                 // today; pop defensively so we never leak stack slots.
                 task.co.pop(num_results);
@@ -3708,14 +3708,14 @@ pub const LuaEngine = struct {
         if (task.primitive_arena) |a| {
             a.deinit();
             self.allocator.destroy(a);
-            // task about to be destroyed — no need to null the field
+            // task about to be destroyed; no need to null the field
         }
 
         const was_cancelled = task.scope.isCancelled();
 
         // Snapshot joiners so we can safely tear down the task's state while
         // still resuming them afterwards. If snapshot alloc fails, joiners
-        // block forever — log so the pathological case is visible.
+        // block forever; log so the pathological case is visible.
         var joiners_snap: []i32 = &.{};
         if (task.joiners.items.len > 0) {
             joiners_snap = self.allocator.alloc(i32, task.joiners.items.len) catch blk: {
@@ -3972,7 +3972,7 @@ test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
     const ref = try eng.spawnCoroutine(0, null);
     const task = eng.tasks.get(ref).?;
 
-    // Cancel immediately — worker is either queued or mid-sleep. Worker's
+    // Cancel immediately; worker is either queued or mid-sleep. Worker's
     // 10ms poll loop in executeJob sees isCancelled() and returns the job
     // with err_tag=.cancelled.
     try task.scope.cancel("test");
@@ -4236,6 +4236,7 @@ test "loadConfig with nonexistent file returns error" {
 }
 
 test "loadConfig reports syntax error gracefully instead of crashing" {
+    std.testing.log_level = .err;
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
@@ -4252,6 +4253,7 @@ test "loadConfig reports syntax error gracefully instead of crashing" {
 }
 
 test "loadConfig reports runtime error gracefully" {
+    std.testing.log_level = .err;
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
@@ -4569,6 +4571,7 @@ test "zag.set_escape_timeout_ms applied at loadUserConfig time lands on engine p
 }
 
 test "zag.set_escape_timeout_ms rejects negative" {
+    std.testing.log_level = .err;
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
@@ -5915,7 +5918,7 @@ test "zag.http.stream flushes trailing partial line on EOS" {
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
             }
-            // Body is "a\nb\nc" — 5 bytes, no trailing newline.
+            // Body is "a\nb\nc"; 5 bytes, no trailing newline.
             const resp =
                 "HTTP/1.1 200 OK\r\n" ++
                 "Content-Length: 5\r\n" ++
@@ -5975,7 +5978,7 @@ test "zag.http.stream flushes trailing partial line on EOS" {
 test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
     // Regression: child prints "a\nb\nc" with no trailing newline.
     // The read_line path must surface "c" as the final line before
-    // returning nil at EOF — not silently drop it.
+    // returning nil at EOF; not silently drop it.
     var eng = try LuaEngine.init(std.testing.allocator);
     defer eng.deinit();
     eng.storeSelfPointer();
@@ -6427,7 +6430,7 @@ test "zag.fs.exists returns true for present file, false for missing" {
 }
 
 test "zag.log.{debug,info} and zag.notify run without error" {
-    // Only exercise debug/info/notify here — the Zig test runner flags
+    // Only exercise debug/info/notify here; the Zig test runner flags
     // any .warn/.err emitted during a test as a logged error, which
     // would make a "does the binding call without raising" assertion
     // impossible to pass. warn/err wire to the same std.log machinery
@@ -6525,7 +6528,7 @@ test "hook budget cancels a runaway coroutine" {
     const got = try eng.lua.toString(-1);
     // The cancel reason propagates from Scope as "cancelled: budget_exceeded"
     // or similar. Either the err tag string or the "cancelled" prefix is
-    // acceptable — both prove the budget fired.
+    // acceptable; both prove the budget fired.
     try std.testing.expect(
         std.mem.indexOf(u8, got, "cancelled") != null or
             std.mem.indexOf(u8, got, "budget_exceeded") != null,

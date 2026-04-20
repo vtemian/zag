@@ -16,7 +16,7 @@ const Aborter = job_mod.Aborter;
 const log = std.log.scoped(.lua_cmd);
 
 /// 50ms cadence between cancel checks while the child is running. Matches
-/// the agent-side bash tool for consistency — latency the plugin author
+/// the agent-side bash tool for consistency. Latency the plugin author
 /// can rely on as "cancel propagates within one tick".
 const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
 
@@ -163,7 +163,7 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
 
         // Poll for 50ms at a time, re-check deadline each iteration. If the
         // deadline is less than 50ms away, the next iteration's
-        // `now_ms >= deadline_ms` branch handles it — shrinking the poll
+        // `now_ms >= deadline_ms` branch handles it. Shrinking the poll
         // timeout to the exact remainder buys nothing and, when
         // `timeout_ms == 0` makes deadline_ms == maxInt(i64), the
         // `(deadline_ms - now_ms) * ns_per_ms` multiplication overflows.
@@ -206,7 +206,7 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
     }
 
     // The child is either naturally done (!more) or we killed it for
-    // truncation. Reap if still running — wait on natural-exit path.
+    // truncation. Reap if still running; wait on natural-exit path.
     const term = if (truncated) blk: {
         // We already waited after kill in the truncate branch above.
         break :blk std.process.Child.Term{ .Signal = @intCast(std.posix.SIG.KILL) };
@@ -366,7 +366,7 @@ test "executeExec cancels in-flight child via aborter" {
     // Give the worker enough time to actually spawn /bin/sleep
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
-    // Cancel — should invoke Job.aborter which SIGKILLs the child
+    // Cancel. Should invoke Job.aborter which SIGKILLs the child
     try root.cancel("test");
 
     thread.join();
