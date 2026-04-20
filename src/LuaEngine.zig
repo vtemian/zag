@@ -11,6 +11,7 @@ const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const input = @import("input.zig");
+const llm = @import("llm.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -69,20 +70,30 @@ pub const LuaEngine = struct {
     /// Optional reason string allocated via `self.allocator`. Owned by
     /// the caller of `takeCancel()` once handed off.
     pending_cancel_reason: ?[]const u8 = null,
-    /// Optional pointer to the shared keymap registry. The orchestrator
-    /// sets this after `init()` and before `loadUserConfig()` so
-    /// `zag.keymap()` calls from `config.lua` land in the same registry
-    /// that dispatches keys.
-    keymap_registry: ?*Keymap.Registry = null,
-    /// Optional pointer to the input parser. Wired from main.zig after
-    /// orchestrator construction so `zag.set_escape_timeout_ms()` can
-    /// tune the bare-Escape deadline at config-load time. Null when the
-    /// engine is exercised standalone in tests.
-    input_parser: ?*input.Parser = null,
+    /// Keymap registry owned by the engine. Populated with built-in
+    /// defaults during `init()`; `zag.keymap()` calls from `config.lua`
+    /// overwrite entries here, and the window manager reads from it via
+    /// `keymapRegistry()` when dispatching keys.
+    keymap_registry: Keymap.Registry,
+    /// Persistent escape-sequence parser owned by the engine. Defaults
+    /// match `input.Parser{}`, so `zag.set_escape_timeout_ms()` from
+    /// `config.lua` lands here during `loadUserConfig`; the orchestrator
+    /// reads this through `window_manager.inputParser()` when polling
+    /// stdin. Outlives a single tick so fragmented CSI/SS3 sequences
+    /// assemble across reads.
+    input_parser: input.Parser = .{},
+    /// Provider names the user declared via `zag.provider{ name = "..." }`.
+    /// Owned (each entry duped into `allocator`). Populated during `loadUserConfig`,
+    /// read once by `llm.createProviderFromLuaConfig` at startup.
+    enabled_providers: std.ArrayList([]const u8),
+    /// Default model string set via `zag.set_default_model("prov/id")`.
+    /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
+    default_model: ?[]const u8 = null,
 
-    /// Create a new LuaEngine. Sets up the VM and installs the `zag.*`
-    /// globals but does NOT load user config. Callers must wire any
-    /// pointers (e.g. `keymap_registry`) and then call `loadUserConfig`.
+    /// Create a new LuaEngine. Sets up the VM, installs the `zag.*`
+    /// globals, and populates the keymap registry with built-in defaults.
+    /// Does NOT load user config; callers invoke `loadUserConfig` for that
+    /// so `zag.keymap()` overrides land on top of the defaults.
     ///
     /// Callers who drive the VM directly via `self.lua.doString(...)` and
     /// invoke `zag.*` functions MUST call `self.storeSelfPointer()` first,
@@ -103,12 +114,32 @@ pub const LuaEngine = struct {
 
         injectZagGlobal(lua);
 
+        var keymap_registry = Keymap.Registry.init(allocator);
+        errdefer keymap_registry.deinit();
+        try keymap_registry.loadDefaults();
+
         return LuaEngine{
             .lua = lua,
             .allocator = allocator,
             .tools = .empty,
             .hook_registry = Hooks.Registry.init(allocator),
+            .enabled_providers = .empty,
+            .keymap_registry = keymap_registry,
         };
+    }
+
+    /// Borrow the engine's keymap registry. The window manager reads
+    /// this on every keypress; `zag.keymap()` writes through the same
+    /// pointer during `loadUserConfig`.
+    pub fn keymapRegistry(self: *LuaEngine) *Keymap.Registry {
+        return &self.keymap_registry;
+    }
+
+    /// Borrow the engine's input parser. The orchestrator polls this on
+    /// every tick; `zag.set_escape_timeout_ms()` writes through the same
+    /// pointer during `loadUserConfig`.
+    pub fn inputParser(self: *LuaEngine) *input.Parser {
+        return &self.input_parser;
     }
 
     /// Resolve ~/.config/zag paths, set plugin search path, load config.lua.
@@ -150,7 +181,11 @@ pub const LuaEngine = struct {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
         self.hook_registry.deinit();
+        for (self.enabled_providers.items) |name| self.allocator.free(name);
+        self.enabled_providers.deinit(self.allocator);
+        if (self.default_model) |m| self.allocator.free(m);
         if (self.pending_cancel_reason) |r| self.allocator.free(r);
+        self.keymap_registry.deinit();
         self.lua.deinit();
     }
 
@@ -168,6 +203,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "keymap");
         lua.pushFunction(zlua.wrap(zagSetEscapeTimeoutMsFn));
         lua.setField(-2, "set_escape_timeout_ms");
+        lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
+        lua.setField(-2, "set_default_model");
+        lua.pushFunction(zlua.wrap(zagProviderFn));
+        lua.setField(-2, "provider");
         lua.setGlobal("zag");
     }
 
@@ -373,9 +412,8 @@ pub const LuaEngine = struct {
     }
 
     /// Zig function backing `zag.keymap(mode, key, action)`.
-    /// Writes a binding into `engine.keymap_registry` if the engine has
-    /// one attached; otherwise logs a warning and no-ops so that test
-    /// harnesses without a registry don't crash.
+    /// Writes a binding into `engine.keymap_registry`. The registry is
+    /// owned by the engine and always present, so no null check is needed.
     fn zagKeymapFn(lua: *Lua) !i32 {
         return zagKeymapFnInner(lua) catch |err| {
             log.err("zag.keymap() failed: {}", .{err});
@@ -425,19 +463,15 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        const registry = engine.keymap_registry orelse {
-            log.warn("zag.keymap(): no registry bound; binding ignored", .{});
-            return 0;
-        };
-        try registry.register(mode, spec, action);
+        try engine.keymap_registry.register(mode, spec, action);
         return 0;
     }
 
     /// Zig function backing `zag.set_escape_timeout_ms(ms)`.
-    /// Writes the bare-Escape deadline through `engine.input_parser` if
-    /// it is attached; no-ops otherwise so the test harness without a
-    /// parser doesn't crash. Negative timeouts are rejected as a Lua
-    /// runtime error.
+    /// Writes the bare-Escape deadline through `engine.input_parser`,
+    /// which the orchestrator reads on every tick via
+    /// `window_manager.inputParser()`. Negative timeouts are rejected
+    /// as a Lua runtime error.
     fn zagSetEscapeTimeoutMsFn(lua: *Lua) !i32 {
         const ms = lua.checkInteger(1);
         if (ms < 0) {
@@ -453,11 +487,90 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        const parser = engine.input_parser orelse {
-            log.warn("zag.set_escape_timeout_ms(): no parser bound; value ignored", .{});
-            return 0;
+        engine.input_parser.escape_timeout_ms = ms;
+        return 0;
+    }
+
+    /// Zig function backing `zag.set_default_model("prov/id")`.
+    /// Stores the duped string into `engine.default_model`, freeing any
+    /// prior value. Non-string arguments warn-log and return `error.LuaError`
+    /// (which `zlua.wrap` surfaces as a Lua runtime error to the caller).
+    /// We reject numbers explicitly because Lua 5.4 silently coerces them
+    /// through `toString`.
+    fn zagSetDefaultModelFn(lua: *Lua) !i32 {
+        if (lua.typeOf(1) != .string) {
+            log.warn("zag.set_default_model(): arg 1 must be a string", .{});
+            return error.LuaError;
+        }
+        const model = lua.toString(1) catch {
+            log.warn("zag.set_default_model(): arg 1 must be a string", .{});
+            return error.LuaError;
         };
-        parser.escape_timeout_ms = ms;
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.set_default_model(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        const owned = try engine.allocator.dupe(u8, model);
+        if (engine.default_model) |old| engine.allocator.free(old);
+        engine.default_model = owned;
+        return 0;
+    }
+
+    /// Zig function backing `zag.provider{ name = "..." }`.
+    /// Validates `name` against `llm.builtin_endpoints` and appends the duped
+    /// string to `engine.enabled_providers`. Unknown names, missing `name`
+    /// field, non-string `name`, and empty `name` all return `error.LuaError`
+    /// which `zlua.wrap` surfaces as a Lua runtime error.
+    fn zagProviderFn(lua: *Lua) !i32 {
+        if (!lua.isTable(1)) {
+            log.warn("zag.provider() expects a table argument", .{});
+            return error.LuaError;
+        }
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.provider(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        _ = lua.getField(1, "name");
+        // Reject missing `name` (nil) and non-string values explicitly; Lua 5.4
+        // would otherwise coerce numbers through `toString`.
+        if (lua.typeOf(-1) != .string) {
+            lua.pop(1);
+            log.warn("zag.provider(): 'name' field must be a string", .{});
+            return error.LuaError;
+        }
+        const name = lua.toString(-1) catch {
+            lua.pop(1);
+            log.warn("zag.provider(): 'name' field must be a string", .{});
+            return error.LuaError;
+        };
+
+        if (name.len == 0) {
+            lua.pop(1);
+            log.warn("zag.provider(): 'name' must not be empty", .{});
+            return error.LuaError;
+        }
+
+        if (!llm.isBuiltinEndpointName(name)) {
+            log.warn("zag.provider(): unknown provider '{s}'", .{name});
+            lua.pop(1);
+            return error.LuaError;
+        }
+
+        const owned = try engine.allocator.dupe(u8, name);
+        errdefer engine.allocator.free(owned);
+        lua.pop(1);
+
+        try engine.enabled_providers.append(engine.allocator, owned);
         return 0;
     }
 
@@ -1099,6 +1212,13 @@ test "LuaEngine init and deinit" {
     try std.testing.expectEqual(@as(i64, 2), val);
 }
 
+test "LuaEngine.init initializes provider config state" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    try std.testing.expectEqual(@as(usize, 0), engine.enabled_providers.items.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
+}
+
 test "zag.tool() collects tool definitions" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
@@ -1537,14 +1657,10 @@ test "UserMessagePre can rewrite text" {
     try std.testing.expectEqualStrings("expanded: hi", payload.user_message_pre.text_rewrite.?);
 }
 
-test "zag.keymap registers into the shared registry" {
+test "zag.keymap registers into the engine-owned registry" {
     const alloc = std.testing.allocator;
-    var registry = Keymap.Registry.init(alloc);
-    defer registry.deinit();
-
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
-    engine.keymap_registry = &registry;
     engine.storeSelfPointer();
 
     try engine.lua.doString(
@@ -1552,6 +1668,7 @@ test "zag.keymap registers into the shared registry" {
         \\zag.keymap("normal", "<C-q>", "close_window")
     );
 
+    const registry = engine.keymapRegistry();
     try std.testing.expectEqual(
         Keymap.Action.focus_right,
         registry.lookup(.normal, .{ .key = .{ .char = 'w' }, .modifiers = .{} }).?,
@@ -1565,27 +1682,121 @@ test "zag.keymap registers into the shared registry" {
     );
 }
 
-test "zag.set_escape_timeout_ms updates Parser.escape_timeout_ms" {
+test "LuaEngine init populates keymap defaults" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
 
-    var parser: input.Parser = .{};
-    engine.input_parser = &parser;
+    const registry = engine.keymapRegistry();
+    try std.testing.expectEqual(
+        Keymap.Action.focus_left,
+        registry.lookup(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }).?,
+    );
+    try std.testing.expectEqual(
+        Keymap.Action.enter_insert_mode,
+        registry.lookup(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }).?,
+    );
+}
+
+test "zag.set_escape_timeout_ms updates Parser.escape_timeout_ms" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString("zag.set_escape_timeout_ms(120)");
 
-    try std.testing.expectEqual(@as(i64, 120), parser.escape_timeout_ms);
+    try std.testing.expectEqual(@as(i64, 120), engine.input_parser.escape_timeout_ms);
+}
+
+test "zag.set_escape_timeout_ms applied at loadUserConfig time lands on engine parser" {
+    // Regression guard for Task 8: without engine-owned input_parser, the
+    // timeout silently no-opped because the parser was only wired after
+    // loadUserConfig had already run. This test drives the binding through
+    // the same path loadUserConfig uses (storeSelfPointer + doString) and
+    // asserts the value lands on engine.input_parser.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.set_escape_timeout_ms(50)");
+
+    try std.testing.expectEqual(@as(i64, 50), engine.input_parser.escape_timeout_ms);
 }
 
 test "zag.set_escape_timeout_ms rejects negative" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
-
-    var parser: input.Parser = .{};
-    engine.input_parser = &parser;
     engine.storeSelfPointer();
 
     const result = engine.lua.doString("zag.set_escape_timeout_ms(-10)");
     try std.testing.expectError(error.LuaRuntime, result);
+}
+
+test "zag.set_default_model stores the owned string" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.set_default_model(\"openai/gpt-4o\")");
+
+    try std.testing.expect(engine.default_model != null);
+    try std.testing.expectEqualStrings("openai/gpt-4o", engine.default_model.?);
+}
+
+test "zag.set_default_model replaces prior value without leaking" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.set_default_model("first/model")
+        \\zag.set_default_model("second/model")
+    );
+    try std.testing.expectEqualStrings("second/model", engine.default_model.?);
+}
+
+test "zag.set_default_model rejects non-string argument" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // `zlua.wrap` surfaces returned Zig errors as Lua runtime errors,
+    // which `doString` reports as `error.LuaRuntime` (same mapping as
+    // `zag.set_escape_timeout_ms rejects negative`).
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.set_default_model(42)"),
+    );
+}
+
+test "zag.provider registers an enabled provider by name" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider { name = "openai" }
+        \\zag.provider { name = "anthropic" }
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), engine.enabled_providers.items.len);
+    try std.testing.expectEqualStrings("openai", engine.enabled_providers.items[0]);
+    try std.testing.expectEqualStrings("anthropic", engine.enabled_providers.items[1]);
+}
+
+test "zag.provider rejects unknown provider names" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.provider { name = \"bogus\" }"),
+    );
+}
+
+test "zag.provider requires a name field" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.provider { }"),
+    );
 }

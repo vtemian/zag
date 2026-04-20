@@ -1,8 +1,8 @@
 //! Append-only per-instance file logger. Replaces the TUI log handler so
 //! log output never touches the conversation buffers.
 //!
-//! Path resolution: `$ZAG_LOG_FILE` if set, else `$HOME/.zag/logs/<uuid>.log`.
-//! No rotation; one file per process invocation.
+//! Path: `$HOME/.zag/logs/<uuid>.log`. No rotation; one file per process
+//! invocation. Disabled with `error.NoLogPath` when `$HOME` is unset.
 
 const std = @import("std");
 const posix = std.posix;
@@ -34,11 +34,10 @@ pub fn initWithPath(path: []const u8) !void {
     log_file = std.fs.File{ .handle = fd };
 }
 
-/// Resolve the log path and open it. Disables logging if no path is
-/// resolvable (no `$HOME`, no `$ZAG_LOG_FILE`). Returns `error.NoLogPath`
-/// in that case so callers can decide whether to proceed.
+/// Resolve the log path and open it. Returns `error.NoLogPath` when
+/// `$HOME` is unset so callers can decide whether to proceed.
 pub fn init(alloc: Allocator) !void {
-    const path = try resolvePath(alloc) orelse return error.NoLogPath;
+    const path = try resolvePath(alloc);
     defer alloc.free(path);
     try initWithPath(path);
 }
@@ -96,17 +95,10 @@ fn formatPrefix(buf: []u8, scope: []const u8, level: []const u8) ![]const u8 {
 }
 
 /// Resolve the log file path. Caller owns the returned slice.
-/// Returns null if neither `$ZAG_LOG_FILE` nor `$HOME` is set.
-pub fn resolvePath(alloc: Allocator) !?[]const u8 {
-    if (std.process.getEnvVarOwned(alloc, "ZAG_LOG_FILE")) |p| {
-        return p;
-    } else |err| switch (err) {
-        error.EnvironmentVariableNotFound => {},
-        else => return err,
-    }
-
+/// Returns `error.NoLogPath` if `$HOME` is unset.
+pub fn resolvePath(alloc: Allocator) ![]const u8 {
     const home = std.process.getEnvVarOwned(alloc, "HOME") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return null,
+        error.EnvironmentVariableNotFound => return error.NoLogPath,
         else => return err,
     };
     defer alloc.free(home);
@@ -170,8 +162,12 @@ test "handler is a silent no-op when uninitialized" {
     handler(.info, .default, "should not crash: {d}", .{42});
 }
 
-test "resolvePath prefers ZAG_LOG_FILE when set" {
-    // Skip: std.process has no portable set-env in tests. Exercise the
-    // function in a follow-up integration test if needed.
-    return error.SkipZigTest;
+test "resolvePath returns $HOME/.zag/logs/<uuid>.log" {
+    const path = resolvePath(std.testing.allocator) catch |err| switch (err) {
+        error.NoLogPath => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.indexOf(u8, path, "/.zag/logs/") != null);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".log"));
 }

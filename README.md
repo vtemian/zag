@@ -28,20 +28,41 @@ What actually runs today:
 
 ```bash
 zig build                          # build (Zig 0.15+)
-zig build run                      # run (default: anthropic/claude-sonnet-4-20250514)
+zig build run                      # run (model via config.lua, fallback: anthropic/claude-sonnet-4-20250514)
 zig build test                     # run tests
 zig build -Dmetrics=true           # compile in performance tracing
 zig fmt --check .                  # formatting check
-
-ZAG_MODEL="openai/gpt-4o" zig build run
-ZAG_MODEL="openrouter/anthropic/claude-sonnet-4" zig build run
-ZAG_MODEL="ollama/llama3" zig build run
 
 zig build run -- --session=<id>    # resume a specific session
 zig build run -- --last            # resume the most recent one
 ```
 
-Set the matching provider key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`). Ollama is keyless.
+## Configuration
+
+Zag reads two files on startup, both under `~/.config/zag/`:
+
+- `config.lua` (optional). Sets the default model and declares provider names. The provider declarations are validated today but not yet load-bearing; the active provider is whatever prefix you put on `zag.set_default_model()`.
+- `auth.json` (required for any non-Ollama provider). Holds API keys. Create by hand and chmod `0600`.
+
+A fresh install with no `config.lua` runs against the fallback model `anthropic/claude-sonnet-4-20250514`; it still needs an `anthropic` entry in `auth.json`.
+
+Example `config.lua`:
+
+```lua
+zag.set_default_model("openai/gpt-4o")
+zag.provider { name = "openai" }
+```
+
+Example `auth.json`:
+
+```json
+{
+  "anthropic":  { "type": "api_key", "key": "sk-ant-..." },
+  "openai":     { "type": "api_key", "key": "sk-..." },
+  "openrouter": { "type": "api_key", "key": "sk-or-..." },
+  "groq":       { "type": "api_key", "key": "gsk_..." }
+}
+```
 
 ## Window system
 
