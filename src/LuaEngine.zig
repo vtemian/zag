@@ -290,6 +290,27 @@ pub const LuaEngine = struct {
         lua.setField(-2, "stream"); // zag.http.stream = fn; [zag_table, http_table]
         lua.setField(-2, "http"); // zag.http = http_table; [zag_table]
 
+        // zag.fs — plain namespace table for filesystem primitives.
+        // All async entries yield the coroutine; `exists` is sync.
+        lua.newTable(); // [zag_table, fs_table]
+        lua.pushFunction(zlua.wrap(zagFsReadFn));
+        lua.setField(-2, "read");
+        lua.pushFunction(zlua.wrap(zagFsWriteFn));
+        lua.setField(-2, "write");
+        lua.pushFunction(zlua.wrap(zagFsAppendFn));
+        lua.setField(-2, "append");
+        lua.pushFunction(zlua.wrap(zagFsMkdirFn));
+        lua.setField(-2, "mkdir");
+        lua.pushFunction(zlua.wrap(zagFsRemoveFn));
+        lua.setField(-2, "remove");
+        lua.pushFunction(zlua.wrap(zagFsListFn));
+        lua.setField(-2, "list");
+        lua.pushFunction(zlua.wrap(zagFsStatFn));
+        lua.setField(-2, "stat");
+        lua.pushFunction(zlua.wrap(zagFsExistsFn));
+        lua.setField(-2, "exists");
+        lua.setField(-2, "fs"); // zag.fs = fs_table; [zag_table]
+
         lua.setGlobal("zag");
     }
 
@@ -1754,6 +1775,214 @@ pub const LuaEngine = struct {
         return 0;
     }
 
+    /// Shared prelude for every async `zag.fs.*` binding. Validates we're
+    /// inside a yieldable coroutine, stages the path string in a per-task
+    /// arena, and returns the arena + dup'd path so the caller can build
+    /// its Job spec on top. Any failure raises a Lua error — the returned
+    /// arena is only valid on success.
+    ///
+    /// The arena is attached to the Task in `submitFsJob`. Until then the
+    /// caller owns it and must tear it down on every error path the way
+    /// `zagCmdCallFn` / `zagHttpGetFn` do.
+    fn fsStagePath(co: *Lua, op_name: []const u8) struct {
+        engine: *LuaEngine,
+        arena_ptr: *std.heap.ArenaAllocator,
+        path: []const u8,
+    } {
+        const engine = getEngineFromState(co);
+        if (!co.isYieldable()) {
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "{s} must be called inside zag.async/hook/keymap", .{op_name}) catch "zag.fs must be called inside a coroutine";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        }
+        const path_raw = co.checkString(1);
+
+        const arena_ptr = engine.allocator.create(std.heap.ArenaAllocator) catch {
+            var buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "{s} arena alloc failed", .{op_name}) catch "zag.fs arena alloc failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+        arena_ptr.* = std.heap.ArenaAllocator.init(engine.allocator);
+        const path = arena_ptr.allocator().dupe(u8, path_raw) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            var buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "{s} path dupe failed", .{op_name}) catch "zag.fs path dupe failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return .{ .engine = engine, .arena_ptr = arena_ptr, .path = path };
+    }
+
+    /// Shared submit/yield tail for every async `zag.fs.*` binding. Takes
+    /// an already-populated `JobKind` + the arena that owns its borrowed
+    /// slices. On synchronous failure (no task, already-cancelled scope,
+    /// submit error) tears the arena down and returns the appropriate
+    /// (nil, err) tuple to Lua by returning 2; on success it attaches the
+    /// job to the task, submits, and yields (never returns).
+    fn submitFsJob(
+        co: *Lua,
+        engine: *LuaEngine,
+        arena_ptr: *std.heap.ArenaAllocator,
+        kind: async_job.JobKind,
+        op_name: []const u8,
+    ) i32 {
+        const task = engine.taskForCoroutine(co) orelse {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "{s}: no task for this coroutine", .{op_name}) catch "zag.fs: no task for this coroutine";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+
+        const job = engine.allocator.create(async_job.Job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            var buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "{s} job alloc failed", .{op_name}) catch "zag.fs job alloc failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+        job.* = .{
+            .kind = kind,
+            .thread_ref = task.thread_ref,
+            .scope = task.scope,
+        };
+        task.pending_job = job;
+        task.primitive_arena = arena_ptr;
+
+        if (task.scope.isCancelled()) {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.primitive_arena = null;
+            co.pushNil();
+            _ = co.pushString("cancelled");
+            return 2;
+        }
+
+        engine.io_pool.?.submit(job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.primitive_arena = null;
+            co.pushNil();
+            _ = co.pushString("io_error: submit failed");
+            return 2;
+        };
+
+        co.yield(0);
+        // yield is noreturn on Lua 5.4.
+    }
+
+    /// `zag.fs.read(path)` — read a whole file. Yields until the worker
+    /// finishes, then resumes with `(bytes, nil)` or `(nil, err)`.
+    fn zagFsReadFn(co: *Lua) i32 {
+        const staged = fsStagePath(co, "zag.fs.read");
+        return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_read = .{
+            .path = staged.path,
+        } }, "zag.fs.read");
+    }
+
+    /// Shared body for `zag.fs.write` and `zag.fs.append` — identical
+    /// except for the `mode` field on the job spec.
+    fn zagFsWriteImpl(co: *Lua, comptime mode: enum { overwrite, append }) i32 {
+        const op_name = switch (mode) {
+            .overwrite => "zag.fs.write",
+            .append => "zag.fs.append",
+        };
+        const staged = fsStagePath(co, op_name);
+        const content_raw = co.checkString(2);
+        const content = staged.arena_ptr.allocator().dupe(u8, content_raw) catch {
+            staged.arena_ptr.deinit();
+            staged.engine.allocator.destroy(staged.arena_ptr);
+            co.raiseErrorStr("zag.fs write content dupe failed", .{});
+        };
+        return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_write = .{
+            .path = staged.path,
+            .content = content,
+            .mode = switch (mode) {
+                .overwrite => .overwrite,
+                .append => .append,
+            },
+        } }, op_name);
+    }
+
+    /// `zag.fs.write(path, content)` — overwrite-or-create.
+    fn zagFsWriteFn(co: *Lua) i32 {
+        return zagFsWriteImpl(co, .overwrite);
+    }
+
+    /// `zag.fs.append(path, content)` — open-or-create, seek to end, write.
+    fn zagFsAppendFn(co: *Lua) i32 {
+        return zagFsWriteImpl(co, .append);
+    }
+
+    /// `zag.fs.mkdir(path, { parents = false })` — `parents=true` walks
+    /// the chain (mkdir -p), false requires the parent to exist.
+    fn zagFsMkdirFn(co: *Lua) i32 {
+        const staged = fsStagePath(co, "zag.fs.mkdir");
+        var parents = false;
+        if (co.isTable(2)) {
+            _ = co.getField(2, "parents");
+            if (!co.isNil(-1)) parents = co.toBoolean(-1);
+            co.pop(1);
+        }
+        return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_mkdir = .{
+            .path = staged.path,
+            .parents = parents,
+        } }, "zag.fs.mkdir");
+    }
+
+    /// `zag.fs.remove(path, { recursive = false })` — delete a file, an
+    /// empty directory, or (with recursive=true) an entire tree.
+    fn zagFsRemoveFn(co: *Lua) i32 {
+        const staged = fsStagePath(co, "zag.fs.remove");
+        var recursive = false;
+        if (co.isTable(2)) {
+            _ = co.getField(2, "recursive");
+            if (!co.isNil(-1)) recursive = co.toBoolean(-1);
+            co.pop(1);
+        }
+        return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_remove = .{
+            .path = staged.path,
+            .recursive = recursive,
+        } }, "zag.fs.remove");
+    }
+
+    /// `zag.fs.list(dir)` — list a directory's immediate children as an
+    /// array of `{name=string, kind=string}` (kind is file/dir/symlink/
+    /// other).
+    fn zagFsListFn(co: *Lua) i32 {
+        const staged = fsStagePath(co, "zag.fs.list");
+        return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_list = .{
+            .path = staged.path,
+        } }, "zag.fs.list");
+    }
+
+    /// `zag.fs.stat(path)` — returns `{kind, size, mtime_ms, mode}` on
+    /// success.
+    fn zagFsStatFn(co: *Lua) i32 {
+        const staged = fsStagePath(co, "zag.fs.stat");
+        return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_stat = .{
+            .path = staged.path,
+        } }, "zag.fs.stat");
+    }
+
+    /// `zag.fs.exists(path)` — SYNC; returns a bool and never yields or
+    /// errors. A filesystem `access` syscall on a missing file is
+    /// cheaper than round-tripping through the worker pool, and a bool
+    /// return keeps callsites ergonomic (`if zag.fs.exists(p) then`).
+    fn zagFsExistsFn(co: *Lua) i32 {
+        const path = co.checkString(1);
+        std.fs.cwd().access(path, .{}) catch {
+            co.pushBoolean(false);
+            return 1;
+        };
+        co.pushBoolean(true);
+        return 1;
+    }
+
     /// Call once during LuaEngine.init after openLibs to register the
     /// TaskHandle metatable so userdata created from zag.spawn can find
     /// methods via __index.
@@ -2959,6 +3188,93 @@ pub const LuaEngine = struct {
                 }
                 if (r.headers.len > 0) self.allocator.free(r.headers);
 
+                co.pushNil();
+                return 2;
+            },
+            .fs_read => {
+                // Success: push bytes, free the engine-owned slice.
+                const r = blk: {
+                    if (job.result) |res| switch (res) {
+                        .fs_read => |rr| break :blk rr,
+                        else => {},
+                    };
+                    co.pushNil();
+                    _ = co.pushString("io_error: fs_read missing result");
+                    return 2;
+                };
+                _ = co.pushString(r.bytes);
+                self.allocator.free(r.bytes);
+                co.pushNil();
+                return 2;
+            },
+            .fs_write, .fs_mkdir, .fs_remove => {
+                // Success path: (true, nil). `empty` result carries no
+                // payload; a null result with no err_tag is a worker
+                // bug and surfaces as io_error so the coroutine can see
+                // it rather than faulting.
+                if (job.result) |res| switch (res) {
+                    .empty => {
+                        co.pushBoolean(true);
+                        co.pushNil();
+                        return 2;
+                    },
+                    else => {},
+                };
+                co.pushNil();
+                _ = co.pushString("io_error: fs op missing result");
+                return 2;
+            },
+            .fs_list => {
+                const r = blk: {
+                    if (job.result) |res| switch (res) {
+                        .fs_list => |lr| break :blk lr,
+                        else => {},
+                    };
+                    co.pushNil();
+                    _ = co.pushString("io_error: fs_list missing result");
+                    return 2;
+                };
+
+                // Array-style Lua table: numeric keys 1..N, each value
+                // `{name=string, kind=string}`. Kind is a stable string
+                // tag (file/dir/symlink/other) rather than the
+                // std.fs.File.Kind identifier so Lua callers aren't
+                // coupled to the Zig enum layout.
+                co.newTable();
+                for (r.entries, 0..) |entry, i| {
+                    co.newTable();
+                    _ = co.pushString(entry.name);
+                    co.setField(-2, "name");
+                    _ = co.pushString(entry.kind.toString());
+                    co.setField(-2, "kind");
+                    co.rawSetIndex(-2, @intCast(i + 1));
+                }
+
+                for (r.entries) |entry| self.allocator.free(entry.name);
+                if (r.entries.len > 0) self.allocator.free(r.entries);
+
+                co.pushNil();
+                return 2;
+            },
+            .fs_stat => {
+                const r = blk: {
+                    if (job.result) |res| switch (res) {
+                        .fs_stat => |sr| break :blk sr,
+                        else => {},
+                    };
+                    co.pushNil();
+                    _ = co.pushString("io_error: fs_stat missing result");
+                    return 2;
+                };
+                co.newTable();
+                _ = co.pushString(r.kind.toString());
+                co.setField(-2, "kind");
+                co.pushInteger(@intCast(r.size));
+                co.setField(-2, "size");
+                co.pushInteger(r.mtime_ms);
+                co.setField(-2, "mtime_ms");
+                co.pushInteger(@intCast(r.mode));
+                co.setField(-2, "mode");
                 co.pushNil();
                 return 2;
             },
@@ -5174,4 +5490,405 @@ test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
     eng.lua.pop(1);
 
     try eng.lua.doString("collectgarbage('collect')");
+}
+
+// ----- zag.fs.* integration tests -----
+
+/// Shared helper: drive the engine's drain loop until no tasks remain
+/// or the deadline expires. Every async fs test ends with this exact
+/// pattern, so pull it out to keep the test bodies focused on their
+/// assertions.
+fn driveDrainLoop(eng: *LuaEngine, timeout_ms: i64) !void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+}
+
+test "zag.fs.read returns file bytes" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "r.txt", .data = "hello-from-disk" });
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/r.txt", .{base});
+
+    _ = eng.lua.pushString(path);
+    eng.lua.setGlobal("_read_path");
+
+    try eng.lua.doString(
+        \\function test_read()
+        \\  local data, err = zag.fs.read(_read_path)
+        \\  _read_err_nil = (err == nil)
+        \\  _read_data = data
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_read");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_read_err_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_read_data");
+    try std.testing.expectEqualStrings("hello-from-disk", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.fs.read returns not_found for missing file" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_missing()
+        \\  local data, err = zag.fs.read("/nonexistent/path/to/nowhere/xyzzy")
+        \\  _missing_data_nil = (data == nil)
+        \\  _missing_err = err
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_missing");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_missing_data_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_missing_err");
+    const err = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, err, "not_found"));
+    eng.lua.pop(1);
+}
+
+test "zag.fs.write + read roundtrip" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/w.txt", .{base});
+
+    _ = eng.lua.pushString(path);
+    eng.lua.setGlobal("_w_path");
+
+    try eng.lua.doString(
+        \\function test_write_read()
+        \\  local ok, werr = zag.fs.write(_w_path, "payload-42")
+        \\  _w_ok = ok
+        \\  _w_err_nil = (werr == nil)
+        \\  local data, rerr = zag.fs.read(_w_path)
+        \\  _wr_data = data
+        \\  _wr_err_nil = (rerr == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_write_read");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_w_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_w_err_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_wr_data");
+    try std.testing.expectEqualStrings("payload-42", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.fs.append extends an existing file" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "first" });
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/a.txt", .{base});
+
+    _ = eng.lua.pushString(path);
+    eng.lua.setGlobal("_a_path");
+
+    try eng.lua.doString(
+        \\function test_append()
+        \\  local ok, err = zag.fs.append(_a_path, "-second")
+        \\  _a_ok, _a_err = ok, err
+        \\  local data = zag.fs.read(_a_path)
+        \\  _a_data = data
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_append");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_a_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_a_data");
+    try std.testing.expectEqualStrings("first-second", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.fs.mkdir creates directories, parents=true handles nesting" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var flat_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const flat_path = try std.fmt.bufPrint(&flat_buf, "{s}/flat", .{base});
+    var deep_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const deep_path = try std.fmt.bufPrint(&deep_buf, "{s}/nested/inner/leaf", .{base});
+
+    _ = eng.lua.pushString(flat_path);
+    eng.lua.setGlobal("_mk_flat");
+    _ = eng.lua.pushString(deep_path);
+    eng.lua.setGlobal("_mk_deep");
+
+    try eng.lua.doString(
+        \\function test_mkdir()
+        \\  local ok1, err1 = zag.fs.mkdir(_mk_flat)
+        \\  _mk_flat_ok, _mk_flat_err = ok1, err1
+        \\  local ok2, err2 = zag.fs.mkdir(_mk_deep, { parents = true })
+        \\  _mk_deep_ok, _mk_deep_err = ok2, err2
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_mkdir");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_mk_flat_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_mk_deep_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    // Verify both directories actually exist on disk.
+    try tmp.dir.access("flat", .{});
+    try tmp.dir.access("nested/inner/leaf", .{});
+}
+
+test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "trash.txt", .data = "x" });
+    try tmp.dir.makePath("tree/inner");
+    try tmp.dir.writeFile(.{ .sub_path = "tree/inner/child.txt", .data = "y" });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var f_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try std.fmt.bufPrint(&f_buf, "{s}/trash.txt", .{base});
+    var t_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tree_path = try std.fmt.bufPrint(&t_buf, "{s}/tree", .{base});
+
+    _ = eng.lua.pushString(file_path);
+    eng.lua.setGlobal("_rm_file");
+    _ = eng.lua.pushString(tree_path);
+    eng.lua.setGlobal("_rm_tree");
+
+    try eng.lua.doString(
+        \\function test_remove()
+        \\  local ok1, err1 = zag.fs.remove(_rm_file)
+        \\  _rm_file_ok, _rm_file_err = ok1, err1
+        \\  local ok2, err2 = zag.fs.remove(_rm_tree, { recursive = true })
+        \\  _rm_tree_ok, _rm_tree_err = ok2, err2
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_remove");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_rm_file_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_rm_tree_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    // Nothing should remain at those paths.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("trash.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("tree", .{}));
+}
+
+test "zag.fs.list returns directory entries" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "one.txt", .data = "1" });
+    try tmp.dir.writeFile(.{ .sub_path = "two.txt", .data = "2" });
+    try tmp.dir.makeDir("sub");
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    _ = eng.lua.pushString(base);
+    eng.lua.setGlobal("_ls_path");
+
+    try eng.lua.doString(
+        \\function test_list()
+        \\  local entries, err = zag.fs.list(_ls_path)
+        \\  _ls_err_nil = (err == nil)
+        \\  if entries then
+        \\    _ls_count = #entries
+        \\    -- Collect into two parallel sets keyed by name → kind.
+        \\    _ls_kinds = {}
+        \\    for i = 1, #entries do
+        \\      _ls_kinds[entries[i].name] = entries[i].kind
+        \\    end
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_list");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_ls_err_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ls_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+
+    // _ls_kinds["one.txt"] == "file"
+    _ = try eng.lua.getGlobal("_ls_kinds");
+    _ = eng.lua.getField(-1, "one.txt");
+    try std.testing.expectEqualStrings("file", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = eng.lua.getField(-1, "sub");
+    try std.testing.expectEqualStrings("dir", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    eng.lua.pop(1); // _ls_kinds
+}
+
+test "zag.fs.stat returns kind, size, mtime_ms, mode" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.dat", .data = "0123456789ab" });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/s.dat", .{base});
+
+    _ = eng.lua.pushString(path);
+    eng.lua.setGlobal("_st_path");
+
+    try eng.lua.doString(
+        \\function test_stat()
+        \\  local s, err = zag.fs.stat(_st_path)
+        \\  _st_err_nil = (err == nil)
+        \\  if s then
+        \\    _st_kind = s.kind
+        \\    _st_size = s.size
+        \\    _st_mtime = s.mtime_ms
+        \\    _st_mode = s.mode
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_stat");
+    _ = try eng.spawnCoroutine(0, null);
+    try driveDrainLoop(&eng, 2000);
+
+    _ = try eng.lua.getGlobal("_st_err_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_st_kind");
+    try std.testing.expectEqualStrings("file", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_st_size");
+    try std.testing.expectEqual(@as(i64, 12), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    // mtime_ms is whatever the fs recorded; just ensure it's positive.
+    _ = try eng.lua.getGlobal("_st_mtime");
+    try std.testing.expect((try eng.lua.toInteger(-1)) > 0);
+    eng.lua.pop(1);
+    // mode should be non-zero on POSIX.
+    _ = try eng.lua.getGlobal("_st_mode");
+    try std.testing.expect((try eng.lua.toInteger(-1)) > 0);
+    eng.lua.pop(1);
+}
+
+test "zag.fs.exists returns true for present file, false for missing" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "e.txt", .data = "" });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    var yes_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const yes_path = try std.fmt.bufPrint(&yes_buf, "{s}/e.txt", .{base});
+    var no_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const no_path = try std.fmt.bufPrint(&no_buf, "{s}/missing.txt", .{base});
+
+    _ = eng.lua.pushString(yes_path);
+    eng.lua.setGlobal("_ex_yes");
+    _ = eng.lua.pushString(no_path);
+    eng.lua.setGlobal("_ex_no");
+
+    // zag.fs.exists is sync; it can be called from the main state
+    // without spawning a coroutine.
+    try eng.lua.doString(
+        \\_ex_yes_result = zag.fs.exists(_ex_yes)
+        \\_ex_no_result = zag.fs.exists(_ex_no)
+    );
+    _ = try eng.lua.getGlobal("_ex_yes_result");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ex_no_result");
+    try std.testing.expect(!eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }

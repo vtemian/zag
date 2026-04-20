@@ -181,6 +181,98 @@ pub const HttpStreamLineDoneSpec = struct {
     line: ?[]const u8,
 };
 
+/// Entry kind surfaced to Lua for fs.list and fs.stat. Maps
+/// `std.fs.File.Kind` onto the four buckets we expose: file, dir,
+/// symlink, other. Everything that isn't a regular file, directory,
+/// or symlink collapses into `.other`.
+pub const FsKind = enum {
+    file,
+    dir,
+    symlink,
+    other,
+
+    pub fn toString(self: FsKind) []const u8 {
+        return switch (self) {
+            .file => "file",
+            .dir => "dir",
+            .symlink => "symlink",
+            .other => "other",
+        };
+    }
+};
+
+/// Path payload for an `fs_read` job. Path is borrowed from the
+/// caller's arena until `resumeFromJob` fires.
+pub const FsReadSpec = struct {
+    path: []const u8,
+};
+
+/// Success payload for an `fs_read` job. `bytes` is heap-allocated on
+/// the engine allocator; `pushJobResultOntoStack` frees it after
+/// `pushString` has copied the content into Lua.
+pub const FsReadResult = struct {
+    bytes: []const u8,
+};
+
+/// Payload for an `fs_write` job (also covers the append flavour via
+/// `mode`). All slice fields are borrowed from the caller's arena.
+pub const FsWriteSpec = struct {
+    path: []const u8,
+    content: []const u8,
+    mode: enum { overwrite, append },
+};
+
+/// Payload for an `fs_mkdir` job. `parents` = true calls
+/// `makePath` (mkdir -p); false calls `makeDir` (single level).
+pub const FsMkdirSpec = struct {
+    path: []const u8,
+    parents: bool,
+};
+
+/// Payload for an `fs_remove` job. `recursive` = true deletes a tree;
+/// false deletes a single file or empty directory.
+pub const FsRemoveSpec = struct {
+    path: []const u8,
+    recursive: bool,
+};
+
+/// Payload for an `fs_list` job. Path borrowed from the caller's arena.
+pub const FsListSpec = struct {
+    path: []const u8,
+};
+
+/// One entry in an `fs_list` result. `name` is heap-allocated on the
+/// engine allocator and freed by `pushJobResultOntoStack` after the
+/// bytes are copied into Lua.
+pub const FsEntry = struct {
+    name: []const u8,
+    kind: FsKind,
+};
+
+/// Success payload for an `fs_list` job. The outer slice and each
+/// entry's `name` are heap-allocated on the engine allocator and must
+/// be freed by `pushJobResultOntoStack`.
+pub const FsListResult = struct {
+    entries: []const FsEntry,
+};
+
+/// Payload for an `fs_stat` job. Path borrowed from the caller's arena.
+pub const FsStatSpec = struct {
+    path: []const u8,
+};
+
+/// Success payload for an `fs_stat` job. `mtime_ms` is milliseconds
+/// since UTC 1970-01-01 (truncated from std.fs.File.Stat.mtime which
+/// is nanoseconds). `mode` is the POSIX mode bits widened to u32 so
+/// the Lua binding can push it as an integer without worrying about
+/// platform-specific `mode_t` width.
+pub const FsStatResult = struct {
+    kind: FsKind,
+    size: u64,
+    mtime_ms: i64,
+    mode: u32,
+};
+
 /// What the worker should do with this job. The scheduler fills this in
 /// before submit.
 pub const JobKind = union(enum) {
@@ -212,7 +304,18 @@ pub const JobKind = union(enum) {
     /// EOF. Not pool-submitted — the helper thread synthesises these
     /// directly onto the completion queue.
     http_stream_line_done: HttpStreamLineDoneSpec,
-    // fs lands in a later phase
+    /// Filesystem primitives backed by std.fs.cwd() on a worker thread.
+    /// Worker code lives in `primitives/fs.zig`. Each variant either
+    /// fills a matching `JobResult` arm or `err_tag` + `err_detail`.
+    fs_read: FsReadSpec,
+    /// Shares `JobResult.empty`: success pushes `(true, nil)`.
+    fs_write: FsWriteSpec,
+    /// Shares `JobResult.empty`: success pushes `(true, nil)`.
+    fs_mkdir: FsMkdirSpec,
+    /// Shares `JobResult.empty`: success pushes `(true, nil)`.
+    fs_remove: FsRemoveSpec,
+    fs_list: FsListSpec,
+    fs_stat: FsStatSpec,
 };
 
 /// Success payload handed back to the coroutine on resume. `.empty` means
@@ -221,6 +324,9 @@ pub const JobResult = union(enum) {
     empty,
     cmd_exec: CmdExecResult,
     http: HttpResult,
+    fs_read: FsReadResult,
+    fs_list: FsListResult,
+    fs_stat: FsStatResult,
 };
 
 /// Stable string tag surfaced to Lua on failure. The strings are part of
