@@ -228,7 +228,82 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_default_model");
         lua.pushFunction(zlua.wrap(zagProviderFn));
         lua.setField(-2, "provider");
+        lua.pushFunction(zlua.wrap(zagSleepFn));
+        lua.setField(-2, "sleep");
         lua.setGlobal("zag");
+    }
+
+    /// Fetch the engine pointer stashed by `storeSelfPointer`. Must only be
+    /// called from a C-closure registered after `storeSelfPointer` has run;
+    /// a missing pointer is a programmer error and aborts via unreachable.
+    fn getEngineFromState(lua: *Lua) *LuaEngine {
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch unreachable;
+        lua.pop(1);
+        return @ptrCast(@alignCast(@constCast(ptr)));
+    }
+
+    /// Find the Task owning `co`. Linear scan over the tasks map; tasks are
+    /// few in practice (tens). Candidate for an extraspace-based fast path
+    /// if it ever shows up in profiles.
+    pub fn taskForCoroutine(self: *LuaEngine, co: *Lua) ?*Task {
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.co == co) return entry.value_ptr.*;
+        }
+        return null;
+    }
+
+    /// Zig function backing `zag.sleep(ms)`. Allocates a sleep Job,
+    /// submits it to the worker pool, and yields the coroutine. The
+    /// completion drain later calls `resumeFromJob`, which pushes
+    /// (true, nil) or (nil, err_tag) onto the coroutine stack and
+    /// resumes it. Soft failures (submit errored after alloc) return
+    /// (nil, err_string) synchronously; hard errors (bad arg type,
+    /// no task) raise a Lua error and unwind.
+    fn zagSleepFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("zag.sleep must be called inside zag.async/hook/keymap", .{});
+        }
+
+        const ms_i = co.checkInteger(1);
+        if (ms_i < 0) co.raiseErrorStr("zag.sleep: ms must be non-negative", .{});
+        const ms: u64 = @intCast(ms_i);
+
+        const task = engine.taskForCoroutine(co) orelse {
+            co.raiseErrorStr("zag.sleep: no task for this coroutine", .{});
+        };
+
+        // Early-cancel short-circuit: scope already cancelled, don't bother
+        // with a Job round-trip — hand back (nil, "cancelled") synchronously.
+        if (task.scope.isCancelled()) {
+            co.pushNil();
+            _ = co.pushString("cancelled");
+            return 2;
+        }
+
+        const job = engine.allocator.create(async_job.Job) catch {
+            co.raiseErrorStr("zag.sleep alloc failed", .{});
+        };
+        job.* = .{
+            .kind = .{ .sleep = .{ .ms = ms } },
+            .thread_ref = task.thread_ref,
+            .scope = task.scope,
+        };
+        task.pending_job = job;
+
+        engine.io_pool.?.submit(job) catch {
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            co.pushNil();
+            _ = co.pushString("io_error: submit failed");
+            return 2;
+        };
+
+        co.yield(0);
+        // yield is noreturn on Lua 5.4.
     }
 
     /// Store a pointer to this engine in the Lua registry so C callbacks can find it.
@@ -1147,13 +1222,57 @@ pub const LuaEngine = struct {
     }
 
     /// Called by the orchestrator tick after a worker posts a completion.
-    /// The stub destroys the job so tests don't leak; Phase 4 wires real
-    /// lua_resume via thread_ref lookup in self.tasks.
+    /// Looks up the owning task by `thread_ref`, pushes the result tuple
+    /// onto the coroutine stack via `pushJobResultOntoStack`, frees the
+    /// Job, and drives one resume step via `resumeTask`. If the task is
+    /// already gone (e.g. scope cancelled and retired synchronously), the
+    /// Job and any `err_detail` are freed without a resume.
     pub fn resumeFromJob(self: *LuaEngine, job: *async_job.Job) !void {
-        // TODO(Phase 4.4): find task via self.tasks.get(job.thread_ref),
-        // push result values onto task.co, call self.resumeTask(task, n).
-        // For now, free the job so the orchestrator drain doesn't leak it.
+        const task = self.tasks.get(job.thread_ref) orelse {
+            if (job.err_detail) |d| self.allocator.free(d);
+            self.allocator.destroy(job);
+            return;
+        };
+        task.pending_job = null;
+
+        const num_values = self.pushJobResultOntoStack(task.co, job);
+        const err_detail = job.err_detail;
         self.allocator.destroy(job);
+
+        self.resumeTask(task, num_values);
+
+        if (err_detail) |d| self.allocator.free(d);
+    }
+
+    /// Push the (value, err) result tuple for `job` onto `co`'s stack.
+    /// Returns the number of values pushed (always 2 today). On error
+    /// pushes (nil, err_tag_string); on success pushes per-kind values
+    /// (sleep: true, nil). `err_detail` (if present) is borrowed for the
+    /// duration of this call and freed by the caller after resume.
+    fn pushJobResultOntoStack(self: *LuaEngine, co: *Lua, job: *async_job.Job) i32 {
+        if (job.err_tag) |tag| {
+            co.pushNil();
+            if (job.err_detail) |d| {
+                var buf: [256]u8 = undefined;
+                const formatted = std.fmt.bufPrint(
+                    &buf,
+                    "{s}: {s}",
+                    .{ tag.toString(), d },
+                ) catch tag.toString();
+                _ = co.pushString(formatted);
+            } else {
+                _ = co.pushString(tag.toString());
+            }
+            return 2;
+        }
+        _ = self;
+        switch (job.kind) {
+            .sleep => {
+                co.pushBoolean(true);
+                co.pushNil();
+                return 2;
+            },
+        }
     }
 
     /// Creates a coroutine for the Lua function + `nargs` arguments that are
@@ -1411,6 +1530,50 @@ test "spawnCoroutine runs a synchronous Lua function to completion" {
 
     // Synchronous completion retires the task immediately; tasks map is empty.
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+}
+
+test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Coroutine body stores (ok, err) into a single global table so we can
+    // observe `err == nil` without tripping getGlobal's nil-is-error contract.
+    try eng.lua.doString(
+        \\function test_sleep()
+        \\  local ok, err = zag.sleep(10)
+        \\  _test_sleep = { ok = ok, err_is_nil = (err == nil) }
+        \\end
+    );
+
+    _ = try eng.lua.getGlobal("test_sleep");
+    _ = try eng.spawnCoroutine(0, null);
+
+    // Drive the drain-and-resume loop by hand: no orchestrator running in
+    // tests, so we poll the completion queue and feed each job through
+    // resumeFromJob until the coroutine retires (or the deadline trips).
+    const deadline = std.time.milliTimestamp() + 500;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_test_sleep");
+    defer eng.lua.pop(1);
+
+    _ = eng.lua.getField(-1, "ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    _ = eng.lua.getField(-1, "err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }
 
 test "zag.tool() collects tool definitions" {
