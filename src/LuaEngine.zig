@@ -1258,7 +1258,10 @@ pub const LuaEngine = struct {
                     &buf,
                     "{s}: {s}",
                     .{ tag.toString(), d },
-                ) catch tag.toString();
+                ) catch blk: {
+                    log.debug("err detail truncated: tag={s}, detail_len={d}", .{ tag.toString(), d.len });
+                    break :blk tag.toString();
+                };
                 _ = co.pushString(formatted);
             } else {
                 _ = co.pushString(tag.toString());
@@ -1573,6 +1576,90 @@ test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
 
     _ = eng.lua.getField(-1, "err_is_nil");
     try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_cancel()
+        \\  local ok, err = zag.sleep(1000)
+        \\  _test_cancel = { ok_is_nil = (ok == nil), err = err }
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_cancel");
+    const ref = try eng.spawnCoroutine(0, null);
+    const task = eng.tasks.get(ref).?;
+
+    // Cancel immediately — worker is either queued or mid-sleep. Worker's
+    // 10ms poll loop in executeJob sees isCancelled() and returns the job
+    // with err_tag=.cancelled.
+    try task.scope.cancel("test");
+
+    // Drive drain loop until task retires.
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_test_cancel");
+    try std.testing.expect(eng.lua.isTable(-1));
+
+    _ = eng.lua.getField(-1, "ok_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    _ = eng.lua.getField(-1, "err");
+    const err_str = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, err_str, "cancelled"));
+    eng.lua.pop(1);
+    eng.lua.pop(1); // pop table
+}
+
+test "zag.sleep returns (nil, 'cancelled') synchronously when scope already cancelled" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_sync_cancel()
+        \\  local ok, err = zag.sleep(1000)
+        \\  _test_sync_cancel = { ok_is_nil = (ok == nil), err = err }
+        \\end
+    );
+
+    // Cancel root BEFORE spawnCoroutine; the child scope inherits cancellation
+    // and zag.sleep's sync-cancel shortcut returns (nil, "cancelled") without
+    // ever submitting a job.
+    try eng.root_scope.?.cancel("pre-test");
+
+    _ = try eng.lua.getGlobal("test_sync_cancel");
+    _ = try eng.spawnCoroutine(0, null);
+
+    // Task retires synchronously inside spawnCoroutine's first resume.
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_test_sync_cancel");
+    try std.testing.expect(eng.lua.isTable(-1));
+    _ = eng.lua.getField(-1, "ok_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = eng.lua.getField(-1, "err");
+    const err_str = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.eql(u8, err_str, "cancelled"));
+    eng.lua.pop(1);
     eng.lua.pop(1);
 }
 
