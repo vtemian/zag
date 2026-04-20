@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const auth = @import("auth.zig");
 const Allocator = std.mem.Allocator;
 
 pub const anthropic = @import("providers/anthropic.zig");
@@ -416,29 +417,41 @@ pub const ProviderResult = struct {
     }
 };
 
-/// Create a provider from the ZAG_MODEL environment variable.
-/// Reads the model string, initializes the endpoint registry, looks up the
-/// provider, and returns everything bundled in a single ProviderResult.
-pub fn createProviderFromEnv(allocator: Allocator) !ProviderResult {
-    const model_id = std.process.getEnvVarOwned(allocator, "ZAG_MODEL") catch
-        try allocator.dupe(u8, "anthropic/claude-sonnet-4-20250514");
+/// Create a provider from Lua-populated config.
+///
+/// `default_model` is the model string the user set via
+/// `zag.set_default_model("prov/id")` (null falls back to
+/// `anthropic/claude-sonnet-4-20250514`). The api key is read out of
+/// `auth_file_path` (normally `~/.config/zag/auth.json`) via `auth.getApiKey`.
+/// Endpoints whose `auth` discriminator is `.none` (e.g. Ollama) skip the
+/// credential lookup entirely. The returned `ProviderResult` owns the duped
+/// model string, the duped api key, the endpoint registry, and the serializer
+/// state.
+pub fn createProviderFromLuaConfig(
+    default_model: ?[]const u8,
+    auth_file_path: []const u8,
+    allocator: Allocator,
+) !ProviderResult {
+    const model_id = try allocator.dupe(u8, default_model orelse "anthropic/claude-sonnet-4-20250514");
     errdefer allocator.free(model_id);
 
     var registry = try Registry.init(allocator);
     errdefer registry.deinit();
 
-    return createProviderWithRegistry(model_id, registry, allocator);
-}
-
-/// Create a provider from an explicit model string and registry.
-/// Takes ownership of both model_id and registry on success.
-fn createProviderWithRegistry(model_id: []const u8, registry: Registry, allocator: Allocator) !ProviderResult {
     const spec = parseModelString(model_id);
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
-    // TODO(env-to-lua Task 6): replaced by auth.resolveCredential lookup.
-    const api_key = try allocator.dupe(u8, "");
+    const api_key: []const u8 = switch (endpoint.auth) {
+        .none => try allocator.dupe(u8, ""),
+        .x_api_key, .bearer => blk: {
+            var auth_file = try auth.loadAuthFile(allocator, auth_file_path);
+            defer auth_file.deinit();
+            const borrowed = (try auth_file.getApiKey(spec.provider_name)) orelse
+                return error.MissingCredential;
+            break :blk try allocator.dupe(u8, borrowed);
+        },
+    };
     errdefer allocator.free(api_key);
 
     switch (endpoint.serializer) {
@@ -1028,15 +1041,116 @@ test "parseModelString handles nested slashes for openrouter" {
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", result.model_id);
 }
 
-test "createProviderWithRegistry returns UnknownProvider for unsupported provider" {
+test "createProviderFromLuaConfig reads model from engine and key from auth.json" {
     const allocator = std.testing.allocator;
-    const model = try allocator.dupe(u8, "fakeprovider/some-model");
-    var registry = try Registry.init(allocator);
-    const result = createProviderWithRegistry(model, registry, allocator);
-    // On error, ownership stays with us
-    defer allocator.free(model);
-    defer registry.deinit();
-    try std.testing.expectError(error.UnknownProvider, result);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "openai": { "type": "api_key", "key": "sk-openai-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var result = try createProviderFromLuaConfig("openai/gpt-4o", auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("openai/gpt-4o", result.model_id);
+    try std.testing.expectEqualStrings("sk-openai-test", result.api_key);
+    try std.testing.expectEqual(Serializer.openai, result.serializer);
+}
+
+test "createProviderFromLuaConfig uses hardcoded fallback when default_model unset" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "anthropic": { "type": "api_key", "key": "sk-ant-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var result = try createProviderFromLuaConfig(null, auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", result.model_id);
+    try std.testing.expectEqualStrings("sk-ant-test", result.api_key);
+    try std.testing.expectEqual(Serializer.anthropic, result.serializer);
+}
+
+test "createProviderFromLuaConfig returns MissingCredential when provider not in auth.json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "anthropic": { "type": "api_key", "key": "sk-ant-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    try std.testing.expectError(
+        error.MissingCredential,
+        createProviderFromLuaConfig("openai/gpt-4o", auth_path, allocator),
+    );
+}
+
+test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints" {
+    // Ollama has Endpoint.auth = .none. Even with no auth.json present we must
+    // succeed and hand back an empty api_key string.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var result = try createProviderFromLuaConfig("ollama/llama3", auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("ollama/llama3", result.model_id);
+    try std.testing.expectEqualStrings("", result.api_key);
+    try std.testing.expectEqual(Serializer.openai, result.serializer);
+}
+
+test "createProviderFromLuaConfig returns UnknownProvider for unsupported provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    try std.testing.expectError(
+        error.UnknownProvider,
+        createProviderFromLuaConfig("fakeprovider/some-model", auth_path, allocator),
+    );
 }
 
 test "ResponseBuilder assembles text and tool_use blocks" {
