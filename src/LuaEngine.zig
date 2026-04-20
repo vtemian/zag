@@ -75,11 +75,13 @@ pub const LuaEngine = struct {
     /// overwrite entries here, and the window manager reads from it via
     /// `keymapRegistry()` when dispatching keys.
     keymap_registry: Keymap.Registry,
-    /// Optional pointer to the input parser. Wired from main.zig after
-    /// orchestrator construction so `zag.set_escape_timeout_ms()` can
-    /// tune the bare-Escape deadline at config-load time. Null when the
-    /// engine is exercised standalone in tests.
-    input_parser: ?*input.Parser = null,
+    /// Persistent escape-sequence parser owned by the engine. Defaults
+    /// match `input.Parser{}`, so `zag.set_escape_timeout_ms()` from
+    /// `config.lua` lands here during `loadUserConfig`; the orchestrator
+    /// reads this through `window_manager.inputParser()` when polling
+    /// stdin. Outlives a single tick so fragmented CSI/SS3 sequences
+    /// assemble across reads.
+    input_parser: input.Parser = .{},
     /// Provider names the user declared via `zag.provider{ name = "..." }`.
     /// Owned (each entry duped into `allocator`). Populated during `loadUserConfig`,
     /// read once by `llm.createProviderFromLuaConfig` at startup.
@@ -131,6 +133,13 @@ pub const LuaEngine = struct {
     /// pointer during `loadUserConfig`.
     pub fn keymapRegistry(self: *LuaEngine) *Keymap.Registry {
         return &self.keymap_registry;
+    }
+
+    /// Borrow the engine's input parser. The orchestrator polls this on
+    /// every tick; `zag.set_escape_timeout_ms()` writes through the same
+    /// pointer during `loadUserConfig`.
+    pub fn inputParser(self: *LuaEngine) *input.Parser {
+        return &self.input_parser;
     }
 
     /// Resolve ~/.config/zag paths, set plugin search path, load config.lua.
@@ -459,10 +468,10 @@ pub const LuaEngine = struct {
     }
 
     /// Zig function backing `zag.set_escape_timeout_ms(ms)`.
-    /// Writes the bare-Escape deadline through `engine.input_parser` if
-    /// it is attached; no-ops otherwise so the test harness without a
-    /// parser doesn't crash. Negative timeouts are rejected as a Lua
-    /// runtime error.
+    /// Writes the bare-Escape deadline through `engine.input_parser`,
+    /// which the orchestrator reads on every tick via
+    /// `window_manager.inputParser()`. Negative timeouts are rejected
+    /// as a Lua runtime error.
     fn zagSetEscapeTimeoutMsFn(lua: *Lua) !i32 {
         const ms = lua.checkInteger(1);
         if (ms < 0) {
@@ -478,11 +487,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        const parser = engine.input_parser orelse {
-            log.warn("zag.set_escape_timeout_ms(): no parser bound; value ignored", .{});
-            return 0;
-        };
-        parser.escape_timeout_ms = ms;
+        engine.input_parser.escape_timeout_ms = ms;
         return 0;
     }
 
@@ -1695,22 +1700,31 @@ test "LuaEngine init populates keymap defaults" {
 test "zag.set_escape_timeout_ms updates Parser.escape_timeout_ms" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
-
-    var parser: input.Parser = .{};
-    engine.input_parser = &parser;
     engine.storeSelfPointer();
 
     try engine.lua.doString("zag.set_escape_timeout_ms(120)");
 
-    try std.testing.expectEqual(@as(i64, 120), parser.escape_timeout_ms);
+    try std.testing.expectEqual(@as(i64, 120), engine.input_parser.escape_timeout_ms);
+}
+
+test "zag.set_escape_timeout_ms applied at loadUserConfig time lands on engine parser" {
+    // Regression guard for Task 8: without engine-owned input_parser, the
+    // timeout silently no-opped because the parser was only wired after
+    // loadUserConfig had already run. This test drives the binding through
+    // the same path loadUserConfig uses (storeSelfPointer + doString) and
+    // asserts the value lands on engine.input_parser.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.set_escape_timeout_ms(50)");
+
+    try std.testing.expectEqual(@as(i64, 50), engine.input_parser.escape_timeout_ms);
 }
 
 test "zag.set_escape_timeout_ms rejects negative" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
-
-    var parser: input.Parser = .{};
-    engine.input_parser = &parser;
     engine.storeSelfPointer();
 
     const result = engine.lua.doString("zag.set_escape_timeout_ms(-10)");

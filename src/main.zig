@@ -276,13 +276,10 @@ pub fn main() !void {
     // this after orchestrator construction so the pointer is stable.
     compositor.orchestrator = &orchestrator;
 
-    // Wire the orchestrator-owned input parser onto the engine and register
-    // any Lua-declared tools into the dispatch registry. Config.lua already
-    // ran before provider creation, so the keymap overrides and
-    // default_model are live; escape-timeout overrides only take effect
-    // from here on (that surface is best-effort per the plan).
+    // Register any Lua-declared tools into the dispatch registry. Config.lua
+    // already ran before provider creation, so the keymap overrides,
+    // default_model, and escape-timeout are all live by this point.
     if (lua_engine) |*eng| {
-        eng.input_parser = &orchestrator.input_parser;
         eng.registerTools(&registry) catch |err| {
             log.warn("failed to register lua tools: {}", .{err});
         };

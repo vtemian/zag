@@ -6,9 +6,10 @@
 //! are created in main() and held here as pointers. Their lifetimes
 //! exceed the orchestrator's. The orchestrator itself owns the extra
 //! split panes and frame-local counters (spinner, transient status).
-//! The keymap registry lives on the Lua engine and is accessed via
-//! `window_manager.keymapRegistry()`. Each pane owns its own draft
-//! input (see ConversationBuffer.draft).
+//! The keymap registry and the persistent input parser both live on the
+//! Lua engine, accessed via `window_manager.keymapRegistry()` and
+//! `window_manager.inputParser()`. Each pane owns its own draft input
+//! (see ConversationBuffer.draft).
 
 const std = @import("std");
 const posix = std.posix;
@@ -71,9 +72,6 @@ wake_write_fd: posix.fd_t,
 provider: *llm.ProviderResult,
 /// Tool registry borrowed from main for tool dispatch in agent runs.
 registry: *const tools.Registry,
-/// Persistent escape-sequence parser. Outlives a single poll cycle
-/// so fragmented CSI/SS3 sequences assemble correctly.
-input_parser: input.Parser = .{},
 
 /// Window, pane, and frame-local UI state. Layout/compositor/root_pane
 /// live here so the orchestrator stays a pure event coordinator.
@@ -207,7 +205,8 @@ fn tick(
     // delivers a resize this way), and any other poll error will resurface
     // on the next syscall in this tick. Logging every EINTR would spam the
     // status log on every terminal resize.
-    const poll_timeout: i32 = self.input_parser.pollTimeoutMs(std.time.milliTimestamp()) orelse -1;
+    const parser = self.window_manager.inputParser();
+    const poll_timeout: i32 = parser.pollTimeoutMs(std.time.milliTimestamp()) orelse -1;
     _ = posix.poll(&fds, poll_timeout) catch {};
 
     // Drain stale wake bytes so one wake equals one frame regardless of how
@@ -217,7 +216,7 @@ fn tick(
     }
 
     // Poll for input (outside frame span, so wait doesn't count)
-    const maybe_event = self.input_parser.pollOnce(posix.STDIN_FILENO, std.time.milliTimestamp());
+    const maybe_event = parser.pollOnce(posix.STDIN_FILENO, std.time.milliTimestamp());
 
     // Resize: merge SIGWINCH and in-band CSI sources so handleResize
     // is called at most once per tick.

@@ -92,6 +92,10 @@ spinner_frame: u8 = 0,
 /// Global editing mode. Insert = typing into input buffer;
 /// Normal = keymap bindings fire, typing is disabled.
 current_mode: Keymap.Mode = .insert,
+/// Fallback input parser used only when the Lua engine is absent (init
+/// failed). Default timeouts apply. Ownership lives on the engine
+/// otherwise; see `inputParser()`.
+fallback_input_parser: input.Parser = .{},
 
 pub const Config = struct {
     /// Heap allocator for runtime allocations owned by the manager.
@@ -133,6 +137,15 @@ pub fn init(cfg: Config) !WindowManager {
 pub fn keymapRegistry(self: *WindowManager) ?*Keymap.Registry {
     const engine = self.lua_engine orelse return null;
     return engine.keymapRegistry();
+}
+
+/// Borrow the input parser. Prefers the engine-owned parser so
+/// `zag.set_escape_timeout_ms()` is honored; falls back to a
+/// default-initialized parser on this WindowManager when Lua init
+/// failed, so input polling keeps working regardless.
+pub fn inputParser(self: *WindowManager) *input.Parser {
+    if (self.lua_engine) |engine| return engine.inputParser();
+    return &self.fallback_input_parser;
 }
 
 /// Release every extra pane's resources. Agent threads must be shut down
