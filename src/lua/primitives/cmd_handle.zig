@@ -114,6 +114,10 @@ pub const CmdHandle = struct {
     /// Set once `child.stdout.read` returned 0 (EOF). Sticky — once
     /// true, subsequent `:lines()` iterations return nil.
     stdout_eof: bool = false,
+    /// Mirrors `SpawnOpts.max_line_bytes`. Consulted in `runReadLine`
+    /// after each append to `stdout_buf` so an unbounded line is
+    /// rejected before the buffer starves the helper thread.
+    max_line_bytes: usize = 0,
 
     pub const METATABLE_NAME = "zag.CmdHandle";
 
@@ -130,11 +134,13 @@ pub const CmdHandle = struct {
         /// the default at `.Ignore` means children that never get read
         /// can't stall on a full pipe buffer.
         capture_stdout: bool = false,
-        /// Symmetric to `capture_stdout`. Reserved for a future
-        /// `:stderr_lines()` / merged-stream opt; for 6.4b the helper
-        /// thread doesn't drain stderr, so enabling this on a chatty
-        /// child will eventually block the child's stderr writes.
-        capture_stderr: bool = false,
+        /// Maximum bytes buffered for a single line before the
+        /// `:lines()` reader gives up and surfaces `io_error: line
+        /// exceeded max_line_bytes`. Guards against a misbehaving
+        /// child that writes megabytes without a newline and OOMs the
+        /// helper thread. `0` disables the cap (not recommended for
+        /// untrusted children).
+        max_line_bytes: usize = 1 * 1024 * 1024,
     };
 
     /// Spawn a child and start the helper thread. On success the
@@ -161,17 +167,21 @@ pub const CmdHandle = struct {
             .arena = arena,
             .child = std.process.Child.init(argv, alloc),
             .helper = undefined,
+            .max_line_bytes = opts.max_line_bytes,
         };
         // Route stdio to /dev/null by default. `.Close` would hand
         // EBADF to any child that writes a startup banner (see
         // /bin/echo, which exits non-zero when stdout is closed);
         // `.Inherit` would spam the host process's terminal during
-        // tests. `capture_stdout`/`capture_stderr` in `opts` opt into
-        // `.Pipe` for `:lines()` / a future `:stderr_lines()`; `:write`
-        // in 6.4c will add `capture_stdin`.
+        // tests. `capture_stdout` in `opts` opts into `.Pipe` for
+        // `:lines()`; `:write` in 6.4c will add `capture_stdin`.
+        // stderr is always `.Ignore` until `:stderr_lines()` exists —
+        // the Lua binding rejects `capture_stderr = true` at spawn
+        // rather than silently letting a chatty child stall on a full
+        // stderr pipe the helper never drains.
         self.child.stdin_behavior = .Ignore;
         self.child.stdout_behavior = if (opts.capture_stdout) .Pipe else .Ignore;
-        self.child.stderr_behavior = if (opts.capture_stderr) .Pipe else .Ignore;
+        self.child.stderr_behavior = .Ignore;
         if (opts.cwd) |c| self.child.cwd = c;
 
         switch (opts.env_mode) {
@@ -307,6 +317,17 @@ pub const CmdHandle = struct {
                 self.postReadLineDoneErr(thread_ref, "oom");
                 return;
             };
+            // Reject single lines that exceed the configured cap
+            // before `stdout_buf` starves the helper thread. We drop
+            // the buffered bytes so later reads don't keep tripping
+            // the same limit on partial leftovers; the caller has
+            // already lost the offending line and needs to decide
+            // whether to `:kill` the child.
+            if (self.max_line_bytes > 0 and self.stdout_buf.items.len > self.max_line_bytes) {
+                self.stdout_buf.clearRetainingCapacity();
+                self.postReadLineDoneErr(thread_ref, "line exceeded max_line_bytes");
+                return;
+            }
             if (self.popLineFromBuf()) |line| {
                 self.postReadLineDone(thread_ref, line);
                 return;

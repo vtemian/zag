@@ -707,14 +707,46 @@ pub const LuaEngine = struct {
             }
             co.pop(1);
 
-            // capture_stdout / capture_stderr toggle `.Pipe` vs
-            // `.Ignore`. Accept any truthy Lua value; default (false)
-            // keeps stdio routed to /dev/null.
+            // capture_stdout toggles `.Pipe` vs `.Ignore` for the
+            // child's stdout. Accept any truthy Lua value; default
+            // (false) keeps stdout routed to /dev/null.
             _ = co.getField(opts_idx, "capture_stdout");
             opts.capture_stdout = co.toBoolean(-1);
             co.pop(1);
+            // capture_stderr is not yet implemented: the helper thread
+            // doesn't drain stderr, so a chatty child with a full
+            // stderr pipe would stall forever. Reject at spawn time
+            // rather than silently mis-wiring the child. Will be
+            // enabled when `:stderr_lines()` lands.
             _ = co.getField(opts_idx, "capture_stderr");
-            opts.capture_stderr = co.toBoolean(-1);
+            if (co.toBoolean(-1)) {
+                co.pop(1);
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd.spawn: capture_stderr not yet implemented; use capture_stdout or redirect 2>&1", .{});
+            }
+            co.pop(1);
+
+            // max_line_bytes caps the per-line buffer used by
+            // `:lines()`. Accept either an integer (bytes) or absent
+            // (falls back to the SpawnOpts default). A Lua number that
+            // isn't a non-negative integer is a user mistake; reject.
+            _ = co.getField(opts_idx, "max_line_bytes");
+            if (!co.isNil(-1)) {
+                const n = co.toInteger(-1) catch {
+                    co.pop(1);
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.cmd.spawn: opts.max_line_bytes must be an integer", .{});
+                };
+                if (n < 0) {
+                    co.pop(1);
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.cmd.spawn: opts.max_line_bytes must be >= 0", .{});
+                }
+                opts.max_line_bytes = @intCast(n);
+            }
             co.pop(1);
 
             // env vs env_extra. Same rules as zag.cmd: mutually
@@ -1038,6 +1070,7 @@ pub const LuaEngine = struct {
             return 2;
         };
 
+        // yield is noreturn on Lua 5.4; no reachable return statement.
         co.yield(0);
     }
 
@@ -3738,5 +3771,44 @@ test "zag.cmd.spawn :lines yields lines then nil at EOF" {
     try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "c"));
     eng.lua.pop(1);
 
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.spawn :lines errors when stdout not captured" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_no_capture()
+        \\  local h = zag.cmd.spawn({ "/bin/echo", "x" })
+        \\  local iter = h:lines()
+        \\  local line, err = iter()
+        \\  _no_cap_line_is_nil = (line == nil)
+        \\  _no_cap_err = err
+        \\  h:wait()
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_no_capture");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    _ = try eng.lua.getGlobal("_no_cap_line_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_no_cap_err");
+    const err_str = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, err_str, "io_error"));
+    eng.lua.pop(1);
     try eng.lua.doString("collectgarbage('collect')");
 }
