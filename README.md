@@ -143,7 +143,11 @@ zag.tool({
 
 Config entry point: `~/.config/zag/config.lua`. Modules load from `~/.config/zag/lua/?.lua` via `require`. A missing config file is not an error.
 
-Blocking I/O inside a tool today blocks the main thread. An async runtime (coroutine-based, with `zag.http`, `zag.cmd`, `zag.fs`, `zag.sleep`) is sketched in [`docs/plans/2026-04-20-lua-async-plugin-runtime.md`](docs/plans/2026-04-20-lua-async-plugin-runtime.md) but not yet merged.
+## Plugins
+
+Zag embeds Lua 5.4 and ships an async plugin runtime: hooks, custom tools, keymaps, and coroutine-friendly primitives for HTTP, subprocess, and filesystem work. Drop a `~/.config/zag/config.lua` and you can veto tool calls, rewrite user messages, register new tools, or run background pollers without ever blocking the TUI.
+
+See the [plugin authoring guide](docs/plugins/README.md) for event tables, the primitive reference, error conventions, and worked examples (remote policy hooks, git watchers, file watchers).
 
 ## Session persistence
 
