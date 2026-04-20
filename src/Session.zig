@@ -344,12 +344,14 @@ pub const SessionHandle = struct {
 
         try self.updateMeta();
 
-        // Also write a session_rename entry
+        // Also write a session_rename entry. Meta is already on disk at
+        // this point; if the audit entry fails we'd silently drift from
+        // the audit log, so log the failure rather than swallowing.
         self.appendEntry(.{
             .entry_type = .session_rename,
             .content = new_name,
             .timestamp = self.meta.updated,
-        }) catch {};
+        }) catch |err| log.warn("session_rename audit entry failed: {s}", .{@errorName(err)});
     }
 
     /// Close the JSONL file handle.
