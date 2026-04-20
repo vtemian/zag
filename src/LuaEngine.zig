@@ -108,6 +108,11 @@ pub const LuaEngine = struct {
         thread_ref: i32,
         scope: *async_scope.Scope,
         pending_job: ?*async_job.Job = null,
+        /// Coroutines blocked on :join() waiting for this task to retire.
+        /// Each entry is a thread_ref of a joining task (in self.tasks).
+        /// Retired + freed in retireTask; joiners resumed with (true, nil)
+        /// or (nil, "cancelled") based on self.scope.isCancelled at retirement.
+        joiners: std.ArrayList(i32) = .empty,
     };
 
     /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
@@ -415,13 +420,41 @@ pub const LuaEngine = struct {
         return 1;
     }
 
-    /// TaskHandle:join() -> (true, nil). STUB for Task 5.1; real yielding
-    /// implementation lands in Task 5.3.
-    fn taskHandleJoin(lua: *Lua) i32 {
-        // TODO(Phase 5.3): yield caller task until target retires.
-        lua.pushBoolean(true);
-        lua.pushNil();
-        return 2;
+    /// TaskHandle:join() -> (true, nil) on target's success or (nil, "cancelled")
+    /// if target was cancelled. Must be called inside a coroutine (yields).
+    ///
+    /// Known limitation: target's Lua return values are NOT forwarded — join is
+    /// a completion signal, not a value-transfer. Propagating values across
+    /// coroutines requires a registry-backed serializer, out of scope for v1.
+    /// Callers that need return values should write to a closed-over upvalue
+    /// or a shared Lua table.
+    fn taskHandleJoin(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+        const h = co.checkUserdata(TaskHandle, 1, TaskHandle.METATABLE_NAME);
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("task:join must be called inside a coroutine", .{});
+        }
+
+        // Already retired? Return (true, nil) synchronously. Cancel info died
+        // with the task; callers that need that distinction must race via
+        // :done() before :join() or use their own completion signal.
+        const target = engine.tasks.get(h.thread_ref) orelse {
+            co.pushBoolean(true);
+            co.pushNil();
+            return 2;
+        };
+
+        // Register ourselves as a joiner on the target, then yield. Retirement
+        // of the target pushes results on our stack and resumes us.
+        const my_task = engine.taskForCoroutine(co) orelse {
+            co.raiseErrorStr("task:join: no task for this coroutine", .{});
+        };
+        target.joiners.append(engine.allocator, my_task.thread_ref) catch |err| {
+            co.raiseErrorStr("task:join: %s", .{@errorName(err).ptr});
+        };
+        co.yield(0);
+        // yield is noreturn on Lua 5.4.
     }
 
     /// Store a pointer to this engine in the Lua registry so C callbacks can find it.
@@ -1471,12 +1504,51 @@ pub const LuaEngine = struct {
 
     /// Remove a task from the active set: unregister, unref the thread
     /// from the Lua registry (letting the GC reclaim the coroutine),
-    /// tear down the scope, and free the Task allocation.
+    /// tear down the scope, resume any joiners, and free the Task.
+    ///
+    /// Order matters: we snapshot + free the joiners list BEFORE destroying
+    /// the task (so the ArrayList deinit happens against a live allocator),
+    /// then destroy the task, then resume joiners against the now-detached
+    /// snapshot. Joiners resume with (true, nil) on normal completion or
+    /// (nil, "cancelled") if the retiring task's scope was cancelled.
     fn retireTask(self: *LuaEngine, task: *Task) void {
+        const was_cancelled = task.scope.isCancelled();
+
+        // Snapshot joiners so we can safely tear down the task's state while
+        // still resuming them afterwards. If snapshot alloc fails, joiners
+        // block forever — log so the pathological case is visible.
+        var joiners_snap: []i32 = &.{};
+        if (task.joiners.items.len > 0) {
+            joiners_snap = self.allocator.alloc(i32, task.joiners.items.len) catch blk: {
+                log.warn(
+                    "retireTask: OOM snapshotting joiners; {d} joiners will block forever",
+                    .{task.joiners.items.len},
+                );
+                break :blk &.{};
+            };
+            if (joiners_snap.len == task.joiners.items.len) {
+                @memcpy(joiners_snap, task.joiners.items);
+            }
+        }
+        defer if (joiners_snap.len > 0) self.allocator.free(joiners_snap);
+        task.joiners.deinit(self.allocator);
+
         _ = self.tasks.remove(task.thread_ref);
         self.lua.unref(zlua.registry_index, task.thread_ref);
         task.scope.deinit();
         self.allocator.destroy(task);
+
+        for (joiners_snap) |joiner_ref| {
+            const joiner = self.tasks.get(joiner_ref) orelse continue;
+            if (was_cancelled) {
+                joiner.co.pushNil();
+                _ = joiner.co.pushString("cancelled");
+            } else {
+                joiner.co.pushBoolean(true);
+                joiner.co.pushNil();
+            }
+            self.resumeTask(joiner, 2);
+        }
     }
 
     /// Hook for agent threads to bind this engine as their active Lua context.
@@ -2469,5 +2541,85 @@ test "zag.detach spawns a fire-and-forget coroutine" {
     eng.lua.pop(1);
     _ = try eng.lua.getGlobal("_detach_ran");
     try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "task:join yields until target completes, returns (true, nil)" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function outer()
+        \\  local t = zag.spawn(function()
+        \\    zag.sleep(10)
+        \\  end)
+        \\  local ok, err = t:join()
+        \\  _outer_ok = ok
+        \\  _outer_err_is_nil = (err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("outer");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_outer_ok");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_outer_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "task:join returns (nil, 'cancelled') when target is cancelled" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function outer()
+        \\  local t = zag.spawn(function()
+        \\    zag.sleep(1000) -- will be cancelled mid-flight
+        \\  end)
+        \\  t:cancel()
+        \\  local ok, err = t:join()
+        \\  _outer_join = { ok_is_nil = (ok == nil), err = err }
+        \\end
+    );
+    _ = try eng.lua.getGlobal("outer");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_outer_join");
+    try std.testing.expect(eng.lua.isTable(-1));
+    _ = eng.lua.getField(-1, "ok_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = eng.lua.getField(-1, "err");
+    const err_str = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.eql(u8, err_str, "cancelled"));
+    eng.lua.pop(1);
     eng.lua.pop(1);
 }
