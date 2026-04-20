@@ -1437,8 +1437,8 @@ test "end-to-end: config file to registry execution" {
         pump_thread.join();
     }
 
-    AgentThread.lua_request_queue = &queue;
-    defer AgentThread.lua_request_queue = null;
+    tools_mod.lua_request_queue = &queue;
+    defer tools_mod.lua_request_queue = null;
 
     // Execute through the full registry path (luaToolExecute -> queue -> dispatcher -> executeTool)
     const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator, null);

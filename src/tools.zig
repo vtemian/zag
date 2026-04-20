@@ -7,7 +7,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const Hooks = @import("Hooks.zig");
-const AgentThread = @import("AgentThread.zig");
+const agent_events = @import("agent_events.zig");
 const json_schema = @import("json_schema.zig");
 const Allocator = std.mem.Allocator;
 
@@ -15,6 +15,13 @@ const Allocator = std.mem.Allocator;
 /// Set by Registry.execute() before calling the tool function,
 /// allowing stateless function pointers to identify themselves.
 pub threadlocal var current_tool_name: ?[]const u8 = null;
+
+/// Thread-local event queue pointer used by `luaToolExecute` to round-trip
+/// a Lua tool call to the main thread. Set by the agent loop at the top
+/// of `runLoopStreaming` and by each parallel tool worker before calling
+/// `tools.execute`; cleared on exit. Lives here because this file owns
+/// the sole consumer (`luaToolExecute`).
+pub threadlocal var lua_request_queue: ?*agent_events.EventQueue = null;
 
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
@@ -119,8 +126,8 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
 
 /// Static function pointer shared by all Lua-defined tools. Runs on the
 /// caller's thread (agent loop or parallel tool worker) and round-trips
-/// through the main thread via `AgentThread.lua_request_queue` because
-/// Lua state may only be touched from the main thread.
+/// through the main thread via `lua_request_queue` because Lua state may
+/// only be touched from the main thread.
 pub fn luaToolExecute(
     input_raw: []const u8,
     allocator: Allocator,
@@ -129,7 +136,7 @@ pub fn luaToolExecute(
     _ = cancel; // Lua tools round-trip through the main thread; the cancel pointer
     // could be wired into the request so long-running Lua tools poll it,
     // but today all Lua tools complete quickly.
-    const queue = AgentThread.lua_request_queue orelse return .{
+    const queue = lua_request_queue orelse return .{
         .content = "error: no lua queue bound for this thread",
         .is_error = true,
         .owned = false,

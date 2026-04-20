@@ -24,13 +24,6 @@ pub const AgentEvent = agent_events.AgentEvent;
 pub const EventQueue = agent_events.EventQueue;
 pub const CancelFlag = agent_events.CancelFlag;
 
-/// Thread-local event queue pointer used by `tools.luaToolExecute` to
-/// round-trip a Lua tool call to the main thread. Set at the start of the
-/// agent loop (and at the start of each parallel worker), cleared on exit.
-/// Lives here because AgentThread owns `EventQueue`; placing the threadlocal
-/// upstream of tools.zig avoids a cycle.
-pub threadlocal var lua_request_queue: ?*EventQueue = null;
-
 /// Spawn a background thread running the streaming agent loop.
 /// The thread calls agent.runLoopStreaming, pushing events to the queue.
 /// Returns the thread handle; the caller must join it when done.
@@ -69,8 +62,8 @@ fn threadMain(
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
-    lua_request_queue = queue;
-    defer lua_request_queue = null;
+    tools.lua_request_queue = queue;
+    defer tools.lua_request_queue = null;
     if (lua_engine) |eng| eng.activate();
     defer if (lua_engine) |eng| eng.deactivate();
 
