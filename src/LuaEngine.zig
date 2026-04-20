@@ -113,6 +113,11 @@ pub const LuaEngine = struct {
         /// Retired + freed in retireTask; joiners resumed with (true, nil)
         /// or (nil, "cancelled") based on self.scope.isCancelled at retirement.
         joiners: std.ArrayList(i32) = .empty,
+        /// Arena holding argv/cwd/env strings for an in-flight zag.cmd.
+        /// Null when the task isn't currently waiting on a cmd_exec job.
+        /// Cleaned up by resumeFromJob after the result is pushed onto the
+        /// coroutine stack (Lua has copied the data via pushString by then).
+        cmd_arena: ?*std.heap.ArenaAllocator = null,
     };
 
     /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
@@ -251,6 +256,16 @@ pub const LuaEngine = struct {
         lua.setField(-2, "spawn");
         lua.pushFunction(zlua.wrap(zagDetachFn));
         lua.setField(-2, "detach");
+
+        // zag.cmd is a callable table so later tasks can hang spawn/kill
+        // off the same name. Stack after this block: [zag_table].
+        lua.newTable(); // [zag_table, cmd_table]
+        lua.newTable(); // [zag_table, cmd_table, mt]
+        lua.pushFunction(zlua.wrap(zagCmdCallFn));
+        lua.setField(-2, "__call"); // mt.__call = fn; [zag_table, cmd_table, mt]
+        lua.setMetatable(-2); // setmetatable(cmd_table, mt); [zag_table, cmd_table]
+        lua.setField(-2, "cmd"); // zag.cmd = cmd_table; [zag_table]
+
         lua.setGlobal("zag");
     }
 
@@ -383,6 +398,145 @@ pub const LuaEngine = struct {
             co.raiseErrorStr("%s", .{msg.ptr});
         };
         return 0;
+    }
+
+    /// `zag.cmd(argv, opts?)` — run a subprocess to completion and return a
+    /// result table `{ code, stdout, stderr, truncated }` on success or
+    /// `(nil, err_tag)` on failure. Yields until the worker pool finishes.
+    ///
+    /// Registered as a callable table (`__call` metamethod), which makes
+    /// `zag.cmd` itself a Lua table; later tasks hang `.spawn`/`.kill` off
+    /// it. When invoked as `zag.cmd(argv, opts)`, Lua passes the table as
+    /// arg 1 and the user arguments as args 2+.
+    ///
+    /// Opts handled here: `cwd`, `timeout_ms`, `max_output_bytes`. `stdin`,
+    /// `env_extra`, `env_replace` are wired in Task 6.3.
+    fn zagCmdCallFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("zag.cmd must be called inside zag.async/hook/keymap", .{});
+        }
+
+        // __call invocation layout: [cmd_table, argv, opts?]. argv is always
+        // at slot 2 because we only register zag.cmd as a callable table.
+        const argv_idx: i32 = 2;
+        const opts_idx: i32 = 3;
+
+        if (!co.isTable(argv_idx)) {
+            co.raiseErrorStr("zag.cmd: arg 1 must be argv table", .{});
+        }
+
+        const argv_len: usize = @intCast(co.rawLen(argv_idx));
+        if (argv_len == 0) {
+            co.raiseErrorStr("zag.cmd: argv empty", .{});
+        }
+
+        // Stage argv/opts strings in a per-task arena so cleanup is one call
+        // regardless of how many argv entries there are. Arena is owned by
+        // Task.cmd_arena once it's attached; prior to that we own it here.
+        const arena_ptr = engine.allocator.create(std.heap.ArenaAllocator) catch {
+            co.raiseErrorStr("zag.cmd arena alloc failed", .{});
+        };
+        arena_ptr.* = std.heap.ArenaAllocator.init(engine.allocator);
+        const arena = arena_ptr.allocator();
+
+        const argv = arena.alloc([]const u8, argv_len) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.cmd argv alloc failed", .{});
+        };
+        var i: usize = 0;
+        while (i < argv_len) : (i += 1) {
+            _ = co.rawGetIndex(argv_idx, @intCast(i + 1));
+            defer co.pop(1);
+            const s = co.toString(-1) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd: argv[%d] is not a string", .{@as(i32, @intCast(i + 1))});
+            };
+            argv[i] = arena.dupe(u8, s) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd argv dupe failed", .{});
+            };
+        }
+
+        var opts_cwd: ?[]const u8 = null;
+        var timeout_ms: u64 = 30_000;
+        var max_output: usize = 10 * 1024 * 1024;
+
+        if (co.isTable(opts_idx)) {
+            _ = co.getField(opts_idx, "cwd");
+            if (co.isString(-1)) {
+                const s = co.toString(-1) catch "";
+                opts_cwd = arena.dupe(u8, s) catch null;
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "timeout_ms");
+            if (co.isInteger(-1)) {
+                const v = co.toInteger(-1) catch 30_000;
+                timeout_ms = if (v < 0) 0 else @intCast(v);
+            }
+            co.pop(1);
+
+            _ = co.getField(opts_idx, "max_output_bytes");
+            if (co.isInteger(-1)) {
+                const v = co.toInteger(-1) catch @as(i64, @intCast(max_output));
+                max_output = if (v < 0) 0 else @intCast(v);
+            }
+            co.pop(1);
+        }
+
+        const task = engine.taskForCoroutine(co) orelse {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.cmd: no task for this coroutine", .{});
+        };
+
+        const job = engine.allocator.create(async_job.Job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.cmd job alloc failed", .{});
+        };
+        job.* = .{
+            .kind = .{ .cmd_exec = .{
+                .argv = argv,
+                .cwd = opts_cwd,
+                .timeout_ms = timeout_ms,
+                .max_output_bytes = max_output,
+            } },
+            .thread_ref = task.thread_ref,
+            .scope = task.scope,
+        };
+        task.pending_job = job;
+        task.cmd_arena = arena_ptr;
+
+        if (task.scope.isCancelled()) {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.cmd_arena = null;
+            co.pushNil();
+            _ = co.pushString("cancelled");
+            return 2;
+        }
+
+        engine.io_pool.?.submit(job) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            engine.allocator.destroy(job);
+            task.pending_job = null;
+            task.cmd_arena = null;
+            co.pushNil();
+            _ = co.pushString("io_error: submit failed");
+            return 2;
+        };
+
+        co.yield(0);
+        // yield is noreturn on Lua 5.4.
     }
 
     /// Call once during LuaEngine.init after openLibs to register the
@@ -1404,6 +1558,15 @@ pub const LuaEngine = struct {
         const err_detail = job.err_detail;
         self.allocator.destroy(job);
 
+        // Result strings have been copied onto the coroutine stack; the
+        // per-task cmd arena (argv/cwd copies) is safe to free here, before
+        // the coroutine resumes and reuses the task.
+        if (task.cmd_arena) |a| {
+            a.deinit();
+            self.allocator.destroy(a);
+            task.cmd_arena = null;
+        }
+
         self.resumeTask(task, num_values);
 
         if (err_detail) |d| self.allocator.free(d);
@@ -1440,18 +1603,34 @@ pub const LuaEngine = struct {
                 return 2;
             },
             .cmd_exec => {
-                // Task 6.2 wires the proper result table (code/stdout/stderr/
-                // truncated). For now push a placeholder and free the owned
-                // buffers so cmd_exec jobs routed through the pool don't leak
-                // when the eventual binding isn't yet reading them.
-                if (job.result) |r| switch (r) {
-                    .cmd_exec => |cr| {
-                        self.allocator.free(cr.stdout);
-                        self.allocator.free(cr.stderr);
-                    },
-                    else => {},
+                // On success worker populated job.result.cmd_exec. Null
+                // result with no err_tag is a worker bug — surface a generic
+                // io_error rather than faulting so the coroutine can observe it.
+                const r = blk: {
+                    if (job.result) |res| switch (res) {
+                        .cmd_exec => |cr| break :blk cr,
+                        else => {},
+                    };
+                    co.pushNil();
+                    _ = co.pushString("io_error: cmd_exec missing result");
+                    return 2;
                 };
-                co.pushBoolean(true);
+
+                co.newTable();
+                co.pushInteger(r.code);
+                co.setField(-2, "code");
+                _ = co.pushString(r.stdout);
+                co.setField(-2, "stdout");
+                _ = co.pushString(r.stderr);
+                co.setField(-2, "stderr");
+                co.pushBoolean(r.truncated);
+                co.setField(-2, "truncated");
+
+                // Lua copied the bytes via pushString; the worker-owned
+                // heap slices can go back to the allocator now.
+                self.allocator.free(r.stdout);
+                self.allocator.free(r.stderr);
+
                 co.pushNil();
                 return 2;
             },
@@ -2650,5 +2829,51 @@ test "task:join returns (nil, 'cancelled') when target is cancelled" {
     const err_str = try eng.lua.toString(-1);
     try std.testing.expect(std.mem.eql(u8, err_str, "cancelled"));
     eng.lua.pop(1);
+    eng.lua.pop(1);
+}
+
+test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_cmd()
+        \\  local r, err = zag.cmd({ "/bin/echo", "hello" })
+        \\  _cmd_err_is_nil = (err == nil)
+        \\  if r then
+        \\    _cmd_code = r.code
+        \\    _cmd_stdout = r.stdout
+        \\    _cmd_truncated = r.truncated
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_cmd");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_cmd_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cmd_code");
+    try std.testing.expectEqual(@as(i64, 0), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cmd_stdout");
+    const stdout = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, stdout, "hello"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_cmd_truncated");
+    try std.testing.expect(!eng.lua.toBoolean(-1));
     eng.lua.pop(1);
 }
