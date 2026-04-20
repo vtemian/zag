@@ -633,7 +633,12 @@ pub const LuaEngine = struct {
     /// helper thread hold a raw `*CmdHandle` without worrying about
     /// garbage collection reallocating the userdata's inline storage.
     pub const CmdHandleUd = struct {
-        ptr: *cmd_handle_mod.CmdHandle,
+        /// Optional so the userdata can be put on the Lua stack with a
+        /// stub value BEFORE `CmdHandle.init` runs. If any Lua call
+        /// between newUserdata and setMetatable longjmps on OOM, the
+        /// userdata still has a metatable whose `__gc` safely no-ops
+        /// on a null pointer.
+        ptr: ?*cmd_handle_mod.CmdHandle,
 
         pub const METATABLE_NAME = cmd_handle_mod.CmdHandle.METATABLE_NAME;
     };
@@ -775,6 +780,17 @@ pub const LuaEngine = struct {
             co.raiseErrorStr("zag.cmd.spawn: async runtime not initialized", .{});
         };
 
+        // Pre-allocate the userdata slot with a null pointer and attach
+        // the metatable BEFORE calling CmdHandle.init. If newUserdata or
+        // setMetatable longjmps (Lua OOM), the child/helper thread have
+        // not been created yet — nothing to leak. If they succeed and
+        // init later fails, __gc runs on a null-ptr userdata and is a
+        // no-op; we clean up the arena inline and raise the error.
+        const ud = co.newUserdata(CmdHandleUd, 0);
+        ud.* = .{ .ptr = null };
+        _ = co.getMetatableRegistry(CmdHandleUd.METATABLE_NAME);
+        co.setMetatable(-2);
+
         const handle = cmd_handle_mod.CmdHandle.init(
             engine.allocator,
             completions,
@@ -789,11 +805,7 @@ pub const LuaEngine = struct {
             const msg = std.fmt.bufPrintZ(&buf, "zag.cmd.spawn failed: {s}", .{@errorName(err)}) catch "zag.cmd.spawn failed";
             co.raiseErrorStr("%s", .{msg.ptr});
         };
-
-        const ud = co.newUserdata(CmdHandleUd, 0);
-        ud.* = .{ .ptr = handle };
-        _ = co.getMetatableRegistry(CmdHandleUd.METATABLE_NAME);
-        co.setMetatable(-2);
+        ud.ptr = handle;
         return 1;
     }
 
@@ -824,7 +836,9 @@ pub const LuaEngine = struct {
     fn cmdHandleWait(co: *Lua) i32 {
         const engine = getEngineFromState(co);
         const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
-        const h = ud.ptr;
+        const h = ud.ptr orelse {
+            co.raiseErrorStr("cmd:wait: invalid handle", .{});
+        };
 
         // Fast path: child already reaped. Synchronous (code, nil).
         if (h.state.load(.acquire) == .exited) {
@@ -836,17 +850,24 @@ pub const LuaEngine = struct {
         if (!co.isYieldable()) {
             co.raiseErrorStr("cmd:wait must be called inside a coroutine", .{});
         }
-        if (h.wait_thread_ref != null) {
-            co.raiseErrorStr("cmd:wait already has a waiting coroutine", .{});
-        }
 
         const task = engine.taskForCoroutine(co) orelse {
             co.raiseErrorStr("cmd:wait: no task for this coroutine", .{});
         };
 
-        h.wait_thread_ref = task.thread_ref;
+        // Atomic transition .running -> .waiting. Fails if another
+        // coroutine is already suspended in :wait or the child has
+        // already exited (the fast path above catches the latter, but
+        // another thread could have won the race).
+        if (!h.claimWaitSlot()) {
+            co.raiseErrorStr("cmd:wait already has a waiting coroutine", .{});
+        }
+
         h.submit(.{ .wait = .{ .thread_ref = task.thread_ref } }) catch {
-            h.wait_thread_ref = null;
+            // Revert the slot claim so GC cleanup can proceed with the
+            // `.running` fast path instead of thinking a waiter is
+            // pending forever.
+            h.state.store(.running, .release);
             co.pushNil();
             _ = co.pushString("io_error: cmd:wait submit failed");
             return 2;
@@ -855,18 +876,21 @@ pub const LuaEngine = struct {
         co.yield(0);
     }
 
-    /// `CmdHandle:kill(signal)` — synchronous SIGNAL delivery. Returns
-    /// nothing. Safe to call from any coroutine; does NOT yield. Known
-    /// signals: "TERM", "KILL", "INT", "HUP". Calling after `:wait()`
-    /// has already returned is a no-op (the child is reaped; the PID
-    /// may have been recycled and we should not blindly kill it).
+    /// `CmdHandle:kill(signal)` — deliver a signal to the child. Does
+    /// not yield; the call routes the kill through the helper thread
+    /// (which also owns `child.wait()`) so the signal cannot race the
+    /// kernel recycling the child's PID after reap. Known signals:
+    /// TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT. Calling
+    /// after `:wait()` has returned is a no-op.
     fn cmdHandleKill(lua: *Lua) i32 {
         const ud = lua.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
-        const h = ud.ptr;
+        const h = ud.ptr orelse {
+            lua.raiseErrorStr("cmd:kill: invalid handle", .{});
+        };
 
         const sig_name = lua.checkString(2);
         const signo = cmd_handle_mod.signalNameToNum(sig_name) orelse {
-            lua.raiseErrorStr("cmd:kill: unknown signal (valid: TERM, KILL, INT, HUP)", .{});
+            lua.raiseErrorStr("cmd:kill: unknown signal (valid: TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT)", .{});
         };
 
         if (h.state.load(.acquire) == .exited) {
@@ -874,8 +898,11 @@ pub const LuaEngine = struct {
             return 0;
         }
 
-        std.posix.kill(h.child.id, signo) catch |err| {
-            log.debug("cmd:kill kill failed: {s}", .{@errorName(err)});
+        // Route through the helper so the kill is serialised with the
+        // helper's `child.wait()` call. If a wait is already queued
+        // the kill still lands first (FIFO order on the queue).
+        h.submit(.{ .kill = .{ .signo = signo } }) catch |err| {
+            log.debug("cmd:kill submit failed: {s}", .{@errorName(err)});
         };
         return 0;
     }
@@ -886,7 +913,11 @@ pub const LuaEngine = struct {
     /// user called `:wait()` properly this is a cheap no-op.
     fn cmdHandleGc(lua: *Lua) i32 {
         const ud = lua.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
-        ud.ptr.shutdownAndCleanup();
+        // Null ptr is the "spawn failed between newUserdata and
+        // CmdHandle.init" case — nothing was created, nothing to tear
+        // down.
+        const h = ud.ptr orelse return 0;
+        h.shutdownAndCleanup();
         return 0;
     }
 
@@ -3435,4 +3466,71 @@ test "zag.cmd.spawn of short-lived process: wait returns code 0" {
     eng.lua.pop(1);
 
     try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.spawn :wait after child exited returns code" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_post_exit()
+        \\  local h = zag.cmd.spawn({ "/usr/bin/true" })
+        \\  zag.sleep(50)
+        \\  local code, err = h:wait()
+        \\  _pe_code = code
+        \\  _pe_err_is_nil = (err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_post_exit");
+    _ = try eng.spawnCoroutine(0, null);
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_pe_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_code");
+    try std.testing.expectEqual(@as(i64, 0), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.spawn GC without :wait reaps child cleanly" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_gc_no_wait()
+        \\  local h = zag.cmd.spawn({ "/bin/sleep", "5" })
+        \\  h = nil
+        \\  collectgarbage("collect")
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_gc_no_wait");
+    _ = try eng.spawnCoroutine(0, null);
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+    // Reaching here without testing.allocator reporting leaks means
+    // the SIGKILL + helper-reap + join path closed every resource.
 }
