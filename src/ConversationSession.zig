@@ -18,6 +18,10 @@ allocator: Allocator,
 messages: std.ArrayList(types.Message) = .empty,
 /// Open session file for persistence (null if unsaved session).
 session_handle: ?*Session.SessionHandle = null,
+/// Set to true by callers when a persist attempt has failed. The
+/// compositor consults this to surface a status-bar warning; once
+/// tripped it stays true for the remainder of the session.
+persist_failed: bool = false,
 
 pub fn init(allocator: Allocator) ConversationSession {
     return .{ .allocator = allocator };
@@ -46,22 +50,26 @@ pub fn appendUserMessage(self: *ConversationSession, text: []const u8) !void {
 }
 
 /// Persist an event to the session JSONL file, if a session is attached.
-/// Failures are logged but not propagated; persistence is best-effort.
-pub fn persistEvent(self: *ConversationSession, entry: Session.Entry) void {
+/// Propagates errors so callers can decide whether to log and flip the
+/// `persist_failed` flag or abort the operation.
+pub fn persistEvent(self: *ConversationSession, entry: Session.Entry) !void {
     const sh = self.session_handle orelse return;
-    sh.appendEntry(entry) catch |err| {
-        log.warn("session persist failed: {}", .{err});
-    };
+    try sh.appendEntry(entry);
 }
 
 /// Persist a user_message entry with the current timestamp. Convenience
-/// wrapper around `persistEvent` for the submit path.
+/// wrapper around `persistEvent` for the submit path. Errors are logged
+/// and flip `persist_failed`; the caller continues since we have already
+/// accepted the message into the conversation history.
 pub fn persistUserMessage(self: *ConversationSession, text: []const u8) void {
     self.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
         .timestamp = std.time.milliTimestamp(),
-    });
+    }) catch |err| {
+        log.err("session persist failed: {}", .{err});
+        self.persist_failed = true;
+    };
 }
 
 /// Reconstruct the LLM message history from loaded entries.
@@ -193,6 +201,50 @@ test "init and deinit" {
     defer s.deinit();
     try std.testing.expectEqual(@as(usize, 0), s.messages.items.len);
     try std.testing.expect(s.session_handle == null);
+    try std.testing.expect(s.persist_failed == false);
+}
+
+test "persistEvent propagates errors from a closed file handle" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("closed.jsonl", .{ .truncate = true });
+    // Close immediately so the subsequent write on the stale handle fails.
+    file.close();
+
+    var handle = Session.SessionHandle{
+        .file = file,
+        .meta = Session.Meta{},
+        .allocator = allocator,
+    };
+
+    var s = ConversationSession.init(allocator);
+    defer s.deinit();
+    s.attachSession(&handle);
+
+    const result = s.persistEvent(.{
+        .entry_type = .user_message,
+        .content = "hello",
+        .timestamp = 0,
+    });
+    // The exact error kind depends on the platform write syscall; we just
+    // require that persistEvent surfaced something rather than swallowed it.
+    try std.testing.expect(std.meta.isError(result));
+}
+
+test "persistEvent is a no-op when no session is attached" {
+    const allocator = std.testing.allocator;
+    var s = ConversationSession.init(allocator);
+    defer s.deinit();
+
+    try s.persistEvent(.{
+        .entry_type = .user_message,
+        .content = "hello",
+        .timestamp = 0,
+    });
+    try std.testing.expect(s.persist_failed == false);
 }
 
 test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
