@@ -143,7 +143,12 @@ pub fn main() !void {
     defer layout.deinit();
     try layout.setRoot(root_buffer.buf());
 
-    var provider = try llm.createProviderFromEnv(allocator);
+    // TODO(env-to-lua Task 8): move Lua init + loadUserConfig ahead of this
+    // line and pass engine.default_model instead of null. The path stays as
+    // the hardcoded well-known location across the reorder.
+    const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{std.posix.getenv("HOME") orelse "."});
+    defer allocator.free(auth_path);
+    var provider = try llm.createProviderFromLuaConfig(null, auth_path, allocator);
     defer provider.deinit();
 
     var registry = try tools.createDefaultRegistry(allocator);
