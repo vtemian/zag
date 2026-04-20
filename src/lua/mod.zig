@@ -12,5 +12,6 @@ test {
     _ = @import("LuaCompletionQueue.zig");
     _ = @import("LuaIoPool.zig");
     _ = @import("primitives/cmd.zig");
+    _ = @import("primitives/cmd_handle.zig");
     _ = @import("integration_test.zig");
 }

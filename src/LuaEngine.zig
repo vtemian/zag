@@ -20,6 +20,7 @@ const async_pool = @import("lua/LuaIoPool.zig");
 const async_completions = @import("lua/LuaCompletionQueue.zig");
 const async_scope = @import("lua/Scope.zig");
 const async_job = @import("lua/Job.zig");
+const cmd_handle_mod = @import("lua/primitives/cmd_handle.zig");
 
 /// Whether the Lua sandbox strips dangerous globals before user code runs.
 /// A shared plugin marketplace should never be one `os.execute("rm -rf ~")`
@@ -155,6 +156,7 @@ pub const LuaEngine = struct {
 
         injectZagGlobal(lua);
         try registerTaskHandleMt(lua);
+        try registerCmdHandleMt(lua);
 
         var keymap_registry = Keymap.Registry.init(allocator);
         errdefer keymap_registry.deinit();
@@ -257,9 +259,11 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagDetachFn));
         lua.setField(-2, "detach");
 
-        // zag.cmd is a callable table so later tasks can hang spawn/kill
+        // zag.cmd is a callable table so we can hang zag.cmd.spawn et al.
         // off the same name. Stack after this block: [zag_table].
         lua.newTable(); // [zag_table, cmd_table]
+        lua.pushFunction(zlua.wrap(zagCmdSpawnFn));
+        lua.setField(-2, "spawn"); // zag.cmd.spawn = fn; [zag_table, cmd_table]
         lua.newTable(); // [zag_table, cmd_table, mt]
         lua.pushFunction(zlua.wrap(zagCmdCallFn));
         lua.setField(-2, "__call"); // mt.__call = fn; [zag_table, cmd_table, mt]
@@ -621,6 +625,269 @@ pub const LuaEngine = struct {
 
         co.yield(0);
         // yield is noreturn on Lua 5.4.
+    }
+
+    /// Lua userdata payload for a `CmdHandle`. Storing a pointer (rather
+    /// than embedding the struct) keeps the handle's address stable
+    /// regardless of how Lua moves the userdata around, and lets the
+    /// helper thread hold a raw `*CmdHandle` without worrying about
+    /// garbage collection reallocating the userdata's inline storage.
+    pub const CmdHandleUd = struct {
+        ptr: *cmd_handle_mod.CmdHandle,
+
+        pub const METATABLE_NAME = cmd_handle_mod.CmdHandle.METATABLE_NAME;
+    };
+
+    /// `zag.cmd.spawn(argv, opts?)` — spawn a long-lived child process
+    /// and return a `CmdHandle` userdata. For 6.4a `opts` honours
+    /// `cwd`, `env`, and `env_extra` (same semantics as `zag.cmd`);
+    /// `stdin`, `max_output_bytes`, and `timeout_ms` are intentionally
+    /// absent — they belong to `:write`/`:lines`/per-op deadlines
+    /// implemented in 6.4b/6.4c.
+    fn zagCmdSpawnFn(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+
+        const argv_idx: i32 = 1;
+        const opts_idx: i32 = 2;
+
+        if (!co.isTable(argv_idx)) {
+            co.raiseErrorStr("zag.cmd.spawn: arg 1 must be argv table", .{});
+        }
+        const argv_len: usize = @intCast(co.rawLen(argv_idx));
+        if (argv_len == 0) {
+            co.raiseErrorStr("zag.cmd.spawn: argv empty", .{});
+        }
+
+        // Stage argv/cwd/env into an arena that lives for the handle's
+        // whole lifetime. The CmdHandle owns it and frees it in
+        // shutdownAndCleanup.
+        const arena_ptr = engine.allocator.create(std.heap.ArenaAllocator) catch {
+            co.raiseErrorStr("zag.cmd.spawn arena alloc failed", .{});
+        };
+        arena_ptr.* = std.heap.ArenaAllocator.init(engine.allocator);
+        const arena = arena_ptr.allocator();
+
+        const argv = arena.alloc([]const u8, argv_len) catch {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.cmd.spawn argv alloc failed", .{});
+        };
+        var i: usize = 0;
+        while (i < argv_len) : (i += 1) {
+            _ = co.rawGetIndex(argv_idx, @intCast(i + 1));
+            defer co.pop(1);
+            const s = co.toString(-1) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd.spawn: argv[%d] is not a string", .{@as(i32, @intCast(i + 1))});
+            };
+            argv[i] = arena.dupe(u8, s) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd.spawn argv dupe failed", .{});
+            };
+        }
+
+        var opts: cmd_handle_mod.CmdHandle.SpawnOpts = .{};
+
+        if (co.isTable(opts_idx)) {
+            _ = co.getField(opts_idx, "cwd");
+            if (co.isString(-1)) {
+                const s = co.toString(-1) catch "";
+                opts.cwd = arena.dupe(u8, s) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.cmd.spawn opts.cwd dupe failed", .{});
+                };
+            }
+            co.pop(1);
+
+            // env vs env_extra. Same rules as zag.cmd: mutually
+            // exclusive; env replaces, env_extra overlays on top of
+            // the inherited environment.
+            const has_env = blk: {
+                _ = co.getField(opts_idx, "env");
+                const t = co.isTable(-1);
+                co.pop(1);
+                break :blk t;
+            };
+            const has_env_extra = blk: {
+                _ = co.getField(opts_idx, "env_extra");
+                const t = co.isTable(-1);
+                co.pop(1);
+                break :blk t;
+            };
+            if (has_env and has_env_extra) {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.cmd.spawn: opts.env and opts.env_extra are mutually exclusive", .{});
+            }
+
+            if (has_env or has_env_extra) {
+                var env_map = std.process.EnvMap.init(arena);
+                // env_extra overlays on top of the inherited env, so
+                // seed the map with the parent's environment first.
+                if (has_env_extra) {
+                    var sys_env = std.process.getEnvMap(arena) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.cmd.spawn: getEnvMap failed", .{});
+                    };
+                    var sit = sys_env.iterator();
+                    while (sit.next()) |e| env_map.put(e.key_ptr.*, e.value_ptr.*) catch {};
+                }
+
+                const field_name: [:0]const u8 = if (has_env) "env" else "env_extra";
+                _ = co.getField(opts_idx, field_name);
+                co.pushNil();
+                while (co.next(-2)) {
+                    if (!co.isString(-2) or !co.isString(-1)) {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.cmd.spawn opts.env entries must be string->string", .{});
+                    }
+                    const k = co.toString(-2) catch "";
+                    const v = co.toString(-1) catch "";
+                    env_map.put(k, v) catch {
+                        arena_ptr.deinit();
+                        engine.allocator.destroy(arena_ptr);
+                        co.raiseErrorStr("zag.cmd.spawn opts.env put failed", .{});
+                    };
+                    co.pop(1);
+                }
+                co.pop(1); // env_table
+                opts.env_mode = if (has_env) .replace else .extend;
+                opts.env_map = env_map;
+            }
+        }
+
+        // CmdHandle needs a Scope pointer to stuff into completion
+        // jobs; the root scope is the right borrow since the handle's
+        // lifetime is driven by Lua GC, not by any individual task.
+        const root = engine.root_scope orelse {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.cmd.spawn: async runtime not initialized", .{});
+        };
+        const completions = engine.completions orelse {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            co.raiseErrorStr("zag.cmd.spawn: async runtime not initialized", .{});
+        };
+
+        const handle = cmd_handle_mod.CmdHandle.init(
+            engine.allocator,
+            completions,
+            root,
+            arena_ptr,
+            argv,
+            opts,
+        ) catch |err| {
+            arena_ptr.deinit();
+            engine.allocator.destroy(arena_ptr);
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.cmd.spawn failed: {s}", .{@errorName(err)}) catch "zag.cmd.spawn failed";
+            co.raiseErrorStr("%s", .{msg.ptr});
+        };
+
+        const ud = co.newUserdata(CmdHandleUd, 0);
+        ud.* = .{ .ptr = handle };
+        _ = co.getMetatableRegistry(CmdHandleUd.METATABLE_NAME);
+        co.setMetatable(-2);
+        return 1;
+    }
+
+    /// Register the CmdHandle metatable so userdata returned from
+    /// `zag.cmd.spawn` carries `:wait`, `:kill`, and `__gc`.
+    fn registerCmdHandleMt(lua: *Lua) !void {
+        try lua.newMetatable(CmdHandleUd.METATABLE_NAME);
+        lua.pushFunction(zlua.wrap(cmdHandleWait));
+        lua.setField(-2, "wait");
+        lua.pushFunction(zlua.wrap(cmdHandleKill));
+        lua.setField(-2, "kill");
+        // __index = self so `h:wait()` dispatches to wait(h).
+        lua.pushValue(-1);
+        lua.setField(-2, "__index");
+        lua.pushFunction(zlua.wrap(cmdHandleGc));
+        lua.setField(-2, "__gc");
+        lua.pop(1);
+    }
+
+    /// `CmdHandle:wait()` — yield the caller's coroutine until the
+    /// child exits; resume with (code, nil). Signal-killed children
+    /// return a negative code (e.g. -9 for SIGKILL). If the child has
+    /// already exited, returns synchronously.
+    ///
+    /// v1 limitation: only one coroutine may be inside `:wait()` at a
+    /// time per handle. A second concurrent call raises a Lua error.
+    /// A single handle is normally awaited by its owning task anyway.
+    fn cmdHandleWait(co: *Lua) i32 {
+        const engine = getEngineFromState(co);
+        const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        const h = ud.ptr;
+
+        // Fast path: child already reaped. Synchronous (code, nil).
+        if (h.state.load(.acquire) == .exited) {
+            co.pushInteger(h.exit_code orelse -1);
+            co.pushNil();
+            return 2;
+        }
+
+        if (!co.isYieldable()) {
+            co.raiseErrorStr("cmd:wait must be called inside a coroutine", .{});
+        }
+        if (h.wait_thread_ref != null) {
+            co.raiseErrorStr("cmd:wait already has a waiting coroutine", .{});
+        }
+
+        const task = engine.taskForCoroutine(co) orelse {
+            co.raiseErrorStr("cmd:wait: no task for this coroutine", .{});
+        };
+
+        h.wait_thread_ref = task.thread_ref;
+        h.submit(.{ .wait = .{ .thread_ref = task.thread_ref } }) catch {
+            h.wait_thread_ref = null;
+            co.pushNil();
+            _ = co.pushString("io_error: cmd:wait submit failed");
+            return 2;
+        };
+
+        co.yield(0);
+    }
+
+    /// `CmdHandle:kill(signal)` — synchronous SIGNAL delivery. Returns
+    /// nothing. Safe to call from any coroutine; does NOT yield. Known
+    /// signals: "TERM", "KILL", "INT", "HUP". Calling after `:wait()`
+    /// has already returned is a no-op (the child is reaped; the PID
+    /// may have been recycled and we should not blindly kill it).
+    fn cmdHandleKill(lua: *Lua) i32 {
+        const ud = lua.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        const h = ud.ptr;
+
+        const sig_name = lua.checkString(2);
+        const signo = cmd_handle_mod.signalNameToNum(sig_name) orelse {
+            lua.raiseErrorStr("cmd:kill: unknown signal (valid: TERM, KILL, INT, HUP)", .{});
+        };
+
+        if (h.state.load(.acquire) == .exited) {
+            // Child already reaped — nothing to signal.
+            return 0;
+        }
+
+        std.posix.kill(h.child.id, signo) catch |err| {
+            log.debug("cmd:kill kill failed: {s}", .{@errorName(err)});
+        };
+        return 0;
+    }
+
+    /// `__gc` metamethod — Lua calls this when the userdata becomes
+    /// unreachable. Idempotent cleanup: SIGKILL + reap the child if
+    /// still running, join the helper thread, free the handle. If the
+    /// user called `:wait()` properly this is a cheap no-op.
+    fn cmdHandleGc(lua: *Lua) i32 {
+        const ud = lua.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
+        ud.ptr.shutdownAndCleanup();
+        return 0;
     }
 
     /// Call once during LuaEngine.init after openLibs to register the
@@ -1715,6 +1982,14 @@ pub const LuaEngine = struct {
                 self.allocator.free(r.stdout);
                 self.allocator.free(r.stderr);
 
+                co.pushNil();
+                return 2;
+            },
+            .cmd_wait_done => |w| {
+                // CmdHandle:wait() resumes with (code, nil). Child is
+                // already reaped by the helper thread; nothing else to
+                // clean up here.
+                co.pushInteger(w.code);
                 co.pushNil();
                 return 2;
             },
@@ -3080,4 +3355,84 @@ test "zag.cmd timeout_ms kills long-running process" {
     eng.lua.pop(1);
     // Must NOT have waited the full 10s.
     try std.testing.expect(elapsed < 2000);
+}
+
+test "zag.cmd.spawn + kill + wait returns signal-coded exit" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_spawn_kill()
+        \\  local h = zag.cmd.spawn({ "/bin/sleep", "5" })
+        \\  h:kill("KILL")
+        \\  local code, err = h:wait()
+        \\  _spawn_kill_err_is_nil = (err == nil)
+        \\  _spawn_kill_code_negative = (code ~= nil and code < 0)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_spawn_kill");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_spawn_kill_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_spawn_kill_code_negative");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    // Force the userdata to be collected so its __gc runs before we
+    // tear down the engine. Otherwise the handle's helper thread
+    // outlives deinitAsync and we race on completions.
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
+test "zag.cmd.spawn of short-lived process: wait returns code 0" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_spawn_quick()
+        \\  local h = zag.cmd.spawn({ "/bin/echo", "hi" })
+        \\  local code, err = h:wait()
+        \\  _spawn_quick_code = code
+        \\  _spawn_quick_err_is_nil = (err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_spawn_quick");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.completions.?.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_spawn_quick_code");
+    try std.testing.expectEqual(@as(i64, 0), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_spawn_quick_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
 }
