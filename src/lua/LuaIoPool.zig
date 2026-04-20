@@ -51,6 +51,7 @@ pub const Pool = struct {
     }
 
     pub fn submit(self: *Pool, job: *Job) !void {
+        if (self.shutdown.load(.acquire)) return error.PoolShuttingDown;
         const node = try self.alloc.create(JobNode);
         node.* = .{ .job = job };
         self.queue_mu.lock();
@@ -99,6 +100,21 @@ test "Pool starts and shuts down cleanly" {
 
     const pool = try Pool.init(alloc, 2, &completions);
     pool.deinit();
+}
+
+test "Pool.submit rejects after shutdown is signalled" {
+    const alloc = testing.allocator;
+    var completions = try CompletionQueue.init(alloc, 16);
+    defer completions.deinit();
+
+    const pool = try Pool.init(alloc, 2, &completions);
+    defer pool.deinit();
+
+    // Signal shutdown manually before submit
+    pool.shutdown.store(true, .release);
+
+    var job = Job{};
+    try testing.expectError(error.PoolShuttingDown, pool.submit(&job));
 }
 
 test "Pool submit routes job to worker and posts to completion queue" {
