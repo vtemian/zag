@@ -1146,6 +1146,16 @@ pub const LuaEngine = struct {
         }
     }
 
+    /// Called by the orchestrator tick after a worker posts a completion.
+    /// The stub destroys the job so tests don't leak; Phase 4 wires real
+    /// lua_resume via thread_ref lookup in self.tasks.
+    pub fn resumeFromJob(self: *LuaEngine, job: *async_job.Job) !void {
+        // TODO(Phase 4): find task via self.tasks.get(job.thread_ref),
+        // push result values onto task.co, call task.co.resumeThread(...).
+        // For now, free the job so the orchestrator drain doesn't leak it.
+        self.allocator.destroy(job);
+    }
+
     /// Hook for agent threads to bind this engine as their active Lua context.
     /// Currently a no-op: Lua tool execution round-trips through the main thread
     /// via `tools.lua_request_queue`, so no per-thread engine pointer is
