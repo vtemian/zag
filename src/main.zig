@@ -50,13 +50,6 @@ fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
 const file_log = @import("file_log.zig");
 pub const std_options: std.Options = .{ .logFn = file_log.handler };
 
-// auth.zig is referenced here so `zig test` picks up its inline test
-// block via transitive import discovery. Task 6 (createProviderFromLuaConfig)
-// will replace this with a real call-site.
-comptime {
-    _ = @import("auth.zig");
-}
-
 /// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
 fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
@@ -143,26 +136,53 @@ pub fn main() !void {
     defer layout.deinit();
     try layout.setRoot(root_buffer.buf());
 
-    // TODO(env-to-lua Task 8): move Lua init + loadUserConfig ahead of this
-    // line and pass engine.default_model instead of null. The path stays as
-    // the hardcoded well-known location across the reorder.
-    const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{std.posix.getenv("HOME") orelse "."});
-    defer allocator.free(auth_path);
-    var provider = try llm.createProviderFromLuaConfig(null, auth_path, allocator);
-    defer provider.deinit();
-
-    var registry = try tools.createDefaultRegistry(allocator);
-    defer registry.deinit();
-
-    // Initialize Lua plugin engine. Init is split from config loading so
-    // we can wire the keymap registry pointer (owned by the orchestrator)
-    // before running config.lua; otherwise `zag.keymap` calls in config.lua
-    // would silently no-op.
+    // Lua engine comes up first so `loadUserConfig` can populate
+    // `default_model` and `enabled_providers` before the provider factory
+    // reads them. The engine owns its keymap registry; keymap overrides in
+    // config.lua land there directly. Input-parser wiring and tool
+    // registration happen after the orchestrator is built because those
+    // state lives on it.
     var lua_engine: ?LuaEngine = LuaEngine.init(allocator) catch |err| blk: {
         log.warn("lua init failed, plugins disabled: {}", .{err});
         break :blk null;
     };
     defer if (lua_engine) |*eng| eng.deinit();
+
+    if (lua_engine) |*eng| {
+        eng.loadUserConfig();
+    }
+
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => blk: {
+            log.warn("HOME unset; falling back to \".\" for auth.json path", .{});
+            break :blk try allocator.dupe(u8, ".");
+        },
+        else => return err,
+    };
+    defer allocator.free(home_dir);
+    const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home_dir});
+    defer allocator.free(auth_path);
+
+    const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
+    var provider = llm.createProviderFromLuaConfig(default_model, auth_path, allocator) catch |err| {
+        if (err == error.MissingCredential) {
+            const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+            const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
+            const spec = llm.parseModelString(model_id);
+            var scratch: [512]u8 = undefined;
+            const message = std.fmt.bufPrint(
+                &scratch,
+                "zag: no credentials for provider '{s}' in ~/.config/zag/auth.json\n",
+                .{spec.provider_name},
+            ) catch "zag: no credentials for configured provider in ~/.config/zag/auth.json\n";
+            _ = stderr_file.write(message) catch {};
+        }
+        return err;
+    };
+    defer provider.deinit();
+
+    var registry = try tools.createDefaultRegistry(allocator);
+    defer registry.deinit();
 
     // Wire the lua engine into the root runner so the main-thread drain loop
     // can service `hook_request` / `lua_tool_request` events pushed by the
@@ -256,15 +276,13 @@ pub fn main() !void {
     // this after orchestrator construction so the pointer is stable.
     compositor.orchestrator = &orchestrator;
 
-    // Wire the orchestrator-owned input parser onto the engine and load
-    // user config. The keymap registry is owned by the engine itself;
-    // `zag.keymap()` overrides land directly on it, and the window
-    // manager reads through `keymapRegistry()` on every key event. Tool
-    // registration follows so config-registered tools reach the dispatch
-    // registry.
+    // Wire the orchestrator-owned input parser onto the engine and register
+    // any Lua-declared tools into the dispatch registry. Config.lua already
+    // ran before provider creation, so the keymap overrides and
+    // default_model are live; escape-timeout overrides only take effect
+    // from here on (that surface is best-effort per the plan).
     if (lua_engine) |*eng| {
         eng.input_parser = &orchestrator.input_parser;
-        eng.loadUserConfig();
         eng.registerTools(&registry) catch |err| {
             log.warn("failed to register lua tools: {}", .{err});
         };
