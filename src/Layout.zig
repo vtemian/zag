@@ -1,8 +1,12 @@
-//! Layout: binary tree of splits and leaves for composable windows.
+//! Layout: binary tree of window splits and leaf geometry.
 //!
-//! Manages a single root node containing a binary tree of window splits.
-//! Leaves hold buffer references and screen rects. The tree is recalculated
-//! from the root whenever the terminal resizes.
+//! Owns: tree node allocation, rect calculation, focus traversal.
+//! Does NOT own: panes, sessions, runners, or any lifecycle state;
+//! leaves hold borrowed `Buffer` handles only.
+//!
+//! The tree is recalculated from the root whenever the terminal
+//! resizes. See `WindowManager` for how Layout is embedded inside
+//! a pane-lifecycle context.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

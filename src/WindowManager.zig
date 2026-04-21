@@ -1,9 +1,15 @@
-//! Layout, panes, focus, and frame-local UI state. Owns the tree of
-//! windows, the list of extra panes (root lives elsewhere), and the
-//! transient-status + spinner counters. The keymap registry is owned
-//! by the Lua engine and accessed via `keymapRegistry()`. Does not own
-//! terminal/screen/compositor or the Lua engine; those are borrowed
-//! from the coordinator.
+//! Window manager: pane lifecycle (session, runner, buffer) plus the
+//! frame-local UI state (mode, transient status, spinner counters).
+//!
+//! Owns: extra_panes (PaneEntry), mode, transient_status + spinner,
+//! and access to the keymap registry (which lives on the Lua engine).
+//! Does NOT own: terminal/screen/compositor or the Lua engine itself;
+//! those are borrowed from the coordinator.
+//!
+//! Delegates tree geometry to `Layout`: `handleResize` calls
+//! `layout.recalculate(cols, rows)` and then walks leaves to notify
+//! their buffers. Layout itself has no knowledge of panes; keep any
+//! new tree/geometry logic there and any new lifecycle logic here.
 
 const std = @import("std");
 const posix = std.posix;
