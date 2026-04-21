@@ -276,9 +276,15 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
 
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
     if (root.get("usage")) |usage| {
         if (usage.object.get("prompt_tokens")) |pt| input_tokens = @intCast(pt.integer);
         if (usage.object.get("completion_tokens")) |ct| output_tokens = @intCast(ct.integer);
+        if (usage.object.get("prompt_tokens_details")) |d| if (d == .object) {
+            if (d.object.get("cached_tokens")) |v| if (v == .integer) {
+                cache_read_tokens = @intCast(v.integer);
+            };
+        };
     }
 
     const message = choice.get("message") orelse return error.MalformedResponse;
@@ -304,7 +310,7 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         }
     }
 
-    return builder.finish(stop_reason, input_tokens, output_tokens, 0, 0, allocator);
+    return builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator);
 }
 
 /// State for accumulating a tool call during OpenAI streaming.
@@ -707,6 +713,21 @@ test "parseResponse handles missing usage gracefully" {
     defer response.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
+}
+
+test "parseResponse captures cached_tokens from prompt_tokens_details" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+        \\ "usage":{"prompt_tokens":20,"completion_tokens":5,
+        \\          "prompt_tokens_details":{"cached_tokens":7}}}
+    ;
+    const response = try parseResponse(json, allocator);
+    defer response.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 20), response.input_tokens);
+    try std.testing.expectEqual(@as(u32, 5), response.output_tokens);
+    try std.testing.expectEqual(@as(u32, 0), response.cache_creation_tokens);
+    try std.testing.expectEqual(@as(u32, 7), response.cache_read_tokens);
 }
 
 test "parseResponse returns error for malformed JSON" {
