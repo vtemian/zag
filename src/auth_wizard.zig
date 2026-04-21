@@ -93,9 +93,43 @@ pub const WizardResult = struct {
     scaffolded_config: bool,
 };
 
-/// Static metadata for one wizard-offered provider. Task 8 extends this with
-/// an optional OAuth callback; until then `PROVIDERS` is pure data and the
-/// wizard always takes the paste-key path.
+/// OAuth login callback signature. Any future browser-OAuth flow (e.g.
+/// `wip/chatgpt-oauth`'s `oauth.runLoginFlow`) conforms to this shape so it
+/// can slot into `ProviderEntry.oauth_fn` via a one-line shim. Arguments:
+/// - `allocator`: transient allocations for PKCE/token exchange.
+/// - `provider_name`: key the credential will be stored under in `auth.json`
+///   (mirrors `ProviderEntry.name`).
+/// - `auth_path`: absolute path to `auth.json` — the OAuth flow writes its
+///   credential entry there directly, atomically, with mode 0o600.
+///
+/// The callback is responsible for persisting the credential to `auth_path`.
+/// It MUST NOT write to `config.lua`; `runWizard` owns the scaffold step so
+/// the paste-key and OAuth paths share identical post-credential behavior.
+pub const OAuthFn = *const fn (allocator: std.mem.Allocator, provider_name: []const u8, auth_path: []const u8) anyerror!void;
+
+/// Static metadata for one wizard-offered provider.
+///
+/// `oauth_fn` is the extension seam for browser-OAuth providers. When null
+/// (the default, and every entry's value on `main` today), `runWizard` takes
+/// the paste-key path. When non-null, `runWizard` delegates to the callback
+/// and skips `promptSecret` entirely; the callback owns writing `auth.json`.
+///
+/// Integration note: when `wip/chatgpt-oauth` lands on main, wiring is a
+/// one-line registration. The OAuth plan registers ChatGPT as a separate
+/// provider key (`openai-oauth`, distinct from `openai`), so the expected
+/// shape is to append a new entry:
+///
+///     .{
+///         .name = "openai-oauth",
+///         .label = "ChatGPT (OAuth)",
+///         .default_model = "openai-oauth/gpt-5",
+///         .oauth_fn = oauth.runLoginFlowForOpenAI,
+///     },
+///
+/// where `runLoginFlowForOpenAI` is a thin shim around
+/// `oauth.runLoginFlow(alloc, .{ .provider_name = ..., .auth_path = ... })`.
+/// If a future plan instead attaches OAuth to an existing entry, the same
+/// seam applies — just mutate that entry's `oauth_fn` in place.
 pub const ProviderEntry = struct {
     /// Short key the user picks and the auth/config files store ("openai").
     name: []const u8,
@@ -105,16 +139,24 @@ pub const ProviderEntry = struct {
     /// `scaffoldConfigLua` when the user is a first-time stranger; once the
     /// config file exists the wizard never rewrites it.
     default_model: []const u8,
+    /// Optional browser-OAuth login callback. Null for paste-key providers;
+    /// non-null entries bypass `promptSecret` and let the callback write
+    /// `auth.json` itself. See `OAuthFn` for the contract.
+    oauth_fn: ?OAuthFn = null,
 };
 
 /// Providers the wizard knows how to onboard. Order is the display order in
 /// the choice menu and in the scaffolded `config.lua` (picked entry first,
 /// others emitted as commented-out hints).
+///
+/// Every entry sets `oauth_fn` to `null` explicitly; the paste-key flow is
+/// the only onboarding path in this plan. When `wip/chatgpt-oauth` merges,
+/// a new `openai-oauth` entry with a non-null `oauth_fn` joins this table.
 pub const PROVIDERS = [_]ProviderEntry{
-    .{ .name = "openai", .label = "OpenAI", .default_model = "openai/gpt-4o" },
-    .{ .name = "anthropic", .label = "Anthropic", .default_model = "anthropic/claude-sonnet-4-20250514" },
-    .{ .name = "openrouter", .label = "OpenRouter", .default_model = "openrouter/anthropic/claude-sonnet-4" },
-    .{ .name = "groq", .label = "Groq", .default_model = "groq/llama-3.3-70b-versatile" },
+    .{ .name = "openai", .label = "OpenAI", .default_model = "openai/gpt-4o", .oauth_fn = null },
+    .{ .name = "anthropic", .label = "Anthropic", .default_model = "anthropic/claude-sonnet-4-20250514", .oauth_fn = null },
+    .{ .name = "openrouter", .label = "OpenRouter", .default_model = "openrouter/anthropic/claude-sonnet-4", .oauth_fn = null },
+    .{ .name = "groq", .label = "Groq", .default_model = "groq/llama-3.3-70b-versatile", .oauth_fn = null },
 };
 
 /// Linear lookup against `PROVIDERS`. Returns a pointer so callers can read
@@ -331,6 +373,37 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
 
 const auth = @import("auth.zig");
 
+/// Dispatch credential capture for `picked` — the OAuth seam. If
+/// `picked.oauth_fn` is non-null, delegate the whole credential write to the
+/// OAuth flow (which persists `auth.json` itself). Otherwise run the paste
+/// path: prompt for the key, load/update/save `auth.json`.
+///
+/// Extracted from `runWizard` so the dispatch branch is independently
+/// testable without mutating the `const` `PROVIDERS` table.
+fn dispatchProviderCredential(deps: *const WizardDeps, picked: *const ProviderEntry) !void {
+    if (picked.oauth_fn) |oauth_fn| {
+        try deps.stdout.print("Starting {s} OAuth login...\n", .{picked.label});
+        try deps.stdout.flush();
+        try oauth_fn(deps.allocator, picked.name, deps.auth_path);
+        return;
+    }
+
+    try deps.stdout.print("Paste your {s} API key: ", .{picked.label});
+    try deps.stdout.flush();
+    const key = try promptSecret(deps, "");
+    // setApiKey dupes, so free `key` as soon as it has been absorbed by the
+    // AuthFile; the errdefer below covers the window in between.
+    errdefer deps.allocator.free(key);
+
+    var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
+    defer auth_file.deinit();
+
+    try auth_file.setApiKey(picked.name, key);
+    deps.allocator.free(key);
+
+    try auth.saveAuthFile(deps.auth_path, auth_file);
+}
+
 /// Top-level first-run flow. Walks the user through provider choice (skipped
 /// when `deps.forced_provider` is set), reads the key with ECHO disabled when
 /// `is_tty`, appends it to an existing `auth.json` (or writes a new one), and
@@ -365,20 +438,7 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
         break :blk &PROVIDERS[choice];
     };
 
-    try deps.stdout.print("Paste your {s} API key: ", .{picked.label});
-    try deps.stdout.flush();
-    const key = try promptSecret(&deps, "");
-    // setApiKey dupes, so free `key` as soon as it has been absorbed by the
-    // AuthFile; the errdefer below covers the window in between.
-    errdefer deps.allocator.free(key);
-
-    var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
-    defer auth_file.deinit();
-
-    try auth_file.setApiKey(picked.name, key);
-    deps.allocator.free(key);
-
-    try auth.saveAuthFile(deps.auth_path, auth_file);
+    try dispatchProviderCredential(&deps, picked);
 
     var scaffolded = false;
     if (deps.scaffold_config and deps.forced_provider == null) {
@@ -1053,6 +1113,124 @@ test "removeAuth removes existing entry" {
 
     const rendered = stdout_writer.written();
     try testing.expect(std.mem.indexOf(u8, rendered, "Removed credential for anthropic") != null);
+}
+
+// Test-scoped state for the oauth_fn seam test. The wizard expects the OAuth
+// callback to be a plain function pointer, so we can't close over test locals
+// — stash the observed arguments in file-scope vars and assert on them.
+var test_oauth_call_count: usize = 0;
+var test_oauth_last_provider: []const u8 = "";
+var test_oauth_last_auth_path: []const u8 = "";
+
+fn test_oauth_fn_stub(
+    _: std.mem.Allocator,
+    provider_name: []const u8,
+    auth_path: []const u8,
+) anyerror!void {
+    test_oauth_call_count += 1;
+    test_oauth_last_provider = provider_name;
+    test_oauth_last_auth_path = auth_path;
+}
+
+test "dispatchProviderCredential calls oauth_fn when set and skips promptSecret" {
+    test_oauth_call_count = 0;
+    test_oauth_last_provider = "";
+    test_oauth_last_auth_path = "";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    // Empty stdin: if the OAuth branch falls through to `promptSecret`, the
+    // resulting `error.UserAborted` on EOF will fail the test.
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    const picked: ProviderEntry = .{
+        .name = "openai-oauth",
+        .label = "ChatGPT (OAuth)",
+        .default_model = "openai-oauth/gpt-5",
+        .oauth_fn = &test_oauth_fn_stub,
+    };
+
+    try dispatchProviderCredential(&deps, &picked);
+
+    try testing.expectEqual(@as(usize, 1), test_oauth_call_count);
+    try testing.expectEqualStrings("openai-oauth", test_oauth_last_provider);
+    try testing.expectEqualStrings(paths.auth_path, test_oauth_last_auth_path);
+
+    // The OAuth stub wrote nothing; runWizard's contract says the OAuth flow
+    // owns auth.json persistence. Verify the dispatch helper itself did not
+    // write the file (the stub is a no-op, so nothing should land on disk).
+    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.auth_path));
+
+    // Stdout should surface the "Starting ... OAuth login..." breadcrumb so
+    // the user sees what's happening.
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "Starting ChatGPT (OAuth) OAuth login") != null);
+}
+
+test "dispatchProviderCredential falls through to paste path when oauth_fn is null" {
+    test_oauth_call_count = 0;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("sk-paste-key\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    const picked: ProviderEntry = .{
+        .name = "openai",
+        .label = "OpenAI",
+        .default_model = "openai/gpt-4o",
+        .oauth_fn = null,
+    };
+
+    try dispatchProviderCredential(&deps, &picked);
+
+    try testing.expectEqual(@as(usize, 0), test_oauth_call_count);
+
+    var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("sk-paste-key", (try loaded.getApiKey("openai")).?);
+}
+
+test "PROVIDERS entries all default oauth_fn to null" {
+    // The paste-key flow is the only onboarding path in this plan. Guard
+    // against an accidental registration landing in a different PR by
+    // asserting every entry's oauth_fn is explicitly null.
+    for (&PROVIDERS) |entry| {
+        try testing.expectEqual(@as(?OAuthFn, null), entry.oauth_fn);
+    }
 }
 
 test "removeAuth is a no-op for missing entry" {
