@@ -406,6 +406,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         },
         .tool_start => |ev| {
             defer allocator.free(ev.name);
+            defer if (ev.input_raw) |raw| allocator.free(raw);
             self.current_assistant_node = null;
             const node = self.view.appendNode(null, .tool_call, ev.name) catch null;
             self.last_tool_call = node;

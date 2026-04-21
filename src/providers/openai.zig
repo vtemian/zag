@@ -933,7 +933,7 @@ test "parseSseStream captures usage and cached_tokens from final chunk" {
 
     var fake = std.Io.Reader.fixed(sse_body);
 
-    var sr: llm.StreamingResponse = .{
+    var sr: llm.streaming.StreamingResponse = .{
         .client = undefined,
         .req = undefined,
         .body_reader = &fake,

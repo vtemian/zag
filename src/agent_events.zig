@@ -45,6 +45,10 @@ pub const AgentEvent = union(enum) {
         /// Correlation ID matching this start to its result.
         /// Null for streaming preview events (before execution).
         call_id: ?[]const u8 = null,
+        /// Raw JSON arguments passed to the tool. Null for streaming
+        /// previews that see the call before arguments are fully assembled.
+        /// Trajectory writers consume this as ATIF `tool_calls[].arguments`.
+        input_raw: ?[]const u8 = null,
     };
 
     /// Payload for a completed tool execution.
@@ -68,6 +72,7 @@ pub const AgentEvent = union(enum) {
             .tool_start => |t| {
                 allocator.free(t.name);
                 if (t.call_id) |id| allocator.free(id);
+                if (t.input_raw) |raw| allocator.free(raw);
             },
             .tool_result => |r| {
                 allocator.free(r.content);
