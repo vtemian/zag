@@ -386,11 +386,37 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-/// Load `path`, upsert `cred` under `name`, then save. Convenience wrapper
-/// for the OAuth refresh and exchange paths. Task 9 wraps this in a file
-/// lock to make concurrent writers safe.
+/// Load `path`, upsert `cred` under `name`, then save. Takes an exclusive
+/// advisory lock on a sidecar `<path>.lock` file so concurrent OAuth
+/// refreshes (across threads or processes) cannot stomp each other's
+/// writes. The lock file is created with mode `0o600` and left in place
+/// between calls; subsequent callers re-open it cheaply. On macOS the lock
+/// is advisory, but every writer in this codebase goes through this
+/// function so serialization is guaranteed within a zag installation.
 pub fn upsertOAuth(alloc: Allocator, path: []const u8, name: []const u8, cred: OAuthCred) !void {
-    var file = try loadAuthFile(alloc, path);
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{path});
+    defer alloc.free(lock_path);
+
+    if (std.fs.path.dirname(path)) |parent| {
+        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+
+    const lock_file = try std.fs.cwd().createFile(lock_path, .{
+        .read = true,
+        .truncate = false,
+        .mode = 0o600,
+    });
+    defer lock_file.close();
+    try lock_file.lock(.exclusive);
+    defer lock_file.unlock();
+
+    var file = loadAuthFile(alloc, path) catch |err| switch (err) {
+        error.FileNotFound => AuthFile.init(alloc),
+        else => return err,
+    };
     defer file.deinit();
     try file.setOAuth(name, cred);
     try saveAuthFile(path, file);
@@ -642,6 +668,49 @@ test "upsertOAuth replaces an existing oauth entry without clobbering api_key en
     const oauth = try loaded.getOAuth("openai-oauth");
     try std.testing.expectEqualStrings("new-id", oauth.id_token);
     try std.testing.expectEqualStrings("new-at", oauth.access_token);
+}
+
+test "upsertOAuth serializes concurrent callers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    // Seed the file with an api_key so we can also assert it survives both
+    // concurrent writers. Without a lock, the second writer's load misses
+    // one of the oauth inserts because it started from the same on-disk
+    // snapshot as the first writer.
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setApiKey("openai", "sk-initial");
+        try saveAuthFile(path, file);
+    }
+
+    const Worker = struct {
+        fn run(p: []const u8, name: []const u8) void {
+            upsertOAuth(std.testing.allocator, p, name, .{
+                .id_token = "id",
+                .access_token = "at",
+                .refresh_token = "rt",
+                .account_id = "acc",
+                .last_refresh = "2026-04-20T00:00:00Z",
+            }) catch |err| std.debug.panic("upsertOAuth failed: {}", .{err});
+        }
+    };
+
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ path, "openai-oauth-1" });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ path, "openai-oauth-2" });
+    t1.join();
+    t2.join();
+
+    var loaded = try loadAuthFile(std.testing.allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("sk-initial", (try loaded.getApiKey("openai")).?);
+    _ = try loaded.getOAuth("openai-oauth-1");
+    _ = try loaded.getOAuth("openai-oauth-2");
 }
 
 test {
