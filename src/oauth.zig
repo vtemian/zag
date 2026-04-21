@@ -5,7 +5,10 @@
 //! --login=<provider> or from src/auth.zig during credential refresh.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+
+const auth = @import("auth.zig");
 
 const log = std.log.scoped(.oauth);
 
@@ -693,4 +696,452 @@ test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
         .refresh_token = "EXPIRED",
         .client_id = "app_test",
     }));
+}
+
+// === End-to-end login flow ===
+//
+// `runLoginFlow` orchestrates PKCE generation, a one-shot HTTP callback
+// server on 127.0.0.1:1455, the browser launch, the token exchange, and
+// the auth.json upsert. The tested core is `runLoginFlowWithCodes`, which
+// accepts pre-generated PKCE + state so tests don't race RNG, and exposes
+// `port = 0` and `skip_browser = true` knobs for in-process testing.
+
+pub const LoginOptions = struct {
+    provider_name: []const u8,
+    auth_path: []const u8,
+    issuer: []const u8 = "https://auth.openai.com",
+    client_id: []const u8 = "app_EMoamEEZ73f0CkXaXp7hrann",
+    port: u16 = 1455,
+    scopes: []const u8 = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+    originator: []const u8 = "zag_cli",
+    /// Tests pass `true` to keep the real browser from launching.
+    skip_browser: bool = false,
+};
+
+pub fn runLoginFlow(alloc: Allocator, opts: LoginOptions) !void {
+    const pkce = try generatePkce(alloc);
+    defer pkce.deinit(alloc);
+    const state = try generateState(alloc);
+    defer alloc.free(state);
+
+    try runLoginFlowWithCodes(alloc, opts, pkce, state);
+}
+
+/// Testable core of the login flow. Caller supplies pre-generated PKCE and
+/// CSRF state; this function binds the callback server, (optionally) launches
+/// the browser, accepts one connection, parses the callback, exchanges the
+/// code for tokens, and persists them.
+pub fn runLoginFlowWithCodes(
+    alloc: Allocator,
+    opts: LoginOptions,
+    pkce: PkceCodes,
+    state: []const u8,
+) !void {
+    // 1) Bind the callback listener.
+    const addr = try std.net.Address.parseIp("127.0.0.1", opts.port);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const bound_port = listener.listen_address.getPort();
+
+    const redirect_uri = try std.fmt.allocPrint(
+        alloc,
+        "http://localhost:{d}/auth/callback",
+        .{bound_port},
+    );
+    defer alloc.free(redirect_uri);
+
+    // 2) Build the authorize URL.
+    const auth_url = try buildAuthorizeUrl(alloc, .{
+        .issuer = opts.issuer,
+        .client_id = opts.client_id,
+        .redirect_uri = redirect_uri,
+        .challenge = pkce.challenge,
+        .state = state,
+        .scopes = opts.scopes,
+        .originator = opts.originator,
+    });
+    defer alloc.free(auth_url);
+
+    // 3) Launch the browser unless tests opted out.
+    if (!opts.skip_browser) {
+        var stdout_buf: [1024]u8 = undefined;
+        var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+        stdout_w.interface.print(
+            "Opening your browser to sign in. If it doesn't open, paste:\n  {s}\n\n",
+            .{auth_url},
+        ) catch {};
+        stdout_w.interface.flush() catch {};
+        launchBrowser(alloc, auth_url) catch |err| {
+            log.warn("browser launch failed: {s}; URL printed above", .{@errorName(err)});
+        };
+    }
+
+    // 4) Accept exactly one inbound connection.
+    const conn = try listener.accept();
+    defer conn.stream.close();
+
+    var read_buf: [16 * 1024]u8 = undefined;
+    var write_buf: [8 * 1024]u8 = undefined;
+    var net_reader = conn.stream.reader(&read_buf);
+    var net_writer = conn.stream.writer(&write_buf);
+    var server = std.http.Server.init(net_reader.interface(), &net_writer.interface);
+    var request = try server.receiveHead();
+
+    // 5) Parse /auth/callback?code=...&state=...
+    const target = request.head.target;
+    const q_start = std.mem.indexOfScalar(u8, target, '?') orelse {
+        sendError(&request, "Missing query string") catch {};
+        return error.CallbackMissingQuery;
+    };
+    const query = target[q_start + 1 ..];
+
+    if (findQueryParam(alloc, query, "error")) |err_val| {
+        defer alloc.free(err_val);
+        log.warn("authorize callback returned error={s}", .{err_val});
+        sendError(&request, "Authorization denied") catch {};
+        return error.AuthorizationDenied;
+    } else |_| {}
+
+    const code = findQueryParam(alloc, query, "code") catch {
+        sendError(&request, "Missing code parameter") catch {};
+        return error.CallbackParamMissing;
+    };
+    defer alloc.free(code);
+    const received_state = findQueryParam(alloc, query, "state") catch {
+        sendError(&request, "Missing state parameter") catch {};
+        return error.CallbackParamMissing;
+    };
+    defer alloc.free(received_state);
+
+    // 6) Validate state (CSRF).
+    if (!std.mem.eql(u8, received_state, state)) {
+        sendError(&request, "State mismatch (CSRF protection)") catch {};
+        return error.StateMismatch;
+    }
+
+    // 7) Exchange the authorization code for tokens.
+    const token_url = try std.fmt.allocPrint(alloc, "{s}/oauth/token", .{opts.issuer});
+    defer alloc.free(token_url);
+
+    const tokens = exchangeCode(alloc, .{
+        .token_url = token_url,
+        .code = code,
+        .verifier = pkce.verifier,
+        .redirect_uri = redirect_uri,
+        .client_id = opts.client_id,
+    }) catch |err| {
+        sendError(&request, "Token exchange failed") catch {};
+        return err;
+    };
+    defer tokens.deinit(alloc);
+
+    // 8) Extract the chatgpt_account_id claim from the id_token.
+    const account_id = extractAccountId(alloc, tokens.id_token) catch |err| {
+        sendError(&request, "id_token missing chatgpt_account_id") catch {};
+        return err;
+    };
+    defer alloc.free(account_id);
+
+    // 9) Persist into auth.json.
+    const last_refresh = try formatIsoUtc(alloc, std.time.timestamp());
+    defer alloc.free(last_refresh);
+    auth.upsertOAuth(alloc, opts.auth_path, opts.provider_name, .{
+        .id_token = tokens.id_token,
+        .access_token = tokens.access_token,
+        .refresh_token = tokens.refresh_token,
+        .account_id = account_id,
+        .last_refresh = last_refresh,
+    }) catch |err| {
+        sendError(&request, "Failed to save credentials") catch {};
+        return err;
+    };
+
+    // 10) Respond with a minimal success page and let the defers unwind.
+    const success_body =
+        "<!doctype html><html><head><title>Zag Login</title></head>" ++
+        "<body style='font-family:sans-serif;margin:40px;max-width:560px'>" ++
+        "<h1>You're signed in.</h1>" ++
+        "<p>You can close this tab and return to zag.</p>" ++
+        "</body></html>";
+    try request.respond(success_body, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            .{ .name = "connection", .value = "close" },
+        },
+    });
+}
+
+fn launchBrowser(alloc: Allocator, url: []const u8) !void {
+    const argv: []const []const u8 = switch (builtin.os.tag) {
+        .macos => &.{ "open", url },
+        .linux => &.{ "xdg-open", url },
+        else => return error.UnsupportedPlatform,
+    };
+    var child = std.process.Child.init(argv, alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    _ = child.wait() catch {};
+}
+
+/// Look up `key` in a form-encoded query string. Returns a freshly allocated
+/// percent-decoded value or `error.CallbackParamMissing`.
+fn findQueryParam(alloc: Allocator, query: []const u8, key: []const u8) ![]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        if (std.mem.eql(u8, kv[0..eq], key)) {
+            return percentDecode(alloc, kv[eq + 1 ..]);
+        }
+    }
+    return error.CallbackParamMissing;
+}
+
+fn percentDecode(alloc: Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, s.len);
+
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return error.BadEscape;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return error.BadEscape;
+            try out.append(alloc, (hi << 4) | lo);
+            i += 3;
+        } else if (c == '+') {
+            // application/x-www-form-urlencoded treats `+` as space.
+            try out.append(alloc, ' ');
+            i += 1;
+        } else {
+            try out.append(alloc, c);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn sendError(request: *std.http.Server.Request, msg: []const u8) !void {
+    const body_fmt = "<!doctype html><body><h1>Login failed</h1><p>{s}</p></body>";
+    var buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&buf, body_fmt, .{msg});
+    try request.respond(body, .{
+        .status = .bad_request,
+        .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+    });
+}
+
+/// Format `unix_seconds` as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`). Mirrors
+/// the helper in `auth.zig`; duplicated here to avoid cross-module coupling
+/// on a private function.
+fn formatIsoUtc(alloc: Allocator, unix_seconds: i64) ![]const u8 {
+    const secs: u64 = if (unix_seconds < 0) 0 else @intCast(unix_seconds);
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ed = es.getEpochDay();
+    const ym = ed.calculateYearDay();
+    const md = ym.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        ym.year,
+        md.month.numeric(),
+        @as(u16, md.day_index) + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    });
+}
+
+test "findQueryParam returns percent-decoded value" {
+    const query = "code=abc%20xyz&state=s1";
+    const v = try findQueryParam(std.testing.allocator, query, "code");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("abc xyz", v);
+}
+
+test "findQueryParam returns error.CallbackParamMissing when key absent" {
+    const query = "code=abc&state=s1";
+    try std.testing.expectError(
+        error.CallbackParamMissing,
+        findQueryParam(std.testing.allocator, query, "missing"),
+    );
+}
+
+test "percentDecode handles %XX escapes and `+` as space" {
+    const out = try percentDecode(std.testing.allocator, "a%2Fb+c%3D");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("a/b c=", out);
+}
+
+// --- Login-flow integration tests -----------------------------------------
+
+/// A tiny issuer that answers one POST /oauth/token with the canned JSON.
+const MockIssuer = struct {
+    server: std.net.Server,
+    port: u16,
+    thread: std.Thread = undefined,
+
+    fn start() !MockIssuer {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        const server = try addr.listen(.{ .reuse_address = true });
+        return .{ .server = server, .port = server.listen_address.getPort() };
+    }
+
+    fn deinit(self: *MockIssuer) void {
+        self.server.deinit();
+    }
+
+    fn run(srv: *std.net.Server) void {
+        const conn = srv.accept() catch return;
+        defer conn.stream.close();
+        var buf: [8192]u8 = undefined;
+        _ = conn.stream.read(&buf) catch {};
+        const resp =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+            "Content-Length: 203\r\nConnection: close\r\n\r\n" ++
+            // id_token payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acc-123"}}
+            // Encoded with a trailing `.sig` stub to look like a real JWT.
+            "{\"id_token\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjLTEyMyJ9fQ.sig\",\"access_token\":\"at\",\"refresh_token\":\"rt\"}";
+        _ = conn.stream.writeAll(resp) catch {};
+    }
+};
+
+test "runLoginFlowWithCodes exchanges code, persists auth.json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const auth_path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(auth_path);
+
+    // Bring up the mock issuer.
+    var issuer = try MockIssuer.start();
+    defer issuer.deinit();
+    const issuer_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{issuer.port});
+    defer std.testing.allocator.free(issuer_url);
+    const issuer_thread = try std.Thread.spawn(.{}, MockIssuer.run, .{&issuer.server});
+    defer issuer_thread.join();
+
+    // Pick a free port for the callback server so we know what to dial.
+    const probe_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var probe = try probe_addr.listen(.{ .reuse_address = true });
+    const callback_port = probe.listen_address.getPort();
+    probe.deinit();
+
+    // Spawn the simulated browser: connects to the callback port once the
+    // login flow is listening and delivers a matching code + state.
+    const BrowserCtx = struct {
+        fn run(port: u16, state: []const u8) void {
+            // Retry connect until the login flow's listener is up.
+            var attempts: u8 = 0;
+            while (attempts < 50) : (attempts += 1) {
+                const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
+                const stream = std.net.tcpConnectToAddress(addr) catch {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                };
+                defer stream.close();
+                var buf: [1024]u8 = undefined;
+                const req = std.fmt.bufPrint(
+                    &buf,
+                    "GET /auth/callback?code=CODE123&state={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    .{state},
+                ) catch return;
+                _ = stream.writeAll(req) catch return;
+                var drain: [4096]u8 = undefined;
+                while (true) {
+                    const n = stream.read(&drain) catch 0;
+                    if (n == 0) break;
+                }
+                return;
+            }
+        }
+    };
+    const state: []const u8 = "my_state_123";
+    const browser_thread = try std.Thread.spawn(.{}, BrowserCtx.run, .{ callback_port, state });
+    defer browser_thread.join();
+
+    // Pre-generated PKCE — tests can stub this since `runLoginFlowWithCodes`
+    // accepts it directly.
+    const pkce_verifier = try std.testing.allocator.dupe(u8, "test_verifier_xyz");
+    const pkce_challenge = try std.testing.allocator.dupe(u8, "test_challenge_xyz");
+    const pkce = PkceCodes{ .verifier = pkce_verifier, .challenge = pkce_challenge };
+    defer pkce.deinit(std.testing.allocator);
+
+    try runLoginFlowWithCodes(std.testing.allocator, .{
+        .provider_name = "openai-oauth",
+        .auth_path = auth_path,
+        .issuer = issuer_url,
+        .client_id = "app_test",
+        .port = callback_port,
+        .skip_browser = true,
+    }, pkce, state);
+
+    // auth.json must now carry the oauth entry with the exchanged tokens.
+    var file = try auth.loadAuthFile(std.testing.allocator, auth_path);
+    defer file.deinit();
+    const entry = try file.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings("at", entry.access_token);
+    try std.testing.expectEqualStrings("rt", entry.refresh_token);
+    try std.testing.expectEqualStrings("acc-123", entry.account_id);
+}
+
+test "runLoginFlowWithCodes rejects mismatched state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const auth_path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(auth_path);
+
+    const probe_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var probe = try probe_addr.listen(.{ .reuse_address = true });
+    const callback_port = probe.listen_address.getPort();
+    probe.deinit();
+
+    const BrowserCtx = struct {
+        fn run(port: u16) void {
+            var attempts: u8 = 0;
+            while (attempts < 50) : (attempts += 1) {
+                const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
+                const stream = std.net.tcpConnectToAddress(addr) catch {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                };
+                defer stream.close();
+                // Deliberately wrong state.
+                const req = "GET /auth/callback?code=CODE123&state=WRONG HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                _ = stream.writeAll(req) catch return;
+                var drain: [4096]u8 = undefined;
+                while (true) {
+                    const n = stream.read(&drain) catch 0;
+                    if (n == 0) break;
+                }
+                return;
+            }
+        }
+    };
+    const browser_thread = try std.Thread.spawn(.{}, BrowserCtx.run, .{callback_port});
+    defer browser_thread.join();
+
+    const pkce_verifier = try std.testing.allocator.dupe(u8, "v");
+    const pkce_challenge = try std.testing.allocator.dupe(u8, "c");
+    const pkce = PkceCodes{ .verifier = pkce_verifier, .challenge = pkce_challenge };
+    defer pkce.deinit(std.testing.allocator);
+
+    const result = runLoginFlowWithCodes(std.testing.allocator, .{
+        .provider_name = "openai-oauth",
+        .auth_path = auth_path,
+        .issuer = "http://127.0.0.1:1",
+        .client_id = "app_test",
+        .port = callback_port,
+        .skip_browser = true,
+    }, pkce, "EXPECTED");
+
+    try std.testing.expectError(error.StateMismatch, result);
+
+    // auth.json must not have been written.
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(auth_path, .{}));
 }
