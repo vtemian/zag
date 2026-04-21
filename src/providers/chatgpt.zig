@@ -11,16 +11,97 @@
 //! - `instructions` replaces the system role message.
 //!
 //! Reference: codex-rs/codex-api/src/common.rs:159-180 (ResponsesApiRequest).
-//!
-//! Task 13 covers the request body. Task 14 adds SSE stream parsing. The
-//! Provider vtable (ChatgptSerializer struct + factory wiring) lands in Task 15.
 
 const std = @import("std");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
+const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.chatgpt);
+
+/// ChatGPT Responses API serializer state. Pairs an endpoint descriptor with
+/// the on-disk auth location so each request can resolve a fresh OAuth access
+/// token (Codex rotates tokens on refresh). The serializer never caches the
+/// token itself — `buildHeaders` reloads from `auth.json` per request, so a
+/// concurrent refresh from another tab picks up immediately.
+pub const ChatgptSerializer = struct {
+    /// Endpoint connection details (URL, oauth auth kind, static headers).
+    endpoint: *const llm.Endpoint,
+    /// Absolute path to `auth.json`. Passed to `buildHeaders` for per-request
+    /// credential resolution with proactive refresh.
+    auth_path: []const u8,
+    /// Model identifier (e.g., "gpt-5-codex").
+    model: []const u8,
+
+    const vtable: Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "chatgpt",
+    };
+
+    /// Create a Provider interface backed by this serializer.
+    pub fn provider(self: *ChatgptSerializer) Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn callImpl(
+        ptr: *anyopaque,
+        req: *const llm.Request,
+    ) llm.ProviderError!types.LlmResponse {
+        return callImplInner(ptr, req) catch |err| return llm.mapProviderError(err);
+    }
+
+    // The ChatGPT backend is streaming-only; a non-streaming `call` routes
+    // through the same SSE pipeline and buffers the result. Agent code that
+    // wants incremental events should use `callStreaming` directly.
+    fn callImplInner(
+        ptr: *anyopaque,
+        req: *const llm.Request,
+    ) !types.LlmResponse {
+        const self: *ChatgptSerializer = @ptrCast(@alignCast(ptr));
+
+        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        defer req.allocator.free(body);
+
+        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator, .{});
+        defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
+
+        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
+        defer stream.destroy();
+
+        var cancel = std.atomic.Value(bool).init(false);
+        const noop_callback: llm.StreamCallback = .{ .ctx = undefined, .on_event = noopEvent };
+        return parseSseStream(stream, req.allocator, noop_callback, &cancel);
+    }
+
+    fn noopEvent(_: *anyopaque, _: llm.StreamEvent) void {}
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        return callStreamingImplInner(ptr, req) catch |err| return llm.mapProviderError(err);
+    }
+
+    fn callStreamingImplInner(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) !types.LlmResponse {
+        const self: *ChatgptSerializer = @ptrCast(@alignCast(ptr));
+
+        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        defer req.allocator.free(body);
+
+        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator, .{});
+        defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
+
+        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
+        defer stream.destroy();
+
+        return parseSseStream(stream, req.allocator, req.callback, req.cancel);
+    }
+};
 
 /// Serialize a non-streaming Responses API request body.
 pub fn buildRequestBody(
@@ -221,7 +302,7 @@ pub const StreamEmitter = struct {
 /// and return — we never fail the stream on an event we don't recognize,
 /// because OpenAI iterates `/responses` faster than we can keep up.
 pub fn dispatchEvent(
-    evt: llm.StreamingResponse.SseEvent,
+    evt: llm.streaming.StreamingResponse.SseEvent,
     emit: *StreamEmitter,
 ) !void {
     const event_type = evt.event_type;
@@ -521,9 +602,9 @@ fn handleIncomplete(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 
 /// Drive the full stream: loop `nextSseEvent`, dispatch each one, then
 /// assemble the final LlmResponse from the accumulated blocks. Used by the
-/// `callStreaming` entry point in Task 15.
+/// `ChatgptSerializer.callStreaming` entry point.
 pub fn parseSseStream(
-    stream: *llm.StreamingResponse,
+    stream: *llm.streaming.StreamingResponse,
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
@@ -565,7 +646,9 @@ pub fn parseSseStream(
         }
     }
 
-    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
+    // ChatGPT Responses API doesn't expose cache token counts today; pass 0
+    // so the final LlmResponse still populates all four fields cleanly.
+    return builder.finish(stop_reason, input_tokens, output_tokens, 0, 0, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -1095,4 +1178,320 @@ test "chatgpt SSE: custom_tool_call_input.delta accumulates like function_call" 
 
     try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
     try std.testing.expectEqualStrings("{\"q\":1}", fx.blocks.items[0].content.items);
+}
+
+// -- End-to-end serializer tests --------------------------------------------
+//
+// Drive `ChatgptSerializer` against an in-process HTTP mock to exercise the
+// full request → stream → response path. These tests use `http://` (not
+// TLS) because zig's std.http.Client handles both and we don't want to
+// stand up a real TLS cert in tests. The serializer's URL lives on the
+// `Endpoint` struct, so we construct a bespoke endpoint pointing at the
+// localhost mock.
+
+const auth_mod = @import("../auth.zig");
+
+/// Build a minimal JWT with `exp` set to `exp_seconds`. Copied from
+/// `llm.zig` test helpers (the originals there are test-private). The
+/// signature is fake — `extractExp` only parses the payload.
+fn testAccessTokenWithExp(alloc: Allocator, exp_seconds: i64) ![]const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_buf = try alloc.alloc(u8, enc.calcSize(header.len));
+    defer alloc.free(header_buf);
+    const header_b64 = enc.encode(header_buf, header);
+
+    const payload = try std.fmt.allocPrint(alloc, "{{\"exp\":{d}}}", .{exp_seconds});
+    defer alloc.free(payload);
+    const payload_buf = try alloc.alloc(u8, enc.calcSize(payload.len));
+    defer alloc.free(payload_buf);
+    const payload_b64 = enc.encode(payload_buf, payload);
+
+    return std.fmt.allocPrint(alloc, "{s}.{s}.sig", .{ header_b64, payload_b64 });
+}
+
+/// Canned SSE stream the mock server emits for happy-path tests. Mirrors the
+/// event sequence the live ChatGPT backend sends for a plain text turn.
+const canned_text_sse =
+    "event: response.created\r\n" ++
+    "data: {\"response\":{\"id\":\"r_test\"}}\r\n" ++
+    "\r\n" ++
+    "event: response.output_text.delta\r\n" ++
+    "data: {\"delta\":\"Hello\"}\r\n" ++
+    "\r\n" ++
+    "event: response.output_text.delta\r\n" ++
+    "data: {\"delta\":\", world!\"}\r\n" ++
+    "\r\n" ++
+    "event: response.completed\r\n" ++
+    "data: {\"response\":{\"id\":\"r_test\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\r\n" ++
+    "\r\n";
+
+/// Thread entrypoint for the mock HTTP server. Accepts one connection,
+/// drains the full HTTP request (headers + body), and replies with
+/// `response` verbatim.
+///
+/// A single `read()` is NOT sufficient: zig's `std.http.Client` can send
+/// headers and body in separate syscalls, and the accept/read/write race
+/// hangs the client — the server starts writing before the body hits the
+/// socket, the client's `receiveHead` blocks waiting for response bytes
+/// that are already in flight but the connection is still mid-write.
+/// Draining until `\r\n\r\n` (end of request headers) plus any
+/// `Content-Length` body bytes is the robust shape.
+fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
+    const conn = srv.accept() catch return;
+    defer conn.stream.close();
+
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+
+    var tmp: [4096]u8 = undefined;
+    // 1. Read until we see the end-of-headers sentinel.
+    var headers_end: usize = 0;
+    while (true) {
+        const n = conn.stream.read(&tmp) catch return;
+        if (n == 0) return; // client hung up before finishing request
+        req.appendSlice(alloc, tmp[0..n]) catch return;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
+            headers_end = idx + 4;
+            break;
+        }
+    }
+
+    // 2. If Content-Length was advertised, drain the rest of the body.
+    var content_length: usize = 0;
+    const headers_slice = req.items[0..headers_end];
+    var it = std.mem.splitSequence(u8, headers_slice, "\r\n");
+    while (it.next()) |line| {
+        // Case-insensitive match on the header name.
+        if (line.len > 15 and std.ascii.eqlIgnoreCase(line[0..15], "content-length:")) {
+            const rest = std.mem.trim(u8, line[15..], " \t");
+            content_length = std.fmt.parseInt(usize, rest, 10) catch 0;
+            break;
+        }
+    }
+    const body_have = req.items.len - headers_end;
+    var body_remaining = if (content_length > body_have) content_length - body_have else 0;
+    while (body_remaining > 0) {
+        const want = @min(body_remaining, tmp.len);
+        const n = conn.stream.read(tmp[0..want]) catch return;
+        if (n == 0) break;
+        body_remaining -= n;
+    }
+
+    // 3. Now it's safe to write the canned response.
+    _ = conn.stream.writeAll(response) catch {};
+}
+
+// Chunked transfer encoding: Zig 0.15's http.Client has a bug in
+// `contentLengthStream` where re-reading after EOF panics on a union field
+// mismatch. `chunkedStream` returns EndOfStream cleanly on the `.ready`
+// state, so we frame the body as a single chunk followed by the `0\r\n\r\n`
+// terminator. See /opt/homebrew/Cellar/zig/0.15.2_1/lib/zig/std/http.zig
+// lines 506-542 for the divergent state machines.
+fn buildMockResponse(allocator: Allocator, sse_body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+        .{ sse_body.len, sse_body },
+    );
+}
+
+const RecordingCallback = struct {
+    events: *std.ArrayList(RecordedEvent),
+    alloc: Allocator,
+
+    fn on(ctx: *anyopaque, ev: llm.StreamEvent) void {
+        const self: *RecordingCallback = @ptrCast(@alignCast(ctx));
+        const tagged: RecordedEvent = switch (ev) {
+            .text_delta => |t| .{ .kind = .text_delta, .payload = self.alloc.dupe(u8, t) catch return },
+            .tool_start => |t| .{ .kind = .tool_start, .payload = self.alloc.dupe(u8, t) catch return },
+            .info => |t| .{ .kind = .info, .payload = self.alloc.dupe(u8, t) catch return },
+            .done => .{ .kind = .done, .payload = self.alloc.dupe(u8, "") catch return },
+            .err => |t| .{ .kind = .err, .payload = self.alloc.dupe(u8, t) catch return },
+        };
+        self.events.append(self.alloc, tagged) catch {};
+    }
+
+    fn callback(self: *RecordingCallback) llm.StreamCallback {
+        return .{ .ctx = self, .on_event = &on };
+    }
+};
+
+test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse" {
+    const allocator = std.testing.allocator;
+
+    // 1. Spin up a localhost SSE server with a canned response.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    const http_response = try buildMockResponse(allocator, canned_text_sse);
+    defer allocator.free(http_response);
+
+    const thr = try std.Thread.spawn(.{}, mockServeOnce, .{ &server, http_response });
+    // Close the listen socket before joining so the worker's accept() returns
+    // even if the client never connected (e.g. callStreaming errored early).
+    // Otherwise the test deadlocks on a failing happy path.
+    defer {
+        server.deinit();
+        thr.join();
+    }
+
+    // 2. Seed auth.json with a fresh (not-yet-expired) OAuth entry so the
+    // serializer's buildHeaders resolves without triggering a refresh.
+    // Use wall-clock time rather than a frozen constant: buildHeaders uses
+    // ResolveOptions{} defaults (std.time.timestamp), so a hardcoded past
+    // exp would trigger a refresh against the mock URL and fail.
+    const access = try testAccessTokenWithExp(allocator, std.time.timestamp() + 3600);
+    defer allocator.free(access);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_abs);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
+    defer allocator.free(auth_path);
+
+    {
+        var file = auth_mod.AuthFile.init(allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "idt",
+            .access_token = access,
+            .refresh_token = "rt",
+            .account_id = "acc-xyz",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try auth_mod.saveAuthFile(auth_path, file);
+    }
+
+    // 3. Construct an Endpoint + ChatgptSerializer pointing at the mock.
+    var url_buf: [96]u8 = undefined;
+    const mock_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/responses", .{port});
+
+    const endpoint: llm.Endpoint = .{
+        .name = "openai-oauth",
+        .serializer = .chatgpt,
+        .url = mock_url,
+        .auth = .oauth_chatgpt,
+        .headers = &.{},
+    };
+
+    var serializer: ChatgptSerializer = .{
+        .endpoint = &endpoint,
+        .auth_path = auth_path,
+        .model = "gpt-5-codex",
+    };
+    const provider = serializer.provider();
+
+    // 4. Drive the stream.
+    var events: std.ArrayList(RecordedEvent) = .empty;
+    defer {
+        for (events.items) |e| e.deinit(allocator);
+        events.deinit(allocator);
+    }
+    var recorder: RecordingCallback = .{ .events = &events, .alloc = allocator };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const content = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &content }};
+
+    const response = try provider.callStreaming(&.{
+        .system_prompt = "be brief",
+        .messages = &messages,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+        .callback = recorder.callback(),
+        .cancel = &cancel,
+    });
+    defer response.deinit(allocator);
+
+    // 5. Final response assembled from the stream.
+    try std.testing.expectEqual(.end_turn, response.stop_reason);
+    try std.testing.expectEqual(@as(u32, 5), response.input_tokens);
+    try std.testing.expectEqual(@as(u32, 2), response.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), response.content.len);
+    switch (response.content[0]) {
+        .text => |t| try std.testing.expectEqualStrings("Hello, world!", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // 6. Live events delivered via the callback (2 text deltas + done).
+    try std.testing.expect(events.items.len >= 3);
+    try std.testing.expectEqual(.text_delta, events.items[0].kind);
+    try std.testing.expectEqualStrings("Hello", events.items[0].payload);
+    try std.testing.expectEqual(.text_delta, events.items[1].kind);
+    try std.testing.expectEqualStrings(", world!", events.items[1].payload);
+    try std.testing.expectEqual(.done, events.items[events.items.len - 1].kind);
+}
+
+test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" {
+    const allocator = std.testing.allocator;
+
+    // A fresh token so the startup path doesn't require a live IdP: the
+    // factory's oauth arm skips the eager credential check entirely, but
+    // a well-formed auth.json keeps the test self-contained if that
+    // decision ever flips.
+    // Use wall-clock time rather than a frozen constant: buildHeaders uses
+    // ResolveOptions{} defaults (std.time.timestamp), so a hardcoded past
+    // exp would trigger a refresh against the mock URL and fail.
+    const access = try testAccessTokenWithExp(allocator, std.time.timestamp() + 3600);
+    defer allocator.free(access);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_abs);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
+    defer allocator.free(auth_path);
+
+    {
+        var file = auth_mod.AuthFile.init(allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "idt",
+            .access_token = access,
+            .refresh_token = "rt",
+            .account_id = "acc-xyz",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try auth_mod.saveAuthFile(auth_path, file);
+    }
+
+    var result = try llm.createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(llm.Serializer.chatgpt, result.serializer);
+    try std.testing.expectEqualStrings("openai-oauth/gpt-5-codex", result.model_id);
+    try std.testing.expectEqualStrings("chatgpt", result.provider.vtable.name);
+
+    // The serializer state is the concrete ChatgptSerializer, with the model
+    // slice pointing at the right half of the parsed model string.
+    const state: *ChatgptSerializer = @ptrCast(@alignCast(result.state));
+    try std.testing.expectEqualStrings("gpt-5-codex", state.model);
+    try std.testing.expectEqualStrings("openai-oauth", state.endpoint.name);
+    try std.testing.expectEqual(llm.Endpoint.Auth.oauth_chatgpt, state.endpoint.auth);
+}
+
+test "createProviderFromLuaConfig skips eager credential check for oauth providers" {
+    // OAuth paths defer the resolve+refresh dance to the first request. An
+    // empty auth.json (no `openai-oauth` entry yet — user hasn't run
+    // `zag --login=openai-oauth`) must still let the factory build the
+    // provider so the TUI can boot and show a reasonable error on the
+    // first call.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_abs);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
+    defer allocator.free(auth_path);
+    // No auth.json on disk at all.
+
+    var result = try llm.createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(llm.Serializer.chatgpt, result.serializer);
 }

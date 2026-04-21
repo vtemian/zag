@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 
 pub const anthropic = @import("providers/anthropic.zig");
 pub const openai = @import("providers/openai.zig");
+pub const chatgpt = @import("providers/chatgpt.zig");
 pub const pricing = @import("pricing.zig");
 pub const Trajectory = @import("Trajectory.zig");
 pub const streaming = @import("llm/streaming.zig");
@@ -240,10 +241,9 @@ pub const ProviderResult = struct {
             .openai => {
                 self.allocator.destroy(@as(*openai.OpenAiSerializer, @ptrCast(@alignCast(self.state))));
             },
-            // Task 15 replaces this stub with ChatgptSerializer destroy.
-            // .chatgpt ProviderResult is never constructed until then; the
-            // factory returns error.NotImplemented before reaching this path.
-            .chatgpt => unreachable,
+            .chatgpt => {
+                self.allocator.destroy(@as(*chatgpt.ChatgptSerializer, @ptrCast(@alignCast(self.state))));
+            },
         }
     }
 };
@@ -302,8 +302,9 @@ pub fn createProviderFromLuaConfig(
         return error.UnknownProvider;
 
     // Fail-fast existence check for api-key providers. OAuth paths defer
-    // their resolve+refresh dance to the first request; .none has nothing
-    // to check.
+    // their resolve+refresh dance to the first request (the token may be
+    // stale on disk, and we don't want to burn a network round-trip at
+    // startup); .none has nothing to check.
     switch (endpoint.auth) {
         .none => {},
         .x_api_key, .bearer => {
@@ -313,8 +314,7 @@ pub fn createProviderFromLuaConfig(
                 return error.MissingCredential;
             _ = borrowed;
         },
-        // Task 10 replaces this stub with resolveCredential (proactive refresh).
-        .oauth_chatgpt => return error.NotImplemented,
+        .oauth_chatgpt => {},
     }
 
     const auth_path = try allocator.dupe(u8, auth_file_path);
@@ -347,8 +347,19 @@ pub fn createProviderFromLuaConfig(
                 .serializer = .openai,
             };
         },
-        // Task 15 replaces this stub with ChatgptSerializer wiring.
-        .chatgpt => return error.NotImplemented,
+        .chatgpt => {
+            const state = try allocator.create(chatgpt.ChatgptSerializer);
+            state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = spec.model_id };
+            return .{
+                .provider = state.provider(),
+                .model_id = model_id,
+                .state = state,
+                .auth_path = auth_path,
+                .registry = registry,
+                .allocator = allocator,
+                .serializer = .chatgpt,
+            };
+        },
     }
 }
 
