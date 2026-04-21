@@ -312,6 +312,31 @@ fn runLoginCommand(
 const file_log = @import("file_log.zig");
 pub const std_options: std.Options = .{ .logFn = file_log.handler };
 
+/// Format the startup "no credentials" diagnostic into `scratch`.
+/// OAuth providers get a `zag --login=<provider>` hint; api-key providers
+/// get told to edit `~/.config/zag/auth.json`. Unknown providers fall back
+/// to the generic message. Extracted so tests can assert on the full
+/// message without spawning a process.
+fn formatMissingCredentialHint(scratch: []u8, model_id: []const u8) []const u8 {
+    const spec = llm.parseModelString(model_id);
+    const endpoint_opt = llm.findBuiltinEndpoint(spec.provider_name);
+    const is_oauth = if (endpoint_opt) |ep| ep.auth == .oauth_chatgpt else false;
+
+    const fallback = "zag: no credentials for configured provider in ~/.config/zag/auth.json\n";
+    if (is_oauth) {
+        return std.fmt.bufPrint(
+            scratch,
+            "zag: not signed in to '{s}'. Run: zag --login={s}\n",
+            .{ spec.provider_name, spec.provider_name },
+        ) catch fallback;
+    }
+    return std.fmt.bufPrint(
+        scratch,
+        "zag: no credentials for provider '{s}' in ~/.config/zag/auth.json\n",
+        .{spec.provider_name},
+    ) catch fallback;
+}
+
 /// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
 fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
@@ -411,11 +436,13 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     const started_at = std.time.milliTimestamp();
     try capture.beginTurn(started_at);
 
+    const spec = llm.parseModelString(deps.model_id);
     try deps.runner.submit(&deps.session.messages, .{
         .allocator = gpa,
         .wake_write_fd = deps.wake_write_fd,
         .lua_engine = deps.lua_engine,
         .provider = deps.provider.*,
+        .provider_name = spec.provider_name,
         .registry = deps.registry,
     });
 
@@ -1184,5 +1211,32 @@ test "runLoginCommand rejects providers whose auth is not oauth_chatgpt" {
     try std.testing.expectEqualStrings(
         "zag: provider 'anthropic' does not use OAuth; edit ~/.config/zag/auth.json directly.\n",
         err_aw.written(),
+    );
+}
+
+test "formatMissingCredentialHint points OAuth providers at --login" {
+    var scratch: [512]u8 = undefined;
+    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5");
+    try std.testing.expectEqualStrings(
+        "zag: not signed in to 'openai-oauth'. Run: zag --login=openai-oauth\n",
+        msg,
+    );
+}
+
+test "formatMissingCredentialHint points api-key providers at auth.json" {
+    var scratch: [512]u8 = undefined;
+    const msg = formatMissingCredentialHint(&scratch, "openai/gpt-4o");
+    try std.testing.expectEqualStrings(
+        "zag: no credentials for provider 'openai' in ~/.config/zag/auth.json\n",
+        msg,
+    );
+}
+
+test "formatMissingCredentialHint falls back to generic message for unknown provider" {
+    var scratch: [512]u8 = undefined;
+    const msg = formatMissingCredentialHint(&scratch, "not-a-real-provider/x");
+    try std.testing.expectEqualStrings(
+        "zag: no credentials for provider 'not-a-real-provider' in ~/.config/zag/auth.json\n",
+        msg,
     );
 }

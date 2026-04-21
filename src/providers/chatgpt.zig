@@ -1474,12 +1474,11 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
     try std.testing.expectEqual(llm.Endpoint.Auth.oauth_chatgpt, state.endpoint.auth);
 }
 
-test "createProviderFromLuaConfig skips eager credential check for oauth providers" {
-    // OAuth paths defer the resolve+refresh dance to the first request. An
-    // empty auth.json (no `openai-oauth` entry yet — user hasn't run
-    // `zag --login=openai-oauth`) must still let the factory build the
-    // provider so the TUI can boot and show a reasonable error on the
-    // first call.
+test "createProviderFromLuaConfig fails fast when oauth provider has no credentials" {
+    // First-run hazard: the user launches `zag` before `zag --login=`.
+    // The factory must surface `MissingCredential` up to `main.zig` so
+    // the startup hint fires, rather than letting the TUI boot and show
+    // an opaque `ApiError` on the first turn.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1490,8 +1489,8 @@ test "createProviderFromLuaConfig skips eager credential check for oauth provide
     defer allocator.free(auth_path);
     // No auth.json on disk at all.
 
-    var result = try llm.createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator);
-    defer result.deinit();
-
-    try std.testing.expectEqual(llm.Serializer.chatgpt, result.serializer);
+    try std.testing.expectError(
+        error.MissingCredential,
+        llm.createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator),
+    );
 }

@@ -311,10 +311,12 @@ pub fn createProviderFromLuaConfig(
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
-    // Fail-fast existence check for api-key providers. OAuth paths defer
-    // their resolve+refresh dance to the first request (the token may be
-    // stale on disk, and we don't want to burn a network round-trip at
-    // startup); .none has nothing to check.
+    // Fail-fast existence check before the TUI takes over. For api-key
+    // providers this is a trivial lookup; for `.oauth_chatgpt` we call
+    // `resolveCredential` so a stale token on disk is refreshed
+    // up-front rather than ambushing the user mid-turn. Missing entries
+    // and rejected refresh tokens both collapse to `MissingCredential`,
+    // which `main.zig` maps to a `zag --login=<provider>` hint.
     switch (endpoint.auth) {
         .none => {},
         .x_api_key, .bearer => {
@@ -324,7 +326,13 @@ pub fn createProviderFromLuaConfig(
                 return error.MissingCredential;
             _ = borrowed;
         },
-        .oauth_chatgpt => {},
+        .oauth_chatgpt => {
+            const resolved = auth.resolveCredential(allocator, auth_file_path, spec.provider_name, .{}) catch |err| switch (err) {
+                error.NotLoggedIn, error.LoginExpired => return error.MissingCredential,
+                else => return err,
+            };
+            resolved.deinit(allocator);
+        },
     }
 
     const auth_path = try allocator.dupe(u8, auth_file_path);
@@ -704,6 +712,34 @@ test "createProviderFromLuaConfig returns UnknownProvider for unsupported provid
     try std.testing.expectError(
         error.UnknownProvider,
         createProviderFromLuaConfig("fakeprovider/some-model", auth_path, allocator),
+    );
+}
+
+test "createProviderFromLuaConfig returns MissingCredential for oauth provider with no entry" {
+    // First-run hazard: the user launches `zag` before `zag --login=`.
+    // The factory must fail fast with `MissingCredential` so `main.zig`
+    // can print the "run zag --login=openai-oauth" hint, rather than
+    // letting the TUI boot and surface `ApiError` mid-turn.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json",
+        .data =
+        \\{
+        \\  "anthropic": { "type": "api_key", "key": "sk-ant-test" }
+        \\}
+        ,
+    });
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
+    defer allocator.free(auth_path);
+
+    try std.testing.expectError(
+        error.MissingCredential,
+        createProviderFromLuaConfig("openai-oauth/gpt-5", auth_path, allocator),
     );
 }
 
