@@ -992,6 +992,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("lua/mod.zig");
     _ = @import("auth_wizard.zig");
+    _ = @import("oauth.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
