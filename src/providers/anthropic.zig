@@ -284,6 +284,8 @@ fn parseSseStream(
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     var blocks: std.ArrayList(StreamingBlock) = .empty;
     defer {
@@ -304,6 +306,8 @@ fn parseSseStream(
             &stop_reason,
             &input_tokens,
             &output_tokens,
+            &cache_creation_tokens,
+            &cache_read_tokens,
             callback,
         );
     }
@@ -319,7 +323,11 @@ fn parseSseStream(
         }
     }
 
-    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
+    // TODO(Task 4): fold into builder.finish signature
+    var response = try builder.finish(stop_reason, input_tokens, output_tokens, allocator);
+    response.cache_creation_tokens = cache_creation_tokens;
+    response.cache_read_tokens = cache_read_tokens;
+    return response;
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.
@@ -331,6 +339,8 @@ pub fn processSseEvent(
     stop_reason: *types.StopReason,
     input_tokens: *u32,
     output_tokens: *u32,
+    cache_creation_tokens: *u32,
+    cache_read_tokens: *u32,
     callback: llm.StreamCallback,
 ) !void {
     if (std.mem.eql(u8, event_type, "ping")) return;
@@ -349,6 +359,8 @@ pub fn processSseEvent(
                 const usage_obj = usage.object;
                 if (usage_obj.get("input_tokens")) |it| input_tokens.* = @intCast(it.integer);
                 if (usage_obj.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
+                if (usage_obj.get("cache_creation_input_tokens")) |v| cache_creation_tokens.* = @intCast(v.integer);
+                if (usage_obj.get("cache_read_input_tokens")) |v| cache_read_tokens.* = @intCast(v.integer);
             }
         }
     } else if (std.mem.eql(u8, event_type, "content_block_start")) {
@@ -681,6 +693,8 @@ test "processSseEvent handles text_delta" {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     const Counter = struct {
         text_delta_count: u32 = 0,
@@ -696,7 +710,7 @@ test "processSseEvent handles text_delta" {
     const callback: llm.StreamCallback = .{ .ctx = &counter, .on_event = &Counter.onEvent };
 
     const data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}";
-    try processSseEvent("content_block_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, callback);
+    try processSseEvent("content_block_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     try std.testing.expectEqualStrings("Hello", blocks.items[0].content.items);
     try std.testing.expectEqual(@as(u32, 1), counter.text_delta_count);
@@ -714,6 +728,8 @@ test "processSseEvent handles content_block_start for tool_use" {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     const Counter = struct {
         tool_start_count: u32 = 0,
@@ -729,12 +745,49 @@ test "processSseEvent handles content_block_start for tool_use" {
     const callback: llm.StreamCallback = .{ .ctx = &counter, .on_event = &Counter.onEvent };
 
     const data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"bash\",\"input\":{}}}";
-    try processSseEvent("content_block_start", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, callback);
+    try processSseEvent("content_block_start", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
     try std.testing.expectEqualStrings("toolu_123", blocks.items[0].tool_id);
     try std.testing.expectEqualStrings("bash", blocks.items[0].tool_name);
     try std.testing.expectEqual(@as(u32, 1), counter.tool_start_count);
+}
+
+test "processSseEvent captures cache tokens from message_start" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer blocks.deinit(allocator);
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
+
+    const Sink = struct {
+        fn onEvent(_: *anyopaque, _: llm.StreamEvent) void {}
+    };
+    var sink: u8 = 0;
+    const callback: llm.StreamCallback = .{ .ctx = &sink, .on_event = &Sink.onEvent };
+
+    const data = "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_creation_input_tokens\":77,\"cache_read_input_tokens\":33}}}";
+    try processSseEvent(
+        "message_start",
+        data,
+        allocator,
+        &blocks,
+        &stop_reason,
+        &input_tokens,
+        &output_tokens,
+        &cache_creation_tokens,
+        &cache_read_tokens,
+        callback,
+    );
+
+    try std.testing.expectEqual(@as(u32, 10), input_tokens);
+    try std.testing.expectEqual(@as(u32, 77), cache_creation_tokens);
+    try std.testing.expectEqual(@as(u32, 33), cache_read_tokens);
 }
 
 test "processSseEvent handles message_delta with stop_reason" {
@@ -746,6 +799,8 @@ test "processSseEvent handles message_delta with stop_reason" {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     const Sink = struct {
         fn onEvent(_: *anyopaque, _: llm.StreamEvent) void {}
@@ -754,7 +809,7 @@ test "processSseEvent handles message_delta with stop_reason" {
     const callback: llm.StreamCallback = .{ .ctx = &sink, .on_event = &Sink.onEvent };
 
     const data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":42}}";
-    try processSseEvent("message_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, callback);
+    try processSseEvent("message_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     try std.testing.expectEqual(.tool_use, stop_reason);
     try std.testing.expectEqual(@as(u32, 42), output_tokens);
@@ -769,6 +824,8 @@ test "processSseEvent skips ping events" {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     const Watcher = struct {
         called: bool = false,
@@ -780,7 +837,7 @@ test "processSseEvent skips ping events" {
     var watcher: Watcher = .{};
     const callback: llm.StreamCallback = .{ .ctx = &watcher, .on_event = &Watcher.onEvent };
 
-    try processSseEvent("ping", "{}", allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, callback);
+    try processSseEvent("ping", "{}", allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     try std.testing.expect(!watcher.called);
 }
@@ -806,6 +863,8 @@ test "processSseEvent accumulates input_json_delta for tool use" {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     const Sink = struct {
         fn onEvent(_: *anyopaque, _: llm.StreamEvent) void {}
@@ -814,10 +873,10 @@ test "processSseEvent accumulates input_json_delta for tool use" {
     const callback: llm.StreamCallback = .{ .ctx = &sink, .on_event = &Sink.onEvent };
 
     const data1 = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pa\"}}";
-    try processSseEvent("content_block_delta", data1, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, callback);
+    try processSseEvent("content_block_delta", data1, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     const data2 = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"th\\\":\\\"foo\\\"}\"}}";
-    try processSseEvent("content_block_delta", data2, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, callback);
+    try processSseEvent("content_block_delta", data2, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     try std.testing.expectEqualStrings("{\"path\":\"foo\"}", blocks.items[0].content.items);
 }
