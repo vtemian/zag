@@ -42,6 +42,20 @@ orchestrator: ?*EventOrchestrator = null,
 /// Whether the layout changed (resize/split/close) and borders need redrawing.
 /// The caller sets this; composite clears it.
 layout_dirty: bool = true,
+/// Cached status-line inputs from the previous frame. Used to skip
+/// `drawStatusLine` when nothing visible on that row has changed; the
+/// cache is bypassed when `-Dmetrics=true` is active because the metrics
+/// digits themselves shift every frame.
+last_status_key: StatusKey = .{},
+
+const StatusKey = struct {
+    mode: Keymap.Mode = .normal,
+    focused_buffer: ?*anyopaque = null,
+    width: u16 = 0,
+    height: u16 = 0,
+    dropped: u64 = 0,
+    valid: bool = false,
+};
 
 /// Create a Compositor with a fresh per-frame arena.
 pub fn init(screen: *Screen, allocator: Allocator, theme: *const Theme) Compositor {
@@ -85,6 +99,10 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
     const root = layout.root orelse return;
     const focused = layout.focused orelse root;
 
+    // Capture layout_dirty before the block clears it; the status-line
+    // cache check needs the frame's initial state, not the post-draw state.
+    const frame_layout_dirty = self.layout_dirty;
+
     if (self.layout_dirty) {
         // Layout changed: full clear and redraw everything
         {
@@ -112,11 +130,28 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
         }
     }
 
-    // Input/status line: always redraw (one row, cheap)
+    // Input/status line: skip the redraw when nothing visible on that
+    // row has actually changed. Metrics enabled means frame-time digits
+    // shift every frame, so the cache is bypassed there.
     {
-        var s = trace.span("status_line");
-        defer s.end();
-        self.drawStatusLine(focused, input.mode);
+        const current_key = self.buildStatusKey(focused, input);
+        const skip_status = self.last_status_key.valid and
+            !trace.enabled and
+            !frame_layout_dirty and
+            statusKeyEql(self.last_status_key, current_key);
+        if (!skip_status) {
+            var s = trace.span("status_line");
+            defer s.end();
+            self.drawStatusLine(focused, input.mode);
+            self.last_status_key = .{
+                .mode = current_key.mode,
+                .focused_buffer = current_key.focused_buffer,
+                .width = current_key.width,
+                .height = current_key.height,
+                .dropped = current_key.dropped,
+                .valid = !trace.enabled,
+            };
+        }
     }
 
     // Per-pane prompts: repainted every frame because drafts change on
@@ -500,6 +535,37 @@ fn fitName(dest: []u8, name: []const u8, max: u16) []const u8 {
     @memcpy(dest[0..keep], name[0..keep]);
     @memcpy(dest[keep .. keep + 3], "\u{2026}");
     return dest[0 .. keep + 3];
+}
+
+/// Build a `StatusKey` snapshot of the inputs drawStatusLine actually reads.
+/// Returns a zero-valued key when the focus is a split (drawStatusLine bails
+/// out in that case anyway, so the cache check is a no-op there).
+fn buildStatusKey(self: *const Compositor, focused: *const Layout.LayoutNode, input: InputState) StatusKey {
+    const leaf = switch (focused.*) {
+        .leaf => |l| l,
+        .split => return .{ .mode = input.mode, .valid = false },
+    };
+    var dropped: u64 = 0;
+    if (self.orchestrator) |orch| {
+        if (orch.window_manager.paneFromBuffer(leaf.buffer)) |pane| {
+            dropped = pane.runner.droppedEventCount();
+        }
+    }
+    return .{
+        .mode = input.mode,
+        .focused_buffer = leaf.buffer.ptr,
+        .width = leaf.rect.width,
+        .height = leaf.rect.height,
+        .dropped = dropped,
+    };
+}
+
+fn statusKeyEql(a: StatusKey, b: StatusKey) bool {
+    return a.mode == b.mode and
+        a.focused_buffer == b.focused_buffer and
+        a.width == b.width and
+        a.height == b.height and
+        a.dropped == b.dropped;
 }
 
 /// Draw the status line on the last row using the theme status_line highlight.
@@ -1075,6 +1141,39 @@ test "normal mode does not paint a block cursor in the focused pane" {
         }
     }
     try std.testing.expect(!any_bg);
+}
+
+test "status_line cache skips redraw when inputs are unchanged" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 6);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
+    defer cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(cb.buf());
+    layout.recalculate(40, 6);
+
+    const input: Compositor.InputState = .{ .mode = .normal };
+
+    // First frame: layout dirty, draws everything, populates the cache.
+    compositor.composite(&layout, input);
+    try std.testing.expect(compositor.last_status_key.valid);
+
+    // Scribble a sentinel on the status row; if the second frame redraws
+    // the status line we expect the sentinel to be overwritten.
+    const last_row: u16 = screen.height - 1;
+    const sentinel_cell = screen.getCell(last_row, 5);
+    sentinel_cell.codepoint = '#';
+
+    // Second frame: same inputs, layout stable — status line must skip.
+    compositor.composite(&layout, input);
+    try std.testing.expectEqual(@as(u21, '#'), screen.getCellConst(last_row, 5).codepoint);
 }
 
 test "composite twice produces identical screen content" {
