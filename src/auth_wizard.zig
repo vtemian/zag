@@ -40,6 +40,12 @@ pub const WizardDeps = struct {
     scaffold_config: bool,
     /// Non-null for `zag auth login <prov>`: skips the provider-choice prompt.
     forced_provider: ?[]const u8,
+    /// Escape hatch for tests that use a fake stdin but still want to exercise
+    /// the first-run (`scaffold_config = true`) path. Production wiring leaves
+    /// this at `false` so `runWizard` refuses interactive first-run under a
+    /// pipe; tests set it to `true` to bypass the refusal without lying about
+    /// `is_tty` (which would trigger the termios toggle on real STDIN_FILENO).
+    allow_non_tty_first_run: bool = false,
 };
 
 /// Errors the wizard surfaces to `main.zig`. `EmptyInput` / `KeyTooLong` land
@@ -52,6 +58,20 @@ pub const WizardError = error{
     EmptyInput,
     KeyTooLong,
     NonInteractiveFirstRun,
+    UnknownProvider,
+};
+
+/// Outcome of a successful `runWizard` pass. `main.zig` reads
+/// `provider_name` so it can retry `createProviderFromEnv` against the
+/// just-written credential, and consults `scaffolded_config` to decide
+/// whether the one-time "pointed config.lua at X" message should print.
+pub const WizardResult = struct {
+    /// Provider key (e.g. "openai"). Owned by the caller; free with
+    /// `deps.allocator.free(result.provider_name)` once it's no longer needed.
+    provider_name: []u8,
+    /// True when the wizard wrote a fresh `config.lua` during this run.
+    /// False when `scaffold_config` was disabled or the file already existed.
+    scaffolded_config: bool,
 };
 
 /// Static metadata for one wizard-offered provider. Task 8 extends this with
@@ -288,6 +308,141 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     if (trimmed.len > max_secret_len) return error.KeyTooLong;
 
     return deps.allocator.dupe(u8, trimmed);
+}
+
+const auth = @import("auth.zig");
+
+/// Top-level first-run flow. Walks the user through provider choice (skipped
+/// when `deps.forced_provider` is set), reads the key with ECHO disabled when
+/// `is_tty`, appends it to an existing `auth.json` (or writes a new one), and
+/// scaffolds `config.lua` when `scaffold_config` is true and the file is
+/// absent.
+///
+/// Error contract:
+/// - `error.NonInteractiveFirstRun` — attempted first-run (`scaffold_config &&
+///   !forced_provider`) under a non-TTY stdin and `allow_non_tty_first_run`
+///   was false. Callers should point the user at `zag auth login <prov>`.
+/// - `error.UnknownProvider` — `forced_provider` is not in `PROVIDERS`.
+/// - Anything `promptChoice` / `promptSecret` / `auth.*` propagate.
+///
+/// Ownership: `result.provider_name` is owned by `deps.allocator`. The caller
+/// must free it once the retry in `main.zig` succeeds.
+pub fn runWizard(deps: WizardDeps) !WizardResult {
+    if (!deps.is_tty and deps.scaffold_config and deps.forced_provider == null and !deps.allow_non_tty_first_run) {
+        return error.NonInteractiveFirstRun;
+    }
+
+    const picked: *const ProviderEntry = blk: {
+        if (deps.forced_provider) |forced| {
+            break :blk findProvider(forced) orelse return error.UnknownProvider;
+        }
+        try deps.stdout.writeAll("zag needs a provider. Choose one:\n");
+        try deps.stdout.flush();
+
+        var labels: [PROVIDERS.len][]const u8 = undefined;
+        for (&PROVIDERS, 0..) |entry, i| labels[i] = entry.label;
+
+        const choice = try promptChoice(&deps, "", &labels);
+        break :blk &PROVIDERS[choice];
+    };
+
+    try deps.stdout.print("Paste your {s} API key: ", .{picked.label});
+    try deps.stdout.flush();
+    const key = try promptSecret(&deps, "");
+    // setApiKey dupes, so free `key` as soon as it has been absorbed by the
+    // AuthFile; the errdefer below covers the window in between.
+    errdefer deps.allocator.free(key);
+
+    var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
+    defer auth_file.deinit();
+
+    try auth_file.setApiKey(picked.name, key);
+    deps.allocator.free(key);
+
+    try auth.saveAuthFile(deps.auth_path, auth_file);
+
+    var scaffolded = false;
+    if (deps.scaffold_config and deps.forced_provider == null) {
+        const exists = if (std.fs.accessAbsolute(deps.config_path, .{})) |_|
+            true
+        else |err| switch (err) {
+            error.FileNotFound => false,
+            else => return err,
+        };
+        if (!exists) {
+            try scaffoldConfigLua(deps.allocator, deps.config_path, picked.name);
+            scaffolded = true;
+        }
+    }
+
+    try deps.stdout.print("\nSaved credential for {s}.\n", .{picked.label});
+    if (scaffolded) {
+        try deps.stdout.print(
+            "Scaffolded {s} with default model {s}.\n",
+            .{ deps.config_path, picked.default_model },
+        );
+    }
+    try deps.stdout.flush();
+
+    const provider_name = try deps.allocator.dupe(u8, picked.name);
+    return .{ .provider_name = provider_name, .scaffolded_config = scaffolded };
+}
+
+/// Render the contents of `auth.json` for the `zag auth list` subcommand.
+/// Each line shows `<name>  api_key  <masked>` where the mask exposes only
+/// the last four bytes of the key so the user can tell stored credentials
+/// apart without spraying the full secret across the terminal. Empty
+/// configurations print an actionable hint instead of a blank list.
+pub fn printAuthList(deps: WizardDeps) !void {
+    var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
+    defer auth_file.deinit();
+
+    if (auth_file.entries.count() == 0) {
+        try deps.stdout.writeAll("No credentials configured. Run `zag auth login <provider>`.\n");
+        try deps.stdout.flush();
+        return;
+    }
+
+    var it = auth_file.entries.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        switch (entry.value_ptr.*) {
+            .api_key => |key| {
+                var mask_buf: [16]u8 = undefined;
+                const masked = formatMaskedKey(&mask_buf, key);
+                try deps.stdout.print("  {s}  api_key  {s}\n", .{ name, masked });
+            },
+        }
+    }
+    try deps.stdout.flush();
+}
+
+/// Build the user-visible masked rendering of `key`. Short keys (under 5
+/// bytes) collapse to `(empty)` because leaking three characters of a
+/// 4-character key would defeat the whole point.
+fn formatMaskedKey(out: *[16]u8, key: []const u8) []const u8 {
+    if (key.len < 5) return "(empty)";
+    const tail = key[key.len - 4 ..];
+    return std.fmt.bufPrint(out, "...{s}", .{tail}) catch "(empty)";
+}
+
+/// Drop `provider_name` from `auth.json` and persist the result. Missing
+/// entries are a success, not an error: `zag auth remove X` is a declarative
+/// "X should not be present", so idempotence matches user intent.
+pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
+    var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
+    defer auth_file.deinit();
+
+    const existed = (auth_file.getApiKey(provider_name) catch null) != null;
+    auth_file.removeEntry(provider_name);
+    try auth.saveAuthFile(deps.auth_path, auth_file);
+
+    if (existed) {
+        try deps.stdout.print("Removed credential for {s}.\n", .{provider_name});
+    } else {
+        try deps.stdout.print("{s} not configured; nothing to remove.\n", .{provider_name});
+    }
+    try deps.stdout.flush();
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -574,4 +729,329 @@ test "scaffoldConfigLua rejects unknown provider" {
         error.UnknownProvider,
         scaffoldConfigLua(testing.allocator, path, "bogus"),
     );
+}
+
+/// Compose the two absolute paths `runWizard` takes, rooted at a throwaway
+/// `tmpDir`. Returned slices are owned by `testing.allocator` and must be
+/// freed by the caller.
+fn wizardPaths(
+    dir: std.fs.Dir,
+) !struct { auth_path: []u8, config_path: []u8 } {
+    const dir_path = try dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const auth_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "auth.json" });
+    errdefer testing.allocator.free(auth_path);
+    const config_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
+    return .{ .auth_path = auth_path, .config_path = config_path };
+}
+
+test "runWizard happy path writes auth.json and scaffolds config.lua" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("1\nsk-abc-123\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = true,
+        .forced_provider = null,
+        .allow_non_tty_first_run = true,
+    };
+
+    const result = try runWizard(deps);
+    defer testing.allocator.free(result.provider_name);
+
+    try testing.expectEqualStrings("openai", result.provider_name);
+    try testing.expect(result.scaffolded_config);
+
+    // auth.json: 0o600, openai key present.
+    const auth_stat = try std.fs.cwd().statFile(paths.auth_path);
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(auth_stat.mode & 0o777)));
+
+    var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("sk-abc-123", (try loaded.getApiKey("openai")).?);
+
+    // config.lua: scaffolded with the openai template.
+    const config_body = try std.fs.cwd().readFileAlloc(testing.allocator, paths.config_path, 1 << 16);
+    defer testing.allocator.free(config_body);
+    try testing.expect(std.mem.indexOf(u8, config_body, "zag.provider { name = \"openai\" }") != null);
+    try testing.expect(std.mem.indexOf(u8, config_body, "zag.set_default_model(\"openai/gpt-4o\")") != null);
+}
+
+test "runWizard with forced_provider skips the choice prompt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    // No digit line: promptChoice must not run.
+    var stdin = std.Io.Reader.fixed("sk-ant-key\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = "anthropic",
+    };
+
+    const result = try runWizard(deps);
+    defer testing.allocator.free(result.provider_name);
+
+    try testing.expectEqualStrings("anthropic", result.provider_name);
+    try testing.expect(!result.scaffolded_config);
+
+    var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("sk-ant-key", (try loaded.getApiKey("anthropic")).?);
+
+    // config.lua must NOT exist: forced mode is credential-only.
+    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.config_path));
+}
+
+test "runWizard refuses non-TTY first-run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = true,
+        .forced_provider = null,
+        // allow_non_tty_first_run defaults to false — production wiring.
+    };
+
+    try testing.expectError(error.NonInteractiveFirstRun, runWizard(deps));
+}
+
+test "runWizard appends to existing auth.json without clobbering other providers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    // Pre-seed auth.json with an existing anthropic entry.
+    {
+        var seed = auth.AuthFile.init(testing.allocator);
+        defer seed.deinit();
+        try seed.setApiKey("anthropic", "pre-existing-key");
+        try auth.saveAuthFile(paths.auth_path, seed);
+    }
+
+    var stdin = std.Io.Reader.fixed("1\nsk-new\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+        .allow_non_tty_first_run = true,
+    };
+
+    const result = try runWizard(deps);
+    defer testing.allocator.free(result.provider_name);
+
+    var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 2), loaded.entries.count());
+    try testing.expectEqualStrings("pre-existing-key", (try loaded.getApiKey("anthropic")).?);
+    try testing.expectEqualStrings("sk-new", (try loaded.getApiKey("openai")).?);
+}
+
+test "runWizard rejects unknown forced_provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = "bogus",
+    };
+
+    try testing.expectError(error.UnknownProvider, runWizard(deps));
+}
+
+test "printAuthList prints entries with masked keys" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    {
+        var seed = auth.AuthFile.init(testing.allocator);
+        defer seed.deinit();
+        try seed.setApiKey("openai", "sk-1234abcd");
+        try seed.setApiKey("anthropic", "sk-ant-deadbeef");
+        try auth.saveAuthFile(paths.auth_path, seed);
+    }
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    try printAuthList(deps);
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "openai") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "anthropic") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "api_key") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "...abcd") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "...beef") != null);
+    // Raw secret bytes must never leak; only the last four chars should show.
+    try testing.expect(std.mem.indexOf(u8, rendered, "sk-1234abcd") == null);
+}
+
+test "printAuthList reports empty configuration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    try printAuthList(deps);
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "No credentials configured") != null);
+}
+
+test "removeAuth removes existing entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    {
+        var seed = auth.AuthFile.init(testing.allocator);
+        defer seed.deinit();
+        try seed.setApiKey("openai", "sk-keep");
+        try seed.setApiKey("anthropic", "sk-ant-drop");
+        try auth.saveAuthFile(paths.auth_path, seed);
+    }
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    try removeAuth(deps, "anthropic");
+
+    var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 1), loaded.entries.count());
+    try testing.expectEqualStrings("sk-keep", (try loaded.getApiKey("openai")).?);
+    try testing.expectEqual(@as(?[]const u8, null), try loaded.getApiKey("anthropic"));
+
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "Removed credential for anthropic") != null);
+}
+
+test "removeAuth is a no-op for missing entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    try removeAuth(deps, "groq");
+
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "groq not configured; nothing to remove") != null);
 }
