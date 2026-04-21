@@ -23,33 +23,33 @@ const log = std.log.scoped(.chatgpt);
 
 /// Serialize a non-streaming Responses API request body.
 pub fn buildRequestBody(
-    allocator: Allocator,
     model: []const u8,
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(allocator, model, system_prompt, messages, tool_definitions, false);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, allocator);
 }
 
 /// Serialize a streaming Responses API request body (`stream: true`).
 pub fn buildStreamingRequestBody(
-    allocator: Allocator,
     model: []const u8,
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(allocator, model, system_prompt, messages, tool_definitions, true);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, allocator);
 }
 
 fn serializeRequest(
-    allocator: Allocator,
     model: []const u8,
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
+    allocator: Allocator,
 ) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -102,6 +102,7 @@ fn writeTools(defs: []const types.ToolDefinition, w: anytype) !void {
 /// Emit the `input` array, expanding zag's Message/ContentBlock pairs into
 /// Responses API input-item variants (`message`, `function_call`,
 /// `function_call_output`).
+// One message produces N input items (1 per content block), unlike Anthropic which emits 1 item per message.
 fn writeInput(messages: []const types.Message, w: anytype) !void {
     try w.writeAll("\"input\":[");
     var first = true;
@@ -160,6 +161,7 @@ fn writeFunctionCallItem(tu: types.ContentBlock.ToolUse, w: anytype) !void {
 }
 
 /// Emit a `{"type":"function_call_output","call_id":"...","output":"..."}` item.
+// Responses API has no is_error; error state is conveyed via output text.
 fn writeFunctionCallOutputItem(tr: types.ContentBlock.ToolResultBlock, w: anytype) !void {
     try w.writeAll("{\"type\":\"function_call_output\",");
     try w.print("\"call_id\":\"{s}\",", .{tr.tool_use_id});
@@ -180,7 +182,7 @@ test "chatgpt: single user turn emits Responses API shape" {
     const content = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
     const messages = [_]types.Message{.{ .role = .user, .content = &content }};
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "", &messages, &.{});
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5-codex\"") != null);
@@ -197,7 +199,7 @@ test "chatgpt: instructions field set when system prompt provided" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "be concise", &messages, &.{});
+    const body = try buildRequestBody("gpt-5-codex", "be concise", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -209,7 +211,7 @@ test "chatgpt: streaming body sets stream:true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody(allocator, "gpt-5-codex", "", &messages, &.{});
+    const body = try buildStreamingRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -243,7 +245,7 @@ test "chatgpt: tool call round trip emits function_call and function_call_output
         .{ .role = .user, .content = &followup_content },
     };
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "", &messages, &.{});
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -288,7 +290,7 @@ test "chatgpt: assistant text message uses output_text content type" {
     const asst_content = [_]types.ContentBlock{.{ .text = .{ .text = "sure thing" } }};
     const messages = [_]types.Message{.{ .role = .assistant, .content = &asst_content }};
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "", &messages, &.{});
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\"") != null);
@@ -308,7 +310,7 @@ test "chatgpt: tools are emitted flat (not nested under function)" {
         },
     };
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "", &messages, &tool_defs);
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &tool_defs, allocator);
     defer allocator.free(body);
 
     // Flat shape: {"tools":[{"type":"function","name":"...","description":"...","parameters":{...}}]}
@@ -330,7 +332,7 @@ test "chatgpt: empty tools array is still emitted" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "", &messages, &.{});
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -343,7 +345,7 @@ test "chatgpt: JSON escapes special characters in text" {
     const content = [_]types.ContentBlock{.{ .text = .{ .text = "line1\n\"quoted\"" } }};
     const messages = [_]types.Message{.{ .role = .user, .content = &content }};
 
-    const body = try buildRequestBody(allocator, "gpt-5-codex", "", &messages, &.{});
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
     defer allocator.free(body);
 
     // Valid JSON overall.
