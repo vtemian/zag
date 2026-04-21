@@ -55,6 +55,20 @@ pub const Cell = struct {
     /// must skip continuation cells; overwriting a wide char requires
     /// clearing both halves.
     continuation: bool = false,
+    /// Non-zero when this cell's content is a multi-codepoint grapheme
+    /// cluster (ZWJ emoji, skin-toned emoji, flag, etc.). Indexes into
+    /// `Screen.cluster_index`. Zero means the cell is a simple single
+    /// codepoint and the renderer emits `codepoint` directly. Fits inside
+    /// the existing 16-byte Cell padding, no size penalty.
+    cluster_id: u16 = 0,
+};
+
+/// Side-table entry describing a multi-codepoint cluster's bytes within
+/// `cluster_bytes`. `start` is the byte offset and `len` is the byte count
+/// of the cluster's full UTF-8 encoding.
+pub const ClusterIndex = struct {
+    start: u32,
+    len: u16,
 };
 
 /// Width of the screen in columns.
@@ -69,6 +83,16 @@ previous: []Cell,
 allocator: Allocator,
 /// Persistent output buffer reused across render() calls.
 render_buf: std.ArrayList(u8),
+/// Interned UTF-8 bytes for multi-codepoint clusters (ZWJ emoji etc.).
+/// Entries indexed by `cluster_id - 1` via `cluster_index`. Reset after
+/// each `render()` once the frame's bytes have been flushed; cluster_ids
+/// in both grids are simultaneously cleared so stale IDs never dereference
+/// a recycled entry.
+cluster_bytes: std.ArrayList(u8),
+/// Offset+length side table for `cluster_bytes`. `cluster_index[id-1]`
+/// yields the slice for `cluster_id = id`. Zero cluster_id means "no
+/// cluster, render the cell's codepoint directly".
+cluster_index: std.ArrayList(ClusterIndex),
 /// Set when the prior render exceeded `write_deadline_ms` and returned
 /// `error.WriteTimeout`. The next render wipes `previous` to force a
 /// full redraw, since the terminal received an unknown partial prefix
@@ -106,6 +130,8 @@ pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
         .previous = previous,
         .allocator = allocator,
         .render_buf = .empty,
+        .cluster_bytes = .empty,
+        .cluster_index = .empty,
         .write_timed_out = false,
     };
 }
@@ -113,6 +139,8 @@ pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
 /// Release grid memory.
 pub fn deinit(self: *Screen) void {
     self.render_buf.deinit(self.allocator);
+    self.cluster_bytes.deinit(self.allocator);
+    self.cluster_index.deinit(self.allocator);
     self.allocator.free(self.current);
     self.allocator.free(self.previous);
 }
@@ -136,6 +164,8 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
     self.width = width;
     self.height = height;
     self.render_buf.clearRetainingCapacity();
+    self.cluster_bytes.clearRetainingCapacity();
+    self.cluster_index.clearRetainingCapacity();
 }
 
 /// Get a mutable pointer to a cell in the current grid.
@@ -158,6 +188,79 @@ pub fn getCellConst(self: *const Screen, row: u16, col: u16) *const Cell {
     return &self.current[idx];
 }
 
+/// Paint one grapheme cluster starting at (row, col). `bytes` is the full
+/// UTF-8 encoding of the cluster (from `width.nextCluster`). `base` is the
+/// first codepoint; `w` is 1 or 2; `style` and `fg` apply to the primary
+/// and any wide-continuation cell.
+///
+/// When `bytes` covers only the base codepoint's UTF-8 encoding the cell
+/// renders directly from `codepoint` and no side-table entry is allocated.
+/// Otherwise the full byte run (ZWJ joiners, skin-tone modifiers, etc.) is
+/// interned and the cell's `cluster_id` points at it so the renderer can
+/// emit the complete grapheme.
+///
+/// Caller must ensure row < height and col + w <= width.
+pub fn writeCluster(
+    self: *Screen,
+    row: u16,
+    col: u16,
+    bytes: []const u8,
+    base: u21,
+    w: u2,
+    style: Style,
+    fg: Color,
+) void {
+    const cell = self.getCell(row, col);
+    cell.codepoint = base;
+    cell.style = style;
+    cell.fg = fg;
+    cell.continuation = false;
+
+    // Simple cluster: `bytes` matches the UTF-8 length of the base codepoint
+    // alone, so the renderer's single-codepoint path handles it correctly.
+    const base_len: usize = std.unicode.utf8CodepointSequenceLength(base) catch bytes.len;
+    if (bytes.len == base_len) {
+        cell.cluster_id = 0;
+    } else {
+        cell.cluster_id = self.internCluster(bytes) catch blk: {
+            // Allocation failure: fall back to base-only rendering. The
+            // cluster loses its joiners visually but the cell stays valid.
+            log.warn("cluster intern OOM, falling back to base codepoint U+{X:0>4}", .{@as(u32, base)});
+            break :blk 0;
+        };
+    }
+
+    if (w == 2) {
+        const cont = self.getCell(row, col + 1);
+        cont.codepoint = ' ';
+        cont.style = style;
+        cont.fg = fg;
+        cont.continuation = true;
+        cont.cluster_id = 0;
+    }
+}
+
+/// Append `bytes` to the side table and return a 1-based cluster_id. Caller
+/// is responsible for storing the id on a Cell. Non-zero ID guarantees the
+/// entry is reachable via `clusterBytes`.
+fn internCluster(self: *Screen, bytes: []const u8) !u16 {
+    if (self.cluster_index.items.len >= std.math.maxInt(u16)) {
+        return error.ClusterTableFull;
+    }
+    const start: u32 = @intCast(self.cluster_bytes.items.len);
+    try self.cluster_bytes.appendSlice(self.allocator, bytes);
+    errdefer self.cluster_bytes.shrinkRetainingCapacity(start);
+    try self.cluster_index.append(self.allocator, .{ .start = start, .len = @intCast(bytes.len) });
+    return @intCast(self.cluster_index.items.len);
+}
+
+/// Return the UTF-8 byte slice for a given cluster_id. Caller must ensure
+/// `id != 0` and that the id was assigned during the current frame.
+fn clusterBytes(self: *const Screen, id: u16) []const u8 {
+    const entry = self.cluster_index.items[id - 1];
+    return self.cluster_bytes.items[entry.start..][0..entry.len];
+}
+
 /// Write a UTF-8 string into the screen grid at (row, col), clipping to screen width.
 /// Decodes multi-byte UTF-8 sequences into codepoints. Invalid sequences are
 /// replaced with U+FFFD. Returns the column after the last written character.
@@ -165,23 +268,14 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
     var c = col;
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
-    while (width_mod.nextCluster(&iter)) |cluster| {
+    while (true) {
         if (row >= self.height) break;
+        const cluster_start = iter.i;
+        const cluster = width_mod.nextCluster(&iter) orelse break;
         const w = cluster.width;
         if (w == 0) continue;
         if (c + w > self.width) break;
-        const cell = self.getCell(row, c);
-        cell.codepoint = cluster.base;
-        cell.style = style;
-        cell.fg = fg;
-        cell.continuation = false;
-        if (w == 2) {
-            const cont = self.getCell(row, c + 1);
-            cont.codepoint = ' ';
-            cont.style = style;
-            cont.fg = fg;
-            cont.continuation = true;
-        }
+        self.writeCluster(row, c, text[cluster_start..][0..cluster.byte_len], cluster.base, w, style, fg);
         c += w;
     }
     return c;
@@ -203,8 +297,10 @@ pub fn writeStrWrapped(
     var col = start_col;
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
-    while (width_mod.nextCluster(&iter)) |cluster| {
+    while (true) {
         if (row >= max_row) break;
+        const cluster_start = iter.i;
+        const cluster = width_mod.nextCluster(&iter) orelse break;
         const w = cluster.width;
         if (w == 0) continue;
         if (col + w > max_col) {
@@ -213,18 +309,7 @@ pub fn writeStrWrapped(
             if (row >= max_row) break;
             if (col + w > max_col) break; // still won't fit - give up
         }
-        const cell = self.getCell(row, col);
-        cell.codepoint = cluster.base;
-        cell.style = style;
-        cell.fg = fg;
-        cell.continuation = false;
-        if (w == 2) {
-            const cont = self.getCell(row, col + 1);
-            cont.codepoint = ' ';
-            cont.style = style;
-            cont.fg = fg;
-            cont.continuation = true;
-        }
+        self.writeCluster(row, col, text[cluster_start..][0..cluster.byte_len], cluster.base, w, style, fg);
         col += w;
     }
     return .{ .row = row, .col = col };
@@ -251,8 +336,14 @@ pub fn clearRect(self: *Screen, y: u16, x: u16, width: u16, height: u16) void {
 }
 
 /// Compare two cells field by field.
+///
+/// Cluster IDs are only generated for the current frame: a non-zero id on
+/// `previous` is always stale (cleared at end of render). Any mismatch in
+/// cluster_id therefore forces a redraw, which is the correct behavior
+/// when a grapheme moves, changes, or appears/disappears at a cell.
 fn cellsEqual(a: Cell, b: Cell) bool {
     if (a.codepoint != b.codepoint) return false;
+    if (a.cluster_id != b.cluster_id) return false;
     if (!colorsEqual(a.fg, b.fg)) return false;
     if (!colorsEqual(a.bg, b.bg)) return false;
     if (@as(u6, @bitCast(a.style)) != @as(u6, @bitCast(b.style))) return false;
@@ -359,7 +450,11 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                 while (c < run_end) : (c += 1) {
                     const run_cell = self.current[row_base + c];
                     if (run_cell.continuation) continue;
-                    try writeCodepoint(writer, run_cell.codepoint);
+                    if (run_cell.cluster_id != 0) {
+                        try writer.writeAll(self.clusterBytes(run_cell.cluster_id));
+                    } else {
+                        try writeCodepoint(writer, run_cell.codepoint);
+                    }
                 }
 
                 col = run_end;
