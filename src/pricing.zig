@@ -5,6 +5,44 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.pricing);
+
+/// Guards lazy init and mutation of the unknown-model warned set. Pricing
+/// may be queried from agent threads, so the set needs a lock.
+var warned_mu: std.Thread.Mutex = .{};
+/// Lazily initialized on first `shouldWarnForModel` call. Lives for the
+/// lifetime of the process; entries are never freed individually.
+var warned: ?std.StringHashMap(void) = null;
+
+/// Returns true the first time this model id is seen, false on every
+/// subsequent call with the same id. Callers use this to log drift
+/// (missing rate entries) exactly once per unknown model, rather than
+/// on every turn. On allocation failure the set is left untouched and
+/// this returns true: noisy logs beat silent drift.
+pub fn shouldWarnForModel(id: []const u8) bool {
+    warned_mu.lock();
+    defer warned_mu.unlock();
+
+    if (warned == null) {
+        // c_allocator fits process-lifetime free-forever globals:
+        // page_allocator wastes a page per entry, smp_allocator holds
+        // onto tree state we never tear down. Entries here outlive any
+        // subsystem allocator and must not be tied to one.
+        warned = std.StringHashMap(void).init(std.heap.c_allocator);
+    }
+    var set = &warned.?;
+
+    if (set.contains(id)) return false;
+
+    // Dupe the id so the set owns its keys independent of caller lifetime.
+    const owned = std.heap.c_allocator.dupe(u8, id) catch return true;
+    set.put(owned, {}) catch {
+        std.heap.c_allocator.free(owned);
+        return true;
+    };
+    return true;
+}
+
 /// Token counts captured from a provider's usage object. Cache fields are
 /// zero when the provider doesn't report them or when the request missed
 /// the cache entirely.
@@ -73,7 +111,12 @@ const rates = [_]Rate{
 pub fn estimateCost(model: []const u8, usage: Usage) ?f64 {
     const rate = for (rates) |r| {
         if (std.mem.eql(u8, r.model, model)) break r;
-    } else return null;
+    } else {
+        if (shouldWarnForModel(model)) {
+            log.warn("pricing: no rate entry for model {s}", .{model});
+        }
+        return null;
+    };
 
     const one_mtok: f64 = 1_000_000.0;
     var total: f64 = 0;
@@ -105,6 +148,19 @@ test "estimateCost for claude-sonnet-4 with cache hits" {
 test "estimateCost returns null for unknown model" {
     const usage = Usage{ .input_tokens = 1, .output_tokens = 1 };
     try std.testing.expectEqual(@as(?f64, null), estimateCost("unknown/model", usage));
+}
+
+test "shouldWarnForModel returns true once per model" {
+    // Use an id unlikely to collide with other tests in this process.
+    try std.testing.expect(shouldWarnForModel("test/once-a"));
+    try std.testing.expect(!shouldWarnForModel("test/once-a"));
+}
+
+test "shouldWarnForModel tracks distinct models separately" {
+    try std.testing.expect(shouldWarnForModel("test/distinct-foo"));
+    try std.testing.expect(shouldWarnForModel("test/distinct-bar"));
+    try std.testing.expect(!shouldWarnForModel("test/distinct-foo"));
+    try std.testing.expect(!shouldWarnForModel("test/distinct-bar"));
 }
 
 test {
