@@ -175,7 +175,7 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
 /// per-node `cached_lines` and each cache entry's `spans` array). On
 /// cache hit the output list shares its `spans` pointers with the cache;
 /// because those pointers are cache-owned, callers must not free them
-/// via `StyledLine.deinit` — reset the frame arena instead.
+/// via `StyledLine.deinit`; reset the frame arena instead.
 pub fn getVisibleLines(
     self: *const ConversationBuffer,
     frame_alloc: Allocator,

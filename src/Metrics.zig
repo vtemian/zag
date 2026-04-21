@@ -43,7 +43,7 @@ var total_frame_count: u64 = 0;
 
 /// High water mark for memory usage across the session. `Stats.peak_memory_bytes`
 /// (see below) is a snapshot of this value at `getStats()` time; the shared name
-/// is intentional — the struct field mirrors this running counter.
+/// is intentional; the struct field mirrors this running counter.
 var peak_memory_bytes: u64 = 0;
 
 /// Monotonic session start time, captured on first frameStart().
