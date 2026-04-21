@@ -11,6 +11,15 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Hooks = @import("Hooks.zig");
 
+const log = std.log.scoped(.agent_events);
+
+/// Default backpressure budget for `pushWithBackpressure`. Chosen so a
+/// transient main-loop stall (one slow frame, a blocking Lua tool, a noisy
+/// GC) absorbs without dropping events, but a genuinely wedged consumer
+/// doesn't stall the agent thread indefinitely. 100ms × 256 slots is an
+/// order of magnitude more headroom than the typical 8-16ms main-loop tick.
+pub const default_backpressure_ms: u32 = 100;
+
 /// An event produced by the agent loop for the main thread to consume.
 pub const AgentEvent = union(enum) {
     /// Partial text from the LLM response.
@@ -97,14 +106,13 @@ pub const AgentEvent = union(enum) {
 /// increment of `dropped` and frees the event's owned bytes so the drop is
 /// observable and leak-free.
 ///
-/// Backpressure policy: agent-thread producers use `tryPush` by default so
-/// a saturated queue degrades to dropped events plus an incremented counter,
-/// not a propagated error that would halt the agent loop. The three places
-/// that still call `push` directly (hook request submissions in
-/// `agent.fireLifecycleHook`, `firePreHook`, `firePostHook`) catch
-/// `error.QueueFull` explicitly and fall back to a safe default instead of
-/// entering the blocking wait for a `req.done` signal that would never
-/// arrive. No agent-thread path lets `error.QueueFull` propagate.
+/// Backpressure policy: agent-thread producers call `pushWithBackpressure`
+/// so a saturated queue absorbs a short main-loop stall (retries for up to
+/// `default_backpressure_ms`) before degrading to a logged drop plus an
+/// incremented counter. Silent drops were the bug; bounded waiting plus a
+/// loud log is the fix. `tryPush` remains for callers that MUST be
+/// non-blocking (e.g., signal-style paths) and for terminal cleanup where
+/// there is no caller left to react to `error.EventDropped`.
 pub const EventQueue = struct {
     /// Guards concurrent access to buffer / head / tail / len.
     mutex: std.Thread.Mutex = .{},
