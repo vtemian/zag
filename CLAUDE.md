@@ -13,6 +13,9 @@ zig fmt --check .            # check formatting
 
 zig build run -- --session=<id>   # resume specific session
 zig build run -- --last           # resume most recent session
+
+zig build run -- --headless --instruction-file=prompt.txt --trajectory-out=traj.json
+                                  # single-shot eval run, writes ATIF-v1.2 JSON
 ```
 
 Requires: Zig 0.15+. Dependencies: ziglua (Lua 5.4, compiled from source).
