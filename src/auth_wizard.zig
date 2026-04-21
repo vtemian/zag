@@ -1,9 +1,10 @@
 //! Interactive onboarding wizard for first-run credential setup.
 //!
 //! The module is written over `std.Io.Reader` / `std.Io.Writer` so the prompt
-//! flow can be exercised from tests without a real terminal. `runWizard`,
-//! `promptSecret`, and `scaffoldConfigLua` land in later tasks; Task 2 ships
-//! the shared `WizardDeps` shape and the provider-choice prompt.
+//! flow can be exercised from tests without a real terminal. `runWizard` and
+//! `scaffoldConfigLua` land in later tasks; Task 2 shipped the shared
+//! `WizardDeps` shape and the provider-choice prompt, Task 3 adds
+//! `promptSecret` with the termios ECHO toggle.
 
 const std = @import("std");
 
@@ -75,7 +76,16 @@ pub fn promptChoice(
         try deps.stdout.print("Choose [1-{d}]: ", .{options.len});
         try deps.stdout.flush();
 
-        const line = (try deps.stdin.takeDelimiter('\n')) orelse return error.UserAborted;
+        const line = deps.stdin.takeDelimiter('\n') catch |err| switch (err) {
+            // A line longer than the reader's buffer is indistinguishable from
+            // "not a valid 1..N digit" for this prompt; consume the retry slot
+            // and ask again instead of leaking the raw I/O error.
+            error.StreamTooLong => {
+                try deps.stdout.print("invalid choice; pick a number 1..{d}\n", .{options.len});
+                continue;
+            },
+            else => |e| return e,
+        } orelse return error.UserAborted;
         const trimmed = std.mem.trim(u8, stripCr(line), " \t");
 
         const choice = std.fmt.parseInt(usize, trimmed, 10) catch {
@@ -105,13 +115,29 @@ const max_secret_len: usize = 8192;
 /// Prompt the user for a secret (API key). When `deps.is_tty`, toggles the
 /// terminal's `ECHO` flag off via termios for the duration of the read so
 /// pasted bytes don't hit the screen; the original termios is restored on
-/// return even if the read fails. Returns the trimmed secret as an owned
-/// slice the caller must free.
+/// return even if the read fails.
 ///
 /// ECHO is cleared *before* the prompt is printed so a fast typist can't slip
 /// visible characters into the gap. Non-TTY callers (tests, pipes) share the
 /// same parse path without touching termios, which is what keeps the inline
 /// tests meaningful.
+///
+/// Contract:
+/// - The returned slice is owned by `deps.allocator`; the caller must free it.
+/// - The length cap (`max_secret_len`) is checked after whitespace trimming,
+///   so it matches the user-visible paste size.
+/// - A partial line at EOF (input with no trailing `\n`) is accepted rather
+///   than discarded, so a typed-but-unterminated key is never silently lost.
+/// - `error.StreamTooLong` from the underlying reader (input exceeds the
+///   reader's own buffer capacity) is remapped to `error.KeyTooLong` so
+///   callers only ever need to know about the wizard's own error set.
+// MANUAL TEST (run in a real terminal once Task 6 wires the subcommand):
+//   1. `rm -rf ~/.config/zag && zig build run` triggers the wizard.
+//   2. Paste an API key at the "Paste key:" prompt; confirm no bytes echo to
+//      the screen and the cursor advances to a fresh line after Enter.
+//   3. Hit Ctrl-C mid-prompt and verify the terminal's echo flag is restored
+//      (typing into the shell afterwards should display characters again).
+// Until Task 6 lands only the unit tests below exercise this function.
 pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     var original: ?std.posix.termios = null;
     if (deps.is_tty) {
@@ -130,7 +156,10 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     try deps.stdout.writeAll(prompt);
     try deps.stdout.flush();
 
-    const line = (try deps.stdin.takeDelimiter('\n')) orelse return error.UserAborted;
+    const line = deps.stdin.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong => return error.KeyTooLong,
+        else => |e| return e,
+    } orelse return error.UserAborted;
     const clean = stripCr(line);
     const trimmed = std.mem.trim(u8, clean, " \t");
 
@@ -262,17 +291,47 @@ test "promptSecret rejects whitespace-only input" {
     try testing.expectError(error.EmptyInput, promptSecret(&deps, "Paste key: "));
 }
 
-test "promptSecret rejects input over cap" {
-    const oversize = try testing.allocator.alloc(u8, 8194);
-    defer testing.allocator.free(oversize);
-    @memset(oversize[0 .. oversize.len - 1], 'x');
-    oversize[oversize.len - 1] = '\n';
+test "promptSecret accepts exactly max_secret_len bytes" {
+    const input = try testing.allocator.alloc(u8, max_secret_len + 1);
+    defer testing.allocator.free(input);
+    @memset(input[0..max_secret_len], 'x');
+    input[max_secret_len] = '\n';
 
-    var stdin = std.Io.Reader.fixed(oversize);
+    var stdin = std.Io.Reader.fixed(input);
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
     const deps = testDeps(&stdin, &stdout_writer.writer);
+    const secret = try promptSecret(&deps, "Paste key: ");
+    defer deps.allocator.free(secret);
+    try testing.expectEqual(max_secret_len, secret.len);
+}
+
+test "promptSecret rejects max_secret_len + 1 bytes" {
+    const input = try testing.allocator.alloc(u8, max_secret_len + 2);
+    defer testing.allocator.free(input);
+    @memset(input[0 .. max_secret_len + 1], 'x');
+    input[max_secret_len + 1] = '\n';
+
+    var stdin = std.Io.Reader.fixed(input);
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    try testing.expectError(error.KeyTooLong, promptSecret(&deps, "Paste key: "));
+}
+
+test "promptSecret maps StreamTooLong to KeyTooLong when reader buffer overflows" {
+    // Input is 32 bytes plus `\n`; backing reader buffer is only 16. The
+    // delimiter is past the buffer's capacity, so `takeDelimiter` raises
+    // `StreamTooLong` before `promptSecret` ever sees the trimmed slice.
+    const input = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+    var reader_buffer: [16]u8 = undefined;
+    var backing: std.testing.Reader = .init(&reader_buffer, &.{.{ .buffer = input }});
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&backing.interface, &stdout_writer.writer);
     try testing.expectError(error.KeyTooLong, promptSecret(&deps, "Paste key: "));
 }
 
