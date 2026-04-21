@@ -104,7 +104,13 @@ pub fn init() !Terminal {
     try writeEscapeSequence("\x1b[?1000h\x1b[?1006h");
     errdefer writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch {};
 
-    // 7. Install SIGWINCH handler
+    // 7. Enable bracketed paste so a multi-line paste arrives as one
+    //    event (bracketed by CSI 200~ / CSI 201~) instead of hundreds
+    //    of individual key events.
+    try writeEscapeSequence("\x1b[?2004h");
+    errdefer writeEscapeSequence("\x1b[?2004l") catch {};
+
+    // 8. Install SIGWINCH handler
     installSigwinchHandler();
 
     // 8. Detect 24-bit color capability from $COLORTERM.
@@ -147,6 +153,9 @@ pub fn trueColorFromValue(val: []const u8) bool {
 /// consistent signature across init/deinit pairs avoids callsite friction.
 pub fn deinit(self: *Terminal) void {
     // Reverse order of init
+    writeEscapeSequence("\x1b[?2004l") catch |err| {
+        log.warn("failed to disable bracketed paste: {s}", .{@errorName(err)});
+    };
     writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch |err| {
         log.warn("failed to disable mouse tracking: {s}", .{@errorName(err)});
     };

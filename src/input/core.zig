@@ -10,7 +10,8 @@ const std = @import("std");
 const csi = @import("csi.zig");
 const mouse = @import("mouse.zig");
 
-/// A terminal input event: key press, mouse action, terminal resize, or nothing.
+/// A terminal input event: key press, mouse action, terminal resize,
+/// paste block, or nothing.
 pub const Event = union(enum) {
     /// A keyboard event.
     key: KeyEvent,
@@ -18,6 +19,11 @@ pub const Event = union(enum) {
     mouse: MouseEvent,
     /// The terminal was resized.
     resize: struct { rows: u16, cols: u16 },
+    /// Raw bytes between a CSI 200~ / CSI 201~ pair. The slice is a
+    /// borrowed view into the owning `Parser`'s paste buffer and is
+    /// valid only until the next `Parser.feedBytes` call, so consumers
+    /// must copy immediately (e.g., into a buffer's draft).
+    paste: []const u8,
     /// No event available (non-blocking read returned nothing).
     none,
 };

@@ -31,6 +31,46 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
+test "Parser emits a single paste event for a bracketed paste block" {
+    var p: Parser = .{};
+    const body = "hello\nworld";
+    const input_bytes = "\x1b[200~" ++ body ++ "\x1b[201~";
+    p.feedBytes(input_bytes, 0);
+    const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .paste => |bytes| try std.testing.expectEqualSlices(u8, body, bytes),
+        else => return error.TestUnexpectedResult,
+    }
+    // After emitting the paste, no further events are pending.
+    try std.testing.expect(p.nextEvent(0) == null);
+}
+
+test "Parser handles a bracketed paste split across reads" {
+    var p: Parser = .{};
+    p.feedBytes("\x1b[200~hel", 0);
+    // No event yet — still waiting for the end marker.
+    try std.testing.expect(p.nextEvent(0) == null);
+    p.feedBytes("lo\x1b[201~", 0);
+    const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .paste => |bytes| try std.testing.expectEqualSlices(u8, "hello", bytes),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser: raw ESC inside a paste is not flushed by the ESC timeout" {
+    var p: Parser = .{};
+    const body = "a\x1bb"; // literal 0x1b byte inside the paste payload
+    p.feedBytes("\x1b[200~" ++ body ++ "\x1b[201~", 0);
+    // Advance past the escape timeout to prove the in-paste branch
+    // bypasses it and still emits the paste intact.
+    const event = p.nextEvent(1000) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .paste => |bytes| try std.testing.expectEqualSlices(u8, body, bytes),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parse ASCII character 'A'" {
     const event = parseBytes(&.{'A'}) orelse return error.TestUnexpectedResult;
     switch (event) {

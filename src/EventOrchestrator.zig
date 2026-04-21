@@ -263,6 +263,7 @@ fn tick(
                 if (self.handleKey(k) == .quit) running.* = false;
             },
             .mouse => |m| self.handleMouse(m),
+            .paste => |bytes| self.handlePaste(bytes),
             else => {},
         }
     }
@@ -441,6 +442,18 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 /// 1-based in `input.MouseEvent` (SGR convention); the layout's rects
 /// are 0-based, so translate before the hit test. Events outside any
 /// leaf are dropped.
+/// Route a bracketed paste to the focused buffer's draft. Active only in
+/// insert mode; in normal mode a stray paste is dropped on purpose (it
+/// would otherwise land as input-that-looks-like-commands). The bytes
+/// are a borrowed slice into the parser's paste buffer and are only
+/// valid for this call.
+fn handlePaste(self: *EventOrchestrator, bytes: []const u8) void {
+    self.window_manager.transient_status_len = 0;
+    if (self.window_manager.current_mode != .insert) return;
+    const focused = self.window_manager.getFocusedPane();
+    focused.view.appendPaste(bytes);
+}
+
 fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
     if (ev.x == 0 or ev.y == 0) return;
     const screen_x: u16 = ev.x - 1;
