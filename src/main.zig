@@ -310,6 +310,7 @@ test {
     // + ConversationBuffer + tools, so refAllDecls covers the whole graph.
     @import("std").testing.refAllDecls(@This());
     _ = @import("lua/mod.zig");
+    _ = @import("auth_wizard.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
