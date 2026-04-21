@@ -200,3 +200,124 @@ test "buildAuthorizeUrl preserves Codex query-parameter order" {
         cursor = idx + needle.len;
     }
 }
+
+// === JWT claim extraction ===
+//
+// Tokens on this flow are `<header_b64>.<payload_b64>.<signature>` with
+// base64url-nopad encoding. Signature is never verified; these are stored
+// locally and trusted on first write.
+
+fn decodePayload(alloc: Allocator, jwt: []const u8) ![]const u8 {
+    var it = std.mem.splitScalar(u8, jwt, '.');
+    _ = it.next() orelse return error.MalformedJwt; // header
+    const payload_b64 = it.next() orelse return error.MalformedJwt;
+    _ = it.next() orelse return error.MalformedJwt; // signature
+    if (it.next() != null) return error.MalformedJwt; // too many parts
+
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const out_len = dec.calcSizeForSlice(payload_b64) catch return error.MalformedJwt;
+    const out = try alloc.alloc(u8, out_len);
+    errdefer alloc.free(out);
+    dec.decode(out, payload_b64) catch return error.MalformedJwt;
+    return out;
+}
+
+pub fn extractAccountId(alloc: Allocator, id_token: []const u8) ![]const u8 {
+    const payload = try decodePayload(alloc, id_token);
+    defer alloc.free(payload);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return error.MalformedJwt;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.MalformedJwt,
+    };
+    const auth_v = root.get("https://api.openai.com/auth") orelse return error.ClaimMissing;
+    const auth_obj = switch (auth_v) {
+        .object => |o| o,
+        else => return error.ClaimMissing,
+    };
+    const acc_v = auth_obj.get("chatgpt_account_id") orelse return error.ClaimMissing;
+    const acc = switch (acc_v) {
+        .string => |s| s,
+        else => return error.ClaimMissing,
+    };
+    return alloc.dupe(u8, acc);
+}
+
+pub fn extractExp(access_token: []const u8) !i64 {
+    // Uses page_allocator so callers on the credential-resolve hot path
+    // don't need to thread an allocator through.
+    const page = std.heap.page_allocator;
+    const payload = try decodePayload(page, access_token);
+    defer page.free(payload);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, page, payload, .{}) catch return error.MalformedJwt;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.MalformedJwt,
+    };
+    const exp_v = root.get("exp") orelse return error.ClaimMissing;
+    return switch (exp_v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => error.ClaimMissing,
+    };
+}
+
+fn encodeTestJwt(alloc: Allocator, payload: []const u8) ![]const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_buf = try alloc.alloc(u8, enc.calcSize(header.len));
+    defer alloc.free(header_buf);
+    const header_b64 = enc.encode(header_buf, header);
+
+    const payload_buf = try alloc.alloc(u8, enc.calcSize(payload.len));
+    defer alloc.free(payload_buf);
+    const payload_b64 = enc.encode(payload_buf, payload);
+
+    return std.fmt.allocPrint(alloc, "{s}.{s}.sig", .{ header_b64, payload_b64 });
+}
+
+test "extractAccountId reads chatgpt_account_id claim" {
+    const payload = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc-123\"}}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    const account_id = try extractAccountId(std.testing.allocator, jwt);
+    defer std.testing.allocator.free(account_id);
+    try std.testing.expectEqualStrings("acc-123", account_id);
+}
+
+test "extractExp reads numeric exp claim" {
+    const payload = "{\"exp\":1735689600,\"iat\":1735689000}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    const exp = try extractExp(jwt);
+    try std.testing.expectEqual(@as(i64, 1735689600), exp);
+}
+
+test "extractAccountId returns error.ClaimMissing when path absent" {
+    const payload = "{\"other\":\"thing\"}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    try std.testing.expectError(error.ClaimMissing, extractAccountId(std.testing.allocator, jwt));
+}
+
+test "extractExp returns error.ClaimMissing when exp absent" {
+    const payload = "{}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    try std.testing.expectError(error.ClaimMissing, extractExp(jwt));
+}
+
+test "extractAccountId returns error.MalformedJwt on bad shape" {
+    try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "only.one.dot"));
+    try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "no-dots-at-all"));
+}
