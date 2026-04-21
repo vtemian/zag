@@ -1,4 +1,4 @@
-//! ConversationSession: LLM conversation history and session persistence.
+//! ConversationHistory: LLM conversation history and session persistence.
 //!
 //! Owns the message list sent to the LLM API and the optional session
 //! handle used to persist events as JSONL. Tree state lives elsewhere
@@ -10,7 +10,7 @@ const log = std.log.scoped(.conversation_session);
 const types = @import("types.zig");
 const Session = @import("Session.zig");
 
-const ConversationSession = @This();
+const ConversationHistory = @This();
 
 /// Allocator used for messages and their content blocks.
 allocator: Allocator,
@@ -23,24 +23,24 @@ session_handle: ?*Session.SessionHandle = null,
 /// tripped it stays true for the remainder of the session.
 persist_failed: bool = false,
 
-pub fn init(allocator: Allocator) ConversationSession {
+pub fn init(allocator: Allocator) ConversationHistory {
     return .{ .allocator = allocator };
 }
 
-pub fn deinit(self: *ConversationSession) void {
+pub fn deinit(self: *ConversationHistory) void {
     for (self.messages.items) |msg| msg.deinit(self.allocator);
     self.messages.deinit(self.allocator);
 }
 
 /// Attach a session handle for persistence. Does not take ownership of the
 /// handle: the caller remains responsible for closing it.
-pub fn attachSession(self: *ConversationSession, handle: *Session.SessionHandle) void {
+pub fn attachSession(self: *ConversationHistory, handle: *Session.SessionHandle) void {
     self.session_handle = handle;
 }
 
 /// Append a user message with one text ContentBlock. The text is duped
 /// into an allocation owned by the message's content slice.
-pub fn appendUserMessage(self: *ConversationSession, text: []const u8) !void {
+pub fn appendUserMessage(self: *ConversationHistory, text: []const u8) !void {
     const content = try self.allocator.alloc(types.ContentBlock, 1);
     errdefer self.allocator.free(content);
     const duped = try self.allocator.dupe(u8, text);
@@ -52,7 +52,7 @@ pub fn appendUserMessage(self: *ConversationSession, text: []const u8) !void {
 /// Persist an event to the session JSONL file, if a session is attached.
 /// Propagates errors so callers can decide whether to log and flip the
 /// `persist_failed` flag or abort the operation.
-pub fn persistEvent(self: *ConversationSession, entry: Session.Entry) !void {
+pub fn persistEvent(self: *ConversationHistory, entry: Session.Entry) !void {
     const sh = self.session_handle orelse return;
     try sh.appendEntry(entry);
 }
@@ -61,7 +61,7 @@ pub fn persistEvent(self: *ConversationSession, entry: Session.Entry) !void {
 /// wrapper around `persistEvent` for the submit path. Errors are logged
 /// and flip `persist_failed`; the caller continues since we have already
 /// accepted the message into the conversation history.
-pub fn persistUserMessage(self: *ConversationSession, text: []const u8) void {
+pub fn persistUserMessage(self: *ConversationHistory, text: []const u8) void {
     self.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
@@ -73,7 +73,7 @@ pub fn persistUserMessage(self: *ConversationSession, text: []const u8) void {
 }
 
 /// Reconstruct the LLM message history from loaded entries.
-pub fn rebuildMessages(self: *ConversationSession, entries: []const Session.Entry, allocator: Allocator) !void {
+pub fn rebuildMessages(self: *ConversationHistory, entries: []const Session.Entry, allocator: Allocator) !void {
     var assistant_blocks: std.ArrayList(types.ContentBlock) = .empty;
     defer assistant_blocks.deinit(allocator);
 
@@ -137,13 +137,13 @@ pub fn rebuildMessages(self: *ConversationSession, entries: []const Session.Entr
     if (last_tool_use_id) |id| allocator.free(id);
 }
 
-fn flushAssistantMessage(self: *ConversationSession, blocks: *std.ArrayList(types.ContentBlock), allocator: Allocator) !void {
+fn flushAssistantMessage(self: *ConversationHistory, blocks: *std.ArrayList(types.ContentBlock), allocator: Allocator) !void {
     if (blocks.items.len == 0) return;
     const content = try blocks.toOwnedSlice(allocator);
     try self.messages.append(allocator, .{ .role = .assistant, .content = content });
 }
 
-fn flushToolResultMessage(self: *ConversationSession, blocks: *std.ArrayList(types.ContentBlock), allocator: Allocator) !void {
+fn flushToolResultMessage(self: *ConversationHistory, blocks: *std.ArrayList(types.ContentBlock), allocator: Allocator) !void {
     if (blocks.items.len == 0) return;
     const content = try blocks.toOwnedSlice(allocator);
     try self.messages.append(allocator, .{ .role = .user, .content = content });
@@ -161,7 +161,7 @@ pub const SessionSummaryInputs = struct {
 /// auto-naming. Returns null if the session lacks at least one of each.
 /// The returned slices point into the session's messages and are valid
 /// until the next mutation.
-pub fn sessionSummaryInputs(self: *const ConversationSession) ?SessionSummaryInputs {
+pub fn sessionSummaryInputs(self: *const ConversationHistory) ?SessionSummaryInputs {
     const msgs = self.messages.items;
     if (msgs.len < 2) return null;
 
@@ -197,7 +197,7 @@ test {
 
 test "init and deinit" {
     const allocator = std.testing.allocator;
-    var s = ConversationSession.init(allocator);
+    var s = ConversationHistory.init(allocator);
     defer s.deinit();
     try std.testing.expectEqual(@as(usize, 0), s.messages.items.len);
     try std.testing.expect(s.session_handle == null);
@@ -220,7 +220,7 @@ test "persistEvent propagates errors from a closed file handle" {
         .allocator = allocator,
     };
 
-    var s = ConversationSession.init(allocator);
+    var s = ConversationHistory.init(allocator);
     defer s.deinit();
     s.attachSession(&handle);
 
@@ -236,7 +236,7 @@ test "persistEvent propagates errors from a closed file handle" {
 
 test "persistEvent is a no-op when no session is attached" {
     const allocator = std.testing.allocator;
-    var s = ConversationSession.init(allocator);
+    var s = ConversationHistory.init(allocator);
     defer s.deinit();
 
     try s.persistEvent(.{
@@ -249,7 +249,7 @@ test "persistEvent is a no-op when no session is attached" {
 
 test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
 
     const entries = [_]Session.Entry{

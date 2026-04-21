@@ -20,7 +20,7 @@ const tools = @import("tools.zig");
 const Screen = @import("Screen.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationSession = @import("ConversationSession.zig");
+const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
@@ -45,7 +45,7 @@ pub const Pane = struct {
     /// Conversation buffer rendered for this pane.
     view: *ConversationBuffer,
     /// Message history and turn state backing the view.
-    session: *ConversationSession,
+    session: *ConversationHistory,
     /// Agent worker driving LLM calls and tool execution for this pane.
     runner: *AgentRunner,
 };
@@ -312,9 +312,9 @@ pub fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
 /// Create a new split pane: session + view + runner + optional persistence
 /// handle, tracked for cleanup. Returns the freshly composed `Pane`.
 pub fn createSplitPane(self: *WindowManager) !Pane {
-    const cs = try self.allocator.create(ConversationSession);
+    const cs = try self.allocator.create(ConversationHistory);
     errdefer self.allocator.destroy(cs);
-    cs.* = ConversationSession.init(self.allocator);
+    cs.* = ConversationHistory.init(self.allocator);
     errdefer cs.deinit();
 
     var name_scratch: [32]u8 = undefined;
@@ -521,7 +521,7 @@ fn autoNameSession(self: *WindowManager, pane: Pane) void {
 /// Send a minimal LLM request to summarize the first exchange in 3-5 words.
 fn generateSessionName(
     self: *WindowManager,
-    inputs: ConversationSession.SessionSummaryInputs,
+    inputs: ConversationHistory.SessionSummaryInputs,
 ) ![]const u8 {
     const allocator = self.allocator;
 
@@ -631,8 +631,8 @@ test "modeAfterKey: non-mode action (focus_left) keeps mode" {
 test "Pane composes view + session + runner" {
     const allocator = std.testing.allocator;
 
-    const session = try allocator.create(ConversationSession);
-    session.* = ConversationSession.init(allocator);
+    const session = try allocator.create(ConversationHistory);
+    session.* = ConversationHistory.init(allocator);
     defer {
         session.deinit();
         allocator.destroy(session);
@@ -705,7 +705,7 @@ test "restorePane rebuilds both tree and messages" {
     @memcpy(handle.id[0..session_id.len], session_id);
     defer handle.close();
 
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "restored");
     defer cb.deinit();

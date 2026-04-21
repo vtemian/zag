@@ -106,7 +106,7 @@ draft: [MAX_DRAFT]u8 = undefined,
 draft_len: usize = 0,
 
 /// Create a new empty buffer with the given id and name. The buffer is a
-/// pure view; its LLM messages live on `ConversationSession` and its
+/// pure view; its LLM messages live on `ConversationHistory` and its
 /// agent-thread coordination lives on `AgentRunner`. Callers compose the
 /// three through `EventOrchestrator.Pane`.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
@@ -124,7 +124,7 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
 }
 
 /// Release all memory owned by this buffer: nodes, name, and lists.
-/// Messages and the session handle live on `ConversationSession`; the
+/// Messages and the session handle live on `ConversationHistory`; the
 /// agent thread, event queue, and streaming state live on `AgentRunner`.
 /// Neither is owned by the buffer.
 pub fn deinit(self: *ConversationBuffer) void {

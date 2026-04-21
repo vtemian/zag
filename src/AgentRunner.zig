@@ -1,7 +1,7 @@
 //! AgentRunner: agent thread lifecycle and event coordination.
 //!
 //! Coordinates between the view (ConversationBuffer) and the session
-//! (ConversationSession). Owns the agent thread, event queue, cancel
+//! (ConversationHistory). Owns the agent thread, event queue, cancel
 //! flag, Lua engine pointer, and streaming/correlation state that
 //! bridges LLM call IDs to view tree nodes.
 
@@ -9,7 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.agent_runner);
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationSession = @import("ConversationSession.zig");
+const ConversationHistory = @import("ConversationHistory.zig");
 const agent_events = @import("agent_events.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
@@ -25,7 +25,7 @@ const AgentRunner = @This();
 view: *ConversationBuffer,
 /// Session state this runner persists into. Borrowed; the orchestrator
 /// owns the lifetime.
-session: *ConversationSession,
+session: *ConversationHistory,
 /// Allocator for pending_tool_calls keys and any transient runner state.
 allocator: Allocator,
 
@@ -61,7 +61,7 @@ last_info_len: u8 = 0,
 pub fn init(
     allocator: Allocator,
     view: *ConversationBuffer,
-    session: *ConversationSession,
+    session: *ConversationHistory,
 ) AgentRunner {
     return .{
         .allocator = allocator,
@@ -492,7 +492,7 @@ test {
 
 test "resetCurrentAssistantText removes the in-progress node" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "reset-test");
     defer cb.deinit();
@@ -514,7 +514,7 @@ test "resetCurrentAssistantText removes the in-progress node" {
 
 test "resetCurrentAssistantText is a no-op when nothing is in progress" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "reset-noop");
     defer cb.deinit();
@@ -531,7 +531,7 @@ test "resetCurrentAssistantText is a no-op when nothing is in progress" {
 
 test "text_delta after reset starts a fresh assistant node" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "reset-flow");
     defer cb.deinit();
@@ -556,7 +556,7 @@ test "text_delta after reset starts a fresh assistant node" {
 
 test "handleAgentEvent correlates tool_result to tool_start via call_id" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "tool-corr");
     defer cb.deinit();
@@ -595,7 +595,7 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
 
 test "wake_fd default is null" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "wake-default");
     defer cb.deinit();
@@ -609,7 +609,7 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
     // Mirrors the submitInput sequence (init EventQueue, copy wake_fd)
     // without spawning a real agent thread.
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate");
     defer cb.deinit();
@@ -745,7 +745,7 @@ test "text_delta fires post-hook with text" {
 
 test "submitInput records user message on session, tree, and resets streaming" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "submit-runner");
     defer cb.deinit();
@@ -774,7 +774,7 @@ test "submitInput records user message on session, tree, and resets streaming" {
 
 test "drainEvents joins thread and deinits queue on .done" {
     const allocator = std.testing.allocator;
-    var scb = ConversationSession.init(allocator);
+    var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "drain-test");
     defer cb.deinit();
