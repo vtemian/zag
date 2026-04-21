@@ -19,8 +19,10 @@ const default_max_tokens = 8192;
 pub const OpenAiSerializer = struct {
     /// Endpoint connection details (URL, auth, headers).
     endpoint: *const llm.Endpoint,
-    /// API key for Bearer authentication.
-    api_key: []const u8,
+    /// Absolute path to `auth.json`. Credentials are resolved per request
+    /// so the serializer never caches a key that could rotate out from
+    /// under it.
+    auth_path: []const u8,
     /// Model identifier (e.g., "gpt-4o", "gpt-4o-mini").
     model: []const u8,
 
@@ -51,7 +53,7 @@ pub const OpenAiSerializer = struct {
         const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
-        var headers = try llm.http.buildHeaders(self.endpoint, self.api_key, req.allocator);
+        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator, .{});
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
         const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
@@ -76,7 +78,7 @@ pub const OpenAiSerializer = struct {
         const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
-        var headers = try llm.http.buildHeaders(self.endpoint, self.api_key, req.allocator);
+        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator, .{});
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
         const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
