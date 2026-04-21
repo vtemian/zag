@@ -302,6 +302,156 @@ fn writeFinalMetrics(writer: anytype, fm: FinalMetrics) !void {
     try writer.writeByte('}');
 }
 
+/// Per-turn token and cost metrics gathered as the agent run proceeds.
+/// Mirrors the schema's per-step `Metrics` shape but lives inside `Capture`.
+pub const TurnMetrics = struct {
+    /// Prompt (input) tokens charged for this turn.
+    prompt_tokens: ?u32 = null,
+    /// Completion (output) tokens charged for this turn.
+    completion_tokens: ?u32 = null,
+    /// Subset of `prompt_tokens` served from the provider cache.
+    cached_tokens: ?u32 = null,
+    /// Estimated USD cost for this turn, null when pricing is unknown.
+    cost_usd: ?f64 = null,
+};
+
+/// One agent turn captured live from the event stream.
+/// All slices inside `text`, `tool_calls`, and `tool_results` are owned by
+/// `Capture`'s internal arena.
+pub const CapturedTurn = struct {
+    /// Wall-clock timestamp of the turn start, in milliseconds since epoch.
+    started_at_ms: i64,
+    /// Concatenated assistant text deltas observed during the turn.
+    text: std.ArrayList(u8),
+    /// Tool calls the assistant emitted during this turn.
+    tool_calls: std.ArrayList(ToolCall),
+    /// Tool results observed during this turn (one per call).
+    tool_results: std.ArrayList(ObservationResult),
+    /// Per-turn token and cost metrics, populated by `endTurn`.
+    metrics: ?TurnMetrics = null,
+};
+
+/// Live accumulator that records assistant turns as agent events drain.
+/// Owns every captured string via an internal arena so consumers can read
+/// the data after the agent thread has exited and freed its event payloads.
+pub const Capture = struct {
+    /// Allocator used for the `turns` ArrayList backing array. The arena
+    /// is built from this allocator and owns every captured string.
+    allocator: std.mem.Allocator,
+    /// Internal arena. Frees all duped strings + per-turn ArrayLists at deinit.
+    arena: std.heap.ArenaAllocator,
+    /// Ordered captured turns, one per `beginTurn`/`endTurn` cycle.
+    turns: std.ArrayList(CapturedTurn),
+    /// Pointer into `turns` for the in-flight turn, or null between turns.
+    cur: ?*CapturedTurn = null,
+
+    /// Construct an empty Capture. The arena is parented to `allocator`.
+    pub fn init(allocator: std.mem.Allocator) Capture {
+        return .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .turns = .empty,
+            .cur = null,
+        };
+    }
+
+    /// Release the arena (frees all captured strings + per-turn ArrayLists)
+    /// and the `turns` backing array.
+    pub fn deinit(self: *Capture) void {
+        self.arena.deinit();
+        self.turns.deinit(self.allocator);
+        self.cur = null;
+    }
+
+    /// Open a new captured turn timestamped at `timestamp_ms` (ms since epoch).
+    /// Subsequent `addTextDelta`/`addToolCall`/`addToolResult` calls attach to
+    /// this turn until `endTurn` is called.
+    pub fn beginTurn(self: *Capture, timestamp_ms: i64) !void {
+        try self.turns.append(self.allocator, .{
+            .started_at_ms = timestamp_ms,
+            .text = .empty,
+            .tool_calls = .empty,
+            .tool_results = .empty,
+        });
+        self.cur = &self.turns.items[self.turns.items.len - 1];
+    }
+
+    /// Append assistant text to the current turn. The delta is duped into
+    /// the arena so the caller can free its copy immediately.
+    pub fn addTextDelta(self: *Capture, delta: []const u8) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        const arena_alloc = self.arena.allocator();
+        const owned = try arena_alloc.dupe(u8, delta);
+        try turn.text.appendSlice(arena_alloc, owned);
+    }
+
+    /// Record a tool invocation on the current turn. All three strings are
+    /// duped into the arena.
+    pub fn addToolCall(
+        self: *Capture,
+        id: []const u8,
+        name: []const u8,
+        args_json: []const u8,
+    ) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        const arena_alloc = self.arena.allocator();
+        try turn.tool_calls.append(arena_alloc, .{
+            .tool_call_id = try arena_alloc.dupe(u8, id),
+            .function_name = try arena_alloc.dupe(u8, name),
+            .arguments_json = try arena_alloc.dupe(u8, args_json),
+        });
+    }
+
+    /// Record a tool result on the most recently opened turn. Tool results
+    /// can arrive after `endTurn` because the agent loop closes the assistant
+    /// turn before dispatching tools, so this attaches to the last turn
+    /// rather than requiring an active `cur`. The `is_error` flag is
+    /// intentionally dropped here.
+    /// TODO(Task 11): decide error representation in ATIF observation.
+    pub fn addToolResult(
+        self: *Capture,
+        call_id: []const u8,
+        content: []const u8,
+        is_error: bool,
+    ) !void {
+        _ = is_error;
+        if (self.turns.items.len == 0) return error.NoActiveTurn;
+        const turn = &self.turns.items[self.turns.items.len - 1];
+        const arena_alloc = self.arena.allocator();
+        try turn.tool_results.append(arena_alloc, .{
+            .source_call_id = try arena_alloc.dupe(u8, call_id),
+            .content = try arena_alloc.dupe(u8, content),
+        });
+    }
+
+    /// Close the current turn, attaching `metrics` to it. Subsequent
+    /// `addTextDelta` calls before another `beginTurn` will fail.
+    pub fn endTurn(self: *Capture, metrics: TurnMetrics) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        turn.metrics = metrics;
+        self.cur = null;
+    }
+};
+
+test "Capture records assistant turn with tool calls and observation" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1_700_000_000_000); // ms
+    try cap.addToolCall("t1", "bash", "{\"cmd\":\"ls\"}");
+    try cap.addTextDelta("I'll list files.");
+    try cap.endTurn(.{
+        .prompt_tokens = 12,
+        .completion_tokens = 4,
+        .cached_tokens = 0,
+        .cost_usd = null,
+    });
+    try cap.addToolResult("t1", "file1\nfile2", false);
+
+    try std.testing.expectEqual(@as(usize, 1), cap.turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cap.turns.items[0].tool_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cap.turns.items[0].tool_results.items.len);
+}
+
 test "Trajectory struct has required ATIF-v1.2 fields" {
     const agent = Agent{ .name = "zag", .version = "0.1.0" };
     const steps = [_]Step{.{
