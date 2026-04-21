@@ -12,7 +12,7 @@ const tools = @import("tools.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationSession = @import("ConversationSession.zig");
+const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
@@ -110,7 +110,7 @@ pub fn main() !void {
     };
     defer file_log.deinit();
 
-    var root_session = ConversationSession.init(allocator);
+    var root_session = ConversationHistory.init(allocator);
     defer root_session.deinit();
 
     var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
