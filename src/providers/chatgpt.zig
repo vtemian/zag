@@ -189,8 +189,13 @@ pub const StreamingBlock = struct {
 
     pub fn deinit(self: *StreamingBlock, allocator: Allocator) void {
         self.content.deinit(allocator);
-        if (self.call_id.len > 0) allocator.free(self.call_id);
-        if (self.name.len > 0) allocator.free(self.name);
+        switch (self.kind) {
+            .text => {},
+            .function_call => {
+                allocator.free(self.call_id);
+                allocator.free(self.name);
+            },
+        }
     }
 };
 
@@ -305,29 +310,36 @@ fn handleOutputItemAdded(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
     const name_value = item.get("name") orelse return;
     if (call_id_value != .string or name_value != .string) return;
 
-    const call_id = try emit.allocator.dupe(u8, call_id_value.string);
-    errdefer emit.allocator.free(call_id);
-    const name = try emit.allocator.dupe(u8, name_value.string);
-    errdefer emit.allocator.free(name);
-
-    try emit.blocks.append(emit.allocator, .{
+    // Build the block as a local value so partial-failure cleanup stays
+    // ownership-clear: every allocation has an errdefer registered BEFORE
+    // any later fallible op. The final `append` transfers ownership into
+    // `emit.blocks`; after that, no fallible op runs before return, so the
+    // outer defer in `parseSseStream` owns the whole block.
+    var block: StreamingBlock = .{
         .kind = .function_call,
         .content = .empty,
-        .call_id = call_id,
-        .name = name,
-    });
+        .call_id = try emit.allocator.dupe(u8, call_id_value.string),
+        .name = "",
+    };
+    errdefer emit.allocator.free(block.call_id);
+
+    block.name = try emit.allocator.dupe(u8, name_value.string);
+    errdefer emit.allocator.free(block.name);
+
+    errdefer block.content.deinit(emit.allocator);
 
     // Seed the argument buffer if the server sent a non-empty `arguments`
     // string in the initial item (some Responses variants include a priming
     // chunk here rather than a dedicated delta event).
     if (item.get("arguments")) |args| {
         if (args == .string and args.string.len > 0) {
-            const last = &emit.blocks.items[emit.blocks.items.len - 1];
-            try last.content.appendSlice(emit.allocator, args.string);
+            try block.content.appendSlice(emit.allocator, args.string);
         }
     }
 
-    emit.callback.on_event(emit.callback.ctx, .{ .tool_start = name });
+    try emit.blocks.append(emit.allocator, block);
+
+    emit.callback.on_event(emit.callback.ctx, .{ .tool_start = block.name });
 }
 
 fn handleOutputItemDone(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
@@ -437,23 +449,28 @@ fn handleCompleted(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 }
 
 fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    // A mid-stream `response.failed` is terminal: the provider will not
+    // send `response.completed`, so any partially-accumulated blocks are
+    // discarded by the outer defer in `parseSseStream`. We fire the `.err`
+    // callback for observers and then return `ProviderResponseFailed` so
+    // callers can distinguish this from a successful empty turn.
     const response_value = obj.get("response") orelse {
         emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return;
+        return error.ProviderResponseFailed;
     };
     if (response_value != .object) {
         emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return;
+        return error.ProviderResponseFailed;
     }
 
     const response = response_value.object;
     const err_value = response.get("error") orelse {
         emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return;
+        return error.ProviderResponseFailed;
     };
     if (err_value != .object) {
         emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return;
+        return error.ProviderResponseFailed;
     }
 
     const err_obj = err_value.object;
@@ -473,6 +490,7 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 
     emit.callback.on_event(emit.callback.ctx, .{ .err = text });
     emit.stop_reason.* = .end_turn;
+    return error.ProviderResponseFailed;
 }
 
 fn handleIncomplete(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
@@ -915,19 +933,53 @@ test "chatgpt SSE: response.failed emits err with code and message" {
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
 
-    try fx.run(allocator, &.{
+    // `response.failed` now terminates dispatch with ProviderResponseFailed;
+    // the `.err` callback still fires before the error propagates.
+    const result = fx.run(allocator, &.{
         .{ .event_type = "response.created", .data = "{\"response\":{\"id\":\"r_3\"}}" },
         .{
             .event_type = "response.failed",
             .data = "{\"response\":{\"id\":\"r_3\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too big\"}}}",
         },
     });
+    try std.testing.expectError(error.ProviderResponseFailed, result);
 
     const ev = fx.recorder.events.items;
     try std.testing.expectEqual(@as(usize, 1), ev.len);
     try std.testing.expectEqual(.err, ev[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, ev[0].payload, "context_length_exceeded") != null);
     try std.testing.expect(std.mem.indexOf(u8, ev[0].payload, "too big") != null);
+}
+
+test "chatgpt SSE: response.failed returns error to caller" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    // Accumulate a text delta first so we also exercise the outer cleanup
+    // path that frees partial blocks on the error return.
+    const result = fx.run(allocator, &.{
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"partial\"}" },
+        .{
+            .event_type = "response.failed",
+            .data = "{\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}",
+        },
+        // Events after the failure should never run — dispatch aborted.
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\" more\"}" },
+    });
+    try std.testing.expectError(error.ProviderResponseFailed, result);
+
+    // The .err callback must have fired before the error propagated.
+    var saw_err = false;
+    for (fx.recorder.events.items) |e| {
+        if (e.kind == .err and std.mem.indexOf(u8, e.payload, "server_error") != null) saw_err = true;
+    }
+    try std.testing.expect(saw_err);
+
+    // The partial text block is still in fx.blocks; fx.deinit frees it via
+    // testing.allocator, which panics on leak. If this test passes, no leak.
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqualStrings("partial", fx.blocks.items[0].content.items);
 }
 
 test "chatgpt SSE: unknown event types are ignored, not fatal" {
