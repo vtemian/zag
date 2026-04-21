@@ -206,7 +206,8 @@ pub fn parseModelString(model: []const u8) ModelSpec {
 }
 
 /// Result of creating a provider. Owns all resources needed for LLM calls.
-/// A single deinit() frees everything: provider state, API key, model string, registry.
+/// A single deinit() frees everything: provider state, auth path, model
+/// string, and registry.
 pub const ProviderResult = struct {
     /// The provider interface for agent loop LLM calls.
     provider: Provider,
@@ -214,8 +215,9 @@ pub const ProviderResult = struct {
     model_id: []const u8,
     /// The allocated provider state. Must be destroyed when done.
     state: *anyopaque,
-    /// The API key string, owned by this result.
-    api_key: []const u8,
+    /// Absolute path to `auth.json`, owned by this result. Serializers
+    /// borrow it for per-request credential resolution.
+    auth_path: []const u8,
     /// Endpoint registry (owned, freed on deinit).
     registry: Registry,
     /// Allocator used to create the state (for cleanup).
@@ -224,7 +226,7 @@ pub const ProviderResult = struct {
     serializer: Serializer,
 
     pub fn deinit(self: *ProviderResult) void {
-        self.allocator.free(self.api_key);
+        self.allocator.free(self.auth_path);
         self.allocator.free(self.model_id);
         self.registry.deinit();
         switch (self.serializer) {
@@ -246,12 +248,16 @@ pub const ProviderResult = struct {
 ///
 /// `default_model` is the model string the user set via
 /// `zag.set_default_model("prov/id")` (null falls back to
-/// `anthropic/claude-sonnet-4-20250514`). The api key is read out of
-/// `auth_file_path` (normally `~/.config/zag/auth.json`) via `auth.getApiKey`.
+/// `anthropic/claude-sonnet-4-20250514`). Credentials are not loaded
+/// eagerly here — the serializer holds the path and resolves fresh bytes
+/// per request via `buildHeaders`. A single up-front existence check keeps
+/// the fail-fast behaviour for api-key providers: a missing entry surfaces
+/// as `error.MissingCredential` before the TUI boots.
 /// Endpoints whose `auth` discriminator is `.none` (e.g. Ollama) skip the
 /// credential lookup entirely. The returned `ProviderResult` owns the duped
-/// model string, the duped api key, the endpoint registry, and the serializer
-/// state.
+/// model string, the duped auth-file path, the endpoint registry, and the
+/// serializer state.
+///
 /// Construct the default `auth.json` path in `buf` as
 /// `$HOME/.config/zag/auth.json`, falling back to `./.config/zag/auth.json`
 /// when `$HOME` is unset. Returns a slice of `buf`; no heap allocation.
@@ -291,29 +297,34 @@ pub fn createProviderFromLuaConfig(
     const endpoint = registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
-    const api_key: []const u8 = switch (endpoint.auth) {
-        .none => try allocator.dupe(u8, ""),
-        .x_api_key, .bearer => blk: {
+    // Fail-fast existence check for api-key providers. OAuth paths defer
+    // their resolve+refresh dance to the first request; .none has nothing
+    // to check.
+    switch (endpoint.auth) {
+        .none => {},
+        .x_api_key, .bearer => {
             var auth_file = try auth.loadAuthFile(allocator, auth_file_path);
             defer auth_file.deinit();
             const borrowed = (try auth_file.getApiKey(spec.provider_name)) orelse
                 return error.MissingCredential;
-            break :blk try allocator.dupe(u8, borrowed);
+            _ = borrowed;
         },
         // Task 10 replaces this stub with resolveCredential (proactive refresh).
         .oauth_chatgpt => return error.NotImplemented,
-    };
-    errdefer allocator.free(api_key);
+    }
+
+    const auth_path = try allocator.dupe(u8, auth_file_path);
+    errdefer allocator.free(auth_path);
 
     switch (endpoint.serializer) {
         .anthropic => {
             const state = try allocator.create(anthropic.AnthropicSerializer);
-            state.* = .{ .endpoint = endpoint, .api_key = api_key, .model = spec.model_id };
+            state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = spec.model_id };
             return .{
                 .provider = state.provider(),
                 .model_id = model_id,
                 .state = state,
-                .api_key = api_key,
+                .auth_path = auth_path,
                 .registry = registry,
                 .allocator = allocator,
                 .serializer = .anthropic,
@@ -321,12 +332,12 @@ pub fn createProviderFromLuaConfig(
         },
         .openai => {
             const state = try allocator.create(openai.OpenAiSerializer);
-            state.* = .{ .endpoint = endpoint, .api_key = api_key, .model = spec.model_id };
+            state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = spec.model_id };
             return .{
                 .provider = state.provider(),
                 .model_id = model_id,
                 .state = state,
-                .api_key = api_key,
+                .auth_path = auth_path,
                 .registry = registry,
                 .allocator = allocator,
                 .serializer = .openai,
@@ -581,7 +592,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
     defer result.deinit();
 
     try std.testing.expectEqualStrings("openai/gpt-4o", result.model_id);
-    try std.testing.expectEqualStrings("sk-openai-test", result.api_key);
+    try std.testing.expectEqualStrings(auth_path, result.auth_path);
     try std.testing.expectEqual(Serializer.openai, result.serializer);
 }
 
@@ -607,7 +618,7 @@ test "createProviderFromLuaConfig uses hardcoded fallback when default_model uns
     defer result.deinit();
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", result.model_id);
-    try std.testing.expectEqualStrings("sk-ant-test", result.api_key);
+    try std.testing.expectEqualStrings(auth_path, result.auth_path);
     try std.testing.expectEqual(Serializer.anthropic, result.serializer);
 }
 
@@ -636,8 +647,8 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
 }
 
 test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints" {
-    // Ollama has Endpoint.auth = .none. Even with no auth.json present we must
-    // succeed and hand back an empty api_key string.
+    // Ollama has Endpoint.auth = .none. Even with no auth.json present we
+    // must succeed; nothing reads the credential path for .none endpoints.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -651,7 +662,7 @@ test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints"
     defer result.deinit();
 
     try std.testing.expectEqualStrings("ollama/llama3", result.model_id);
-    try std.testing.expectEqualStrings("", result.api_key);
+    try std.testing.expectEqualStrings(auth_path, result.auth_path);
     try std.testing.expectEqual(Serializer.openai, result.serializer);
 }
 
