@@ -388,6 +388,19 @@ pub fn deleteWordFromDraft(self: *ConversationBuffer) void {
     }
 }
 
+/// Append a chunk of bytes to the draft, e.g. from a bracketed paste.
+/// Silently truncates past `draft.len`; a warning is logged so overflow
+/// is observable without interrupting the paste.
+pub fn appendPaste(self: *ConversationBuffer, data: []const u8) void {
+    const room = self.draft.len - self.draft_len;
+    const to_copy = @min(room, data.len);
+    @memcpy(self.draft[self.draft_len..][0..to_copy], data[0..to_copy]);
+    self.draft_len += to_copy;
+    if (to_copy < data.len) {
+        std.log.scoped(.buffer).warn("paste truncated: {d} bytes dropped (draft full)", .{data.len - to_copy});
+    }
+}
+
 /// Clear the draft entirely.
 pub fn clearDraft(self: *ConversationBuffer) void {
     self.draft_len = 0;

@@ -22,6 +22,17 @@ pub const PARSER_BUF_SIZE = 128;
 /// Maximum bytes we read in a single poll, enough for any escape sequence.
 const READ_BUF_SIZE = 64;
 
+/// Hard cap on an accumulated bracketed paste. Sized to match the
+/// ConversationBuffer draft (4 KiB), since anything past that would be
+/// truncated at the consumer anyway.
+pub const PASTE_BUF_SIZE = 4096;
+
+/// Bracketed paste start marker: `ESC [ 2 0 0 ~`.
+const paste_start = "\x1b[200~";
+
+/// Bracketed paste end marker: `ESC [ 2 0 1 ~`.
+const paste_end = "\x1b[201~";
+
 /// Stateful input parser that buffers partial escape sequences across
 /// multiple reads and applies a timeout to disambiguate bare-Escape
 /// from an unfinished CSI/SS3 prefix.
@@ -48,6 +59,13 @@ pub const Parser = struct {
     /// the leading byte as bare-Escape. 50 ms is the xterm/iTerm
     /// convention.
     escape_timeout_ms: i64 = 50,
+
+    /// Accumulator for raw bytes captured between a `CSI 200~` start
+    /// and `CSI 201~` end marker. Valid only while `in_paste` is true
+    /// and between paste emissions; reused across pastes.
+    paste_buf: [PASTE_BUF_SIZE]u8 = undefined,
+    paste_len: usize = 0,
+    in_paste: bool = false,
 
     /// Append bytes to the pending buffer. On overflow (a pathological
     /// terminal flooding a single sequence past PARSER_BUF_SIZE), the
@@ -78,6 +96,36 @@ pub const Parser = struct {
         while (true) {
             if (self.pending_len == 0) return null;
             const slice = self.pending[0..self.pending_len];
+
+            // Inside a bracketed paste: scan for the end marker and
+            // copy everything up to it into paste_buf. The escape
+            // timeout is intentionally bypassed so a bare 0x1b byte
+            // inside pasted content does not get flushed as Escape.
+            if (self.in_paste) {
+                if (self.tryFinishPaste(slice, now_ms)) |ev| return ev;
+                return null;
+            }
+
+            // Look for a complete paste-start marker before handing the
+            // bytes off to the generic dispatcher (which would otherwise
+            // accept `CSI 200~` as an unknown CSI and discard it).
+            if (slice.len >= paste_start.len and
+                std.mem.eql(u8, slice[0..paste_start.len], paste_start))
+            {
+                self.in_paste = true;
+                self.paste_len = 0;
+                self.consume(paste_start.len, now_ms);
+                continue;
+            }
+            // Same for the end marker arriving without a matching start:
+            // drop it silently rather than emitting a stray CSI.
+            if (slice.len >= paste_end.len and
+                std.mem.eql(u8, slice[0..paste_end.len], paste_end))
+            {
+                self.consume(paste_end.len, now_ms);
+                continue;
+            }
+
             switch (core.nextEventInBuf(slice)) {
                 .ok => |o| {
                     self.consume(o.consumed, now_ms);
@@ -96,6 +144,46 @@ pub const Parser = struct {
                     return null;
                 },
             }
+        }
+    }
+
+    /// While in paste mode, try to find the `CSI 201~` end marker in
+    /// `slice`. On success, flush the paste bytes and emit the paste
+    /// event. Otherwise consume everything except the last
+    /// `paste_end.len - 1` bytes (to leave room for the marker to
+    /// complete on the next read) and return null.
+    fn tryFinishPaste(self: *Parser, slice: []const u8, now_ms: i64) ?Event {
+        var i: usize = 0;
+        while (i + paste_end.len <= slice.len) : (i += 1) {
+            if (std.mem.eql(u8, slice[i .. i + paste_end.len], paste_end)) {
+                self.appendToPasteBuf(slice[0..i]);
+                self.consume(i + paste_end.len, now_ms);
+                self.in_paste = false;
+                return Event{ .paste = self.paste_buf[0..self.paste_len] };
+            }
+        }
+
+        // No marker yet. Consume everything except the trailing
+        // potential-prefix; keep up to paste_end.len - 1 bytes so a
+        // split marker reassembles on the next feedBytes.
+        const keep = @min(slice.len, paste_end.len - 1);
+        const flush = slice.len - keep;
+        if (flush > 0) {
+            self.appendToPasteBuf(slice[0..flush]);
+            self.consume(flush, now_ms);
+        }
+        return null;
+    }
+
+    /// Append `data` to `paste_buf`, clipping at `PASTE_BUF_SIZE`.
+    /// Truncation is logged once per paste so consumers can notice.
+    fn appendToPasteBuf(self: *Parser, data: []const u8) void {
+        const room = self.paste_buf.len - self.paste_len;
+        const to_copy = @min(room, data.len);
+        @memcpy(self.paste_buf[self.paste_len..][0..to_copy], data[0..to_copy]);
+        self.paste_len += to_copy;
+        if (to_copy < data.len) {
+            log.warn("paste truncated: {d} bytes dropped (paste_buf full)", .{data.len - to_copy});
         }
     }
 
