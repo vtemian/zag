@@ -197,11 +197,12 @@ fn drainWakePipe(fd: posix.fd_t) void {
     }
 }
 
-/// Drain every finished Lua async job from the completion queue and hand it
-/// to the engine for coroutine resume. Runs once per tick before per-pane
-/// hook dispatch so any hook that fires later sees the resumed coroutine's
-/// observable state.
-fn drainLuaCompletions(eng: *LuaEngine) void {
+/// Pop every finished Lua async job off the completion queue and resume
+/// the owning coroutine in the engine. Despite the name, this does not
+/// just empty a data structure: each call feeds the Lua state machine
+/// forward, which may fire hooks and queue more events before returning.
+/// "Pump" conveys that drive-forward behavior better than "drain".
+fn pumpLuaCompletions(eng: *LuaEngine) void {
     const runtime = eng.async_runtime orelse return;
     while (runtime.completions.pop()) |job| {
         eng.resumeFromJob(job) catch |err| {
@@ -268,10 +269,18 @@ fn tick(
         }
     }
 
-    // Drain Lua async completions before per-pane work so coroutine results
-    // are visible to any hook that runs during this tick.
+    // CRITICAL ORDERING: pump Lua async completions BEFORE per-pane drains.
+    // Resuming a coroutine may fire hooks (via resumeFromJob) whose
+    // observable side effects must be visible to the subsequent
+    // dispatchHookRequests calls driven by drainPane below. Reversing the
+    // order would push those effects to the next tick.
+    //
+    // Assumption: hooks fired from resumes do not themselves queue new
+    // completions. Holding that would require a fixed-point loop (pump →
+    // drain → repeat until both empty); file a follow-up if a real plugin
+    // scenario needs it.
     if (self.lua_engine) |eng| {
-        drainLuaCompletions(eng);
+        pumpLuaCompletions(eng);
     }
 
     // Drain agent events from every pane. AgentRunner.drainEvents calls
