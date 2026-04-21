@@ -79,7 +79,7 @@ pub const OpenAiSerializer = struct {
         var headers = try llm.buildHeaders(self.endpoint, self.api_key, req.allocator);
         defer llm.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const stream = try llm.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
+        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
         defer stream.destroy();
 
         return parseSseStream(stream, req.allocator, req.callback, req.cancel);
@@ -324,7 +324,7 @@ const StreamingToolCall = struct {
 /// Invokes `callback.on_event` for each event as it arrives, then assembles
 /// the final LlmResponse.
 fn parseSseStream(
-    stream: *llm.StreamingResponse,
+    stream: *llm.streaming.StreamingResponse,
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
