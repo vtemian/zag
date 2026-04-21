@@ -1,10 +1,15 @@
 //! Interactive onboarding wizard for first-run credential setup.
 //!
 //! The module is written over `std.Io.Reader` / `std.Io.Writer` so the prompt
-//! flow can be exercised from tests without a real terminal. `runWizard` and
-//! `scaffoldConfigLua` land in later tasks; Task 2 shipped the shared
-//! `WizardDeps` shape and the provider-choice prompt, Task 3 adds
-//! `promptSecret` with the termios ECHO toggle.
+//! flow can be exercised from tests without a real terminal. Task 2 shipped
+//! the shared `WizardDeps` shape and the provider-choice prompt, Task 3 the
+//! `promptSecret` termios dance, Task 4 the `PROVIDERS` registry and
+//! `scaffoldConfigLua`; `runWizard` and the `auth list` / `auth remove`
+//! helpers land with Task 5.
+//!
+//! Adding a new provider means appending an entry to `PROVIDERS`. Task 8 will
+//! extend the entry with an optional OAuth callback so the ChatGPT OAuth
+//! branch can plug in without touching the wizard orchestrator.
 
 const std = @import("std");
 
@@ -48,6 +53,115 @@ pub const WizardError = error{
     KeyTooLong,
     NonInteractiveFirstRun,
 };
+
+/// Static metadata for one wizard-offered provider. Task 8 extends this with
+/// an optional OAuth callback; until then `PROVIDERS` is pure data and the
+/// wizard always takes the paste-key path.
+pub const ProviderEntry = struct {
+    /// Short key the user picks and the auth/config files store ("openai").
+    name: []const u8,
+    /// Human-facing label shown in the choice menu ("OpenAI").
+    label: []const u8,
+    /// Default `zag.set_default_model` string for this provider. Used by
+    /// `scaffoldConfigLua` when the user is a first-time stranger; once the
+    /// config file exists the wizard never rewrites it.
+    default_model: []const u8,
+};
+
+/// Providers the wizard knows how to onboard. Order is the display order in
+/// the choice menu and in the scaffolded `config.lua` (picked entry first,
+/// others emitted as commented-out hints).
+pub const PROVIDERS = [_]ProviderEntry{
+    .{ .name = "openai", .label = "OpenAI", .default_model = "openai/gpt-4o" },
+    .{ .name = "anthropic", .label = "Anthropic", .default_model = "anthropic/claude-sonnet-4-20250514" },
+    .{ .name = "openrouter", .label = "OpenRouter", .default_model = "openrouter/anthropic/claude-sonnet-4" },
+    .{ .name = "groq", .label = "Groq", .default_model = "groq/llama-3.3-70b-versatile" },
+};
+
+/// Linear lookup against `PROVIDERS`. Returns a pointer so callers can read
+/// all three fields without copying; null means the user picked a name the
+/// wizard doesn't know.
+pub fn findProvider(name: []const u8) ?*const ProviderEntry {
+    for (&PROVIDERS) |*entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
+}
+
+/// Write a first-run `config.lua` at `config_path` with `provider_name`
+/// uncommented and a matching `zag.set_default_model(...)`. The other
+/// providers in `PROVIDERS` are emitted as commented-out hints in their
+/// declaration order so the file doubles as a quick reference.
+///
+/// No-op if `config_path` already exists: re-running the wizard must never
+/// clobber a user's hand-written Lua. Parent directories are created via
+/// `makePath`. File mode is `0o644` because `config.lua` isn't secret.
+///
+/// Errors:
+/// - `error.UnknownProvider` — `provider_name` not in `PROVIDERS`.
+/// - `error.InvalidConfigPath` — `config_path` has no parent component.
+/// - Anything `std.fs` / allocator APIs propagate.
+pub fn scaffoldConfigLua(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    provider_name: []const u8,
+) !void {
+    const picked = findProvider(provider_name) orelse return error.UnknownProvider;
+
+    const parent = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
+    std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const file = std.fs.createFileAbsolute(config_path, .{
+        .exclusive = true,
+        .mode = 0o644,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return err,
+    };
+    defer file.close();
+
+    const body = try renderConfigLua(allocator, picked);
+    defer allocator.free(body);
+
+    var scratch: [512]u8 = undefined;
+    var w = file.writer(&scratch);
+    try w.interface.writeAll(body);
+    try w.interface.flush();
+}
+
+/// Build the scaffold text for `picked`. Split out from `scaffoldConfigLua`
+/// so the render logic is independently testable and the orchestrator stays
+/// focused on filesystem concerns.
+fn renderConfigLua(
+    allocator: std.mem.Allocator,
+    picked: *const ProviderEntry,
+) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+
+    try body.appendSlice(allocator,
+        \\-- zag config. See https://github.com/vladtemian/zag for reference.
+        \\--
+        \\-- Uncomment the providers you want to use. Keys live in ~/.config/zag/auth.json
+        \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
+        \\
+        \\
+    );
+
+    try body.writer(allocator).print("zag.provider {{ name = \"{s}\" }}\n", .{picked.name});
+    for (&PROVIDERS) |*entry| {
+        if (entry == picked) continue;
+        try body.writer(allocator).print("-- zag.provider {{ name = \"{s}\" }}\n", .{entry.name});
+    }
+
+    try body.appendSlice(allocator, "\n");
+    try body.writer(allocator).print("zag.set_default_model(\"{s}\")\n", .{picked.default_model});
+
+    return body.toOwnedSlice(allocator);
+}
 
 /// Cap on how many times `promptChoice` re-asks before giving up. Five is
 /// enough to absorb typos without making a misconfigured pipe spin forever.
@@ -342,4 +456,122 @@ test "promptSecret returns UserAborted on EOF" {
 
     const deps = testDeps(&stdin, &stdout_writer.writer);
     try testing.expectError(error.UserAborted, promptSecret(&deps, "Paste key: "));
+}
+
+test "findProvider returns matching entry" {
+    const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
+    try testing.expectEqualStrings("anthropic", entry.name);
+    try testing.expectEqualStrings("Anthropic", entry.label);
+    try testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", entry.default_model);
+}
+
+test "findProvider returns null for unknown" {
+    try testing.expectEqual(@as(?*const ProviderEntry, null), findProvider("bogus"));
+}
+
+test "scaffoldConfigLua writes expected contents for openai" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
+    defer testing.allocator.free(path);
+
+    try scaffoldConfigLua(testing.allocator, path, "openai");
+
+    const expected =
+        \\-- zag config. See https://github.com/vladtemian/zag for reference.
+        \\--
+        \\-- Uncomment the providers you want to use. Keys live in ~/.config/zag/auth.json
+        \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
+        \\
+        \\zag.provider { name = "openai" }
+        \\-- zag.provider { name = "anthropic" }
+        \\-- zag.provider { name = "openrouter" }
+        \\-- zag.provider { name = "groq" }
+        \\
+        \\zag.set_default_model("openai/gpt-4o")
+        \\
+    ;
+
+    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(expected, actual);
+}
+
+test "scaffoldConfigLua writes expected contents for anthropic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
+    defer testing.allocator.free(path);
+
+    try scaffoldConfigLua(testing.allocator, path, "anthropic");
+
+    const expected =
+        \\-- zag config. See https://github.com/vladtemian/zag for reference.
+        \\--
+        \\-- Uncomment the providers you want to use. Keys live in ~/.config/zag/auth.json
+        \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
+        \\
+        \\zag.provider { name = "anthropic" }
+        \\-- zag.provider { name = "openai" }
+        \\-- zag.provider { name = "openrouter" }
+        \\-- zag.provider { name = "groq" }
+        \\
+        \\zag.set_default_model("anthropic/claude-sonnet-4-20250514")
+        \\
+    ;
+
+    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(expected, actual);
+}
+
+test "scaffoldConfigLua is a no-op when file exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
+    defer testing.allocator.free(path);
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.lua", .data = "-- user content" });
+
+    try scaffoldConfigLua(testing.allocator, path, "openai");
+
+    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings("-- user content", actual);
+}
+
+test "scaffoldConfigLua creates parent directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "nested", "config.lua" });
+    defer testing.allocator.free(path);
+
+    try scaffoldConfigLua(testing.allocator, path, "groq");
+
+    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    defer testing.allocator.free(actual);
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.provider { name = \"groq\" }") != null);
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"groq/llama-3.3-70b-versatile\")") != null);
+}
+
+test "scaffoldConfigLua rejects unknown provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
+    defer testing.allocator.free(path);
+
+    try testing.expectError(
+        error.UnknownProvider,
+        scaffoldConfigLua(testing.allocator, path, "bogus"),
+    );
 }
