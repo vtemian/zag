@@ -37,6 +37,18 @@ zig build run -- --session=<id>    # resume a specific session
 zig build run -- --last            # resume the most recent one
 ```
 
+## Headless mode (harbor / Terminal-Bench)
+
+Zag can run a single-shot agent task for benchmark frameworks like harbor:
+
+    zag --headless \
+        --instruction-file=prompt.txt \
+        --trajectory-out=trajectory.json \
+        --no-session
+
+The trajectory follows ATIF-v1.2 and validates against
+`python -m harbor.utils.trajectory_validator`.
+
 ## Configuration
 
 Zag reads two files on startup, both under `~/.config/zag/`:
