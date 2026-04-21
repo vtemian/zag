@@ -203,10 +203,9 @@ fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *age
     var scratch: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
     const duped = try allocator.dupe(u8, msg);
-    // On QueueFull the push returns an error before taking ownership, so we
-    // must free the dup ourselves or the bytes leak.
-    errdefer allocator.free(duped);
-    try queue.push(.{ .info = duped });
+    // tryPush frees `duped` internally on QueueFull (via freeOwned) and bumps
+    // the dropped counter; no error propagates.
+    queue.tryPush(allocator, .{ .info = duped });
 }
 
 /// Extract tool_use blocks from a response into an owned slice.
@@ -292,7 +291,10 @@ fn firePreHook(
         .args_rewrite = null,
     } };
     var req = Hooks.HookRequest.init(&payload);
-    try queue.push(.{ .hook_request = &req });
+    // Queue-full here means the main loop is saturated; skip the hook round
+    // trip and proceed with the original tool input rather than deadlocking
+    // on `req.done` that nobody will signal.
+    queue.push(.{ .hook_request = &req }) catch return .{ .proceed = null };
     while (true) {
         if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
             break;
@@ -339,7 +341,13 @@ fn firePostHook(
         .is_error_rewrite = null,
     } };
     var req = Hooks.HookRequest.init(&payload);
-    try queue.push(.{ .hook_request = &req });
+    // Queue-full here means the main loop is saturated; skip the hook round
+    // trip and return an empty rewrite rather than deadlocking on `req.done`
+    // that nobody will signal.
+    queue.push(.{ .hook_request = &req }) catch return .{
+        .content_rewrite = null,
+        .is_error_rewrite = null,
+    };
     while (true) {
         if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
             break;
@@ -382,14 +390,14 @@ fn runToolStep(
                 errdefer allocator.free(start_name);
                 const start_id = try allocator.dupe(u8, tc.id);
                 errdefer allocator.free(start_id);
-                try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+                queue.tryPush(allocator, .{ .tool_start = .{ .name = start_name, .call_id = start_id } });
             }
 
             const result_content = try allocator.dupe(u8, synth);
             errdefer allocator.free(result_content);
             const result_id = try allocator.dupe(u8, tc.id);
             errdefer allocator.free(result_id);
-            try queue.push(.{ .tool_result = .{
+            queue.tryPush(allocator, .{ .tool_result = .{
                 .content = result_content,
                 .is_error = true,
                 .call_id = result_id,
@@ -406,7 +414,7 @@ fn runToolStep(
                 errdefer allocator.free(start_name);
                 const start_id = try allocator.dupe(u8, tc.id);
                 errdefer allocator.free(start_id);
-                try queue.push(.{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+                queue.tryPush(allocator, .{ .tool_start = .{ .name = start_name, .call_id = start_id } });
             }
 
             const t0 = std.time.milliTimestamp();
@@ -438,7 +446,7 @@ fn runToolStep(
             errdefer allocator.free(result_content);
             const result_id = try allocator.dupe(u8, tc.id);
             errdefer allocator.free(result_id);
-            try queue.push(.{ .tool_result = .{
+            queue.tryPush(allocator, .{ .tool_result = .{
                 .content = result_content,
                 .is_error = final.is_error,
                 .call_id = result_id,
@@ -469,7 +477,6 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
         const msg = switch (err) {
             error.Cancelled => "error: cancelled",
             error.OutOfMemory => "error: out of memory",
-            error.QueueFull => "error: event queue full",
         };
         ctx.results[ctx.index] = .{ .content = msg, .is_error = true };
         return;
@@ -619,6 +626,34 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "emitTokenUsage degrades to a drop when the queue is saturated" {
+    const allocator = std.testing.allocator;
+
+    // 1-slot queue; fill it so the next push must drop.
+    var queue = try agent_events.EventQueue.initBounded(allocator, 1);
+    defer {
+        var drain_buf: [1]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+        queue.deinit();
+    }
+
+    const filler = try allocator.dupe(u8, "filler");
+    try queue.push(.{ .info = filler });
+
+    const response = types.LlmResponse{
+        .content = &.{},
+        .stop_reason = .end_turn,
+        .input_tokens = 42,
+        .output_tokens = 7,
+    };
+
+    // Must not error; tryPush drops and bumps the counter.
+    try emitTokenUsage(response, allocator, &queue);
+
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.monotonic));
 }
 
 test "user message is appended with correct role and content" {

@@ -91,6 +91,15 @@ pub const AgentEvent = union(enum) {
 /// `push` returns `error.QueueFull`; `tryPush` converts that into an
 /// increment of `dropped` and frees the event's owned bytes so the drop is
 /// observable and leak-free.
+///
+/// Backpressure policy: agent-thread producers use `tryPush` by default so
+/// a saturated queue degrades to dropped events plus an incremented counter,
+/// not a propagated error that would halt the agent loop. The three places
+/// that still call `push` directly (hook request submissions in
+/// `agent.fireLifecycleHook`, `firePreHook`, `firePostHook`) catch
+/// `error.QueueFull` explicitly and fall back to a safe default instead of
+/// entering the blocking wait for a `req.done` signal that would never
+/// arrive. No agent-thread path lets `error.QueueFull` propagate.
 pub const EventQueue = struct {
     /// Guards concurrent access to buffer / head / tail / len.
     mutex: std.Thread.Mutex = .{},
