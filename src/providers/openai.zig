@@ -304,7 +304,7 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
         }
     }
 
-    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
+    return builder.finish(stop_reason, input_tokens, output_tokens, 0, 0, allocator);
 }
 
 /// State for accumulating a tool call during OpenAI streaming.
@@ -430,7 +430,7 @@ fn parseSseStream(
         try builder.addToolUse(tc.id.items, tc.name.items, tc.arguments.items, allocator);
     }
 
-    return builder.finish(stop_reason, 0, 0, allocator);
+    return builder.finish(stop_reason, 0, 0, 0, 0, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------

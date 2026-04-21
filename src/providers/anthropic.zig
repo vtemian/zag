@@ -248,11 +248,14 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
         }
     }
 
-    // TODO(Task 4): fold into builder.finish signature
-    var response = try builder.finish(stop_reason, input_tokens, output_tokens, allocator);
-    response.cache_creation_tokens = cache_creation_tokens;
-    response.cache_read_tokens = cache_read_tokens;
-    return response;
+    return builder.finish(
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        allocator,
+    );
 }
 
 /// State for accumulating a single content block during streaming.
@@ -323,11 +326,14 @@ fn parseSseStream(
         }
     }
 
-    // TODO(Task 4): fold into builder.finish signature
-    var response = try builder.finish(stop_reason, input_tokens, output_tokens, allocator);
-    response.cache_creation_tokens = cache_creation_tokens;
-    response.cache_read_tokens = cache_read_tokens;
-    return response;
+    return builder.finish(
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        allocator,
+    );
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.
