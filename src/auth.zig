@@ -309,7 +309,10 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
 
     // Belt-and-suspenders: a stale <path>.tmp from a prior crash would
     // otherwise inherit its old mode bits via O_CREAT|O_TRUNC. Unlinking
-    // first guarantees a fresh 0o600 file.
+    // first guarantees a fresh 0o600 file. Combined with the rename-to-path
+    // below, every save re-asserts 0o600 even when auth.json pre-exists with
+    // laxer permissions (addressing the same concern as the POSIX fchmod
+    // approach from wip/chatgpt-oauth 65a25e4).
     cwd.deleteFile(tmp_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -634,6 +637,31 @@ test "saveAuthFile writes mode 0600" {
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
+
+    var file = AuthFile.init(std.testing.allocator);
+    defer file.deinit();
+    try file.setApiKey("openai", "sk-test");
+    try saveAuthFile(path, file);
+
+    const stat = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+}
+
+test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    // Pre-create the file with a world-readable mode, as if the user chmod'd
+    // it or restored from a tarball that stripped the original 0o600.
+    {
+        const pre = try std.fs.cwd().createFile(path, .{ .mode = 0o644, .truncate = true });
+        defer pre.close();
+        try std.posix.fchmod(pre.handle, 0o644);
+    }
 
     var file = AuthFile.init(std.testing.allocator);
     defer file.deinit();
