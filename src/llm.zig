@@ -233,6 +233,30 @@ pub const ProviderResult = struct {
 /// credential lookup entirely. The returned `ProviderResult` owns the duped
 /// model string, the duped api key, the endpoint registry, and the serializer
 /// state.
+/// Construct the default `auth.json` path in `buf` as
+/// `$HOME/.config/zag/auth.json`, falling back to `./.config/zag/auth.json`
+/// when `$HOME` is unset. Returns a slice of `buf`; no heap allocation.
+fn defaultAuthPath(buf: []u8) ![]const u8 {
+    const home = std.posix.getenv("HOME") orelse ".";
+    return std.fmt.bufPrint(buf, "{s}/.config/zag/auth.json", .{home});
+}
+
+/// Build a provider from `$HOME`/auth.json and a Lua-supplied model.
+/// Wraps `createProviderFromLuaConfig` with the HOME lookup and path
+/// construction that used to live in `main.zig`, so entry-point code can
+/// just call this single factory.
+pub fn createProviderFromEnv(
+    default_model: ?[]const u8,
+    allocator: Allocator,
+) !ProviderResult {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const auth_path = defaultAuthPath(&path_buf) catch |err| {
+        log.err("failed to construct auth.json path: {s}", .{@errorName(err)});
+        return err;
+    };
+    return createProviderFromLuaConfig(default_model, auth_path, allocator);
+}
+
 pub fn createProviderFromLuaConfig(
     default_model: ?[]const u8,
     auth_file_path: []const u8,

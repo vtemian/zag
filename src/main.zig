@@ -152,19 +152,8 @@ pub fn main() !void {
         eng.loadUserConfig();
     }
 
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => blk: {
-            log.warn("HOME unset; falling back to \".\" for auth.json path", .{});
-            break :blk try allocator.dupe(u8, ".");
-        },
-        else => return err,
-    };
-    defer allocator.free(home_dir);
-    const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home_dir});
-    defer allocator.free(auth_path);
-
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    var provider = llm.createProviderFromLuaConfig(default_model, auth_path, allocator) catch |err| {
+    var provider = llm.createProviderFromEnv(default_model, allocator) catch |err| {
         if (err == error.MissingCredential) {
             const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
             const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
