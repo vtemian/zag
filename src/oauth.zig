@@ -382,7 +382,9 @@ pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     };
 
     if (result.status != .ok) {
-        log.warn("exchangeCode status {}: {s}", .{ result.status, resp_aw.written() });
+        var err_buf: [128]u8 = undefined;
+        const code = extractErrorCode(resp_aw.written(), &err_buf) orelse "unparseable";
+        log.warn("exchangeCode failed: status={}, error={s}", .{ result.status, code });
         return error.TokenExchangeFailed;
     }
 
@@ -564,14 +566,46 @@ pub fn refreshAccessToken(alloc: Allocator, p: RefreshParams) !TokenResponse {
         .ok => return parseTokenResponse(alloc, resp_aw.written(), .refresh),
         .unauthorized, .bad_request => {
             if (isInvalidGrant(resp_aw.written())) return error.LoginExpired;
-            log.warn("refreshAccessToken {}: {s}", .{ result.status, resp_aw.written() });
+            var err_buf: [128]u8 = undefined;
+            const code = extractErrorCode(resp_aw.written(), &err_buf) orelse "unparseable";
+            log.warn("refreshAccessToken failed: status={}, error={s}", .{ result.status, code });
             return error.TokenRefreshFailed;
         },
         else => {
-            log.warn("refreshAccessToken {}: {s}", .{ result.status, resp_aw.written() });
+            var err_buf: [128]u8 = undefined;
+            const code = extractErrorCode(resp_aw.written(), &err_buf) orelse "unparseable";
+            log.warn("refreshAccessToken failed: status={}, error={s}", .{ result.status, code });
             return error.TokenRefreshFailed;
         },
     }
+}
+
+/// Parse a JSON body and copy the OAuth2-standard `error` field into `out`.
+/// Returns the written slice on success, null on any parse/shape failure
+/// (including when the code doesn't fit in `out`). Callers log `unparseable`
+/// on null so raw bytes never reach log output.
+///
+/// IdP error responses like OpenAI, Azure, Auth0 share the RFC 6749 shape
+/// `{ "error": "...", "error_description": "..." }`; a misbehaving IdP, proxy,
+/// or captive portal could echo bearer tokens or other secrets in a free-form
+/// body, so we log only the short machine-readable code.
+fn extractErrorCode(body: []const u8, out: []u8) ?[]const u8 {
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), body, .{}) catch return null;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const err_val = root.get("error") orelse return null;
+    const code = switch (err_val) {
+        .string => |x| x,
+        else => return null,
+    };
+    if (code.len > out.len) return null;
+    @memcpy(out[0..code.len], code);
+    return out[0..code.len];
 }
 
 fn isInvalidGrant(body: []const u8) bool {
@@ -582,6 +616,33 @@ fn isInvalidGrant(body: []const u8) bool {
         std.mem.indexOf(u8, body, "refresh_token_expired") != null or
         std.mem.indexOf(u8, body, "refresh_token_revoked") != null or
         std.mem.indexOf(u8, body, "refresh_token_invalidated") != null;
+}
+
+test "extractErrorCode parses RFC 6749 error field" {
+    var buf: [64]u8 = undefined;
+    const body =
+        \\{"error":"invalid_grant","error_description":"code already redeemed"}
+    ;
+    const code = extractErrorCode(body, &buf) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("invalid_grant", code);
+}
+
+test "extractErrorCode returns null for non-JSON bodies" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(extractErrorCode("<html>gateway timeout</html>", &buf) == null);
+    try std.testing.expect(extractErrorCode("", &buf) == null);
+}
+
+test "extractErrorCode returns null when `error` is missing or not a string" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(extractErrorCode("{\"foo\":\"bar\"}", &buf) == null);
+    try std.testing.expect(extractErrorCode("{\"error\":42}", &buf) == null);
+}
+
+test "extractErrorCode returns null when code exceeds out buffer" {
+    var buf: [4]u8 = undefined;
+    const body = "{\"error\":\"invalid_grant\"}";
+    try std.testing.expect(extractErrorCode(body, &buf) == null);
 }
 
 test "refreshAccessToken POSTs JSON and parses tokens" {

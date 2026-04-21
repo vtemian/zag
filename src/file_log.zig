@@ -20,6 +20,12 @@ pub const Error = error{NoLogPath};
 
 /// Open the log file at `path` with append semantics. Replaces any
 /// existing handle. Caller ensures `path` is absolute.
+///
+/// The file is opened with mode 0o600 to match auth.json's security posture:
+/// log bodies can contain tool output, stack traces, and fragments of prompts
+/// or responses that the user has not classified as shareable, so we keep
+/// them owner-only. Any pre-existing file with a laxer mode is chmod'd back
+/// to 0o600 on open.
 pub fn initWithPath(path: []const u8) !void {
     deinit();
 
@@ -30,7 +36,11 @@ pub fn initWithPath(path: []const u8) !void {
         .ACCMODE = .WRONLY,
         .APPEND = true,
         .CREAT = true,
-    }, 0o644);
+    }, 0o600);
+    // POSIX honours the mode argument only when the file is newly created;
+    // re-apply after open so an existing log with looser permissions gets
+    // tightened back to 0o600.
+    try posix.fchmod(fd, 0o600);
     log_file = std.fs.File{ .handle = fd };
 }
 
@@ -155,6 +165,29 @@ test "initWithPath opens an existing directory and appends" {
 
     try std.testing.expect(std.mem.indexOf(u8, contents, "[default] info: hello world\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "[agent] warn: tool bash\n") != null);
+}
+
+test "initWithPath opens the log file with mode 0o600" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
+
+    // Pre-create with loose permissions to exercise the chmod-after-open path.
+    {
+        const pre = try std.fs.createFileAbsolute(path, .{ .mode = 0o644, .truncate = true });
+        defer pre.close();
+        try posix.fchmod(pre.handle, 0o644);
+    }
+
+    try initWithPath(path);
+    defer deinit();
+
+    const stat = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
 }
 
 test "handler is a silent no-op when uninitialized" {
