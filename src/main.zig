@@ -200,7 +200,7 @@ const HeadlessDeps = struct {
     registry: *const tools.Registry,
     lua_engine: ?*LuaEngine,
     runner: *AgentRunner,
-    session: *ConversationSession,
+    session: *ConversationHistory,
     wake_read_fd: std.posix.fd_t,
     wake_write_fd: std.posix.fd_t,
     session_id: []const u8,
@@ -394,7 +394,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
 /// non-interactive single-shot agent loop. TUI subsystems (Terminal, Screen,
 /// Compositor, EventOrchestrator) are intentionally never constructed.
 pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
-    var root_session = ConversationSession.init(gpa);
+    var root_session = ConversationHistory.init(gpa);
     defer root_session.deinit();
 
     var root_buffer = try ConversationBuffer.init(gpa, 0, "session");
