@@ -98,6 +98,55 @@ fn stripCr(line: []const u8) []const u8 {
     return line;
 }
 
+/// Upper bound on key length. API keys we care about run ~100-200 bytes; 8KiB
+/// is a comfortable cliff that still catches a runaway paste.
+const max_secret_len: usize = 8192;
+
+/// Prompt the user for a secret (API key). When `deps.is_tty`, toggles the
+/// terminal's `ECHO` flag off via termios for the duration of the read so
+/// pasted bytes don't hit the screen; the original termios is restored on
+/// return even if the read fails. Returns the trimmed secret as an owned
+/// slice the caller must free.
+///
+/// ECHO is cleared *before* the prompt is printed so a fast typist can't slip
+/// visible characters into the gap. Non-TTY callers (tests, pipes) share the
+/// same parse path without touching termios, which is what keeps the inline
+/// tests meaningful.
+pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
+    var original: ?std.posix.termios = null;
+    if (deps.is_tty) {
+        const saved = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        original = saved;
+        var echo_off = saved;
+        echo_off.lflag.ECHO = false;
+        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, echo_off);
+    }
+    defer if (original) |saved| {
+        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch |err| {
+            log.warn("failed to restore termios: {}", .{err});
+        };
+    };
+
+    try deps.stdout.writeAll(prompt);
+    try deps.stdout.flush();
+
+    const line = (try deps.stdin.takeDelimiter('\n')) orelse return error.UserAborted;
+    const clean = stripCr(line);
+    const trimmed = std.mem.trim(u8, clean, " \t");
+
+    if (deps.is_tty) {
+        // Enter wasn't echoed; move the cursor down so the next prompt doesn't
+        // render on top of the (now invisible) input line.
+        try deps.stdout.writeByte('\n');
+        try deps.stdout.flush();
+    }
+
+    if (trimmed.len == 0) return error.EmptyInput;
+    if (trimmed.len > max_secret_len) return error.KeyTooLong;
+
+    return deps.allocator.dupe(u8, trimmed);
+}
+
 // -- Tests -------------------------------------------------------------------
 
 const testing = std.testing;
@@ -171,4 +220,67 @@ test "promptChoice returns UserAborted on EOF" {
     const deps = testDeps(&stdin, &stdout_writer.writer);
     const options = [_][]const u8{ "openai", "anthropic", "groq" };
     try testing.expectError(error.UserAborted, promptChoice(&deps, "Pick a provider:", &options));
+}
+
+test "promptSecret reads line and strips newline" {
+    var stdin = std.Io.Reader.fixed("sk-abc-123\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const secret = try promptSecret(&deps, "Paste key: ");
+    defer deps.allocator.free(secret);
+    try testing.expectEqualStrings("sk-abc-123", secret);
+}
+
+test "promptSecret trims whitespace" {
+    var stdin = std.Io.Reader.fixed("  sk-xyz  \n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const secret = try promptSecret(&deps, "Paste key: ");
+    defer deps.allocator.free(secret);
+    try testing.expectEqualStrings("sk-xyz", secret);
+}
+
+test "promptSecret rejects empty input" {
+    var stdin = std.Io.Reader.fixed("\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    try testing.expectError(error.EmptyInput, promptSecret(&deps, "Paste key: "));
+}
+
+test "promptSecret rejects whitespace-only input" {
+    var stdin = std.Io.Reader.fixed("   \n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    try testing.expectError(error.EmptyInput, promptSecret(&deps, "Paste key: "));
+}
+
+test "promptSecret rejects input over cap" {
+    const oversize = try testing.allocator.alloc(u8, 8194);
+    defer testing.allocator.free(oversize);
+    @memset(oversize[0 .. oversize.len - 1], 'x');
+    oversize[oversize.len - 1] = '\n';
+
+    var stdin = std.Io.Reader.fixed(oversize);
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    try testing.expectError(error.KeyTooLong, promptSecret(&deps, "Paste key: "));
+}
+
+test "promptSecret returns UserAborted on EOF" {
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    try testing.expectError(error.UserAborted, promptSecret(&deps, "Paste key: "));
 }
