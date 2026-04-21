@@ -19,6 +19,13 @@ pub fn parseCsi(seq: []const u8) Event {
         return mouse.parseSgrMouse(seq[1..]);
     }
 
+    // Kitty Keyboard Protocol: CSI <code>;<mods>u or
+    // CSI <code>;<mods>:<event>u. Terminals emit this for ambiguous
+    // keys (Ctrl+letter, Ctrl+Enter, etc.) when flag 1 is pushed.
+    if (seq.len > 1 and seq[seq.len - 1] == 'u') {
+        return parseKittyKey(seq[0 .. seq.len - 1]);
+    }
+
     // Simple single-letter CSI sequences: arrows, home, end
     if (seq.len == 1) {
         return switch (seq[0]) {
@@ -148,5 +155,115 @@ fn decodeModifier(val: u16) KeyEvent.Modifiers {
         .shift = (m & 1) != 0,
         .alt = (m & 2) != 0,
         .ctrl = (m & 4) != 0,
+    };
+}
+
+/// Decode a Kitty Keyboard Protocol modifier bitmask. The six bits
+/// (Shift/Alt/Ctrl/Super/Hyper/Meta) map one-for-one onto `Modifiers`.
+fn decodeKittyModifier(val: u32) KeyEvent.Modifiers {
+    if (val == 0) return KeyEvent.no_modifiers;
+    const m = val -| 1;
+    return .{
+        .shift = (m & 1) != 0,
+        .alt = (m & 2) != 0,
+        .ctrl = (m & 4) != 0,
+        .super = (m & 8) != 0,
+        .hyper = (m & 16) != 0,
+        .meta = (m & 32) != 0,
+    };
+}
+
+/// Parse a Kitty Keyboard Protocol body: `<codepoint>[;<mods>[:<event>]]`
+/// (the final `u` has already been stripped). Returns the corresponding
+/// Event, or `Event.none` on a malformed body we do not understand.
+fn parseKittyKey(body: []const u8) Event {
+    var cp: u32 = 0;
+    var cp_seen = false;
+    var mods: u32 = 1; // KKP mods are 1-indexed; 1 = no modifiers.
+    var mods_seen = false;
+    var event_type_raw: u32 = 1; // 1 = press (the default when omitted).
+    var event_seen = false;
+    var field: u8 = 0; // 0=codepoint, 1=modifiers, 2=event type
+
+    for (body) |c| {
+        if (c == ';') {
+            if (field == 0) field = 1 else return Event.none;
+        } else if (c == ':' and field == 1) {
+            field = 2;
+        } else if (c >= '0' and c <= '9') {
+            const digit: u32 = c - '0';
+            switch (field) {
+                0 => {
+                    if (!cp_seen) cp = 0;
+                    cp = cp *| 10 +| digit;
+                    cp_seen = true;
+                },
+                1 => {
+                    if (!mods_seen) mods = 0;
+                    mods = mods *| 10 +| digit;
+                    mods_seen = true;
+                },
+                2 => {
+                    if (!event_seen) event_type_raw = 0;
+                    event_type_raw = event_type_raw *| 10 +| digit;
+                    event_seen = true;
+                },
+                else => return Event.none,
+            }
+        } else {
+            return Event.none;
+        }
+    }
+
+    if (!cp_seen) return Event.none;
+
+    const modifiers = decodeKittyModifier(mods);
+    const event_type: KeyEvent.EventType = switch (event_type_raw) {
+        1 => .press,
+        2 => .repeat,
+        3 => .release,
+        else => .press,
+    };
+
+    const key = mapKittyCodepoint(cp) orelse return Event.none;
+    return Event{ .key = .{
+        .key = key,
+        .modifiers = modifiers,
+        .event_type = event_type,
+    } };
+}
+
+/// Map a KKP codepoint to a `KeyEvent.Key`. Plain ASCII maps to `.char`;
+/// the PUA functional codepoints (arrows, Home/End, F1..F24, etc.)
+/// decode to their named variants. Codepoints outside either range fall
+/// back to `.char` so the event still carries the raw Unicode value.
+fn mapKittyCodepoint(cp: u32) ?KeyEvent.Key {
+    return switch (cp) {
+        // ASCII control keys carried in the protocol under their legacy codes.
+        9 => KeyEvent.Key.tab,
+        10, 13 => KeyEvent.Key.enter,
+        27 => KeyEvent.Key.escape,
+        127 => KeyEvent.Key.backspace,
+
+        // PUA functional codepoints per the Kitty protocol.
+        57348 => KeyEvent.Key.insert,
+        57349 => KeyEvent.Key.delete,
+        57350 => KeyEvent.Key.left,
+        57351 => KeyEvent.Key.right,
+        57352 => KeyEvent.Key.up,
+        57353 => KeyEvent.Key.down,
+        57354 => KeyEvent.Key.page_up,
+        57355 => KeyEvent.Key.page_down,
+        57356 => KeyEvent.Key.home,
+        57357 => KeyEvent.Key.end,
+
+        // F1..F24 live in 57364..57387 (protocol allocates skips for
+        // system-reserved PUA entries, but the ordering is contiguous).
+        57364...57387 => KeyEvent.Key{ .function = @intCast(cp - 57364 + 1) },
+
+        else => blk: {
+            if (cp <= 0x10FFFF) break :blk KeyEvent.Key{ .char = @intCast(cp) };
+            break :blk null;
+        },
     };
 }

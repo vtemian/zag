@@ -31,6 +31,46 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
+test "parseBytes decodes Kitty Ctrl+A as CSI 65;5u" {
+    const seq = [_]u8{ 0x1b, '[', '6', '5', ';', '5', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'A' }, k.key);
+            try std.testing.expect(k.modifiers.ctrl);
+            try std.testing.expect(!k.modifiers.shift);
+            try std.testing.expect(!k.modifiers.alt);
+            try std.testing.expectEqual(KeyEvent.EventType.press, k.event_type);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseBytes decodes Kitty Up via 57352u" {
+    const seq = [_]u8{ 0x1b, '[', '5', '7', '3', '5', '2', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.up, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseBytes decodes Kitty release event as CSI 97;1:3u" {
+    // codepoint 97 = 'a'; mods 1 = none; event type 3 = release.
+    const seq = [_]u8{ 0x1b, '[', '9', '7', ';', '1', ':', '3', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'a' }, k.key);
+            try std.testing.expectEqual(KeyEvent.EventType.release, k.event_type);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "Parser emits a single paste event for a bracketed paste block" {
     var p: Parser = .{};
     const body = "hello\nworld";

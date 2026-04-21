@@ -110,7 +110,14 @@ pub fn init() !Terminal {
     try writeEscapeSequence("\x1b[?2004h");
     errdefer writeEscapeSequence("\x1b[?2004l") catch {};
 
-    // 8. Install SIGWINCH handler
+    // 8. Push Kitty Keyboard Protocol flags: 1 (disambiguate escape
+    //    codes) + 2 (report press/repeat/release). Terminals that don't
+    //    speak KKP ignore the sequence and keep sending legacy CSI, so
+    //    this is safe to push unconditionally.
+    try writeEscapeSequence("\x1b[>3u");
+    errdefer writeEscapeSequence("\x1b[<u") catch {};
+
+    // 9. Install SIGWINCH handler
     installSigwinchHandler();
 
     // 8. Detect 24-bit color capability from $COLORTERM.
@@ -153,6 +160,9 @@ pub fn trueColorFromValue(val: []const u8) bool {
 /// consistent signature across init/deinit pairs avoids callsite friction.
 pub fn deinit(self: *Terminal) void {
     // Reverse order of init
+    writeEscapeSequence("\x1b[<u") catch |err| {
+        log.warn("failed to disable Kitty keyboard protocol: {s}", .{@errorName(err)});
+    };
     writeEscapeSequence("\x1b[?2004l") catch |err| {
         log.warn("failed to disable bracketed paste: {s}", .{@errorName(err)});
     };
