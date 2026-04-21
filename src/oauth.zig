@@ -1086,6 +1086,9 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     try std.testing.expectEqualStrings("at", entry.access_token);
     try std.testing.expectEqualStrings("rt", entry.refresh_token);
     try std.testing.expectEqualStrings("acc-123", entry.account_id);
+    try std.testing.expect(std.mem.startsWith(u8, entry.id_token, "eyJ"));
+    try std.testing.expectEqual(@as(usize, 20), entry.last_refresh.len);
+    try std.testing.expectEqual(@as(u8, 'Z'), entry.last_refresh[entry.last_refresh.len - 1]);
 }
 
 test "runLoginFlowWithCodes rejects mismatched state" {
