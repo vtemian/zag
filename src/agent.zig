@@ -168,6 +168,10 @@ fn callLlm(
     };
 
     return provider.callStreaming(&stream_req) catch |streaming_err| {
+        // Cancellation is cooperative, not a streaming failure: re-firing
+        // the same request non-streamed would waste work and ignore the
+        // user's intent. Propagate straight to the turn loop.
+        if (streaming_err == error.Cancelled) return error.Cancelled;
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
         const req = llm.Request{
             .system_prompt = prompt,
