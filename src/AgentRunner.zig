@@ -129,6 +129,10 @@ pub const SpawnDeps = struct {
     lua_engine: ?*LuaEngine,
     /// Provider used by the agent loop for LLM calls.
     provider: llm.Provider,
+    /// Provider name (e.g. "openai-oauth") extracted from the model
+    /// string. Surfaced in `NotLoggedIn` / `LoginExpired` error hints so
+    /// the user sees `zag --login=<provider>` with the real name.
+    provider_name: []const u8,
     /// Tool registry dispatched from the agent loop.
     registry: *const tools.Registry,
 };
@@ -166,7 +170,36 @@ pub fn submit(
         &self.event_queue,
         &self.cancel_flag,
         deps.lua_engine,
+        deps.provider_name,
     });
+}
+
+/// Format an actionable error message for a provider error. Returns an
+/// owned slice the caller must free with `allocator`. Well-known
+/// credential errors get a `zag --login=<provider>` hint; everything
+/// else falls back to the raw error name so the user has a term to grep
+/// the source for.
+///
+/// Standalone (not a method) so it can be unit-tested without spinning
+/// up a real AgentRunner + thread.
+pub fn formatAgentErrorMessage(
+    err: anyerror,
+    provider_name: []const u8,
+    allocator: Allocator,
+) ![]u8 {
+    return switch (err) {
+        error.NotLoggedIn => std.fmt.allocPrint(
+            allocator,
+            "Not signed in. Run: zag --login={s}",
+            .{provider_name},
+        ),
+        error.LoginExpired => std.fmt.allocPrint(
+            allocator,
+            "OAuth token expired. Re-run: zag --login={s}",
+            .{provider_name},
+        ),
+        else => allocator.dupe(u8, @errorName(err)),
+    };
 }
 
 /// Background agent thread entry point. Runs the agent loop and
@@ -181,6 +214,7 @@ fn threadMain(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine,
+    provider_name: []const u8,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -188,16 +222,16 @@ fn threadMain(
     defer tools.lua_request_queue = null;
 
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
-        // Dup because the event sits in the queue until drained and
-        // @errorName points into .rodata. On a dup failure the drop is
-        // recorded on the queue counter and .done is still pushed so the
-        // UI returns to idle rather than getting stuck.
-        const duped_err = allocator.dupe(u8, @errorName(err)) catch {
+        // The message sits in the queue until drained; allocate owned
+        // bytes. On an allocation failure the drop is recorded on the
+        // queue counter and `.done` is still pushed so the UI returns to
+        // idle rather than getting stuck.
+        const message = formatAgentErrorMessage(err, provider_name, allocator) catch {
             _ = queue.dropped.fetchAdd(1, .monotonic);
             queue.tryPush(allocator, .done);
             return;
         };
-        queue.tryPush(allocator, .{ .err = duped_err });
+        queue.tryPush(allocator, .{ .err = message });
     };
     queue.tryPush(allocator, .done);
 }
@@ -810,4 +844,25 @@ test "drainEvents joins thread and deinits queue on .done" {
     try std.testing.expect(finished);
     try std.testing.expect(runner.agent_thread == null);
     try std.testing.expect(!runner.queue_active);
+}
+
+test "formatAgentErrorMessage hints NotLoggedIn with provider name" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.NotLoggedIn, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("Not signed in. Run: zag --login=openai-oauth", msg);
+}
+
+test "formatAgentErrorMessage hints LoginExpired with provider name" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.LoginExpired, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("OAuth token expired. Re-run: zag --login=openai-oauth", msg);
+}
+
+test "formatAgentErrorMessage falls back to error name for other errors" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("ApiError", msg);
 }

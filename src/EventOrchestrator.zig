@@ -535,11 +535,13 @@ fn onUserInputSubmitted(
 
     if (pane.runner.isAgentRunning()) return;
 
+    const spec = llm.parseModelString(self.provider.model_id);
     try pane.runner.submit(&pane.session.messages, .{
         .allocator = self.allocator,
         .wake_write_fd = self.wake_write_fd,
         .lua_engine = self.lua_engine,
         .provider = self.provider.provider,
+        .provider_name = spec.provider_name,
         .registry = self.registry,
     });
 }
