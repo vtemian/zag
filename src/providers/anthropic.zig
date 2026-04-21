@@ -216,10 +216,14 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     // Parse usage
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
     if (root.get("usage")) |usage| {
         const usage_obj = usage.object;
         if (usage_obj.get("input_tokens")) |it| input_tokens = @intCast(it.integer);
         if (usage_obj.get("output_tokens")) |ot| output_tokens = @intCast(ot.integer);
+        if (usage_obj.get("cache_creation_input_tokens")) |v| cache_creation_tokens = @intCast(v.integer);
+        if (usage_obj.get("cache_read_input_tokens")) |v| cache_read_tokens = @intCast(v.integer);
     }
 
     // Parse content blocks
@@ -244,7 +248,11 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
         }
     }
 
-    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
+    // TODO(Task 4): fold into builder.finish signature
+    var response = try builder.finish(stop_reason, input_tokens, output_tokens, allocator);
+    response.cache_creation_tokens = cache_creation_tokens;
+    response.cache_read_tokens = cache_read_tokens;
+    return response;
 }
 
 /// State for accumulating a single content block during streaming.
@@ -530,6 +538,32 @@ test "parseResponse handles missing usage gracefully" {
 
     try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
+}
+
+test "parseResponse captures cache_creation and cache_read tokens" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "id": "msg_1",
+        \\  "type": "message",
+        \\  "role": "assistant",
+        \\  "content": [{"type":"text","text":"hi"}],
+        \\  "stop_reason": "end_turn",
+        \\  "usage": {
+        \\    "input_tokens": 10,
+        \\    "output_tokens": 2,
+        \\    "cache_creation_input_tokens": 100,
+        \\    "cache_read_input_tokens": 50
+        \\  }
+        \\}
+    ;
+
+    const response = try parseResponse(json, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 100), response.cache_creation_tokens);
+    try std.testing.expectEqual(@as(u32, 50), response.cache_read_tokens);
 }
 
 test "parseResponse maps unknown stop_reason to end_turn" {
