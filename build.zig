@@ -50,6 +50,12 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zag");
     run_step.dependOn(&run_cmd.step);
 
+    const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
+    const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
+    script.addArtifactArg(exe);
+    script.step.dependOn(b.getInstallStep());
+    validate_step.dependOn(&script.step);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
