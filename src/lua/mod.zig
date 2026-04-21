@@ -17,4 +17,7 @@ test {
     _ = @import("primitives/http_stream.zig");
     _ = @import("primitives/fs.zig");
     _ = @import("integration_test.zig");
+    _ = @import("hook_registry.zig");
+    _ = @import("job_result.zig");
+    _ = @import("lua_json.zig");
 }

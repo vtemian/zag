@@ -269,3 +269,7 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
         },
     }
 }
+
+test {
+    std.testing.refAllDecls(@This());
+}
