@@ -262,7 +262,11 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
             continue;
         }
 
-        for (drain_buf[0..count]) |ev| switch (ev) {
+        // `drain()` advances the queue head for the whole batch in one shot,
+        // so breaking out of this loop on `.done` or `.err` would orphan any
+        // events that follow in the same `drain_buf` slice. Free the tail
+        // explicitly in those arms before breaking.
+        for (drain_buf[0..count], 0..) |ev, idx| switch (ev) {
             .text_delta => |t| {
                 defer gpa.free(t);
                 capture.addTextDelta(t) catch |err| {
@@ -334,6 +338,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                 capture.endTurn(metrics) catch |err| {
                     log.warn("capture endTurn failed: {s}", .{@errorName(err)});
                 };
+                for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
                 if (deps.runner.agent_thread) |t| t.join();
                 deps.runner.agent_thread = null;
                 deps.runner.event_queue.deinit();
@@ -344,6 +349,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
             .err => |text| {
                 agent_err = gpa.dupe(u8, text) catch null;
                 gpa.free(text);
+                for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
                 capture.endTurn(.{}) catch {};
                 if (deps.runner.agent_thread) |t| t.join();
                 deps.runner.agent_thread = null;
