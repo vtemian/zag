@@ -30,7 +30,7 @@ const system_prompt_suffix =
 ;
 
 /// Build the system prompt with tool descriptions from the registry.
-fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]const u8 {
+pub fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -390,7 +390,13 @@ fn runToolStep(
                 errdefer allocator.free(start_name);
                 const start_id = try allocator.dupe(u8, tc.id);
                 errdefer allocator.free(start_id);
-                queue.tryPush(allocator, .{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+                const start_input = try allocator.dupe(u8, tc.input_raw);
+                errdefer allocator.free(start_input);
+                queue.tryPush(allocator, .{ .tool_start = .{
+                    .name = start_name,
+                    .call_id = start_id,
+                    .input_raw = start_input,
+                } });
             }
 
             const result_content = try allocator.dupe(u8, synth);
@@ -414,7 +420,13 @@ fn runToolStep(
                 errdefer allocator.free(start_name);
                 const start_id = try allocator.dupe(u8, tc.id);
                 errdefer allocator.free(start_id);
-                queue.tryPush(allocator, .{ .tool_start = .{ .name = start_name, .call_id = start_id } });
+                const start_input = try allocator.dupe(u8, effective_input);
+                errdefer allocator.free(start_input);
+                queue.tryPush(allocator, .{ .tool_start = .{
+                    .name = start_name,
+                    .call_id = start_id,
+                    .input_raw = start_input,
+                } });
             }
 
             const t0 = std.time.milliTimestamp();
@@ -786,6 +798,7 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                 .tool_start => |s| {
                     allocator.free(s.name);
                     if (s.call_id) |id| allocator.free(id);
+                    if (s.input_raw) |raw| allocator.free(raw);
                 },
                 .tool_result => |r| {
                     allocator.free(r.content);
