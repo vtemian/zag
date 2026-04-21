@@ -21,21 +21,85 @@ const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const trace = @import("Metrics.zig");
 const EventOrchestrator = @import("EventOrchestrator.zig");
+const auth_wizard = @import("auth_wizard.zig");
 
 const log = std.log.scoped(.main);
 
-/// How to initialize the session on startup.
+/// How to initialize the session on startup. `auth_*` variants short-circuit
+/// the TUI path entirely so `zag auth ...` subcommands never build Lua or a
+/// provider; they are handled by dedicated wizard helpers and then exit.
 const StartupMode = union(enum) {
     new_session,
     resume_session: []const u8,
     resume_last,
+    /// Provider name duped into the allocator passed to `parseStartupArgs`.
+    /// `freeStartupMode` releases it.
+    auth_login: []u8,
+    auth_list,
+    /// Provider name duped into the allocator passed to `parseStartupArgs`.
+    /// `freeStartupMode` releases it.
+    auth_remove: []u8,
 };
 
-/// Parse CLI args. Recognizes --session=<id> and --last. Everything else is ignored.
+/// One-liner describing the `zag auth ...` grammar, sent to stderr on bad
+/// input. Kept in a single place so the usage text doesn't drift from the
+/// parser.
+fn printAuthHelp() void {
+    const msg =
+        \\zag: usage:
+        \\  zag auth login <provider>   Add or replace credential for <provider>
+        \\  zag auth list               List configured providers (keys masked)
+        \\  zag auth remove <provider>  Delete credential for <provider>
+        \\
+    ;
+    const stderr = std.fs.File{ .handle = posix.STDERR_FILENO };
+    _ = stderr.write(msg) catch {};
+}
+
+/// Parse CLI args. Recognizes `--session=<id>`, `--last`, and the
+/// `zag auth login|list|remove` subcommand grammar. Anything else falls
+/// through as `.new_session`.
 fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
     var iter = try std.process.argsWithAllocator(allocator);
     defer iter.deinit();
     _ = iter.next(); // skip argv[0]
+
+    const first = iter.next() orelse return .new_session;
+
+    if (std.mem.eql(u8, first, "auth")) {
+        const sub = iter.next() orelse {
+            printAuthHelp();
+            std.process.exit(2);
+        };
+        if (std.mem.eql(u8, sub, "login")) {
+            const prov = iter.next() orelse {
+                printAuthHelp();
+                std.process.exit(2);
+            };
+            return .{ .auth_login = try allocator.dupe(u8, prov) };
+        }
+        if (std.mem.eql(u8, sub, "list")) {
+            return .auth_list;
+        }
+        if (std.mem.eql(u8, sub, "remove")) {
+            const prov = iter.next() orelse {
+                printAuthHelp();
+                std.process.exit(2);
+            };
+            return .{ .auth_remove = try allocator.dupe(u8, prov) };
+        }
+        printAuthHelp();
+        std.process.exit(2);
+    }
+
+    // Fold `first` into the existing --session= / --last handling so the arg
+    // that wasn't "auth" is still considered before we drain the rest.
+    if (std.mem.startsWith(u8, first, "--session=")) {
+        return .{ .resume_session = first["--session=".len..] };
+    }
+    if (std.mem.eql(u8, first, "--last")) {
+        return .resume_last;
+    }
 
     while (iter.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--session=")) {
@@ -46,6 +110,46 @@ fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
     }
     return .new_session;
 }
+
+/// Release memory owned by `auth_login` / `auth_remove` variants.
+fn freeStartupMode(mode: StartupMode, allocator: std.mem.Allocator) void {
+    switch (mode) {
+        .auth_login => |prov| allocator.free(prov),
+        .auth_remove => |prov| allocator.free(prov),
+        else => {},
+    }
+}
+
+/// Bundle of owned path strings returned by `buildWizardPaths`. Keeping both
+/// paths derived from the same `$HOME` lookup means a single free-pair per
+/// wizard invocation instead of three.
+const WizardPaths = struct {
+    auth_path: []u8,
+    config_path: []u8,
+
+    fn deinit(self: WizardPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.auth_path);
+        allocator.free(self.config_path);
+    }
+};
+
+/// Resolve `~/.config/zag/auth.json` and `~/.config/zag/config.lua` against
+/// `$HOME`. Mirrors `LuaEngine.loadUserConfig` (`LuaEngine.zig:228-239`).
+fn buildWizardPaths(allocator: std.mem.Allocator) !WizardPaths {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+
+    const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home});
+    errdefer allocator.free(auth_path);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/config.lua", .{home});
+    return .{ .auth_path = auth_path, .config_path = config_path };
+}
+
+/// Enough slack above `auth_wizard.max_secret_len` (8192) that legitimate
+/// 8192-byte keys hit the wizard's explicit length check instead of surfacing
+/// as `error.StreamTooLong` from `takeDelimiter`. 64 bytes covers the trailing
+/// `\n` + any trimmed whitespace.
+const stdin_buffer_len: usize = 8256;
 
 const file_log = @import("file_log.zig");
 pub const std_options: std.Options = .{ .logFn = file_log.handler };
@@ -94,6 +198,98 @@ fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_
     }
 }
 
+/// Handle `createProviderFromEnv` returning `error.MissingCredential` at
+/// first-run: drop into the onboarding wizard when stdin is a TTY, then
+/// reload Lua and retry provider creation once. On a non-TTY or repeated
+/// failure, print an actionable stderr message and propagate the original
+/// error so `main()` exits cleanly.
+fn firstRunWizardRetry(
+    allocator: std.mem.Allocator,
+    lua_engine: ?*LuaEngine,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !llm.ProviderResult {
+    const default_model: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
+    const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
+    const spec = llm.parseModelString(model_id);
+
+    const stderr = std.fs.File{ .handle = posix.STDERR_FILENO };
+    const is_tty = std.posix.isatty(posix.STDIN_FILENO);
+
+    if (!is_tty) {
+        var scratch: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &scratch,
+            "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
+            .{ spec.provider_name, spec.provider_name },
+        ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
+        _ = stderr.write(msg) catch {};
+        return error.MissingCredential;
+    }
+
+    const paths = buildWizardPaths(allocator) catch |err| {
+        log.err("first-run wizard: unable to resolve config paths: {}", .{err});
+        return err;
+    };
+    defer paths.deinit(allocator);
+
+    // Scaffold config.lua only when it's truly absent; a user with a pinned
+    // default_model should keep their file untouched.
+    const scaffold = blk: {
+        std.fs.accessAbsolute(paths.config_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk true,
+            else => break :blk false,
+        };
+        break :blk false;
+    };
+
+    const deps: auth_wizard.WizardDeps = .{
+        .allocator = allocator,
+        .stdin = stdin,
+        .stdout = stdout,
+        .is_tty = true,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = scaffold,
+        .forced_provider = null,
+    };
+
+    const result = auth_wizard.runWizard(deps) catch |err| {
+        if (err == error.NonInteractiveFirstRun) {
+            var scratch: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &scratch,
+                "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
+                .{ spec.provider_name, spec.provider_name },
+            ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
+            _ = stderr.write(msg) catch {};
+        }
+        return err;
+    };
+    defer allocator.free(result.provider_name);
+
+    // Reload Lua so a freshly scaffolded config.lua's default_model becomes
+    // visible before the retry. If scaffolding was skipped (config already
+    // present), reload is a no-op in terms of default_model but still safe.
+    if (lua_engine) |eng| eng.loadUserConfig();
+
+    const new_default: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
+    return llm.createProviderFromEnv(new_default, allocator) catch |err| {
+        if (err == error.MissingCredential) {
+            const new_model = new_default orelse "anthropic/claude-sonnet-4-20250514";
+            const new_spec = llm.parseModelString(new_model);
+            var scratch: [768]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &scratch,
+                "zag: config.lua sets default model to '{s}', but no credential is configured for provider '{s}'. Edit ~/.config/zag/config.lua to use the provider you just added ('{s}').\n",
+                .{ new_model, new_spec.provider_name, result.provider_name },
+            ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
+            _ = stderr.write(msg) catch {};
+        }
+        return err;
+    };
+}
+
 /// Top-level entry: wires subsystems and hands control to EventOrchestrator.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -109,6 +305,87 @@ pub fn main() !void {
         std.debug.print("zag: file logger disabled ({s})\n", .{@errorName(err)});
     };
     defer file_log.deinit();
+
+    // Parse args first so `zag auth ...` subcommands bypass Lua + provider
+    // init entirely. The TUI path picks up `.new_session` / `.resume_*`
+    // below exactly as before.
+    const startup_mode = parseStartupArgs(allocator) catch .new_session;
+    defer freeStartupMode(startup_mode, allocator);
+
+    // Real stdin/stdout for the wizard. Sized >= auth_wizard.max_secret_len so
+    // legitimate 8192-byte keys trigger the wizard's explicit length check
+    // instead of surfacing as `error.StreamTooLong` from the reader.
+    const stdin_file = std.fs.File{ .handle = posix.STDIN_FILENO };
+    var stdin_buf: [stdin_buffer_len]u8 = undefined;
+    var stdin_reader = stdin_file.reader(&stdin_buf);
+
+    const stdout_file_wiz = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    var stdout_wiz_buf: [1024]u8 = undefined;
+    var stdout_wiz_writer = stdout_file_wiz.writer(&stdout_wiz_buf);
+
+    // Dispatch auth subcommands *before* any subsystem comes up. These paths
+    // exit the process; the TUI wiring below never runs.
+    switch (startup_mode) {
+        .auth_login => |prov| {
+            const paths = buildWizardPaths(allocator) catch |err| {
+                log.err("auth login: unable to resolve config paths: {}", .{err});
+                return err;
+            };
+            defer paths.deinit(allocator);
+            const deps: auth_wizard.WizardDeps = .{
+                .allocator = allocator,
+                .stdin = &stdin_reader.interface,
+                .stdout = &stdout_wiz_writer.interface,
+                .is_tty = std.posix.isatty(posix.STDIN_FILENO),
+                .auth_path = paths.auth_path,
+                .config_path = paths.config_path,
+                .scaffold_config = false,
+                .forced_provider = prov,
+            };
+            const result = try auth_wizard.runWizard(deps);
+            allocator.free(result.provider_name);
+            return;
+        },
+        .auth_list => {
+            const paths = buildWizardPaths(allocator) catch |err| {
+                log.err("auth list: unable to resolve config paths: {}", .{err});
+                return err;
+            };
+            defer paths.deinit(allocator);
+            const deps: auth_wizard.WizardDeps = .{
+                .allocator = allocator,
+                .stdin = &stdin_reader.interface,
+                .stdout = &stdout_wiz_writer.interface,
+                .is_tty = std.posix.isatty(posix.STDIN_FILENO),
+                .auth_path = paths.auth_path,
+                .config_path = paths.config_path,
+                .scaffold_config = false,
+                .forced_provider = null,
+            };
+            try auth_wizard.printAuthList(deps);
+            return;
+        },
+        .auth_remove => |prov| {
+            const paths = buildWizardPaths(allocator) catch |err| {
+                log.err("auth remove: unable to resolve config paths: {}", .{err});
+                return err;
+            };
+            defer paths.deinit(allocator);
+            const deps: auth_wizard.WizardDeps = .{
+                .allocator = allocator,
+                .stdin = &stdin_reader.interface,
+                .stdout = &stdout_wiz_writer.interface,
+                .is_tty = std.posix.isatty(posix.STDIN_FILENO),
+                .auth_path = paths.auth_path,
+                .config_path = paths.config_path,
+                .scaffold_config = false,
+                .forced_provider = null,
+            };
+            try auth_wizard.removeAuth(deps, prov);
+            return;
+        },
+        else => {},
+    }
 
     var root_session = ConversationHistory.init(allocator);
     defer root_session.deinit();
@@ -153,20 +430,14 @@ pub fn main() !void {
     }
 
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    var provider = llm.createProviderFromEnv(default_model, allocator) catch |err| {
-        if (err == error.MissingCredential) {
-            const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
-            const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
-            const spec = llm.parseModelString(model_id);
-            var scratch: [512]u8 = undefined;
-            const message = std.fmt.bufPrint(
-                &scratch,
-                "zag: no credentials for provider '{s}' in ~/.config/zag/auth.json\n",
-                .{spec.provider_name},
-            ) catch "zag: no credentials for configured provider in ~/.config/zag/auth.json\n";
-            _ = stderr_file.write(message) catch {};
-        }
-        return err;
+    var provider = llm.createProviderFromEnv(default_model, allocator) catch |err| first_try: {
+        if (err != error.MissingCredential) return err;
+        break :first_try try firstRunWizardRetry(
+            allocator,
+            if (lua_engine) |*eng| eng else null,
+            &stdin_reader.interface,
+            &stdout_wiz_writer.interface,
+        );
     };
     defer provider.deinit();
 
@@ -179,8 +450,6 @@ pub fn main() !void {
     if (lua_engine) |*eng| {
         root_runner.lua_engine = eng;
     }
-
-    const startup_mode = parseStartupArgs(allocator) catch .new_session;
 
     var session_mgr = Session.SessionManager.init(allocator) catch |err| blk: {
         log.warn("session init failed, persistence disabled: {}", .{err});
@@ -200,6 +469,9 @@ pub fn main() !void {
             }
             break :blk null;
         },
+        // Auth subcommands were dispatched before subsystem init; the switch
+        // above `return`ed before reaching here.
+        .auth_login, .auth_list, .auth_remove => unreachable,
     };
 
     var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(resume_id, provider.model_id) else null;
