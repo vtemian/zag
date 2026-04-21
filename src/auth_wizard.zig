@@ -491,6 +491,11 @@ pub fn printAuthList(deps: WizardDeps) !void {
                 const masked = formatMaskedKey(&mask_buf, key);
                 try deps.stdout.print("  {s}  api_key  {s}\n", .{ name, masked });
             },
+            .oauth => |cred| {
+                var mask_buf: [16]u8 = undefined;
+                const masked = formatMaskedKey(&mask_buf, cred.access_token);
+                try deps.stdout.print("  {s}  oauth    {s}\n", .{ name, masked });
+            },
         }
     }
     try deps.stdout.flush();
