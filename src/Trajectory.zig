@@ -367,6 +367,7 @@ pub const Capture = struct {
     /// Subsequent `addTextDelta`/`addToolCall`/`addToolResult` calls attach to
     /// this turn until `endTurn` is called.
     pub fn beginTurn(self: *Capture, timestamp_ms: i64) !void {
+        if (self.cur != null) return error.TurnAlreadyActive;
         try self.turns.append(self.allocator, .{
             .started_at_ms = timestamp_ms,
             .text = .empty,
@@ -376,13 +377,12 @@ pub const Capture = struct {
         self.cur = &self.turns.items[self.turns.items.len - 1];
     }
 
-    /// Append assistant text to the current turn. The delta is duped into
-    /// the arena so the caller can free its copy immediately.
+    /// Append assistant text to the current turn. `appendSlice` copies the
+    /// bytes into the arena-backed ArrayList, so the caller can free its
+    /// copy immediately.
     pub fn addTextDelta(self: *Capture, delta: []const u8) !void {
         const turn = self.cur orelse return error.NoActiveTurn;
-        const arena_alloc = self.arena.allocator();
-        const owned = try arena_alloc.dupe(u8, delta);
-        try turn.text.appendSlice(arena_alloc, owned);
+        try turn.text.appendSlice(self.arena.allocator(), delta);
     }
 
     /// Record a tool invocation on the current turn. All three strings are
@@ -432,6 +432,13 @@ pub const Capture = struct {
         self.cur = null;
     }
 };
+
+test "Capture.beginTurn errors when a turn is already active" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1_700_000_000_000);
+    try std.testing.expectError(error.TurnAlreadyActive, cap.beginTurn(1_700_000_000_001));
+}
 
 test "Capture records assistant turn with tool calls and observation" {
     var cap = Capture.init(std.testing.allocator);
