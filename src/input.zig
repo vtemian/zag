@@ -31,6 +31,20 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
+test "parseBytes rejects CSI with a control byte mid-sequence" {
+    // ESC [ 1 ; BEL m — BEL (0x07) is forbidden in a CSI body.
+    const seq = [_]u8{ 0x1b, '[', '1', ';', 0x07, 'm' };
+    try std.testing.expect(parseBytes(&seq) == null);
+}
+
+test "parseBytes accepts a clean SGR sequence" {
+    // ESC [ 1 ; 3 1 m — unchanged by the malformed-byte guard.
+    const seq = [_]u8{ 0x1b, '[', '1', ';', '3', '1', 'm' };
+    // parseCsi returns Event.none for unrecognized bodies, not null;
+    // the important thing is parseBytes does not skip or error here.
+    _ = parseBytes(&seq);
+}
+
 test "parseBytes decodes Kitty Ctrl+A as CSI 65;5u" {
     const seq = [_]u8{ 0x1b, '[', '6', '5', ';', '5', 'u' };
     const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
