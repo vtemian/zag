@@ -153,9 +153,22 @@ pub fn nextEventInBuf(buf: []const u8) ParseResult {
         if (second == '[') {
             if (buf.len < 3) return .incomplete;
             const body = buf[2..];
-            const final_offset = findCsiFinal(body) orelse return .incomplete;
-            const seq = body[0 .. final_offset + 1];
-            return .{ .ok = .{ .event = csi.parseCsi(seq), .consumed = 2 + seq.len } };
+            switch (findCsiFinal(body)) {
+                .incomplete => return .incomplete,
+                .final_at => |off| {
+                    const seq = body[0 .. off + 1];
+                    return .{ .ok = .{ .event = csi.parseCsi(seq), .consumed = 2 + seq.len } };
+                },
+                .malformed_at => |off| {
+                    const bad = body[off];
+                    std.log.scoped(.input).warn(
+                        "CSI contains control byte 0x{x:0>2} at offset {d}; skipping sequence",
+                        .{ bad, off },
+                    );
+                    // Consume ESC, `[`, and everything up to and including the bad byte.
+                    return .{ .skip = .{ .consumed = 2 + off + 1 } };
+                },
+            }
         }
 
         // SS3: ESC O <letter>
@@ -250,18 +263,27 @@ pub fn parseBytes(buf: []const u8) ?Event {
     };
 }
 
-/// Scan forward from `start` in `buf` looking for an ECMA-48 CSI final
-/// byte in the range 0x40..0x7E. Returns the index of that byte, or
-/// null if the sequence is still growing.
-pub fn findCsiFinal(buf: []const u8) ?usize {
+/// Outcome of scanning a CSI body for its final byte.
+pub const CsiFinalResult = union(enum) {
+    /// No final byte yet; caller must wait for more bytes.
+    incomplete,
+    /// A valid final byte (0x40..0x7E) sits at this offset.
+    final_at: usize,
+    /// A forbidden control byte (0x00..0x1F) sits at this offset. Per
+    /// ECMA-48 the sequence is corrupt; caller drops the bytes through
+    /// the end of the malformed byte and resumes parsing.
+    malformed_at: usize,
+};
+
+/// Scan the CSI body for its final byte per ECMA-48 § 8.3.16.
+/// Parameter bytes are 0x30..0x3F, intermediates 0x20..0x2F, final
+/// 0x40..0x7E. Control bytes 0x00..0x1F mid-sequence are protocol
+/// violations; we surface them so callers log and skip instead of
+/// silently accepting a truncated sequence.
+pub fn findCsiFinal(buf: []const u8) CsiFinalResult {
     for (buf, 0..) |b, i| {
-        // Intermediate/parameter bytes are 0x20..0x3F; final is 0x40..0x7E.
-        if (b >= 0x40 and b <= 0x7E) return i;
-        // Anything below 0x20 inside a CSI is malformed, but we still
-        // consider the CSI complete at that point to avoid eating
-        // arbitrary amounts of subsequent input. parseCsi will return
-        // Event.none for malformed content.
-        if (b < 0x20) return i;
+        if (b >= 0x40 and b <= 0x7E) return .{ .final_at = i };
+        if (b < 0x20) return .{ .malformed_at = i };
     }
-    return null;
+    return .incomplete;
 }
