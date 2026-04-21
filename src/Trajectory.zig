@@ -129,6 +129,179 @@ pub const Trajectory = struct {
     final_metrics: ?FinalMetrics = null,
 };
 
+/// Emit `traj` as ATIF-v1.2 JSON onto `writer`. Null optional fields are
+/// omitted entirely so the output passes harbor's `extra: forbid` validator
+/// without emitting `"field": null`. `ToolCall.arguments_json` is re-parsed
+/// and re-emitted as a JSON object, not a string.
+pub fn serialize(traj: Trajectory, allocator: std.mem.Allocator, writer: anytype) !void {
+    try writer.writeByte('{');
+    try writeStringField(writer, "schema_version", traj.schema_version, true);
+    try writeStringField(writer, "session_id", traj.session_id, false);
+
+    try writer.writeAll(",\"agent\":");
+    try writeAgent(writer, traj.agent);
+
+    try writer.writeAll(",\"steps\":");
+    try writeSteps(writer, allocator, traj.steps);
+
+    if (traj.notes) |notes| try writeStringField(writer, "notes", notes, false);
+    if (traj.final_metrics) |fm| {
+        try writer.writeAll(",\"final_metrics\":");
+        try writeFinalMetrics(writer, fm);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeStringField(writer: anytype, name: []const u8, value: []const u8, first: bool) !void {
+    if (!first) try writer.writeByte(',');
+    try writer.writeByte('"');
+    try writer.writeAll(name);
+    try writer.writeAll("\":");
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writeAgent(writer: anytype, agent: Agent) !void {
+    try writer.writeByte('{');
+    try writeStringField(writer, "name", agent.name, true);
+    try writeStringField(writer, "version", agent.version, false);
+    if (agent.model_name) |m| try writeStringField(writer, "model_name", m, false);
+    try writer.writeByte('}');
+}
+
+fn writeSteps(writer: anytype, allocator: std.mem.Allocator, steps: []const Step) !void {
+    try writer.writeByte('[');
+    for (steps, 0..) |step, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeStep(writer, allocator, step);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeStep(writer: anytype, allocator: std.mem.Allocator, step: Step) !void {
+    try writer.writeByte('{');
+    try writer.print("\"step_id\":{d}", .{step.step_id});
+    if (step.timestamp) |ts| try writeStringField(writer, "timestamp", ts, false);
+    try writeStringField(writer, "source", step.source.toString(), false);
+    if (step.model_name) |m| try writeStringField(writer, "model_name", m, false);
+    try writeStringField(writer, "message", step.message, false);
+    if (step.reasoning_content) |r| try writeStringField(writer, "reasoning_content", r, false);
+    if (step.tool_calls) |calls| {
+        try writer.writeAll(",\"tool_calls\":");
+        try writeToolCalls(writer, allocator, calls);
+    }
+    if (step.observation) |obs| {
+        try writer.writeAll(",\"observation\":");
+        try writeObservation(writer, obs);
+    }
+    if (step.metrics) |m| {
+        try writer.writeAll(",\"metrics\":");
+        try writeMetrics(writer, m);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeToolCalls(writer: anytype, allocator: std.mem.Allocator, calls: []const ToolCall) !void {
+    try writer.writeByte('[');
+    for (calls, 0..) |call, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeToolCall(writer, allocator, call);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeToolCall(writer: anytype, allocator: std.mem.Allocator, call: ToolCall) !void {
+    try writer.writeByte('{');
+    try writeStringField(writer, "tool_call_id", call.tool_call_id, true);
+    try writeStringField(writer, "function_name", call.function_name, false);
+    try writer.writeAll(",\"arguments\":");
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{});
+    defer parsed.deinit();
+    try std.json.Stringify.value(parsed.value, .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn writeObservation(writer: anytype, obs: Observation) !void {
+    try writer.writeAll("{\"results\":[");
+    for (obs.results, 0..) |r, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeObservationResult(writer, r);
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeObservationResult(writer: anytype, r: ObservationResult) !void {
+    try writer.writeByte('{');
+    var first = true;
+    if (r.source_call_id) |id| {
+        try writeStringField(writer, "source_call_id", id, first);
+        first = false;
+    }
+    if (r.content) |c| {
+        try writeStringField(writer, "content", c, first);
+        first = false;
+    }
+    try writer.writeByte('}');
+}
+
+fn writeMetrics(writer: anytype, m: Metrics) !void {
+    try writer.writeByte('{');
+    var first = true;
+    if (m.prompt_tokens) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"prompt_tokens\":{d}", .{v});
+        first = false;
+    }
+    if (m.completion_tokens) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"completion_tokens\":{d}", .{v});
+        first = false;
+    }
+    if (m.cached_tokens) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"cached_tokens\":{d}", .{v});
+        first = false;
+    }
+    if (m.cost_usd) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.writeAll("\"cost_usd\":");
+        try std.json.Stringify.value(v, .{}, writer);
+        first = false;
+    }
+    try writer.writeByte('}');
+}
+
+fn writeFinalMetrics(writer: anytype, fm: FinalMetrics) !void {
+    try writer.writeByte('{');
+    var first = true;
+    if (fm.total_prompt_tokens) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"total_prompt_tokens\":{d}", .{v});
+        first = false;
+    }
+    if (fm.total_completion_tokens) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"total_completion_tokens\":{d}", .{v});
+        first = false;
+    }
+    if (fm.total_cached_tokens) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"total_cached_tokens\":{d}", .{v});
+        first = false;
+    }
+    if (fm.total_cost_usd) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.writeAll("\"total_cost_usd\":");
+        try std.json.Stringify.value(v, .{}, writer);
+        first = false;
+    }
+    if (fm.total_steps) |v| {
+        if (!first) try writer.writeByte(',');
+        try writer.print("\"total_steps\":{d}", .{v});
+        first = false;
+    }
+    try writer.writeByte('}');
+}
+
 test "Trajectory struct has required ATIF-v1.2 fields" {
     const agent = Agent{ .name = "zag", .version = "0.1.0" };
     const steps = [_]Step{.{
@@ -149,6 +322,54 @@ test "Step source enum round-trips to strings" {
     try std.testing.expectEqualStrings("system", Source.system.toString());
     try std.testing.expectEqualStrings("user", Source.user.toString());
     try std.testing.expectEqualStrings("agent", Source.agent.toString());
+}
+
+test "serialize minimal trajectory matches golden shape" {
+    var out: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const steps = [_]Step{
+        .{ .step_id = 1, .source = .system, .message = "You are zag." },
+        .{ .step_id = 2, .source = .user, .message = "hi" },
+    };
+    const traj = Trajectory{
+        .session_id = "sess",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .steps = &steps,
+    };
+    try serialize(traj, std.testing.allocator, &out.writer);
+    const body = out.written();
+
+    // Required fields present
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"schema_version\":\"ATIF-v1.2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"session_id\":\"sess\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"step_id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":\"system\"") != null);
+    // Null optionals are excluded (exclude_none)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"notes\":null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"timestamp\":null") == null);
+
+    // Output must round-trip as valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+}
+
+test "tool_calls arguments serialize as object not string" {
+    const calls = [_]ToolCall{
+        .{ .tool_call_id = "t1", .function_name = "bash", .arguments_json = "{\"cmd\":\"ls\"}" },
+    };
+    const steps = [_]Step{
+        .{ .step_id = 1, .source = .agent, .message = "", .tool_calls = &calls },
+    };
+    const traj = Trajectory{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .steps = &steps,
+    };
+    var out: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+    // Must appear as {"cmd":"ls"}, not "{\"cmd\":\"ls\"}"
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"arguments\":{\"cmd\":\"ls\"}") != null);
 }
 
 test {
