@@ -45,6 +45,13 @@ pub const ProviderError = std.mem.Allocator.Error || CancelError || error{
     /// Provider signalled a mid-stream failure (e.g. Responses API
     /// `response.failed` event) and the turn cannot be assembled.
     ProviderResponseFailed,
+    /// `auth.json` has no entry for the endpoint's provider name. The
+    /// user needs to run `zag --login=<provider>` (for OAuth providers)
+    /// or edit `auth.json` (for api-key providers).
+    NotLoggedIn,
+    /// Refresh token was rejected by the IdP (invalid_grant family).
+    /// The user needs to re-run `zag --login=<provider>`.
+    LoginExpired,
 };
 
 /// Cooperative-cancellation error, composed into ProviderError via `||`.
@@ -72,6 +79,8 @@ pub fn mapProviderError(err: anyerror) ProviderError {
         error.SseEventDataTooLarge => error.SseEventDataTooLarge,
         error.Cancelled => error.Cancelled,
         error.ProviderResponseFailed => error.ProviderResponseFailed,
+        error.NotLoggedIn => error.NotLoggedIn,
+        error.LoginExpired => error.LoginExpired,
         else => blk: {
             log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
             break :blk error.ApiError;
@@ -695,6 +704,20 @@ test "createProviderFromLuaConfig returns UnknownProvider for unsupported provid
     try std.testing.expectError(
         error.UnknownProvider,
         createProviderFromLuaConfig("fakeprovider/some-model", auth_path, allocator),
+    );
+}
+
+test "mapProviderError passes NotLoggedIn through" {
+    try std.testing.expectEqual(
+        @as(ProviderError, error.NotLoggedIn),
+        mapProviderError(error.NotLoggedIn),
+    );
+}
+
+test "mapProviderError passes LoginExpired through" {
+    try std.testing.expectEqual(
+        @as(ProviderError, error.LoginExpired),
+        mapProviderError(error.LoginExpired),
     );
 }
 
