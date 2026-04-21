@@ -201,8 +201,8 @@ fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_
 /// Handle `createProviderFromEnv` returning `error.MissingCredential` at
 /// first-run: drop into the onboarding wizard when stdin is a TTY, then
 /// reload Lua and retry provider creation once. On a non-TTY or repeated
-/// failure, print an actionable stderr message and propagate the original
-/// error so `main()` exits cleanly.
+/// failure, print an actionable stderr message and `std.process.exit(1)` so
+/// the user sees only the friendly message, not a Zig error-return trace.
 fn firstRunWizardRetry(
     allocator: std.mem.Allocator,
     lua_engine: ?*LuaEngine,
@@ -224,7 +224,7 @@ fn firstRunWizardRetry(
             .{ spec.provider_name, spec.provider_name },
         ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
         _ = stderr.write(msg) catch {};
-        return error.MissingCredential;
+        std.process.exit(1);
     }
 
     const paths = buildWizardPaths(allocator) catch |err| {
@@ -263,6 +263,7 @@ fn firstRunWizardRetry(
                 .{ spec.provider_name, spec.provider_name },
             ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
             _ = stderr.write(msg) catch {};
+            std.process.exit(1);
         }
         return err;
     };
@@ -285,6 +286,7 @@ fn firstRunWizardRetry(
                 .{ new_model, new_spec.provider_name, result.provider_name },
             ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
             _ = stderr.write(msg) catch {};
+            std.process.exit(1);
         }
         return err;
     };
