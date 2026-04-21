@@ -168,6 +168,10 @@ pub const LlmResponse = struct {
     input_tokens: u32 = 0,
     /// Number of output tokens produced by this response.
     output_tokens: u32 = 0,
+    /// Number of input tokens written to the provider's prompt cache.
+    cache_creation_tokens: u32 = 0,
+    /// Number of input tokens served from the provider's prompt cache.
+    cache_read_tokens: u32 = 0,
 
     /// Free all owned allocations within content blocks, then the slice itself.
     pub fn deinit(self: LlmResponse, allocator: Allocator) void {
@@ -291,4 +295,13 @@ test "LlmResponse defaults token counts to zero" {
     try std.testing.expectEqual(@as(u32, 0), resp.input_tokens);
     try std.testing.expectEqual(@as(u32, 0), resp.output_tokens);
     try std.testing.expectEqual(StopReason.end_turn, resp.stop_reason);
+}
+
+test "LlmResponse has cache token fields with zero defaults" {
+    const resp = LlmResponse{
+        .content = &.{},
+        .stop_reason = .end_turn,
+    };
+    try std.testing.expectEqual(@as(u32, 0), resp.cache_creation_tokens);
+    try std.testing.expectEqual(@as(u32, 0), resp.cache_read_tokens);
 }
