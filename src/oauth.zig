@@ -517,3 +517,180 @@ test "exchangeCode returns error.TokenExchangeFailed on non-2xx" {
         .client_id = "app_test",
     }));
 }
+
+// === Token refresh (refresh_token) ===
+
+pub const RefreshParams = struct {
+    token_url: []const u8,
+    refresh_token: []const u8,
+    client_id: []const u8,
+};
+
+pub fn refreshAccessToken(alloc: Allocator, p: RefreshParams) !TokenResponse {
+    // Build JSON body.
+    const body_obj = .{
+        .client_id = p.client_id,
+        .grant_type = @as([]const u8, "refresh_token"),
+        .refresh_token = p.refresh_token,
+    };
+    const body_json = try std.json.Stringify.valueAlloc(alloc, body_obj, .{});
+    defer alloc.free(body_json);
+
+    var client = std.http.Client{ .allocator = alloc };
+    defer client.deinit();
+
+    var resp_aw: std.io.Writer.Allocating = .init(alloc);
+    defer resp_aw.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = p.token_url },
+        .method = .POST,
+        .payload = body_json,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Accept", .value = "application/json" },
+        },
+        .response_writer = &resp_aw.writer,
+        .keep_alive = false,
+    }) catch |err| {
+        log.warn("refreshAccessToken transport failed: {s}", .{@errorName(err)});
+        return error.TokenRefreshFailed;
+    };
+
+    switch (result.status) {
+        .ok => return parseTokenResponse(alloc, resp_aw.written(), .refresh),
+        .unauthorized, .bad_request => {
+            if (isInvalidGrant(resp_aw.written())) return error.LoginExpired;
+            log.warn("refreshAccessToken {}: {s}", .{ result.status, resp_aw.written() });
+            return error.TokenRefreshFailed;
+        },
+        else => {
+            log.warn("refreshAccessToken {}: {s}", .{ result.status, resp_aw.written() });
+            return error.TokenRefreshFailed;
+        },
+    }
+}
+
+fn isInvalidGrant(body: []const u8) bool {
+    // Simple substring scan; the real classification in Codex inspects
+    // error.code, error.message, error_description. For v1 any
+    // occurrence of these markers in the body is good enough.
+    return std.mem.indexOf(u8, body, "invalid_grant") != null or
+        std.mem.indexOf(u8, body, "refresh_token_expired") != null or
+        std.mem.indexOf(u8, body, "refresh_token_revoked") != null or
+        std.mem.indexOf(u8, body, "refresh_token_invalidated") != null;
+}
+
+test "refreshAccessToken POSTs JSON and parses tokens" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const Captured = struct { bytes: [8192]u8 = undefined, len: usize = 0 };
+    var captured = Captured{};
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server, cap: *Captured) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            cap.len = conn.stream.read(&cap.bytes) catch 0;
+            const resp =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: 70\r\nConnection: close\r\n\r\n" ++
+                "{\"id_token\":\"NEW_ID\",\"access_token\":\"NEW_AT\",\"refresh_token\":\"NEW_RT\"}";
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    const resp = try refreshAccessToken(std.testing.allocator, .{
+        .token_url = url,
+        .refresh_token = "OLD_RT",
+        .client_id = "app_test",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("NEW_ID", resp.id_token);
+    try std.testing.expectEqualStrings("NEW_AT", resp.access_token);
+    try std.testing.expectEqualStrings("NEW_RT", resp.refresh_token);
+
+    const req = captured.bytes[0..captured.len];
+    try std.testing.expect(std.mem.indexOf(u8, req, "Content-Type: application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"grant_type\":\"refresh_token\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"client_id\":\"app_test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"refresh_token\":\"OLD_RT\"") != null);
+}
+
+test "refreshAccessToken tolerates omitted fields (empty strings)" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var b: [4096]u8 = undefined;
+            _ = conn.stream.read(&b) catch {};
+            const resp =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: 26\r\nConnection: close\r\n\r\n" ++
+                "{\"access_token\":\"ONLY_AT\"}";
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    const resp = try refreshAccessToken(std.testing.allocator, .{
+        .token_url = url,
+        .refresh_token = "OLD_RT",
+        .client_id = "app_test",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("ONLY_AT", resp.access_token);
+    try std.testing.expectEqualStrings("", resp.id_token);
+    try std.testing.expectEqualStrings("", resp.refresh_token);
+}
+
+test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var b: [4096]u8 = undefined;
+            _ = conn.stream.read(&b) catch {};
+            const resp =
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: 69\r\nConnection: close\r\n\r\n" ++
+                "{\"error\":\"invalid_grant\",\"error_description\":\"refresh token expired\"}";
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    try std.testing.expectError(error.LoginExpired, refreshAccessToken(std.testing.allocator, .{
+        .token_url = url,
+        .refresh_token = "EXPIRED",
+        .client_id = "app_test",
+    }));
+}
