@@ -116,6 +116,10 @@ pub const AgentEvent = union(enum) {
 pub const EventQueue = struct {
     /// Guards concurrent access to buffer / head / tail / len.
     mutex: std.Thread.Mutex = .{},
+    /// Signalled after `drain` frees slots so a producer waiting in
+    /// `pushWithBackpressure` wakes as soon as capacity reopens rather than
+    /// after a fixed polling interval. Waited on under `mutex`.
+    drained: std.Thread.Condition = .{},
     /// Ring storage for queued events. Length equals the queue's capacity.
     buffer: []AgentEvent,
     /// Index of the next event to be drained.
@@ -180,8 +184,59 @@ pub const EventQueue = struct {
         };
     }
 
+    /// Canonical producer path for the agent thread: push `event`, and if
+    /// the ring is full, wait up to `max_wait_ms` for the consumer to drain
+    /// a slot before giving up. Returns `error.EventDropped` if the budget
+    /// expires; in that case `dropped` is incremented, the event's owned
+    /// bytes are freed, and a warn-level log records the drop so it isn't
+    /// silent. Thread-safe.
+    ///
+    /// Uses the `drained` condition variable so a consumer freeing capacity
+    /// wakes the producer within microseconds rather than after a fixed
+    /// polling interval.
+    pub fn pushWithBackpressure(
+        self: *EventQueue,
+        event: AgentEvent,
+        max_wait_ms: u32,
+    ) error{EventDropped}!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const deadline_ns: u64 = @as(u64, max_wait_ms) * std.time.ns_per_ms;
+        var elapsed_ns: u64 = 0;
+        while (self.len == self.buffer.len) {
+            if (elapsed_ns >= deadline_ns) {
+                _ = self.dropped.fetchAdd(1, .monotonic);
+                log.warn(
+                    "event queue drop after {d}ms backpressure: kind={s}",
+                    .{ max_wait_ms, @tagName(event) },
+                );
+                event.freeOwned(self.allocator);
+                return error.EventDropped;
+            }
+            const remaining_ns = deadline_ns - elapsed_ns;
+            const wait_start = std.time.nanoTimestamp();
+            self.drained.timedWait(&self.mutex, remaining_ns) catch {};
+            const wait_end = std.time.nanoTimestamp();
+            const delta: u64 = @intCast(@max(0, wait_end - wait_start));
+            elapsed_ns += delta;
+        }
+
+        // Slot open; perform the enqueue inline so we don't drop the mutex
+        // and race another producer into the same slot.
+        self.buffer[self.tail] = event;
+        self.tail = (self.tail + 1) % self.buffer.len;
+        self.len += 1;
+        if (self.wake_fd) |fd| {
+            _ = std.posix.write(fd, &[_]u8{1}) catch {};
+        }
+    }
+
     /// Drain up to out.len events into the provided buffer.
     /// Returns the number of events copied. Thread-safe.
+    ///
+    /// Wakes any producer blocked in `pushWithBackpressure` once slots are
+    /// freed so backpressure clears at consumer speed, not polling speed.
     pub fn drain(self: *EventQueue, out: []AgentEvent) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -193,6 +248,7 @@ pub const EventQueue = struct {
             self.head = (self.head + 1) % self.buffer.len;
         }
         self.len -= n;
+        if (n > 0) self.drained.broadcast();
         return n;
     }
 };
@@ -358,6 +414,80 @@ test "push and drain hook_request event" {
         Hooks.EventKind.agent_done,
         buf[0].hook_request.payload.kind(),
     );
+}
+
+const BackpressureDrainer = struct {
+    queue: *EventQueue,
+    allocator: Allocator,
+    go: std.Thread.ResetEvent,
+    drained_n: std.atomic.Value(usize),
+
+    fn run(self: *BackpressureDrainer) void {
+        self.go.wait();
+        var buf: [8]AgentEvent = undefined;
+        const n = self.queue.drain(&buf);
+        for (buf[0..n]) |ev| ev.freeOwned(self.allocator);
+        self.drained_n.store(n, .release);
+    }
+};
+
+test "pushWithBackpressure waits for drain and succeeds" {
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 2);
+    defer queue.deinit();
+
+    // Fill the queue
+    for (0..2) |_| {
+        const owned = try alloc.dupe(u8, "x");
+        try queue.push(.{ .info = owned });
+    }
+
+    var drainer: BackpressureDrainer = .{
+        .queue = &queue,
+        .allocator = alloc,
+        .go = .{},
+        .drained_n = .{ .raw = 0 },
+    };
+    const thread = try std.Thread.spawn(.{}, BackpressureDrainer.run, .{&drainer});
+    defer thread.join();
+
+    // Release drainer so it drains concurrently while we wait.
+    drainer.go.set();
+
+    const payload = try alloc.dupe(u8, "after-drain");
+    try queue.pushWithBackpressure(.{ .info = payload }, 5_000);
+
+    // Poll for the drainer to finish — bounded by the join() in defer so a
+    // busted wake-up would hang the test rather than silently passing.
+    while (drainer.drained_n.load(.acquire) == 0) std.Thread.yield() catch {};
+
+    try std.testing.expectEqual(@as(u64, 0), queue.dropped.load(.acquire));
+
+    // Drain the pushed event to keep the deferred deinit clean.
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    for (buf[0..n]) |ev| ev.freeOwned(alloc);
+}
+
+test "pushWithBackpressure drops after budget, no leak" {
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 2);
+    defer queue.deinit();
+    defer {
+        var buf: [4]AgentEvent = undefined;
+        const n = queue.drain(&buf);
+        for (buf[0..n]) |ev| ev.freeOwned(alloc);
+    }
+
+    for (0..2) |_| {
+        const owned = try alloc.dupe(u8, "x");
+        try queue.push(.{ .info = owned });
+    }
+
+    const payload = try alloc.dupe(u8, "doomed");
+    const err = queue.pushWithBackpressure(.{ .info = payload }, 10);
+    try std.testing.expectError(error.EventDropped, err);
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
 }
 
 test "push and drain lua_tool_request event" {
