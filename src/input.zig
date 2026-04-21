@@ -5,11 +5,11 @@
 //! non-blocking polling against a raw-mode terminal file descriptor.
 //!
 //! Facade over the `input/` submodule set:
-//! - `core`   — Event/KeyEvent/MouseEvent/ParseResult types plus the
-//!              stateless `nextEventInBuf` dispatcher.
-//! - `csi`    — CSI and SS3 sequence decoding (`parseCsi`, `parseSs3`).
-//! - `mouse`  — SGR mouse encoding (`parseSgrMouse`).
-//! - `parser` — stateful `Parser` with fragmentation + ESC timeout.
+//! - `core`:   Event/KeyEvent/MouseEvent/ParseResult types plus the
+//!             stateless `nextEventInBuf` dispatcher.
+//! - `csi`:    CSI and SS3 sequence decoding (`parseCsi`, `parseSs3`).
+//! - `mouse`:  SGR mouse encoding (`parseSgrMouse`).
+//! - `parser`: stateful `Parser` with fragmentation + ESC timeout.
 
 const std = @import("std");
 const core = @import("input/core.zig");
@@ -32,13 +32,13 @@ test {
 }
 
 test "parseBytes rejects CSI with a control byte mid-sequence" {
-    // ESC [ 1 ; BEL m — BEL (0x07) is forbidden in a CSI body.
+    // ESC [ 1 ; BEL m; BEL (0x07) is forbidden in a CSI body.
     const seq = [_]u8{ 0x1b, '[', '1', ';', 0x07, 'm' };
     try std.testing.expect(parseBytes(&seq) == null);
 }
 
 test "parseBytes accepts a clean SGR sequence" {
-    // ESC [ 1 ; 3 1 m — unchanged by the malformed-byte guard.
+    // ESC [ 1 ; 3 1 m; unchanged by the malformed-byte guard.
     const seq = [_]u8{ 0x1b, '[', '1', ';', '3', '1', 'm' };
     // parseCsi returns Event.none for unrecognized bodies, not null;
     // the important thing is parseBytes does not skip or error here.
@@ -102,7 +102,7 @@ test "Parser emits a single paste event for a bracketed paste block" {
 test "Parser handles a bracketed paste split across reads" {
     var p: Parser = .{};
     p.feedBytes("\x1b[200~hel", 0);
-    // No event yet — still waiting for the end marker.
+    // No event yet; still waiting for the end marker.
     try std.testing.expect(p.nextEvent(0) == null);
     p.feedBytes("lo\x1b[201~", 0);
     const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;

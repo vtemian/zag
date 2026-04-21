@@ -87,3 +87,7 @@ test "resumeFromJob drains completion queue and frees the job" {
     eng.async_runtime.?.completions.mu.unlock();
     try testing.expectEqual(@as(usize, 0), remaining);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

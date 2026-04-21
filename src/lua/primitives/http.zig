@@ -562,3 +562,7 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
     // jitter, and the 100ms cancel delay itself.
     try testing.expect(elapsed_ms < 1000);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

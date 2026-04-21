@@ -341,3 +341,7 @@ test "Pool sleep honors cancellation before dispatch" {
     }
     return error.CancelledJobNeverCompleted;
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
