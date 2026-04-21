@@ -52,6 +52,25 @@ pub const WizardDeps = struct {
 /// with `promptSecret` in Task 3, `NonInteractiveFirstRun` with `runWizard` in
 /// Task 5; they're reserved up front so the error set doesn't widen when
 /// later tasks import this module.
+///
+/// Caller contract per variant (error sets can't carry per-variant doc
+/// comments, so the contract lives here):
+/// - `UserAborted`: stdin hit EOF mid-prompt. The wizard prints nothing
+///   extra; callers decide whether to surface a goodbye message.
+/// - `TooManyRetries`: `promptChoice` exhausted `max_prompt_retries` rounds of
+///   bad input. The wizard already printed per-attempt "invalid choice" lines.
+/// - `EmptyInput` / `KeyTooLong`: `promptSecret` rejected the entry. The
+///   wizard printed nothing extra; the user-facing rationale belongs to the
+///   caller (e.g. `main.zig` prints "key was empty, try again").
+/// - `NonInteractiveFirstRun`: first-run under a pipe with
+///   `allow_non_tty_first_run = false`. The wizard returns this *without
+///   printing*; `main.zig` (Task 6) owns the user-facing stderr message
+///   (something like "zag: first-run setup requires an interactive terminal;
+///   populate ~/.config/zag/auth.json manually, or run
+///   `zag auth login <provider>` from a real TTY").
+/// - `UnknownProvider`: `forced_provider` (or `scaffoldConfigLua`'s
+///   `provider_name`) wasn't in `PROVIDERS`. The wizard prints nothing; the
+///   caller should echo back the bad name and the known-providers list.
 pub const WizardError = error{
     UserAborted,
     TooManyRetries,
@@ -429,11 +448,19 @@ fn formatMaskedKey(out: *[16]u8, key: []const u8) []const u8 {
 /// Drop `provider_name` from `auth.json` and persist the result. Missing
 /// entries are a success, not an error: `zag auth remove X` is a declarative
 /// "X should not be present", so idempotence matches user intent.
+///
+// TODO(task-8): once `Credential` grows an `.oauth` variant, add a test that
+// seeds a non-api_key entry (either via a raw JSON fixture once the loader
+// accepts it, or by injecting a `Credential{.oauth = ...}` into
+// `auth_file.entries` directly) and asserts `removeAuth` still prints
+// "Removed credential for X". Today `Credential` is a single-variant union,
+// so the `entries.contains` probe below is variant-agnostic by construction
+// but can't be exercised against a non-api_key entry yet.
 pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
     var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
     defer auth_file.deinit();
 
-    const existed = (auth_file.getApiKey(provider_name) catch null) != null;
+    const existed = auth_file.entries.contains(provider_name);
     auth_file.removeEntry(provider_name);
     try auth.saveAuthFile(deps.auth_path, auth_file);
 
