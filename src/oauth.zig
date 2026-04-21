@@ -321,3 +321,199 @@ test "extractAccountId returns error.MalformedJwt on bad shape" {
     try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "only.one.dot"));
     try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "no-dots-at-all"));
 }
+
+// === Token exchange (authorization_code) ===
+
+pub const TokenResponse = struct {
+    id_token: []const u8, // owned by caller
+    access_token: []const u8, // owned by caller
+    refresh_token: []const u8, // owned by caller
+
+    pub fn deinit(self: TokenResponse, alloc: Allocator) void {
+        alloc.free(self.id_token);
+        alloc.free(self.access_token);
+        alloc.free(self.refresh_token);
+    }
+};
+
+pub const ExchangeParams = struct {
+    token_url: []const u8,
+    code: []const u8,
+    verifier: []const u8,
+    redirect_uri: []const u8,
+    client_id: []const u8,
+};
+
+pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
+    // Build form body.
+    var body_aw: std.io.Writer.Allocating = .init(alloc);
+    defer body_aw.deinit();
+    const body_w = &body_aw.writer;
+
+    try writeFormField(body_w, "grant_type", "authorization_code", true);
+    try writeFormField(body_w, "code", p.code, false);
+    try writeFormField(body_w, "redirect_uri", p.redirect_uri, false);
+    try writeFormField(body_w, "client_id", p.client_id, false);
+    try writeFormField(body_w, "code_verifier", p.verifier, false);
+
+    // Send.
+    var client = std.http.Client{ .allocator = alloc };
+    defer client.deinit();
+
+    var resp_aw: std.io.Writer.Allocating = .init(alloc);
+    defer resp_aw.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = p.token_url },
+        .method = .POST,
+        .payload = body_aw.written(),
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "Accept", .value = "application/json" },
+        },
+        .response_writer = &resp_aw.writer,
+        .keep_alive = false,
+    }) catch |err| {
+        log.warn("exchangeCode transport failed: {s}", .{@errorName(err)});
+        return error.TokenExchangeFailed;
+    };
+
+    if (result.status != .ok) {
+        log.warn("exchangeCode status {}: {s}", .{ result.status, resp_aw.written() });
+        return error.TokenExchangeFailed;
+    }
+
+    return parseTokenResponse(alloc, resp_aw.written(), .exchange);
+}
+
+fn writeFormField(w: *std.io.Writer, key: []const u8, val: []const u8, first: bool) !void {
+    if (!first) try w.writeByte('&');
+    try std.Uri.Component.formatEscaped(.{ .raw = key }, w);
+    try w.writeByte('=');
+    try std.Uri.Component.formatEscaped(.{ .raw = val }, w);
+}
+
+const ParseMode = enum { exchange, refresh };
+
+fn parseTokenResponse(alloc: Allocator, body: []const u8, mode: ParseMode) !TokenResponse {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.MalformedResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.MalformedResponse,
+    };
+
+    const required = switch (mode) {
+        .exchange => true,
+        .refresh => false,
+    };
+
+    const id_token = try pickString(alloc, root, "id_token", required);
+    errdefer alloc.free(id_token);
+    const access_token = try pickString(alloc, root, "access_token", required);
+    errdefer alloc.free(access_token);
+    const refresh_token = try pickString(alloc, root, "refresh_token", required);
+    errdefer alloc.free(refresh_token);
+
+    return .{
+        .id_token = id_token,
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+    };
+}
+
+fn pickString(alloc: Allocator, obj: std.json.ObjectMap, key: []const u8, required: bool) ![]const u8 {
+    const v = obj.get(key) orelse {
+        if (required) return error.MalformedResponse;
+        return alloc.dupe(u8, "");
+    };
+    return switch (v) {
+        .string => |s| alloc.dupe(u8, s),
+        .null => if (required) error.MalformedResponse else alloc.dupe(u8, ""),
+        else => error.MalformedResponse,
+    };
+}
+
+test "exchangeCode POSTs form-urlencoded and parses tokens" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const Captured = struct { bytes: [8192]u8 = undefined, len: usize = 0 };
+    var captured = Captured{};
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server, cap: *Captured) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            cap.len = conn.stream.read(&cap.bytes) catch 0;
+            const resp =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: 59\r\nConnection: close\r\n\r\n" ++
+                "{\"id_token\":\"idt\",\"access_token\":\"at\",\"refresh_token\":\"rt\"}";
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    const resp = try exchangeCode(std.testing.allocator, .{
+        .token_url = url,
+        .code = "code_xyz",
+        .verifier = "ver_abc",
+        .redirect_uri = "http://localhost:1455/auth/callback",
+        .client_id = "app_test",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("idt", resp.id_token);
+    try std.testing.expectEqualStrings("at", resp.access_token);
+    try std.testing.expectEqualStrings("rt", resp.refresh_token);
+
+    const req = captured.bytes[0..captured.len];
+    try std.testing.expect(std.mem.indexOf(u8, req, "POST /oauth/token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Content-Type: application/x-www-form-urlencoded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "grant_type=authorization_code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "code=code_xyz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "code_verifier=ver_abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "client_id=app_test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") != null);
+}
+
+test "exchangeCode returns error.TokenExchangeFailed on non-2xx" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var b: [4096]u8 = undefined;
+            _ = conn.stream.read(&b) catch {};
+            const resp =
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: 65\r\nConnection: close\r\n\r\n" ++
+                "{\"error\":\"invalid_grant\",\"error_description\":\"auth code expired\"}";
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    try std.testing.expectError(error.TokenExchangeFailed, exchangeCode(std.testing.allocator, .{
+        .token_url = url,
+        .code = "bad",
+        .verifier = "ver",
+        .redirect_uri = "http://localhost:1455/auth/callback",
+        .client_id = "app_test",
+    }));
+}
