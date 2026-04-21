@@ -122,7 +122,7 @@ fn serializeRequest(
     try w.writeAll("{");
     try w.print("\"model\":\"{s}\",", .{model});
     try w.print("\"max_tokens\":{d},", .{max_tokens});
-    if (stream) try w.writeAll("\"stream\":true,");
+    if (stream) try w.writeAll("\"stream\":true,\"stream_options\":{\"include_usage\":true},");
 
     try writeMessagesWithSystem(system_prompt, messages, w);
 
@@ -330,6 +330,9 @@ fn parseSseStream(
     cancel: *std.atomic.Value(bool),
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     var text_content: std.ArrayList(u8) = .empty;
     defer text_content.deinit(allocator);
@@ -350,6 +353,26 @@ fn parseSseStream(
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, sse.data, .{}) catch continue;
         defer parsed.deinit();
         const obj = parsed.value.object;
+
+        // Usage rides on the final chunk when stream_options.include_usage is set.
+        // That chunk has choices:[] so we must look for usage before the empty-choices
+        // continue below.
+        if (obj.get("usage")) |usage| {
+            if (usage == .object) {
+                const usage_obj = usage.object;
+                if (usage_obj.get("prompt_tokens")) |v| if (v == .integer) {
+                    input_tokens = @intCast(v.integer);
+                };
+                if (usage_obj.get("completion_tokens")) |v| if (v == .integer) {
+                    output_tokens = @intCast(v.integer);
+                };
+                if (usage_obj.get("prompt_tokens_details")) |d| if (d == .object) {
+                    if (d.object.get("cached_tokens")) |v| if (v == .integer) {
+                        cache_read_tokens = @intCast(v.integer);
+                    };
+                };
+            }
+        }
 
         const choices = obj.get("choices") orelse continue;
         if (choices.array.items.len == 0) continue;
@@ -430,7 +453,10 @@ fn parseSseStream(
         try builder.addToolUse(tc.id.items, tc.name.items, tc.arguments.items, allocator);
     }
 
-    return builder.finish(stop_reason, 0, 0, 0, 0, allocator);
+    // OpenAI doesn't split cache_creation from prompt_tokens: cached-read tokens are
+    // reported separately via prompt_tokens_details.cached_tokens and are a subset of
+    // prompt_tokens. Pass 0 for cache_creation to stay honest.
+    return builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -535,6 +561,25 @@ test "buildStreamingRequestBody includes stream:true" {
 
     const root = parsed.value.object;
     try std.testing.expect(root.get("stream").?.bool == true);
+}
+
+test "buildStreamingRequestBody sets stream_options.include_usage=true" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    // Raw-substring check pins the on-the-wire JSON shape: OpenAI only emits
+    // a final usage chunk when this exact field is set in the request body.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const stream_options = root.get("stream_options") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(stream_options.object.get("include_usage").?.bool == true);
 }
 
 test "parseResponse parses text-only response" {
@@ -847,6 +892,52 @@ test "openai writeMessage concatenates multiple pure-text blocks" {
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
     try std.testing.expectEqualStrings("foobar", root.get("content").?.string);
+}
+
+fn noopStreamCallback(_: *anyopaque, _: llm.StreamEvent) void {}
+
+test "parseSseStream captures usage and cached_tokens from final chunk" {
+    const allocator = std.testing.allocator;
+
+    // OpenAI's final SSE chunk (when stream_options.include_usage is set) carries
+    // usage on a choices:[] payload, followed by [DONE]. Verify we pick prompt,
+    // completion, and cached tokens off it.
+    const sse_body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fake = std.Io.Reader.fixed(sse_body);
+
+    var sr: llm.StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var sink: u8 = 0;
+    const callback: llm.StreamCallback = .{
+        .ctx = @ptrCast(&sink),
+        .on_event = &noopStreamCallback,
+    };
+
+    const response = try parseSseStream(&sr, allocator, callback, &cancel);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 12), response.input_tokens);
+    try std.testing.expectEqual(@as(u32, 3), response.output_tokens);
+    try std.testing.expectEqual(@as(u32, 4), response.cache_read_tokens);
+    try std.testing.expectEqual(@as(u32, 0), response.cache_creation_tokens);
 }
 
 test "openai writeMessage emits tool role for tool_result" {
