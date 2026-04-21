@@ -75,3 +75,27 @@ test "generatePkce produces distinct verifiers across calls" {
     defer b.deinit(std.testing.allocator);
     try std.testing.expect(!std.mem.eql(u8, a.verifier, b.verifier));
 }
+
+// === CSRF state ===
+
+pub fn generateState(alloc: Allocator) ![]const u8 {
+    var raw: [32]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const buf = try alloc.alloc(u8, enc.calcSize(raw.len));
+    errdefer alloc.free(buf);
+    _ = enc.encode(buf, &raw);
+    return buf;
+}
+
+test "generateState produces base64url-nopad of 32 random bytes" {
+    const s = try generateState(std.testing.allocator);
+    defer std.testing.allocator.free(s);
+
+    // 32 raw bytes → base64url-nopad of 43 chars.
+    try std.testing.expectEqual(@as(usize, 43), s.len);
+    for (s) |c| {
+        try std.testing.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
+    }
+}
