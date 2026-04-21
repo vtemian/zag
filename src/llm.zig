@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 
 pub const anthropic = @import("providers/anthropic.zig");
 pub const openai = @import("providers/openai.zig");
+pub const pricing = @import("pricing.zig");
 pub const streaming = @import("llm/streaming.zig");
 pub const http = @import("llm/http.zig");
 const registry_mod = @import("llm/registry.zig");
