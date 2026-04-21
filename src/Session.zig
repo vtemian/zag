@@ -201,7 +201,29 @@ pub const SessionManager = struct {
         const cwd = std.fs.cwd();
 
         // Read meta
-        const meta = try readMetaFile(meta_path, self.allocator);
+        var meta = try readMetaFile(meta_path, self.allocator);
+
+        // Recover from any crash that left the session half-written: truncate
+        // an incomplete trailing JSONL line, remove orphaned .tmp files, and
+        // reconcile meta.message_count against the real line count.
+        var sessions = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
+            log.err("failed to open sessions dir for recovery: {}", .{e});
+            return e;
+        };
+        defer sessions.close();
+
+        const report = recoverSessionFiles(sessions, id, self.allocator) catch |e| {
+            log.err("session recovery failed: {}", .{e});
+            return e;
+        };
+
+        if (meta.message_count != report.actual_line_count) {
+            log.warn("session {s}: meta.message_count={d} but JSONL has {d} lines; trusting JSONL", .{
+                id, meta.message_count, report.actual_line_count,
+            });
+            meta.message_count = report.actual_line_count;
+            try writeMetaFile(meta_path, &meta);
+        }
 
         // Open JSONL for appending
         const jsonl_file = cwd.openFile(jsonl_path, .{ .mode = .write_only }) catch |e| {
@@ -411,6 +433,76 @@ pub fn freeEntry(entry: Entry, allocator: Allocator) void {
     if (entry.content.len > 0) allocator.free(entry.content);
     if (entry.tool_name.len > 0) allocator.free(entry.tool_name);
     if (entry.tool_input.len > 0) allocator.free(entry.tool_input);
+}
+
+/// Outcome of a session's crash-recovery pass. `actual_line_count` is the
+/// number of complete JSONL lines after truncation, used by `loadSession`
+/// to reconcile against `meta.message_count`.
+pub const RecoveryReport = struct {
+    actual_line_count: u32 = 0,
+    truncated_bytes: usize = 0,
+    orphaned_tmp_cleaned: usize = 0,
+};
+
+/// Scan `dir` for files belonging to session `id` and repair whatever the
+/// last crash left behind:
+///   1. Truncate an incomplete trailing JSONL line (no final `\n`).
+///   2. Delete orphan `.tmp` files from a failed atomic meta rename.
+///   3. Report the real line count so the caller can fix `meta.message_count`.
+/// `dir` must be opened with `.iterate = true`.
+pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator) !RecoveryReport {
+    var report: RecoveryReport = .{};
+
+    // Step 1: truncate incomplete final JSONL line, count complete lines.
+    var jsonl_name_buf: [64]u8 = undefined;
+    const jsonl_name = std.fmt.bufPrint(&jsonl_name_buf, "{s}.jsonl", .{id}) catch
+        return error.PathTooLong;
+
+    if (dir.openFile(jsonl_name, .{ .mode = .read_write })) |file| {
+        defer file.close();
+        const end_pos = try file.getEndPos();
+        if (end_pos > 0) {
+            const content = try allocator.alloc(u8, end_pos);
+            defer allocator.free(content);
+            try file.seekTo(0);
+            const n = try file.readAll(content);
+
+            var last_nl: ?usize = null;
+            for (content[0..n], 0..) |b, i| {
+                if (b == '\n') last_nl = i;
+            }
+            const truncate_to = if (last_nl) |idx| idx + 1 else 0;
+            if (truncate_to < n) {
+                report.truncated_bytes = n - truncate_to;
+                try file.setEndPos(truncate_to);
+                log.warn("session {s}: dropped {d} bytes of incomplete trailing JSONL line", .{
+                    id, report.truncated_bytes,
+                });
+            }
+            for (content[0..truncate_to]) |b| {
+                if (b == '\n') report.actual_line_count += 1;
+            }
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {}, // No JSONL yet — leave report at zero.
+        else => return err,
+    }
+
+    // Step 2: delete orphan `.tmp` files belonging to this session.
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, id)) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".tmp")) continue;
+        dir.deleteFile(entry.name) catch |e| {
+            log.warn("session {s}: failed to delete orphan {s}: {}", .{ id, entry.name, e });
+            continue;
+        };
+        log.warn("session {s}: deleted orphan .tmp file {s}", .{ id, entry.name });
+        report.orphaned_tmp_cleaned += 1;
+    }
+
+    return report;
 }
 
 // -- Internal helpers --------------------------------------------------------
@@ -864,4 +956,65 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
     const loaded = try readMetaFile(meta_path, allocator);
     try std.testing.expectEqualStrings(id, loaded.idSlice());
     try std.testing.expectEqual(@as(u32, 1), loaded.message_count);
+}
+
+test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two complete lines plus one partial (no trailing newline).
+    const jsonl_body = "{\"a\":1}\n{\"b\":2}\n{\"c\":";
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = jsonl_body });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc", allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), report.actual_line_count);
+    try std.testing.expectEqual(@as(usize, "{\"c\":".len), report.truncated_bytes);
+
+    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", after);
+}
+
+test "recoverSessionFiles deletes orphan .tmp files for the session" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // One session, two orphans, plus an unrelated session's .tmp that must survive.
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = "{\"a\":1}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "abc.meta.json.tmp", .data = "{}" });
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl.tmp", .data = "{}" });
+    try tmp.dir.writeFile(.{ .sub_path = "other.meta.json.tmp", .data = "{}" });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc", allocator);
+    try std.testing.expectEqual(@as(usize, 2), report.orphaned_tmp_cleaned);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("abc.meta.json.tmp"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("abc.jsonl.tmp"));
+    // Unrelated session's tmp must NOT be touched.
+    _ = try tmp.dir.statFile("other.meta.json.tmp");
+}
+
+test "recoverSessionFiles reports line count for count reconciliation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const jsonl_body = "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n{\"d\":4}\n";
+    try tmp.dir.writeFile(.{ .sub_path = "sess.jsonl", .data = jsonl_body });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "sess", allocator);
+    try std.testing.expectEqual(@as(u32, 4), report.actual_line_count);
+    try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
 }
