@@ -27,6 +27,9 @@ pub fn buildHeaders(endpoint: *const Endpoint, api_key: []const u8, allocator: A
             errdefer allocator.free(auth_value);
             try headers.append(allocator, .{ .name = "Authorization", .value = auth_value });
         },
+        // Task 12 replaces this stub with the ChatGPT OAuth header block
+        // (Bearer + chatgpt-account-id + session_id + originator).
+        .oauth_chatgpt => return error.NotImplemented,
         .none => {},
     }
 

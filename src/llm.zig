@@ -142,6 +142,8 @@ pub const Serializer = enum {
     anthropic,
     /// OpenAI Chat Completions API format (also used by OpenRouter, Groq, Ollama, etc.).
     openai,
+    /// OpenAI Responses API format (ChatGPT backend, used with OAuth).
+    chatgpt,
 };
 
 /// Runtime-polymorphic LLM provider interface.
@@ -232,6 +234,10 @@ pub const ProviderResult = struct {
             .openai => {
                 self.allocator.destroy(@as(*openai.OpenAiSerializer, @ptrCast(@alignCast(self.state))));
             },
+            // Task 15 replaces this stub with ChatgptSerializer destroy.
+            // .chatgpt ProviderResult is never constructed until then; the
+            // factory returns error.NotImplemented before reaching this path.
+            .chatgpt => unreachable,
         }
     }
 };
@@ -294,6 +300,8 @@ pub fn createProviderFromLuaConfig(
                 return error.MissingCredential;
             break :blk try allocator.dupe(u8, borrowed);
         },
+        // Task 10 replaces this stub with resolveCredential (proactive refresh).
+        .oauth_chatgpt => return error.NotImplemented,
     };
     errdefer allocator.free(api_key);
 
@@ -324,6 +332,8 @@ pub fn createProviderFromLuaConfig(
                 .serializer = .openai,
             };
         },
+        // Task 15 replaces this stub with ChatgptSerializer wiring.
+        .chatgpt => return error.NotImplemented,
     }
 }
 

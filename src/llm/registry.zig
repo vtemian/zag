@@ -32,6 +32,9 @@ pub const Endpoint = struct {
         x_api_key,
         /// Bearer token: `Authorization: Bearer <key>`.
         bearer,
+        /// OAuth access token for the ChatGPT backend (looked up via
+        /// auth.resolveCredential and refreshed on demand).
+        oauth_chatgpt,
         /// No authentication (e.g., local Ollama).
         none,
     };
@@ -121,6 +124,13 @@ const builtin_endpoints = [_]Endpoint{
         .serializer = .openai,
         .url = "http://localhost:11434/v1/chat/completions",
         .auth = .none,
+        .headers = &.{},
+    },
+    .{
+        .name = "openai-oauth",
+        .serializer = .chatgpt,
+        .url = "https://chatgpt.com/backend-api/codex/responses",
+        .auth = .oauth_chatgpt,
         .headers = &.{},
     },
 };
@@ -237,6 +247,22 @@ test "isBuiltinEndpointName rejects unknown names" {
     try std.testing.expect(!isBuiltinEndpointName("bogus"));
     try std.testing.expect(!isBuiltinEndpointName(""));
     try std.testing.expect(!isBuiltinEndpointName("ANTHROPIC"));
+}
+
+test "builtin endpoints include openai-oauth with .oauth_chatgpt auth" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const ep = reg.find("openai-oauth") orelse return error.EndpointMissing;
+    try std.testing.expectEqual(Endpoint.Auth.oauth_chatgpt, ep.auth);
+    try std.testing.expectEqual(Serializer.chatgpt, ep.serializer);
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", ep.url);
+    try std.testing.expectEqual(@as(usize, 0), ep.headers.len);
+}
+
+test "isBuiltinEndpointName recognizes openai-oauth" {
+    try std.testing.expect(isBuiltinEndpointName("openai-oauth"));
+    try std.testing.expect(!isBuiltinEndpointName("openai-foo"));
 }
 
 test {
