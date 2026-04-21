@@ -431,7 +431,174 @@ pub const Capture = struct {
         turn.metrics = metrics;
         self.cur = null;
     }
+
+    /// Translate captured turns into an ATIF-v1.2 `Trajectory`.
+    ///
+    /// Step layout:
+    ///   1. system  (from `opts.system_prompt`)
+    ///   2. user    (from `opts.user_instruction`)
+    ///   3..N       one per captured turn, `source = .agent`
+    ///
+    /// `final_metrics` is left null; Task 12 populates it.
+    ///
+    /// Lifetime: all strings inside the returned Trajectory reference memory
+    /// owned by this `Capture`'s internal arena. The outer ArrayLists (steps
+    /// slice, per-step tool_calls slice, per-step observation.results slice)
+    /// are allocated from `allocator` and must be released via
+    /// `freeTrajectory(traj, allocator)`. The returned Trajectory therefore
+    /// must not outlive the `Capture` it was built from.
+    pub fn build(self: *Capture, allocator: std.mem.Allocator, opts: BuildOpts) !Trajectory {
+        const total_steps = 2 + self.turns.items.len;
+        const steps = try allocator.alloc(Step, total_steps);
+        errdefer allocator.free(steps);
+
+        steps[0] = .{
+            .step_id = 1,
+            .source = .system,
+            .message = opts.system_prompt,
+        };
+        steps[1] = .{
+            .step_id = 2,
+            .source = .user,
+            .message = opts.user_instruction,
+        };
+
+        const arena_alloc = self.arena.allocator();
+        for (self.turns.items, 0..) |*turn, i| {
+            const tool_calls: ?[]const ToolCall = if (turn.tool_calls.items.len == 0)
+                null
+            else blk: {
+                const dst = try allocator.alloc(ToolCall, turn.tool_calls.items.len);
+                @memcpy(dst, turn.tool_calls.items);
+                break :blk dst;
+            };
+            errdefer if (tool_calls) |tc| allocator.free(tc);
+
+            const observation: ?Observation = if (turn.tool_results.items.len == 0)
+                null
+            else blk: {
+                const dst = try allocator.alloc(ObservationResult, turn.tool_results.items.len);
+                @memcpy(dst, turn.tool_results.items);
+                break :blk .{ .results = dst };
+            };
+            errdefer if (observation) |obs| allocator.free(obs.results);
+
+            var ts_buf: [32]u8 = undefined;
+            const ts_view = try formatIso8601(turn.started_at_ms, &ts_buf);
+            const timestamp = try arena_alloc.dupe(u8, ts_view);
+
+            steps[2 + i] = .{
+                .step_id = @intCast(3 + i),
+                .timestamp = timestamp,
+                .source = .agent,
+                .model_name = opts.model,
+                .message = turn.text.items,
+                .tool_calls = tool_calls,
+                .observation = observation,
+                .metrics = if (turn.metrics) |m| .{
+                    .prompt_tokens = m.prompt_tokens,
+                    .completion_tokens = m.completion_tokens,
+                    .cached_tokens = m.cached_tokens,
+                    .cost_usd = m.cost_usd,
+                } else null,
+            };
+        }
+
+        return .{
+            .session_id = opts.session_id,
+            .agent = opts.agent,
+            .steps = steps,
+        };
+    }
 };
+
+/// Inputs required to translate a `Capture` into a `Trajectory`. All slices
+/// are borrowed, not copied: they must outlive the returned Trajectory.
+pub const BuildOpts = struct {
+    /// Opaque run identifier that lands in `Trajectory.session_id`.
+    session_id: []const u8,
+    /// Agent identity block emitted verbatim.
+    agent: Agent,
+    /// Text of the leading system step.
+    system_prompt: []const u8,
+    /// Text of the second (user) step.
+    user_instruction: []const u8,
+    /// Model id attached to every agent-source step.
+    model: []const u8,
+};
+
+/// Release the outer arrays allocated by `Capture.build`:
+/// the `steps` slice plus each agent step's `tool_calls` slice and
+/// `observation.results` slice. Inner strings are owned by the originating
+/// `Capture`'s arena and are NOT freed here; the caller must keep that
+/// Capture alive until after this call.
+pub fn freeTrajectory(traj: Trajectory, allocator: std.mem.Allocator) void {
+    for (traj.steps) |step| {
+        if (step.tool_calls) |calls| allocator.free(calls);
+        if (step.observation) |obs| allocator.free(obs.results);
+    }
+    allocator.free(traj.steps);
+}
+
+/// Format `ms` (Unix milliseconds) as an ISO 8601 UTC timestamp with
+/// millisecond precision: `YYYY-MM-DDTHH:MM:SS.sssZ`. `buf` must be at
+/// least 24 bytes.
+fn formatIso8601(ms: i64, buf: []u8) ![]u8 {
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divTrunc(ms, 1000)) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const seconds_of_day = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
+        seconds_of_day.getHoursIntoDay(),
+        seconds_of_day.getMinutesIntoHour(),
+        seconds_of_day.getSecondsIntoMinute(),
+        @as(u32, @intCast(@mod(ms, 1000))),
+    });
+}
+
+test "Capture.build produces dense step_id and correct source mapping" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addTextDelta("Listing...");
+    try cap.addToolCall("t1", "bash", "{\"cmd\":\"ls\"}");
+    try cap.endTurn(.{ .prompt_tokens = 10, .completion_tokens = 3 });
+    try cap.addToolResult("t1", "a\nb", false);
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s1",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "You are zag.",
+        .user_instruction = "list files",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), traj.steps.len);
+    try std.testing.expectEqual(@as(u32, 1), traj.steps[0].step_id);
+    try std.testing.expectEqual(Source.system, traj.steps[0].source);
+    try std.testing.expectEqualStrings("You are zag.", traj.steps[0].message);
+    try std.testing.expectEqual(@as(u32, 2), traj.steps[1].step_id);
+    try std.testing.expectEqual(Source.user, traj.steps[1].source);
+    try std.testing.expectEqualStrings("list files", traj.steps[1].message);
+    try std.testing.expectEqual(@as(u32, 3), traj.steps[2].step_id);
+    try std.testing.expectEqual(Source.agent, traj.steps[2].source);
+    try std.testing.expectEqualStrings("Listing...", traj.steps[2].message);
+    try std.testing.expect(traj.steps[2].tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), traj.steps[2].tool_calls.?.len);
+    try std.testing.expect(traj.steps[2].observation != null);
+    try std.testing.expectEqual(@as(usize, 1), traj.steps[2].observation.?.results.len);
+    try std.testing.expect(traj.steps[2].timestamp != null);
+    try std.testing.expect(traj.steps[2].metrics != null);
+    try std.testing.expectEqual(@as(?u32, 10), traj.steps[2].metrics.?.prompt_tokens);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", traj.steps[2].model_name.?);
+    // final_metrics stays null until Task 12.
+    try std.testing.expect(traj.final_metrics == null);
+}
 
 test "Capture.beginTurn errors when a turn is already active" {
     var cap = Capture.init(std.testing.allocator);
