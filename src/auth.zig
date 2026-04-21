@@ -25,6 +25,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const oauth = @import("oauth.zig");
+
 const log = std.log.scoped(.auth);
 
 /// OAuth credential bundle. Every field is owned by the enclosing
@@ -422,6 +424,182 @@ pub fn upsertOAuth(alloc: Allocator, path: []const u8, name: []const u8, cred: O
     try saveAuthFile(path, file);
 }
 
+// -- Unified resolve entry point ------------------------------------------
+
+/// Result of `resolveCredential`. Every byte payload is owned by the caller
+/// and must be released through `deinit`. Two variants mirror `Credential`
+/// but carry only the fields downstream code actually needs when placing a
+/// request: provider code doesn't look at `refresh_token` or `last_refresh`.
+pub const Resolved = union(enum) {
+    api_key: []const u8,
+    oauth: struct {
+        access_token: []const u8,
+        account_id: []const u8,
+    },
+
+    /// Release every byte owned by this result.
+    pub fn deinit(self: Resolved, alloc: Allocator) void {
+        switch (self) {
+            .api_key => |k| alloc.free(k),
+            .oauth => |o| {
+                alloc.free(o.access_token);
+                alloc.free(o.account_id);
+            },
+        }
+    }
+};
+
+/// Number of seconds before `exp` at which a proactive refresh kicks in.
+/// Codex refreshes reactively on 401. Zag refreshes proactively so the
+/// agent loop never sees a 401 (which it treats as a hard turn abort).
+const refresh_margin_seconds: i64 = 5 * 60;
+
+/// Well-known Codex OIDC token endpoint. Override via `ResolveOptions` in
+/// tests that point at a local mock server.
+const default_token_url: []const u8 = "https://auth.openai.com/oauth/token";
+
+/// Codex public OAuth client id. Mirrors the value in `src/oauth.zig`
+/// callers; kept local here so the resolver has no dependency on login-flow
+/// knobs.
+const default_client_id: []const u8 = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// Injection points for `resolveCredential`. Defaults hit the real Codex
+/// IdP and wall-clock time; tests supply a local URL and a frozen clock.
+pub const ResolveOptions = struct {
+    /// Token endpoint for the refresh POST. Defaults to the Codex IdP.
+    token_url: []const u8 = default_token_url,
+    /// OAuth client id sent with the refresh request.
+    client_id: []const u8 = default_client_id,
+    /// Unix-seconds clock. Tests override to control proactive-refresh
+    /// behaviour without sleeping.
+    now_fn: *const fn () i64 = defaultNow,
+};
+
+fn defaultNow() i64 {
+    return std.time.timestamp();
+}
+
+/// Unified credential entry point. Loads `auth.json`, looks up
+/// `provider_name`, and returns usable bytes:
+///
+/// - `api_key` entries: duped and returned directly.
+/// - `oauth` entries: if the access token's `exp` is more than
+///   `refresh_margin_seconds` in the future, the current token is returned.
+///   Otherwise `oauth.refreshAccessToken` is called and the result is
+///   persisted via `upsertOAuth` before the new token is returned.
+///
+/// Errors:
+/// - `error.NotLoggedIn` — no entry for `provider_name`.
+/// - `error.LoginExpired` — refresh endpoint rejected the refresh token
+///   (invalid_grant family). Caller should prompt `zag --login=<provider>`.
+/// - Any other error from the underlying load/refresh/save propagates.
+///
+/// Thread safety: the load is lock-free; `upsertOAuth` takes the sidecar
+/// file lock internally, so concurrent resolvers serialize writes but race
+/// reads (worst case: one extra refresh round-trip).
+pub fn resolveCredential(
+    alloc: Allocator,
+    auth_path: []const u8,
+    provider_name: []const u8,
+    opts: ResolveOptions,
+) !Resolved {
+    var file = try loadAuthFile(alloc, auth_path);
+    defer file.deinit();
+
+    const cred = file.entries.get(provider_name) orelse return error.NotLoggedIn;
+
+    switch (cred) {
+        .api_key => |k| {
+            const dup = try alloc.dupe(u8, k);
+            return .{ .api_key = dup };
+        },
+        .oauth => |o| {
+            const now = opts.now_fn();
+            // If the JWT is malformed, treat it as already-expired so the
+            // refresh path fires. A stale token on disk shouldn't trap the
+            // user in a permanent 401.
+            const exp = oauth.extractExp(o.access_token) catch now;
+            if (exp > now + refresh_margin_seconds) {
+                const at_dup = try alloc.dupe(u8, o.access_token);
+                errdefer alloc.free(at_dup);
+                const acc_dup = try alloc.dupe(u8, o.account_id);
+                return .{ .oauth = .{ .access_token = at_dup, .account_id = acc_dup } };
+            }
+
+            // Need to refresh. Copy the old refresh_token/id_token/account_id
+            // into locals first so we can free the AuthFile before the
+            // network call — `upsertOAuth` will re-load auth.json under the
+            // lock and we don't want to double-hold the map.
+            const old_rt = try alloc.dupe(u8, o.refresh_token);
+            defer alloc.free(old_rt);
+            const old_at = try alloc.dupe(u8, o.access_token);
+            defer alloc.free(old_at);
+            const old_id = try alloc.dupe(u8, o.id_token);
+            defer alloc.free(old_id);
+            const old_acc = try alloc.dupe(u8, o.account_id);
+            defer alloc.free(old_acc);
+
+            file.deinit();
+            // Tombstone so the outer `defer file.deinit()` is a no-op.
+            file = AuthFile.init(alloc);
+
+            const refreshed = try oauth.refreshAccessToken(alloc, .{
+                .token_url = opts.token_url,
+                .refresh_token = old_rt,
+                .client_id = opts.client_id,
+            });
+            defer refreshed.deinit(alloc);
+
+            // The refresh response may omit id_token / refresh_token; fall
+            // back to the previous values so we never store an empty field.
+            const new_id = if (refreshed.id_token.len > 0) refreshed.id_token else old_id;
+            const new_at = if (refreshed.access_token.len > 0) refreshed.access_token else old_at;
+            const new_rt = if (refreshed.refresh_token.len > 0) refreshed.refresh_token else old_rt;
+
+            const new_account_id = if (refreshed.id_token.len > 0)
+                try oauth.extractAccountId(alloc, refreshed.id_token)
+            else
+                try alloc.dupe(u8, old_acc);
+            defer alloc.free(new_account_id);
+
+            const last_refresh_iso = try formatIsoNow(alloc, opts.now_fn());
+            defer alloc.free(last_refresh_iso);
+
+            try upsertOAuth(alloc, auth_path, provider_name, .{
+                .id_token = new_id,
+                .access_token = new_at,
+                .refresh_token = new_rt,
+                .account_id = new_account_id,
+                .last_refresh = last_refresh_iso,
+            });
+
+            const at_dup = try alloc.dupe(u8, new_at);
+            errdefer alloc.free(at_dup);
+            const acc_dup = try alloc.dupe(u8, new_account_id);
+            return .{ .oauth = .{ .access_token = at_dup, .account_id = acc_dup } };
+        },
+    }
+}
+
+/// Format `unix_seconds` as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`). Used for
+/// the `last_refresh` bookkeeping field.
+fn formatIsoNow(alloc: Allocator, unix_seconds: i64) ![]const u8 {
+    const secs: u64 = if (unix_seconds < 0) 0 else @intCast(unix_seconds);
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ed = es.getEpochDay();
+    const ym = ed.calculateYearDay();
+    const md = ym.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        ym.year,
+        md.month.numeric(),
+        @as(u16, md.day_index) + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    });
+}
+
 // -- Tests -----------------------------------------------------------------
 
 test "checkFileMode flags world- or group-accessible bits" {
@@ -628,8 +806,8 @@ test "loadAuthFile preserves api_key entries alongside oauth entries" {
     defer loaded.deinit();
     try std.testing.expectEqualStrings("sk-openai", (try loaded.getApiKey("openai")).?);
     try std.testing.expectEqualStrings("sk-ant", (try loaded.getApiKey("anthropic")).?);
-    const oauth = try loaded.getOAuth("openai-oauth");
-    try std.testing.expectEqualStrings("idt", oauth.id_token);
+    const entry = try loaded.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings("idt", entry.id_token);
 }
 
 test "upsertOAuth replaces an existing oauth entry without clobbering api_key entries" {
@@ -665,9 +843,9 @@ test "upsertOAuth replaces an existing oauth entry without clobbering api_key en
     var loaded = try loadAuthFile(std.testing.allocator, path);
     defer loaded.deinit();
     try std.testing.expectEqualStrings("sk-should-stay", (try loaded.getApiKey("openai")).?);
-    const oauth = try loaded.getOAuth("openai-oauth");
-    try std.testing.expectEqualStrings("new-id", oauth.id_token);
-    try std.testing.expectEqualStrings("new-at", oauth.access_token);
+    const entry = try loaded.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings("new-id", entry.id_token);
+    try std.testing.expectEqualStrings("new-at", entry.access_token);
 }
 
 test "upsertOAuth serializes concurrent callers" {
@@ -711,6 +889,362 @@ test "upsertOAuth serializes concurrent callers" {
     try std.testing.expectEqualStrings("sk-initial", (try loaded.getApiKey("openai")).?);
     _ = try loaded.getOAuth("openai-oauth-1");
     _ = try loaded.getOAuth("openai-oauth-2");
+}
+
+// -- resolveCredential tests ----------------------------------------------
+//
+// Shared helpers: build a tiny JWT whose payload is an arbitrary object,
+// and run a one-shot mock token endpoint on a random loopback port so each
+// test can control the refresh response.
+
+fn encodeJwtWithPayload(alloc: Allocator, payload: []const u8) ![]const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_buf = try alloc.alloc(u8, enc.calcSize(header.len));
+    defer alloc.free(header_buf);
+    const header_b64 = enc.encode(header_buf, header);
+
+    const payload_buf = try alloc.alloc(u8, enc.calcSize(payload.len));
+    defer alloc.free(payload_buf);
+    const payload_b64 = enc.encode(payload_buf, payload);
+
+    return std.fmt.allocPrint(alloc, "{s}.{s}.sig", .{ header_b64, payload_b64 });
+}
+
+fn accessTokenWithExp(alloc: Allocator, exp: i64) ![]const u8 {
+    const payload = try std.fmt.allocPrint(alloc, "{{\"exp\":{d}}}", .{exp});
+    defer alloc.free(payload);
+    return encodeJwtWithPayload(alloc, payload);
+}
+
+fn idTokenWithAccount(alloc: Allocator, account_id: []const u8) ![]const u8 {
+    const payload = try std.fmt.allocPrint(
+        alloc,
+        "{{\"https://api.openai.com/auth\":{{\"chatgpt_account_id\":\"{s}\"}}}}",
+        .{account_id},
+    );
+    defer alloc.free(payload);
+    return encodeJwtWithPayload(alloc, payload);
+}
+
+test "resolveCredential returns api_key verbatim" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setApiKey("anthropic", "sk-ant-verbatim");
+        try saveAuthFile(path, file);
+    }
+
+    const got = try resolveCredential(std.testing.allocator, path, "anthropic", .{});
+    defer got.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("sk-ant-verbatim", got.api_key);
+}
+
+test "resolveCredential returns error.NotLoggedIn when entry missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    // No auth.json at all — loader returns empty map, lookup fails.
+    try std.testing.expectError(
+        error.NotLoggedIn,
+        resolveCredential(std.testing.allocator, path, "missing", .{}),
+    );
+}
+
+test "resolveCredential returns current oauth tokens when well before expiry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    // Frozen clock at an arbitrary epoch; access token expires one hour later.
+    const frozen_now: i64 = 1_700_000_000;
+    const access_token = try accessTokenWithExp(std.testing.allocator, frozen_now + 3600);
+    defer std.testing.allocator.free(access_token);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "idt",
+            .access_token = access_token,
+            .refresh_token = "rt",
+            .account_id = "acc-fresh",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    const FrozenClock = struct {
+        fn now() i64 {
+            return 1_700_000_000;
+        }
+    };
+
+    // Pointing token_url at an unreachable loopback port would panic the
+    // test if the refresh path were taken — we expect it not to be.
+    const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
+        .token_url = "http://127.0.0.1:1/should-not-be-hit",
+        .now_fn = FrozenClock.now,
+    });
+    defer got.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(access_token, got.oauth.access_token);
+    try std.testing.expectEqualStrings("acc-fresh", got.oauth.account_id);
+}
+
+test "resolveCredential refreshes when within 5 minutes of expiry" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    // Mock IdP returns a fresh id_token whose account claim is acc-new, a
+    // new access_token whose exp is well in the future, and a rotated
+    // refresh_token.
+    const frozen_now: i64 = 1_700_000_000;
+    const new_access = try accessTokenWithExp(std.testing.allocator, frozen_now + 3600);
+    defer std.testing.allocator.free(new_access);
+    const new_id = try idTokenWithAccount(std.testing.allocator, "acc-new");
+    defer std.testing.allocator.free(new_id);
+
+    // Body assembled at runtime because the JWT lengths vary with base64
+    // padding. Content-Length must match body.len exactly.
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id_token\":\"{s}\",\"access_token\":\"{s}\",\"refresh_token\":\"NEW_RT\"}}",
+        .{ new_id, new_access },
+    );
+    defer std.testing.allocator.free(body);
+    const response = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer std.testing.allocator.free(response);
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server, resp: []const u8) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [4096]u8 = undefined;
+            _ = conn.stream.read(&buf) catch {};
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, response });
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    // Stale access token: expires two minutes from now (well inside the
+    // 5-minute proactive-refresh margin).
+    const stale_at = try accessTokenWithExp(std.testing.allocator, frozen_now + 120);
+    defer std.testing.allocator.free(stale_at);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "old-id",
+            .access_token = stale_at,
+            .refresh_token = "OLD_RT",
+            .account_id = "acc-old",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    const FrozenClock = struct {
+        fn now() i64 {
+            return 1_700_000_000;
+        }
+    };
+
+    const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
+        .token_url = url,
+        .now_fn = FrozenClock.now,
+    });
+    defer got.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(new_access, got.oauth.access_token);
+    try std.testing.expectEqualStrings("acc-new", got.oauth.account_id);
+
+    // auth.json must carry the rotated refresh token and the new id_token.
+    var loaded = try loadAuthFile(std.testing.allocator, path);
+    defer loaded.deinit();
+    const persisted = try loaded.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings(new_id, persisted.id_token);
+    try std.testing.expectEqualStrings(new_access, persisted.access_token);
+    try std.testing.expectEqualStrings("NEW_RT", persisted.refresh_token);
+    try std.testing.expectEqualStrings("acc-new", persisted.account_id);
+    // last_refresh was rewritten to a fresh ISO stamp (i.e. not the seeded value).
+    try std.testing.expect(!std.mem.eql(u8, "2026-04-20T00:00:00Z", persisted.last_refresh));
+}
+
+test "resolveCredential refreshes when access token already expired" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const frozen_now: i64 = 1_700_000_000;
+    const new_access = try accessTokenWithExp(std.testing.allocator, frozen_now + 3600);
+    defer std.testing.allocator.free(new_access);
+    const new_id = try idTokenWithAccount(std.testing.allocator, "acc-new");
+    defer std.testing.allocator.free(new_id);
+
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id_token\":\"{s}\",\"access_token\":\"{s}\",\"refresh_token\":\"NEW_RT\"}}",
+        .{ new_id, new_access },
+    );
+    defer std.testing.allocator.free(body);
+    const response = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer std.testing.allocator.free(response);
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server, resp: []const u8) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [4096]u8 = undefined;
+            _ = conn.stream.read(&buf) catch {};
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, response });
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    // Access token expired an hour ago.
+    const expired_at = try accessTokenWithExp(std.testing.allocator, frozen_now - 3600);
+    defer std.testing.allocator.free(expired_at);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "old-id",
+            .access_token = expired_at,
+            .refresh_token = "OLD_RT",
+            .account_id = "acc-old",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    const FrozenClock = struct {
+        fn now() i64 {
+            return 1_700_000_000;
+        }
+    };
+
+    const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
+        .token_url = url,
+        .now_fn = FrozenClock.now,
+    });
+    defer got.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(new_access, got.oauth.access_token);
+    try std.testing.expectEqualStrings("acc-new", got.oauth.account_id);
+}
+
+test "resolveCredential maps LoginExpired from refresh endpoint" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    const ServerCtx = struct {
+        fn run(srv: *std.net.Server) void {
+            const conn = srv.accept() catch return;
+            defer conn.stream.close();
+            var buf: [4096]u8 = undefined;
+            _ = conn.stream.read(&buf) catch {};
+            const resp =
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: 69\r\nConnection: close\r\n\r\n" ++
+                "{\"error\":\"invalid_grant\",\"error_description\":\"refresh token expired\"}";
+            _ = conn.stream.writeAll(resp) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    const frozen_now: i64 = 1_700_000_000;
+    const expired_at = try accessTokenWithExp(std.testing.allocator, frozen_now - 1);
+    defer std.testing.allocator.free(expired_at);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "idt",
+            .access_token = expired_at,
+            .refresh_token = "rt",
+            .account_id = "acc",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    const FrozenClock = struct {
+        fn now() i64 {
+            return 1_700_000_000;
+        }
+    };
+
+    try std.testing.expectError(error.LoginExpired, resolveCredential(
+        std.testing.allocator,
+        path,
+        "openai-oauth",
+        .{ .token_url = url, .now_fn = FrozenClock.now },
+    ));
 }
 
 test {
