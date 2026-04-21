@@ -82,11 +82,12 @@ fn printAuthHelp() void {
 }
 
 /// Parse CLI args. Recognizes `zag auth login|list|remove`, `--session=<id>`,
-/// `--last`, and the headless flag set (`--headless`, `--instruction-file=`,
-/// `--trajectory-out=`, `--no-session`). Auth subcommands are handled inline
-/// since they're a distinct grammar; everything else goes through the
-/// slice-based flag parser. Strings that need an owning copy are duped into
-/// `allocator` and must be released with `freeStartupMode`.
+/// `--last`, `--login=<provider>`, and the headless flag set (`--headless`,
+/// `--instruction-file=`, `--trajectory-out=`, `--no-session`). Auth
+/// subcommands are handled inline since they're a distinct grammar;
+/// everything else goes through the slice-based flag parser. Strings that
+/// need an owning copy are duped into `allocator` and must be released with
+/// `freeStartupMode`.
 fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -247,30 +248,29 @@ fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
 
 /// One-shot signin entry point invoked when `--login=<provider>` is passed.
 /// Returns the process exit code so `main` can call `std.process.exit` with
-/// the right value without juggling control flow inline.
-fn runLoginCommand(allocator: std.mem.Allocator, provider_name: []const u8) !u8 {
-    const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
-    const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
-
+/// the right value without juggling control flow inline. Diagnostic messages
+/// are written to `err_writer`, which `main` wires to stderr; tests pass an
+/// Allocating writer and assert on the captured bytes. The success message is
+/// still emitted to stdout directly because it's only reached from the real
+/// OAuth flow, which is never exercised under test.
+fn runLoginCommand(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    err_writer: *std.io.Writer,
+) !u8 {
     const endpoint = llm.findBuiltinEndpoint(provider_name) orelse {
-        var scratch: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &scratch,
+        err_writer.print(
             "zag: unknown provider '{s}'. Try --login=openai-oauth.\n",
             .{provider_name},
-        ) catch "zag: unknown provider; try --login=openai-oauth.\n";
-        _ = stderr_file.write(msg) catch {};
+        ) catch {};
         return 1;
     };
 
     if (endpoint.auth != .oauth_chatgpt) {
-        var scratch: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &scratch,
+        err_writer.print(
             "zag: provider '{s}' does not use OAuth; edit ~/.config/zag/auth.json directly.\n",
             .{provider_name},
-        ) catch "zag: provider does not use OAuth; edit auth.json directly.\n";
-        _ = stderr_file.write(msg) catch {};
+        ) catch {};
         return 1;
     }
 
@@ -294,16 +294,11 @@ fn runLoginCommand(allocator: std.mem.Allocator, provider_name: []const u8) !u8 
             error.ClaimMissing, error.MalformedJwt => "id_token was missing the chatgpt_account_id claim",
             else => @errorName(err),
         };
-        var scratch: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &scratch,
-            "zag: login failed: {s}\n",
-            .{hint},
-        ) catch "zag: login failed\n";
-        _ = stderr_file.write(msg) catch {};
+        err_writer.print("zag: login failed: {s}\n", .{hint}) catch {};
         return 1;
     };
 
+    const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
     var scratch: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(
         &scratch,
@@ -889,7 +884,13 @@ pub fn main() !void {
             // `--login=<provider>` bypasses the wizard entirely and runs
             // the OAuth signin flow. Exit with the process code the helper
             // returns so shell scripts can branch on success/failure.
-            const code = try runLoginCommand(allocator, prov);
+            var stderr_buf: [1024]u8 = undefined;
+            var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+            const code = runLoginCommand(allocator, prov, &stderr_w.interface) catch |err| {
+                stderr_w.interface.flush() catch {};
+                return err;
+            };
+            stderr_w.interface.flush() catch {};
             std.process.exit(code);
         },
         else => {},
@@ -1161,13 +1162,27 @@ test "parseStartupArgs extracts the provider from --login=" {
 }
 
 test "runLoginCommand rejects unknown providers with exit code 1" {
-    const code = try runLoginCommand(std.testing.allocator, "definitely-not-a-provider");
+    var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_aw.deinit();
+
+    const code = try runLoginCommand(std.testing.allocator, "definitely-not-a-provider", &err_aw.writer);
     try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expectEqualStrings(
+        "zag: unknown provider 'definitely-not-a-provider'. Try --login=openai-oauth.\n",
+        err_aw.written(),
+    );
 }
 
 test "runLoginCommand rejects providers whose auth is not oauth_chatgpt" {
     // `anthropic` is a built-in endpoint but uses .x_api_key auth; the login
     // command must refuse it rather than trying to run an OAuth flow.
-    const code = try runLoginCommand(std.testing.allocator, "anthropic");
+    var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_aw.deinit();
+
+    const code = try runLoginCommand(std.testing.allocator, "anthropic", &err_aw.writer);
     try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expectEqualStrings(
+        "zag: provider 'anthropic' does not use OAuth; edit ~/.config/zag/auth.json directly.\n",
+        err_aw.written(),
+    );
 }
