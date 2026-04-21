@@ -212,7 +212,7 @@ test "bash kills child on cancel" {
     std.Thread.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .release);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     thread.join();
     const elapsed_ns = timer.read();
 

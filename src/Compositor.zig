@@ -1171,7 +1171,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
     const sentinel_cell = screen.getCell(last_row, 5);
     sentinel_cell.codepoint = '#';
 
-    // Second frame: same inputs, layout stable — status line must skip.
+    // Second frame: same inputs, layout stable; status line must skip.
     compositor.composite(&layout, input);
     try std.testing.expectEqual(@as(u21, '#'), screen.getCellConst(last_row, 5).codepoint);
 }

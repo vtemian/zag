@@ -144,3 +144,7 @@ test "spike: runtime error in coroutine returns LuaRuntime, msg readable" {
     try testing.expect(std.mem.indexOf(u8, msg, "oops") != null);
     co.pop(1);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

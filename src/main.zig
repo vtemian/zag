@@ -280,7 +280,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                     if (s.input_raw) |raw| gpa.free(raw);
                 }
                 const args_json = s.input_raw orelse "{}";
-                const id_str = if (s.call_id) |id| id else blk: {
+                const tool_id = if (s.call_id) |id| id else blk: {
                     synth_counter += 1;
                     var buf: [16]u8 = undefined;
                     const synth = std.fmt.bufPrint(&buf, "t{d}", .{synth_counter}) catch "t?";
@@ -293,7 +293,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                     };
                     break :blk owned;
                 };
-                capture.addToolCall(id_str, s.name, args_json) catch |err| {
+                capture.addToolCall(tool_id, s.name, args_json) catch |err| {
                     log.warn("capture dropped tool call: {s}", .{@errorName(err)});
                 };
             },
@@ -309,13 +309,13 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                 // after the call returns.
                 var synth_owned: ?[]const u8 = null;
                 defer if (synth_owned) |id| gpa.free(id);
-                const id_str = if (r.call_id) |id| id else blk: {
+                const tool_id = if (r.call_id) |id| id else blk: {
                     if (pending_synth.items.len == 0) break :blk "";
                     const id = pending_synth.orderedRemove(0);
                     synth_owned = id;
                     break :blk id;
                 };
-                capture.addToolResult(id_str, r.content, r.is_error) catch |err| {
+                capture.addToolResult(tool_id, r.content, r.is_error) catch |err| {
                     log.warn("capture dropped tool result: {s}", .{@errorName(err)});
                 };
             },

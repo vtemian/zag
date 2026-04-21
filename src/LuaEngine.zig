@@ -560,7 +560,7 @@ pub const LuaEngine = struct {
         var max_output: usize = 10 * 1024 * 1024;
         var opts_stdin: ?[]const u8 = null;
         var opts_env_mode: async_job.CmdExecEnvMode = .inherit;
-        var opts_env_map: ?std.process.EnvMap = null;
+        var opts_env: ?std.process.EnvMap = null;
 
         if (co.isTable(opts_idx)) {
             _ = co.getField(opts_idx, "cwd");
@@ -630,7 +630,7 @@ pub const LuaEngine = struct {
                 // copies internally, and the arena owns the EnvMap's
                 // backing storage. The worker never frees either; Task
                 // cleanup deinits the arena after resumeFromJob.
-                opts_env_map = std.process.EnvMap.init(arena);
+                opts_env = std.process.EnvMap.init(arena);
 
                 const field_name: [:0]const u8 = if (has_env) "env" else "env_extra";
                 _ = co.getField(opts_idx, field_name);
@@ -646,7 +646,7 @@ pub const LuaEngine = struct {
                     }
                     const k = co.toString(-2) catch "";
                     const v = co.toString(-1) catch "";
-                    opts_env_map.?.put(k, v) catch {
+                    opts_env.?.put(k, v) catch {
                         arena_ptr.deinit();
                         engine.allocator.destroy(arena_ptr);
                         co.raiseErrorStr("zag.cmd opts.env put failed", .{});
@@ -674,7 +674,7 @@ pub const LuaEngine = struct {
                 .cwd = opts_cwd,
                 .stdin_bytes = opts_stdin,
                 .env_mode = opts_env_mode,
-                .env_map = opts_env_map,
+                .env_map = opts_env,
                 .timeout_ms = timeout_ms,
                 .max_output_bytes = max_output,
             } },
@@ -750,7 +750,7 @@ pub const LuaEngine = struct {
         var timeout_ms: u64 = 30_000;
         var follow_redirects: bool = true;
         // Header list backed by the arena so we don't deinit it separately.
-        var headers_list: std.ArrayList(async_job.HttpHeader) = .empty;
+        var headers: std.ArrayList(async_job.HttpHeader) = .empty;
 
         if (co.isTable(opts_idx)) {
             _ = co.getField(opts_idx, "timeout_ms");
@@ -790,7 +790,7 @@ pub const LuaEngine = struct {
                         engine.allocator.destroy(arena_ptr);
                         co.raiseErrorStr("zag.http.get header dupe failed", .{});
                     };
-                    headers_list.append(arena, .{ .name = name, .value = val }) catch {
+                    headers.append(arena, .{ .name = name, .value = val }) catch {
                         arena_ptr.deinit();
                         engine.allocator.destroy(arena_ptr);
                         co.raiseErrorStr("zag.http.get headers append failed", .{});
@@ -804,7 +804,7 @@ pub const LuaEngine = struct {
         // toOwnedSlice transfers the ArrayList items into a plain slice;
         // since the list used the arena, the slice itself is arena-owned
         // and dies with the arena.
-        const headers_slice = headers_list.toOwnedSlice(arena) catch &.{};
+        const headers_slice = headers.toOwnedSlice(arena) catch &.{};
 
         const task = engine.taskForCoroutine(co) orelse {
             arena_ptr.deinit();
@@ -894,7 +894,7 @@ pub const LuaEngine = struct {
 
         var timeout_ms: u64 = 30_000;
         var follow_redirects: bool = true;
-        var headers_list: std.ArrayList(async_job.HttpHeader) = .empty;
+        var headers: std.ArrayList(async_job.HttpHeader) = .empty;
         var body_slice: []const u8 = "";
         var body_was_table = false;
         var has_body = false;
@@ -946,7 +946,7 @@ pub const LuaEngine = struct {
                         engine.allocator.destroy(arena_ptr);
                         co.raiseErrorStr("zag.http.post header dupe failed", .{});
                     };
-                    headers_list.append(arena, .{ .name = name, .value = val }) catch {
+                    headers.append(arena, .{ .name = name, .value = val }) catch {
                         arena_ptr.deinit();
                         engine.allocator.destroy(arena_ptr);
                         co.raiseErrorStr("zag.http.post headers append failed", .{});
@@ -987,7 +987,7 @@ pub const LuaEngine = struct {
             content_type = "application/json";
         }
 
-        const headers_slice = headers_list.toOwnedSlice(arena) catch &.{};
+        const headers_slice = headers.toOwnedSlice(arena) catch &.{};
 
         const task = engine.taskForCoroutine(co) orelse {
             arena_ptr.deinit();
@@ -2917,7 +2917,7 @@ pub const LuaEngine = struct {
                             // Fail-soft: the hook ran to completion, but its return
                             // table couldn't be marshalled back into the payload.
                             // Discard the mutations and continue with subsequent hooks.
-                            log.warn("hook return apply failed (kind={s}, task={d}): {} — discarding mutations", .{
+                            log.warn("hook return apply failed (kind={s}, task={d}): {}, discarding mutations", .{
                                 @tagName(hp.kind()), task.thread_ref, err,
                             });
                         };

@@ -424,3 +424,7 @@ test "Job.abort calls aborter" {
     job.abort();
     try std.testing.expect(called);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
