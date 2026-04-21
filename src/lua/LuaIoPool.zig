@@ -147,8 +147,14 @@ fn executeJob(alloc: Allocator, job: *Job) void {
         .fs_stat => @import("primitives/fs.zig").executeStat(alloc, job),
         // CmdHandle helper threads synthesise these kinds directly
         // onto the completion queue; the pool never dispatches them.
-        // Seeing one here is a programmer bug.
-        .cmd_wait_done, .cmd_read_line_done, .cmd_write_done, .cmd_close_stdin_done, .http_stream_line_done => unreachable,
+        // Seeing one here is a programmer bug. Handle each variant
+        // explicitly so the compiler flags new enum members instead
+        // of silently folding them into a catch-all.
+        .cmd_wait_done => std.debug.panic("executeJob: cmd_wait_done should not reach the pool", .{}),
+        .cmd_read_line_done => std.debug.panic("executeJob: cmd_read_line_done should not reach the pool", .{}),
+        .cmd_write_done => std.debug.panic("executeJob: cmd_write_done should not reach the pool", .{}),
+        .cmd_close_stdin_done => std.debug.panic("executeJob: cmd_close_stdin_done should not reach the pool", .{}),
+        .http_stream_line_done => std.debug.panic("executeJob: http_stream_line_done should not reach the pool", .{}),
     }
 }
 
