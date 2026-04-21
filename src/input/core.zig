@@ -34,6 +34,10 @@ pub const KeyEvent = struct {
     key: Key,
     /// Which modifier keys were held.
     modifiers: Modifiers,
+    /// Press/repeat/release. Only the Kitty Keyboard Protocol path sets
+    /// non-`.press` values; legacy CSI and ASCII dispatches always emit
+    /// `.press`.
+    event_type: EventType = .press,
 
     /// The logical key identity: either a Unicode codepoint or a named special key.
     pub const Key = union(enum) {
@@ -71,7 +75,8 @@ pub const KeyEvent = struct {
         function: u8,
     };
 
-    /// Modifier key state: shift, alt, ctrl as individual booleans.
+    /// Modifier key state: shift, alt, ctrl (plus super/hyper/meta when
+    /// the terminal is running the Kitty Keyboard Protocol).
     pub const Modifiers = packed struct {
         /// Shift is held.
         shift: bool = false,
@@ -79,6 +84,21 @@ pub const KeyEvent = struct {
         alt: bool = false,
         /// Ctrl is held.
         ctrl: bool = false,
+        /// Super / Windows / Command key (KKP only).
+        super: bool = false,
+        /// Hyper key (KKP only; rare).
+        hyper: bool = false,
+        /// Meta key as reported by KKP (distinct from Alt on platforms
+        /// that differentiate; most terminals fold it into Alt).
+        meta: bool = false,
+    };
+
+    /// Key-event phase as reported by the Kitty Keyboard Protocol flag 2.
+    /// Legacy CSI and ASCII always report `.press`.
+    pub const EventType = enum(u2) {
+        press = 1,
+        repeat = 2,
+        release = 3,
     };
 
     /// No modifiers active.
