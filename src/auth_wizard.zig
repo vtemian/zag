@@ -7,9 +7,9 @@
 //! `scaffoldConfigLua`; `runWizard` and the `auth list` / `auth remove`
 //! helpers land with Task 5.
 //!
-//! Adding a new provider means appending an entry to `PROVIDERS`. Task 8 will
-//! extend the entry with an optional OAuth callback so the ChatGPT OAuth
-//! branch can plug in without touching the wizard orchestrator.
+//! Adding a new provider means appending an entry to `PROVIDERS`. Provider
+//! entries may carry an optional OAuth callback; when non-null, `runWizard`
+//! delegates credential capture to it instead of prompting for a pasted key.
 
 const std = @import("std");
 
@@ -48,10 +48,10 @@ pub const WizardDeps = struct {
     allow_non_tty_first_run: bool = false,
 };
 
-/// Errors the wizard surfaces to `main.zig`. `EmptyInput` / `KeyTooLong` land
-/// with `promptSecret` in Task 3, `NonInteractiveFirstRun` with `runWizard` in
-/// Task 5; they're reserved up front so the error set doesn't widen when
-/// later tasks import this module.
+/// Errors the wizard surfaces to `main.zig`. Named variants for
+/// caller-meaningful errors (`NonInteractiveFirstRun` is the one `main.zig`
+/// matches on for UX handling; the rest let callers tailor messaging per
+/// failure mode instead of lumping everything into a single `WizardFailed`).
 ///
 /// Caller contract per variant (error sets can't carry per-variant doc
 /// comments, so the contract lives here):
@@ -509,10 +509,10 @@ fn formatMaskedKey(out: *[16]u8, key: []const u8) []const u8 {
 /// entries are a success, not an error: `zag auth remove X` is a declarative
 /// "X should not be present", so idempotence matches user intent.
 ///
-// TODO(task-8): once `Credential` grows an `.oauth` variant, add a test that
-// seeds a non-api_key entry (either via a raw JSON fixture once the loader
-// accepts it, or by injecting a `Credential{.oauth = ...}` into
-// `auth_file.entries` directly) and asserts `removeAuth` still prints
+// TODO(oauth-plan): once `src/auth.zig` grows a `Credential.oauth` variant,
+// add a test that seeds a non-api_key entry (either via a raw JSON fixture
+// once the loader accepts it, or by injecting a `Credential{.oauth = ...}`
+// into `auth_file.entries` directly) and asserts `removeAuth` still prints
 // "Removed credential for X". Today `Credential` is a single-variant union,
 // so the `entries.contains` probe below is variant-agnostic by construction
 // but can't be exercised against a non-api_key entry yet.
