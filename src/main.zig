@@ -993,6 +993,7 @@ test {
     _ = @import("lua/mod.zig");
     _ = @import("auth_wizard.zig");
     _ = @import("oauth.zig");
+    _ = @import("providers/chatgpt.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
