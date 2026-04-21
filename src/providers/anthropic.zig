@@ -49,10 +49,10 @@ pub const AnthropicSerializer = struct {
         const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
-        var headers = try llm.buildHeaders(self.endpoint, self.api_key, req.allocator);
-        defer llm.freeHeaders(self.endpoint, &headers, req.allocator);
+        var headers = try llm.http.buildHeaders(self.endpoint, self.api_key, req.allocator);
+        defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const response_bytes = try llm.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
+        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
         defer req.allocator.free(response_bytes);
 
         return parseResponse(response_bytes, req.allocator);
@@ -74,8 +74,8 @@ pub const AnthropicSerializer = struct {
         const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
-        var headers = try llm.buildHeaders(self.endpoint, self.api_key, req.allocator);
-        defer llm.freeHeaders(self.endpoint, &headers, req.allocator);
+        var headers = try llm.http.buildHeaders(self.endpoint, self.api_key, req.allocator);
+        defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
         const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
         defer stream.destroy();
