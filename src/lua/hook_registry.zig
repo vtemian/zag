@@ -95,8 +95,16 @@ pub const HookDispatcher = struct {
 
     /// Fire every hook matching `payload`'s event kind from the main
     /// thread (the only thread permitted to touch Lua). Mutates `payload`
-    /// in place when a hook returns a rewrite; a hook that raises is
-    /// logged and skipped while subsequent hooks still run.
+    /// in place when a hook returns a rewrite.
+    ///
+    /// Error policy: fail-soft. If a hook raises during its resume, or
+    /// its return table fails to marshal back, the hook is retired, any
+    /// pending mutations are discarded, and execution continues with the
+    /// next matching hook. Errors log with context (event kind, task id,
+    /// error) so operators can trace failures without a single buggy
+    /// hook blocking the whole chain. `fireHook`'s return value is never
+    /// influenced by an errored hook; only an explicit `{ cancel = true }`
+    /// from a successful hook produces a veto reason.
     ///
     /// Returns the veto reason (owned by the caller, freed via the
     /// dispatcher allocator) if a veto-capable hook returned
@@ -163,7 +171,11 @@ pub const HookDispatcher = struct {
         while (self.anyHookAlive(sink, spawned.items)) {
             sink.enforceBudgetFn(sink.ctx, self.hook_budget_ms);
             const did_work = sink.drainOneFn(sink.ctx) catch |err| blk: {
-                log.warn("hook drain failed: {}", .{err});
+                // Fail-soft: a single resume failure does not cancel the
+                // wait-for-retirement loop. The offending task was still
+                // retired by the engine; the next iteration's anyHookAlive
+                // check will notice if we're truly stuck.
+                log.warn("hook drain resume failed: {} — continuing", .{err});
                 break :blk false;
             };
             if (!did_work) {

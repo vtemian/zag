@@ -2914,7 +2914,12 @@ pub const LuaEngine = struct {
                 if (task.hook_payload) |hp| {
                     if (num_results >= 1 and task.co.isTable(-1)) {
                         self.hook_dispatcher.applyHookReturnFromCoroutine(task.co, hp) catch |err| {
-                            log.warn("hook return apply failed: {}", .{err});
+                            // Fail-soft: the hook ran to completion, but its return
+                            // table couldn't be marshalled back into the payload.
+                            // Discard the mutations and continue with subsequent hooks.
+                            log.warn("hook return apply failed (kind={s}, task={d}): {} — discarding mutations", .{
+                                @tagName(hp.kind()), task.thread_ref, err,
+                            });
                         };
                     }
                 }
