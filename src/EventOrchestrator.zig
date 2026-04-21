@@ -202,8 +202,8 @@ fn drainWakePipe(fd: posix.fd_t) void {
 /// hook dispatch so any hook that fires later sees the resumed coroutine's
 /// observable state.
 fn drainLuaCompletions(eng: *LuaEngine) void {
-    const completions = eng.completions orelse return;
-    while (completions.pop()) |job| {
+    const runtime = eng.async_runtime orelse return;
+    while (runtime.completions.pop()) |job| {
         eng.resumeFromJob(job) catch |err| {
             std.log.scoped(.lua).warn("resume from job failed: {}", .{err});
         };

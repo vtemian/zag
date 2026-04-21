@@ -289,7 +289,7 @@ pub fn main() !void {
     // scope). Deferred teardown runs before `eng.deinit()` thanks to LIFO
     // ordering so workers stop referencing queue memory before the Lua
     // state (and the allocator it shares) goes away. `deinitAsync` tolerates
-    // an unsuccessful `initAsync` (nil io_pool, empty tasks map), so the
+    // an unsuccessful `initAsync` (nil async_runtime, empty tasks map), so the
     // defer is unconditional.
     if (lua_engine) |*eng| {
         eng.initAsync(4, 256) catch |err| {
@@ -298,9 +298,9 @@ pub fn main() !void {
         // Share the orchestrator's wake pipe so Lua workers wake the main
         // loop the same way agent-event pushes do. initAsync runs after
         // orchestrator construction, so `wakeWriteFd()` is valid here; if
-        // initAsync failed above, `completions` is null and the assignment
+        // initAsync failed above, `async_runtime` is null and the assignment
         // is a no-op.
-        if (eng.completions) |c| c.wake_fd = orchestrator.wakeWriteFd();
+        if (eng.async_runtime) |rt| rt.completions.wake_fd = orchestrator.wakeWriteFd();
     }
     defer if (lua_engine) |*eng| eng.deinitAsync();
 

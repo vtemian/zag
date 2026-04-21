@@ -14,7 +14,7 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
     const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
-    eng.completions.?.wake_fd = fds[1];
+    eng.async_runtime.?.completions.wake_fd = fds[1];
 
     // Build a minimal Job the worker can run. Sleep(0) is fine.
     // But our Pool currently has no sleep dispatch; workerLoop just
@@ -26,7 +26,7 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
         .thread_ref = 0,
         .scope = root,
     };
-    try eng.io_pool.?.submit(&job);
+    try eng.async_runtime.?.pool.submit(&job);
 
     // Wait for wake byte
     var buf: [1]u8 = undefined;
@@ -41,7 +41,7 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
         };
         if (n == 1) {
             // Drain the completion so deinit doesn't warn about stragglers
-            _ = eng.completions.?.pop();
+            _ = eng.async_runtime.?.completions.pop();
             return;
         }
     }
@@ -64,26 +64,26 @@ test "resumeFromJob drains completion queue and frees the job" {
         .thread_ref = 0,
         .scope = root,
     };
-    try eng.io_pool.?.submit(job);
+    try eng.async_runtime.?.pool.submit(job);
 
     // Wait for the worker's pass-through push to land in completions.
     const deadline = std.time.milliTimestamp() + 1000;
     while (std.time.milliTimestamp() < deadline) {
-        eng.completions.?.mu.lock();
-        const has_entry = eng.completions.?.len > 0;
-        eng.completions.?.mu.unlock();
+        eng.async_runtime.?.completions.mu.lock();
+        const has_entry = eng.async_runtime.?.completions.len > 0;
+        eng.async_runtime.?.completions.mu.unlock();
         if (has_entry) break;
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
 
     // Mirror the orchestrator drain step: pop every job and hand it to
     // resumeFromJob. The stub destroys the job, so nothing leaks.
-    while (eng.completions.?.pop()) |j| {
+    while (eng.async_runtime.?.completions.pop()) |j| {
         try eng.resumeFromJob(j);
     }
 
-    eng.completions.?.mu.lock();
-    const remaining = eng.completions.?.len;
-    eng.completions.?.mu.unlock();
+    eng.async_runtime.?.completions.mu.lock();
+    const remaining = eng.async_runtime.?.completions.len;
+    eng.async_runtime.?.completions.mu.unlock();
     try testing.expectEqual(@as(usize, 0), remaining);
 }
