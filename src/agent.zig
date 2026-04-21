@@ -122,7 +122,7 @@ fn fireLifecycleHook(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
 ) void {
-    if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) return;
+    if (lua_engine == null or lua_engine.?.hook_dispatcher.registry.hooks.items.len == 0) return;
     var req = Hooks.HookRequest.init(payload);
     queue.push(.{ .hook_request = &req }) catch return;
     while (true) {
@@ -282,7 +282,7 @@ fn firePreHook(
     // main-thread round-trip. Keeps unit tests that lack a dispatcher from
     // deadlocking, and avoids useless queue churn in production runs with
     // no hooks configured.
-    if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) {
+    if (lua_engine == null or lua_engine.?.hook_dispatcher.registry.hooks.items.len == 0) {
         return .{ .proceed = null };
     }
     var payload: Hooks.HookPayload = .{ .tool_pre = .{
@@ -326,7 +326,7 @@ fn firePostHook(
     // No engine or no hooks registered -> skip round-trip. Same rationale
     // as firePreHook: avoid deadlocks in dispatcher-less tests and useless
     // queue churn when no post hooks are configured.
-    if (lua_engine == null or lua_engine.?.hook_registry.hooks.items.len == 0) {
+    if (lua_engine == null or lua_engine.?.hook_dispatcher.registry.hooks.items.len == 0) {
         return .{ .content_rewrite = null, .is_error_rewrite = null };
     }
     var payload: Hooks.HookPayload = .{ .tool_post = .{
