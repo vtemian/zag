@@ -198,7 +198,7 @@ pub const StyledLine = struct {
 /// caller owns each line's spans array directly (e.g. a test that drives
 /// the renderer and keeps the result). When lines come from
 /// `Buffer.getVisibleLines`, their spans arrays are owned by the buffer's
-/// per-node cache — call `lines.deinit(alloc)` instead.
+/// per-node cache; call `lines.deinit(alloc)` instead.
 pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: std.mem.Allocator) void {
     for (lines.items) |line| line.deinit(allocator);
     lines.deinit(allocator);
