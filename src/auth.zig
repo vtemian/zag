@@ -82,6 +82,15 @@ pub const AuthFile = struct {
             .api_key => |key| key,
         };
     }
+
+    /// Remove `name` from the map, freeing its duped key and credential
+    /// bytes. Missing names are a no-op: the `zag auth remove <prov>`
+    /// subcommand treats "not configured" as a successful end-state.
+    pub fn removeEntry(self: *AuthFile, name: []const u8) void {
+        const existing = self.entries.fetchRemove(name) orelse return;
+        self.allocator.free(existing.key);
+        freeCredential(self.allocator, existing.value);
+    }
 };
 
 /// Free the bytes a `Credential` owns. Split out so `deinit` and
@@ -151,7 +160,9 @@ pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
 }
 
 /// Serialise `file` to `path` as pretty JSON with mode `0o600`. Creates the
-/// parent directory if missing.
+/// parent directory if missing. Uses the tmpfile + fsync + rename pattern
+/// (mirroring `Session.zig`) so a mid-write crash can never leave a
+/// partially-written `auth.json`.
 pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
     if (std.fs.path.dirname(path)) |parent| {
         std.fs.cwd().makePath(parent) catch |err| switch (err) {
@@ -160,13 +171,32 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
         };
     }
 
-    const handle = try std.fs.cwd().createFile(path, .{ .mode = 0o600, .truncate = true });
-    defer handle.close();
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch
+        return error.PathTooLong;
 
-    var scratch: [512]u8 = undefined;
-    var w = handle.writer(&scratch);
-    try writeAuthJson(&w.interface, file);
-    try w.interface.flush();
+    const cwd = std.fs.cwd();
+
+    // Belt-and-suspenders: a stale <path>.tmp from a prior crash would
+    // otherwise inherit its old mode bits via O_CREAT|O_TRUNC. Unlinking
+    // first guarantees a fresh 0o600 file.
+    cwd.deleteFile(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    {
+        const tmp_file = try cwd.createFile(tmp_path, .{ .mode = 0o600, .truncate = true });
+        defer tmp_file.close();
+
+        var scratch: [512]u8 = undefined;
+        var w = tmp_file.writer(&scratch);
+        try writeAuthJson(&w.interface, file);
+        try w.interface.flush();
+        try tmp_file.sync();
+    }
+
+    try cwd.rename(tmp_path, path);
 }
 
 /// Emit `file` as `{ "provider": { "type": "api_key", "key": "..." }, ... }`.
@@ -269,6 +299,84 @@ test "getApiKey returns null for missing provider" {
     var file = AuthFile.init(std.testing.allocator);
     defer file.deinit();
     try std.testing.expectEqual(@as(?[]const u8, null), try file.getApiKey("openai"));
+}
+
+test "saveAuthFile is atomic under simulated crash" {
+    // Pre-create a stale <path>.tmp from a hypothetical prior crash. The
+    // atomic-save path must unlink it and still succeed, leaving the final
+    // auth.json with the new contents only.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "auth.json.tmp",
+        .data = "garbage-from-a-prior-crash",
+    });
+
+    var file = AuthFile.init(std.testing.allocator);
+    defer file.deinit();
+    try file.setApiKey("openai", "sk-fresh");
+    try saveAuthFile(path, file);
+
+    var reloaded = try loadAuthFile(std.testing.allocator, path);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.entries.count());
+    try std.testing.expectEqualStrings("sk-fresh", (try reloaded.getApiKey("openai")).?);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile("auth.json.tmp"),
+    );
+}
+
+test "saveAuthFile preserves 0o600 after atomic rename" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    var file = AuthFile.init(std.testing.allocator);
+    defer file.deinit();
+    try file.setApiKey("openai", "sk-mode");
+    try saveAuthFile(path, file);
+
+    const stat = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+}
+
+test "removeEntry deletes existing and is a no-op for missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    var file = AuthFile.init(std.testing.allocator);
+    defer file.deinit();
+    try file.setApiKey("openai", "sk-keep");
+    try file.setApiKey("anthropic", "sk-ant-drop");
+
+    file.removeEntry("anthropic");
+    try std.testing.expectEqual(@as(usize, 1), file.entries.count());
+
+    // No-op for a name that was never present.
+    file.removeEntry("groq");
+    try std.testing.expectEqual(@as(usize, 1), file.entries.count());
+
+    try saveAuthFile(path, file);
+
+    var reloaded = try loadAuthFile(std.testing.allocator, path);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.entries.count());
+    try std.testing.expectEqualStrings("sk-keep", (try reloaded.getApiKey("openai")).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try reloaded.getApiKey("anthropic"));
 }
 
 test "loadAuthFile rejects oauth entries with UnknownCredentialType" {
