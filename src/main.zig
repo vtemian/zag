@@ -29,22 +29,95 @@ const StartupMode = union(enum) {
     new_session,
     resume_session: []const u8,
     resume_last,
+    headless: HeadlessMode,
 };
 
-/// Parse CLI args. Recognizes --session=<id> and --last. Everything else is ignored.
-fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
-    var iter = try std.process.argsWithAllocator(allocator);
-    defer iter.deinit();
-    _ = iter.next(); // skip argv[0]
+/// Non-interactive run: read an instruction from a file, run the agent loop
+/// to completion, write an ATIF trajectory to disk, exit.
+const HeadlessMode = struct {
+    /// Path to the file whose contents become the first user message.
+    instruction_file: []const u8,
+    /// Path where the ATIF-v1.2 trajectory JSON is written.
+    trajectory_out: []const u8,
+    /// When true, the run does not touch the on-disk session store at all.
+    no_session: bool = false,
+};
 
-    while (iter.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--session=")) {
-            return .{ .resume_session = arg["--session=".len..] };
+/// Parse CLI args. Recognizes --session=<id>, --last, --headless,
+/// --instruction-file=<path>, --trajectory-out=<path>, --no-session.
+/// Thin wrapper that reads process argv then delegates to the slice form.
+fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+    return parseStartupArgsFromSlice(allocator, argv);
+}
+
+/// Testable core of `parseStartupArgs`. Accepts argv as a slice so tests do
+/// not need to mutate the process environment. All returned strings are
+/// duped into `allocator` and must be released with `freeStartupMode`.
+///
+/// `--headless` wins over `--session=` / `--last`: when `--headless` is set
+/// any resume flag is silently ignored. The TUI-only resume paths are not
+/// meaningful in non-interactive mode.
+fn parseStartupArgsFromSlice(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !StartupMode {
+    var headless = false;
+    var instruction_file: ?[]const u8 = null;
+    var trajectory_out: ?[]const u8 = null;
+    var no_session = false;
+    var resume_mode: ?StartupMode = null;
+
+    if (argv.len == 0) return .new_session;
+
+    for (argv[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--headless")) {
+            headless = true;
+        } else if (std.mem.startsWith(u8, arg, "--instruction-file=")) {
+            instruction_file = arg["--instruction-file=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--trajectory-out=")) {
+            trajectory_out = arg["--trajectory-out=".len..];
+        } else if (std.mem.eql(u8, arg, "--no-session")) {
+            no_session = true;
+        } else if (std.mem.startsWith(u8, arg, "--session=")) {
+            resume_mode = .{ .resume_session = arg["--session=".len..] };
         } else if (std.mem.eql(u8, arg, "--last")) {
-            return .resume_last;
+            resume_mode = .resume_last;
         }
     }
+
+    if (headless) {
+        const i_file = instruction_file orelse return error.MissingHeadlessArgs;
+        const t_out = trajectory_out orelse return error.MissingHeadlessArgs;
+        const duped_i = try allocator.dupe(u8, i_file);
+        errdefer allocator.free(duped_i);
+        const duped_t = try allocator.dupe(u8, t_out);
+        return .{ .headless = .{
+            .instruction_file = duped_i,
+            .trajectory_out = duped_t,
+            .no_session = no_session,
+        } };
+    }
+
+    if (resume_mode) |m| return switch (m) {
+        .resume_session => |s| .{ .resume_session = try allocator.dupe(u8, s) },
+        else => m,
+    };
     return .new_session;
+}
+
+/// Release any strings duped into `allocator` by `parseStartupArgsFromSlice`.
+/// Safe to call on every variant; a no-op for variants without owned strings.
+fn freeStartupMode(mode: StartupMode, allocator: std.mem.Allocator) void {
+    switch (mode) {
+        .new_session, .resume_last => {},
+        .resume_session => |s| allocator.free(s),
+        .headless => |h| {
+            allocator.free(h.instruction_file);
+            allocator.free(h.trajectory_out);
+        },
+    }
 }
 
 const file_log = @import("file_log.zig");
@@ -200,6 +273,9 @@ pub fn main() !void {
             }
             break :blk null;
         },
+        // Task 15 replaces this branch with a call to runHeadless() that
+        // exits the process before the TUI is constructed.
+        .headless => null,
     };
 
     var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(resume_id, provider.model_id) else null;
@@ -322,4 +398,30 @@ test "appendStatusLine creates a status node on the given view" {
     try std.testing.expectEqual(@as(usize, 1), view.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.root_children.items[0].node_type);
     try std.testing.expectEqualStrings("hello world", view.root_children.items[0].content.items);
+}
+
+test "parseStartupArgs recognizes --headless with required files" {
+    const mode = try parseStartupArgsFromSlice(std.testing.allocator, &.{
+        "zag", "--headless", "--instruction-file=/tmp/i.txt", "--trajectory-out=/tmp/t.json",
+    });
+    defer freeStartupMode(mode, std.testing.allocator);
+    try std.testing.expect(mode == .headless);
+    try std.testing.expectEqualStrings("/tmp/i.txt", mode.headless.instruction_file);
+    try std.testing.expectEqualStrings("/tmp/t.json", mode.headless.trajectory_out);
+    try std.testing.expect(!mode.headless.no_session);
+}
+
+test "parseStartupArgs rejects --headless without required files" {
+    const result = parseStartupArgsFromSlice(std.testing.allocator, &.{
+        "zag", "--headless",
+    });
+    try std.testing.expectError(error.MissingHeadlessArgs, result);
+}
+
+test "parseStartupArgs accepts --no-session with --headless" {
+    const mode = try parseStartupArgsFromSlice(std.testing.allocator, &.{
+        "zag", "--headless", "--instruction-file=/a", "--trajectory-out=/b", "--no-session",
+    });
+    defer freeStartupMode(mode, std.testing.allocator);
+    try std.testing.expect(mode.headless.no_session);
 }
