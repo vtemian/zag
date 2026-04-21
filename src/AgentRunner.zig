@@ -4,6 +4,16 @@
 //! (ConversationHistory). Owns the agent thread, event queue, cancel
 //! flag, Lua engine pointer, and streaming/correlation state that
 //! bridges LLM call IDs to view tree nodes.
+//!
+//! Session↔tree sync invariant: every append to `session.messages`
+//! pairs with an append to `view.root_children`. `submitInput` is
+//! the canonical join point for user turns (session.appendUserMessage
+//! + view.appendUserNode); tool_result events correlate to their
+//! tool_use by call_id via a HashMap on this struct. Tree and session
+//! may briefly diverge during streaming (deltas land on the tree
+//! before the whole assistant message is committed to the session),
+//! but `persist*` calls at turn boundaries close the gap before the
+//! next turn begins.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
