@@ -12,11 +12,12 @@
 //!
 //! Reference: codex-rs/codex-api/src/common.rs:159-180 (ResponsesApiRequest).
 //!
-//! Task 13 covers the request body only. SSE parsing lands in Task 14; the
+//! Task 13 covers the request body. Task 14 adds SSE stream parsing. The
 //! Provider vtable (ChatgptSerializer struct + factory wiring) lands in Task 15.
 
 const std = @import("std");
 const types = @import("../types.zig");
+const llm = @import("../llm.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.chatgpt);
@@ -168,6 +169,385 @@ fn writeFunctionCallOutputItem(tr: types.ContentBlock.ToolResultBlock, w: anytyp
     try w.writeAll("\"output\":");
     try std.json.Stringify.value(tr.content, .{}, w);
     try w.writeAll("}");
+}
+
+// -- SSE stream parsing ------------------------------------------------------
+
+/// One accumulating content block during Responses-API streaming.
+/// A `function_call` block aggregates argument bytes from
+/// `response.function_call_arguments.delta` (or the custom-tool variant) into
+/// `content`, keyed by `call_id` so concurrent tool calls in the same turn
+/// don't trample each other's buffers.
+pub const StreamingBlock = struct {
+    kind: enum { text, function_call },
+    /// Text body for text blocks, argument JSON for function_call blocks.
+    content: std.ArrayList(u8),
+    /// Responses-API `call_id` for function_call blocks, `""` for text.
+    call_id: []const u8,
+    /// Tool name for function_call blocks, `""` for text.
+    name: []const u8,
+
+    pub fn deinit(self: *StreamingBlock, allocator: Allocator) void {
+        self.content.deinit(allocator);
+        if (self.call_id.len > 0) allocator.free(self.call_id);
+        if (self.name.len > 0) allocator.free(self.name);
+    }
+};
+
+/// Mutable accumulator threaded through each `dispatchEvent` call. The caller
+/// (`parseSseStream` in production, tests in isolation) owns the backing
+/// storage; the emitter only borrows pointers so we can test dispatch without
+/// a live HTTP connection.
+pub const StreamEmitter = struct {
+    allocator: Allocator,
+    blocks: *std.ArrayList(StreamingBlock),
+    stop_reason: *types.StopReason,
+    input_tokens: *u32,
+    output_tokens: *u32,
+    /// Emitted `StreamEvent`s go through this callback. Tests plug in a
+    /// recorder; production plugs in the agent-loop event queue.
+    callback: llm.StreamCallback,
+};
+
+/// Dispatch a single framed SSE event to the accumulator. `event_type` tells
+/// us which field mapping to apply; `data` is the JSON payload.
+///
+/// Unknown event types (reasoning streaming, future additions) log at debug
+/// and return — we never fail the stream on an event we don't recognize,
+/// because OpenAI iterates `/responses` faster than we can keep up.
+pub fn dispatchEvent(
+    evt: llm.StreamingResponse.SseEvent,
+    emit: *StreamEmitter,
+) !void {
+    const event_type = evt.event_type;
+
+    // `response.created` carries no state we surface; log at debug and move
+    // on so the test fixtures can include it without ceremony.
+    if (std.mem.eql(u8, event_type, "response.created")) {
+        log.debug("response.created", .{});
+        return;
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, emit.allocator, evt.data, .{}) catch |err| {
+        log.warn("SSE JSON parse error for event '{s}': {}", .{ event_type, err });
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("SSE event '{s}' payload was not a JSON object", .{event_type});
+        return;
+    }
+    const obj = parsed.value.object;
+
+    if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
+        try handleTextDelta(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+        try handleOutputItemAdded(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
+        try handleOutputItemDone(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta") or
+        std.mem.eql(u8, event_type, "response.custom_tool_call_input.delta"))
+    {
+        try handleFunctionCallArgsDelta(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.completed")) {
+        try handleCompleted(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.failed")) {
+        try handleFailed(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.incomplete")) {
+        try handleIncomplete(obj, emit);
+    } else {
+        // Reasoning deltas, summary parts, unknown future events. Log and skip.
+        log.debug("ignoring SSE event type '{s}'", .{event_type});
+    }
+}
+
+fn handleTextDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const delta_value = obj.get("delta") orelse return;
+    if (delta_value != .string) return;
+    const delta = delta_value.string;
+
+    const last_block = lastTextBlock(emit.blocks);
+    if (last_block) |b| {
+        try b.content.appendSlice(emit.allocator, delta);
+    } else {
+        try emit.blocks.append(emit.allocator, .{
+            .kind = .text,
+            .content = .empty,
+            .call_id = "",
+            .name = "",
+        });
+        try emit.blocks.items[emit.blocks.items.len - 1].content.appendSlice(emit.allocator, delta);
+    }
+
+    emit.callback.on_event(emit.callback.ctx, .{ .text_delta = delta });
+}
+
+/// Return the most recent text block, but only if it's still the most recent
+/// block overall — a tool call in between should force a fresh text block so
+/// ordering is preserved.
+fn lastTextBlock(blocks: *std.ArrayList(StreamingBlock)) ?*StreamingBlock {
+    if (blocks.items.len == 0) return null;
+    const last = &blocks.items[blocks.items.len - 1];
+    if (last.kind != .text) return null;
+    return last;
+}
+
+fn handleOutputItemAdded(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const item_value = obj.get("item") orelse return;
+    if (item_value != .object) return;
+    const item = item_value.object;
+
+    const item_type = item.get("type") orelse return;
+    if (item_type != .string) return;
+    if (!std.mem.eql(u8, item_type.string, "function_call")) return;
+
+    const call_id_value = item.get("call_id") orelse return;
+    const name_value = item.get("name") orelse return;
+    if (call_id_value != .string or name_value != .string) return;
+
+    const call_id = try emit.allocator.dupe(u8, call_id_value.string);
+    errdefer emit.allocator.free(call_id);
+    const name = try emit.allocator.dupe(u8, name_value.string);
+    errdefer emit.allocator.free(name);
+
+    try emit.blocks.append(emit.allocator, .{
+        .kind = .function_call,
+        .content = .empty,
+        .call_id = call_id,
+        .name = name,
+    });
+
+    // Seed the argument buffer if the server sent a non-empty `arguments`
+    // string in the initial item (some Responses variants include a priming
+    // chunk here rather than a dedicated delta event).
+    if (item.get("arguments")) |args| {
+        if (args == .string and args.string.len > 0) {
+            const last = &emit.blocks.items[emit.blocks.items.len - 1];
+            try last.content.appendSlice(emit.allocator, args.string);
+        }
+    }
+
+    emit.callback.on_event(emit.callback.ctx, .{ .tool_start = name });
+}
+
+fn handleOutputItemDone(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const item_value = obj.get("item") orelse return;
+    if (item_value != .object) return;
+    const item = item_value.object;
+
+    const item_type = item.get("type") orelse return;
+    if (item_type != .string) return;
+    if (!std.mem.eql(u8, item_type.string, "function_call")) return;
+
+    // If the server shipped the final arguments in one lump under
+    // `item.arguments` rather than via deltas, use that as the authoritative
+    // value — but only when no deltas have landed yet, to avoid duplication
+    // when both mechanisms fire.
+    const call_id_value = item.get("call_id") orelse return;
+    if (call_id_value != .string) return;
+
+    const block = findFunctionCallBlock(emit.blocks, call_id_value.string) orelse return;
+    if (block.content.items.len > 0) return;
+
+    if (item.get("arguments")) |args| {
+        if (args == .string) {
+            try block.content.appendSlice(emit.allocator, args.string);
+        }
+    }
+}
+
+fn handleFunctionCallArgsDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const delta_value = obj.get("delta") orelse return;
+    if (delta_value != .string) return;
+    const delta = delta_value.string;
+
+    // Prefer `call_id` but fall back to `item_id` — Responses API sometimes
+    // uses one, sometimes the other. Fall back further to the last
+    // function_call block if neither is present.
+    const key: ?[]const u8 = blk: {
+        if (obj.get("call_id")) |v| {
+            if (v == .string) break :blk v.string;
+        }
+        if (obj.get("item_id")) |v| {
+            if (v == .string) break :blk v.string;
+        }
+        break :blk null;
+    };
+
+    const block = if (key) |k|
+        findFunctionCallBlock(emit.blocks, k) orelse lastFunctionCallBlock(emit.blocks)
+    else
+        lastFunctionCallBlock(emit.blocks);
+
+    if (block) |b| {
+        try b.content.appendSlice(emit.allocator, delta);
+    } else {
+        log.warn("function_call_arguments.delta with no matching block (key={?s})", .{key});
+    }
+}
+
+fn findFunctionCallBlock(
+    blocks: *std.ArrayList(StreamingBlock),
+    call_id: []const u8,
+) ?*StreamingBlock {
+    var i: usize = blocks.items.len;
+    while (i > 0) {
+        i -= 1;
+        const b = &blocks.items[i];
+        if (b.kind == .function_call and std.mem.eql(u8, b.call_id, call_id)) return b;
+    }
+    return null;
+}
+
+fn lastFunctionCallBlock(blocks: *std.ArrayList(StreamingBlock)) ?*StreamingBlock {
+    var i: usize = blocks.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (blocks.items[i].kind == .function_call) return &blocks.items[i];
+    }
+    return null;
+}
+
+fn handleCompleted(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const response_value = obj.get("response") orelse return;
+    if (response_value != .object) return;
+    const response = response_value.object;
+
+    if (response.get("usage")) |usage| {
+        if (usage == .object) {
+            const usage_obj = usage.object;
+            if (usage_obj.get("input_tokens")) |it| {
+                if (it == .integer) emit.input_tokens.* = @intCast(it.integer);
+            }
+            if (usage_obj.get("output_tokens")) |ot| {
+                if (ot == .integer) emit.output_tokens.* = @intCast(ot.integer);
+            }
+        }
+    }
+
+    // Stop reason classification: if we have a function_call block, the turn
+    // ended in a tool call; otherwise it's a normal end_turn. Responses API
+    // doesn't surface a dedicated `stop_reason` field like Chat Completions
+    // does, so we derive it from the accumulated blocks.
+    emit.stop_reason.* = for (emit.blocks.items) |b| {
+        if (b.kind == .function_call) break .tool_use;
+    } else .end_turn;
+
+    emit.callback.on_event(emit.callback.ctx, .done);
+}
+
+fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const response_value = obj.get("response") orelse {
+        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
+        return;
+    };
+    if (response_value != .object) {
+        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
+        return;
+    }
+
+    const response = response_value.object;
+    const err_value = response.get("error") orelse {
+        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
+        return;
+    };
+    if (err_value != .object) {
+        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
+        return;
+    }
+
+    const err_obj = err_value.object;
+    const code: []const u8 = if (err_obj.get("code")) |c|
+        if (c == .string) c.string else ""
+    else
+        "";
+    const message: []const u8 = if (err_obj.get("message")) |m|
+        if (m == .string) m.string else ""
+    else
+        "";
+
+    // Classify known error codes. Detailed mapping to zag's ProviderError set
+    // happens at the call site; here we just surface the text.
+    const text = try std.fmt.allocPrint(emit.allocator, "{s}: {s}", .{ code, message });
+    defer emit.allocator.free(text);
+
+    emit.callback.on_event(emit.callback.ctx, .{ .err = text });
+    emit.stop_reason.* = .end_turn;
+}
+
+fn handleIncomplete(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    // response.incomplete is a soft error: the model stopped before finishing,
+    // typically due to `max_tokens` or content filtering. Surface as a warning
+    // and set the stop reason so callers can tell the turn was truncated.
+    const reason: []const u8 = blk: {
+        const response_value = obj.get("response") orelse break :blk "incomplete";
+        if (response_value != .object) break :blk "incomplete";
+        const details = response_value.object.get("incomplete_details") orelse break :blk "incomplete";
+        if (details != .object) break :blk "incomplete";
+        const r = details.object.get("reason") orelse break :blk "incomplete";
+        if (r != .string) break :blk "incomplete";
+        break :blk r.string;
+    };
+
+    // "max_output_tokens" is the Responses API's counterpart to Chat
+    // Completions' "length" — pin it to `.max_tokens` so the agent loop can
+    // detect truncation without string sniffing.
+    if (std.mem.eql(u8, reason, "max_output_tokens") or std.mem.eql(u8, reason, "max_tokens")) {
+        emit.stop_reason.* = .max_tokens;
+    }
+
+    const text = try std.fmt.allocPrint(emit.allocator, "incomplete: {s}", .{reason});
+    defer emit.allocator.free(text);
+    emit.callback.on_event(emit.callback.ctx, .{ .err = text });
+}
+
+/// Drive the full stream: loop `nextSseEvent`, dispatch each one, then
+/// assemble the final LlmResponse from the accumulated blocks. Used by the
+/// `callStreaming` entry point in Task 15.
+pub fn parseSseStream(
+    stream: *llm.StreamingResponse,
+    allocator: Allocator,
+    callback: llm.StreamCallback,
+    cancel: *std.atomic.Value(bool),
+) !types.LlmResponse {
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    var emitter: StreamEmitter = .{
+        .allocator = allocator,
+        .blocks = &blocks,
+        .stop_reason = &stop_reason,
+        .input_tokens = &input_tokens,
+        .output_tokens = &output_tokens,
+        .callback = callback,
+    };
+
+    var scratch: [128]u8 = undefined;
+    var sse_data: std.ArrayList(u8) = .empty;
+    defer sse_data.deinit(allocator);
+
+    while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
+        try dispatchEvent(sse, &emitter);
+    }
+
+    var builder: llm.ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
+
+    for (blocks.items) |*b| {
+        switch (b.kind) {
+            .text => try builder.addText(b.content.items, allocator),
+            .function_call => try builder.addToolUse(b.call_id, b.name, b.content.items, allocator),
+        }
+    }
+
+    return builder.finish(stop_reason, input_tokens, output_tokens, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -354,4 +734,313 @@ test "chatgpt: JSON escapes special characters in text" {
     const msg_obj = parsed.value.object.get("input").?.array.items[0].object;
     const content_arr = msg_obj.get("content").?.array;
     try std.testing.expectEqualStrings("line1\n\"quoted\"", content_arr.items[0].object.get("text").?.string);
+}
+
+// -- SSE dispatch tests ------------------------------------------------------
+
+/// Recorded StreamEvent for assertions. Owns its payload so the test body
+/// survives after the emitter's scratch JSON is freed.
+const RecordedEvent = struct {
+    kind: enum { text_delta, tool_start, info, done, err },
+    payload: []const u8,
+
+    fn deinit(self: RecordedEvent, alloc: Allocator) void {
+        alloc.free(self.payload);
+    }
+};
+
+const EventRecorder = struct {
+    allocator: Allocator,
+    events: std.ArrayList(RecordedEvent) = .empty,
+
+    fn deinit(self: *EventRecorder) void {
+        for (self.events.items) |e| e.deinit(self.allocator);
+        self.events.deinit(self.allocator);
+    }
+
+    fn record(ctx: *anyopaque, event: llm.StreamEvent) void {
+        const self: *EventRecorder = @ptrCast(@alignCast(ctx));
+        const tagged: RecordedEvent = switch (event) {
+            .text_delta => |t| .{
+                .kind = .text_delta,
+                .payload = self.allocator.dupe(u8, t) catch return,
+            },
+            .tool_start => |t| .{
+                .kind = .tool_start,
+                .payload = self.allocator.dupe(u8, t) catch return,
+            },
+            .info => |t| .{
+                .kind = .info,
+                .payload = self.allocator.dupe(u8, t) catch return,
+            },
+            .done => .{
+                .kind = .done,
+                .payload = self.allocator.dupe(u8, "") catch return,
+            },
+            .err => |t| .{
+                .kind = .err,
+                .payload = self.allocator.dupe(u8, t) catch return,
+            },
+        };
+        self.events.append(self.allocator, tagged) catch {};
+    }
+
+    fn callback(self: *EventRecorder) llm.StreamCallback {
+        return .{ .ctx = self, .on_event = &record };
+    }
+};
+
+/// Package-up helper: run a list of `(event_type, data)` fixture tuples
+/// through `dispatchEvent`, returning an emitter + recorder the caller can
+/// inspect. Caller owns everything via the provided allocator.
+const DispatchFixture = struct {
+    blocks: std.ArrayList(StreamingBlock),
+    stop_reason: types.StopReason,
+    input_tokens: u32,
+    output_tokens: u32,
+    recorder: EventRecorder,
+
+    fn init(allocator: Allocator) DispatchFixture {
+        return .{
+            .blocks = .empty,
+            .stop_reason = .end_turn,
+            .input_tokens = 0,
+            .output_tokens = 0,
+            .recorder = .{ .allocator = allocator },
+        };
+    }
+
+    fn deinit(self: *DispatchFixture, allocator: Allocator) void {
+        for (self.blocks.items) |*b| b.deinit(allocator);
+        self.blocks.deinit(allocator);
+        self.recorder.deinit();
+    }
+
+    fn run(
+        self: *DispatchFixture,
+        allocator: Allocator,
+        fixtures: []const struct { event_type: []const u8, data: []const u8 },
+    ) !void {
+        var emitter: StreamEmitter = .{
+            .allocator = allocator,
+            .blocks = &self.blocks,
+            .stop_reason = &self.stop_reason,
+            .input_tokens = &self.input_tokens,
+            .output_tokens = &self.output_tokens,
+            .callback = self.recorder.callback(),
+        };
+        for (fixtures) |f| {
+            try dispatchEvent(.{ .event_type = f.event_type, .data = f.data }, &emitter);
+        }
+    }
+};
+
+test "chatgpt SSE: plain text response assembles into single text block" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.created", .data = "{\"response\":{\"id\":\"r_1\"}}" },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"Hel\"}" },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"lo, \"}" },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"world!\"}" },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_1\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqual(.text, fx.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("Hello, world!", fx.blocks.items[0].content.items);
+
+    try std.testing.expectEqual(.end_turn, fx.stop_reason);
+    try std.testing.expectEqual(@as(u32, 7), fx.input_tokens);
+    try std.testing.expectEqual(@as(u32, 3), fx.output_tokens);
+
+    const ev = fx.recorder.events.items;
+    try std.testing.expectEqual(@as(usize, 4), ev.len);
+    try std.testing.expectEqual(.text_delta, ev[0].kind);
+    try std.testing.expectEqualStrings("Hel", ev[0].payload);
+    try std.testing.expectEqualStrings("lo, ", ev[1].payload);
+    try std.testing.expectEqualStrings("world!", ev[2].payload);
+    try std.testing.expectEqual(.done, ev[3].kind);
+}
+
+test "chatgpt SSE: function_call accumulates arguments across deltas" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.created", .data = "{\"response\":{\"id\":\"r_2\"}}" },
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"function_call\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"\"}}",
+        },
+        .{
+            .event_type = "response.function_call_arguments.delta",
+            .data = "{\"call_id\":\"call_abc\",\"delta\":\"{\\\"command\\\":\"}",
+        },
+        .{
+            .event_type = "response.function_call_arguments.delta",
+            .data = "{\"call_id\":\"call_abc\",\"delta\":\"\\\"ls\\\"}\"}",
+        },
+        .{
+            .event_type = "response.output_item.done",
+            .data = "{\"item\":{\"type\":\"function_call\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"\"}}",
+        },
+        .{
+            .event_type = "response.completed",
+            .data = "{\"response\":{\"id\":\"r_2\",\"usage\":{\"input_tokens\":11,\"output_tokens\":4}}}",
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    const block = fx.blocks.items[0];
+    try std.testing.expectEqual(.function_call, block.kind);
+    try std.testing.expectEqualStrings("call_abc", block.call_id);
+    try std.testing.expectEqualStrings("bash", block.name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", block.content.items);
+
+    try std.testing.expectEqual(.tool_use, fx.stop_reason);
+
+    const ev = fx.recorder.events.items;
+    try std.testing.expectEqual(@as(usize, 2), ev.len);
+    try std.testing.expectEqual(.tool_start, ev[0].kind);
+    try std.testing.expectEqualStrings("bash", ev[0].payload);
+    try std.testing.expectEqual(.done, ev[1].kind);
+}
+
+test "chatgpt SSE: response.failed emits err with code and message" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.created", .data = "{\"response\":{\"id\":\"r_3\"}}" },
+        .{
+            .event_type = "response.failed",
+            .data = "{\"response\":{\"id\":\"r_3\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too big\"}}}",
+        },
+    });
+
+    const ev = fx.recorder.events.items;
+    try std.testing.expectEqual(@as(usize, 1), ev.len);
+    try std.testing.expectEqual(.err, ev[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, ev[0].payload, "context_length_exceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ev[0].payload, "too big") != null);
+}
+
+test "chatgpt SSE: unknown event types are ignored, not fatal" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.reasoning_summary_text.delta", .data = "{\"delta\":\"thinking...\"}" },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"answer\"}" },
+        .{ .event_type = "response.mystery_event_v99", .data = "{\"foo\":1}" },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_4\"}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqualStrings("answer", fx.blocks.items[0].content.items);
+
+    // No error events were emitted for the unknown types.
+    for (fx.recorder.events.items) |e| {
+        try std.testing.expect(e.kind != .err);
+    }
+}
+
+test "chatgpt SSE: malformed JSON in data is logged and skipped" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    // A broken delta followed by a good one — parser should recover.
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.output_text.delta", .data = "{not json at all" },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"ok\"}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqualStrings("ok", fx.blocks.items[0].content.items);
+}
+
+test "chatgpt SSE: response.incomplete with max_output_tokens sets stop_reason" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"partial\"}" },
+        .{
+            .event_type = "response.incomplete",
+            .data = "{\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+        },
+    });
+
+    try std.testing.expectEqual(.max_tokens, fx.stop_reason);
+
+    var saw_err = false;
+    for (fx.recorder.events.items) |e| {
+        if (e.kind == .err and std.mem.indexOf(u8, e.payload, "max_output_tokens") != null) saw_err = true;
+    }
+    try std.testing.expect(saw_err);
+}
+
+test "chatgpt SSE: interleaved text and tool call preserve block ordering" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"let me check. \"}" },
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"\"}}",
+        },
+        .{
+            .event_type = "response.function_call_arguments.delta",
+            .data = "{\"call_id\":\"c1\",\"delta\":\"{}\"}",
+        },
+        .{
+            .event_type = "response.output_item.done",
+            .data = "{\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}",
+        },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"done.\"}" },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_5\"}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), fx.blocks.items.len);
+    try std.testing.expectEqual(.text, fx.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("let me check. ", fx.blocks.items[0].content.items);
+    try std.testing.expectEqual(.function_call, fx.blocks.items[1].kind);
+    try std.testing.expectEqualStrings("{}", fx.blocks.items[1].content.items);
+    try std.testing.expectEqual(.text, fx.blocks.items[2].kind);
+    try std.testing.expectEqualStrings("done.", fx.blocks.items[2].content.items);
+
+    // A tool_call was present -> stop_reason is tool_use, matching zag's
+    // agent loop's expectation that any tool use preempts end_turn.
+    try std.testing.expectEqual(.tool_use, fx.stop_reason);
+}
+
+test "chatgpt SSE: custom_tool_call_input.delta accumulates like function_call" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"custom\",\"arguments\":\"\"}}",
+        },
+        .{
+            .event_type = "response.custom_tool_call_input.delta",
+            .data = "{\"call_id\":\"c2\",\"delta\":\"{\\\"q\\\":1}\"}",
+        },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_6\"}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqualStrings("{\"q\":1}", fx.blocks.items[0].content.items);
 }
