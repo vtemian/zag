@@ -37,14 +37,20 @@ zig build run -- --session=<id>    # resume a specific session
 zig build run -- --last            # resume the most recent one
 ```
 
+## First run
+
+On a clean machine, `zig build run` drops you into an interactive onboarding wizard. It asks which provider you want to use, accepts the API key with terminal echo disabled, writes `~/.config/zag/auth.json` atomically with mode `0600`, and scaffolds a matching `~/.config/zag/config.lua` with the provider enabled and `zag.set_default_model(...)` pointing at a sensible default. Then it continues straight into the TUI.
+
+Supported providers today: `openai`, `anthropic`, `openrouter`, `groq`. Ollama is keyless and needs no entry.
+
+If you already have a `config.lua` the wizard leaves it alone and only writes `auth.json`.
+
 ## Configuration
 
 Zag reads two files on startup, both under `~/.config/zag/`:
 
-- `config.lua` (optional). Sets the default model and declares provider names. The provider declarations are validated today but not yet load-bearing; the active provider is whatever prefix you put on `zag.set_default_model()`.
-- `auth.json` (required for any non-Ollama provider). Holds API keys. Create by hand and chmod `0600`.
-
-A fresh install with no `config.lua` runs against the fallback model `anthropic/claude-sonnet-4-20250514`; it still needs an `anthropic` entry in `auth.json`.
+- `config.lua` is user-editable. It sets the default model and declares provider names. The provider declarations are validated today but not yet load-bearing; the active provider is whatever prefix you put on `zag.set_default_model()`.
+- `auth.json` is machine-written by the wizard and the `zag auth` subcommands below. Do not hand-edit it. The schema is stable and documented here for reference only.
 
 Example `config.lua`:
 
@@ -53,7 +59,7 @@ zag.set_default_model("openai/gpt-4o")
 zag.provider { name = "openai" }
 ```
 
-Example `auth.json`:
+`auth.json` schema (managed for you):
 
 ```json
 {
@@ -63,6 +69,18 @@ Example `auth.json`:
   "groq":       { "type": "api_key", "key": "gsk_..." }
 }
 ```
+
+## Credentials
+
+Manage provider credentials with the `zag auth` subcommands. Each runs the same atomic, mode-`0600` write path as the first-run wizard, so `auth.json` never ends up partially written.
+
+```bash
+zag auth login <provider>    # add or replace a credential (openai, anthropic, openrouter, groq)
+zag auth list                # list configured providers with masked keys
+zag auth remove <provider>   # delete a credential
+```
+
+`login` is the canonical way to rotate a key: run it again for the same provider and the entry is replaced in place.
 
 ## Window system
 
