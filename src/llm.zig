@@ -344,12 +344,22 @@ pub const ResponseBuilder = struct {
 
     /// Consume the builder and return the final LlmResponse.
     /// After this call the builder is empty and should not be used.
-    pub fn finish(self: *ResponseBuilder, stop_reason: types.StopReason, input_tokens: u32, output_tokens: u32, allocator: Allocator) !types.LlmResponse {
+    pub fn finish(
+        self: *ResponseBuilder,
+        stop_reason: types.StopReason,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_creation_tokens: u32,
+        cache_read_tokens: u32,
+        allocator: Allocator,
+    ) !types.LlmResponse {
         return .{
             .content = try self.blocks.toOwnedSlice(allocator),
             .stop_reason = stop_reason,
             .input_tokens = input_tokens,
             .output_tokens = output_tokens,
+            .cache_creation_tokens = cache_creation_tokens,
+            .cache_read_tokens = cache_read_tokens,
         };
     }
 
@@ -648,7 +658,7 @@ test "ResponseBuilder assembles text and tool_use blocks" {
     try builder.addToolUse("toolu_1", "read", "{\"path\":\"/tmp\"}", allocator);
     try builder.addText("Done.", allocator);
 
-    const response = try builder.finish(.tool_use, 10, 20, allocator);
+    const response = try builder.finish(.tool_use, 10, 20, 0, 0, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), response.content.len);
@@ -674,11 +684,28 @@ test "ResponseBuilder assembles text and tool_use blocks" {
     }
 }
 
+test "ResponseBuilder finish populates all four token counts" {
+    const allocator = std.testing.allocator;
+
+    var builder: ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
+
+    try builder.addText("hi", allocator);
+
+    const response = try builder.finish(.end_turn, 11, 22, 33, 44, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 11), response.input_tokens);
+    try std.testing.expectEqual(@as(u32, 22), response.output_tokens);
+    try std.testing.expectEqual(@as(u32, 33), response.cache_creation_tokens);
+    try std.testing.expectEqual(@as(u32, 44), response.cache_read_tokens);
+}
+
 test "ResponseBuilder empty finish returns no content" {
     const allocator = std.testing.allocator;
 
     var builder: ResponseBuilder = .{};
-    const response = try builder.finish(.end_turn, 0, 0, allocator);
+    const response = try builder.finish(.end_turn, 0, 0, 0, 0, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), response.content.len);
