@@ -463,6 +463,20 @@ pub const Capture = struct {
             .message = opts.user_instruction,
         };
 
+        // Tracks how many loop iterations fully populated `steps[2 + j]` with
+        // their inner tool_calls/observation slices. The outer errdefer below
+        // walks [2, last_initialized) and frees those inner slices if any
+        // later iteration fails mid-alloc; the per-iteration errdefers below
+        // still cover the in-flight iteration's partial state.
+        var last_initialized: usize = 2;
+        errdefer {
+            var j: usize = 2;
+            while (j < last_initialized) : (j += 1) {
+                if (steps[j].tool_calls) |tc| allocator.free(tc);
+                if (steps[j].observation) |obs| allocator.free(obs.results);
+            }
+        }
+
         const arena_alloc = self.arena.allocator();
         for (self.turns.items, 0..) |*turn, i| {
             const tool_calls: ?[]const ToolCall = if (turn.tool_calls.items.len == 0)
@@ -502,6 +516,7 @@ pub const Capture = struct {
                     .cost_usd = m.cost_usd,
                 } else null,
             };
+            last_initialized = 2 + i + 1;
         }
 
         return .{
@@ -694,6 +709,37 @@ test "tool_calls arguments serialize as object not string" {
     try serialize(traj, std.testing.allocator, &out.writer);
     // Must appear as {"cmd":"ls"}, not "{\"cmd\":\"ls\"}"
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"arguments\":{\"cmd\":\"ls\"}") != null);
+}
+
+test "Capture.build cleans up inner slices on mid-loop OOM" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+
+    try cap.beginTurn(1000);
+    try cap.addToolCall("t1", "bash", "{}");
+    try cap.endTurn(.{});
+    try cap.addToolResult("t1", "ok", false);
+
+    try cap.beginTurn(2000);
+    try cap.addToolCall("t2", "bash", "{}");
+    try cap.endTurn(.{});
+    try cap.addToolResult("t2", "ok", false);
+
+    try cap.beginTurn(3000);
+    try cap.addToolCall("t3", "bash", "{}");
+    try cap.endTurn(.{});
+    try cap.addToolResult("t3", "ok", false);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+
+    const result = cap.build(failing.allocator(), .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "sys",
+        .user_instruction = "u",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    try std.testing.expectError(error.OutOfMemory, result);
 }
 
 test {
