@@ -169,8 +169,8 @@ fn splitAndAppend(
 }
 
 /// Split content on newlines, prepending an indent string to each line.
-/// `indent_count` must not exceed `Prefixes.indent_pad_max.len`; the
-/// padding span text slices that interned buffer directly.
+/// `indent_count` is clamped to `Prefixes.indent_pad_max.len`; the padding
+/// span text slices that interned buffer directly.
 fn splitAndAppendIndented(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
@@ -178,8 +178,8 @@ fn splitAndAppendIndented(
     style: Theme.CellStyle,
     indent_count: u16,
 ) !void {
-    std.debug.assert(indent_count <= Prefixes.indent_pad_max.len);
-    const padding = Prefixes.indent_pad_max[0..indent_count];
+    const pad_len = @min(indent_count, Prefixes.indent_pad_max.len);
+    const padding = Prefixes.indent_pad_max[0..pad_len];
 
     var rest: []const u8 = content;
     while (rest.len > 0) {

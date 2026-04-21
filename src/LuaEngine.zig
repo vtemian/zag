@@ -394,7 +394,7 @@ pub const LuaEngine = struct {
     /// completion drain later calls `resumeFromJob`, which pushes
     /// (true, nil) or (nil, err_tag) onto the coroutine stack and
     /// resumes it. Soft failures (submit errored after alloc) return
-    /// (nil, err_string) synchronously; hard errors (bad arg type,
+    /// (nil, messageing) synchronously; hard errors (bad arg type,
     /// no task) raise a Lua error and unwind.
     fn zagSleepFn(co: *Lua) i32 {
         const engine = getEngineFromState(co);
@@ -1287,7 +1287,7 @@ pub const LuaEngine = struct {
     /// `zag.cmd.kill(pid, signal)`: send a POSIX signal to an arbitrary
     /// PID. Sync (no yield), useful for plugins that track external
     /// processes (from pidfiles, other tools, etc.) without going through
-    /// a CmdHandle. Returns true on success, `(nil, err_string)` on
+    /// a CmdHandle. Returns true on success, `(nil, messageing)` on
     /// failure. Unknown signal names raise a Lua error.
     ///
     /// Signal names: TERM, KILL, INT, HUP, QUIT, USR1, USR2, STOP, CONT
@@ -1710,7 +1710,7 @@ pub const LuaEngine = struct {
             arena_ptr.deinit();
             engine.allocator.destroy(arena_ptr);
             // Drop the stub userdata so the returned tuple is
-            // (nil, err_string) rather than (ud, err_string).
+            // (nil, messageing) rather than (ud, messageing).
             co.pop(1);
             co.pushNil();
             _ = co.pushString(switch (err) {
@@ -3098,7 +3098,7 @@ pub const LuaEngine = struct {
             return .{ .content = owned_msg, .is_error = true };
         };
 
-        // Check return convention: string OR nil,err_string
+        // Check return convention: string OR nil,messageing
         if (self.lua.isNoneOrNil(-2)) {
             const err_msg = self.lua.toString(-1) catch "unknown error from Lua tool";
             const owned = allocator.dupe(u8, err_msg) catch {
@@ -3996,8 +3996,8 @@ test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
     eng.lua.pop(1);
 
     _ = eng.lua.getField(-1, "err");
-    const err_str = try eng.lua.toString(-1);
-    try std.testing.expect(std.mem.startsWith(u8, err_str, "cancelled"));
+    const message = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, message, "cancelled"));
     eng.lua.pop(1);
     eng.lua.pop(1); // pop table
 }
@@ -4033,8 +4033,8 @@ test "zag.sleep returns (nil, 'cancelled') synchronously when scope already canc
     try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
     _ = eng.lua.getField(-1, "err");
-    const err_str = try eng.lua.toString(-1);
-    try std.testing.expect(std.mem.eql(u8, err_str, "cancelled"));
+    const message = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.eql(u8, message, "cancelled"));
     eng.lua.pop(1);
     eng.lua.pop(1);
 }
@@ -4833,8 +4833,8 @@ test "task:join returns (nil, 'cancelled') when target is cancelled" {
     try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
     _ = eng.lua.getField(-1, "err");
-    const err_str = try eng.lua.toString(-1);
-    try std.testing.expect(std.mem.eql(u8, err_str, "cancelled"));
+    const message = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.eql(u8, message, "cancelled"));
     eng.lua.pop(1);
     eng.lua.pop(1);
 }
@@ -5171,8 +5171,8 @@ test "zag.cmd timeout_ms kills long-running process" {
     try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
     _ = try eng.lua.getGlobal("_to_err");
-    const err_str = try eng.lua.toString(-1);
-    try std.testing.expect(std.mem.startsWith(u8, err_str, "timeout"));
+    const message = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, message, "timeout"));
     eng.lua.pop(1);
     // Must NOT have waited the full 10s.
     try std.testing.expect(elapsed < 2000);
@@ -5408,8 +5408,8 @@ test "zag.cmd.spawn :lines errors when stdout not captured" {
     try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
     _ = try eng.lua.getGlobal("_no_cap_err");
-    const err_str = try eng.lua.toString(-1);
-    try std.testing.expect(std.mem.startsWith(u8, err_str, "io_error"));
+    const message = try eng.lua.toString(-1);
+    try std.testing.expect(std.mem.startsWith(u8, message, "io_error"));
     eng.lua.pop(1);
     try eng.lua.doString("collectgarbage('collect')");
 }
