@@ -1,35 +1,54 @@
 //! Multi-provider credential reader for `~/.config/zag/auth.json`.
 //!
-//! On-disk shape (the OAuth plan extends this with `"type": "oauth"` later):
+//! On-disk shape:
 //! ```json
 //! {
-//!   "openai":    { "type": "api_key", "key": "sk-..." },
-//!   "anthropic": { "type": "api_key", "key": "sk-ant-..." }
+//!   "openai":        { "type": "api_key", "key": "sk-..." },
+//!   "anthropic":     { "type": "api_key", "key": "sk-..." },
+//!   "openai-oauth":  {
+//!     "type": "oauth",
+//!     "id_token": "...",
+//!     "access_token": "...",
+//!     "refresh_token": "...",
+//!     "account_id": "...",
+//!     "last_refresh": "2026-04-20T12:34:56Z"
+//!   }
 //! }
 //! ```
 //!
 //! File mode is `0o600`. The loader treats a missing file as an empty map
 //! (first-run UX); any other IO failure or malformed JSON surfaces as an
-//! error. OAuth entries are recognised at load time but rejected with
-//! `error.UnknownCredentialType` so api-key-only call sites fail loudly
-//! instead of silently dropping the entry. The full OAuth path lands with
-//! `docs/plans/2026-04-20-chatgpt-oauth.md`.
+//! error. Unknown credential `type` tags are rejected with
+//! `error.UnknownCredentialType` so call sites fail loudly instead of
+//! silently dropping the entry.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.auth);
 
-/// A single provider credential. Today only `api_key` is constructed by the
-/// loader; the tagged union keeps room for `oauth` so the OAuth plan can
-/// extend it without changing the discriminator shape at call sites.
+/// OAuth credential bundle. Every field is owned by the enclosing
+/// `AuthFile`'s allocator; `last_refresh` is an ISO-8601 UTC timestamp used
+/// by the proactive-refresh path.
+pub const OAuthCred = struct {
+    id_token: []const u8,
+    access_token: []const u8,
+    refresh_token: []const u8,
+    account_id: []const u8,
+    last_refresh: []const u8,
+};
+
+/// A single provider credential. Both variants own their byte payloads
+/// through the enclosing `AuthFile`'s allocator.
 pub const Credential = union(enum) {
     /// Bearer-style API key, owned by the enclosing `AuthFile`.
     api_key: []const u8,
+    /// OAuth token bundle, every field owned by the enclosing `AuthFile`.
+    oauth: OAuthCred,
 };
 
 /// In-memory view of `auth.json`. Each entry owns both its key (provider
-/// name) and its value (api_key bytes) through the same allocator.
+/// name) and its value bytes through the same allocator.
 pub const AuthFile = struct {
     /// Allocator used for every duped string inside `entries`.
     allocator: Allocator,
@@ -75,11 +94,42 @@ pub const AuthFile = struct {
 
     /// Return a borrowed api-key slice for `name`, or `null` if the provider
     /// has no entry. Returns `error.WrongCredentialType` if the entry exists
-    /// but is not an api-key (reserved for the future OAuth case).
+    /// but is an oauth bundle.
     pub fn getApiKey(self: *AuthFile, name: []const u8) !?[]const u8 {
         const cred = self.entries.get(name) orelse return null;
         return switch (cred) {
             .api_key => |key| key,
+            .oauth => error.WrongCredentialType,
+        };
+    }
+
+    /// Insert or replace an oauth credential for `name`. Every field of
+    /// `cred` is duped into the allocator; if the provider already has any
+    /// entry (api_key or oauth), the previous bytes are freed first.
+    pub fn setOAuth(self: *AuthFile, name: []const u8, cred: OAuthCred) !void {
+        const duped = try dupeOAuth(self.allocator, cred);
+        errdefer freeOAuth(self.allocator, duped);
+
+        if (self.entries.getEntry(name)) |existing| {
+            freeCredential(self.allocator, existing.value_ptr.*);
+            existing.value_ptr.* = .{ .oauth = duped };
+            return;
+        }
+
+        const duped_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(duped_name);
+
+        try self.entries.put(duped_name, .{ .oauth = duped });
+    }
+
+    /// Return a borrowed `OAuthCred` for `name`. Returns `error.NotFound`
+    /// if the provider has no entry, or `error.WrongCredentialType` if the
+    /// entry exists but is an api-key.
+    pub fn getOAuth(self: *AuthFile, name: []const u8) !OAuthCred {
+        const cred = self.entries.get(name) orelse return error.NotFound;
+        return switch (cred) {
+            .oauth => |o| o,
+            .api_key => error.WrongCredentialType,
         };
     }
 
@@ -93,11 +143,43 @@ pub const AuthFile = struct {
     }
 };
 
-/// Free the bytes a `Credential` owns. Split out so `deinit` and
-/// `setApiKey`'s replace path stay symmetric.
+/// Dupe every field of `src` into `alloc`. Unwinds partial allocations on
+/// failure so callers never see a half-populated `OAuthCred`.
+fn dupeOAuth(alloc: Allocator, src: OAuthCred) !OAuthCred {
+    const id_token = try alloc.dupe(u8, src.id_token);
+    errdefer alloc.free(id_token);
+    const access_token = try alloc.dupe(u8, src.access_token);
+    errdefer alloc.free(access_token);
+    const refresh_token = try alloc.dupe(u8, src.refresh_token);
+    errdefer alloc.free(refresh_token);
+    const account_id = try alloc.dupe(u8, src.account_id);
+    errdefer alloc.free(account_id);
+    const last_refresh = try alloc.dupe(u8, src.last_refresh);
+    errdefer alloc.free(last_refresh);
+    return .{
+        .id_token = id_token,
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .account_id = account_id,
+        .last_refresh = last_refresh,
+    };
+}
+
+/// Free every field of an owned `OAuthCred`. Paired with `dupeOAuth`.
+fn freeOAuth(alloc: Allocator, cred: OAuthCred) void {
+    alloc.free(cred.id_token);
+    alloc.free(cred.access_token);
+    alloc.free(cred.refresh_token);
+    alloc.free(cred.account_id);
+    alloc.free(cred.last_refresh);
+}
+
+/// Free the bytes a `Credential` owns. Split out so `deinit` and the
+/// `setApiKey`/`setOAuth` replace paths stay symmetric.
 fn freeCredential(alloc: Allocator, cred: Credential) void {
     switch (cred) {
         .api_key => |key| alloc.free(key),
+        .oauth => |o| freeOAuth(alloc, o),
     }
 }
 
@@ -173,15 +255,36 @@ pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
                 else => return error.MalformedAuthJson,
             };
             try file.setApiKey(provider_name, key_bytes);
+        } else if (std.mem.eql(u8, type_tag, "oauth")) {
+            const id_token = try stringField(value_obj, "id_token");
+            const access_token = try stringField(value_obj, "access_token");
+            const refresh_token = try stringField(value_obj, "refresh_token");
+            const account_id = try stringField(value_obj, "account_id");
+            const last_refresh = try stringField(value_obj, "last_refresh");
+            try file.setOAuth(provider_name, .{
+                .id_token = id_token,
+                .access_token = access_token,
+                .refresh_token = refresh_token,
+                .account_id = account_id,
+                .last_refresh = last_refresh,
+            });
         } else {
-            // OAuth storage ships with the OAuth plan. Rejecting here keeps
-            // callers from silently seeing a half-populated map.
             log.warn("unknown credential type '{s}' for provider '{s}'", .{ type_tag, provider_name });
             return error.UnknownCredentialType;
         }
     }
 
     return file;
+}
+
+/// Pull a required string field from a JSON object, returning
+/// `error.MalformedAuthJson` if missing or of the wrong kind.
+fn stringField(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const v = obj.get(name) orelse return error.MalformedAuthJson;
+    return switch (v) {
+        .string => |s| s,
+        else => error.MalformedAuthJson,
+    };
 }
 
 /// Serialise `file` to `path` as pretty JSON with mode `0o600`. Creates the
@@ -224,9 +327,9 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
     try cwd.rename(tmp_path, path);
 }
 
-/// Emit `file` as `{ "provider": { "type": "api_key", "key": "..." }, ... }`.
-/// Order is the hash map's iteration order; stable enough for a config
-/// file that humans will re-read but not sort-critical.
+/// Emit `file` as a JSON object keyed by provider name. Order is the hash
+/// map's iteration order; stable enough for a config file that humans will
+/// re-read but not sort-critical.
 fn writeAuthJson(w: *std.Io.Writer, file: AuthFile) !void {
     try w.writeAll("{\n");
     var first = true;
@@ -236,11 +339,26 @@ fn writeAuthJson(w: *std.Io.Writer, file: AuthFile) !void {
         first = false;
         try w.writeAll("  ");
         try writeJsonString(w, entry.key_ptr.*);
-        try w.writeAll(": { \"type\": \"api_key\", \"key\": ");
         switch (entry.value_ptr.*) {
-            .api_key => |key| try writeJsonString(w, key),
+            .api_key => |key| {
+                try w.writeAll(": { \"type\": \"api_key\", \"key\": ");
+                try writeJsonString(w, key);
+                try w.writeAll(" }");
+            },
+            .oauth => |o| {
+                try w.writeAll(": { \"type\": \"oauth\", \"id_token\": ");
+                try writeJsonString(w, o.id_token);
+                try w.writeAll(", \"access_token\": ");
+                try writeJsonString(w, o.access_token);
+                try w.writeAll(", \"refresh_token\": ");
+                try writeJsonString(w, o.refresh_token);
+                try w.writeAll(", \"account_id\": ");
+                try writeJsonString(w, o.account_id);
+                try w.writeAll(", \"last_refresh\": ");
+                try writeJsonString(w, o.last_refresh);
+                try w.writeAll(" }");
+            },
         }
-        try w.writeAll(" }");
     }
     try w.writeAll("\n}\n");
 }
@@ -266,6 +384,16 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
         }
     }
     try w.writeByte('"');
+}
+
+/// Load `path`, upsert `cred` under `name`, then save. Convenience wrapper
+/// for the OAuth refresh and exchange paths. Task 9 wraps this in a file
+/// lock to make concurrent writers safe.
+pub fn upsertOAuth(alloc: Allocator, path: []const u8, name: []const u8, cred: OAuthCred) !void {
+    var file = try loadAuthFile(alloc, path);
+    defer file.deinit();
+    try file.setOAuth(name, cred);
+    try saveAuthFile(path, file);
 }
 
 // -- Tests -----------------------------------------------------------------
@@ -416,34 +544,104 @@ test "removeEntry deletes existing and is a no-op for missing" {
     try std.testing.expectEqual(@as(?[]const u8, null), try reloaded.getApiKey("anthropic"));
 }
 
-test "loadAuthFile rejects oauth entries with UnknownCredentialType" {
-    // Option (b) from the plan: the loader rejects an oauth entry at load
-    // time with `error.UnknownCredentialType` because OAuth storage lands in
-    // a later plan. The test preseeds raw JSON and asserts the load error
-    // surfaces instead of silently dropping the entry. Once the OAuth plan
-    // extends `Credential`, this test flips to exercise `getApiKey` on a
-    // successfully-loaded oauth entry and assert `error.WrongCredentialType`
-    // there.
+test "loadAuthFile round-trips an oauth entry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(dir_path);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
 
-    try tmp.dir.writeFile(.{
-        .sub_path = "auth.json",
-        .data =
-        \\{
-        \\  "openai-oauth": { "type": "oauth", "access_token": "abc" }
-        \\}
-        ,
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "idt",
+            .access_token = "at",
+            .refresh_token = "rt",
+            .account_id = "acc-123",
+            .last_refresh = "2026-04-20T12:34:56Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    var loaded = try loadAuthFile(std.testing.allocator, path);
+    defer loaded.deinit();
+    const got = try loaded.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings("idt", got.id_token);
+    try std.testing.expectEqualStrings("at", got.access_token);
+    try std.testing.expectEqualStrings("rt", got.refresh_token);
+    try std.testing.expectEqualStrings("acc-123", got.account_id);
+    try std.testing.expectEqualStrings("2026-04-20T12:34:56Z", got.last_refresh);
+}
+
+test "loadAuthFile preserves api_key entries alongside oauth entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setApiKey("openai", "sk-openai");
+        try file.setApiKey("anthropic", "sk-ant");
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "idt",
+            .access_token = "at",
+            .refresh_token = "rt",
+            .account_id = "acc",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    var loaded = try loadAuthFile(std.testing.allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("sk-openai", (try loaded.getApiKey("openai")).?);
+    try std.testing.expectEqualStrings("sk-ant", (try loaded.getApiKey("anthropic")).?);
+    const oauth = try loaded.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings("idt", oauth.id_token);
+}
+
+test "upsertOAuth replaces an existing oauth entry without clobbering api_key entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
+    defer std.testing.allocator.free(path);
+
+    {
+        var file = AuthFile.init(std.testing.allocator);
+        defer file.deinit();
+        try file.setApiKey("openai", "sk-should-stay");
+        try file.setOAuth("openai-oauth", .{
+            .id_token = "old-id",
+            .access_token = "old-at",
+            .refresh_token = "old-rt",
+            .account_id = "acc",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try saveAuthFile(path, file);
+    }
+
+    try upsertOAuth(std.testing.allocator, path, "openai-oauth", .{
+        .id_token = "new-id",
+        .access_token = "new-at",
+        .refresh_token = "new-rt",
+        .account_id = "acc",
+        .last_refresh = "2026-04-21T00:00:00Z",
     });
 
-    try std.testing.expectError(
-        error.UnknownCredentialType,
-        loadAuthFile(std.testing.allocator, path),
-    );
+    var loaded = try loadAuthFile(std.testing.allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("sk-should-stay", (try loaded.getApiKey("openai")).?);
+    const oauth = try loaded.getOAuth("openai-oauth");
+    try std.testing.expectEqualStrings("new-id", oauth.id_token);
+    try std.testing.expectEqualStrings("new-at", oauth.access_token);
 }
 
 test {
