@@ -523,9 +523,55 @@ pub const Capture = struct {
             .session_id = opts.session_id,
             .agent = opts.agent,
             .steps = steps,
+            .final_metrics = aggregateFinalMetrics(self.turns.items, @intCast(steps.len)),
         };
     }
 };
+
+/// Sum nullable per-turn metrics across `turns`. A total is null when every
+/// turn left that field null; otherwise nulls contribute 0 to the sum.
+/// Returns null entirely when no turn reports any token/cost data, so the
+/// trajectory omits `final_metrics` rather than emitting a bare step count.
+fn aggregateFinalMetrics(turns: []const CapturedTurn, total_steps: u32) ?FinalMetrics {
+    var prompt_sum: u32 = 0;
+    var prompt_any = false;
+    var completion_sum: u32 = 0;
+    var completion_any = false;
+    var cached_sum: u32 = 0;
+    var cached_any = false;
+    var cost_sum: f64 = 0;
+    var cost_any = false;
+
+    for (turns) |turn| {
+        const m = turn.metrics orelse continue;
+        if (m.prompt_tokens) |v| {
+            prompt_sum += v;
+            prompt_any = true;
+        }
+        if (m.completion_tokens) |v| {
+            completion_sum += v;
+            completion_any = true;
+        }
+        if (m.cached_tokens) |v| {
+            cached_sum += v;
+            cached_any = true;
+        }
+        if (m.cost_usd) |v| {
+            cost_sum += v;
+            cost_any = true;
+        }
+    }
+
+    if (!prompt_any and !completion_any and !cached_any and !cost_any) return null;
+
+    return .{
+        .total_prompt_tokens = if (prompt_any) prompt_sum else null,
+        .total_completion_tokens = if (completion_any) completion_sum else null,
+        .total_cached_tokens = if (cached_any) cached_sum else null,
+        .total_cost_usd = if (cost_any) cost_sum else null,
+        .total_steps = total_steps,
+    };
+}
 
 /// Inputs required to translate a `Capture` into a `Trajectory`. All slices
 /// are borrowed, not copied: they must outlive the returned Trajectory.
@@ -611,7 +657,50 @@ test "Capture.build produces dense step_id and correct source mapping" {
     try std.testing.expect(traj.steps[2].metrics != null);
     try std.testing.expectEqual(@as(?u32, 10), traj.steps[2].metrics.?.prompt_tokens);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", traj.steps[2].model_name.?);
-    // final_metrics stays null until Task 12.
+}
+
+test "build aggregates per-turn metrics into final_metrics" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.endTurn(.{ .prompt_tokens = 10, .completion_tokens = 5, .cached_tokens = 2, .cost_usd = 0.001 });
+    try cap.beginTurn(2000);
+    try cap.endTurn(.{ .prompt_tokens = 12, .completion_tokens = 3, .cached_tokens = 0, .cost_usd = 0.0005 });
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "openai/gpt-4o",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    const fm = traj.final_metrics.?;
+    try std.testing.expectEqual(@as(u32, 22), fm.total_prompt_tokens.?);
+    try std.testing.expectEqual(@as(u32, 8), fm.total_completion_tokens.?);
+    try std.testing.expectEqual(@as(u32, 2), fm.total_cached_tokens.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0015), fm.total_cost_usd.?, 0.0001);
+    try std.testing.expectEqual(@as(u32, 4), fm.total_steps.?); // system + user + 2 agent
+}
+
+test "build leaves final_metrics null when no turn has metrics" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.endTurn(.{});
+    try cap.beginTurn(2000);
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "openai/gpt-4o",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
     try std.testing.expect(traj.final_metrics == null);
 }
 
