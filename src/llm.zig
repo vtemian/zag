@@ -19,6 +19,7 @@ const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
 pub const isBuiltinEndpointName = registry_mod.isBuiltinEndpointName;
+pub const findBuiltinEndpoint = registry_mod.findBuiltinEndpoint;
 
 const log = std.log.scoped(.llm);
 

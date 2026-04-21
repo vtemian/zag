@@ -27,12 +27,16 @@ const agent_events = @import("agent_events.zig");
 const types = @import("types.zig");
 const pricing = @import("pricing.zig");
 const auth_wizard = @import("auth_wizard.zig");
+const oauth = @import("oauth.zig");
 
 const log = std.log.scoped(.main);
 
 /// How to initialize the session on startup. `auth_*` variants short-circuit
 /// the TUI path entirely so `zag auth ...` subcommands never build Lua or a
 /// provider; they are handled by dedicated wizard helpers and then exit.
+/// `.login` is the older `--login=<provider>` CLI shortcut that jumps
+/// straight into the OAuth signin flow; it dispatches to the same code as
+/// `zag auth login <provider>` for an OAuth-auth endpoint.
 const StartupMode = union(enum) {
     new_session,
     resume_session: []const u8,
@@ -45,6 +49,10 @@ const StartupMode = union(enum) {
     /// Provider name duped into the allocator passed to `parseStartupArgs`.
     /// `freeStartupMode` releases it.
     auth_remove: []u8,
+    /// Borrowed slice of argv memory; parseStartupArgs dupes this into the
+    /// StartupMode-owning allocator so callers don't need to track argv
+    /// lifetime separately.
+    login: []u8,
 };
 
 /// Non-interactive run: read an instruction from a file, run the agent loop
@@ -146,6 +154,11 @@ fn parseStartupArgsFromSlice(
             resume_mode = .{ .resume_session = arg["--session=".len..] };
         } else if (std.mem.eql(u8, arg, "--last")) {
             resume_mode = .resume_last;
+        } else if (std.mem.startsWith(u8, arg, "--login=")) {
+            // --login short-circuits all other modes; dupe now so the
+            // returned StartupMode doesn't borrow argv memory.
+            const duped = try allocator.dupe(u8, arg["--login=".len..]);
+            return .{ .login = duped };
         }
     }
 
@@ -181,6 +194,7 @@ fn freeStartupMode(mode: StartupMode, allocator: std.mem.Allocator) void {
         },
         .auth_login => |prov| allocator.free(prov),
         .auth_remove => |prov| allocator.free(prov),
+        .login => |prov| allocator.free(prov),
     }
 }
 
@@ -214,6 +228,91 @@ fn buildWizardPaths(allocator: std.mem.Allocator) !WizardPaths {
 /// as `error.StreamTooLong` from `takeDelimiter`. 64 bytes covers the trailing
 /// `\n` + any trimmed whitespace.
 const stdin_buffer_len: usize = 8256;
+
+/// Build the canonical `~/.config/zag/auth.json` path. Caller frees the
+/// returned slice. Falls back to `./.config/zag/auth.json` if HOME is unset
+/// so we don't crash under `env -i`; the login flow will surface a clearer
+/// error downstream when it tries to persist.
+fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => blk: {
+            log.warn("HOME unset; falling back to \".\" for auth.json path", .{});
+            break :blk try allocator.dupe(u8, ".");
+        },
+        else => return err,
+    };
+    defer allocator.free(home_dir);
+    return std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home_dir});
+}
+
+/// One-shot signin entry point invoked when `--login=<provider>` is passed.
+/// Returns the process exit code so `main` can call `std.process.exit` with
+/// the right value without juggling control flow inline.
+fn runLoginCommand(allocator: std.mem.Allocator, provider_name: []const u8) !u8 {
+    const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+    const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
+
+    const endpoint = llm.findBuiltinEndpoint(provider_name) orelse {
+        var scratch: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &scratch,
+            "zag: unknown provider '{s}'. Try --login=openai-oauth.\n",
+            .{provider_name},
+        ) catch "zag: unknown provider; try --login=openai-oauth.\n";
+        _ = stderr_file.write(msg) catch {};
+        return 1;
+    };
+
+    if (endpoint.auth != .oauth_chatgpt) {
+        var scratch: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &scratch,
+            "zag: provider '{s}' does not use OAuth; edit ~/.config/zag/auth.json directly.\n",
+            .{provider_name},
+        ) catch "zag: provider does not use OAuth; edit auth.json directly.\n";
+        _ = stderr_file.write(msg) catch {};
+        return 1;
+    }
+
+    const auth_path = try buildAuthPath(allocator);
+    defer allocator.free(auth_path);
+
+    oauth.runLoginFlow(allocator, .{
+        .provider_name = provider_name,
+        .auth_path = auth_path,
+    }) catch |err| {
+        // Map the well-known OAuth error paths to actionable hints. Anything
+        // not named here falls back to `@errorName`, which at least gives the
+        // user a term to grep the source for. Only errors that `runLoginFlow`
+        // can actually return are listed; adding others is a compile error.
+        const hint: []const u8 = switch (err) {
+            error.StateMismatch => "state mismatch (CSRF protection tripped); retry the command",
+            error.AuthorizationDenied => "authorization was denied in the browser",
+            error.AddressInUse => "port 1455 is busy; stop the other listener (lsof -i :1455) and retry",
+            error.CallbackMissingQuery, error.CallbackParamMissing => "browser callback was malformed; retry the command",
+            error.TokenExchangeFailed => "token exchange with the OAuth server failed",
+            error.ClaimMissing, error.MalformedJwt => "id_token was missing the chatgpt_account_id claim",
+            else => @errorName(err),
+        };
+        var scratch: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &scratch,
+            "zag: login failed: {s}\n",
+            .{hint},
+        ) catch "zag: login failed\n";
+        _ = stderr_file.write(msg) catch {};
+        return 1;
+    };
+
+    var scratch: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &scratch,
+        "Signed in to {s}. Credentials saved to {s}.\n",
+        .{ provider_name, auth_path },
+    ) catch "Signed in.\n";
+    _ = stdout_file.write(msg) catch {};
+    return 0;
+}
 
 const file_log = @import("file_log.zig");
 pub const std_options: std.Options = .{ .logFn = file_log.handler };
@@ -709,7 +808,8 @@ pub fn main() !void {
 
     // Parse args first so `zag auth ...` subcommands bypass Lua + provider
     // init entirely. The TUI path picks up `.new_session` / `.resume_*`
-    // below exactly as before.
+    // below exactly as before. `--login=<provider>` is an older CLI shortcut
+    // that also exits before any TUI wiring.
     const startup_mode = parseStartupArgs(allocator) catch .new_session;
     defer freeStartupMode(startup_mode, allocator);
 
@@ -784,6 +884,13 @@ pub fn main() !void {
             };
             try auth_wizard.removeAuth(deps, prov);
             return;
+        },
+        .login => |prov| {
+            // `--login=<provider>` bypasses the wizard entirely and runs
+            // the OAuth signin flow. Exit with the process code the helper
+            // returns so shell scripts can branch on success/failure.
+            const code = try runLoginCommand(allocator, prov);
+            std.process.exit(code);
         },
         else => {},
     }
@@ -878,9 +985,9 @@ pub fn main() !void {
             break :blk null;
         },
         // These variants all exit the process before reaching here:
-        // headless runs its own entry point above, and auth subcommands were
-        // dispatched before subsystem init.
-        .headless, .auth_login, .auth_list, .auth_remove => unreachable,
+        // headless runs its own entry point above, and auth subcommands
+        // plus `--login=<provider>` were dispatched before subsystem init.
+        .headless, .auth_login, .auth_list, .auth_remove, .login => unreachable,
     };
 
     var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(resume_id, provider.model_id) else null;
@@ -1044,4 +1151,23 @@ test "parseTokenInfo returns null on non-matching strings" {
     try std.testing.expect(parseTokenInfo("hello world") == null);
     try std.testing.expect(parseTokenInfo("tokens: abc in, 7 out") == null);
     try std.testing.expect(parseTokenInfo("tokens: 1 in,") == null);
+}
+
+test "parseStartupArgs extracts the provider from --login=" {
+    const mode = try parseStartupArgsFromSlice(std.testing.allocator, &.{ "zag", "--login=openai-oauth" });
+    defer freeStartupMode(mode, std.testing.allocator);
+    try std.testing.expect(mode == .login);
+    try std.testing.expectEqualStrings("openai-oauth", mode.login);
+}
+
+test "runLoginCommand rejects unknown providers with exit code 1" {
+    const code = try runLoginCommand(std.testing.allocator, "definitely-not-a-provider");
+    try std.testing.expectEqual(@as(u8, 1), code);
+}
+
+test "runLoginCommand rejects providers whose auth is not oauth_chatgpt" {
+    // `anthropic` is a built-in endpoint but uses .x_api_key auth; the login
+    // command must refuse it rather than trying to run an OAuth flow.
+    const code = try runLoginCommand(std.testing.allocator, "anthropic");
+    try std.testing.expectEqual(@as(u8, 1), code);
 }

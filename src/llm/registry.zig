@@ -144,6 +144,17 @@ pub fn isBuiltinEndpointName(name: []const u8) bool {
     return false;
 }
 
+/// Look up a built-in endpoint by name. Returns a pointer into the static
+/// table so callers can inspect `.auth` (and any other field) without paying
+/// for a Registry. Used by the `--login=<provider>` CLI dispatcher to confirm
+/// the provider exists and uses an OAuth auth scheme.
+pub fn findBuiltinEndpoint(name: []const u8) ?*const Endpoint {
+    for (&builtin_endpoints) |*ep| {
+        if (std.mem.eql(u8, ep.name, name)) return ep;
+    }
+    return null;
+}
+
 /// Runtime registry of LLM endpoints. Seeded with built-ins, extensible at runtime.
 pub const Registry = struct {
     /// All registered endpoints (built-in and runtime-added).
@@ -263,6 +274,17 @@ test "builtin endpoints include openai-oauth with .oauth_chatgpt auth" {
 test "isBuiltinEndpointName recognizes openai-oauth" {
     try std.testing.expect(isBuiltinEndpointName("openai-oauth"));
     try std.testing.expect(!isBuiltinEndpointName("openai-foo"));
+}
+
+test "findBuiltinEndpoint returns the OAuth endpoint for openai-oauth" {
+    const ep = findBuiltinEndpoint("openai-oauth") orelse return error.EndpointMissing;
+    try std.testing.expectEqual(Endpoint.Auth.oauth_chatgpt, ep.auth);
+    try std.testing.expectEqualStrings("openai-oauth", ep.name);
+}
+
+test "findBuiltinEndpoint returns null for unknown names" {
+    try std.testing.expect(findBuiltinEndpoint("bogus") == null);
+    try std.testing.expect(findBuiltinEndpoint("") == null);
 }
 
 test {
