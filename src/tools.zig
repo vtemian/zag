@@ -23,6 +23,12 @@ pub threadlocal var current_tool_name: ?[]const u8 = null;
 /// the sole consumer (`luaToolExecute`).
 pub threadlocal var lua_request_queue: ?*agent_events.EventQueue = null;
 
+/// Thread-local handle of the pane whose agent is currently invoking a
+/// tool. Set by `AgentRunner` before dispatching `registry.execute` and
+/// cleared on return. Used by layout tools to refuse destructive
+/// operations on their own pane.
+pub threadlocal var current_caller_pane_id: ?u32 = null;
+
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
