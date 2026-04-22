@@ -163,8 +163,8 @@ pub const PROVIDERS = [_]ProviderEntry{
 const oauth = @import("oauth.zig");
 
 /// Thin shim matching the `OAuthFn` signature. Delegates to
-/// `oauth.runLoginFlow` with the OpenAI/ChatGPT defaults baked into
-/// `oauth.LoginOptions` (issuer, client_id, port, scopes, originator).
+/// `oauth.runLoginFlow` with the OpenAI/ChatGPT Codex values synthesised
+/// inline; Phase H replaces these with a pull from the endpoint registry.
 /// Keeping this in lockstep with `main.zig`'s `runLoginCommand` means the
 /// wizard and `--login=openai-oauth` exercise the same code path.
 fn chatgptOauthShim(
@@ -175,6 +175,17 @@ fn chatgptOauthShim(
     return oauth.runLoginFlow(allocator, .{
         .provider_name = provider_name,
         .auth_path = auth_path,
+        .issuer = "https://auth.openai.com/oauth/authorize",
+        .token_url = "https://auth.openai.com/oauth/token",
+        .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+        .redirect_port = 1455,
+        .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        .originator = "zag_cli",
+        .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        .extra_authorize_params = &.{
+            .{ .name = "id_token_add_organizations", .value = "true" },
+            .{ .name = "codex_cli_simplified_flow", .value = "true" },
+        },
     });
 }
 

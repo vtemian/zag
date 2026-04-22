@@ -280,6 +280,17 @@ fn runLoginCommand(
     oauth.runLoginFlow(allocator, .{
         .provider_name = provider_name,
         .auth_path = auth_path,
+        .issuer = "https://auth.openai.com/oauth/authorize",
+        .token_url = "https://auth.openai.com/oauth/token",
+        .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+        .redirect_port = 1455,
+        .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        .originator = "zag_cli",
+        .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        .extra_authorize_params = &.{
+            .{ .name = "id_token_add_organizations", .value = "true" },
+            .{ .name = "codex_cli_simplified_flow", .value = "true" },
+        },
     }) catch |err| {
         // Map the well-known OAuth error paths to actionable hints. Anything
         // not named here falls back to `@errorName`, which at least gives the
@@ -288,10 +299,10 @@ fn runLoginCommand(
         const hint: []const u8 = switch (err) {
             error.StateMismatch => "state mismatch (CSRF protection tripped); retry the command",
             error.AuthorizationDenied => "authorization was denied in the browser",
-            error.AddressInUse => "port 1455 is busy; stop the other listener (lsof -i :1455) and retry",
+            error.AddressInUse => "callback port is busy (another OAuth login? check with lsof); retry",
             error.CallbackMissingQuery, error.CallbackParamMissing => "browser callback was malformed; retry the command",
             error.TokenExchangeFailed => "token exchange with the OAuth server failed",
-            error.ClaimMissing, error.MalformedJwt => "id_token was missing the chatgpt_account_id claim",
+            error.ClaimMissing, error.MalformedJwt => "id_token was missing the expected account_id claim",
             else => @errorName(err),
         };
         err_writer.print("zag: login failed: {s}\n", .{hint}) catch {};
