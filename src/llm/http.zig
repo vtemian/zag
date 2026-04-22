@@ -106,6 +106,32 @@ pub fn freeHeaders(endpoint: *const Endpoint, headers: *std.ArrayList(std.http.H
     headers.deinit(allocator);
 }
 
+/// Merge one injected header into the outgoing list. If a header with the
+/// same name (case-insensitive, RFC 7230 field-name comparison) already
+/// exists, comma-append the new value and free the old value. Otherwise
+/// duplicate the incoming value and append as a new entry.
+///
+/// Post-condition: every `h.value` in `headers` is allocator-owned. Callers
+/// must free each one (via freeHeaders, for example) to avoid leaks.
+fn mergeInjectedHeader(
+    headers: *std.ArrayList(std.http.Header),
+    allocator: Allocator,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    for (headers.items) |*h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            const merged = try std.fmt.allocPrint(allocator, "{s},{s}", .{ h.value, value });
+            allocator.free(h.value);
+            h.value = merged;
+            return;
+        }
+    }
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try headers.append(allocator, .{ .name = name, .value = owned });
+}
+
 /// Send a JSON POST request and return the response body.
 /// Both providers share this HTTP plumbing; only the URL and extra headers differ.
 pub fn httpPostJson(
@@ -231,6 +257,48 @@ test "httpPostJson returns InvalidUri on malformed endpoint" {
     const allocator = std.testing.allocator;
     const result = httpPostJson("not a url", "", &.{}, allocator);
     try std.testing.expectError(error.InvalidUri, result);
+}
+
+test "mergeInjectedHeader: new header appends" {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(std.testing.allocator);
+    // Seed with an owned static header so the uniform-ownership invariant holds:
+    try headers.append(std.testing.allocator, .{
+        .name = "anthropic-version",
+        .value = try std.testing.allocator.dupe(u8, "2023-06-01"),
+    });
+    defer std.testing.allocator.free(headers.items[0].value);
+
+    try mergeInjectedHeader(&headers, std.testing.allocator, "x-app", "cli");
+    try std.testing.expectEqual(@as(usize, 2), headers.items.len);
+    try std.testing.expectEqualStrings("x-app", headers.items[1].name);
+    try std.testing.expectEqualStrings("cli", headers.items[1].value);
+    std.testing.allocator.free(headers.items[1].value);
+    _ = headers.pop();
+}
+
+test "mergeInjectedHeader: collision on list-valued header comma-appends" {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(std.testing.allocator);
+    const initial = try std.testing.allocator.dupe(u8, "a,b");
+    try headers.append(std.testing.allocator, .{ .name = "anthropic-beta", .value = initial });
+
+    try mergeInjectedHeader(&headers, std.testing.allocator, "anthropic-beta", "c");
+    try std.testing.expectEqual(@as(usize, 1), headers.items.len);
+    try std.testing.expectEqualStrings("a,b,c", headers.items[0].value);
+    std.testing.allocator.free(headers.items[0].value);
+}
+
+test "mergeInjectedHeader: case-insensitive name match" {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(std.testing.allocator);
+    const initial = try std.testing.allocator.dupe(u8, "one");
+    try headers.append(std.testing.allocator, .{ .name = "X-Test", .value = initial });
+
+    try mergeInjectedHeader(&headers, std.testing.allocator, "x-test", "two");
+    try std.testing.expectEqual(@as(usize, 1), headers.items.len);
+    try std.testing.expectEqualStrings("one,two", headers.items[0].value);
+    std.testing.allocator.free(headers.items[0].value);
 }
 
 test {
