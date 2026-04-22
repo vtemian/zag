@@ -51,6 +51,11 @@ pub const Pane = struct {
     session: *ConversationHistory,
     /// Agent worker driving LLM calls and tool execution for this pane.
     runner: *AgentRunner,
+    /// Pane-local model override. `null` means the pane reads the shared
+    /// `WindowManager.provider`. Non-null means this pane owns the
+    /// `ProviderResult` pointed to; `WindowManager.deinit` frees it
+    /// alongside the pane.
+    provider: ?*llm.ProviderResult = null,
 };
 
 /// A registered pane plus the persistence handle that keeps it tied to
@@ -216,12 +221,28 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
     self.clearPendingModelPick();
+    // Free pane-local provider overrides after each runner's thread has
+    // been joined but before the runner/view/session objects are
+    // destroyed. The agent worker may hold a borrow of the provider for
+    // the duration of its loop; running this after `runner.deinit()`
+    // guarantees no thread can dereference the pointer we are about to
+    // free. The root pane's override is freed first because it is never
+    // reached by the extra_panes loop.
+    if (self.root_pane.provider) |p| {
+        p.deinit();
+        self.allocator.destroy(p);
+        self.root_pane.provider = null;
+    }
     for (self.extra_panes.items) |entry| {
         if (entry.session_handle) |sh| {
             sh.close();
             self.allocator.destroy(sh);
         }
         entry.pane.runner.deinit();
+        if (entry.pane.provider) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+        }
         self.allocator.destroy(entry.pane.runner);
         entry.pane.view.deinit();
         self.allocator.destroy(entry.pane.view);
@@ -832,6 +853,13 @@ pub fn attachSession(self: *WindowManager, pane: Pane) ?*Session.SessionHandle {
 pub fn getFocusedPane(self: *WindowManager) Pane {
     const leaf = self.layout.getFocusedLeaf() orelse return self.root_pane;
     return self.paneFromBuffer(leaf.buffer) orelse self.root_pane;
+}
+
+/// Resolve the `ProviderResult` a pane reads from: its own override when
+/// set, otherwise the shared WindowManager default. The returned pointer
+/// aliases the override or the shared field; callers must not deinit it.
+pub fn providerFor(self: *const WindowManager, pane: *const Pane) *llm.ProviderResult {
+    return pane.provider orelse self.provider;
 }
 
 /// Look up the pane whose view backs `b`. Returns null if no registered
@@ -2247,4 +2275,38 @@ test "swapProvider persists the pick to config.lua" {
     const body = try std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 16);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
+}
+
+test "providerFor falls back to shared default when override is null" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try std.testing.expect(f.wm.root_pane.provider == null);
+    try std.testing.expectEqual(f.wm.provider, f.wm.providerFor(&f.wm.root_pane));
+}
+
+test "providerFor returns pane override when set" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    // Build a second provider on the heap and hand ownership to the
+    // pane's override slot. WindowManager.deinit will free it via the
+    // override teardown loop; the fixture's own `self.provider.deinit()`
+    // only covers the shared default.
+    const override = try allocator.create(llm.ProviderResult);
+    errdefer allocator.destroy(override);
+    override.* = try llm.createProviderFromLuaConfig(
+        &f.registry,
+        "provB/b1",
+        "/tmp/zag_test_unused_credentials",
+        allocator,
+    );
+    f.wm.root_pane.provider = override;
+
+    try std.testing.expectEqual(override, f.wm.providerFor(&f.wm.root_pane));
+    try std.testing.expect(f.wm.providerFor(&f.wm.root_pane) != f.wm.provider);
 }
