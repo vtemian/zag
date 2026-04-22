@@ -325,6 +325,22 @@ pub fn closeById(
     self.notifyLeafRects();
 }
 
+/// Apply a new split `ratio` to the node identified by `handle`.
+/// Non-split handles are rejected by `Layout.resizeSplit`. After the
+/// ratio changes, the layout is recalculated against the current screen
+/// size and surviving leaves are notified of their new rects.
+pub fn resizeById(
+    self: *WindowManager,
+    handle: NodeRegistry.Handle,
+    ratio: f32,
+) !void {
+    const node = try self.node_registry.resolve(handle);
+    try self.layout.resizeSplit(node, ratio);
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+}
+
 /// Return true if `maybe` still points at a live node in the registry.
 /// Used to decide whether a remembered focus pointer can be restored
 /// after a tree mutation.
@@ -1092,6 +1108,65 @@ test "closeById rejects the caller's own pane" {
         unreachable;
     };
     try std.testing.expectError(error.ClosingActivePane, wm.closeById(root_handle, root_handle));
+}
+
+test "resizeById applies ratio to parent split" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    wm.doSplit(.vertical);
+
+    // After the split, the root is the parent split node. Resolve its
+    // handle so resizeById can adjust the ratio via the registry.
+    const root_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == wm.layout.root) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    try wm.resizeById(root_handle, 0.25);
+    try std.testing.expectEqual(@as(f32, 0.25), wm.layout.root.?.split.ratio);
 }
 
 test "restorePane rebuilds both tree and messages" {
