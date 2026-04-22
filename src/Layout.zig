@@ -202,6 +202,18 @@ pub fn focusDirection(self: *Layout, dir: FocusDirection) void {
     }
 }
 
+/// Adjust the split ratio of an internal `node`. Rejects non-split
+/// targets with `error.NotASplit` and ratios outside the open interval
+/// `(0, 1)` with `error.InvalidRatio`. On success, rects are
+/// recomputed from the root's current rect so callers do not need to
+/// know the screen size.
+pub fn resizeSplit(self: *Layout, node: *LayoutNode, ratio: f32) !void {
+    if (node.* != .split) return error.NotASplit;
+    if (ratio <= 0.0 or ratio >= 1.0) return error.InvalidRatio;
+    node.split.ratio = ratio;
+    if (self.root) |r| recalculateNode(r, r.getRect());
+}
+
 /// Recompute all rects in the layout tree.
 /// Reserves the last row for the status line. Content starts at row 0.
 pub fn recalculate(self: *Layout, screen_width: u16, screen_height: u16) void {
@@ -777,4 +789,32 @@ test "registry receives remove on closeWindow" {
         null_count += 1;
     };
     try std.testing.expectEqual(@as(usize, 2), null_count);
+}
+
+test "resizeSplit updates parent ratio" {
+    var layout = Layout.init(std.testing.allocator);
+    defer layout.deinit();
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    try layout.setRoot(dummy_buf);
+    try layout.splitVertical(0.5, dummy_buf);
+    try layout.resizeSplit(layout.root.?, 0.3);
+    try std.testing.expectEqual(@as(f32, 0.3), layout.root.?.split.ratio);
+}
+
+test "resizeSplit rejects non-split nodes" {
+    var layout = Layout.init(std.testing.allocator);
+    defer layout.deinit();
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    try layout.setRoot(dummy_buf);
+    try std.testing.expectError(error.NotASplit, layout.resizeSplit(layout.root.?, 0.3));
+}
+
+test "resizeSplit clamps ratio to valid open interval" {
+    var layout = Layout.init(std.testing.allocator);
+    defer layout.deinit();
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    try layout.setRoot(dummy_buf);
+    try layout.splitVertical(0.5, dummy_buf);
+    try std.testing.expectError(error.InvalidRatio, layout.resizeSplit(layout.root.?, 0.0));
+    try std.testing.expectError(error.InvalidRatio, layout.resizeSplit(layout.root.?, 1.0));
 }
