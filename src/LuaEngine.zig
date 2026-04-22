@@ -2964,7 +2964,10 @@ pub const LuaEngine = struct {
 
         var out: std.ArrayList(llm.Endpoint.ModelRate) = .empty;
         errdefer {
-            for (out.items) |m| allocator.free(m.id);
+            for (out.items) |m| {
+                if (m.label) |l| allocator.free(l);
+                allocator.free(m.id);
+            }
             out.deinit(allocator);
         }
 
@@ -2980,6 +2983,11 @@ pub const LuaEngine = struct {
             const id = (try readStringField(lua, entry, "id", .required, allocator)) orelse unreachable;
             errdefer allocator.free(id);
 
+            const label = try readStringField(lua, entry, "label", .optional, allocator);
+            errdefer if (label) |l| allocator.free(l);
+
+            const recommended = (try readOptionalBool(lua, entry, "recommended")) orelse false;
+
             const context_window = try readOptionalInteger(lua, entry, "context_window", 0);
             const max_output_tokens = try readOptionalInteger(lua, entry, "max_output_tokens", 0);
             const input_per_mtok = try readOptionalFloat(lua, entry, "input_per_mtok", 0);
@@ -2989,6 +2997,8 @@ pub const LuaEngine = struct {
 
             try out.append(allocator, .{
                 .id = id,
+                .label = label,
+                .recommended = recommended,
                 .context_window = @intCast(context_window),
                 .max_output_tokens = @intCast(max_output_tokens),
                 .input_per_mtok = input_per_mtok,
@@ -2999,6 +3009,20 @@ pub const LuaEngine = struct {
         }
 
         return try out.toOwnedSlice(allocator);
+    }
+
+    /// Read a boolean field with no default. Nil/absent yields `null` so the
+    /// caller can distinguish "unset" from "explicitly false". Non-boolean
+    /// values log and return `error.LuaError`.
+    fn readOptionalBool(lua: *Lua, table_idx: i32, name: [:0]const u8) !?bool {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+        if (lua.isNil(-1)) return null;
+        if (lua.typeOf(-1) != .boolean) {
+            log.warn("zag.provider(): field '{s}' must be a boolean", .{name});
+            return error.LuaError;
+        }
+        return lua.toBoolean(-1);
     }
 
     /// Read an integer field with a default. Nil/absent → `default`. Non-number
@@ -4616,6 +4640,32 @@ test "zag.provider{}: full x_api_key declaration registers the endpoint" {
     try std.testing.expectEqual(@as(usize, 1), ep.models.len);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), ep.models[0].input_per_mtok, 0.001);
     try std.testing.expectEqual(@as(u32, 200000), ep.models[0].context_window);
+}
+
+test "zag.provider{}: models parse label and recommended" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "prov",
+        \\  url = "https://example.com",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "none" },
+        \\  default_model = "m1",
+        \\  models = {
+        \\    { id = "m1", label = "One", recommended = true, context_window = 10, max_output_tokens = 5, input_per_mtok = 1.0, output_per_mtok = 2.0 },
+        \\    { id = "m2", context_window = 20, max_output_tokens = 10, input_per_mtok = 0.5, output_per_mtok = 1.5 },
+        \\  },
+        \\}
+    );
+    const ep = engine.providers_registry.find("prov") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    try std.testing.expectEqualStrings("One", ep.models[0].label.?);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
+    try std.testing.expectEqual(@as(?[]const u8, null), ep.models[1].label);
+    try std.testing.expectEqual(false, ep.models[1].recommended);
 }
 
 test "zag.provider{}: oauth declaration materialises into .oauth variant with full spec" {
