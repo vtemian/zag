@@ -259,6 +259,49 @@ pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !v
     try self.tree.appendToNode(node, text);
 }
 
+/// Result of a `readText` call: plain-text view of the visible lines,
+/// the total line count observed, and whether the tail window was
+/// truncated (i.e. the buffer had more lines than `max_lines`).
+pub const ReadResult = struct {
+    /// Joined plain-text lines separated by '\n'. Caller owns.
+    text: []u8,
+    /// Total visible lines in the buffer at the time of the call.
+    total_lines: usize,
+    /// True when `total_lines` exceeded `max_lines` and the head was
+    /// trimmed. False when the full buffer fit in the window.
+    truncated: bool,
+};
+
+/// Render the most recent `max_lines` visible lines as plain text.
+/// Used by the `pane_read` tool and similar read-only introspection
+/// paths. Always returns the tail of the buffer so plugins see the
+/// freshest turns when they ask for a small window.
+pub fn readText(
+    self: *ConversationBuffer,
+    alloc: Allocator,
+    max_lines: usize,
+    theme: *const Theme,
+) !ReadResult {
+    const total = try self.lineCount();
+    const skip = if (max_lines >= total) 0 else total - max_lines;
+    const truncated = skip > 0;
+
+    var styled = try self.getVisibleLines(alloc, self.allocator, theme, skip, max_lines);
+    defer styled.deinit(alloc);
+
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (parts.items) |p| alloc.free(p);
+        parts.deinit(alloc);
+    }
+    for (styled.items) |line| {
+        const line_text = try line.toText(alloc);
+        try parts.append(alloc, line_text);
+    }
+    const joined = try std.mem.join(alloc, "\n", parts.items);
+    return .{ .text = joined, .total_lines = total, .truncated = truncated };
+}
+
 /// Populate the node tree from loaded JSONL entries. The tool_result
 /// parenting uses a local walker rather than the runner's correlation map
 /// because this path runs during session restore, before any agent has
@@ -549,6 +592,24 @@ test "getVisibleLines returns rendered lines" {
     const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
     try std.testing.expectEqualStrings("> hello", line0);
+}
+
+test "readText emits user and assistant turns as plain text" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "readtext-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+    _ = try cb.appendNode(null, .assistant_text, "world");
+
+    const theme = Theme.defaultTheme();
+    const out = try cb.readText(allocator, 10, &theme);
+    defer allocator.free(out.text);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.text, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.text, "world") != null);
+    try std.testing.expect(!out.truncated);
+    try std.testing.expect(out.total_lines >= 2);
 }
 
 test "buffer interface dispatches correctly" {
