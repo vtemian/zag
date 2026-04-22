@@ -1260,7 +1260,7 @@ test "runLoginCommand rejects providers whose auth is not oauth_chatgpt" {
 
 test "formatMissingCredentialHint points OAuth providers at --login" {
     var scratch: [512]u8 = undefined;
-    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5");
+    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5-codex");
     try std.testing.expectEqualStrings(
         "zag: not signed in to 'openai-oauth'. Run: zag --login=openai-oauth\n",
         msg,

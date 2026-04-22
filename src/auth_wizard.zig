@@ -151,7 +151,7 @@ pub const PROVIDERS = [_]ProviderEntry{
         .label = "OpenAI",
         .kind = .oauth,
         .recommended = true,
-        .default_model = "openai-oauth/gpt-5",
+        .default_model = "openai-oauth/gpt-5-codex",
         .oauth_fn = &chatgptOauthShim,
     },
     .{ .name = "openai", .label = "OpenAI", .kind = .api_key, .default_model = "openai/gpt-4o", .oauth_fn = null },
@@ -1084,7 +1084,7 @@ test "findProvider returns the openai-oauth entry with kind=.oauth" {
     try testing.expectEqual(AuthKind.oauth, entry.kind);
     try testing.expect(entry.recommended);
     try testing.expect(entry.oauth_fn != null);
-    try testing.expectEqualStrings("openai-oauth/gpt-5", entry.default_model);
+    try testing.expectEqualStrings("openai-oauth/gpt-5-codex", entry.default_model);
 }
 
 test "findProvider returns null for unknown" {
@@ -1550,7 +1550,7 @@ test "dispatchProviderCredential calls oauth_fn when set and skips promptSecret"
         .name = "openai-oauth",
         .label = "ChatGPT (OAuth)",
         .kind = .oauth,
-        .default_model = "openai-oauth/gpt-5",
+        .default_model = "openai-oauth/gpt-5-codex",
         .oauth_fn = &test_oauth_fn_stub,
     };
 
@@ -1670,7 +1670,7 @@ test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped ent
         .label = "OpenAI",
         .kind = .oauth,
         .recommended = true,
-        .default_model = "openai-oauth/gpt-5",
+        .default_model = "openai-oauth/gpt-5-codex",
         .oauth_fn = &test_oauth_fn_stub,
     };
 
