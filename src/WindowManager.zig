@@ -294,6 +294,48 @@ pub fn splitById(
     return error.HandleMissing;
 }
 
+/// Close the leaf identified by `target`. When `caller` is non-null and
+/// refers to the same pane, the call fails with `error.ClosingActivePane`
+/// so a plugin tool cannot pull the rug out from under its own agent.
+/// After the close, the layout is recalculated and surviving leaves are
+/// notified of their new rects (same post-close work as the
+/// `.close_window` keymap action). Focus is restored to the caller's
+/// previous pane when that pane is still live.
+pub fn closeById(
+    self: *WindowManager,
+    target: NodeRegistry.Handle,
+    caller: ?NodeRegistry.Handle,
+) !void {
+    if (caller) |c| {
+        if (c.index == target.index and c.generation == target.generation) {
+            return error.ClosingActivePane;
+        }
+    }
+    const node = try self.node_registry.resolve(target);
+    if (node.* != .leaf) return error.NotALeaf;
+
+    const prev_focus = self.layout.focused;
+    self.layout.focused = node;
+    self.layout.closeWindow();
+    if (prev_focus != node and self.nodeStillLive(prev_focus)) {
+        self.layout.focused = prev_focus;
+    }
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+}
+
+/// Return true if `maybe` still points at a live node in the registry.
+/// Used to decide whether a remembered focus pointer can be restored
+/// after a tree mutation.
+fn nodeStillLive(self: *WindowManager, maybe: ?*Layout.LayoutNode) bool {
+    const node = maybe orelse return false;
+    for (self.node_registry.slots.items) |slot| {
+        if (slot.node == node) return true;
+    }
+    return false;
+}
+
 /// Run a keymap-bound Action. Mutating mode, layout, or compositor state
 /// lives here exclusively so handleKey stays a pure dispatcher.
 pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
@@ -945,6 +987,111 @@ test "splitById creates a new leaf and returns its handle" {
     const new_id = try wm.splitById(root_handle, .vertical);
     const new_node = try wm.node_registry.resolve(new_id);
     try std.testing.expect(new_node.* == .leaf);
+}
+
+test "closeById removes a leaf and keeps the sibling" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    wm.doSplit(.vertical);
+
+    // After doSplit, focus is on the new leaf. Resolve its handle so we
+    // can close by ID and confirm the sibling survives as the new root.
+    const new_leaf = wm.layout.focused.?;
+    const handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == new_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    try wm.closeById(handle, null);
+    try std.testing.expect(wm.layout.root.?.* == .leaf);
+}
+
+test "closeById rejects the caller's own pane" {
+    const allocator = std.testing.allocator;
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = undefined,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+
+    const root_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == wm.layout.root) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    try std.testing.expectError(error.ClosingActivePane, wm.closeById(root_handle, root_handle));
 }
 
 test "restorePane rebuilds both tree and messages" {
