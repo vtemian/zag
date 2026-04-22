@@ -223,6 +223,80 @@ All tests inline, `testing.allocator`, no mocks.
 Mid-turn cancel integration test is out of scope for v1; the cancel
 path is exercised by existing `AgentRunner` tests.
 
+## Implementation status
+
+Completed on branch `wip/model-onboarding`. 13 test-carrying commits
+plus one docs commit. `zig build`, `zig build test`, and
+`zig fmt --check .` all exit 0.
+
+Commit trail (top of branch first):
+
+```
+cbf6809 wm: swapProvider cancels, drains, and rebuilds the ProviderResult
+b636a18 wm: route digit input to pending_model_pick
+64fc787 wm: /model opens the numbered picker
+50cd6da wm: add pending_model_pick and renderModelPicker
+a4588da wizard: print paste-me model hint when not scaffolding
+bd9f8c2 wizard: add model picker step to runWizard
+fad095f wizard: thread chosen_model through scaffoldConfigLua
+c8f730d wizard: add promptModel helper
+6d999a8 lua/providers: populate openrouter, groq, ollama model lists
+b8ec064 lua/providers: populate anthropic, anthropic-oauth, openai model lists
+1b2798c lua/providers/openai-oauth: full model list and codex headers
+83d367e lua: parse label and recommended on zag.provider{} models
+06c3cad registry: add label and recommended to ModelRate
+```
+
+## Manual verification
+
+Headless smoke (confirms default-model wiring survived the refactor):
+
+```
+echo "what is 2+2?" > /tmp/zag_smoke.txt
+./zig-out/bin/zag --headless \
+    --instruction-file=/tmp/zag_smoke.txt \
+    --trajectory-out=/tmp/zag_smoke_traj.json
+```
+
+Agent step returns `2 + 2 = 4.` Confirmed after the final commit.
+
+Wizard walk-through (remove `~/.config/zag`, run `zig build run`):
+
+1. Provider picker appears with the usual list plus per-provider auth
+   tags.
+2. After credential capture, model picker appears. Recommended entry
+   is pre-selected and tagged `(recommended)`.
+3. Selection writes `zag.set_default_model("<provider>/<chosen>")` to
+   the scaffolded `~/.config/zag/config.lua`.
+4. TUI starts with `model: <provider>/<chosen>` in the banner.
+
+`zag auth login <prov>` walk-through (existing `~/.config/zag`):
+
+1. Credential capture, then model picker.
+2. On selection the wizard prints:
+   ```
+   Add to ~/.config/zag/config.lua to make permanent:
+     zag.set_default_model("<provider>/<chosen>")
+   ```
+3. `config.lua` is not rewritten; the user pastes the hint themselves.
+
+Runtime `/model` walk-through (inside a live TUI):
+
+1. Type `/model` in insert mode and press Enter.
+2. A numbered list renders into the conversation buffer with the
+   current model marked `(current)`.
+3. Type a number and Enter. The status line reads
+   `model -> <provider>/<id>` plus the paste-me hint.
+4. Next prompt routes through the new provider.
+
+Inline tests cover the follow-up cases:
+
+- `q` or `Q` cancels the pending pick.
+- Out-of-range or non-digit input surfaces an error status and leaves
+  the pick active.
+- `swapProvider` on an unconfigured OAuth provider surfaces
+  `MissingCredential` without corrupting the current `ProviderResult`.
+
 ## Non-goals retained
 
 - No live probing.
