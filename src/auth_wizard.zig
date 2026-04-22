@@ -107,34 +107,29 @@ pub const WizardResult = struct {
 /// the paste-key and OAuth paths share identical post-credential behavior.
 pub const OAuthFn = *const fn (allocator: std.mem.Allocator, provider_name: []const u8, auth_path: []const u8) anyerror!void;
 
+/// How a provider authenticates. Drives the picker's auth-kind tag and
+/// whether `ProviderEntry.oauth_fn` must be non-null for the entry to be
+/// considered well-formed.
+pub const AuthKind = enum { api_key, oauth };
+
 /// Static metadata for one wizard-offered provider.
 ///
 /// `oauth_fn` is the extension seam for browser-OAuth providers. When null
-/// (the default, and every entry's value on `main` today), `runWizard` takes
-/// the paste-key path. When non-null, `runWizard` delegates to the callback
-/// and skips `promptSecret` entirely; the callback owns writing `auth.json`.
-///
-/// Integration note: when `wip/chatgpt-oauth` lands on main, wiring is a
-/// one-line registration. The OAuth plan registers ChatGPT as a separate
-/// provider key (`openai-oauth`, distinct from `openai`), so the expected
-/// shape is to append a new entry:
-///
-///     .{
-///         .name = "openai-oauth",
-///         .label = "ChatGPT (OAuth)",
-///         .default_model = "openai-oauth/gpt-5",
-///         .oauth_fn = oauth.runLoginFlowForOpenAI,
-///     },
-///
-/// where `runLoginFlowForOpenAI` is a thin shim around
-/// `oauth.runLoginFlow(alloc, .{ .provider_name = ..., .auth_path = ... })`.
-/// If a future plan instead attaches OAuth to an existing entry, the same
-/// seam applies — just mutate that entry's `oauth_fn` in place.
+/// the wizard takes the paste-key path; when non-null the callback owns
+/// writing `auth.json`. `kind` categorises the entry for the picker label;
+/// `recommended` pins an entry to the top of the picker and adds a
+/// "recommended" suffix to its label.
 pub const ProviderEntry = struct {
     /// Short key the user picks and the auth/config files store ("openai").
     name: []const u8,
     /// Human-facing label shown in the choice menu ("OpenAI").
     label: []const u8,
+    /// How this provider authenticates; drives the picker tag and whether
+    /// `oauth_fn` is required to be non-null.
+    kind: AuthKind,
+    /// If true, this entry sorts to the top of the picker and is marked
+    /// "recommended" in the rendered label.
+    recommended: bool = false,
     /// Default `zag.set_default_model` string for this provider. Used by
     /// `scaffoldConfigLua` when the user is a first-time stranger; once the
     /// config file exists the wizard never rewrites it.
@@ -147,17 +142,41 @@ pub const ProviderEntry = struct {
 
 /// Providers the wizard knows how to onboard. Order is the display order in
 /// the choice menu and in the scaffolded `config.lua` (picked entry first,
-/// others emitted as commented-out hints).
-///
-/// Every entry sets `oauth_fn` to `null` explicitly; the paste-key flow is
-/// the only onboarding path in this plan. When `wip/chatgpt-oauth` merges,
-/// a new `openai-oauth` entry with a non-null `oauth_fn` joins this table.
+/// others emitted as commented-out hints). The OAuth entry sits on top and
+/// is flagged recommended; the paste-key entries follow in rough popularity
+/// order.
 pub const PROVIDERS = [_]ProviderEntry{
-    .{ .name = "openai", .label = "OpenAI", .default_model = "openai/gpt-4o", .oauth_fn = null },
-    .{ .name = "anthropic", .label = "Anthropic", .default_model = "anthropic/claude-sonnet-4-20250514", .oauth_fn = null },
-    .{ .name = "openrouter", .label = "OpenRouter", .default_model = "openrouter/anthropic/claude-sonnet-4", .oauth_fn = null },
-    .{ .name = "groq", .label = "Groq", .default_model = "groq/llama-3.3-70b-versatile", .oauth_fn = null },
+    .{
+        .name = "openai-oauth",
+        .label = "OpenAI",
+        .kind = .oauth,
+        .recommended = true,
+        .default_model = "openai-oauth/gpt-5",
+        .oauth_fn = &chatgptOauthShim,
+    },
+    .{ .name = "openai", .label = "OpenAI", .kind = .api_key, .default_model = "openai/gpt-4o", .oauth_fn = null },
+    .{ .name = "anthropic", .label = "Anthropic", .kind = .api_key, .default_model = "anthropic/claude-sonnet-4-20250514", .oauth_fn = null },
+    .{ .name = "openrouter", .label = "OpenRouter", .kind = .api_key, .default_model = "openrouter/anthropic/claude-sonnet-4", .oauth_fn = null },
+    .{ .name = "groq", .label = "Groq", .kind = .api_key, .default_model = "groq/llama-3.3-70b-versatile", .oauth_fn = null },
 };
+
+const oauth = @import("oauth.zig");
+
+/// Thin shim matching the `OAuthFn` signature. Delegates to
+/// `oauth.runLoginFlow` with the OpenAI/ChatGPT defaults baked into
+/// `oauth.LoginOptions` (issuer, client_id, port, scopes, originator).
+/// Keeping this in lockstep with `main.zig`'s `runLoginCommand` means the
+/// wizard and `--login=openai-oauth` exercise the same code path.
+fn chatgptOauthShim(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    auth_path: []const u8,
+) anyerror!void {
+    return oauth.runLoginFlow(allocator, .{
+        .provider_name = provider_name,
+        .auth_path = auth_path,
+    });
+}
 
 /// Linear lookup against `PROVIDERS`. Returns a pointer so callers can read
 /// all three fields without copying; null means the user picked a name the
@@ -296,6 +315,243 @@ pub fn promptChoice(
     return error.TooManyRetries;
 }
 
+/// One picker entry. Wrapped in a struct (instead of a plain `[]const u8`) so
+/// future fields (icon, disabled flag, keybind hint) can land without
+/// rippling through every call site.
+pub const PickerLabel = struct {
+    /// Rendered text for the row, e.g. `"OpenAI  (paste key)"`.
+    text: []const u8,
+};
+
+/// Decoded action the picker should take after consuming an input byte.
+/// Split out from `promptPicker` so the parse logic is reachable from unit
+/// tests without a real TTY. `.noop` covers both "still assembling a multi-
+/// byte escape sequence" and "byte we chose to ignore".
+const PickerEvent = union(enum) {
+    up,
+    down,
+    commit,
+    abort,
+    noop,
+};
+
+/// Running state for the tiny ESC-sequence decoder that `parsePickerByte`
+/// drives. We only recognise `ESC [ A` and `ESC [ B`; anything else inside
+/// an escape sequence resets the state and is dropped.
+const PickerParseState = struct {
+    /// Set after we see a bare `\x1b`; next byte must be `[` to continue.
+    in_escape: bool = false,
+    /// Set after we see `\x1b [`; next byte is the final direction byte.
+    expect_bracket: bool = false,
+};
+
+/// Feed one byte from stdin through the picker's escape-sequence decoder.
+/// Arrow keys arrive as the three-byte burst `\x1b`, `[`, `A|B`; the first
+/// two bytes return `.noop` and the third returns `.up` / `.down`. CR/LF
+/// commit; `q`/`Q` abort; every other byte is `.noop`.
+///
+/// Bare ESC does NOT abort: distinguishing "ESC alone" from "ESC that
+/// introduces a CSI" requires timing information this decoder doesn't have,
+/// and `ISIG` stays on in raw mode so Ctrl-C still tears the prompt down.
+fn parsePickerByte(state: *PickerParseState, byte: u8) PickerEvent {
+    if (state.expect_bracket) {
+        state.expect_bracket = false;
+        state.in_escape = false;
+        return switch (byte) {
+            'A' => .up,
+            'B' => .down,
+            else => .noop,
+        };
+    }
+    if (state.in_escape) {
+        state.in_escape = false;
+        if (byte == '[') {
+            state.expect_bracket = true;
+            return .noop;
+        }
+        return .noop;
+    }
+    return switch (byte) {
+        0x1b => blk: {
+            state.in_escape = true;
+            break :blk .noop;
+        },
+        '\r', '\n' => .commit,
+        'q', 'Q' => .abort,
+        else => .noop,
+    };
+}
+
+/// ANSI: move cursor up N rows (`ESC [ N A`), clear from cursor to end of
+/// screen (`ESC [ J`). One combined write keeps the redraw flicker-free on
+/// terminals that honour synchronized output.
+fn writePickerRewind(writer: *std.Io.Writer, lines: usize) !void {
+    try writer.print("\x1b[{d}A\x1b[J", .{lines});
+}
+
+/// Render the current picker frame: prompt, blank line, labelled rows with
+/// a `>` gutter on the cursor row, blank line, navigation hint. Flushes so
+/// the frame lands before we block on `read`.
+fn renderPickerFrame(
+    writer: *std.Io.Writer,
+    prompt: []const u8,
+    labels: []const PickerLabel,
+    cursor: usize,
+) !void {
+    try writer.writeAll(prompt);
+    try writer.writeByte('\n');
+    try writer.writeByte('\n');
+    for (labels, 0..) |label, i| {
+        if (i == cursor) {
+            try writer.writeAll("  > ");
+        } else {
+            try writer.writeAll("    ");
+        }
+        try writer.writeAll(label.text);
+        try writer.writeByte('\n');
+    }
+    try writer.writeByte('\n');
+    try writer.writeAll("up/down to navigate . Enter to select . q to abort\n");
+    try writer.flush();
+}
+
+/// Count of rendered rows to rewind over when redrawing:
+/// `labels.len` label rows + 1 blank after the prompt + 1 blank before the
+/// hint + 1 hint row. The prompt itself stays on screen across redraws.
+fn pickerRewindLines(labels_len: usize) usize {
+    return labels_len + 3;
+}
+
+/// Interactive arrow-key picker over raw stdin. Reads one byte at a time
+/// through `parsePickerByte`, redraws the list on every cursor move, and
+/// returns the zero-based index of the committed row. `q` / `Q` and bare
+/// EOF surface as `error.UserAborted`; Ctrl-C still kills the process
+/// because we deliberately leave `ISIG` enabled.
+///
+/// The non-TTY branch (`deps.is_tty == false`) delegates to `promptChoice`
+/// so tests can exercise the wizard's fallback path against fake I/O
+/// without trying to fake termios.
+pub fn promptPicker(
+    deps: *const WizardDeps,
+    prompt: []const u8,
+    labels: []const PickerLabel,
+    initial: usize,
+) !usize {
+    if (labels.len == 0) return error.UserAborted;
+
+    if (!deps.is_tty) {
+        var fallback_labels = try deps.allocator.alloc([]const u8, labels.len);
+        defer deps.allocator.free(fallback_labels);
+        for (labels, 0..) |l, i| fallback_labels[i] = l.text;
+        return promptChoice(deps, prompt, fallback_labels);
+    }
+
+    const fd = std.posix.STDIN_FILENO;
+    const original = try std.posix.tcgetattr(fd);
+    var raw = original;
+    // Per-byte reads: kill ECHO + ICANON, leave ISIG alone (Ctrl-C must work).
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    // ICRNL rewrites Enter (\r) to \n before we see it; we parse both, but
+    // turning it off keeps the byte-for-byte semantics the tests encode.
+    raw.iflag.ICRNL = false;
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    try std.posix.tcsetattr(fd, .NOW, raw);
+    defer std.posix.tcsetattr(fd, .NOW, original) catch |err| {
+        log.warn("failed to restore termios: {}", .{err});
+    };
+
+    var cursor = if (initial < labels.len) initial else 0;
+    var state: PickerParseState = .{};
+
+    try renderPickerFrame(deps.stdout, prompt, labels, cursor);
+
+    var buf: [1]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch |err| {
+            try deps.stdout.writeByte('\n');
+            try deps.stdout.flush();
+            return err;
+        };
+        if (n == 0) {
+            try deps.stdout.writeByte('\n');
+            try deps.stdout.flush();
+            return error.UserAborted;
+        }
+
+        const event = parsePickerByte(&state, buf[0]);
+        switch (event) {
+            .noop => continue,
+            .up => {
+                const new_cursor = if (cursor == 0) labels.len - 1 else cursor - 1;
+                if (new_cursor == cursor) continue;
+                cursor = new_cursor;
+                try writePickerRewind(deps.stdout, pickerRewindLines(labels.len));
+                try renderPickerFrame(deps.stdout, prompt, labels, cursor);
+            },
+            .down => {
+                const new_cursor = if (cursor + 1 >= labels.len) 0 else cursor + 1;
+                if (new_cursor == cursor) continue;
+                cursor = new_cursor;
+                try writePickerRewind(deps.stdout, pickerRewindLines(labels.len));
+                try renderPickerFrame(deps.stdout, prompt, labels, cursor);
+            },
+            .commit => {
+                try deps.stdout.writeByte('\n');
+                try deps.stdout.flush();
+                return cursor;
+            },
+            .abort => {
+                try deps.stdout.writeByte('\n');
+                try deps.stdout.flush();
+                return error.UserAborted;
+            },
+        }
+    }
+}
+
+/// Compute the widest `label` across `PROVIDERS`. Used by
+/// `formatProviderLabel` to left-pad every entry to the same column so the
+/// auth-kind tag starts at a consistent offset.
+fn maxProviderLabelWidth() usize {
+    var widest: usize = 0;
+    for (&PROVIDERS) |entry| {
+        if (entry.label.len > widest) widest = entry.label.len;
+    }
+    return widest;
+}
+
+/// Render `entry` as a picker row: `"<label><padding>  (<tags>)"`. Tags are
+/// the auth-kind (`"API key"` or `"OAuth . ChatGPT sign-in"`, joined by
+/// U+00B7 MIDDLE DOT) plus an optional `"recommended"` marker. The caller
+/// owns the returned slice; free via the same allocator.
+fn formatProviderLabel(
+    allocator: std.mem.Allocator,
+    entry: *const ProviderEntry,
+) ![]u8 {
+    const pad_to = maxProviderLabelWidth();
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, entry.label);
+    if (entry.label.len < pad_to) {
+        try buf.appendNTimes(allocator, ' ', pad_to - entry.label.len);
+    }
+    try buf.appendSlice(allocator, "  (");
+
+    switch (entry.kind) {
+        .oauth => try buf.appendSlice(allocator, "OAuth \xc2\xb7 ChatGPT sign-in"),
+        .api_key => try buf.appendSlice(allocator, "API key"),
+    }
+    if (entry.recommended) {
+        try buf.appendSlice(allocator, " \xc2\xb7 recommended");
+    }
+    try buf.append(allocator, ')');
+
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Drop a trailing `\r` so CRLF-terminated input from a Windows-era terminal
 /// round-trips through `takeDelimiter('\n')` as a clean token.
 fn stripCr(line: []const u8) []const u8 {
@@ -428,13 +684,24 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
         if (deps.forced_provider) |forced| {
             break :blk findProvider(forced) orelse return error.UnknownProvider;
         }
-        try deps.stdout.writeAll("zag needs a provider. Choose one:\n");
-        try deps.stdout.flush();
 
-        var labels: [PROVIDERS.len][]const u8 = undefined;
-        for (&PROVIDERS, 0..) |entry, i| labels[i] = entry.label;
+        var label_bufs: [PROVIDERS.len][]u8 = undefined;
+        var built: usize = 0;
+        errdefer for (label_bufs[0..built]) |b| deps.allocator.free(b);
+        while (built < PROVIDERS.len) : (built += 1) {
+            label_bufs[built] = try formatProviderLabel(deps.allocator, &PROVIDERS[built]);
+        }
+        defer for (label_bufs) |b| deps.allocator.free(b);
 
-        const choice = try promptChoice(&deps, "", &labels);
+        var picker_labels: [PROVIDERS.len]PickerLabel = undefined;
+        for (label_bufs, 0..) |b, i| picker_labels[i] = .{ .text = b };
+
+        const choice = try promptPicker(
+            &deps,
+            "zag needs a provider. Choose one:",
+            &picker_labels,
+            0,
+        );
         break :blk &PROVIDERS[choice];
     };
 
@@ -602,6 +869,56 @@ test "promptChoice retries on non-digit" {
     try testing.expectEqual(@as(usize, 2), choice);
 }
 
+test "parsePickerByte: 'j'/'k' are noop, only arrows move" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'j'));
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'k'));
+}
+
+test "parsePickerByte: down arrow is ESC [ B" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 0x1b));
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, '['));
+    try testing.expectEqual(PickerEvent.down, parsePickerByte(&state, 'B'));
+}
+
+test "parsePickerByte: up arrow is ESC [ A" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 0x1b));
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, '['));
+    try testing.expectEqual(PickerEvent.up, parsePickerByte(&state, 'A'));
+}
+
+test "parsePickerByte: CR commits" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.commit, parsePickerByte(&state, '\r'));
+}
+
+test "parsePickerByte: LF commits" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.commit, parsePickerByte(&state, '\n'));
+}
+
+test "parsePickerByte: q aborts" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.abort, parsePickerByte(&state, 'q'));
+}
+
+test "promptPicker with is_tty=false falls back to promptChoice" {
+    var stdin = std.Io.Reader.fixed("2\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const labels = [_]PickerLabel{
+        .{ .text = "openai" },
+        .{ .text = "anthropic" },
+        .{ .text = "groq" },
+    };
+    const choice = try promptPicker(&deps, "Pick a provider:", &labels, 0);
+    try testing.expectEqual(@as(usize, 1), choice);
+}
+
 test "promptChoice returns UserAborted on EOF" {
     var stdin = std.Io.Reader.fixed("");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -709,7 +1026,17 @@ test "findProvider returns matching entry" {
     const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
     try testing.expectEqualStrings("anthropic", entry.name);
     try testing.expectEqualStrings("Anthropic", entry.label);
+    try testing.expectEqual(AuthKind.api_key, entry.kind);
     try testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", entry.default_model);
+}
+
+test "findProvider returns the openai-oauth entry with kind=.oauth" {
+    const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
+    try testing.expectEqualStrings("openai-oauth", entry.name);
+    try testing.expectEqual(AuthKind.oauth, entry.kind);
+    try testing.expect(entry.recommended);
+    try testing.expect(entry.oauth_fn != null);
+    try testing.expectEqualStrings("openai-oauth/gpt-5", entry.default_model);
 }
 
 test "findProvider returns null for unknown" {
@@ -733,6 +1060,7 @@ test "scaffoldConfigLua writes expected contents for openai" {
         \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
         \\
         \\zag.provider { name = "openai" }
+        \\-- zag.provider { name = "openai-oauth" }
         \\-- zag.provider { name = "anthropic" }
         \\-- zag.provider { name = "openrouter" }
         \\-- zag.provider { name = "groq" }
@@ -763,6 +1091,7 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
         \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
         \\
         \\zag.provider { name = "anthropic" }
+        \\-- zag.provider { name = "openai-oauth" }
         \\-- zag.provider { name = "openai" }
         \\-- zag.provider { name = "openrouter" }
         \\-- zag.provider { name = "groq" }
@@ -844,7 +1173,9 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     defer testing.allocator.free(paths.auth_path);
     defer testing.allocator.free(paths.config_path);
 
-    var stdin = std.Io.Reader.fixed("1\nsk-abc-123\n");
+    // `2` picks the api-key openai entry; entry 1 is the openai-oauth
+    // recommended row whose oauth_fn would launch a real browser.
+    var stdin = std.Io.Reader.fixed("2\nsk-abc-123\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
@@ -959,7 +1290,9 @@ test "runWizard appends to existing auth.json without clobbering other providers
         try auth.saveAuthFile(paths.auth_path, seed);
     }
 
-    var stdin = std.Io.Reader.fixed("1\nsk-new\n");
+    // `2` picks the api-key openai entry; entry 1 is the openai-oauth
+    // recommended row whose oauth_fn would launch a real browser.
+    var stdin = std.Io.Reader.fixed("2\nsk-new\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
@@ -1168,6 +1501,7 @@ test "dispatchProviderCredential calls oauth_fn when set and skips promptSecret"
     const picked: ProviderEntry = .{
         .name = "openai-oauth",
         .label = "ChatGPT (OAuth)",
+        .kind = .oauth,
         .default_model = "openai-oauth/gpt-5",
         .oauth_fn = &test_oauth_fn_stub,
     };
@@ -1216,6 +1550,7 @@ test "dispatchProviderCredential falls through to paste path when oauth_fn is nu
     const picked: ProviderEntry = .{
         .name = "openai",
         .label = "OpenAI",
+        .kind = .api_key,
         .default_model = "openai/gpt-4o",
         .oauth_fn = null,
     };
@@ -1229,13 +1564,97 @@ test "dispatchProviderCredential falls through to paste path when oauth_fn is nu
     try testing.expectEqualStrings("sk-paste-key", (try loaded.getApiKey("openai")).?);
 }
 
-test "PROVIDERS entries all default oauth_fn to null" {
-    // The paste-key flow is the only onboarding path in this plan. Guard
-    // against an accidental registration landing in a different PR by
-    // asserting every entry's oauth_fn is explicitly null.
+test "PROVIDERS: oauth entries carry oauth_fn, api_key entries don't" {
+    // Invariant: every `.oauth` entry must have a non-null `oauth_fn` (or the
+    // picker dispatch would fall through to `promptSecret` with nothing to
+    // paste), and every `.api_key` entry must leave `oauth_fn` null (so the
+    // paste flow runs). Guards against a future registration flipping the
+    // wrong field.
     for (&PROVIDERS) |entry| {
-        try testing.expectEqual(@as(?OAuthFn, null), entry.oauth_fn);
+        switch (entry.kind) {
+            .oauth => try testing.expect(entry.oauth_fn != null),
+            .api_key => try testing.expectEqual(@as(?OAuthFn, null), entry.oauth_fn),
+        }
     }
+}
+
+test "PROVIDERS: exactly one recommended entry, pinned to the top" {
+    var recommended_count: usize = 0;
+    for (&PROVIDERS) |entry| {
+        if (entry.recommended) recommended_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), recommended_count);
+    try testing.expect(PROVIDERS[0].recommended);
+}
+
+test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped entry" {
+    // Mirrors the real PROVIDERS[0] registration but swaps the shim for a
+    // stub so the test doesn't talk to the real OAuth server. Locks in the
+    // contract that `.kind = .oauth + oauth_fn` entries always dispatch to
+    // the callback, not to `promptSecret`.
+    test_oauth_call_count = 0;
+    test_oauth_last_provider = "";
+    test_oauth_last_auth_path = "";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    const picked: ProviderEntry = .{
+        .name = "openai-oauth",
+        .label = "OpenAI",
+        .kind = .oauth,
+        .recommended = true,
+        .default_model = "openai-oauth/gpt-5",
+        .oauth_fn = &test_oauth_fn_stub,
+    };
+
+    try dispatchProviderCredential(&deps, &picked);
+    try testing.expectEqual(@as(usize, 1), test_oauth_call_count);
+    try testing.expectEqualStrings("openai-oauth", test_oauth_last_provider);
+}
+
+test "formatProviderLabel for openai-oauth shows OAuth . ChatGPT sign-in . recommended" {
+    const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, entry);
+    defer testing.allocator.free(rendered);
+    const expected = "OpenAI      (OAuth \xc2\xb7 ChatGPT sign-in \xc2\xb7 recommended)";
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "formatProviderLabel for openai (api_key) shows API key" {
+    const entry = findProvider("openai") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, entry);
+    defer testing.allocator.free(rendered);
+    const expected = "OpenAI      (API key)";
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "formatProviderLabel pads anthropic to widest label width" {
+    const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, entry);
+    defer testing.allocator.free(rendered);
+    // "OpenRouter" is the widest label at 10 chars; "Anthropic" is 9, so one
+    // trailing space before the two-space gutter.
+    const expected = "Anthropic   (API key)";
+    try testing.expectEqualStrings(expected, rendered);
 }
 
 test "removeAuth is a no-op for missing entry" {
