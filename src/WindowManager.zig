@@ -29,6 +29,7 @@ const Session = @import("Session.zig");
 const Keymap = @import("Keymap.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
 const agent_events = @import("agent_events.zig");
+const auth_wizard = @import("auth_wizard.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const input = @import("input.zig");
@@ -989,14 +990,52 @@ pub fn swapProvider(
     self.provider.deinit();
     self.provider.* = new_result;
 
-    // Step 4: surface a confirmation plus the paste-me hint.
+    // Step 4: try to persist the pick to config.lua. On any failure fall
+    // back to the paste-me hint so the user knows how to make the swap
+    // permanent by hand. auth_path lives next to config.lua on disk, so
+    // we derive one from the other; config_path is heap-allocated and
+    // owned by the caller.
+    const config_path = buildConfigPathFromAuth(self.allocator, self.provider.auth_path) catch null;
+    defer if (config_path) |p| self.allocator.free(p);
+
+    const persisted = if (config_path) |p| blk: {
+        auth_wizard.persistDefaultModel(self.allocator, p, model_string) catch |err| {
+            log.warn("persistDefaultModel failed: {}", .{err});
+            break :blk false;
+        };
+        break :blk true;
+    } else false;
+
     var scratch: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(
-        &scratch,
-        "model -> {s}\n  Persist with zag.set_default_model(\"{s}\") in config.lua",
-        .{ model_string, model_string },
-    ) catch "model swapped";
+    const msg = if (persisted)
+        std.fmt.bufPrint(
+            &scratch,
+            "model -> {s}\n  saved as default in {s}",
+            .{ model_string, config_path.? },
+        ) catch "model swapped"
+    else
+        std.fmt.bufPrint(
+            &scratch,
+            "model -> {s}\n  Persist with zag.set_default_model(\"{s}\") in config.lua",
+            .{ model_string, model_string },
+        ) catch "model swapped";
     self.appendStatus(msg);
+}
+
+/// Derive the `config.lua` path that lives alongside `auth_path`. zag
+/// stores both under `~/.config/zag/`, so swapping the filename
+/// component is enough. Returns null when `auth_path` does not end in
+/// `auth.json` (e.g. test fixtures that point at a throwaway temp
+/// file), which signals the caller to skip persistence rather than
+/// write a bogus sibling. The returned slice is caller-owned.
+fn buildConfigPathFromAuth(
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+) !?[]u8 {
+    const basename = "auth.json";
+    if (!std.mem.endsWith(u8, auth_path, basename)) return null;
+    const prefix = auth_path[0 .. auth_path.len - basename.len];
+    return try std.fmt.allocPrint(allocator, "{s}config.lua", .{prefix});
 }
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
@@ -2092,8 +2131,11 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
     try f.registry.add(try ep_b.dupe(allocator));
 
     // Real ProviderResult. Any non-empty `auth_path` is fine; the
-    // endpoint's `.auth = .none` short-circuits the file read.
-    f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", "/tmp/unused_auth.json", allocator);
+    // endpoint's `.auth = .none` short-circuits the file read. The
+    // basename deliberately does NOT end in `auth.json` so
+    // `swapProvider`'s config.lua derivation returns null and tests
+    // don't leak a stray config file into /tmp.
+    f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", "/tmp/zag_test_unused_credentials", allocator);
 
     f.session = ConversationHistory.init(allocator);
     f.view = try ConversationBuffer.init(allocator, 0, "root");
@@ -2176,4 +2218,33 @@ test "swapProvider rebuilds ProviderResult and updates model_id" {
 
     try f.wm.swapProvider("provB", "b2");
     try std.testing.expectEqualStrings("provB/b2", f.wm.provider.model_id);
+}
+
+test "swapProvider persists the pick to config.lua" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_abs);
+    const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
+    defer allocator.free(auth_path);
+    const config_path = try std.fs.path.join(allocator, &.{ dir_abs, "config.lua" });
+    defer allocator.free(config_path);
+
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    // Rewire the fixture's provider to point at a real tmp auth.json
+    // path so `buildConfigPathFromAuth` derives a sibling config.lua
+    // that we can inspect after the swap.
+    f.provider.deinit();
+    f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", auth_path, allocator);
+
+    try f.wm.swapProvider("provB", "b2");
+
+    const body = try std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 16);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
 }
