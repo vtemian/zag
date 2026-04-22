@@ -953,10 +953,15 @@ pub fn swapProvider(
 
     // Step 1: drain any in-flight turn on the focused pane's runner.
     // getFocusedPane falls back to root_pane when no leaf is focused.
+    // The drain polls cooperatively; a stuck tool or streaming HTTP
+    // call would otherwise hang the TUI forever, so we cap the wait.
     const runner = self.getFocusedPane().runner;
     if (runner.isAgentRunning()) {
         runner.cancelAgent();
-        while (runner.isAgentRunning()) {
+        const timeout_ms: u64 = 5_000;
+        var waited_ms: u64 = 0;
+        while (runner.isAgentRunning()) : (waited_ms += 1) {
+            if (waited_ms >= timeout_ms) return error.SwapTimeout;
             _ = runner.drainEvents(self.allocator);
             std.Thread.sleep(1 * std.time.ns_per_ms);
         }
@@ -1083,8 +1088,11 @@ pub fn renderModelPicker(self: *WindowManager) !void {
     }
     try header.appendSlice(self.allocator, "Type a number and press Enter, or q to cancel.\n");
 
-    self.appendStatus(header.items);
+    // Claim the pending-pick slot BEFORE painting the UI so a typed
+    // digit cannot arrive before the slot is set (which would fall
+    // through as a slash command and confuse the user).
     self.pending_model_pick = try entries.toOwnedSlice(self.allocator);
+    self.appendStatus(header.items);
 }
 
 /// Handle `/perf` (summary) or `/perf-dump` (write trace file).
