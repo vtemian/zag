@@ -242,8 +242,62 @@ fn execute_resize(
     } });
 }
 
+const PaneReadInput = struct {
+    id: []const u8,
+    lines: ?u32 = null,
+    offset: ?u32 = null,
+};
+
+/// Read the rendered contents of a pane as plain text. Optional
+/// `lines` caps the number of lines returned; optional `offset` skips
+/// leading lines. The main thread walks the pane's buffer via
+/// `ConversationBuffer.readText`.
+pub const pane_read_tool: types.Tool = .{
+    .definition = .{
+        .name = "pane_read",
+        .description = "Read the rendered contents of a pane as plain text.",
+        .input_schema_json =
+        \\{"type":"object","properties":{"id":{"type":"string"},"lines":{"type":"integer"},"offset":{"type":"integer"}},"required":["id"],"additionalProperties":false}
+        ,
+        .prompt_snippet = "pane_read: read a pane's rendered text",
+    },
+    .execute = &execute_pane_read,
+};
+
+fn execute_pane_read(
+    input_raw: []const u8,
+    allocator: std.mem.Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
+    const parsed = std.json.parseFromSlice(
+        PaneReadInput,
+        allocator,
+        input_raw,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        return .{
+            .content = "error: input must include string id",
+            .is_error = true,
+            .owned = false,
+        };
+    };
+    defer parsed.deinit();
+    return dispatch(allocator, .{ .read_pane = .{
+        .id = parsed.value.id,
+        .lines = parsed.value.lines,
+        .offset = parsed.value.offset,
+    } });
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "pane_read rejects missing id" {
+    const res = try execute_pane_read("{}", std.testing.allocator, null);
+    try std.testing.expect(res.is_error);
+    if (res.owned) std.testing.allocator.free(res.content);
 }
 
 test "layout_focus rejects missing id" {
