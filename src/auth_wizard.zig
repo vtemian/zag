@@ -632,6 +632,7 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     } orelse return error.UserAborted;
     const clean = stripCr(line);
     const trimmed = std.mem.trim(u8, clean, " \t");
+    const unwrapped = stripBracketedPaste(trimmed);
 
     if (deps.is_tty) {
         // Enter wasn't echoed; move the cursor down so the next prompt doesn't
@@ -640,10 +641,40 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
         try deps.stdout.flush();
     }
 
-    if (trimmed.len == 0) return error.EmptyInput;
-    if (trimmed.len > max_secret_len) return error.KeyTooLong;
+    if (unwrapped.len == 0) return error.EmptyInput;
+    if (unwrapped.len > max_secret_len) return error.KeyTooLong;
 
-    return deps.allocator.dupe(u8, trimmed);
+    return deps.allocator.dupe(u8, unwrapped);
+}
+
+/// Strip bracketed paste markers that modern terminals wrap around
+/// pasted content (`ESC [ 200 ~` before, `ESC [ 201 ~` after). Also
+/// trims any trailing bytes after the end marker so a paste followed
+/// by a stray Enter doesn't leak a partial escape into the secret.
+/// Idempotent and safe on input that lacks the markers.
+fn stripBracketedPaste(s: []const u8) []const u8 {
+    const start_marker = "\x1b[200~";
+    const end_marker = "\x1b[201~";
+    var out = s;
+    if (std.mem.startsWith(u8, out, start_marker)) {
+        out = out[start_marker.len..];
+    }
+    if (std.mem.indexOf(u8, out, end_marker)) |idx| {
+        out = out[0..idx];
+    }
+    return std.mem.trim(u8, out, " \t");
+}
+
+test "stripBracketedPaste removes both markers" {
+    try std.testing.expectEqualStrings("sk-abc", stripBracketedPaste("\x1b[200~sk-abc\x1b[201~"));
+}
+
+test "stripBracketedPaste is a noop when no markers" {
+    try std.testing.expectEqualStrings("sk-abc", stripBracketedPaste("sk-abc"));
+}
+
+test "stripBracketedPaste trims trailing whitespace after end marker" {
+    try std.testing.expectEqualStrings("sk-abc", stripBracketedPaste("\x1b[200~sk-abc\x1b[201~  "));
 }
 
 /// Dispatch credential capture for `picked`. OAuth endpoints run a generic
