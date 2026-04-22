@@ -855,6 +855,19 @@ pub fn getFocusedPane(self: *WindowManager) Pane {
     return self.paneFromBuffer(leaf.buffer) orelse self.root_pane;
 }
 
+/// Pointer variant of `getFocusedPane`: returns the in-place `*Pane` so
+/// callers can mutate per-pane state (e.g. the model override slot).
+/// Falls back to `&self.root_pane` on the same two unfocused branches as
+/// `getFocusedPane`, matching its total-function contract.
+pub fn getFocusedPanePtr(self: *WindowManager) *Pane {
+    const leaf = self.layout.getFocusedLeaf() orelse return &self.root_pane;
+    if (self.root_pane.view.buf().ptr == leaf.buffer.ptr) return &self.root_pane;
+    for (self.extra_panes.items) |*entry| {
+        if (entry.pane.view.buf().ptr == leaf.buffer.ptr) return &entry.pane;
+    }
+    return &self.root_pane;
+}
+
 /// Resolve the `ProviderResult` a pane reads from: its own override when
 /// set, otherwise the shared WindowManager default. The returned pointer
 /// aliases the override or the shared field; callers must not deinit it.
@@ -981,10 +994,11 @@ pub fn swapProvider(
     const registry = self.registry orelse return error.NoRegistry;
 
     // Step 1: drain any in-flight turn on the focused pane's runner.
-    // getFocusedPane falls back to root_pane when no leaf is focused.
+    // getFocusedPanePtr falls back to &root_pane when no leaf is focused.
     // The drain polls cooperatively; a stuck tool or streaming HTTP
     // call would otherwise hang the TUI forever, so we cap the wait.
-    const runner = self.getFocusedPane().runner;
+    const focused = self.getFocusedPanePtr();
+    const runner = focused.runner;
     if (runner.isAgentRunning()) {
         runner.cancelAgent();
         const timeout_ms: u64 = 5_000;
@@ -998,7 +1012,9 @@ pub fn swapProvider(
     runner.shutdown();
 
     // Step 2: build the new provider BEFORE touching the old, so a
-    // failure leaves the old provider live.
+    // failure leaves the old provider live. Auth still comes from
+    // `self.provider.auth_path`: the shared default always carries a
+    // valid path since it is the object the wizard / startup built.
     const model_string = try std.fmt.allocPrint(
         self.allocator,
         "{s}/{s}",
@@ -1014,9 +1030,27 @@ pub fn swapProvider(
     );
     errdefer new_result.deinit();
 
-    // Step 3: atomically swap inside the shared ProviderResult slot.
-    self.provider.deinit();
-    self.provider.* = new_result;
+    // Step 3: store the new provider on the FOCUSED pane's override.
+    // The shared `self.provider` slot is left untouched so other panes
+    // keep reading the global default via `providerFor`.
+    if (focused.provider) |existing| {
+        // Pane already owns an override: deinit the old payload in
+        // place and overwrite with the new one. The heap slot is
+        // reused, so no alloc / free churn on repeated swaps.
+        existing.deinit();
+        existing.* = new_result;
+    } else {
+        // First override for this pane: heap-allocate a slot, move the
+        // new payload in, and hand ownership to the pane. The
+        // `allocator.destroy(owned)` errdefer is belt-and-braces; the
+        // pointer assignment below cannot fail, but keeping it protects
+        // the code against future refactors that insert a fallible
+        // step before the assignment.
+        const owned = try self.allocator.create(llm.ProviderResult);
+        errdefer self.allocator.destroy(owned);
+        owned.* = new_result;
+        focused.provider = owned;
+    }
 
     // Step 4: try to persist the pick to config.lua. On any failure fall
     // back to the paste-me hint so the user knows how to make the swap
@@ -1104,12 +1138,15 @@ pub fn renderModelPicker(self: *WindowManager) !void {
     self.clearPendingModelPick();
 
     const registry = self.registry orelse return error.NoRegistry;
-    const current_provider = self.currentProviderName();
-    const current_model_id = blk: {
-        const id = self.provider.model_id;
-        const slash = std.mem.indexOfScalar(u8, id, '/') orelse break :blk id;
-        break :blk id[slash + 1 ..];
-    };
+    // The picker marks the CURRENT model of the focused pane, not the
+    // shared default, so a split pane with its own override sees its
+    // own row highlighted.
+    const focused = self.getFocusedPanePtr();
+    const current = self.providerFor(focused);
+    const current_model_id_full = current.model_id;
+    const slash_idx = std.mem.indexOfScalar(u8, current_model_id_full, '/');
+    const current_provider = if (slash_idx) |i| current_model_id_full[0..i] else current_model_id_full;
+    const current_model_id = if (slash_idx) |i| current_model_id_full[i + 1 ..] else current_model_id_full;
 
     var entries: std.ArrayList(PendingPickEntry) = .empty;
     errdefer {
@@ -2197,12 +2234,13 @@ test "handleCommand resolves digit input when pending_model_pick is set" {
 
     // Typing "2" picks entry index 1. The happy path must clear the
     // pending pick, return .handled, and route through swapProvider so
-    // provider.model_id reflects the new choice (provA/a2 in this
-    // fixture).
+    // the focused pane's active provider reflects the new choice
+    // (provA/a2 in this fixture). The shared default is NOT mutated.
     const result = f.wm.handleCommand("2");
     try std.testing.expectEqual(CommandResult.handled, result);
     try std.testing.expectEqual(@as(?[]PendingPickEntry, null), f.wm.pending_model_pick);
-    try std.testing.expectEqualStrings("provA/a2", f.wm.provider.model_id);
+    try std.testing.expectEqualStrings("provA/a2", f.wm.providerFor(&f.wm.root_pane).model_id);
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
 }
 
 test "handleCommand cancels pending pick on q" {
@@ -2245,7 +2283,10 @@ test "swapProvider rebuilds ProviderResult and updates model_id" {
     try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
 
     try f.wm.swapProvider("provB", "b2");
-    try std.testing.expectEqualStrings("provB/b2", f.wm.provider.model_id);
+    // The focused pane's ACTIVE provider reflects the swap; the shared
+    // default is deliberately untouched.
+    try std.testing.expectEqualStrings("provB/b2", f.wm.providerFor(&f.wm.root_pane).model_id);
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
 }
 
 test "swapProvider persists the pick to config.lua" {
@@ -2309,4 +2350,77 @@ test "providerFor returns pane override when set" {
 
     try std.testing.expectEqual(override, f.wm.providerFor(&f.wm.root_pane));
     try std.testing.expect(f.wm.providerFor(&f.wm.root_pane) != f.wm.provider);
+}
+
+test "swapProvider on focused pane does not affect shared default" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try std.testing.expect(f.wm.root_pane.provider == null);
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
+
+    try f.wm.swapProvider("provB", "b1");
+
+    try std.testing.expect(f.wm.root_pane.provider != null);
+    try std.testing.expectEqualStrings("provB/b1", f.wm.root_pane.provider.?.model_id);
+    // The shared default slot is the invariant we are protecting.
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
+    // providerFor is the canonical read path; it should now see the override.
+    try std.testing.expectEqualStrings("provB/b1", f.wm.providerFor(&f.wm.root_pane).model_id);
+}
+
+test "swapProvider replaces existing override in place" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    // First swap plants the heap slot; remember its address so the
+    // second swap can prove it reuses the same allocation rather than
+    // leaking one and creating a new one.
+    try f.wm.swapProvider("provB", "b1");
+    const first_slot = f.wm.root_pane.provider orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("provB/b1", first_slot.model_id);
+
+    try f.wm.swapProvider("provA", "a2");
+    const second_slot = f.wm.root_pane.provider orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first_slot, second_slot);
+    try std.testing.expectEqualStrings("provA/a2", second_slot.model_id);
+    // Shared default still untouched across both swaps.
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
+}
+
+test "renderModelPicker marks focused pane's current model" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    // Plant an override on the root pane so the picker should mark
+    // provB/b1 as `(current)` rather than the shared default provA/a1.
+    const override = try allocator.create(llm.ProviderResult);
+    errdefer allocator.destroy(override);
+    override.* = try llm.createProviderFromLuaConfig(
+        &f.registry,
+        "provB/b1",
+        "/tmp/zag_test_unused_credentials",
+        allocator,
+    );
+    f.wm.root_pane.provider = override;
+
+    try f.wm.renderModelPicker();
+
+    // The picker emits the numbered list as a single status node. Pull
+    // the last root-level node off the tree and inspect its text.
+    const root_children = f.wm.root_pane.view.tree.root_children.items;
+    try std.testing.expect(root_children.len > 0);
+    const status_node = root_children[root_children.len - 1];
+    const body = status_node.content.items;
+
+    const b1_marker = "provB/b1  (current)";
+    const a1_marker = "provA/a1  (current)";
+    try std.testing.expect(std.mem.indexOf(u8, body, b1_marker) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, a1_marker) == null);
 }
