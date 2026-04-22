@@ -327,7 +327,14 @@ pub fn createProviderFromLuaConfig(
             _ = borrowed;
         },
         .oauth_chatgpt => {
-            const resolved = auth.resolveCredential(allocator, auth_file_path, spec.provider_name, .{}) catch |err| switch (err) {
+            // Phase I will pull these from the endpoint's own auth.oauth
+            // spec once the serializer's buildHeaders does the same.
+            const codex_opts: auth.ResolveOptions = .{
+                .token_url = "https://auth.openai.com/oauth/token",
+                .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+                .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+            };
+            const resolved = auth.resolveCredential(allocator, auth_file_path, spec.provider_name, codex_opts) catch |err| switch (err) {
                 error.NotLoggedIn, error.LoginExpired => return error.MissingCredential,
                 else => return err,
             };

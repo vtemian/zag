@@ -16,14 +16,14 @@ const auth = @import("../auth.zig");
 /// appended first (their values are borrowed), then auth headers (heap-owned).
 /// Caller must call `freeHeaders` when done.
 ///
-/// `opts` is forwarded to `auth.resolveCredential`; production callers pass
-/// `.{}` (defaults hit the Codex IdP and wall-clock), tests inject a mock
-/// token URL and a frozen clock.
+/// `resolveCredential`'s `ResolveOptions` are provider-specific (token URL,
+/// OAuth client id, claim path). Only the `.oauth_chatgpt` arm needs them, so
+/// they're constructed inline here from Codex-specific constants. Phase I
+/// will lift these values out of the endpoint's own `auth.oauth` spec.
 pub fn buildHeaders(
     endpoint: *const Endpoint,
     auth_path: []const u8,
     allocator: Allocator,
-    opts: auth.ResolveOptions,
 ) !std.ArrayList(std.http.Header) {
     var headers: std.ArrayList(std.http.Header) = .empty;
     errdefer freeHeaders(endpoint, &headers, allocator);
@@ -40,7 +40,12 @@ pub fn buildHeaders(
     switch (endpoint.auth) {
         .none => {},
         .x_api_key => {
-            const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, opts);
+            const resolved = try auth.resolveCredential(
+                allocator,
+                auth_path,
+                endpoint.name,
+                apiKeyResolveOpts(),
+            );
             const key = switch (resolved) {
                 .api_key => |k| k,
                 .oauth => {
@@ -52,7 +57,12 @@ pub fn buildHeaders(
             try headers.append(allocator, .{ .name = "x-api-key", .value = key });
         },
         .bearer => {
-            const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, opts);
+            const resolved = try auth.resolveCredential(
+                allocator,
+                auth_path,
+                endpoint.name,
+                apiKeyResolveOpts(),
+            );
             const key = switch (resolved) {
                 .api_key => |k| k,
                 .oauth => {
@@ -66,7 +76,12 @@ pub fn buildHeaders(
             try headers.append(allocator, .{ .name = "Authorization", .value = bearer });
         },
         .oauth_chatgpt => {
-            const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, opts);
+            const codex_opts: auth.ResolveOptions = .{
+                .token_url = "https://auth.openai.com/oauth/token",
+                .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+                .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+            };
+            const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, codex_opts);
             const codex_spec: Endpoint.OAuthSpec = .{
                 .issuer = "",
                 .token_url = "",
@@ -88,6 +103,19 @@ pub fn buildHeaders(
     }
 
     return headers;
+}
+
+/// `ResolveOptions` for the `.x_api_key` and `.bearer` arms. These never
+/// trigger a refresh (api-key entries skip the OAuth code path entirely), so
+/// `token_url` / `client_id` / `account_id_claim_path` are structurally
+/// required by the type but semantically unreachable. Kept as empty strings
+/// to make the ignore-at-runtime intent explicit at the call site.
+fn apiKeyResolveOpts() auth.ResolveOptions {
+    return .{
+        .token_url = "",
+        .client_id = "",
+        .account_id_claim_path = null,
+    };
 }
 
 /// Free every header value and the backing ArrayList.
@@ -261,7 +289,7 @@ test "buildHeaders creates correct auth for bearer endpoint" {
         .default_model = "test-model",
         .models = &.{},
     };
-    var headers = try buildHeaders(&endpoint, path, allocator, .{});
+    var headers = try buildHeaders(&endpoint, path, allocator);
     defer freeHeaders(&endpoint, &headers, allocator);
     try std.testing.expectEqual(@as(usize, 2), headers.items.len);
     // Static endpoint header first, then the owned Bearer header.
@@ -297,7 +325,7 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
         .default_model = "test-model",
         .models = &.{},
     };
-    var headers = try buildHeaders(&endpoint, path, allocator, .{});
+    var headers = try buildHeaders(&endpoint, path, allocator);
     defer freeHeaders(&endpoint, &headers, allocator);
     try std.testing.expectEqual(@as(usize, 2), headers.items.len);
     // Static endpoint header first, then the owned auth header.
@@ -318,7 +346,7 @@ test "buildHeaders handles no-auth endpoint" {
         .models = &.{},
     };
     // `.none` skips resolveCredential, so the auth_path is never read.
-    var headers = try buildHeaders(&endpoint, "", allocator, .{});
+    var headers = try buildHeaders(&endpoint, "", allocator);
     defer freeHeaders(&endpoint, &headers, allocator);
     try std.testing.expectEqual(@as(usize, 0), headers.items.len);
 }
@@ -337,7 +365,7 @@ test "buildHeaders+freeHeaders round-trip with static endpoint headers (no leak)
         .models = &.{},
     };
     // buildHeaders needs an auth_path even for .none; the .none arm won't read it.
-    var headers = try buildHeaders(&endpoint, "/tmp/ignored", std.testing.allocator, .{});
+    var headers = try buildHeaders(&endpoint, "/tmp/ignored", std.testing.allocator);
     defer freeHeaders(&endpoint, &headers, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), headers.items.len);
     try std.testing.expectEqualStrings("2023-06-01", headers.items[0].value);
