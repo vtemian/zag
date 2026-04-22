@@ -3,8 +3,6 @@
 //! `Endpoint` describes a specific LLM endpoint (URL, auth shape, extra
 //! headers). `builtin_endpoints` is the compile-time table of providers
 //! we ship with (Anthropic, OpenAI, OpenRouter, Groq, Ollama).
-//! `isBuiltinEndpointName` is the validation helper used by the Lua
-//! `zag.provider{ name = "..." }` binding to fail loud on typos.
 //! `Registry` wraps the table in a runtime-mutable view that copies
 //! each endpoint's strings onto the heap so it can accept user-added
 //! endpoints alongside the builtins.
@@ -308,15 +306,6 @@ const builtin_endpoints = [_]Endpoint{
     },
 };
 
-/// True if `name` matches any entry in `builtin_endpoints`. Used by the Lua
-/// binding `zag.provider{ name = "..." }` to fail loud on typos at load time.
-pub fn isBuiltinEndpointName(name: []const u8) bool {
-    for (&builtin_endpoints) |ep| {
-        if (std.mem.eql(u8, ep.name, name)) return true;
-    }
-    return false;
-}
-
 /// Look up a built-in endpoint by name. Returns a pointer into the static
 /// table so callers can inspect `.auth` (and any other field) without paying
 /// for a Registry. Used by the `--login=<provider>` CLI dispatcher to confirm
@@ -463,20 +452,6 @@ test "Registry find returns null for unknown endpoint" {
     try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("nonexistent"));
 }
 
-test "isBuiltinEndpointName recognizes built-in providers" {
-    try std.testing.expect(isBuiltinEndpointName("anthropic"));
-    try std.testing.expect(isBuiltinEndpointName("openai"));
-    try std.testing.expect(isBuiltinEndpointName("openrouter"));
-    try std.testing.expect(isBuiltinEndpointName("groq"));
-    try std.testing.expect(isBuiltinEndpointName("ollama"));
-}
-
-test "isBuiltinEndpointName rejects unknown names" {
-    try std.testing.expect(!isBuiltinEndpointName("bogus"));
-    try std.testing.expect(!isBuiltinEndpointName(""));
-    try std.testing.expect(!isBuiltinEndpointName("ANTHROPIC"));
-}
-
 test "builtin endpoints include openai-oauth with .oauth_chatgpt auth" {
     var reg = try Registry.init(std.testing.allocator);
     defer reg.deinit();
@@ -486,11 +461,6 @@ test "builtin endpoints include openai-oauth with .oauth_chatgpt auth" {
     try std.testing.expectEqual(Serializer.chatgpt, ep.serializer);
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", ep.url);
     try std.testing.expectEqual(@as(usize, 0), ep.headers.len);
-}
-
-test "isBuiltinEndpointName recognizes openai-oauth" {
-    try std.testing.expect(isBuiltinEndpointName("openai-oauth"));
-    try std.testing.expect(!isBuiltinEndpointName("openai-foo"));
 }
 
 test "findBuiltinEndpoint returns the OAuth endpoint for openai-oauth" {
