@@ -1461,7 +1461,9 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
         try auth_mod.saveAuthFile(auth_path, file);
     }
 
-    var result = try llm.createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator);
+    var registry = try llm.Registry.init(allocator);
+    defer registry.deinit();
+    var result = try llm.createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator);
     defer result.deinit();
 
     try std.testing.expectEqual(llm.Serializer.chatgpt, result.serializer);
@@ -1491,8 +1493,10 @@ test "createProviderFromLuaConfig fails fast when oauth provider has no credenti
     defer allocator.free(auth_path);
     // No auth.json on disk at all.
 
+    var registry = try llm.Registry.init(allocator);
+    defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,
-        llm.createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator),
+        llm.createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator),
     );
 }

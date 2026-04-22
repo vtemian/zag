@@ -95,10 +95,12 @@ pub const LuaEngine = struct {
     /// stdin. Outlives a single tick so fragmented CSI/SS3 sequences
     /// assemble across reads.
     input_parser: input.Parser = .{},
-    /// Provider names the user declared via `zag.provider{ name = "..." }`.
-    /// Owned (each entry duped into `allocator`). Populated during `loadUserConfig`,
-    /// read once by `llm.createProviderFromLuaConfig` at startup.
-    enabled_providers: std.ArrayList([]const u8),
+    /// Runtime registry of LLM endpoints declared via `zag.provider{...}`.
+    /// Seeded with the builtins at `init`; each `zag.provider{}` call in
+    /// `config.lua` overrides (removes then re-adds) the matching entry so
+    /// a full-schema Lua declaration always wins. Read at startup by
+    /// `llm.createProviderFromLuaConfig` through a borrowed pointer.
+    providers_registry: llm.Registry,
     /// Default model string set via `zag.set_default_model("prov/id")`.
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
@@ -190,6 +192,9 @@ pub const LuaEngine = struct {
         errdefer keymap_registry.deinit();
         try keymap_registry.loadDefaults();
 
+        var providers_registry = try llm.Registry.init(allocator);
+        errdefer providers_registry.deinit();
+
         // Install pure-Lua combinators that build on zag.spawn / :join /
         // :cancel / zag.sleep. These have to run after the primitive
         // bindings exist but don't depend on any engine state.
@@ -202,7 +207,7 @@ pub const LuaEngine = struct {
             .allocator = allocator,
             .tools = .empty,
             .hook_dispatcher = hook_registry_mod.HookDispatcher.init(allocator),
-            .enabled_providers = .empty,
+            .providers_registry = providers_registry,
             .keymap_registry = keymap_registry,
             .tasks = std.AutoHashMap(i32, *Task).init(allocator),
         };
@@ -261,8 +266,7 @@ pub const LuaEngine = struct {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
         self.hook_dispatcher.deinit();
-        for (self.enabled_providers.items) |name| self.allocator.free(name);
-        self.enabled_providers.deinit(self.allocator);
+        self.providers_registry.deinit();
         if (self.default_model) |m| self.allocator.free(m);
         self.keymap_registry.deinit();
         self.lua.deinit();
@@ -2558,11 +2562,260 @@ pub const LuaEngine = struct {
         return try headers.toOwnedSlice(allocator);
     }
 
-    /// Zig function backing `zag.provider{ name = "..." }`.
-    /// Validates `name` against `llm.builtin_endpoints` and appends the duped
-    /// string to `engine.enabled_providers`. Unknown names, missing `name`
-    /// field, non-string `name`, and empty `name` all return `error.LuaError`
-    /// which `zlua.wrap` surfaces as a Lua runtime error.
+    /// Parse the closed `wire` enum surfaced by `zag.provider{}`. Returns
+    /// `null` when the string doesn't match any known serializer.
+    fn parseSerializer(s: []const u8) ?llm.Serializer {
+        if (std.mem.eql(u8, s, "anthropic")) return .anthropic;
+        if (std.mem.eql(u8, s, "openai")) return .openai;
+        if (std.mem.eql(u8, s, "chatgpt")) return .chatgpt;
+        return null;
+    }
+
+    /// Read the `auth = { kind = "...", ... }` subtable from the Lua table at
+    /// `table_idx` and produce an `Endpoint.Auth` value.
+    ///
+    /// Transitional behaviour: the OAuth arm validates every `OAuthSpec` field
+    /// (issuer, token_url, client_id, scopes, redirect_port, optional
+    /// account_id_claim_path, optional extra_authorize_params, and the nested
+    /// `inject` subtable) but discards the parsed data and maps to the legacy
+    /// enum variant `.oauth_chatgpt`. Phase I flips `Endpoint.auth` to the
+    /// `AuthV2` tagged union and re-captures the OAuthSpec data end-to-end.
+    ///
+    /// Requires that the `auth` key be present on the outer table; an absent
+    /// or non-table value returns `error.LuaError` so users see a clear
+    /// diagnostic at config-load time rather than a mysterious runtime error
+    /// at the first turn.
+    fn readAuth(
+        lua: *Lua,
+        table_idx: i32,
+        allocator: Allocator,
+    ) !llm.Endpoint.Auth {
+        _ = lua.getField(table_idx, "auth");
+        defer lua.pop(1);
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider(): 'auth' must be a table", .{});
+            return error.LuaError;
+        }
+
+        const auth_idx = lua.absIndex(-1);
+
+        const kind = (try readStringField(lua, auth_idx, "kind", .required, allocator)) orelse unreachable;
+        defer allocator.free(kind);
+
+        if (std.mem.eql(u8, kind, "x_api_key")) return .x_api_key;
+        if (std.mem.eql(u8, kind, "bearer")) return .bearer;
+        if (std.mem.eql(u8, kind, "none")) return .none;
+        if (std.mem.eql(u8, kind, "oauth")) {
+            // Validate every OAuthSpec field so malformed config fails loud.
+            // The parsed values are deliberately discarded below: the current
+            // `Endpoint.Auth` enum has no room for the spec and Phase I will
+            // re-capture it when the field flips to `AuthV2`.
+            const issuer = (try readStringField(lua, auth_idx, "issuer", .required, allocator)) orelse unreachable;
+            defer allocator.free(issuer);
+            const token_url = (try readStringField(lua, auth_idx, "token_url", .required, allocator)) orelse unreachable;
+            defer allocator.free(token_url);
+            const client_id = (try readStringField(lua, auth_idx, "client_id", .required, allocator)) orelse unreachable;
+            defer allocator.free(client_id);
+            const scopes = (try readStringField(lua, auth_idx, "scopes", .required, allocator)) orelse unreachable;
+            defer allocator.free(scopes);
+
+            // redirect_port: required integer (Lua numbers coerce to int).
+            _ = lua.getField(auth_idx, "redirect_port");
+            if (lua.isNil(-1)) {
+                lua.pop(1);
+                log.warn("zag.provider(): auth.redirect_port missing for oauth kind", .{});
+                return error.LuaError;
+            }
+            _ = lua.toInteger(-1) catch {
+                lua.pop(1);
+                log.warn("zag.provider(): auth.redirect_port must be an integer", .{});
+                return error.LuaError;
+            };
+            lua.pop(1);
+
+            // Optional: account_id_claim_path (string or nil).
+            if (try readStringField(lua, auth_idx, "account_id_claim_path", .optional, allocator)) |claim| {
+                allocator.free(claim);
+            }
+
+            // Optional: extra_authorize_params accepts the same array/map
+            // shape as `headers`; reuse the existing reader for validation
+            // then drop the result.
+            const extras = try readHeaderList(lua, auth_idx, "extra_authorize_params", allocator);
+            for (extras) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(extras);
+
+            // Required: inject subtable (header/prefix/use_account_id/account_id_header).
+            _ = lua.getField(auth_idx, "inject");
+            defer lua.pop(1);
+            if (!lua.isTable(-1)) {
+                log.warn("zag.provider(): auth.inject must be a table for oauth kind", .{});
+                return error.LuaError;
+            }
+            const inject_idx = lua.absIndex(-1);
+
+            const inject_header = (try readStringField(lua, inject_idx, "header", .required, allocator)) orelse unreachable;
+            defer allocator.free(inject_header);
+            const inject_prefix = (try readStringField(lua, inject_idx, "prefix", .required, allocator)) orelse unreachable;
+            defer allocator.free(inject_prefix);
+
+            // Optional: extra_headers validation (same shape as top-level headers).
+            const inject_extras = try readHeaderList(lua, inject_idx, "extra_headers", allocator);
+            for (inject_extras) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(inject_extras);
+
+            // use_account_id: required bool.
+            _ = lua.getField(inject_idx, "use_account_id");
+            if (lua.typeOf(-1) != .boolean) {
+                lua.pop(1);
+                log.warn("zag.provider(): auth.inject.use_account_id must be a boolean", .{});
+                return error.LuaError;
+            }
+            _ = lua.toBoolean(-1);
+            lua.pop(1);
+
+            // account_id_header: required string (may be empty).
+            const account_id_header = (try readStringField(lua, inject_idx, "account_id_header", .required, allocator)) orelse unreachable;
+            allocator.free(account_id_header);
+
+            log.debug("zag.provider(): oauth spec validated; discarding until Phase I wires AuthV2", .{});
+            return .oauth_chatgpt;
+        }
+
+        log.warn("zag.provider(): unknown auth.kind '{s}' (expected x_api_key|bearer|oauth|none)", .{kind});
+        return error.LuaError;
+    }
+
+    /// Read the `models = { ... }` array from the Lua table at `table_idx`.
+    /// Absent or nil yields an empty slice. Each entry requires `id`; all
+    /// numeric fields default to 0, and the cache rates are nullable
+    /// (absent or nil → `null`; number → that value).
+    ///
+    /// Returns an owned slice of `Endpoint.ModelRate`. Each entry's `id`
+    /// string is duped onto `allocator`; caller owns both the outer slice
+    /// and each duped string.
+    fn readModels(
+        lua: *Lua,
+        table_idx: i32,
+        allocator: Allocator,
+    ) ![]llm.Endpoint.ModelRate {
+        _ = lua.getField(table_idx, "models");
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return try allocator.alloc(llm.Endpoint.ModelRate, 0);
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider(): 'models' must be an array table", .{});
+            return error.LuaError;
+        }
+
+        const inner = lua.absIndex(-1);
+        const len = lua.rawLen(inner);
+
+        var out: std.ArrayList(llm.Endpoint.ModelRate) = .empty;
+        errdefer {
+            for (out.items) |m| allocator.free(m.id);
+            out.deinit(allocator);
+        }
+
+        for (0..len) |i| {
+            _ = lua.rawGetIndex(inner, @intCast(i + 1));
+            defer lua.pop(1);
+            if (!lua.isTable(-1)) {
+                log.warn("zag.provider(): models[{d}] must be a table", .{i + 1});
+                return error.LuaError;
+            }
+            const entry = lua.absIndex(-1);
+
+            const id = (try readStringField(lua, entry, "id", .required, allocator)) orelse unreachable;
+            errdefer allocator.free(id);
+
+            const context_window = try readOptionalInteger(lua, entry, "context_window", 0);
+            const max_output_tokens = try readOptionalInteger(lua, entry, "max_output_tokens", 0);
+            const input_per_mtok = try readOptionalFloat(lua, entry, "input_per_mtok", 0);
+            const output_per_mtok = try readOptionalFloat(lua, entry, "output_per_mtok", 0);
+            const cache_write = try readNullableFloat(lua, entry, "cache_write_per_mtok");
+            const cache_read = try readNullableFloat(lua, entry, "cache_read_per_mtok");
+
+            try out.append(allocator, .{
+                .id = id,
+                .context_window = @intCast(context_window),
+                .max_output_tokens = @intCast(max_output_tokens),
+                .input_per_mtok = input_per_mtok,
+                .output_per_mtok = output_per_mtok,
+                .cache_write_per_mtok = cache_write,
+                .cache_read_per_mtok = cache_read,
+            });
+        }
+
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Read an integer field with a default. Nil/absent → `default`. Non-number
+    /// values log and return `error.LuaError`. Leaves the stack untouched.
+    fn readOptionalInteger(lua: *Lua, table_idx: i32, name: [:0]const u8, default: i64) !i64 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+        if (lua.isNil(-1)) return default;
+        if (lua.typeOf(-1) != .number) {
+            log.warn("zag.provider(): field '{s}' must be a number", .{name});
+            return error.LuaError;
+        }
+        return lua.toInteger(-1) catch {
+            log.warn("zag.provider(): field '{s}' must be an integer", .{name});
+            return error.LuaError;
+        };
+    }
+
+    /// Read a float field with a default. Nil/absent → `default`. Non-number
+    /// values log and return `error.LuaError`.
+    fn readOptionalFloat(lua: *Lua, table_idx: i32, name: [:0]const u8, default: f64) !f64 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+        if (lua.isNil(-1)) return default;
+        if (lua.typeOf(-1) != .number) {
+            log.warn("zag.provider(): field '{s}' must be a number", .{name});
+            return error.LuaError;
+        }
+        return lua.toNumber(-1) catch {
+            log.warn("zag.provider(): field '{s}' must be numeric", .{name});
+            return error.LuaError;
+        };
+    }
+
+    /// Read a nullable float. Nil/absent → `null`. Number → that value.
+    fn readNullableFloat(lua: *Lua, table_idx: i32, name: [:0]const u8) !?f64 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+        if (lua.isNil(-1)) return null;
+        if (lua.typeOf(-1) != .number) {
+            log.warn("zag.provider(): field '{s}' must be a number", .{name});
+            return error.LuaError;
+        }
+        return lua.toNumber(-1) catch {
+            log.warn("zag.provider(): field '{s}' must be numeric", .{name});
+            return error.LuaError;
+        };
+    }
+
+    /// Zig function backing `zag.provider{...}`. Reads the full endpoint
+    /// schema from the Lua table (name, url, wire, auth, headers,
+    /// default_model, models), constructs a fully-owned `Endpoint`, and
+    /// upserts it into the engine's `providers_registry`. Lua declarations
+    /// always win against builtins — if an entry with the same `name`
+    /// already exists (builtin or prior Lua declaration) it is removed and
+    /// replaced, so a full-schema declaration effectively overrides the
+    /// builtin for that name.
+    ///
+    /// Any malformed input (missing required field, wrong type, unknown
+    /// `wire`, unknown `auth.kind`, ...) logs a descriptive warning and
+    /// returns `error.LuaError`, which `zlua.wrap` surfaces to the Lua VM
+    /// as a runtime error. `doString` callers see `error.LuaRuntime`.
     fn zagProviderFn(lua: *Lua) !i32 {
         if (!lua.isTable(1)) {
             log.warn("zag.provider() expects a table argument", .{});
@@ -2576,38 +2829,63 @@ pub const LuaEngine = struct {
         };
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+        const allocator = engine.allocator;
 
-        _ = lua.getField(1, "name");
-        // Reject missing `name` (nil) and non-string values explicitly; Lua 5.4
-        // would otherwise coerce numbers through `toString`.
-        if (lua.typeOf(-1) != .string) {
-            lua.pop(1);
-            log.warn("zag.provider(): 'name' field must be a string", .{});
-            return error.LuaError;
-        }
-        const name = lua.toString(-1) catch {
-            lua.pop(1);
-            log.warn("zag.provider(): 'name' field must be a string", .{});
-            return error.LuaError;
-        };
-
+        const name = (try readStringField(lua, 1, "name", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(name);
         if (name.len == 0) {
-            lua.pop(1);
             log.warn("zag.provider(): 'name' must not be empty", .{});
             return error.LuaError;
         }
 
-        if (!llm.isBuiltinEndpointName(name)) {
-            log.warn("zag.provider(): unknown provider '{s}'", .{name});
-            lua.pop(1);
+        const url = (try readStringField(lua, 1, "url", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(url);
+
+        const wire_str = (try readStringField(lua, 1, "wire", .required, allocator)) orelse unreachable;
+        defer allocator.free(wire_str);
+        const serializer = parseSerializer(wire_str) orelse {
+            log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire_str});
             return error.LuaError;
+        };
+
+        const default_model = (try readStringField(lua, 1, "default_model", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(default_model);
+
+        const auth_val = try readAuth(lua, 1, allocator);
+
+        const headers = try readHeaderList(lua, 1, "headers", allocator);
+        errdefer {
+            for (headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(headers);
         }
 
-        const owned = try engine.allocator.dupe(u8, name);
-        errdefer engine.allocator.free(owned);
-        lua.pop(1);
+        const models = try readModels(lua, 1, allocator);
+        errdefer {
+            for (models) |m| allocator.free(m.id);
+            allocator.free(models);
+        }
 
-        try engine.enabled_providers.append(engine.allocator, owned);
+        const ep: llm.Endpoint = .{
+            .name = name,
+            .serializer = serializer,
+            .url = url,
+            .auth = auth_val,
+            .headers = headers,
+            .default_model = default_model,
+            .models = models,
+        };
+
+        // Override-on-conflict: remove any prior entry (builtin or earlier
+        // Lua declaration) so a full-schema declaration always wins. The
+        // subsequent `add` then cannot trip `DuplicateEndpoint`.
+        _ = engine.providers_registry.remove(ep.name);
+        engine.providers_registry.add(ep) catch |err| switch (err) {
+            error.DuplicateEndpoint => unreachable,
+            else => |e| return e,
+        };
         return 0;
     }
 
@@ -3249,10 +3527,11 @@ test "LuaEngine init and deinit" {
     try std.testing.expectEqual(@as(i64, 2), val);
 }
 
-test "LuaEngine.init initializes provider config state" {
+test "LuaEngine.init seeds providers_registry with builtins" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
-    try std.testing.expectEqual(@as(usize, 0), engine.enabled_providers.items.len);
+    try std.testing.expect(engine.providers_registry.find("anthropic") != null);
+    try std.testing.expect(engine.providers_registry.find("openai") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
 }
 
@@ -3989,32 +4268,160 @@ test "zag.set_default_model rejects non-string argument" {
     );
 }
 
-test "zag.provider registers an enabled provider by name" {
+test "zag.provider{}: full x_api_key declaration registers the endpoint" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.provider { name = "openai" }
-        \\zag.provider { name = "anthropic" }
+        \\zag.provider {
+        \\  name = "anthropic",
+        \\  url  = "https://api.anthropic.com/v1/messages",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "x_api_key" },
+        \\  headers = { { name = "anthropic-version", value = "2023-06-01" } },
+        \\  default_model = "claude-sonnet-4-20250514",
+        \\  models = {
+        \\    {
+        \\      id = "claude-sonnet-4-20250514",
+        \\      context_window = 200000, max_output_tokens = 8192,
+        \\      input_per_mtok = 3.0, output_per_mtok = 15.0,
+        \\      cache_write_per_mtok = 3.75, cache_read_per_mtok = 0.30,
+        \\    },
+        \\  },
+        \\}
     );
-
-    try std.testing.expectEqual(@as(usize, 2), engine.enabled_providers.items.len);
-    try std.testing.expectEqualStrings("openai", engine.enabled_providers.items[0]);
-    try std.testing.expectEqualStrings("anthropic", engine.enabled_providers.items[1]);
+    const ep = engine.providers_registry.find("anthropic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
+    try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
+    try std.testing.expectEqual(llm.Endpoint.Auth.x_api_key, ep.auth);
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", ep.default_model);
+    try std.testing.expectEqual(@as(usize, 1), ep.models.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), ep.models[0].input_per_mtok, 0.001);
+    try std.testing.expectEqual(@as(u32, 200000), ep.models[0].context_window);
 }
 
-test "zag.provider rejects unknown provider names" {
+test "zag.provider{}: oauth declaration maps to .oauth_chatgpt (transitional)" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider {
+        \\  name = "openai-oauth",
+        \\  url = "https://chatgpt.com/backend-api/codex/responses",
+        \\  wire = "chatgpt",
+        \\  auth = {
+        \\    kind = "oauth",
+        \\    issuer = "https://auth.openai.com/oauth/authorize",
+        \\    token_url = "https://auth.openai.com/oauth/token",
+        \\    client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+        \\    scopes = "openid profile email offline_access",
+        \\    redirect_port = 1455,
+        \\    account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        \\    extra_authorize_params = {
+        \\      { name = "codex_cli_simplified_flow", value = "true" },
+        \\    },
+        \\    inject = {
+        \\      header = "Authorization",
+        \\      prefix = "Bearer ",
+        \\      extra_headers = {},
+        \\      use_account_id = true,
+        \\      account_id_header = "chatgpt-account-id",
+        \\    },
+        \\  },
+        \\  default_model = "gpt-5",
+        \\  models = { { id = "gpt-5" } },
+        \\}
+    );
+    const ep = engine.providers_registry.find("openai-oauth") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(llm.Endpoint.Auth.oauth_chatgpt, ep.auth);
+}
+
+test "zag.provider{}: missing required url field surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
     try std.testing.expectError(
         error.LuaRuntime,
-        engine.lua.doString("zag.provider { name = \"bogus\" }"),
+        engine.lua.doString(
+            \\zag.provider { name = "x", wire = "openai", auth = { kind = "bearer" }, default_model = "m" }
+        ),
     );
 }
 
-test "zag.provider requires a name field" {
+test "zag.provider{}: unknown wire surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString(
+            \\zag.provider {
+            \\  name = "x", url = "https://x", wire = "not-a-wire",
+            \\  auth = { kind = "bearer" }, default_model = "m"
+            \\}
+        ),
+    );
+}
+
+test "zag.provider{}: unknown auth kind surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString(
+            \\zag.provider {
+            \\  name = "x", url = "https://x", wire = "openai",
+            \\  auth = { kind = "bogus" }, default_model = "m"
+            \\}
+        ),
+    );
+}
+
+test "zag.provider{}: overrides existing builtin with same name" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider {
+        \\  name = "anthropic",
+        \\  url = "https://custom",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "x_api_key" },
+        \\  default_model = "my-model",
+        \\}
+    );
+    const ep = engine.providers_registry.find("anthropic").?;
+    try std.testing.expectEqualStrings("https://custom", ep.url);
+    try std.testing.expectEqualStrings("my-model", ep.default_model);
+}
+
+test "zag.provider{}: headers map-form parses both entries" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider {
+        \\  name = "mapform",
+        \\  url = "https://x",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  headers = { ["X-A"] = "a", ["X-B"] = "b" },
+        \\  default_model = "m",
+        \\}
+    );
+    const ep = engine.providers_registry.find("mapform").?;
+    try std.testing.expectEqual(@as(usize, 2), ep.headers.len);
+}
+
+test "zag.provider{}: requires a name field" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();

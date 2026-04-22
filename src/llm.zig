@@ -285,7 +285,14 @@ fn defaultAuthPath(buf: []u8) ![]const u8 {
 /// Wraps `createProviderFromLuaConfig` with the HOME lookup and path
 /// construction that used to live in `main.zig`, so entry-point code can
 /// just call this single factory.
+///
+/// `registry` is a borrowed pointer to the LuaEngine's provider registry
+/// (seeded with builtins plus any `zag.provider{}` declarations from
+/// config.lua). The factory deep-copies it into the returned
+/// `ProviderResult` so the ProviderResult's lifetime stays independent of
+/// the engine.
 pub fn createProviderFromEnv(
+    registry: *const Registry,
     default_model: ?[]const u8,
     allocator: Allocator,
 ) !ProviderResult {
@@ -294,10 +301,11 @@ pub fn createProviderFromEnv(
         log.err("failed to construct auth.json path: {s}", .{@errorName(err)});
         return err;
     };
-    return createProviderFromLuaConfig(default_model, auth_path, allocator);
+    return createProviderFromLuaConfig(registry, default_model, auth_path, allocator);
 }
 
 pub fn createProviderFromLuaConfig(
+    registry: *const Registry,
     default_model: ?[]const u8,
     auth_file_path: []const u8,
     allocator: Allocator,
@@ -305,11 +313,11 @@ pub fn createProviderFromLuaConfig(
     const model_id = try allocator.dupe(u8, default_model orelse "anthropic/claude-sonnet-4-20250514");
     errdefer allocator.free(model_id);
 
-    var registry = try Registry.init(allocator);
-    errdefer registry.deinit();
+    var owned_registry = try registry.dupe(allocator);
+    errdefer owned_registry.deinit();
 
     const spec = parseModelString(model_id);
-    const endpoint = registry.find(spec.provider_name) orelse
+    const endpoint = owned_registry.find(spec.provider_name) orelse
         return error.UnknownProvider;
 
     // Fail-fast existence check before the TUI takes over. For api-key
@@ -355,7 +363,7 @@ pub fn createProviderFromLuaConfig(
                 .model_id = model_id,
                 .state = state,
                 .auth_path = auth_path,
-                .registry = registry,
+                .registry = owned_registry,
                 .allocator = allocator,
                 .serializer = .anthropic,
             };
@@ -368,7 +376,7 @@ pub fn createProviderFromLuaConfig(
                 .model_id = model_id,
                 .state = state,
                 .auth_path = auth_path,
-                .registry = registry,
+                .registry = owned_registry,
                 .allocator = allocator,
                 .serializer = .openai,
             };
@@ -381,7 +389,7 @@ pub fn createProviderFromLuaConfig(
                 .model_id = model_id,
                 .state = state,
                 .auth_path = auth_path,
-                .registry = registry,
+                .registry = owned_registry,
                 .allocator = allocator,
                 .serializer = .chatgpt,
             };
@@ -629,7 +637,9 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var result = try createProviderFromLuaConfig("openai/gpt-4o", auth_path, allocator);
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
+    var result = try createProviderFromLuaConfig(&registry, "openai/gpt-4o", auth_path, allocator);
     defer result.deinit();
 
     try std.testing.expectEqualStrings("openai/gpt-4o", result.model_id);
@@ -655,7 +665,9 @@ test "createProviderFromLuaConfig uses hardcoded fallback when default_model uns
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var result = try createProviderFromLuaConfig(null, auth_path, allocator);
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
+    var result = try createProviderFromLuaConfig(&registry, null, auth_path, allocator);
     defer result.deinit();
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", result.model_id);
@@ -681,9 +693,11 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,
-        createProviderFromLuaConfig("openai/gpt-4o", auth_path, allocator),
+        createProviderFromLuaConfig(&registry, "openai/gpt-4o", auth_path, allocator),
     );
 }
 
@@ -699,7 +713,9 @@ test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints"
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var result = try createProviderFromLuaConfig("ollama/llama3", auth_path, allocator);
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
+    var result = try createProviderFromLuaConfig(&registry, "ollama/llama3", auth_path, allocator);
     defer result.deinit();
 
     try std.testing.expectEqualStrings("ollama/llama3", result.model_id);
@@ -717,9 +733,11 @@ test "createProviderFromLuaConfig returns UnknownProvider for unsupported provid
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
     try std.testing.expectError(
         error.UnknownProvider,
-        createProviderFromLuaConfig("fakeprovider/some-model", auth_path, allocator),
+        createProviderFromLuaConfig(&registry, "fakeprovider/some-model", auth_path, allocator),
     );
 }
 
@@ -745,9 +763,11 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
+    var registry = try Registry.init(allocator);
+    defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,
-        createProviderFromLuaConfig("openai-oauth/gpt-5", auth_path, allocator),
+        createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5", auth_path, allocator),
     );
 }
 

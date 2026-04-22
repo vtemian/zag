@@ -698,7 +698,13 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
     defer gpa.free(auth_path);
 
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    var provider = llm.createProviderFromLuaConfig(default_model, auth_path, gpa) catch |err| {
+    // If the Lua engine failed to boot, fall back to a builtin-only registry
+    // so the factory still has a provider table to look up against.
+    var fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(gpa) else null;
+    defer if (fallback_registry) |*r| r.deinit();
+    const registry_ptr: *const llm.Registry = if (lua_engine) |*eng| &eng.providers_registry else &fallback_registry.?;
+
+    var provider = llm.createProviderFromLuaConfig(registry_ptr, default_model, auth_path, gpa) catch |err| {
         if (err == error.MissingCredential) {
             const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
             const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
@@ -842,7 +848,10 @@ fn firstRunWizardRetry(
     if (lua_engine) |eng| eng.loadUserConfig();
 
     const new_default: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
-    return llm.createProviderFromEnv(new_default, allocator) catch |err| {
+    var fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(allocator) else null;
+    defer if (fallback_registry) |*r| r.deinit();
+    const registry_ptr: *const llm.Registry = if (lua_engine) |eng| &eng.providers_registry else &fallback_registry.?;
+    return llm.createProviderFromEnv(registry_ptr, new_default, allocator) catch |err| {
         if (err == error.MissingCredential) {
             const new_model = new_default orelse "anthropic/claude-sonnet-4-20250514";
             const new_spec = llm.parseModelString(new_model);
@@ -1004,7 +1013,7 @@ pub fn main() !void {
     try layout.setRoot(root_buffer.buf());
 
     // Lua engine comes up first so `loadUserConfig` can populate
-    // `default_model` and `enabled_providers` before the provider factory
+    // `default_model` and `providers_registry` before the provider factory
     // reads them. The engine owns its keymap registry; keymap overrides in
     // config.lua land there directly. Input-parser wiring and tool
     // registration happen after the orchestrator is built because those
@@ -1020,7 +1029,10 @@ pub fn main() !void {
     }
 
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    var provider = llm.createProviderFromEnv(default_model, allocator) catch |err| first_try: {
+    var fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(allocator) else null;
+    defer if (fallback_registry) |*r| r.deinit();
+    const registry_ptr: *const llm.Registry = if (lua_engine) |*eng| &eng.providers_registry else &fallback_registry.?;
+    var provider = llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
         if (err != error.MissingCredential) return err;
 
         // OAuth providers can't be fixed by the api-key wizard — point the
