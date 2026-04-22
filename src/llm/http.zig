@@ -132,6 +132,74 @@ fn mergeInjectedHeader(
     try headers.append(allocator, .{ .name = name, .value = owned });
 }
 
+/// Apply an OAuth credential to an outgoing header list using the
+/// endpoint's `inject` recipe. Consumes `resolved` — the helper takes
+/// ownership of the access-token and account-id buffers and frees them
+/// before returning (or on any error after the initial destructure).
+///
+/// Behaviour:
+///   - `.api_key` credentials fail with `error.WrongCredentialType` (the
+///     key is freed before returning the error).
+///   - Emits `spec.inject.header: <prefix><access_token>` via
+///     `mergeInjectedHeader` so a collision with an existing static header
+///     of the same name comma-appends rather than duplicates.
+///   - Merges every entry in `spec.inject.extra_headers` with the same
+///     rule, which gives provider specs like a future `anthropic-beta`
+///     token-list the expected merge semantics.
+///   - Optionally emits `spec.inject.account_id_header: <account_id>` when
+///     `spec.inject.use_account_id` is true and the resolved account id is
+///     non-empty. Anthropic OAuth leaves `use_account_id = false`; Codex
+///     sets it true with `"chatgpt-account-id"`.
+fn applyOAuthInjection(
+    headers: *std.ArrayList(std.http.Header),
+    allocator: Allocator,
+    spec: *const Endpoint.OAuthSpec,
+    resolved: auth.Resolved,
+) !void {
+    const cred = switch (resolved) {
+        .oauth => |o| o,
+        .api_key => |k| {
+            allocator.free(k);
+            return error.WrongCredentialType;
+        },
+    };
+    // The account-id buffer is always ours to free, even when the spec
+    // does not inject it (0-byte dupes still count as real allocations).
+    defer allocator.free(cred.account_id);
+
+    // The access-token buffer is ours until it's consumed into `primary`.
+    // Track that handoff with a flag so errdefer frees exactly once.
+    var access_token_owned: bool = true;
+    errdefer if (access_token_owned) allocator.free(cred.access_token);
+
+    // Primary header: "<prefix><access_token>".
+    const primary = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}",
+        .{ spec.inject.prefix, cred.access_token },
+    );
+    allocator.free(cred.access_token);
+    access_token_owned = false;
+    defer allocator.free(primary);
+
+    try mergeInjectedHeader(headers, allocator, spec.inject.header, primary);
+
+    // Extra static headers emitted alongside the token header.
+    for (spec.inject.extra_headers) |h| {
+        try mergeInjectedHeader(headers, allocator, h.name, h.value);
+    }
+
+    // Optional account-id header.
+    if (spec.inject.use_account_id and cred.account_id.len > 0) {
+        try mergeInjectedHeader(
+            headers,
+            allocator,
+            spec.inject.account_id_header,
+            cred.account_id,
+        );
+    }
+}
+
 /// Send a JSON POST request and return the response body.
 /// Both providers share this HTTP plumbing; only the URL and extra headers differ.
 pub fn httpPostJson(
@@ -299,6 +367,132 @@ test "mergeInjectedHeader: case-insensitive name match" {
     try std.testing.expectEqual(@as(usize, 1), headers.items.len);
     try std.testing.expectEqualStrings("one,two", headers.items[0].value);
     std.testing.allocator.free(headers.items[0].value);
+}
+
+test "applyOAuthInjection emits Bearer + extra_headers with comma-append" {
+    const spec: Endpoint.OAuthSpec = .{
+        .issuer = "",
+        .token_url = "",
+        .client_id = "",
+        .scopes = "",
+        .redirect_port = 0,
+        .account_id_claim_path = null,
+        .extra_authorize_params = &.{},
+        .inject = .{
+            .header = "Authorization",
+            .prefix = "Bearer ",
+            .extra_headers = &.{
+                .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" },
+                .{ .name = "x-app", .value = "cli" },
+            },
+            .use_account_id = false,
+            .account_id_header = "",
+        },
+    };
+
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer {
+        for (headers.items) |h| std.testing.allocator.free(h.value);
+        headers.deinit(std.testing.allocator);
+    }
+
+    // Seed a pre-existing anthropic-beta (ownership invariant: value is allocator-owned).
+    try headers.append(std.testing.allocator, .{
+        .name = "anthropic-beta",
+        .value = try std.testing.allocator.dupe(u8, "pdfs-2024-09-25"),
+    });
+
+    const resolved: auth.Resolved = .{ .oauth = .{
+        .access_token = try std.testing.allocator.dupe(u8, "AT"),
+        .account_id = try std.testing.allocator.dupe(u8, ""),
+    } };
+
+    try applyOAuthInjection(&headers, std.testing.allocator, &spec, resolved);
+
+    // Expect 3 headers: Authorization, merged anthropic-beta, x-app.
+    try std.testing.expectEqual(@as(usize, 3), headers.items.len);
+    var saw_auth = false;
+    var saw_beta = false;
+    var saw_xapp = false;
+    for (headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "Authorization")) {
+            try std.testing.expectEqualStrings("Bearer AT", h.value);
+            saw_auth = true;
+        } else if (std.mem.eql(u8, h.name, "anthropic-beta")) {
+            try std.testing.expectEqualStrings("pdfs-2024-09-25,oauth-2025-04-20", h.value);
+            saw_beta = true;
+        } else if (std.mem.eql(u8, h.name, "x-app")) {
+            try std.testing.expectEqualStrings("cli", h.value);
+            saw_xapp = true;
+        }
+    }
+    try std.testing.expect(saw_auth and saw_beta and saw_xapp);
+}
+
+test "applyOAuthInjection emits account_id header when use_account_id + non-empty id" {
+    const spec: Endpoint.OAuthSpec = .{
+        .issuer = "",
+        .token_url = "",
+        .client_id = "",
+        .scopes = "",
+        .redirect_port = 0,
+        .account_id_claim_path = null,
+        .extra_authorize_params = &.{},
+        .inject = .{
+            .header = "Authorization",
+            .prefix = "Bearer ",
+            .extra_headers = &.{},
+            .use_account_id = true,
+            .account_id_header = "chatgpt-account-id",
+        },
+    };
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer {
+        for (headers.items) |h| std.testing.allocator.free(h.value);
+        headers.deinit(std.testing.allocator);
+    }
+    const resolved: auth.Resolved = .{ .oauth = .{
+        .access_token = try std.testing.allocator.dupe(u8, "AT"),
+        .account_id = try std.testing.allocator.dupe(u8, "acc-123"),
+    } };
+    try applyOAuthInjection(&headers, std.testing.allocator, &spec, resolved);
+    try std.testing.expectEqual(@as(usize, 2), headers.items.len);
+    var saw = false;
+    for (headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "chatgpt-account-id")) {
+            try std.testing.expectEqualStrings("acc-123", h.value);
+            saw = true;
+        }
+    }
+    try std.testing.expect(saw);
+}
+
+test "applyOAuthInjection rejects api_key credential with WrongCredentialType" {
+    const spec: Endpoint.OAuthSpec = .{
+        .issuer = "",
+        .token_url = "",
+        .client_id = "",
+        .scopes = "",
+        .redirect_port = 0,
+        .account_id_claim_path = null,
+        .extra_authorize_params = &.{},
+        .inject = .{
+            .header = "Authorization",
+            .prefix = "Bearer ",
+            .extra_headers = &.{},
+            .use_account_id = false,
+            .account_id_header = "",
+        },
+    };
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(std.testing.allocator);
+    const resolved: auth.Resolved = .{
+        .api_key = try std.testing.allocator.dupe(u8, "sk-wrong"),
+    };
+    try std.testing.expectError(
+        error.WrongCredentialType,
+        applyOAuthInjection(&headers, std.testing.allocator, &spec, resolved),
+    );
 }
 
 test {
