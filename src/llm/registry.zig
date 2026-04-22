@@ -32,25 +32,11 @@ pub const Endpoint = struct {
     /// known; callers must fall back to defaults or fail loudly.
     models: []const ModelRate,
 
-    /// How the API key is sent in HTTP headers.
-    pub const Auth = enum {
-        /// Anthropic-style: `x-api-key: <key>`.
-        x_api_key,
-        /// Bearer token: `Authorization: Bearer <key>`.
-        bearer,
-        /// OAuth access token for the ChatGPT backend (looked up via
-        /// auth.resolveCredential and refreshed on demand).
-        oauth_chatgpt,
-        /// No authentication (e.g., local Ollama).
-        none,
-    };
-
-    /// Transitional tagged-union form of `Auth` that carries the full
-    /// `OAuthSpec` on the `oauth` variant instead of a provider-hardcoded
-    /// sentinel. Lives in parallel with the legacy `Auth` enum so Phases A
-    /// through H can migrate call sites one at a time; Phase I collapses the
-    /// duality by retiring `Auth`.
-    pub const AuthV2 = union(enum) {
+    /// How the API key is sent in HTTP headers. The `.oauth` variant carries
+    /// the full `OAuthSpec` so auth.zig / oauth.zig / llm/http.zig can drive
+    /// the login + refresh + injection logic from endpoint data rather than
+    /// provider-hardcoded sentinels.
+    pub const Auth = union(enum) {
         /// Anthropic-style: `x-api-key: <key>`.
         x_api_key: void,
         /// Bearer token: `Authorization: Bearer <key>`.
@@ -185,11 +171,23 @@ pub const Endpoint = struct {
             models_initialized += 1;
         }
 
+        // `.oauth` carries nested strings + slices that must be deep-copied
+        // so the duped endpoint is fully owned by `allocator`. Void variants
+        // are copied by value.
+        const auth: Auth = switch (self.auth) {
+            .x_api_key, .bearer, .none => self.auth,
+            .oauth => |spec| .{ .oauth = try dupeOAuthSpec(spec, allocator) },
+        };
+        errdefer switch (auth) {
+            .oauth => |s| freeOAuthSpec(s, allocator),
+            else => {},
+        };
+
         return .{
             .name = name,
             .serializer = self.serializer,
             .url = url,
-            .auth = self.auth,
+            .auth = auth,
             .headers = headers,
             .default_model = default_model,
             .models = models,
@@ -198,6 +196,10 @@ pub const Endpoint = struct {
 
     /// Free all heap-allocated strings. Pair with dupe().
     pub fn free(self: Endpoint, allocator: Allocator) void {
+        switch (self.auth) {
+            .oauth => |spec| freeOAuthSpec(spec, allocator),
+            else => {},
+        }
         for (self.models) |m| allocator.free(m.id);
         allocator.free(self.models);
         allocator.free(self.default_model);
@@ -210,6 +212,108 @@ pub const Endpoint = struct {
         allocator.free(self.name);
     }
 };
+
+/// Deep-copy every string / slice in an `OAuthSpec` onto `allocator`.
+/// Paired with `freeOAuthSpec`. Uses `errdefer` to unwind partial state if
+/// any inner allocation fails, so a failed dupe never leaks.
+pub fn dupeOAuthSpec(
+    spec: Endpoint.OAuthSpec,
+    allocator: Allocator,
+) !Endpoint.OAuthSpec {
+    const issuer = try allocator.dupe(u8, spec.issuer);
+    errdefer allocator.free(issuer);
+    const token_url = try allocator.dupe(u8, spec.token_url);
+    errdefer allocator.free(token_url);
+    const client_id = try allocator.dupe(u8, spec.client_id);
+    errdefer allocator.free(client_id);
+    const scopes = try allocator.dupe(u8, spec.scopes);
+    errdefer allocator.free(scopes);
+
+    const claim_path: ?[]const u8 = if (spec.account_id_claim_path) |p|
+        try allocator.dupe(u8, p)
+    else
+        null;
+    errdefer if (claim_path) |p| allocator.free(p);
+
+    const extras = try allocator.alloc(Endpoint.Header, spec.extra_authorize_params.len);
+    errdefer allocator.free(extras);
+    var extras_init: usize = 0;
+    errdefer for (extras[0..extras_init]) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    };
+    for (spec.extra_authorize_params, 0..) |h, i| {
+        extras[i] = .{
+            .name = try allocator.dupe(u8, h.name),
+            .value = try allocator.dupe(u8, h.value),
+        };
+        extras_init += 1;
+    }
+
+    const inject_header = try allocator.dupe(u8, spec.inject.header);
+    errdefer allocator.free(inject_header);
+    const inject_prefix = try allocator.dupe(u8, spec.inject.prefix);
+    errdefer allocator.free(inject_prefix);
+
+    const inject_extras = try allocator.alloc(Endpoint.Header, spec.inject.extra_headers.len);
+    errdefer allocator.free(inject_extras);
+    var inject_extras_init: usize = 0;
+    errdefer for (inject_extras[0..inject_extras_init]) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    };
+    for (spec.inject.extra_headers, 0..) |h, i| {
+        inject_extras[i] = .{
+            .name = try allocator.dupe(u8, h.name),
+            .value = try allocator.dupe(u8, h.value),
+        };
+        inject_extras_init += 1;
+    }
+
+    const account_id_header = try allocator.dupe(u8, spec.inject.account_id_header);
+    errdefer allocator.free(account_id_header);
+
+    return .{
+        .issuer = issuer,
+        .token_url = token_url,
+        .client_id = client_id,
+        .scopes = scopes,
+        .redirect_port = spec.redirect_port,
+        .account_id_claim_path = claim_path,
+        .extra_authorize_params = extras,
+        .inject = .{
+            .header = inject_header,
+            .prefix = inject_prefix,
+            .extra_headers = inject_extras,
+            .use_account_id = spec.inject.use_account_id,
+            .account_id_header = account_id_header,
+        },
+    };
+}
+
+/// Release every slice owned by an `OAuthSpec` that was produced by
+/// `dupeOAuthSpec` (or by the `zag.provider{}` Lua reader, which follows
+/// the same ownership convention). Mirror image of `dupeOAuthSpec`.
+pub fn freeOAuthSpec(spec: Endpoint.OAuthSpec, allocator: Allocator) void {
+    allocator.free(spec.issuer);
+    allocator.free(spec.token_url);
+    allocator.free(spec.client_id);
+    allocator.free(spec.scopes);
+    if (spec.account_id_claim_path) |p| allocator.free(p);
+    for (spec.extra_authorize_params) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    allocator.free(spec.extra_authorize_params);
+    allocator.free(spec.inject.header);
+    allocator.free(spec.inject.prefix);
+    for (spec.inject.extra_headers) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    allocator.free(spec.inject.extra_headers);
+    allocator.free(spec.inject.account_id_header);
+}
 
 const builtin_endpoints = [_]Endpoint{
     .{
@@ -299,7 +403,25 @@ const builtin_endpoints = [_]Endpoint{
         .name = "openai-oauth",
         .serializer = .chatgpt,
         .url = "https://chatgpt.com/backend-api/codex/responses",
-        .auth = .oauth_chatgpt,
+        .auth = .{ .oauth = .{
+            .issuer = "https://auth.openai.com/oauth/authorize",
+            .token_url = "https://auth.openai.com/oauth/token",
+            .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+            .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+            .redirect_port = 1455,
+            .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+            .extra_authorize_params = &.{
+                .{ .name = "id_token_add_organizations", .value = "true" },
+                .{ .name = "codex_cli_simplified_flow", .value = "true" },
+            },
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{},
+                .use_account_id = true,
+                .account_id_header = "chatgpt-account-id",
+            },
+        } },
         .headers = &.{},
         .default_model = "gpt-5",
         .models = &.{},
@@ -452,20 +574,29 @@ test "Registry find returns null for unknown endpoint" {
     try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("nonexistent"));
 }
 
-test "builtin endpoints include openai-oauth with .oauth_chatgpt auth" {
+test "builtin endpoints include openai-oauth with .oauth auth carrying Codex spec" {
     var reg = try Registry.init(std.testing.allocator);
     defer reg.deinit();
 
     const ep = reg.find("openai-oauth") orelse return error.EndpointMissing;
-    try std.testing.expectEqual(Endpoint.Auth.oauth_chatgpt, ep.auth);
+    try std.testing.expectEqual(std.meta.Tag(Endpoint.Auth).oauth, std.meta.activeTag(ep.auth));
     try std.testing.expectEqual(Serializer.chatgpt, ep.serializer);
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", ep.url);
     try std.testing.expectEqual(@as(usize, 0), ep.headers.len);
+
+    const spec = ep.auth.oauth;
+    try std.testing.expectEqualStrings("https://auth.openai.com/oauth/authorize", spec.issuer);
+    try std.testing.expectEqualStrings("https://auth.openai.com/oauth/token", spec.token_url);
+    try std.testing.expectEqualStrings("app_EMoamEEZ73f0CkXaXp7hrann", spec.client_id);
+    try std.testing.expectEqual(@as(u16, 1455), spec.redirect_port);
+    try std.testing.expect(spec.inject.use_account_id);
+    try std.testing.expectEqualStrings("chatgpt-account-id", spec.inject.account_id_header);
+    try std.testing.expectEqual(@as(usize, 2), spec.extra_authorize_params.len);
 }
 
 test "findBuiltinEndpoint returns the OAuth endpoint for openai-oauth" {
     const ep = findBuiltinEndpoint("openai-oauth") orelse return error.EndpointMissing;
-    try std.testing.expectEqual(Endpoint.Auth.oauth_chatgpt, ep.auth);
+    try std.testing.expectEqual(std.meta.Tag(Endpoint.Auth).oauth, std.meta.activeTag(ep.auth));
     try std.testing.expectEqualStrings("openai-oauth", ep.name);
 }
 
@@ -509,8 +640,8 @@ test "OAuthSpec is copyable by value" {
     try std.testing.expectEqualStrings("a", copy.issuer);
 }
 
-test "AuthV2 oauth variant carries full spec" {
-    const auth: Endpoint.AuthV2 = .{ .oauth = .{
+test "Auth oauth variant carries full spec" {
+    const auth: Endpoint.Auth = .{ .oauth = .{
         .issuer = "i",
         .token_url = "t",
         .client_id = "c",
@@ -530,6 +661,51 @@ test "AuthV2 oauth variant carries full spec" {
         .oauth => |spec| try std.testing.expectEqualStrings("i", spec.issuer),
         else => try std.testing.expect(false),
     }
+}
+
+test "Endpoint.dupe/free round-trips the .oauth variant's nested strings" {
+    const original: Endpoint = .{
+        .name = "oauth-test",
+        .serializer = .chatgpt,
+        .url = "https://x",
+        .auth = .{ .oauth = .{
+            .issuer = "https://auth.example.com/authorize",
+            .token_url = "https://auth.example.com/token",
+            .client_id = "cid",
+            .scopes = "openid profile",
+            .redirect_port = 7777,
+            .account_id_claim_path = "claim/path",
+            .extra_authorize_params = &.{
+                .{ .name = "foo", .value = "1" },
+                .{ .name = "bar", .value = "2" },
+            },
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{
+                    .{ .name = "x-beta", .value = "y" },
+                },
+                .use_account_id = true,
+                .account_id_header = "x-acct",
+            },
+        } },
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+    const copy = try original.dupe(std.testing.allocator);
+    defer copy.free(std.testing.allocator);
+
+    const spec = copy.auth.oauth;
+    try std.testing.expectEqualStrings(original.auth.oauth.issuer, spec.issuer);
+    try std.testing.expect(original.auth.oauth.issuer.ptr != spec.issuer.ptr);
+    try std.testing.expectEqualStrings("claim/path", spec.account_id_claim_path.?);
+    try std.testing.expectEqual(@as(usize, 2), spec.extra_authorize_params.len);
+    try std.testing.expectEqualStrings("foo", spec.extra_authorize_params[0].name);
+    try std.testing.expectEqualStrings("1", spec.extra_authorize_params[0].value);
+    try std.testing.expectEqual(@as(usize, 1), spec.inject.extra_headers.len);
+    try std.testing.expectEqualStrings("x-beta", spec.inject.extra_headers[0].name);
+    try std.testing.expectEqualStrings("x-acct", spec.inject.account_id_header);
 }
 
 test "Endpoint.dupe copies default_model and models slice" {

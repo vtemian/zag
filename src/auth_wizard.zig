@@ -161,31 +161,39 @@ pub const PROVIDERS = [_]ProviderEntry{
 };
 
 const oauth = @import("oauth.zig");
+const llm = @import("llm.zig");
 
 /// Thin shim matching the `OAuthFn` signature. Delegates to
-/// `oauth.runLoginFlow` with the OpenAI/ChatGPT Codex values synthesised
-/// inline; Phase H replaces these with a pull from the endpoint registry.
-/// Keeping this in lockstep with `main.zig`'s `runLoginCommand` means the
-/// wizard and `--login=openai-oauth` exercise the same code path.
+/// `oauth.runLoginFlow` with the OAuth spec pulled from the builtin
+/// endpoint table — the same source `main.zig`'s `runLoginCommand` uses, so
+/// the wizard and `--login=openai-oauth` exercise identical values.
+///
+/// Returns `error.UnknownProvider` when the named provider isn't a builtin
+/// (nothing in `auth_wizard.PROVIDERS` points here for names not in the
+/// builtin registry, so this is belt-and-suspenders) and
+/// `error.WrongCredentialType` when the endpoint uses api-key auth
+/// (ditto — the wizard routes api-key providers through `promptSecret`).
 fn chatgptOauthShim(
     allocator: std.mem.Allocator,
     provider_name: []const u8,
     auth_path: []const u8,
 ) anyerror!void {
+    const endpoint = llm.findBuiltinEndpoint(provider_name) orelse return error.UnknownProvider;
+    const spec = switch (endpoint.auth) {
+        .oauth => |s| s,
+        else => return error.WrongCredentialType,
+    };
     return oauth.runLoginFlow(allocator, .{
         .provider_name = provider_name,
         .auth_path = auth_path,
-        .issuer = "https://auth.openai.com/oauth/authorize",
-        .token_url = "https://auth.openai.com/oauth/token",
-        .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
-        .redirect_port = 1455,
-        .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        .issuer = spec.issuer,
+        .token_url = spec.token_url,
+        .client_id = spec.client_id,
+        .redirect_port = spec.redirect_port,
+        .scopes = spec.scopes,
         .originator = "zag_cli",
-        .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
-        .extra_authorize_params = &.{
-            .{ .name = "id_token_add_organizations", .value = "true" },
-            .{ .name = "codex_cli_simplified_flow", .value = "true" },
-        },
+        .account_id_claim_path = spec.account_id_claim_path,
+        .extra_authorize_params = spec.extra_authorize_params,
     });
 }
 

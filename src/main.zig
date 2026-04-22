@@ -265,13 +265,16 @@ fn runLoginCommand(
         return 1;
     };
 
-    if (endpoint.auth != .oauth_chatgpt) {
-        err_writer.print(
-            "zag: provider '{s}' does not use OAuth; edit ~/.config/zag/auth.json directly.\n",
-            .{provider_name},
-        ) catch {};
-        return 1;
-    }
+    const spec = switch (endpoint.auth) {
+        .oauth => |s| s,
+        else => {
+            err_writer.print(
+                "zag: provider '{s}' does not use OAuth; edit ~/.config/zag/auth.json directly.\n",
+                .{provider_name},
+            ) catch {};
+            return 1;
+        },
+    };
 
     const auth_path = try buildAuthPath(allocator);
     defer allocator.free(auth_path);
@@ -279,26 +282,28 @@ fn runLoginCommand(
     oauth.runLoginFlow(allocator, .{
         .provider_name = provider_name,
         .auth_path = auth_path,
-        .issuer = "https://auth.openai.com/oauth/authorize",
-        .token_url = "https://auth.openai.com/oauth/token",
-        .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
-        .redirect_port = 1455,
-        .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        .issuer = spec.issuer,
+        .token_url = spec.token_url,
+        .client_id = spec.client_id,
+        .redirect_port = spec.redirect_port,
+        .scopes = spec.scopes,
         .originator = "zag_cli",
-        .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
-        .extra_authorize_params = &.{
-            .{ .name = "id_token_add_organizations", .value = "true" },
-            .{ .name = "codex_cli_simplified_flow", .value = "true" },
-        },
+        .account_id_claim_path = spec.account_id_claim_path,
+        .extra_authorize_params = spec.extra_authorize_params,
     }) catch |err| {
         // Map the well-known OAuth error paths to actionable hints. Anything
         // not named here falls back to `@errorName`, which at least gives the
         // user a term to grep the source for. Only errors that `runLoginFlow`
         // can actually return are listed; adding others is a compile error.
+        var addr_in_use_buf: [128]u8 = undefined;
         const hint: []const u8 = switch (err) {
             error.StateMismatch => "state mismatch (CSRF protection tripped); retry the command",
             error.AuthorizationDenied => "authorization was denied in the browser",
-            error.AddressInUse => "callback port is busy (another OAuth login? check with lsof); retry",
+            error.AddressInUse => std.fmt.bufPrint(
+                &addr_in_use_buf,
+                "callback port {d} is busy (another OAuth login? check with lsof); retry",
+                .{spec.redirect_port},
+            ) catch "callback port is busy (another OAuth login? check with lsof); retry",
             error.CallbackMissingQuery, error.CallbackParamMissing => "browser callback was malformed; retry the command",
             error.TokenExchangeFailed => "token exchange with the OAuth server failed",
             error.ClaimMissing, error.MalformedJwt => "id_token was missing the expected account_id claim",
@@ -330,7 +335,7 @@ pub const std_options: std.Options = .{ .logFn = file_log.handler };
 fn formatMissingCredentialHint(scratch: []u8, model_id: []const u8) []const u8 {
     const spec = llm.parseModelString(model_id);
     const endpoint_opt = llm.findBuiltinEndpoint(spec.provider_name);
-    const is_oauth = if (endpoint_opt) |ep| ep.auth == .oauth_chatgpt else false;
+    const is_oauth = if (endpoint_opt) |ep| std.meta.activeTag(ep.auth) == .oauth else false;
 
     const fallback = "zag: no credentials for configured provider in ~/.config/zag/auth.json\n";
     if (is_oauth) {
@@ -1040,7 +1045,7 @@ pub fn main() !void {
         const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
         const spec = llm.parseModelString(model_id);
         if (llm.findBuiltinEndpoint(spec.provider_name)) |ep| {
-            if (ep.auth == .oauth_chatgpt) {
+            if (std.meta.activeTag(ep.auth) == .oauth) {
                 const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
                 var scratch: [512]u8 = undefined;
                 const message = formatMissingCredentialHint(&scratch, model_id);
@@ -1306,7 +1311,7 @@ test "runLoginCommand rejects unknown providers with exit code 1" {
     );
 }
 
-test "runLoginCommand rejects providers whose auth is not oauth_chatgpt" {
+test "runLoginCommand rejects providers whose auth is not oauth" {
     // `anthropic` is a built-in endpoint but uses .x_api_key auth; the login
     // command must refuse it rather than trying to run an OAuth flow.
     var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);

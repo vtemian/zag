@@ -2574,12 +2574,13 @@ pub const LuaEngine = struct {
     /// Read the `auth = { kind = "...", ... }` subtable from the Lua table at
     /// `table_idx` and produce an `Endpoint.Auth` value.
     ///
-    /// Transitional behaviour: the OAuth arm validates every `OAuthSpec` field
-    /// (issuer, token_url, client_id, scopes, redirect_port, optional
-    /// account_id_claim_path, optional extra_authorize_params, and the nested
-    /// `inject` subtable) but discards the parsed data and maps to the legacy
-    /// enum variant `.oauth_chatgpt`. Phase I flips `Endpoint.auth` to the
-    /// `AuthV2` tagged union and re-captures the OAuthSpec data end-to-end.
+    /// The OAuth arm reads every `OAuthSpec` field (issuer, token_url,
+    /// client_id, scopes, redirect_port, optional account_id_claim_path,
+    /// optional extra_authorize_params, and the nested `inject` subtable) and
+    /// returns an `.oauth` variant carrying the spec. All strings / slices on
+    /// the spec are freshly allocated on `allocator`; the caller passes
+    /// ownership into `Registry.add`, which keeps the heap storage alive for
+    /// the endpoint's lifetime and releases it via `Endpoint.free`.
     ///
     /// Requires that the `auth` key be present on the outer table; an absent
     /// or non-table value returns `error.LuaError` so users see a clear
@@ -2605,91 +2606,111 @@ pub const LuaEngine = struct {
         if (std.mem.eql(u8, kind, "x_api_key")) return .x_api_key;
         if (std.mem.eql(u8, kind, "bearer")) return .bearer;
         if (std.mem.eql(u8, kind, "none")) return .none;
-        if (std.mem.eql(u8, kind, "oauth")) {
-            // Validate every OAuthSpec field so malformed config fails loud.
-            // The parsed values are deliberately discarded below: the current
-            // `Endpoint.Auth` enum has no room for the spec and Phase I will
-            // re-capture it when the field flips to `AuthV2`.
-            const issuer = (try readStringField(lua, auth_idx, "issuer", .required, allocator)) orelse unreachable;
-            defer allocator.free(issuer);
-            const token_url = (try readStringField(lua, auth_idx, "token_url", .required, allocator)) orelse unreachable;
-            defer allocator.free(token_url);
-            const client_id = (try readStringField(lua, auth_idx, "client_id", .required, allocator)) orelse unreachable;
-            defer allocator.free(client_id);
-            const scopes = (try readStringField(lua, auth_idx, "scopes", .required, allocator)) orelse unreachable;
-            defer allocator.free(scopes);
+        if (std.mem.eql(u8, kind, "oauth")) return readOAuthSpec(lua, auth_idx, allocator);
 
-            // redirect_port: required integer (Lua numbers coerce to int).
-            _ = lua.getField(auth_idx, "redirect_port");
-            if (lua.isNil(-1)) {
-                lua.pop(1);
-                log.warn("zag.provider(): auth.redirect_port missing for oauth kind", .{});
-                return error.LuaError;
-            }
-            _ = lua.toInteger(-1) catch {
-                lua.pop(1);
-                log.warn("zag.provider(): auth.redirect_port must be an integer", .{});
-                return error.LuaError;
-            };
+        log.warn("zag.provider(): unknown auth.kind '{s}' (expected x_api_key|bearer|oauth|none)", .{kind});
+        return error.LuaError;
+    }
+
+    /// Materialise an `Endpoint.Auth.oauth` value from the Lua table at
+    /// `auth_idx`. Every nested string / slice is owned by `allocator`; on any
+    /// failure mid-parse, already-allocated pieces are freed via `errdefer`
+    /// chains so the caller never sees a half-built spec.
+    fn readOAuthSpec(
+        lua: *Lua,
+        auth_idx: i32,
+        allocator: Allocator,
+    ) !llm.Endpoint.Auth {
+        const issuer = (try readStringField(lua, auth_idx, "issuer", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(issuer);
+        const token_url = (try readStringField(lua, auth_idx, "token_url", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(token_url);
+        const client_id = (try readStringField(lua, auth_idx, "client_id", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(client_id);
+        const scopes = (try readStringField(lua, auth_idx, "scopes", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(scopes);
+
+        // redirect_port: required integer (Lua numbers coerce to int).
+        _ = lua.getField(auth_idx, "redirect_port");
+        if (lua.isNil(-1)) {
             lua.pop(1);
+            log.warn("zag.provider(): auth.redirect_port missing for oauth kind", .{});
+            return error.LuaError;
+        }
+        const port_int = lua.toInteger(-1) catch {
+            lua.pop(1);
+            log.warn("zag.provider(): auth.redirect_port must be an integer", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const redirect_port: u16 = std.math.cast(u16, port_int) orelse {
+            log.warn("zag.provider(): auth.redirect_port {d} does not fit in u16", .{port_int});
+            return error.LuaError;
+        };
 
-            // Optional: account_id_claim_path (string or nil).
-            if (try readStringField(lua, auth_idx, "account_id_claim_path", .optional, allocator)) |claim| {
-                allocator.free(claim);
-            }
+        // Optional: account_id_claim_path.
+        const claim_path = try readStringField(lua, auth_idx, "account_id_claim_path", .optional, allocator);
+        errdefer if (claim_path) |p| allocator.free(p);
 
-            // Optional: extra_authorize_params accepts the same array/map
-            // shape as `headers`; reuse the existing reader for validation
-            // then drop the result.
-            const extras = try readHeaderList(lua, auth_idx, "extra_authorize_params", allocator);
+        const extras = try readHeaderList(lua, auth_idx, "extra_authorize_params", allocator);
+        errdefer {
             for (extras) |h| {
                 allocator.free(h.name);
                 allocator.free(h.value);
             }
             allocator.free(extras);
+        }
 
-            // Required: inject subtable (header/prefix/use_account_id/account_id_header).
-            _ = lua.getField(auth_idx, "inject");
-            defer lua.pop(1);
-            if (!lua.isTable(-1)) {
-                log.warn("zag.provider(): auth.inject must be a table for oauth kind", .{});
-                return error.LuaError;
-            }
-            const inject_idx = lua.absIndex(-1);
+        _ = lua.getField(auth_idx, "inject");
+        defer lua.pop(1);
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider(): auth.inject must be a table for oauth kind", .{});
+            return error.LuaError;
+        }
+        const inject_idx = lua.absIndex(-1);
 
-            const inject_header = (try readStringField(lua, inject_idx, "header", .required, allocator)) orelse unreachable;
-            defer allocator.free(inject_header);
-            const inject_prefix = (try readStringField(lua, inject_idx, "prefix", .required, allocator)) orelse unreachable;
-            defer allocator.free(inject_prefix);
+        const inject_header = (try readStringField(lua, inject_idx, "header", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(inject_header);
+        const inject_prefix = (try readStringField(lua, inject_idx, "prefix", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(inject_prefix);
 
-            // Optional: extra_headers validation (same shape as top-level headers).
-            const inject_extras = try readHeaderList(lua, inject_idx, "extra_headers", allocator);
+        const inject_extras = try readHeaderList(lua, inject_idx, "extra_headers", allocator);
+        errdefer {
             for (inject_extras) |h| {
                 allocator.free(h.name);
                 allocator.free(h.value);
             }
             allocator.free(inject_extras);
-
-            // use_account_id: required bool.
-            _ = lua.getField(inject_idx, "use_account_id");
-            if (lua.typeOf(-1) != .boolean) {
-                lua.pop(1);
-                log.warn("zag.provider(): auth.inject.use_account_id must be a boolean", .{});
-                return error.LuaError;
-            }
-            _ = lua.toBoolean(-1);
-            lua.pop(1);
-
-            // account_id_header: required string (may be empty).
-            const account_id_header = (try readStringField(lua, inject_idx, "account_id_header", .required, allocator)) orelse unreachable;
-            allocator.free(account_id_header);
-
-            log.debug("zag.provider(): oauth spec validated; discarding until Phase I wires AuthV2", .{});
-            return .oauth_chatgpt;
         }
 
-        log.warn("zag.provider(): unknown auth.kind '{s}' (expected x_api_key|bearer|oauth|none)", .{kind});
-        return error.LuaError;
+        _ = lua.getField(inject_idx, "use_account_id");
+        if (lua.typeOf(-1) != .boolean) {
+            lua.pop(1);
+            log.warn("zag.provider(): auth.inject.use_account_id must be a boolean", .{});
+            return error.LuaError;
+        }
+        const use_account_id = lua.toBoolean(-1);
+        lua.pop(1);
+
+        const account_id_header = (try readStringField(lua, inject_idx, "account_id_header", .required, allocator)) orelse unreachable;
+        errdefer allocator.free(account_id_header);
+
+        return .{ .oauth = .{
+            .issuer = issuer,
+            .token_url = token_url,
+            .client_id = client_id,
+            .scopes = scopes,
+            .redirect_port = redirect_port,
+            .account_id_claim_path = claim_path,
+            .extra_authorize_params = extras,
+            .inject = .{
+                .header = inject_header,
+                .prefix = inject_prefix,
+                .extra_headers = inject_extras,
+                .use_account_id = use_account_id,
+                .account_id_header = account_id_header,
+            },
+        } };
     }
 
     /// Read the `models = { ... }` array from the Lua table at `table_idx`.
@@ -2852,6 +2873,10 @@ pub const LuaEngine = struct {
         errdefer allocator.free(default_model);
 
         const auth_val = try readAuth(lua, 1, allocator);
+        errdefer switch (auth_val) {
+            .oauth => |spec| llm.freeOAuthSpec(spec, allocator),
+            else => {},
+        };
 
         const headers = try readHeaderList(lua, 1, "headers", allocator);
         errdefer {
@@ -4301,7 +4326,7 @@ test "zag.provider{}: full x_api_key declaration registers the endpoint" {
     try std.testing.expectEqual(@as(u32, 200000), ep.models[0].context_window);
 }
 
-test "zag.provider{}: oauth declaration maps to .oauth_chatgpt (transitional)" {
+test "zag.provider{}: oauth declaration materialises into .oauth variant with full spec" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
@@ -4335,7 +4360,87 @@ test "zag.provider{}: oauth declaration maps to .oauth_chatgpt (transitional)" {
         \\}
     );
     const ep = engine.providers_registry.find("openai-oauth") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(llm.Endpoint.Auth.oauth_chatgpt, ep.auth);
+    try std.testing.expectEqual(std.meta.Tag(llm.Endpoint.Auth).oauth, std.meta.activeTag(ep.auth));
+    const spec = ep.auth.oauth;
+    try std.testing.expectEqualStrings("https://auth.openai.com/oauth/authorize", spec.issuer);
+    try std.testing.expectEqualStrings("https://auth.openai.com/oauth/token", spec.token_url);
+    try std.testing.expectEqualStrings("app_EMoamEEZ73f0CkXaXp7hrann", spec.client_id);
+    try std.testing.expectEqualStrings("openid profile email offline_access", spec.scopes);
+    try std.testing.expectEqual(@as(u16, 1455), spec.redirect_port);
+    try std.testing.expectEqualStrings(
+        "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        spec.account_id_claim_path.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), spec.extra_authorize_params.len);
+    try std.testing.expectEqualStrings("codex_cli_simplified_flow", spec.extra_authorize_params[0].name);
+    try std.testing.expectEqualStrings("Authorization", spec.inject.header);
+    try std.testing.expectEqualStrings("Bearer ", spec.inject.prefix);
+    try std.testing.expect(spec.inject.use_account_id);
+    try std.testing.expectEqualStrings("chatgpt-account-id", spec.inject.account_id_header);
+}
+
+test "zag.provider{}: custom oauth provider exposes spec fields usable as LoginOptions" {
+    // Integration: a fresh Lua-declared OAuth provider (not a builtin)
+    // must round-trip every field that `runLoginCommand` / `chatgptOauthShim`
+    // pull into `oauth.LoginOptions`. No HTTP is exercised; this test pins
+    // the data flow (Lua table → Endpoint.auth.oauth → caller's spec view).
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider {
+        \\  name = "custom-oauth",
+        \\  url = "https://api.example.test/chat",
+        \\  wire = "openai",
+        \\  auth = {
+        \\    kind = "oauth",
+        \\    issuer = "https://idp.example/authorize",
+        \\    token_url = "https://idp.example/token",
+        \\    client_id = "client-abc",
+        \\    scopes = "openid email offline",
+        \\    redirect_port = 8123,
+        \\    extra_authorize_params = {
+        \\      { name = "audience", value = "example-api" },
+        \\    },
+        \\    inject = {
+        \\      header = "Authorization",
+        \\      prefix = "Bearer ",
+        \\      extra_headers = { { name = "x-client", value = "zag" } },
+        \\      use_account_id = false,
+        \\      account_id_header = "",
+        \\    },
+        \\  },
+        \\  default_model = "custom-oauth/m",
+        \\  models = {},
+        \\}
+    );
+
+    const ep = engine.providers_registry.find("custom-oauth") orelse return error.TestUnexpectedResult;
+    const spec = switch (ep.auth) {
+        .oauth => |s| s,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Fields that `oauth.LoginOptions` consumes verbatim.
+    try std.testing.expectEqualStrings("https://idp.example/authorize", spec.issuer);
+    try std.testing.expectEqualStrings("https://idp.example/token", spec.token_url);
+    try std.testing.expectEqualStrings("client-abc", spec.client_id);
+    try std.testing.expectEqualStrings("openid email offline", spec.scopes);
+    try std.testing.expectEqual(@as(u16, 8123), spec.redirect_port);
+    try std.testing.expectEqual(@as(?[]const u8, null), spec.account_id_claim_path);
+    try std.testing.expectEqual(@as(usize, 1), spec.extra_authorize_params.len);
+    try std.testing.expectEqualStrings("audience", spec.extra_authorize_params[0].name);
+    try std.testing.expectEqualStrings("example-api", spec.extra_authorize_params[0].value);
+
+    // Fields that `llm/http.zig buildHeaders` consumes via applyOAuthInjection.
+    try std.testing.expectEqualStrings("Authorization", spec.inject.header);
+    try std.testing.expectEqualStrings("Bearer ", spec.inject.prefix);
+    try std.testing.expectEqual(@as(usize, 1), spec.inject.extra_headers.len);
+    try std.testing.expectEqualStrings("x-client", spec.inject.extra_headers[0].name);
+    try std.testing.expectEqualStrings("zag", spec.inject.extra_headers[0].value);
+    try std.testing.expect(!spec.inject.use_account_id);
+    try std.testing.expectEqualStrings("", spec.inject.account_id_header);
 }
 
 test "zag.provider{}: missing required url field surfaces LuaRuntime" {
