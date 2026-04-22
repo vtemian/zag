@@ -252,6 +252,19 @@ fn notifyFocusSwap(prev: ?*Layout.LayoutNode.Leaf, next: ?*Layout.LayoutNode.Lea
     if (next) |n| n.buffer.onFocus(true);
 }
 
+/// Focus the leaf identified by `handle`. Stale or split-pointing handles
+/// are rejected rather than silently ignored so plugin-driven focus moves
+/// fail loudly. Mirrors the side effects of `doFocus`: dirties the
+/// compositor and fires `onFocus` notifications on the leaf swap.
+pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
+    const node = try self.node_registry.resolve(handle);
+    if (node.* != .leaf) return error.NotALeaf;
+    const prev = self.layout.getFocusedLeaf();
+    self.layout.focused = node;
+    self.compositor.layout_dirty = true;
+    notifyFocusSwap(prev, self.layout.getFocusedLeaf());
+}
+
 /// Run a keymap-bound Action. Mutating mode, layout, or compositor state
 /// lives here exclusively so handleKey stays a pure dispatcher.
 pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
@@ -745,6 +758,107 @@ test "WindowManager exposes a NodeRegistry" {
     try layout.setRoot(view.buf());
 
     try std.testing.expect(wm.node_registry.slots.items.len >= 1);
+}
+
+test "focus by handle updates focused leaf" {
+    const allocator = std.testing.allocator;
+
+    // A real Screen, Compositor, and Theme are required because `doSplit`
+    // writes `compositor.layout_dirty` and reads `screen.width/height`.
+    // Provider and session_mgr stay as placeholders: session_mgr points at
+    // a null optional so `createSplitPane` skips the persistence path.
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    wm.doSplit(.vertical);
+
+    // After the split, the original leaf is the first child of the root
+    // split, and focus has moved to the new second leaf. Focusing back by
+    // handle should land on the original leaf pointer.
+    const first_leaf = wm.layout.root.?.split.first;
+    const handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == first_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    try wm.focusById(handle);
+    try std.testing.expectEqual(first_leaf, wm.layout.focused.?);
+}
+
+test "focus by handle rejects stale id" {
+    const allocator = std.testing.allocator;
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = undefined,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+
+    const bogus: NodeRegistry.Handle = .{ .index = 9999, .generation = 0 };
+    try std.testing.expectError(NodeRegistry.Error.StaleNode, wm.focusById(bogus));
 }
 
 test "restorePane rebuilds both tree and messages" {
