@@ -81,8 +81,16 @@ pub const StreamingResponse = struct {
 
         const uri = std.Uri.parse(url) catch return error.InvalidUri;
 
+        // Prepend `Accept: text/event-stream`. Both the ChatGPT Codex
+        // endpoint and the Anthropic streaming endpoint require it;
+        // omitting it produces HTTP 400 with no useful body.
+        var merged_headers = try allocator.alloc(std.http.Header, extra_headers.len + 1);
+        defer allocator.free(merged_headers);
+        merged_headers[0] = .{ .name = "Accept", .value = "text/event-stream" };
+        @memcpy(merged_headers[1..], extra_headers);
+
         self.req = self.client.request(.POST, uri, .{
-            .extra_headers = extra_headers,
+            .extra_headers = merged_headers,
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 // SSE streams must not be compressed; the line-based parser
