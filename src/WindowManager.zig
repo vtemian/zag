@@ -883,9 +883,10 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
     }
 
     if (std.mem.eql(u8, command, "/model")) {
-        var scratch: [128]u8 = undefined;
-        const model_info = std.fmt.bufPrint(&scratch, "model: {s}", .{self.provider.model_id}) catch "model: unknown";
-        self.appendStatus(model_info);
+        self.renderModelPicker() catch |err| {
+            log.warn("renderModelPicker failed: {}", .{err});
+            self.appendStatus("could not render model picker");
+        };
         return .handled;
     }
 
