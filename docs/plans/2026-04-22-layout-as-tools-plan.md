@@ -100,7 +100,7 @@ pub fn resolve(self: *const NodeRegistry, handle: Handle) Error!*LayoutNode {
     return slot.node orelse Error.StaleNode;
 }
 
-pub fn remove(self: *NodeRegistry, handle: Handle) Error!void {
+pub fn remove(self: *NodeRegistry, handle: Handle) (Error || Allocator.Error)!void {
     if (handle.index >= self.slots.items.len) return Error.StaleNode;
     const slot = &self.slots.items[handle.index];
     if (slot.generation != handle.generation) return Error.StaleNode;
@@ -2067,6 +2067,61 @@ git commit -m "docs: layout-as-tools manual verification notes"
 ```
 
 ---
+
+## Implementation status
+
+Completed on branch `wip/layout-as-tools`. 21 commits, all tests green.
+
+Final commit list (top of branch first):
+
+- `lua: expose zag.pane.read`
+- `lua: expose layout focus, split, close, resize`
+- `lua: expose zag.layout.tree`
+- `tools: add pane_read`
+- `tools: add layout focus, split, close, resize`
+- `tools: add layout_tree`
+- `agent: set current_caller_pane_id around tool dispatch`
+- `wm: implement readPaneById via ConversationBuffer.readText`
+- `buffer: add readText helper for pane_read`
+- `agent: dispatch layout_request round trips on main thread`
+- `events: add layout_request variant`
+- `wm: route executeAction close through closeById`
+- `wm: describe emits layout tree as json`
+- `layout: add resizeSplit and expose resizeById on WindowManager`
+- `wm: add closeById with active pane rejection`
+- `wm: add splitById primitive`
+- `wm: add focusById primitive`
+- `wm: own a NodeRegistry and wire it into Layout`
+- `layout: notify NodeRegistry on node create and destroy`
+- `keymap: add resize action variant`
+- `layout: add NodeRegistry for stable layout node ids`
+
+Baseline check after the final commit:
+- `zig build` exit 0
+- `zig build test` exit 0 (existing flaky timing test `agent.zig: parallel execution is faster than sequential` passes on re-run)
+- `zig fmt --check .` exit 0
+
+## Manual verification
+
+Once the branch merges and you want to exercise the new tools end to end, drop this into `~/.config/zag/config.lua` and run `zig build run`:
+
+```lua
+zag.tool({
+  name = "smoke_layout",
+  description = "smoke test for zag.layout primitives",
+  input_schema = { type = "object", properties = {}, additionalProperties = false },
+  execute = function(_args)
+    local tree = zag.layout.tree()
+    local count = 0
+    for _id in pairs(tree.nodes) do count = count + 1 end
+    return "root=" .. tostring(tree.root) .. " count=" .. tostring(count)
+  end,
+})
+```
+
+From an agent pane, ask the model to call `smoke_layout`. Expected output looks like `root=n0 count=1` with a single pane, or higher counts after splits.
+
+To exercise mutations from an LLM tool call, you can ask the agent to call the registered `layout_tree`, `layout_split`, `layout_focus`, `layout_close`, `layout_resize`, and `pane_read` tools directly. `layout_close` on the agent's own pane returns `{"ok": false, "error": "ClosingActivePane"}` because of the Task 7 guard.
 
 ## Non-goals retained from the design
 
