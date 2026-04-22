@@ -1105,6 +1105,13 @@ pub fn main() !void {
     // Extra split panes pick this up inside `createSplitPane`.
     root_runner.window_manager = &orchestrator.window_manager;
 
+    // Lua bindings (zag.layout.*, zag.pane.*) call the window manager
+    // directly on the main thread. Wire after orchestrator construction
+    // so the pointer is stable for the lifetime of the engine.
+    if (lua_engine) |*eng| {
+        eng.window_manager = &orchestrator.window_manager;
+    }
+
     // Publish the root leaf's packed handle on the root runner so the
     // agent thread can mirror it into `tools.current_caller_pane_id`
     // around every tool dispatch. `attachLayoutRegistry` ran above, so

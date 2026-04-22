@@ -12,6 +12,8 @@ const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
+const NodeRegistry = @import("NodeRegistry.zig");
+const WindowManager = @import("WindowManager.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -106,6 +108,11 @@ pub const LuaEngine = struct {
     /// Both have coupled lifetimes (pool writes to queue), so they're
     /// owned together. Null until `initAsync()` runs.
     async_runtime: ?*AsyncRuntime = null,
+    /// Optional back-pointer to the live window manager. Wired by
+    /// `main.zig` once the orchestrator is in its final home; stays
+    /// null in headless mode so Lua layout bindings raise a clean
+    /// "no window manager bound" error instead of dereferencing junk.
+    window_manager: ?*WindowManager = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
     tasks: std.AutoHashMap(i32, *Task),
     /// Root scope (parent of all agent/hook scopes).
@@ -338,6 +345,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagFsExistsFn));
         lua.setField(-2, "exists");
         lua.setField(-2, "fs"); // zag.fs = fs_table; [zag_table]
+
+        // zag.layout; plain namespace table for window-tree inspection
+        // and mutation. Requires a live window manager, which main.zig
+        // wires via `engine.window_manager`. Headless runs leave the
+        // field null and these bindings raise a clean Lua error.
+        lua.newTable(); // [zag_table, layout_table]
+        lua.pushFunction(zlua.wrap(zagLayoutTreeFn));
+        lua.setField(-2, "tree");
+        lua.setField(-2, "layout"); // zag.layout = layout_table; [zag_table]
 
         // Private log entrypoints consumed by the Lua-side wrappers in
         // combinators.lua. User code calls `zag.log.info(fmt, ...)`; the
@@ -2024,6 +2040,31 @@ pub const LuaEngine = struct {
             return 1;
         };
         co.pushBoolean(true);
+        return 1;
+    }
+
+    /// `zag.layout.tree()`: return the live window tree as a Lua table
+    /// with `root` and `nodes` fields, mirroring the `layout_tree` tool
+    /// JSON schema. Runs on the main thread (bindings are invoked from
+    /// `config.lua` / hook / keymap contexts) so it reads the window
+    /// manager directly instead of round-tripping through the agent
+    /// event queue.
+    fn zagLayoutTreeFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.tree: no window manager bound", .{});
+        };
+        const bytes = wm.describe(engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.tree: describe failed: {s}", .{@errorName(err)}) catch "zag.layout.tree: describe failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        defer engine.allocator.free(bytes);
+        lua_json.pushJsonAsTable(lua, bytes, engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.tree: decode failed: {s}", .{@errorName(err)}) catch "zag.layout.tree: decode failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
         return 1;
     }
 
@@ -5773,6 +5814,24 @@ test "hook budget cancels a runaway coroutine" {
         std.mem.indexOf(u8, got, "cancelled") != null or
             std.mem.indexOf(u8, got, "budget_exceeded") != null,
     );
+}
+
+test "zag.layout.tree is registered and fails cleanly without a window manager" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+
+    // The function exists on zag.layout.
+    try eng.lua.doString("_has_tree = type(zag.layout) == 'table' and type(zag.layout.tree) == 'function'");
+    _ = try eng.lua.getGlobal("_has_tree");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    // With no window manager bound, invocation raises a Lua error.
+    try eng.lua.doString("_ok, _err = pcall(function() return zag.layout.tree() end)");
+    _ = try eng.lua.getGlobal("_ok");
+    try std.testing.expect(!eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }
 
 test "hook budget leaves fast hooks alone" {
