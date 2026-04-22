@@ -89,9 +89,12 @@ pub const Endpoint = struct {
         scopes: []const u8,
         /// Loopback port the local redirect listener binds to.
         redirect_port: u16,
-        /// Optional JWT claim path whose value is extracted as the account id
-        /// (e.g., `"https://api.openai.com/auth.chatgpt_account_id"`). `null`
-        /// means this provider does not expose a per-account identifier.
+        /// Optional RFC 6901 JSON Pointer (slash-separated, `~1` escapes `/`
+        /// and `~0` escapes `~`) into the id_token claims, whose value is
+        /// extracted as the account id. Example: Codex's
+        /// `"https:~1~1api.openai.com~1auth/chatgpt_account_id"` resolves to
+        /// `payload["https://api.openai.com/auth"]["chatgpt_account_id"]`.
+        /// `null` means this provider does not expose a per-account identifier.
         account_id_claim_path: ?[]const u8,
         /// Extra query parameters appended to the authorize URL (e.g.,
         /// provider-specific hints). Empty slice means no extras.
