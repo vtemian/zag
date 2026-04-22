@@ -28,6 +28,7 @@ const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const Keymap = @import("Keymap.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
+const agent_events = @import("agent_events.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const input = @import("input.zig");
@@ -398,6 +399,143 @@ pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
     return try aw.toOwnedSlice();
 }
 
+/// Outcome of a layout op bound for a `LayoutRequest`. A thin wrapper so
+/// every branch of `handleLayoutRequest` returns through the same shape.
+const LayoutOutcome = struct { bytes: ?[]u8, is_error: bool };
+
+/// Format a `{"ok":false,"error":"<name>"}` payload. Allocation failure
+/// falls back to a null payload with `is_error=true` so the caller's
+/// waiter still unblocks on a signalling error rather than a leak.
+fn errorOutcome(alloc: Allocator, name: []const u8) LayoutOutcome {
+    const msg = std.fmt.allocPrint(
+        alloc,
+        "{{\"ok\":false,\"error\":\"{s}\"}}",
+        .{name},
+    ) catch return .{ .bytes = null, .is_error = true };
+    return .{ .bytes = msg, .is_error = true };
+}
+
+/// Heap-allocated JSON for a failing op. Caller owns the returned bytes.
+fn formatErrorJson(alloc: Allocator, err: anyerror) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "{{\"ok\":false,\"error\":\"{s}\"}}",
+        .{@errorName(err)},
+    );
+}
+
+/// Service a layout round-trip request from an agent thread: dispatch on
+/// the op, allocate the JSON response on `self.layout.allocator`, and
+/// signal `req.done` so the waiter unblocks. The caller owns the request
+/// struct and frees `result_json` after `done.wait()` when
+/// `result_owned` is true.
+pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutRequest) void {
+    const alloc = self.layout.allocator;
+
+    const outcome: LayoutOutcome = blk: {
+        switch (req.op) {
+            .describe => {
+                const bytes = self.describe(alloc) catch |err| {
+                    break :blk .{
+                        .bytes = formatErrorJson(alloc, err) catch null,
+                        .is_error = true,
+                    };
+                };
+                break :blk .{ .bytes = bytes, .is_error = false };
+            },
+            .focus => |args| {
+                const handle = NodeRegistry.parseId(args.id) catch
+                    break :blk errorOutcome(alloc, "invalid_id");
+                self.focusById(handle) catch |err|
+                    break :blk errorOutcome(alloc, @errorName(err));
+                const bytes = self.describe(alloc) catch
+                    break :blk errorOutcome(alloc, "describe_failed");
+                break :blk .{ .bytes = bytes, .is_error = false };
+            },
+            .split => |args| {
+                const handle = NodeRegistry.parseId(args.id) catch
+                    break :blk errorOutcome(alloc, "invalid_id");
+                const dir: Layout.SplitDirection = if (std.mem.eql(u8, args.direction, "vertical"))
+                    .vertical
+                else if (std.mem.eql(u8, args.direction, "horizontal"))
+                    .horizontal
+                else
+                    break :blk errorOutcome(alloc, "invalid_direction");
+                if (args.buffer_type) |bt| {
+                    if (!std.mem.eql(u8, bt, "conversation")) {
+                        break :blk errorOutcome(alloc, "buffer_kind_not_yet_supported");
+                    }
+                }
+                const new_id = self.splitById(handle, dir) catch |err|
+                    break :blk errorOutcome(alloc, @errorName(err));
+                const id_str = NodeRegistry.formatId(alloc, new_id) catch
+                    break :blk errorOutcome(alloc, "oom");
+                defer alloc.free(id_str);
+                const tree = self.describe(alloc) catch
+                    break :blk errorOutcome(alloc, "describe_failed");
+                defer alloc.free(tree);
+                const merged = std.fmt.allocPrint(
+                    alloc,
+                    "{{\"ok\":true,\"new_id\":\"{s}\",\"tree\":{s}}}",
+                    .{ id_str, tree },
+                ) catch break :blk errorOutcome(alloc, "oom");
+                break :blk .{ .bytes = merged, .is_error = false };
+            },
+            .close => |args| {
+                const handle = NodeRegistry.parseId(args.id) catch
+                    break :blk errorOutcome(alloc, "invalid_id");
+                const caller_opt: ?NodeRegistry.Handle = if (tools.current_caller_pane_id) |raw|
+                    @bitCast(raw)
+                else
+                    null;
+                self.closeById(handle, caller_opt) catch |err|
+                    break :blk errorOutcome(alloc, @errorName(err));
+                const bytes = self.describe(alloc) catch
+                    break :blk errorOutcome(alloc, "describe_failed");
+                break :blk .{ .bytes = bytes, .is_error = false };
+            },
+            .resize => |args| {
+                const handle = NodeRegistry.parseId(args.id) catch
+                    break :blk errorOutcome(alloc, "invalid_id");
+                self.resizeById(handle, args.ratio) catch |err|
+                    break :blk errorOutcome(alloc, @errorName(err));
+                const bytes = self.describe(alloc) catch
+                    break :blk errorOutcome(alloc, "describe_failed");
+                break :blk .{ .bytes = bytes, .is_error = false };
+            },
+            .read_pane => |args| {
+                const handle = NodeRegistry.parseId(args.id) catch
+                    break :blk errorOutcome(alloc, "invalid_id");
+                const bytes = self.readPaneById(alloc, handle, args.lines, args.offset) catch |err|
+                    break :blk errorOutcome(alloc, @errorName(err));
+                break :blk .{ .bytes = bytes, .is_error = false };
+            },
+        }
+    };
+
+    req.result_json = outcome.bytes;
+    req.is_error = outcome.is_error;
+    req.result_owned = outcome.bytes != null;
+    req.done.set();
+}
+
+/// Read a pane's textual content. Stub until Task 14 wires
+/// ConversationBuffer.readText. Returns an "unimplemented" payload on
+/// live leaves and rejects splits so the failure surface is explicit.
+pub fn readPaneById(
+    self: *WindowManager,
+    alloc: Allocator,
+    handle: NodeRegistry.Handle,
+    lines: ?u32,
+    offset: ?u32,
+) ![]u8 {
+    _ = lines;
+    _ = offset;
+    const node = try self.node_registry.resolve(handle);
+    if (node.* != .leaf) return error.NotALeaf;
+    return std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"unimplemented\"}}", .{});
+}
+
 /// Reverse lookup: find the handle that currently addresses `node`.
 /// Returns `error.HandleMissing` if the node is not registered, which
 /// would indicate a registry/layout desync.
@@ -588,10 +726,12 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     errdefer runner.deinit();
 
     // Wake pipe so agent events on this pane interrupt the coordinator's
-    // poll(). Lua engine pointer so main-thread drain can service hook and
-    // tool round-trips. Both inherit from WindowManager's config.
+    // poll(). Lua engine + window manager pointers so main-thread drain can
+    // service hook, tool, and layout round-trips. All three inherit from
+    // WindowManager's config.
     runner.wake_fd = self.wake_write_fd;
     runner.lua_engine = self.lua_engine;
+    runner.window_manager = self;
 
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
@@ -1282,6 +1422,110 @@ test "resizeById applies ratio to parent split" {
     };
     try wm.resizeById(root_handle, 0.25);
     try std.testing.expectEqual(@as(f32, 0.25), wm.layout.root.?.split.ratio);
+}
+
+test "handleLayoutRequest describe round-trips parseable JSON" {
+    const allocator = std.testing.allocator;
+
+    // Same scaffolding as `describe emits parseable node map`. A real
+    // Screen/Compositor is required because `doSplit` writes
+    // `compositor.layout_dirty` and reads `screen.width/height`; we split
+    // once so the describe response covers a non-trivial tree.
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    wm.doSplit(.vertical);
+
+    var req = agent_events.LayoutRequest.init(.{ .describe = {} });
+    wm.handleLayoutRequest(&req);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(!req.is_error);
+    const bytes = req.result_json orelse return error.TestUnexpectedResult;
+    defer if (req.result_owned) allocator.free(bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.object.get("nodes") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nodes == .object);
+}
+
+test "handleLayoutRequest rejects invalid id with error outcome" {
+    const allocator = std.testing.allocator;
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = undefined,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+
+    var req = agent_events.LayoutRequest.init(.{ .focus = .{ .id = "not-an-id" } });
+    wm.handleLayoutRequest(&req);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const bytes = req.result_json orelse return error.TestUnexpectedResult;
+    defer if (req.result_owned) allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "invalid_id") != null);
 }
 
 test "describe emits parseable node map" {
