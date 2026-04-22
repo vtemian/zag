@@ -19,7 +19,9 @@ const log = std.log.scoped(.streaming);
 
 /// Cap on the error body we drain on non-2xx status. Enough to capture a
 /// JSON `{"error": {"message": "..."}}` envelope without blowing up logs.
-const MAX_ERROR_BODY_BYTES: usize = 2048;
+/// Sized to cover the tool array (zag ships ~10 tools) so the full
+/// payload is visible when debugging Codex 400 responses.
+const MAX_ERROR_BODY_BYTES: usize = 16384;
 
 /// Hard cap on a single SSE line. Defends against hostile or broken endpoints
 /// that stream bytes without a newline, which would otherwise grow
