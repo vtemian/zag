@@ -129,7 +129,7 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
 }
 
 /// Heuristic: a Lua table is an array if it has consecutive integer keys starting at 1.
-fn isLuaArray(lua: *Lua, index: i32) bool {
+pub fn isLuaArray(lua: *Lua, index: i32) bool {
     const length = lua.rawLen(index);
     if (length == 0) {
         // Check if the table is truly empty (no keys at all) vs an object
