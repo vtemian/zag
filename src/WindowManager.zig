@@ -929,18 +929,69 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
 
 /// Swap the live provider to `provider_name/model_id`.
 ///
-/// Stub for Task 12: the real cancel, drain, and rebuild logic lands in
-/// Task 13. Keeping the symbol live so the pending-pick handler and its
-/// tests can exercise the happy and failure branches before the swap
-/// implementation exists.
+/// Steps:
+///   1. Cancel and drain any in-flight turn on the focused pane's runner
+///      so the old ProviderResult is no longer being read by a worker.
+///      Shuts the runner down once drained; the next prompt re-spawns.
+///   2. Build a fresh `ProviderResult` from the endpoint registry using
+///      the current `auth_path`. Failures (e.g. MissingCredential for an
+///      OAuth provider the user hasn't logged into) surface as returned
+///      errors; the caller decides how to report them. The old provider
+///      stays intact so the WM never sits in a half-swapped state.
+///   3. Deinit the old result in place and overwrite the slot with the
+///      new one. `self.provider` keeps the same pointer (it addresses
+///      main's owned slot), so every downstream reader sees the new
+///      serializer, registry, and model id on the next read.
+///   4. Emit a status line plus a paste-me hint so the user can persist
+///      the pick by hand; autopersist is a deliberate non-goal.
 pub fn swapProvider(
     self: *WindowManager,
     provider_name: []const u8,
     model_id: []const u8,
 ) !void {
-    _ = self;
-    _ = provider_name;
-    _ = model_id;
+    const registry = self.registry orelse return error.NoRegistry;
+
+    // Step 1: drain any in-flight turn on the focused pane's runner.
+    // getFocusedPane falls back to root_pane when no leaf is focused.
+    const runner = self.getFocusedPane().runner;
+    if (runner.isAgentRunning()) {
+        runner.cancelAgent();
+        while (runner.isAgentRunning()) {
+            _ = runner.drainEvents(self.allocator);
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    runner.shutdown();
+
+    // Step 2: build the new provider BEFORE touching the old, so a
+    // failure leaves the old provider live.
+    const model_string = try std.fmt.allocPrint(
+        self.allocator,
+        "{s}/{s}",
+        .{ provider_name, model_id },
+    );
+    defer self.allocator.free(model_string);
+
+    var new_result = try llm.createProviderFromLuaConfig(
+        registry,
+        model_string,
+        self.provider.auth_path,
+        self.allocator,
+    );
+    errdefer new_result.deinit();
+
+    // Step 3: atomically swap inside the shared ProviderResult slot.
+    self.provider.deinit();
+    self.provider.* = new_result;
+
+    // Step 4: surface a confirmation plus the paste-me hint.
+    var scratch: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &scratch,
+        "model -> {s}\n  Persist with zag.set_default_model(\"{s}\") in config.lua",
+        .{ model_string, model_string },
+    ) catch "model swapped";
+    self.appendStatus(msg);
 }
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
@@ -1969,10 +2020,10 @@ test "restorePane rebuilds both tree and messages" {
 }
 
 // -- Model picker test scaffolding -------------------------------------------
-// The picker tests need a WindowManager whose `provider.model_id`,
-// `registry`, and `root_pane.view` are real enough that `renderModelPicker`
-// and `handleCommand` run end-to-end. Stand up the minimum once here so
-// the three Task 12 tests stay readable.
+// The picker and swap tests need a WindowManager with a real enough
+// ProviderResult that `renderModelPicker`, `handleCommand`, and
+// `swapProvider` all run end-to-end. `.auth = .none` endpoints keep the
+// credential file out of the test path.
 
 const PickerFixture = struct {
     allocator: std.mem.Allocator,
@@ -1990,8 +2041,7 @@ const PickerFixture = struct {
         self.runner.deinit();
         self.view.deinit();
         self.session.deinit();
-        self.allocator.free(self.provider.model_id);
-        self.provider.registry.deinit();
+        self.provider.deinit();
         self.registry.deinit();
     }
 };
@@ -1999,8 +2049,9 @@ const PickerFixture = struct {
 fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
     f.allocator = allocator;
 
-    // Registry with two endpoints, two models each. Ollama-like shape so
-    // `auth = .none` keeps credential lookups out of the test path.
+    // Registry with two endpoints, two models each. `.auth = .none`
+    // dodges auth.json resolution inside createProviderFromLuaConfig so
+    // the test path is disk free.
     f.registry = llm.Registry.init(allocator);
     errdefer f.registry.deinit();
 
@@ -2016,8 +2067,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
             .{ .id = "a2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
         },
     };
-    const duped_a = try ep_a.dupe(allocator);
-    try f.registry.add(duped_a);
+    try f.registry.add(try ep_a.dupe(allocator));
 
     const ep_b: llm.Endpoint = .{
         .name = "provB",
@@ -2031,23 +2081,11 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
             .{ .id = "b2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
         },
     };
-    const duped_b = try ep_b.dupe(allocator);
-    try f.registry.add(duped_b);
+    try f.registry.add(try ep_b.dupe(allocator));
 
-    // A stub ProviderResult that the picker only reads `model_id` from.
-    // Fields not touched by the picker path stay uninitialised; deinit is
-    // never called on this stub, so its internal state and inner registry
-    // are irrelevant. We free `model_id` explicitly in
-    // `PickerFixture.deinit`.
-    f.provider = .{
-        .provider = undefined,
-        .model_id = try allocator.dupe(u8, "provA/a1"),
-        .state = undefined,
-        .auth_path = "",
-        .registry = llm.Registry.init(allocator),
-        .allocator = allocator,
-        .serializer = .openai,
-    };
+    // Real ProviderResult. Any non-empty `auth_path` is fine; the
+    // endpoint's `.auth = .none` short-circuits the file read.
+    f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", "/tmp/unused_auth.json", allocator);
 
     f.session = ConversationHistory.init(allocator);
     f.view = try ConversationBuffer.init(allocator, 0, "root");
@@ -2079,12 +2117,14 @@ test "handleCommand resolves digit input when pending_model_pick is set" {
     try std.testing.expect(f.wm.pending_model_pick != null);
     try std.testing.expect(f.wm.pending_model_pick.?.len >= 2);
 
-    // Typing "2" picks entry index 1. swapProvider is a stub in Task 12,
-    // so the happy path must clear the pending pick and return .handled
-    // without mutating provider.model_id.
+    // Typing "2" picks entry index 1. The happy path must clear the
+    // pending pick, return .handled, and route through swapProvider so
+    // provider.model_id reflects the new choice (provA/a2 in this
+    // fixture).
     const result = f.wm.handleCommand("2");
     try std.testing.expectEqual(CommandResult.handled, result);
     try std.testing.expectEqual(@as(?[]PendingPickEntry, null), f.wm.pending_model_pick);
+    try std.testing.expectEqualStrings("provA/a2", f.wm.provider.model_id);
 }
 
 test "handleCommand cancels pending pick on q" {
@@ -2116,4 +2156,16 @@ test "handleCommand reports bad digit and keeps pick active" {
     const junk = f.wm.handleCommand("hello");
     try std.testing.expectEqual(CommandResult.handled, junk);
     try std.testing.expect(f.wm.pending_model_pick != null);
+}
+
+test "swapProvider rebuilds ProviderResult and updates model_id" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
+
+    try f.wm.swapProvider("provB", "b2");
+    try std.testing.expectEqualStrings("provB/b2", f.wm.provider.model_id);
 }
