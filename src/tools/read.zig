@@ -72,7 +72,8 @@ pub const definition = types.ToolDefinition{
     \\    "path": { "type": "string", "description": "Path to the file to read" },
     \\    "max_lines": { "type": "integer", "description": "Maximum lines to return (default 2000)" }
     \\  },
-    \\  "required": ["path"]
+    \\  "required": ["path"],
+    \\  "additionalProperties": false
     \\}
     ,
 };
