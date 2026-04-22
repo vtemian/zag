@@ -17,9 +17,9 @@ const auth = @import("../auth.zig");
 /// Caller must call `freeHeaders` when done.
 ///
 /// `resolveCredential`'s `ResolveOptions` are provider-specific (token URL,
-/// OAuth client id, claim path). Only the `.oauth_chatgpt` arm needs them, so
-/// they're constructed inline here from Codex-specific constants. Phase I
-/// will lift these values out of the endpoint's own `auth.oauth` spec.
+/// OAuth client id, claim path). Only the `.oauth` arm needs them; they're
+/// pulled from the endpoint's own `auth.oauth` spec so adding a new OAuth
+/// provider is a pure Lua change.
 pub fn buildHeaders(
     endpoint: *const Endpoint,
     auth_path: []const u8,
@@ -75,30 +75,14 @@ pub fn buildHeaders(
             errdefer allocator.free(bearer);
             try headers.append(allocator, .{ .name = "Authorization", .value = bearer });
         },
-        .oauth_chatgpt => {
-            const codex_opts: auth.ResolveOptions = .{
-                .token_url = "https://auth.openai.com/oauth/token",
-                .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
-                .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        .oauth => |spec| {
+            const resolve_opts: auth.ResolveOptions = .{
+                .token_url = spec.token_url,
+                .client_id = spec.client_id,
+                .account_id_claim_path = spec.account_id_claim_path,
             };
-            const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, codex_opts);
-            const codex_spec: Endpoint.OAuthSpec = .{
-                .issuer = "",
-                .token_url = "",
-                .client_id = "",
-                .scopes = "",
-                .redirect_port = 0,
-                .account_id_claim_path = null,
-                .extra_authorize_params = &.{},
-                .inject = .{
-                    .header = "Authorization",
-                    .prefix = "Bearer ",
-                    .extra_headers = &.{},
-                    .use_account_id = true,
-                    .account_id_header = "chatgpt-account-id",
-                },
-            };
-            try applyOAuthInjection(&headers, allocator, &codex_spec, resolved);
+            const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, resolve_opts);
+            try applyOAuthInjection(&headers, allocator, &spec, resolved);
         },
     }
 
@@ -544,6 +528,97 @@ test "applyOAuthInjection rejects api_key credential with WrongCredentialType" {
         error.WrongCredentialType,
         applyOAuthInjection(&headers, std.testing.allocator, &spec, resolved),
     );
+}
+
+/// Build a JWT-shaped access token whose base64url-encoded payload carries
+/// an `exp` claim in the future so `auth.resolveCredential`'s refresh
+/// check passes without needing a live IdP.
+fn buildFreshAccessToken(alloc: Allocator, exp_seconds: i64) ![]const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_buf = try alloc.alloc(u8, enc.calcSize(header.len));
+    defer alloc.free(header_buf);
+    const header_b64 = enc.encode(header_buf, header);
+
+    const payload = try std.fmt.allocPrint(alloc, "{{\"exp\":{d}}}", .{exp_seconds});
+    defer alloc.free(payload);
+    const payload_buf = try alloc.alloc(u8, enc.calcSize(payload.len));
+    defer alloc.free(payload_buf);
+    const payload_b64 = enc.encode(payload_buf, payload);
+
+    return std.fmt.allocPrint(alloc, "{s}.{s}.sig", .{ header_b64, payload_b64 });
+}
+
+test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id from spec" {
+    // Mirrors the ChatGPT happy path but constructs the endpoint
+    // programmatically — no builtin lookup — to prove that OAuth data
+    // sourced from `zag.provider{}` reaches buildHeaders correctly.
+    const allocator = std.testing.allocator;
+
+    const access = try buildFreshAccessToken(allocator, std.time.timestamp() + 3600);
+    defer allocator.free(access);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_abs);
+    const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
+    defer allocator.free(path);
+    {
+        var file = auth.AuthFile.init(allocator);
+        defer file.deinit();
+        try file.setOAuth("lua-declared-oauth", .{
+            .id_token = "idt",
+            .access_token = access,
+            .refresh_token = "rt",
+            .account_id = "acc-7",
+            .last_refresh = "2026-04-20T00:00:00Z",
+        });
+        try auth.saveAuthFile(path, file);
+    }
+
+    const endpoint: Endpoint = .{
+        .name = "lua-declared-oauth",
+        .serializer = .chatgpt,
+        .url = "https://example.test/responses",
+        .auth = .{ .oauth = .{
+            .issuer = "https://idp.test/authorize",
+            .token_url = "https://idp.test/token",
+            .client_id = "client-xyz",
+            .scopes = "openid offline_access",
+            .redirect_port = 9999,
+            .account_id_claim_path = null,
+            .extra_authorize_params = &.{},
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{},
+                .use_account_id = true,
+                .account_id_header = "x-account-id",
+            },
+        } },
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+
+    var headers = try buildHeaders(&endpoint, path, allocator);
+    defer freeHeaders(&endpoint, &headers, allocator);
+
+    // Authorization + x-account-id from the Lua-declared spec.
+    try std.testing.expectEqual(@as(usize, 2), headers.items.len);
+    var saw_auth = false;
+    var saw_acct = false;
+    for (headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "Authorization")) {
+            try std.testing.expect(std.mem.startsWith(u8, h.value, "Bearer "));
+            saw_auth = true;
+        } else if (std.mem.eql(u8, h.name, "x-account-id")) {
+            try std.testing.expectEqualStrings("acc-7", h.value);
+            saw_acct = true;
+        }
+    }
+    try std.testing.expect(saw_auth and saw_acct);
 }
 
 test {

@@ -1374,7 +1374,25 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
         .name = "openai-oauth",
         .serializer = .chatgpt,
         .url = mock_url,
-        .auth = .oauth_chatgpt,
+        .auth = .{ .oauth = .{
+            .issuer = "https://auth.openai.com/oauth/authorize",
+            .token_url = "https://auth.openai.com/oauth/token",
+            .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+            .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+            .redirect_port = 1455,
+            .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+            .extra_authorize_params = &.{
+                .{ .name = "id_token_add_organizations", .value = "true" },
+                .{ .name = "codex_cli_simplified_flow", .value = "true" },
+            },
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{},
+                .use_account_id = true,
+                .account_id_header = "chatgpt-account-id",
+            },
+        } },
         .headers = &.{},
         .default_model = "gpt-5",
         .models = &.{},
@@ -1475,7 +1493,7 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
     const state: *ChatgptSerializer = @ptrCast(@alignCast(result.state));
     try std.testing.expectEqualStrings("gpt-5-codex", state.model);
     try std.testing.expectEqualStrings("openai-oauth", state.endpoint.name);
-    try std.testing.expectEqual(llm.Endpoint.Auth.oauth_chatgpt, state.endpoint.auth);
+    try std.testing.expectEqual(std.meta.Tag(llm.Endpoint.Auth).oauth, std.meta.activeTag(state.endpoint.auth));
 }
 
 test "createProviderFromLuaConfig fails fast when oauth provider has no credentials" {

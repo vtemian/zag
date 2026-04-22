@@ -20,6 +20,7 @@ const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
 pub const findBuiltinEndpoint = registry_mod.findBuiltinEndpoint;
+pub const freeOAuthSpec = registry_mod.freeOAuthSpec;
 
 const log = std.log.scoped(.llm);
 
@@ -320,7 +321,7 @@ pub fn createProviderFromLuaConfig(
         return error.UnknownProvider;
 
     // Fail-fast existence check before the TUI takes over. For api-key
-    // providers this is a trivial lookup; for `.oauth_chatgpt` we call
+    // providers this is a trivial lookup; for `.oauth` we call
     // `resolveCredential` so a stale token on disk is refreshed
     // up-front rather than ambushing the user mid-turn. Missing entries
     // and rejected refresh tokens both collapse to `MissingCredential`,
@@ -334,15 +335,13 @@ pub fn createProviderFromLuaConfig(
                 return error.MissingCredential;
             _ = borrowed;
         },
-        .oauth_chatgpt => {
-            // Phase I will pull these from the endpoint's own auth.oauth
-            // spec once the serializer's buildHeaders does the same.
-            const codex_opts: auth.ResolveOptions = .{
-                .token_url = "https://auth.openai.com/oauth/token",
-                .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
-                .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        .oauth => |oauth_spec| {
+            const resolve_opts: auth.ResolveOptions = .{
+                .token_url = oauth_spec.token_url,
+                .client_id = oauth_spec.client_id,
+                .account_id_claim_path = oauth_spec.account_id_claim_path,
             };
-            const resolved = auth.resolveCredential(allocator, auth_file_path, spec.provider_name, codex_opts) catch |err| switch (err) {
+            const resolved = auth.resolveCredential(allocator, auth_file_path, spec.provider_name, resolve_opts) catch |err| switch (err) {
                 error.NotLoggedIn, error.LoginExpired => return error.MissingCredential,
                 else => return err,
             };
