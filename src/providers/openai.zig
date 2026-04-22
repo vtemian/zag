@@ -53,7 +53,7 @@ pub const OpenAiSerializer = struct {
         const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
-        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator, .{});
+        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
         const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
@@ -78,7 +78,7 @@ pub const OpenAiSerializer = struct {
         const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
-        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator, .{});
+        var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
         const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);

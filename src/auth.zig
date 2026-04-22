@@ -457,24 +457,21 @@ pub const Resolved = union(enum) {
 /// agent loop never sees a 401 (which it treats as a hard turn abort).
 const refresh_margin_seconds: i64 = 5 * 60;
 
-/// Well-known Codex OIDC token endpoint. Override via `ResolveOptions` in
-/// tests that point at a local mock server.
-const default_token_url: []const u8 = "https://auth.openai.com/oauth/token";
-
-/// Codex public OAuth client id. Mirrors the value in `src/oauth.zig`
-/// callers; kept local here so the resolver has no dependency on login-flow
-/// knobs.
-const default_client_id: []const u8 = "app_EMoamEEZ73f0CkXaXp7hrann";
-
-/// Injection points for `resolveCredential`. Defaults hit the real Codex
-/// IdP and wall-clock time; tests supply a local URL and a frozen clock.
+/// Injection points for `resolveCredential`. The first three fields are
+/// provider-specific and have no sensible defaults: callers must pass the
+/// token endpoint, OAuth client id, and (optionally) the JSON-pointer claim
+/// path from the endpoint's own auth config. `now_fn` stays defaulted because
+/// it's provider-independent (wall clock for production, frozen for tests).
 pub const ResolveOptions = struct {
-    /// Token endpoint for the refresh POST. Defaults to the Codex IdP.
-    token_url: []const u8 = default_token_url,
-    /// OAuth client id sent with the refresh request.
-    client_id: []const u8 = default_client_id,
-    /// Unix-seconds clock. Tests override to control proactive-refresh
-    /// behaviour without sleeping.
+    /// Token endpoint POSTed to during refresh. Required.
+    token_url: []const u8,
+    /// OAuth client_id sent with the refresh request. Required.
+    client_id: []const u8,
+    /// Optional RFC 6901 pointer: when `id_token` is present on the refresh
+    /// response, re-extract `account_id` along this path. `null` means "keep
+    /// the existing account_id" (empty string for providers without one).
+    account_id_claim_path: ?[]const u8,
+    /// Unix-seconds clock; defaulted for production, overridden in tests.
     now_fn: *const fn () i64 = defaultNow,
 };
 
@@ -559,14 +556,10 @@ pub fn resolveCredential(
             const new_at = if (refreshed.access_token.len > 0) refreshed.access_token else old_at;
             const new_rt = if (refreshed.refresh_token.len > 0) refreshed.refresh_token else old_rt;
 
-            const new_account_id = if (refreshed.id_token.len > 0)
-                try oauth.extractAccountId(
-                    alloc,
-                    refreshed.id_token,
-                    "https:~1~1api.openai.com~1auth/chatgpt_account_id",
-                )
-            else
-                try alloc.dupe(u8, old_acc);
+            const new_account_id = if (opts.account_id_claim_path) |path| blk: {
+                if (refreshed.id_token.len == 0) break :blk try alloc.dupe(u8, old_acc);
+                break :blk try oauth.extractAccountId(alloc, refreshed.id_token, path);
+            } else try alloc.dupe(u8, old_acc);
             defer alloc.free(new_account_id);
 
             const last_refresh_iso = try formatIsoNow(alloc, opts.now_fn());
@@ -929,6 +922,15 @@ test "upsertOAuth serializes concurrent callers" {
 // and run a one-shot mock token endpoint on a random loopback port so each
 // test can control the refresh response.
 
+/// Codex-shaped `ResolveOptions` base used by the oauth refresh-path tests.
+/// Individual tests override `token_url` (mock port), `account_id_claim_path`
+/// (null vs. non-null branches), and `now_fn` as needed.
+const test_codex_opts: ResolveOptions = .{
+    .token_url = "https://auth.openai.com/oauth/token",
+    .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+    .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+};
+
 fn encodeJwtWithPayload(alloc: Allocator, payload: []const u8) ![]const u8 {
     const enc = std.base64.url_safe_no_pad.Encoder;
     const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
@@ -974,7 +976,7 @@ test "resolveCredential returns api_key verbatim" {
         try saveAuthFile(path, file);
     }
 
-    const got = try resolveCredential(std.testing.allocator, path, "anthropic", .{});
+    const got = try resolveCredential(std.testing.allocator, path, "anthropic", test_codex_opts);
     defer got.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("sk-ant-verbatim", got.api_key);
@@ -991,7 +993,7 @@ test "resolveCredential returns error.NotLoggedIn when entry missing" {
     // No auth.json at all — loader returns empty map, lookup fails.
     try std.testing.expectError(
         error.NotLoggedIn,
-        resolveCredential(std.testing.allocator, path, "missing", .{}),
+        resolveCredential(std.testing.allocator, path, "missing", test_codex_opts),
     );
 }
 
@@ -1031,6 +1033,8 @@ test "resolveCredential returns current oauth tokens when well before expiry" {
     // test if the refresh path were taken — we expect it not to be.
     const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
         .token_url = "http://127.0.0.1:1/should-not-be-hit",
+        .client_id = test_codex_opts.client_id,
+        .account_id_claim_path = test_codex_opts.account_id_claim_path,
         .now_fn = FrozenClock.now,
     });
     defer got.deinit(std.testing.allocator);
@@ -1117,6 +1121,8 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
 
     const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
         .token_url = url,
+        .client_id = test_codex_opts.client_id,
+        .account_id_claim_path = test_codex_opts.account_id_claim_path,
         .now_fn = FrozenClock.now,
     });
     defer got.deinit(std.testing.allocator);
@@ -1206,14 +1212,21 @@ test "resolveCredential refreshes when access token already expired" {
         }
     };
 
+    // account_id_claim_path=null exercises the "keep existing account_id"
+    // branch: even though the mock IdP returns a fresh id_token with
+    // chatgpt_account_id=acc-new, the resolver must leave the account_id
+    // unchanged (acc-old) because no claim path was provided. This matches
+    // the Anthropic OAuth shape, which has no account id.
     const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
         .token_url = url,
+        .client_id = test_codex_opts.client_id,
+        .account_id_claim_path = null,
         .now_fn = FrozenClock.now,
     });
     defer got.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(new_access, got.oauth.access_token);
-    try std.testing.expectEqualStrings("acc-new", got.oauth.account_id);
+    try std.testing.expectEqualStrings("acc-old", got.oauth.account_id);
 }
 
 test "resolveCredential maps LoginExpired from refresh endpoint" {
@@ -1275,8 +1288,28 @@ test "resolveCredential maps LoginExpired from refresh endpoint" {
         std.testing.allocator,
         path,
         "openai-oauth",
-        .{ .token_url = url, .now_fn = FrozenClock.now },
+        .{
+            .token_url = url,
+            .client_id = test_codex_opts.client_id,
+            .account_id_claim_path = test_codex_opts.account_id_claim_path,
+            .now_fn = FrozenClock.now,
+        },
     ));
+}
+
+test "ResolveOptions has no Codex defaults — all three fields required" {
+    const fields = @typeInfo(ResolveOptions).@"struct".fields;
+    inline for (fields) |f| {
+        if (std.mem.eql(u8, f.name, "token_url")) {
+            try std.testing.expect(f.default_value_ptr == null);
+        }
+        if (std.mem.eql(u8, f.name, "client_id")) {
+            try std.testing.expect(f.default_value_ptr == null);
+        }
+        if (std.mem.eql(u8, f.name, "account_id_claim_path")) {
+            try std.testing.expect(f.default_value_ptr == null);
+        }
+    }
 }
 
 test {
