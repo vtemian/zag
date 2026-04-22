@@ -6840,3 +6840,62 @@ test "stdlib: require(zag.providers.ollama) registers ollama" {
     try std.testing.expectEqual(@as(usize, 0), ep.models.len);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .none);
 }
+
+test "stdlib: require(zag.providers.openai-oauth) registers openai-oauth with Codex spec" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.openai-oauth')");
+
+    const ep = engine.providers_registry.find("openai-oauth") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", ep.url);
+    try std.testing.expectEqual(llm.Serializer.chatgpt, ep.serializer);
+    switch (ep.auth) {
+        .oauth => |spec| {
+            try std.testing.expectEqualStrings("app_EMoamEEZ73f0CkXaXp7hrann", spec.client_id);
+            try std.testing.expectEqual(@as(u16, 1455), spec.redirect_port);
+            try std.testing.expect(spec.account_id_claim_path != null);
+            try std.testing.expectEqualStrings("https:~1~1api.openai.com~1auth/chatgpt_account_id", spec.account_id_claim_path.?);
+            try std.testing.expect(spec.inject.use_account_id);
+            try std.testing.expectEqualStrings("chatgpt-account-id", spec.inject.account_id_header);
+            try std.testing.expectEqual(@as(usize, 2), spec.extra_authorize_params.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "stdlib: require(zag.providers.anthropic-oauth) registers Claude Max spec" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.anthropic-oauth')");
+
+    const ep = engine.providers_registry.find("anthropic-oauth") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
+    try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
+    switch (ep.auth) {
+        .oauth => |spec| {
+            try std.testing.expectEqual(@as(u16, 53692), spec.redirect_port);
+            try std.testing.expect(spec.account_id_claim_path == null);
+            try std.testing.expect(!spec.inject.use_account_id);
+            try std.testing.expectEqual(@as(usize, 2), spec.inject.extra_headers.len);
+            var saw_beta = false;
+            for (spec.inject.extra_headers) |h| {
+                if (std.mem.eql(u8, h.name, "anthropic-beta")) {
+                    try std.testing.expectEqualStrings("oauth-2025-04-20,claude-code-20250219", h.value);
+                    saw_beta = true;
+                }
+            }
+            try std.testing.expect(saw_beta);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), ep.models[0].input_per_mtok, 0.0001);
+}
