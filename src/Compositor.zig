@@ -169,6 +169,7 @@ fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
         .leaf => |leaf| {
             self.drawBufferContent(&leaf);
             leaf.buffer.clearDirty();
+            self.syncTreeSnapshot(leaf.buffer);
         },
         .split => |split| {
             self.drawAllLeaves(split.first);
@@ -198,6 +199,7 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
                 }
                 self.drawBufferContent(&leaf);
                 leaf.buffer.clearDirty();
+                self.syncTreeSnapshot(leaf.buffer);
             }
         },
         .split => |split| {
@@ -205,6 +207,16 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
             self.drawDirtyLeaves(split.second);
         },
     }
+}
+
+/// Snapshot the tree's current generation onto the pane's runner. Step
+/// 5 will read this snapshot back on the next frame to tell tree
+/// mutations apart from view-only dirty (scroll, focus) and drive
+/// per-node cache invalidation via `ConversationTree.drainDirty`.
+fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
+    const orch = self.orchestrator orelse return;
+    const pane = orch.window_manager.paneFromBuffer(buf) orelse return;
+    pane.runner.node_version_snapshot = pane.view.tree.currentGeneration();
 }
 
 /// Draw the content of a single buffer into its rect on the screen.
