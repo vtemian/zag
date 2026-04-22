@@ -19,7 +19,6 @@ pub const http = @import("llm/http.zig");
 const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
-pub const findBuiltinEndpoint = registry_mod.findBuiltinEndpoint;
 pub const freeOAuthSpec = registry_mod.freeOAuthSpec;
 
 const log = std.log.scoped(.llm);
@@ -453,6 +452,78 @@ pub const ResponseBuilder = struct {
 
 // -- Tests -------------------------------------------------------------------
 
+/// Hand-construct a registry seeded with the providers these tests reference.
+/// Production code gets its registry from Lua (`require("zag.providers.*")`);
+/// the factory tests below want a deterministic fixture without booting a Lua
+/// engine, so we stamp out a minimal set that matches the stdlib shape for
+/// the handful of names exercised here (`anthropic`, `openai`, `ollama`,
+/// `openai-oauth`).
+fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
+    var reg = Registry.init(allocator);
+    errdefer reg.deinit();
+
+    const anthropic_ep: Endpoint = .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://api.anthropic.com/v1/messages",
+        .auth = .x_api_key,
+        .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
+        .default_model = "claude-sonnet-4-20250514",
+        .models = &.{},
+    };
+    try reg.add(try anthropic_ep.dupe(allocator));
+
+    const openai_ep: Endpoint = .{
+        .name = "openai",
+        .serializer = .openai,
+        .url = "https://api.openai.com/v1/chat/completions",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "gpt-4o",
+        .models = &.{},
+    };
+    try reg.add(try openai_ep.dupe(allocator));
+
+    const ollama_ep: Endpoint = .{
+        .name = "ollama",
+        .serializer = .openai,
+        .url = "http://localhost:11434/v1/chat/completions",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "llama3",
+        .models = &.{},
+    };
+    try reg.add(try ollama_ep.dupe(allocator));
+
+    const openai_oauth_ep: Endpoint = .{
+        .name = "openai-oauth",
+        .serializer = .chatgpt,
+        .url = "https://chatgpt.com/backend-api/codex/responses",
+        .auth = .{ .oauth = .{
+            .issuer = "https://auth.openai.com/oauth/authorize",
+            .token_url = "https://auth.openai.com/oauth/token",
+            .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+            .scopes = "openid profile email offline_access",
+            .redirect_port = 1455,
+            .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+            .extra_authorize_params = &.{},
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{},
+                .use_account_id = true,
+                .account_id_header = "chatgpt-account-id",
+            },
+        } },
+        .headers = &.{},
+        .default_model = "gpt-5",
+        .models = &.{},
+    };
+    try reg.add(try openai_oauth_ep.dupe(allocator));
+
+    return reg;
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
@@ -635,7 +706,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var registry = try Registry.init(allocator);
+    var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
     var result = try createProviderFromLuaConfig(&registry, "openai/gpt-4o", auth_path, allocator);
     defer result.deinit();
@@ -663,7 +734,7 @@ test "createProviderFromLuaConfig uses hardcoded fallback when default_model uns
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var registry = try Registry.init(allocator);
+    var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
     var result = try createProviderFromLuaConfig(&registry, null, auth_path, allocator);
     defer result.deinit();
@@ -691,7 +762,7 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var registry = try Registry.init(allocator);
+    var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,
@@ -711,7 +782,7 @@ test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints"
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var registry = try Registry.init(allocator);
+    var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
     var result = try createProviderFromLuaConfig(&registry, "ollama/llama3", auth_path, allocator);
     defer result.deinit();
@@ -731,7 +802,7 @@ test "createProviderFromLuaConfig returns UnknownProvider for unsupported provid
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var registry = try Registry.init(allocator);
+    var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
     try std.testing.expectError(
         error.UnknownProvider,
@@ -761,7 +832,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
 
-    var registry = try Registry.init(allocator);
+    var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,

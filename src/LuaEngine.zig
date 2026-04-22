@@ -200,7 +200,7 @@ pub const LuaEngine = struct {
         errdefer keymap_registry.deinit();
         try keymap_registry.loadDefaults();
 
-        var providers_registry = try llm.Registry.init(allocator);
+        var providers_registry = llm.Registry.init(allocator);
         errdefer providers_registry.deinit();
 
         // Install pure-Lua combinators that build on zag.spawn / :join /
@@ -3623,11 +3623,11 @@ test "LuaEngine init and deinit" {
     try std.testing.expectEqual(@as(i64, 2), val);
 }
 
-test "LuaEngine.init seeds providers_registry with builtins" {
+test "LuaEngine.init starts with an empty providers_registry" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
-    try std.testing.expect(engine.providers_registry.find("anthropic") != null);
-    try std.testing.expect(engine.providers_registry.find("openai") != null);
+    try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
+    try std.testing.expectEqual(@as(?*const llm.Endpoint, null), engine.providers_registry.find("anthropic"));
     try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
 }
 

@@ -110,7 +110,7 @@ pub fn estimateCost(
 // -- Tests -------------------------------------------------------------------
 
 test "estimateCost: looks up per-model rate through registry split on slash" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-slash",
@@ -144,7 +144,7 @@ test "estimateCost: looks up per-model rate through registry split on slash" {
 }
 
 test "estimateCost: skips nil cache rates" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "openai-test-nilcache",
@@ -178,13 +178,13 @@ test "estimateCost: skips nil cache rates" {
 }
 
 test "estimateCost: unknown provider returns null" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     try std.testing.expect(estimateCost(&reg, "cost-test-nope/foo", .{ .input_tokens = 1 }) == null);
 }
 
 test "estimateCost: unknown model within known provider returns null" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-unknown",

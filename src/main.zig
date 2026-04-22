@@ -27,6 +27,7 @@ const agent_events = @import("agent_events.zig");
 const types = @import("types.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const oauth = @import("oauth.zig");
+const embedded = @import("lua/embedded.zig");
 
 const log = std.log.scoped(.main);
 
@@ -245,6 +246,42 @@ fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home_dir});
 }
 
+/// Iterate the embedded stdlib manifest and `require(...)` each entry so the
+/// engine's `providers_registry` ends up populated with every shipped
+/// provider. Called from main() when `config.lua` left the registry empty
+/// (first run, or a config that explicitly declared zero providers); also
+/// used by the CLI subcommand paths that need a working provider table
+/// without a user's config.lua.
+///
+/// Failures on individual modules are logged and skipped — one broken stdlib
+/// entry must not take down the whole picker. Returns the number of modules
+/// that loaded successfully.
+fn bootstrapStdlibProviders(engine: *LuaEngine) usize {
+    engine.storeSelfPointer();
+    var loaded: usize = 0;
+    for (embedded.entries) |entry| {
+        var src_buf: [128]u8 = undefined;
+        const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
+            log.warn("stdlib bootstrap: module name too long: {s}", .{entry.name});
+            continue;
+        };
+        engine.lua.doString(src) catch |err| {
+            log.warn("stdlib bootstrap: failed to load {s}: {}", .{ entry.name, err });
+            continue;
+        };
+        loaded += 1;
+    }
+    return loaded;
+}
+
+/// Return the `llm.Endpoint` the given `provider_name` resolves to through
+/// the supplied registry, or null when no such entry exists. Thin wrapper
+/// around `Registry.find` kept so future callers can grow registry-aware
+/// fallback logic without touching every call site.
+fn findEndpointIn(registry: *const llm.Registry, provider_name: []const u8) ?*const llm.Endpoint {
+    return registry.find(provider_name);
+}
+
 /// One-shot signin entry point invoked when `--login=<provider>` is passed.
 /// Returns the process exit code so `main` can call `std.process.exit` with
 /// the right value without juggling control flow inline. Diagnostic messages
@@ -257,7 +294,17 @@ fn runLoginCommand(
     provider_name: []const u8,
     err_writer: *std.io.Writer,
 ) !u8 {
-    const endpoint = llm.findBuiltinEndpoint(provider_name) orelse {
+    // `--login` runs before the main Lua engine is built. Boot a throwaway
+    // engine and load the stdlib so we can look up the OAuth spec for the
+    // requested provider without duplicating endpoint metadata here.
+    var engine = LuaEngine.init(allocator) catch |err| {
+        err_writer.print("zag: lua init failed: {s}\n", .{@errorName(err)}) catch {};
+        return 1;
+    };
+    defer engine.deinit();
+    _ = bootstrapStdlibProviders(&engine);
+
+    const endpoint = engine.providers_registry.find(provider_name) orelse {
         err_writer.print(
             "zag: unknown provider '{s}'. Try --login=openai-oauth.\n",
             .{provider_name},
@@ -331,10 +378,17 @@ pub const std_options: std.Options = .{ .logFn = file_log.handler };
 /// OAuth providers get a `zag --login=<provider>` hint; api-key providers
 /// get told to edit `~/.config/zag/auth.json`. Unknown providers fall back
 /// to the generic message. Extracted so tests can assert on the full
-/// message without spawning a process.
-fn formatMissingCredentialHint(scratch: []u8, model_id: []const u8) []const u8 {
+/// message without spawning a process. `registry` is the engine's
+/// `providers_registry` (or a fallback) used to look up the endpoint's auth
+/// shape; a null registry or an absent entry both collapse to the generic
+/// api-key hint.
+fn formatMissingCredentialHint(
+    scratch: []u8,
+    model_id: []const u8,
+    registry: ?*const llm.Registry,
+) []const u8 {
     const spec = llm.parseModelString(model_id);
-    const endpoint_opt = llm.findBuiltinEndpoint(spec.provider_name);
+    const endpoint_opt = if (registry) |r| r.find(spec.provider_name) else null;
     const is_oauth = if (endpoint_opt) |ep| std.meta.activeTag(ep.auth) == .oauth else false;
 
     const fallback = "zag: no credentials for configured provider in ~/.config/zag/auth.json\n";
@@ -689,7 +743,13 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
     };
     defer if (lua_engine) |*eng| eng.deinit();
 
-    if (lua_engine) |*eng| eng.loadUserConfig();
+    if (lua_engine) |*eng| {
+        eng.loadUserConfig();
+        if (eng.providers_registry.endpoints.items.len == 0) {
+            log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
+            _ = bootstrapStdlibProviders(eng);
+        }
+    }
 
     const home_dir = std.process.getEnvVarOwned(gpa, "HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => blk: {
@@ -703,9 +763,10 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
     defer gpa.free(auth_path);
 
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    // If the Lua engine failed to boot, fall back to a builtin-only registry
-    // so the factory still has a provider table to look up against.
-    var fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(gpa) else null;
+    // If the Lua engine failed to boot, fall back to an empty registry.
+    // `createProviderFromLuaConfig` will surface UnknownProvider, which the
+    // caller routes to the "no credentials" hint.
+    var fallback_registry: ?llm.Registry = if (lua_engine == null) llm.Registry.init(gpa) else null;
     defer if (fallback_registry) |*r| r.deinit();
     const registry_ptr: *const llm.Registry = if (lua_engine) |*eng| &eng.providers_registry else &fallback_registry.?;
 
@@ -714,7 +775,7 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
             const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
             const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
             var scratch: [512]u8 = undefined;
-            const message = formatMissingCredentialHint(&scratch, model_id);
+            const message = formatMissingCredentialHint(&scratch, model_id, registry_ptr);
             _ = stderr_file.write(message) catch {};
         }
         return err;
@@ -822,9 +883,10 @@ fn firstRunWizardRetry(
     };
 
     // The wizard iterates the engine's provider registry for its picker.
-    // If the engine didn't boot, fall back to a builtin-only registry so the
-    // user still gets a working choice list.
-    var wizard_fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(allocator) else null;
+    // If the engine didn't boot we have nothing to show; fall back to an
+    // empty registry so `runWizard` surfaces `NoProvidersConfigured` rather
+    // than walking an uninitialised slice.
+    var wizard_fallback_registry: ?llm.Registry = if (lua_engine == null) llm.Registry.init(allocator) else null;
     defer if (wizard_fallback_registry) |*r| r.deinit();
     const wizard_registry: *const llm.Registry = if (lua_engine) |eng| &eng.providers_registry else &wizard_fallback_registry.?;
 
@@ -858,10 +920,15 @@ fn firstRunWizardRetry(
     // Reload Lua so a freshly scaffolded config.lua's default_model becomes
     // visible before the retry. If scaffolding was skipped (config already
     // present), reload is a no-op in terms of default_model but still safe.
-    if (lua_engine) |eng| eng.loadUserConfig();
+    if (lua_engine) |eng| {
+        eng.loadUserConfig();
+        if (eng.providers_registry.endpoints.items.len == 0) {
+            _ = bootstrapStdlibProviders(eng);
+        }
+    }
 
     const new_default: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
-    var fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(allocator) else null;
+    var fallback_registry: ?llm.Registry = if (lua_engine == null) llm.Registry.init(allocator) else null;
     defer if (fallback_registry) |*r| r.deinit();
     const registry_ptr: *const llm.Registry = if (lua_engine) |eng| &eng.providers_registry else &fallback_registry.?;
     return llm.createProviderFromEnv(registry_ptr, new_default, allocator) catch |err| {
@@ -924,12 +991,16 @@ pub fn main() !void {
                 return err;
             };
             defer paths.deinit(allocator);
-            // The auth subcommands run before the Lua engine boots, so build
-            // a standalone registry for the wizard to iterate. Seeded with
-            // builtins today; once Phase I2 lands this will be empty until
-            // the user's config.lua is loaded (a concern for that task).
-            var subcmd_registry = try llm.Registry.init(allocator);
-            defer subcmd_registry.deinit();
+            // Auth subcommands run before the main Lua engine boots. Spin up
+            // a throwaway engine, load the user's config.lua, and fall back
+            // to the stdlib if that left the registry empty — the wizard
+            // picker needs something to iterate over either way.
+            var subcmd_engine = try LuaEngine.init(allocator);
+            defer subcmd_engine.deinit();
+            subcmd_engine.loadUserConfig();
+            if (subcmd_engine.providers_registry.endpoints.items.len == 0) {
+                _ = bootstrapStdlibProviders(&subcmd_engine);
+            }
             const deps: auth_wizard.WizardDeps = .{
                 .allocator = allocator,
                 .stdin = &stdin_reader.interface,
@@ -939,7 +1010,7 @@ pub fn main() !void {
                 .config_path = paths.config_path,
                 .scaffold_config = false,
                 .forced_provider = prov,
-                .registry = &subcmd_registry,
+                .registry = &subcmd_engine.providers_registry,
             };
             const result = try auth_wizard.runWizard(deps);
             allocator.free(result.provider_name);
@@ -951,8 +1022,12 @@ pub fn main() !void {
                 return err;
             };
             defer paths.deinit(allocator);
-            var subcmd_registry = try llm.Registry.init(allocator);
-            defer subcmd_registry.deinit();
+            var subcmd_engine = try LuaEngine.init(allocator);
+            defer subcmd_engine.deinit();
+            subcmd_engine.loadUserConfig();
+            if (subcmd_engine.providers_registry.endpoints.items.len == 0) {
+                _ = bootstrapStdlibProviders(&subcmd_engine);
+            }
             const deps: auth_wizard.WizardDeps = .{
                 .allocator = allocator,
                 .stdin = &stdin_reader.interface,
@@ -962,7 +1037,7 @@ pub fn main() !void {
                 .config_path = paths.config_path,
                 .scaffold_config = false,
                 .forced_provider = null,
-                .registry = &subcmd_registry,
+                .registry = &subcmd_engine.providers_registry,
             };
             try auth_wizard.printAuthList(deps);
             return;
@@ -973,8 +1048,12 @@ pub fn main() !void {
                 return err;
             };
             defer paths.deinit(allocator);
-            var subcmd_registry = try llm.Registry.init(allocator);
-            defer subcmd_registry.deinit();
+            var subcmd_engine = try LuaEngine.init(allocator);
+            defer subcmd_engine.deinit();
+            subcmd_engine.loadUserConfig();
+            if (subcmd_engine.providers_registry.endpoints.items.len == 0) {
+                _ = bootstrapStdlibProviders(&subcmd_engine);
+            }
             const deps: auth_wizard.WizardDeps = .{
                 .allocator = allocator,
                 .stdin = &stdin_reader.interface,
@@ -984,7 +1063,7 @@ pub fn main() !void {
                 .config_path = paths.config_path,
                 .scaffold_config = false,
                 .forced_provider = null,
-                .registry = &subcmd_registry,
+                .registry = &subcmd_engine.providers_registry,
             };
             try auth_wizard.removeAuth(deps, prov);
             return;
@@ -1052,10 +1131,23 @@ pub fn main() !void {
 
     if (lua_engine) |*eng| {
         eng.loadUserConfig();
+        // If the user has no config.lua (or declared zero providers), the
+        // registry is empty and nothing would work. Load the embedded stdlib
+        // so first-run users still have the well-known providers available
+        // to the picker and the factory. A user who later pins their set via
+        // explicit `require(...)` calls in config.lua populates the registry
+        // before this check fires, so the fallback stays dormant.
+        if (eng.providers_registry.endpoints.items.len == 0) {
+            log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
+            _ = bootstrapStdlibProviders(eng);
+        }
     }
 
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    var fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(allocator) else null;
+    var fallback_registry: ?llm.Registry = if (lua_engine == null)
+        llm.Registry.init(allocator)
+    else
+        null;
     defer if (fallback_registry) |*r| r.deinit();
     const registry_ptr: *const llm.Registry = if (lua_engine) |*eng| &eng.providers_registry else &fallback_registry.?;
     var provider = llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
@@ -1065,11 +1157,11 @@ pub fn main() !void {
         // user at `zag --login=<provider>` and exit with the original error.
         const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
         const spec = llm.parseModelString(model_id);
-        if (llm.findBuiltinEndpoint(spec.provider_name)) |ep| {
+        if (registry_ptr.find(spec.provider_name)) |ep| {
             if (std.meta.activeTag(ep.auth) == .oauth) {
                 const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
                 var scratch: [512]u8 = undefined;
-                const message = formatMissingCredentialHint(&scratch, model_id);
+                const message = formatMissingCredentialHint(&scratch, model_id, registry_ptr);
                 _ = stderr_file.write(message) catch {};
                 return err;
             }
@@ -1321,6 +1413,11 @@ test "parseStartupArgs extracts the provider from --login=" {
 }
 
 test "runLoginCommand rejects unknown providers with exit code 1" {
+    // runLoginCommand now boots a throwaway LuaEngine and loads the stdlib
+    // through `require()`; under sandbox mode `require` is stripped and the
+    // bootstrap can't populate the registry, so skip there.
+    if (@import("LuaEngine.zig").sandbox_enabled) return error.SkipZigTest;
+
     var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);
     defer err_aw.deinit();
 
@@ -1333,8 +1430,10 @@ test "runLoginCommand rejects unknown providers with exit code 1" {
 }
 
 test "runLoginCommand rejects providers whose auth is not oauth" {
-    // `anthropic` is a built-in endpoint but uses .x_api_key auth; the login
+    // `anthropic` is a stdlib endpoint but uses .x_api_key auth; the login
     // command must refuse it rather than trying to run an OAuth flow.
+    if (@import("LuaEngine.zig").sandbox_enabled) return error.SkipZigTest;
+
     var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);
     defer err_aw.deinit();
 
@@ -1346,9 +1445,59 @@ test "runLoginCommand rejects providers whose auth is not oauth" {
     );
 }
 
+/// Build a registry pre-seeded with the two endpoint shapes the
+/// formatMissingCredentialHint tests need: one api-key (`openai`) and one
+/// OAuth (`openai-oauth`). Lets the tests exercise the three branches
+/// without booting a Lua engine.
+fn testHintRegistry(allocator: std.mem.Allocator) !llm.Registry {
+    var reg = llm.Registry.init(allocator);
+    errdefer reg.deinit();
+
+    const openai_ep: llm.Endpoint = .{
+        .name = "openai",
+        .serializer = .openai,
+        .url = "https://api.openai.com/v1/chat/completions",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "gpt-4o",
+        .models = &.{},
+    };
+    try reg.add(try openai_ep.dupe(allocator));
+
+    const oauth_ep: llm.Endpoint = .{
+        .name = "openai-oauth",
+        .serializer = .chatgpt,
+        .url = "https://chatgpt.com/backend-api/codex/responses",
+        .auth = .{ .oauth = .{
+            .issuer = "https://auth.openai.com/oauth/authorize",
+            .token_url = "https://auth.openai.com/oauth/token",
+            .client_id = "cid",
+            .scopes = "openid",
+            .redirect_port = 1455,
+            .account_id_claim_path = null,
+            .extra_authorize_params = &.{},
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{},
+                .use_account_id = false,
+                .account_id_header = "",
+            },
+        } },
+        .headers = &.{},
+        .default_model = "gpt-5",
+        .models = &.{},
+    };
+    try reg.add(try oauth_ep.dupe(allocator));
+
+    return reg;
+}
+
 test "formatMissingCredentialHint points OAuth providers at --login" {
+    var reg = try testHintRegistry(std.testing.allocator);
+    defer reg.deinit();
     var scratch: [512]u8 = undefined;
-    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5");
+    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5", &reg);
     try std.testing.expectEqualStrings(
         "zag: not signed in to 'openai-oauth'. Run: zag --login=openai-oauth\n",
         msg,
@@ -1356,8 +1505,10 @@ test "formatMissingCredentialHint points OAuth providers at --login" {
 }
 
 test "formatMissingCredentialHint points api-key providers at auth.json" {
+    var reg = try testHintRegistry(std.testing.allocator);
+    defer reg.deinit();
     var scratch: [512]u8 = undefined;
-    const msg = formatMissingCredentialHint(&scratch, "openai/gpt-4o");
+    const msg = formatMissingCredentialHint(&scratch, "openai/gpt-4o", &reg);
     try std.testing.expectEqualStrings(
         "zag: no credentials for provider 'openai' in ~/.config/zag/auth.json\n",
         msg,
@@ -1365,10 +1516,76 @@ test "formatMissingCredentialHint points api-key providers at auth.json" {
 }
 
 test "formatMissingCredentialHint falls back to generic message for unknown provider" {
+    var reg = try testHintRegistry(std.testing.allocator);
+    defer reg.deinit();
     var scratch: [512]u8 = undefined;
-    const msg = formatMissingCredentialHint(&scratch, "not-a-real-provider/x");
+    const msg = formatMissingCredentialHint(&scratch, "not-a-real-provider/x", &reg);
     try std.testing.expectEqualStrings(
         "zag: no credentials for provider 'not-a-real-provider' in ~/.config/zag/auth.json\n",
         msg,
     );
+}
+
+test "formatMissingCredentialHint survives a null registry" {
+    // Edge case: the engine failed to boot and the fallback registry is
+    // empty. The hint should still render, falling through to the generic
+    // api-key message rather than segfaulting.
+    var scratch: [512]u8 = undefined;
+    const msg = formatMissingCredentialHint(&scratch, "openai/gpt-4o", null);
+    try std.testing.expectEqualStrings(
+        "zag: no credentials for provider 'openai' in ~/.config/zag/auth.json\n",
+        msg,
+    );
+}
+
+test "bootstrapStdlibProviders populates an empty engine registry" {
+    // First-run scenario: fresh LuaEngine with no config.lua loaded. The
+    // bootstrap helper must `require()` every stdlib module and leave the
+    // registry carrying every provider the embedded manifest advertises.
+    if (@import("LuaEngine.zig").sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
+
+    const loaded = bootstrapStdlibProviders(&engine);
+    try std.testing.expectEqual(embedded.entries.len, loaded);
+    try std.testing.expectEqual(embedded.entries.len, engine.providers_registry.endpoints.items.len);
+
+    // Spot-check: anthropic (api-key) and openai-oauth (oauth) both installed.
+    try std.testing.expect(engine.providers_registry.find("anthropic") != null);
+    const oauth_ep = engine.providers_registry.find("openai-oauth").?;
+    try std.testing.expectEqual(std.meta.Tag(llm.Endpoint.Auth).oauth, std.meta.activeTag(oauth_ep.auth));
+}
+
+test "bootstrap is a no-op when config.lua already populated the registry" {
+    // User with an explicit `require("zag.providers.anthropic")` in their
+    // config.lua: the registry is non-empty, so the bootstrap fallback must
+    // not fire. We simulate that by hand-seeding one endpoint, then
+    // asserting the main() guard (`endpoints.items.len == 0`) would leave
+    // the registry untouched.
+    if (@import("LuaEngine.zig").sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    const ep: llm.Endpoint = .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://api.anthropic.com/v1/messages",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "claude-sonnet-4-20250514",
+        .models = &.{},
+    };
+    try engine.providers_registry.add(try ep.dupe(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), engine.providers_registry.endpoints.items.len);
+
+    // Mirror the guard in main(): only load stdlib when the registry is
+    // empty. A pre-populated registry must stay exactly as the user left it.
+    if (engine.providers_registry.endpoints.items.len == 0) {
+        _ = bootstrapStdlibProviders(&engine);
+    }
+    try std.testing.expectEqual(@as(usize, 1), engine.providers_registry.endpoints.items.len);
 }
