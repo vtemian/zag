@@ -1376,6 +1376,8 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
         .url = mock_url,
         .auth = .oauth_chatgpt,
         .headers = &.{},
+        .default_model = "gpt-5",
+        .models = &.{},
     };
 
     var serializer: ChatgptSerializer = .{

@@ -25,6 +25,14 @@ pub const Endpoint = struct {
     auth: Auth,
     /// Additional HTTP headers sent with every request.
     headers: []const Header,
+    /// Model id used when a caller selects this provider without naming a
+    /// specific model (bare id, no `provider/` prefix except for OpenRouter
+    /// whose canonical ids already carry a provider-scoped namespace).
+    default_model: []const u8,
+    /// Rate card for every model this endpoint serves (context window, token
+    /// limits, dollar pricing). Empty slice means no per-model rates are
+    /// known; callers must fall back to defaults or fail loudly.
+    models: []const ModelRate,
 
     /// How the API key is sent in HTTP headers.
     pub const Auth = enum {
@@ -139,17 +147,42 @@ pub const Endpoint = struct {
             initialized += 1;
         }
 
+        const default_model = try allocator.dupe(u8, self.default_model);
+        errdefer allocator.free(default_model);
+
+        const models = try allocator.alloc(ModelRate, self.models.len);
+        errdefer allocator.free(models);
+        var models_initialized: usize = 0;
+        errdefer for (models[0..models_initialized]) |m| allocator.free(m.id);
+        for (self.models, 0..) |m, i| {
+            models[i] = .{
+                .id = try allocator.dupe(u8, m.id),
+                .context_window = m.context_window,
+                .max_output_tokens = m.max_output_tokens,
+                .input_per_mtok = m.input_per_mtok,
+                .output_per_mtok = m.output_per_mtok,
+                .cache_write_per_mtok = m.cache_write_per_mtok,
+                .cache_read_per_mtok = m.cache_read_per_mtok,
+            };
+            models_initialized += 1;
+        }
+
         return .{
             .name = name,
             .serializer = self.serializer,
             .url = url,
             .auth = self.auth,
             .headers = headers,
+            .default_model = default_model,
+            .models = models,
         };
     }
 
     /// Free all heap-allocated strings. Pair with dupe().
     pub fn free(self: Endpoint, allocator: Allocator) void {
+        for (self.models) |m| allocator.free(m.id);
+        allocator.free(self.models);
+        allocator.free(self.default_model);
         for (self.headers) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
@@ -167,6 +200,8 @@ const builtin_endpoints = [_]Endpoint{
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
+        .default_model = "claude-sonnet-4-20250514",
+        .models = &.{},
     },
     .{
         .name = "openai",
@@ -174,6 +209,8 @@ const builtin_endpoints = [_]Endpoint{
         .url = "https://api.openai.com/v1/chat/completions",
         .auth = .bearer,
         .headers = &.{},
+        .default_model = "gpt-4o",
+        .models = &.{},
     },
     .{
         .name = "openrouter",
@@ -181,6 +218,8 @@ const builtin_endpoints = [_]Endpoint{
         .url = "https://openrouter.ai/api/v1/chat/completions",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
+        .default_model = "anthropic/claude-sonnet-4",
+        .models = &.{},
     },
     .{
         .name = "groq",
@@ -188,6 +227,8 @@ const builtin_endpoints = [_]Endpoint{
         .url = "https://api.groq.com/openai/v1/chat/completions",
         .auth = .bearer,
         .headers = &.{},
+        .default_model = "llama-3.3-70b-versatile",
+        .models = &.{},
     },
     .{
         .name = "ollama",
@@ -195,6 +236,8 @@ const builtin_endpoints = [_]Endpoint{
         .url = "http://localhost:11434/v1/chat/completions",
         .auth = .none,
         .headers = &.{},
+        .default_model = "llama3",
+        .models = &.{},
     },
     .{
         .name = "openai-oauth",
@@ -202,6 +245,8 @@ const builtin_endpoints = [_]Endpoint{
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .oauth_chatgpt,
         .headers = &.{},
+        .default_model = "gpt-5",
+        .models = &.{},
     },
 };
 
@@ -267,6 +312,8 @@ test "Endpoint.dupe creates independent copy" {
         .url = "https://example.com",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
+        .default_model = "test-model",
+        .models = &.{},
     };
 
     const duped = try original.dupe(allocator);
@@ -390,6 +437,49 @@ test "OAuthSpec is copyable by value" {
     };
     const copy = spec;
     try std.testing.expectEqualStrings("a", copy.issuer);
+}
+
+test "Endpoint.dupe copies default_model and models slice" {
+    const original: Endpoint = .{
+        .name = "test",
+        .serializer = .openai,
+        .url = "https://x",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "m1",
+        .models = &.{
+            .{
+                .id = "m1",
+                .context_window = 100,
+                .max_output_tokens = 50,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 2.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = null,
+            },
+        },
+    };
+    const copy = try original.dupe(std.testing.allocator);
+    defer copy.free(std.testing.allocator);
+
+    try std.testing.expect(copy.default_model.ptr != original.default_model.ptr);
+    try std.testing.expectEqualStrings("m1", copy.default_model);
+    try std.testing.expectEqual(@as(usize, 1), copy.models.len);
+    try std.testing.expectEqualStrings("m1", copy.models[0].id);
+    try std.testing.expect(copy.models[0].id.ptr != original.models[0].id.ptr);
+    try std.testing.expectEqual(@as(u32, 100), copy.models[0].context_window);
+}
+
+test "builtin endpoints seed default_model per provider" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", reg.find("anthropic").?.default_model);
+    try std.testing.expectEqualStrings("gpt-4o", reg.find("openai").?.default_model);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", reg.find("openrouter").?.default_model);
+    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", reg.find("groq").?.default_model);
+    try std.testing.expectEqualStrings("llama3", reg.find("ollama").?.default_model);
+    try std.testing.expectEqualStrings("gpt-5", reg.find("openai-oauth").?.default_model);
 }
 
 test {
