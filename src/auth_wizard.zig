@@ -152,6 +152,7 @@ pub fn scaffoldConfigLua(
     registry: *const llm.Registry,
     config_path: []const u8,
     provider_name: []const u8,
+    chosen_model: ?[]const u8,
 ) !void {
     const picked = registry.find(provider_name) orelse return error.UnknownProvider;
 
@@ -170,7 +171,7 @@ pub fn scaffoldConfigLua(
     };
     defer file.close();
 
-    const body = try renderConfigLua(allocator, picked);
+    const body = try renderConfigLua(allocator, picked, chosen_model);
     defer allocator.free(body);
 
     var scratch: [512]u8 = undefined;
@@ -200,6 +201,7 @@ fn stripProviderPrefix(module_name: []const u8) []const u8 {
 fn renderConfigLua(
     allocator: std.mem.Allocator,
     picked: *const Endpoint,
+    chosen_model: ?[]const u8,
 ) ![]u8 {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
@@ -223,7 +225,7 @@ fn renderConfigLua(
 
     try body.writer(allocator).print(
         "\nzag.set_default_model(\"{s}/{s}\")\n",
-        .{ picked.name, picked.default_model },
+        .{ picked.name, chosen_model orelse picked.default_model },
     );
 
     return body.toOwnedSlice(allocator);
@@ -845,7 +847,7 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
             else => return err,
         };
         if (!exists) {
-            try scaffoldConfigLua(deps.allocator, deps.registry, deps.config_path, picked.name);
+            try scaffoldConfigLua(deps.allocator, deps.registry, deps.config_path, picked.name, null);
             scaffolded = true;
         }
     }
@@ -1287,7 +1289,7 @@ test "scaffoldConfigLua writes expected contents for openai" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, &registry, path, "openai");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "openai", null);
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1316,7 +1318,7 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic", null);
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1337,7 +1339,7 @@ test "scaffoldConfigLua does not duplicate the picked provider in the commented 
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic", null);
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1369,7 +1371,7 @@ test "scaffoldConfigLua lists every other stdlib provider in the commented block
     // Pick ollama so every other stdlib entry should appear as a commented-out
     // require. The check is driven by `embedded.entries`, not the registry, so
     // custom Lua-declared providers aren't required to match.
-    try scaffoldConfigLua(testing.allocator, &registry, path, "ollama");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "ollama", null);
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1400,7 +1402,7 @@ test "scaffoldConfigLua is a no-op when file exists" {
 
     try tmp.dir.writeFile(.{ .sub_path = "config.lua", .data = "-- user content" });
 
-    try scaffoldConfigLua(testing.allocator, &registry, path, "openai");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "openai", null);
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1418,7 +1420,7 @@ test "scaffoldConfigLua creates parent directories" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "nested", "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, &registry, path, "groq");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "groq", null);
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1439,8 +1441,29 @@ test "scaffoldConfigLua rejects unknown provider" {
 
     try testing.expectError(
         error.UnknownProvider,
-        scaffoldConfigLua(testing.allocator, &registry, path, "bogus"),
+        scaffoldConfigLua(testing.allocator, &registry, path, "bogus", null),
     );
+}
+
+test "scaffoldConfigLua writes chosen_model when provided" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
+    defer testing.allocator.free(path);
+
+    try scaffoldConfigLua(testing.allocator, &registry, path, "openai-oauth", "gpt-5.5");
+
+    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    defer testing.allocator.free(actual);
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"openai-oauth/gpt-5.5\")") != null);
+    // The endpoint's default_model must not leak through when the caller
+    // supplied an explicit chosen_model override.
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"openai-oauth/gpt-5.2\")") == null);
 }
 
 /// Compose the two absolute paths `runWizard` takes, rooted at a throwaway
