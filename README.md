@@ -39,9 +39,28 @@ zig build run -- --last            # resume the most recent one
 
 ## First run
 
-On a clean machine, `zig build run` drops you into an interactive onboarding wizard. It asks which provider you want to use, accepts the API key with terminal echo disabled, writes `~/.config/zag/auth.json` atomically with mode `0600`, and scaffolds a matching `~/.config/zag/config.lua` with the provider enabled and `zag.set_default_model(...)` pointing at a sensible default. Then it continues straight into the TUI.
+On a clean machine, `zig build run` drops you into an interactive onboarding wizard. It shows an arrow-key picker so you can choose a provider without memorising digit prompts:
 
-Supported providers today: `openai`, `anthropic`, `openrouter`, `groq`. Ollama is keyless and needs no entry.
+```
+zag needs a provider. Choose one:
+
+  > OpenAI       (OAuth · ChatGPT sign-in · recommended)
+    OpenAI       (API key)
+    Anthropic    (API key)
+    OpenRouter   (API key)
+    Groq         (API key)
+
+↑/↓ to navigate · Enter to select · Esc to abort
+```
+
+The recommended entry is **OpenAI (OAuth · ChatGPT sign-in)**. It uses a browser sign-in, so there is no key to paste and no dashboard to visit. The remaining four entries use long-lived API keys.
+
+Two flows, depending on which entry you pick:
+
+- **OAuth** (`openai-oauth`): zag opens your default browser to `auth.openai.com`, you sign in with your ChatGPT account, the OAuth callback hits `localhost:1455`, and zag stores the resulting tokens in `~/.config/zag/auth.json` (mode `0600`). The wizard then scaffolds `~/.config/zag/config.lua` and continues into the TUI.
+- **API key**: zag prompts for the key with terminal echo disabled, writes `~/.config/zag/auth.json` atomically (mode `0600`), and scaffolds a matching `~/.config/zag/config.lua` with `zag.set_default_model(...)` pointing at a sensible default. Then it continues into the TUI.
+
+Supported providers today: `openai-oauth` (recommended), `openai`, `anthropic`, `openrouter`, `groq`. Ollama is keyless, does not appear in the picker, and can be enabled by editing `config.lua` directly.
 
 If you already have a `config.lua` the wizard leaves it alone and only writes `auth.json`.
 
@@ -87,12 +106,12 @@ zag.provider { name = "openai" }
 Manage provider credentials with the `zag auth` subcommands. Each runs the same atomic, mode-`0600` write path as the first-run wizard, so `auth.json` never ends up partially written.
 
 ```bash
-zag auth login <provider>    # add or replace a credential (openai, anthropic, openrouter, groq)
+zag auth login <provider>    # add or replace a credential (openai-oauth, openai, anthropic, openrouter, groq)
 zag auth list                # list configured providers with masked keys
 zag auth remove <provider>   # delete a credential
 ```
 
-`login` is the canonical way to rotate a key: run it again for the same provider and the entry is replaced in place.
+`zag auth login openai-oauth` triggers the browser OAuth flow described above; `zag auth login <other>` prompts for a key paste with echo disabled. Either form is the canonical way to rotate a credential: run it again for the same provider and the entry is replaced in place.
 
 ## Window system
 
