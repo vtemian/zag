@@ -42,11 +42,15 @@ pub fn execute(
         return .{ .content = "error: old_text not found in file. Make sure it matches exactly, including whitespace and indentation.", .is_error = true, .owned = false };
     }
 
-    // Count verbatim occurrences.
+    // Count verbatim occurrences, capturing the first match position so we
+    // don't need a second scan (and don't need an `unreachable` guard) when
+    // count == 1.
     var count: u32 = 0;
+    var first_match: usize = 0;
     var pos: usize = 0;
     while (pos <= content.len - input.old_text.len) {
         if (std.mem.eql(u8, content[pos .. pos + input.old_text.len], input.old_text)) {
+            if (count == 0) first_match = pos;
             count += 1;
             pos += input.old_text.len;
         } else {
@@ -61,7 +65,7 @@ pub fn execute(
     var splice_end: usize = 0;
 
     if (count == 1) {
-        splice_start = std.mem.indexOf(u8, content, input.old_text) orelse unreachable;
+        splice_start = first_match;
         splice_end = splice_start + input.old_text.len;
     } else if (count == 0) {
         // CRLF fallback: a Windows file ("\r\n") combined with LF-supplied
