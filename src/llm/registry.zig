@@ -313,6 +313,17 @@ pub const Registry = struct {
         return null;
     }
 
+    /// Take ownership of an already-dupe'd endpoint. On success the registry
+    /// owns `ep`'s heap storage; on duplicate-name rejection the incoming
+    /// endpoint is freed so callers can trust that a failed `add` never leaks.
+    pub fn add(self: *Registry, ep: Endpoint) !void {
+        if (self.find(ep.name) != null) {
+            ep.free(self.allocator);
+            return error.DuplicateEndpoint;
+        }
+        try self.endpoints.append(self.allocator, ep);
+    }
+
     /// Release all heap-owned endpoints and backing storage.
     pub fn deinit(self: *Registry) void {
         for (self.endpoints.items) |ep| ep.free(self.allocator);
@@ -520,6 +531,42 @@ test "builtin endpoints seed default_model per provider" {
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", reg.find("groq").?.default_model);
     try std.testing.expectEqualStrings("llama3", reg.find("ollama").?.default_model);
     try std.testing.expectEqualStrings("gpt-5", reg.find("openai-oauth").?.default_model);
+}
+
+test "Registry.add takes ownership of an already-dupe'd endpoint" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const raw: Endpoint = .{
+        .name = "custom",
+        .serializer = .openai,
+        .url = "https://x",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+    const owned = try raw.dupe(std.testing.allocator);
+    try reg.add(owned);
+
+    const found = reg.find("custom").?;
+    try std.testing.expectEqualStrings("m", found.default_model);
+}
+
+test "Registry.add rejects duplicate names" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const raw: Endpoint = .{
+        .name = "dup",
+        .serializer = .openai,
+        .url = "https://x",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+    try reg.add(try raw.dupe(std.testing.allocator));
+    try std.testing.expectError(error.DuplicateEndpoint, reg.add(try raw.dupe(std.testing.allocator)));
 }
 
 test {
