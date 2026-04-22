@@ -1519,7 +1519,7 @@ fn testHintRegistry(allocator: std.mem.Allocator) !llm.Registry {
             },
         } },
         .headers = &.{},
-        .default_model = "gpt-5",
+        .default_model = "gpt-5-codex",
         .models = &.{},
     };
     try reg.add(try oauth_ep.dupe(allocator));
@@ -1531,7 +1531,7 @@ test "formatMissingCredentialHint points OAuth providers at --login" {
     var reg = try testHintRegistry(std.testing.allocator);
     defer reg.deinit();
     var scratch: [512]u8 = undefined;
-    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5", &reg);
+    const msg = formatMissingCredentialHint(&scratch, "openai-oauth/gpt-5-codex", &reg);
     try std.testing.expectEqualStrings(
         "zag: not signed in to 'openai-oauth'. Run: zag --login=openai-oauth\n",
         msg,

@@ -4647,8 +4647,8 @@ test "zag.provider{}: oauth declaration materialises into .oauth variant with fu
         \\      account_id_header = "chatgpt-account-id",
         \\    },
         \\  },
-        \\  default_model = "gpt-5",
-        \\  models = { { id = "gpt-5" } },
+        \\  default_model = "gpt-5-codex",
+        \\  models = { { id = "gpt-5-codex" } },
         \\}
     );
     const ep = engine.providers_registry.find("openai-oauth") orelse return error.TestUnexpectedResult;
