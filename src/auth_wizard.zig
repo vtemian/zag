@@ -613,9 +613,18 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     if (deps.is_tty) {
         const saved = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
         original = saved;
-        var echo_off = saved;
-        echo_off.lflag.ECHO = false;
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, echo_off);
+        var read_termios = saved;
+        // ECHO off so the pasted secret doesn't hit the screen.
+        read_termios.lflag.ECHO = false;
+        // Force canonical line-at-a-time mode and CR-to-NL translation.
+        // The picker that typically runs before this disables both; if
+        // its defer-restore fails silently, Enter produces a bare \r
+        // that `takeDelimiter('\n')` never sees, so the read hangs
+        // forever. Re-enabling unconditionally makes the read robust
+        // regardless of prior termios state.
+        read_termios.lflag.ICANON = true;
+        read_termios.iflag.ICRNL = true;
+        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, read_termios);
     }
     defer if (original) |saved| {
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch |err| {
