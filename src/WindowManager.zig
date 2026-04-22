@@ -27,6 +27,7 @@ const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const Keymap = @import("Keymap.zig");
+const NodeRegistry = @import("NodeRegistry.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const input = @import("input.zig");
@@ -81,6 +82,10 @@ lua_engine: ?*LuaEngine,
 /// so agent workers can wake the main loop from arbitrary threads.
 wake_write_fd: posix.fd_t,
 
+/// Stable IDs for layout nodes. Populated by `Layout` via its
+/// `registry` back-pointer once `attachLayoutRegistry` wires them
+/// together. Frees all slot storage on `deinit`.
+node_registry: NodeRegistry,
 /// Extra panes created by splits, tracked for cleanup.
 extra_panes: std.ArrayList(PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
@@ -135,7 +140,31 @@ pub fn init(cfg: Config) !WindowManager {
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
+        .node_registry = NodeRegistry.init(cfg.allocator),
     };
+}
+
+/// Point the borrowed `Layout` at this manager's `node_registry` so every
+/// subsequent node create/destroy updates the registry. Any nodes that
+/// already exist on the tree are back-registered now so callers that set
+/// the root before WM was constructed still end up with a tracked root.
+///
+/// Must be called with a stable `*WindowManager` address (the final home
+/// of the manager), not on an in-flight init return value.
+pub fn attachLayoutRegistry(self: *WindowManager) !void {
+    self.layout.registry = &self.node_registry;
+    if (self.layout.root) |root| try registerSubtree(&self.node_registry, root);
+}
+
+fn registerSubtree(registry: *NodeRegistry, node: *Layout.LayoutNode) !void {
+    _ = try registry.register(node);
+    switch (node.*) {
+        .leaf => {},
+        .split => |s| {
+            try registerSubtree(registry, s.first);
+            try registerSubtree(registry, s.second);
+        },
+    }
 }
 
 /// Borrow the keymap registry from the Lua engine. Null when Lua init
@@ -171,6 +200,13 @@ pub fn deinit(self: *WindowManager) void {
         self.allocator.destroy(entry.pane.session);
     }
     self.extra_panes.deinit(self.allocator);
+    // Layout is borrowed and its `deinit` runs AFTER ours under main.zig's
+    // LIFO defer chain. Detach first so Layout's destroyNode walk does not
+    // touch freed registry slots after `node_registry.deinit`.
+    if (self.layout.registry == &self.node_registry) {
+        self.layout.registry = null;
+    }
+    self.node_registry.deinit();
 }
 
 // -- Window management -------------------------------------------------------
@@ -668,6 +704,47 @@ test "Pane composes view + session + runner" {
     try std.testing.expectEqual(view, pane.runner.view);
     try std.testing.expectEqual(session, pane.runner.session);
     try std.testing.expectEqualStrings("pane-test", pane.view.name);
+}
+
+test "WindowManager exposes a NodeRegistry" {
+    const allocator = std.testing.allocator;
+
+    // Stand up the minimum scaffolding needed to assert that the registry
+    // field lives on WindowManager and receives the root leaf handle once
+    // Layout is attached. Provider, compositor, screen, and session paths
+    // are not touched by this test so we hand the manager placeholders for
+    // the fields it requires but never dereferences.
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = undefined,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+
+    try std.testing.expect(wm.node_registry.slots.items.len >= 1);
 }
 
 test "restorePane rebuilds both tree and messages" {

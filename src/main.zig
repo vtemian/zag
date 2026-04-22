@@ -1091,6 +1091,11 @@ pub fn main() !void {
     // this after orchestrator construction so the pointer is stable.
     compositor.orchestrator = &orchestrator;
 
+    // `&self.node_registry` is only a stable address now that `orchestrator`
+    // sits in its final home. Attach here so Layout starts tracking node
+    // create/destroy from this point on and back-registers the existing root.
+    try orchestrator.window_manager.attachLayoutRegistry();
+
     // Register any Lua-declared tools into the dispatch registry. Config.lua
     // already ran before provider creation, so the keymap overrides,
     // default_model, and escape-timeout are all live by this point.
