@@ -740,7 +740,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
 
     try std.testing.expectError(
         error.MissingCredential,
-        createProviderFromLuaConfig("openai-oauth/gpt-5", auth_path, allocator),
+        createProviderFromLuaConfig("openai-oauth/gpt-5-codex", auth_path, allocator),
     );
 }
 
