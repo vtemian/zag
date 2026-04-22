@@ -33,6 +33,7 @@ const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
 const bash_tool = @import("tools/bash.zig");
+const layout_tool = @import("tools/layout.zig");
 
 /// A name-indexed collection of tools that supports registration, lookup, and execution.
 pub const Registry = struct {
@@ -120,13 +121,15 @@ pub const Registry = struct {
     }
 };
 
-/// Build a registry pre-loaded with the built-in tools (read, write, edit, bash).
+/// Build a registry pre-loaded with the built-in tools (read, write,
+/// edit, bash, layout_tree).
 pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     var registry = Registry.init(allocator);
     try registry.register(read_tool.tool);
     try registry.register(write_tool.tool);
     try registry.register(edit_tool.tool);
     try registry.register(bash_tool.tool);
+    try registry.register(layout_tool.tool);
     return registry;
 }
 
@@ -238,6 +241,7 @@ test "createDefaultRegistry has all tools" {
     try std.testing.expect(registry.get("write") != null);
     try std.testing.expect(registry.get("edit") != null);
     try std.testing.expect(registry.get("bash") != null);
+    try std.testing.expect(registry.get("layout_tree") != null);
 }
 
 test "execute sets current_tool_name during execution" {
