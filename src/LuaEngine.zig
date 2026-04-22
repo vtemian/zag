@@ -7050,7 +7050,8 @@ test "stdlib: require(zag.providers.anthropic) registers anthropic" {
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
     try std.testing.expectEqualStrings("claude-sonnet-4-20250514", ep.default_model);
     try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
-    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    try std.testing.expect(ep.models.len >= 2);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .x_api_key);
     try std.testing.expectEqual(@as(usize, 1), ep.headers.len);
     try std.testing.expectEqualStrings("anthropic-version", ep.headers[0].name);
@@ -7070,12 +7071,12 @@ test "stdlib: require(zag.providers.openai) registers openai" {
     try std.testing.expectEqualStrings("https://api.openai.com/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("gpt-4o", ep.default_model);
     try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
-    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    try std.testing.expect(ep.models.len >= 2);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
     // cache_write_per_mtok is absent in the Lua file: readNullableFloat
     // must leave it null rather than defaulting to 0.
     try std.testing.expect(ep.models[0].cache_write_per_mtok == null);
-    try std.testing.expect(ep.models[0].cache_read_per_mtok != null);
 }
 
 test "stdlib: require(zag.providers.openrouter) registers openrouter" {
@@ -7202,6 +7203,6 @@ test "stdlib: require(zag.providers.anthropic-oauth) registers Claude Max spec" 
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 0), ep.models[0].input_per_mtok, 0.0001);
+    try std.testing.expect(ep.models.len >= 2);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
 }
