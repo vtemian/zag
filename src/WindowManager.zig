@@ -715,9 +715,9 @@ test "restorePane rebuilds both tree and messages" {
     const pane: Pane = .{ .view = &cb, .session = &scb, .runner = &runner };
     try restorePane(pane, &handle, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[0].node_type);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, cb.root_children.items[1].node_type);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[0].node_type);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, cb.tree.root_children.items[1].node_type);
     try std.testing.expectEqual(@as(usize, 2), scb.messages.items.len);
     try std.testing.expectEqual(types.Role.user, scb.messages.items[0].role);
     try std.testing.expectEqual(types.Role.assistant, scb.messages.items[1].role);

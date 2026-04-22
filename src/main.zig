@@ -1148,9 +1148,9 @@ test "appendStatusLine creates a status node on the given view" {
 
     try appendStatusLine(&view, "hello world");
 
-    try std.testing.expectEqual(@as(usize, 1), view.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("hello world", view.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), view.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.tree.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("hello world", view.tree.root_children.items[0].content.items);
 }
 
 test "parseStartupArgs recognizes --headless with required files" {
