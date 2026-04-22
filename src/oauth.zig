@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const auth = @import("auth.zig");
+const Endpoint = @import("llm/registry.zig").Endpoint;
 
 const log = std.log.scoped(.oauth);
 
@@ -113,6 +114,10 @@ pub const AuthorizeParams = struct {
     state: []const u8,
     scopes: []const u8, // space-separated, pre-joined
     originator: []const u8, // e.g. "zag_cli"
+    /// Extra key=value pairs appended verbatim after the core params. Names
+    /// are assumed URL-safe (matching what we already do for client_id); the
+    /// value is percent-encoded via `writeParam`.
+    extra_params: []const Endpoint.Header = &.{},
 };
 
 pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
@@ -127,10 +132,9 @@ pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
     try writeParam(&aw.writer, "scope", p.scopes);
     try writeParam(&aw.writer, "code_challenge", p.challenge);
     try aw.writer.writeAll("&code_challenge_method=S256");
-    try aw.writer.writeAll("&id_token_add_organizations=true");
-    try aw.writer.writeAll("&codex_cli_simplified_flow=true");
     try writeParam(&aw.writer, "state", p.state);
     try writeParam(&aw.writer, "originator", p.originator);
+    for (p.extra_params) |kv| try writeParam(&aw.writer, kv.name, kv.value);
 
     return aw.toOwnedSlice();
 }
@@ -151,6 +155,10 @@ test "buildAuthorizeUrl includes all Codex-required params, percent-encoded" {
         .state = "xyz789",
         .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
         .originator = "zag_cli",
+        .extra_params = &.{
+            .{ .name = "id_token_add_organizations", .value = "true" },
+            .{ .name = "codex_cli_simplified_flow", .value = "true" },
+        },
     });
     defer std.testing.allocator.free(url);
 
@@ -182,6 +190,10 @@ test "buildAuthorizeUrl preserves Codex query-parameter order" {
         .state = "s",
         .scopes = "openid",
         .originator = "zag_cli",
+        .extra_params = &.{
+            .{ .name = "id_token_add_organizations", .value = "true" },
+            .{ .name = "codex_cli_simplified_flow", .value = "true" },
+        },
     });
     defer std.testing.allocator.free(url);
 
@@ -192,16 +204,54 @@ test "buildAuthorizeUrl preserves Codex query-parameter order" {
         "scope=",
         "code_challenge=",
         "code_challenge_method=S256",
-        "id_token_add_organizations=true",
-        "codex_cli_simplified_flow=true",
         "state=",
         "originator=",
+        "id_token_add_organizations=true",
+        "codex_cli_simplified_flow=true",
     };
     var cursor: usize = 0;
     for (order) |needle| {
         const idx = std.mem.indexOfPos(u8, url, cursor, needle) orelse return error.OrderViolated;
         cursor = idx + needle.len;
     }
+}
+
+test "buildAuthorizeUrl appends caller extra_params in order" {
+    const url = try buildAuthorizeUrl(std.testing.allocator, .{
+        .issuer = "https://x/authorize",
+        .client_id = "c",
+        .redirect_uri = "http://localhost:1/cb",
+        .challenge = "ch",
+        .state = "st",
+        .scopes = "openid",
+        .originator = "zag",
+        .extra_params = &.{
+            .{ .name = "foo", .value = "bar" },
+            .{ .name = "flag", .value = "true" },
+        },
+    });
+    defer std.testing.allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "&foo=bar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "&flag=true") != null);
+    // Codex-specific flags must no longer be emitted unconditionally:
+    try std.testing.expect(std.mem.indexOf(u8, url, "id_token_add_organizations") == null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "codex_cli_simplified_flow") == null);
+}
+
+test "buildAuthorizeUrl with empty extra_params emits no trailing extras" {
+    const url = try buildAuthorizeUrl(std.testing.allocator, .{
+        .issuer = "https://x/authorize",
+        .client_id = "c",
+        .redirect_uri = "http://localhost:1/cb",
+        .challenge = "ch",
+        .state = "st",
+        .scopes = "openid",
+        .originator = "zag",
+        .extra_params = &.{},
+    });
+    defer std.testing.allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "id_token_add_organizations") == null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "codex_cli_simplified_flow") == null);
 }
 
 // === JWT claim extraction ===
@@ -923,7 +973,9 @@ pub fn runLoginFlowWithCodes(
     );
     defer alloc.free(redirect_uri);
 
-    // 2) Build the authorize URL.
+    // 2) Build the authorize URL. Codex-specific flags are hardcoded here for
+    // now; Phase C3 plumbs them through `LoginOptions` so stdlib Lua files own
+    // them per-provider.
     const auth_url = try buildAuthorizeUrl(alloc, .{
         .issuer = opts.issuer,
         .client_id = opts.client_id,
@@ -932,6 +984,10 @@ pub fn runLoginFlowWithCodes(
         .state = state,
         .scopes = opts.scopes,
         .originator = opts.originator,
+        .extra_params = &.{
+            .{ .name = "id_token_add_organizations", .value = "true" },
+            .{ .name = "codex_cli_simplified_flow", .value = "true" },
+        },
     });
     defer alloc.free(auth_url);
 
