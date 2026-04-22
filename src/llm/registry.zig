@@ -1,11 +1,11 @@
 //! Endpoint configuration and runtime registry.
 //!
 //! `Endpoint` describes a specific LLM endpoint (URL, auth shape, extra
-//! headers). `builtin_endpoints` is the compile-time table of providers
-//! we ship with (Anthropic, OpenAI, OpenRouter, Groq, Ollama).
-//! `Registry` wraps the table in a runtime-mutable view that copies
-//! each endpoint's strings onto the heap so it can accept user-added
-//! endpoints alongside the builtins.
+//! headers). `Registry` holds the runtime list of registered endpoints;
+//! entries are installed exclusively through Lua (`zag.provider{}`),
+//! typically via the embedded stdlib modules baked into the binary
+//! (see `src/lua/embedded.zig`) which users pull in via
+//! `require("zag.providers.<name>")` from their `config.lua`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -315,146 +315,17 @@ pub fn freeOAuthSpec(spec: Endpoint.OAuthSpec, allocator: Allocator) void {
     allocator.free(spec.inject.account_id_header);
 }
 
-const builtin_endpoints = [_]Endpoint{
-    .{
-        .name = "anthropic",
-        .serializer = .anthropic,
-        .url = "https://api.anthropic.com/v1/messages",
-        .auth = .x_api_key,
-        .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
-        .default_model = "claude-sonnet-4-20250514",
-        .models = &.{
-            .{
-                .id = "claude-sonnet-4-20250514",
-                .context_window = 200000,
-                .max_output_tokens = 8192,
-                .input_per_mtok = 3.0,
-                .output_per_mtok = 15.0,
-                .cache_write_per_mtok = 3.75,
-                .cache_read_per_mtok = 0.30,
-            },
-            .{
-                .id = "claude-opus-4-20250514",
-                .context_window = 200000,
-                .max_output_tokens = 8192,
-                .input_per_mtok = 15.0,
-                .output_per_mtok = 75.0,
-                .cache_write_per_mtok = 18.75,
-                .cache_read_per_mtok = 1.50,
-            },
-        },
-    },
-    .{
-        .name = "openai",
-        .serializer = .openai,
-        .url = "https://api.openai.com/v1/chat/completions",
-        .auth = .bearer,
-        .headers = &.{},
-        .default_model = "gpt-4o",
-        .models = &.{
-            .{
-                .id = "gpt-4o",
-                .context_window = 128000,
-                .max_output_tokens = 4096,
-                .input_per_mtok = 2.50,
-                .output_per_mtok = 10.0,
-                .cache_write_per_mtok = null,
-                .cache_read_per_mtok = 1.25,
-            },
-            .{
-                .id = "gpt-4o-mini",
-                .context_window = 128000,
-                .max_output_tokens = 4096,
-                .input_per_mtok = 0.15,
-                .output_per_mtok = 0.60,
-                .cache_write_per_mtok = null,
-                .cache_read_per_mtok = 0.075,
-            },
-        },
-    },
-    .{
-        .name = "openrouter",
-        .serializer = .openai,
-        .url = "https://openrouter.ai/api/v1/chat/completions",
-        .auth = .bearer,
-        .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
-        .default_model = "anthropic/claude-sonnet-4",
-        .models = &.{},
-    },
-    .{
-        .name = "groq",
-        .serializer = .openai,
-        .url = "https://api.groq.com/openai/v1/chat/completions",
-        .auth = .bearer,
-        .headers = &.{},
-        .default_model = "llama-3.3-70b-versatile",
-        .models = &.{},
-    },
-    .{
-        .name = "ollama",
-        .serializer = .openai,
-        .url = "http://localhost:11434/v1/chat/completions",
-        .auth = .none,
-        .headers = &.{},
-        .default_model = "llama3",
-        .models = &.{},
-    },
-    .{
-        .name = "openai-oauth",
-        .serializer = .chatgpt,
-        .url = "https://chatgpt.com/backend-api/codex/responses",
-        .auth = .{ .oauth = .{
-            .issuer = "https://auth.openai.com/oauth/authorize",
-            .token_url = "https://auth.openai.com/oauth/token",
-            .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
-            .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
-            .redirect_port = 1455,
-            .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
-            .extra_authorize_params = &.{
-                .{ .name = "id_token_add_organizations", .value = "true" },
-                .{ .name = "codex_cli_simplified_flow", .value = "true" },
-            },
-            .inject = .{
-                .header = "Authorization",
-                .prefix = "Bearer ",
-                .extra_headers = &.{},
-                .use_account_id = true,
-                .account_id_header = "chatgpt-account-id",
-            },
-        } },
-        .headers = &.{},
-        .default_model = "gpt-5",
-        .models = &.{},
-    },
-};
-
-/// Look up a built-in endpoint by name. Returns a pointer into the static
-/// table so callers can inspect `.auth` (and any other field) without paying
-/// for a Registry. Used by the `--login=<provider>` CLI dispatcher to confirm
-/// the provider exists and uses an OAuth auth scheme.
-pub fn findBuiltinEndpoint(name: []const u8) ?*const Endpoint {
-    for (&builtin_endpoints) |*ep| {
-        if (std.mem.eql(u8, ep.name, name)) return ep;
-    }
-    return null;
-}
-
-/// Runtime registry of LLM endpoints. Seeded with built-ins, extensible at runtime.
+/// Runtime registry of LLM endpoints. Starts empty; entries are installed
+/// through Lua (`zag.provider{}`), either from the user's `config.lua` or
+/// from the embedded stdlib modules loaded via `require("zag.providers.*")`.
 pub const Registry = struct {
-    /// All registered endpoints (built-in and runtime-added).
+    /// All registered endpoints.
     endpoints: std.ArrayList(Endpoint),
     /// Backing allocator for endpoint storage.
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator) !Registry {
-        var self = Registry{ .endpoints = .empty, .allocator = allocator };
-        errdefer self.deinit();
-        for (&builtin_endpoints) |*ep| {
-            const duped = try ep.dupe(allocator);
-            errdefer duped.free(allocator);
-            try self.endpoints.append(allocator, duped);
-        }
-        return self;
+    pub fn init(allocator: Allocator) Registry {
+        return .{ .endpoints = .empty, .allocator = allocator };
     }
 
     /// Find an endpoint by name. Returns null if not found.
@@ -479,8 +350,8 @@ pub const Registry = struct {
     /// Drop the endpoint with the given `name`, freeing its heap storage.
     /// Returns true if an entry was removed, false if no match existed.
     /// Used by the `zag.provider{}` Lua binding to implement override
-    /// semantics: a full-schema Lua declaration removes any builtin of the
-    /// same name before `add` installs the new entry.
+    /// semantics: a full-schema Lua declaration removes any prior entry of
+    /// the same name before `add` installs the new one.
     pub fn remove(self: *Registry, name: []const u8) bool {
         for (self.endpoints.items, 0..) |ep, i| {
             if (std.mem.eql(u8, ep.name, name)) {
@@ -543,66 +414,19 @@ test "Endpoint.dupe creates independent copy" {
     try std.testing.expect(original.url.ptr != duped.url.ptr);
 }
 
-test "Registry initializes with built-in endpoints" {
+test "Registry.init returns an empty registry" {
     const allocator = std.testing.allocator;
-    var registry = try Registry.init(allocator);
+    var registry = Registry.init(allocator);
     defer registry.deinit();
-
-    const anth = registry.find("anthropic");
-    try std.testing.expect(anth != null);
-    try std.testing.expectEqual(Serializer.anthropic, anth.?.serializer);
-
-    const oai = registry.find("openai");
-    try std.testing.expect(oai != null);
-    try std.testing.expectEqual(Serializer.openai, oai.?.serializer);
-
-    const or_ep = registry.find("openrouter");
-    try std.testing.expect(or_ep != null);
-    try std.testing.expectEqual(Serializer.openai, or_ep.?.serializer);
-
-    const ollama = registry.find("ollama");
-    try std.testing.expect(ollama != null);
-    try std.testing.expectEqual(Endpoint.Auth.none, ollama.?.auth);
-
-    try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("unknown"));
+    try std.testing.expectEqual(@as(usize, 0), registry.endpoints.items.len);
+    try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("anthropic"));
 }
 
 test "Registry find returns null for unknown endpoint" {
     const allocator = std.testing.allocator;
-    var registry = try Registry.init(allocator);
+    var registry = Registry.init(allocator);
     defer registry.deinit();
     try std.testing.expectEqual(@as(?*const Endpoint, null), registry.find("nonexistent"));
-}
-
-test "builtin endpoints include openai-oauth with .oauth auth carrying Codex spec" {
-    var reg = try Registry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    const ep = reg.find("openai-oauth") orelse return error.EndpointMissing;
-    try std.testing.expectEqual(std.meta.Tag(Endpoint.Auth).oauth, std.meta.activeTag(ep.auth));
-    try std.testing.expectEqual(Serializer.chatgpt, ep.serializer);
-    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", ep.url);
-    try std.testing.expectEqual(@as(usize, 0), ep.headers.len);
-
-    const spec = ep.auth.oauth;
-    try std.testing.expectEqualStrings("https://auth.openai.com/oauth/authorize", spec.issuer);
-    try std.testing.expectEqualStrings("https://auth.openai.com/oauth/token", spec.token_url);
-    try std.testing.expectEqualStrings("app_EMoamEEZ73f0CkXaXp7hrann", spec.client_id);
-    try std.testing.expectEqual(@as(u16, 1455), spec.redirect_port);
-    try std.testing.expect(spec.inject.use_account_id);
-    try std.testing.expectEqualStrings("chatgpt-account-id", spec.inject.account_id_header);
-    try std.testing.expectEqual(@as(usize, 2), spec.extra_authorize_params.len);
-}
-
-test "findBuiltinEndpoint returns the OAuth endpoint for openai-oauth" {
-    const ep = findBuiltinEndpoint("openai-oauth") orelse return error.EndpointMissing;
-    try std.testing.expectEqual(std.meta.Tag(Endpoint.Auth).oauth, std.meta.activeTag(ep.auth));
-    try std.testing.expectEqualStrings("openai-oauth", ep.name);
-}
-
-test "findBuiltinEndpoint returns null for unknown names" {
-    try std.testing.expect(findBuiltinEndpoint("bogus") == null);
-    try std.testing.expect(findBuiltinEndpoint("") == null);
 }
 
 test "ModelRate defaults: cache rates optional" {
@@ -739,20 +563,8 @@ test "Endpoint.dupe copies default_model and models slice" {
     try std.testing.expectEqual(@as(u32, 100), copy.models[0].context_window);
 }
 
-test "builtin endpoints seed default_model per provider" {
-    var reg = try Registry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", reg.find("anthropic").?.default_model);
-    try std.testing.expectEqualStrings("gpt-4o", reg.find("openai").?.default_model);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", reg.find("openrouter").?.default_model);
-    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", reg.find("groq").?.default_model);
-    try std.testing.expectEqualStrings("llama3", reg.find("ollama").?.default_model);
-    try std.testing.expectEqualStrings("gpt-5", reg.find("openai-oauth").?.default_model);
-}
-
 test "Registry.add takes ownership of an already-dupe'd endpoint" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
 
     const raw: Endpoint = .{
@@ -772,22 +584,44 @@ test "Registry.add takes ownership of an already-dupe'd endpoint" {
 }
 
 test "Registry.remove drops an existing entry and returns true" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
-    try std.testing.expect(reg.find("anthropic") != null);
-    try std.testing.expect(reg.remove("anthropic"));
-    try std.testing.expect(reg.find("anthropic") == null);
+    const ep: Endpoint = .{
+        .name = "removable",
+        .serializer = .openai,
+        .url = "https://x",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+    try reg.add(try ep.dupe(std.testing.allocator));
+    try std.testing.expect(reg.find("removable") != null);
+    try std.testing.expect(reg.remove("removable"));
+    try std.testing.expect(reg.find("removable") == null);
 }
 
 test "Registry.remove returns false when name is absent" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     try std.testing.expect(!reg.remove("not-a-provider"));
 }
 
 test "Registry.remove followed by add implements override" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
+
+    const seed: Endpoint = .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://api.anthropic.com/v1/messages",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "claude-sonnet-4-20250514",
+        .models = &.{},
+    };
+    try reg.add(try seed.dupe(std.testing.allocator));
+
     const replacement: Endpoint = .{
         .name = "anthropic",
         .serializer = .anthropic,
@@ -805,8 +639,20 @@ test "Registry.remove followed by add implements override" {
 }
 
 test "Registry.dupe produces an independent deep copy" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
+
+    const ep: Endpoint = .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://api.anthropic.com/v1/messages",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "claude-sonnet-4-20250514",
+        .models = &.{},
+    };
+    try reg.add(try ep.dupe(std.testing.allocator));
+
     var copy = try reg.dupe(std.testing.allocator);
     defer copy.deinit();
     const orig = reg.find("anthropic").?;
@@ -816,7 +662,7 @@ test "Registry.dupe produces an independent deep copy" {
 }
 
 test "Registry.add rejects duplicate names" {
-    var reg = try Registry.init(std.testing.allocator);
+    var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const raw: Endpoint = .{
         .name = "dup",
@@ -829,50 +675,6 @@ test "Registry.add rejects duplicate names" {
     };
     try reg.add(try raw.dupe(std.testing.allocator));
     try std.testing.expectError(error.DuplicateEndpoint, reg.add(try raw.dupe(std.testing.allocator)));
-}
-
-test "builtin anthropic endpoint carries sonnet-4 and opus-4 ModelRate entries" {
-    var reg = try Registry.init(std.testing.allocator);
-    defer reg.deinit();
-    const ep = reg.find("anthropic").?;
-    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
-
-    // Look up sonnet by id — order-independent assertion
-    var saw_sonnet = false;
-    var saw_opus = false;
-    for (ep.models) |m| {
-        if (std.mem.eql(u8, m.id, "claude-sonnet-4-20250514")) {
-            try std.testing.expectApproxEqAbs(@as(f64, 3.0), m.input_per_mtok, 0.0001);
-            try std.testing.expectApproxEqAbs(@as(f64, 15.0), m.output_per_mtok, 0.0001);
-            try std.testing.expect(m.cache_write_per_mtok != null);
-            try std.testing.expectApproxEqAbs(@as(f64, 3.75), m.cache_write_per_mtok.?, 0.0001);
-            try std.testing.expectApproxEqAbs(@as(f64, 0.30), m.cache_read_per_mtok.?, 0.0001);
-            saw_sonnet = true;
-        } else if (std.mem.eql(u8, m.id, "claude-opus-4-20250514")) {
-            try std.testing.expectApproxEqAbs(@as(f64, 15.0), m.input_per_mtok, 0.0001);
-            try std.testing.expectApproxEqAbs(@as(f64, 75.0), m.output_per_mtok, 0.0001);
-            saw_opus = true;
-        }
-    }
-    try std.testing.expect(saw_sonnet and saw_opus);
-}
-
-test "builtin openai endpoint seeds gpt-4o rate card" {
-    var reg = try Registry.init(std.testing.allocator);
-    defer reg.deinit();
-    const ep = reg.find("openai").?;
-    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
-    var saw_4o = false;
-    for (ep.models) |m| {
-        if (std.mem.eql(u8, m.id, "gpt-4o")) {
-            try std.testing.expectApproxEqAbs(@as(f64, 2.50), m.input_per_mtok, 0.0001);
-            try std.testing.expect(m.cache_write_per_mtok == null);
-            try std.testing.expect(m.cache_read_per_mtok != null);
-            try std.testing.expectApproxEqAbs(@as(f64, 1.25), m.cache_read_per_mtok.?, 0.0001);
-            saw_4o = true;
-        }
-    }
-    try std.testing.expect(saw_4o);
 }
 
 test {

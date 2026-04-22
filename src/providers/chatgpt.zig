@@ -1479,7 +1479,7 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
         try auth_mod.saveAuthFile(auth_path, file);
     }
 
-    var registry = try llm.Registry.init(allocator);
+    var registry = try seedOpenAiOauthRegistry(allocator);
     defer registry.deinit();
     var result = try llm.createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator);
     defer result.deinit();
@@ -1511,10 +1511,46 @@ test "createProviderFromLuaConfig fails fast when oauth provider has no credenti
     defer allocator.free(auth_path);
     // No auth.json on disk at all.
 
-    var registry = try llm.Registry.init(allocator);
+    var registry = try seedOpenAiOauthRegistry(allocator);
     defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,
         llm.createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator),
     );
+}
+
+/// Hand-construct a registry with just the openai-oauth endpoint shape the
+/// ChatGPT factory tests need. Mirrors the shape the stdlib
+/// `require("zag.providers.openai-oauth")` module installs at runtime, but
+/// stays decoupled from the Lua engine so the tests can run without booting
+/// one.
+fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
+    var reg = llm.Registry.init(allocator);
+    errdefer reg.deinit();
+    const ep: llm.Endpoint = .{
+        .name = "openai-oauth",
+        .serializer = .chatgpt,
+        .url = "https://chatgpt.com/backend-api/codex/responses",
+        .auth = .{ .oauth = .{
+            .issuer = "https://auth.openai.com/oauth/authorize",
+            .token_url = "https://auth.openai.com/oauth/token",
+            .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+            .scopes = "openid profile email offline_access",
+            .redirect_port = 1455,
+            .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+            .extra_authorize_params = &.{},
+            .inject = .{
+                .header = "Authorization",
+                .prefix = "Bearer ",
+                .extra_headers = &.{},
+                .use_account_id = true,
+                .account_id_header = "chatgpt-account-id",
+            },
+        } },
+        .headers = &.{},
+        .default_model = "gpt-5",
+        .models = &.{},
+    };
+    try reg.add(try ep.dupe(allocator));
+    return reg;
 }

@@ -776,11 +776,95 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
 
 const testing = std.testing;
 
-/// Build a registry pre-seeded with a handful of endpoints shaped the way
-/// the wizard expects. Keeping it in one place per test file keeps the test
-/// bodies focused on behaviour rather than registry plumbing.
+/// Build a registry pre-seeded with the provider entries these tests walk.
+/// Production registries are populated by Lua (`require("zag.providers.*")`);
+/// this helper hand-stamps a matching fixture so the wizard tests don't have
+/// to boot a Lua engine. The order and shape match the stdlib modules so
+/// tests that assume 1-based indexes (anthropic=1, openai=2, ...) stay
+/// deterministic.
 fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
-    return llm.Registry.init(allocator);
+    var reg = llm.Registry.init(allocator);
+    errdefer reg.deinit();
+
+    const entries = [_]llm.Endpoint{
+        .{
+            .name = "anthropic",
+            .serializer = .anthropic,
+            .url = "https://api.anthropic.com/v1/messages",
+            .auth = .x_api_key,
+            .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
+            .default_model = "claude-sonnet-4-20250514",
+            .models = &.{},
+        },
+        .{
+            .name = "openai",
+            .serializer = .openai,
+            .url = "https://api.openai.com/v1/chat/completions",
+            .auth = .bearer,
+            .headers = &.{},
+            .default_model = "gpt-4o",
+            .models = &.{},
+        },
+        .{
+            .name = "openrouter",
+            .serializer = .openai,
+            .url = "https://openrouter.ai/api/v1/chat/completions",
+            .auth = .bearer,
+            .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
+            .default_model = "anthropic/claude-sonnet-4",
+            .models = &.{},
+        },
+        .{
+            .name = "groq",
+            .serializer = .openai,
+            .url = "https://api.groq.com/openai/v1/chat/completions",
+            .auth = .bearer,
+            .headers = &.{},
+            .default_model = "llama-3.3-70b-versatile",
+            .models = &.{},
+        },
+        .{
+            .name = "ollama",
+            .serializer = .openai,
+            .url = "http://localhost:11434/v1/chat/completions",
+            .auth = .none,
+            .headers = &.{},
+            .default_model = "llama3",
+            .models = &.{},
+        },
+        .{
+            .name = "openai-oauth",
+            .serializer = .chatgpt,
+            .url = "https://chatgpt.com/backend-api/codex/responses",
+            .auth = .{ .oauth = .{
+                .issuer = "https://auth.openai.com/oauth/authorize",
+                .token_url = "https://auth.openai.com/oauth/token",
+                .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+                .scopes = "openid profile email offline_access",
+                .redirect_port = 1455,
+                .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+                .extra_authorize_params = &.{
+                    .{ .name = "id_token_add_organizations", .value = "true" },
+                    .{ .name = "codex_cli_simplified_flow", .value = "true" },
+                },
+                .inject = .{
+                    .header = "Authorization",
+                    .prefix = "Bearer ",
+                    .extra_headers = &.{},
+                    .use_account_id = true,
+                    .account_id_header = "chatgpt-account-id",
+                },
+            } },
+            .headers = &.{},
+            .default_model = "gpt-5",
+            .models = &.{},
+        },
+    };
+
+    for (entries) |ep| {
+        try reg.add(try ep.dupe(allocator));
+    }
+    return reg;
 }
 
 /// Build a throwaway `WizardDeps` pointing at the supplied fake I/O. The
@@ -1156,14 +1240,15 @@ fn wizardPaths(
     return .{ .auth_path = auth_path, .config_path = config_path };
 }
 
-// Builtin registry order (from `src/llm/registry.zig:builtin_endpoints`):
+// `seedTestRegistry` order (mirrors the stdlib modules under
+// `src/lua/zag/providers/`):
 //   1) anthropic    - api-key
 //   2) openai       - api-key
 //   3) openrouter   - api-key
 //   4) groq         - api-key
 //   5) ollama       - no credential
 //   6) openai-oauth - oauth
-// Keep the 1-based indexes below in sync if the builtin table is reordered.
+// Keep the 1-based indexes below in sync if the helper is reordered.
 test "runWizard happy path writes auth.json and scaffolds config.lua" {
     var registry = try seedTestRegistry(testing.allocator);
     defer registry.deinit();
