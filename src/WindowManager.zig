@@ -265,6 +265,35 @@ pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     notifyFocusSwap(prev, self.layout.getFocusedLeaf());
 }
 
+/// Split the leaf identified by `handle` and return the handle of the
+/// freshly created leaf. Temporarily refocuses the target so the existing
+/// `doSplit` path applies; refactoring `Layout.split*` to accept a node
+/// pointer would be a bigger change we defer until more call sites want it.
+pub fn splitById(
+    self: *WindowManager,
+    handle: NodeRegistry.Handle,
+    direction: Layout.SplitDirection,
+) !NodeRegistry.Handle {
+    const target = try self.node_registry.resolve(handle);
+    if (target.* != .leaf) return error.NotALeaf;
+
+    const prev_focus = self.layout.focused;
+    self.layout.focused = target;
+    defer self.layout.focused = prev_focus;
+
+    self.doSplit(direction);
+
+    // `doSplit` leaves focus on the new leaf. Look its handle up in the
+    // registry so the caller can address the new pane by ID.
+    const new_node = self.layout.focused orelse return error.FocusLost;
+    for (self.node_registry.slots.items, 0..) |slot, i| {
+        if (slot.node == new_node) {
+            return .{ .index = @intCast(i), .generation = slot.generation };
+        }
+    }
+    return error.HandleMissing;
+}
+
 /// Run a keymap-bound Action. Mutating mode, layout, or compositor state
 /// lives here exclusively so handleKey stays a pure dispatcher.
 pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
@@ -859,6 +888,63 @@ test "focus by handle rejects stale id" {
 
     const bogus: NodeRegistry.Handle = .{ .index = 9999, .generation = 0 };
     try std.testing.expectError(NodeRegistry.Error.StaleNode, wm.focusById(bogus));
+}
+
+test "splitById creates a new leaf and returns its handle" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    const root = wm.layout.root.?;
+    const root_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == root) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    const new_id = try wm.splitById(root_handle, .vertical);
+    const new_node = try wm.node_registry.resolve(new_id);
+    try std.testing.expect(new_node.* == .leaf);
 }
 
 test "restorePane rebuilds both tree and messages" {
