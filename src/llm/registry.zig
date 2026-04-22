@@ -221,7 +221,26 @@ const builtin_endpoints = [_]Endpoint{
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
         .default_model = "claude-sonnet-4-20250514",
-        .models = &.{},
+        .models = &.{
+            .{
+                .id = "claude-sonnet-4-20250514",
+                .context_window = 200000,
+                .max_output_tokens = 8192,
+                .input_per_mtok = 3.0,
+                .output_per_mtok = 15.0,
+                .cache_write_per_mtok = 3.75,
+                .cache_read_per_mtok = 0.30,
+            },
+            .{
+                .id = "claude-opus-4-20250514",
+                .context_window = 200000,
+                .max_output_tokens = 8192,
+                .input_per_mtok = 15.0,
+                .output_per_mtok = 75.0,
+                .cache_write_per_mtok = 18.75,
+                .cache_read_per_mtok = 1.50,
+            },
+        },
     },
     .{
         .name = "openai",
@@ -230,7 +249,26 @@ const builtin_endpoints = [_]Endpoint{
         .auth = .bearer,
         .headers = &.{},
         .default_model = "gpt-4o",
-        .models = &.{},
+        .models = &.{
+            .{
+                .id = "gpt-4o",
+                .context_window = 128000,
+                .max_output_tokens = 4096,
+                .input_per_mtok = 2.50,
+                .output_per_mtok = 10.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 1.25,
+            },
+            .{
+                .id = "gpt-4o-mini",
+                .context_window = 128000,
+                .max_output_tokens = 4096,
+                .input_per_mtok = 0.15,
+                .output_per_mtok = 0.60,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.075,
+            },
+        },
     },
     .{
         .name = "openrouter",
@@ -570,6 +608,69 @@ test "Registry.add rejects duplicate names" {
     };
     try reg.add(try raw.dupe(std.testing.allocator));
     try std.testing.expectError(error.DuplicateEndpoint, reg.add(try raw.dupe(std.testing.allocator)));
+}
+
+test "builtin anthropic endpoint carries sonnet-4 and opus-4 ModelRate entries" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const ep = reg.find("anthropic").?;
+    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+
+    // Look up sonnet by id — order-independent assertion
+    var saw_sonnet = false;
+    var saw_opus = false;
+    for (ep.models) |m| {
+        if (std.mem.eql(u8, m.id, "claude-sonnet-4-20250514")) {
+            try std.testing.expectApproxEqAbs(@as(f64, 3.0), m.input_per_mtok, 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f64, 15.0), m.output_per_mtok, 0.0001);
+            try std.testing.expect(m.cache_write_per_mtok != null);
+            try std.testing.expectApproxEqAbs(@as(f64, 3.75), m.cache_write_per_mtok.?, 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f64, 0.30), m.cache_read_per_mtok.?, 0.0001);
+            saw_sonnet = true;
+        } else if (std.mem.eql(u8, m.id, "claude-opus-4-20250514")) {
+            try std.testing.expectApproxEqAbs(@as(f64, 15.0), m.input_per_mtok, 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f64, 75.0), m.output_per_mtok, 0.0001);
+            saw_opus = true;
+        }
+    }
+    try std.testing.expect(saw_sonnet and saw_opus);
+}
+
+test "builtin openai endpoint models match pricing.zig rates" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const ep = reg.find("openai").?;
+    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    var saw_4o = false;
+    for (ep.models) |m| {
+        if (std.mem.eql(u8, m.id, "gpt-4o")) {
+            try std.testing.expectApproxEqAbs(@as(f64, 2.50), m.input_per_mtok, 0.0001);
+            try std.testing.expect(m.cache_write_per_mtok == null);
+            try std.testing.expect(m.cache_read_per_mtok != null);
+            try std.testing.expectApproxEqAbs(@as(f64, 1.25), m.cache_read_per_mtok.?, 0.0001);
+            saw_4o = true;
+        }
+    }
+    try std.testing.expect(saw_4o);
+}
+
+test "cost parity between llm.cost and pricing for seeded models" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const usage: @import("cost.zig").Usage = .{
+        .input_tokens = 1_234_567,
+        .output_tokens = 89_012,
+        .cache_creation_tokens = 45_678,
+        .cache_read_tokens = 12_345,
+    };
+    const old = @import("../pricing.zig").estimateCost("anthropic/claude-sonnet-4-20250514", .{
+        .input_tokens = usage.input_tokens,
+        .output_tokens = usage.output_tokens,
+        .cache_creation_tokens = usage.cache_creation_tokens,
+        .cache_read_tokens = usage.cache_read_tokens,
+    }).?;
+    const new = @import("cost.zig").estimateCost(&reg, "anthropic/claude-sonnet-4-20250514", usage).?;
+    try std.testing.expectApproxEqAbs(old, new, 0.000001);
 }
 
 test {
