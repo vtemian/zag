@@ -177,6 +177,72 @@ for now" stays ephemeral.
   (c) `providerFor` returns shared default when override is null,
   (d) pane close releases the override.
 
+## Implementation status
+
+Completed on `wip/onboarding-followups` in 5 feature commits and two
+docs commits. `zig build`, `zig build test`, and `zig fmt --check .`
+all exit 0.
+
+```
+6b90bb5 wm: swapProvider targets the focused pane override
+f8794c4 wm: add Pane.provider override and providerFor helper
+e39744b agent: surface Codex/OpenAI error body in ApiError message
+f72af63 wm: swapProvider persists the pick to config.lua
+c4d468b wizard: add persistDefaultModel for atomic config.lua edits
+```
+
+## Manual verification
+
+Headless end-to-end smoke (confirms the default path still works):
+
+```
+echo 'what is 7*8?' > /tmp/zag_fu_smoke.txt
+./zig-out/bin/zag --headless \
+    --instruction-file=/tmp/zag_fu_smoke.txt \
+    --trajectory-out=/tmp/zag_fu_traj.json
+```
+
+Trajectory step 3 returns `7 x 8 = 56`. Confirmed after the final
+commit in the branch.
+
+Persistence smoke:
+
+```
+mv ~/.config/zag ~/.config/zag.bak
+zig build run
+# Wizard walks through; pick anthropic or openai-oauth.
+# In the TUI: /model, pick a different model.
+# Expected: status reads `saved as default in ~/.config/zag/config.lua`.
+# Quit. Inspect: grep zag.set_default_model ~/.config/zag/config.lua
+# The picked model appears on the active (uncommented) line.
+rm -rf ~/.config/zag
+mv ~/.config/zag.bak ~/.config/zag
+```
+
+Better errors smoke (requires a 400-inducing setup; the inline tests
+cover the parser regardless):
+
+```
+# Edit config.lua so openai-oauth defaults to a codex variant the
+# account tier cannot use: zag.set_default_model("openai-oauth/gpt-5-codex")
+zig build run
+# Send any prompt. Expected:
+#   error: ApiError: The 'gpt-5-codex' model is not supported when
+#   using Codex with a ChatGPT account.
+# replacing the old "HTTP 400 (bad_request). Check ~/.zag/logs ..."
+```
+
+Per-pane smoke:
+
+```
+zig build run
+# <C-w>v to split. Focus left pane; /model; pick provider A.
+# Focus right pane; /model; pick provider B.
+# Send a prompt in each; each routes to its own provider.
+# /model picker on each pane shows its own (current) marker on the
+# row for THAT pane's override.
+```
+
 ## Non-goals retained
 
 - No live probing.
