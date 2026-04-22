@@ -23,6 +23,7 @@ const ConversationHistory = @import("ConversationHistory.zig");
 const agent_events = @import("agent_events.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
@@ -54,6 +55,11 @@ wake_fd: ?std.posix.fd_t = null,
 /// Pointer to the shared Lua engine, if any. Used by the main-thread
 /// drain loop to service hook_request events pushed by the agent.
 lua_engine: ?*LuaEngine = null,
+/// Pointer to the shared window manager, if any. Used by the main-thread
+/// drain loop to service `layout_request` round-trips (the only thread
+/// allowed to mutate the window tree). Wired once after orchestrator
+/// construction; null is tolerated so off-main test harnesses keep working.
+window_manager: ?*WindowManager = null,
 
 /// Pending tool_call nodes keyed by call_id, for parenting tool_result
 /// nodes. Supports parallel tool execution where events interleave.
@@ -305,7 +311,11 @@ pub fn submitInput(self: *AgentRunner, text: []const u8, allocator: Allocator) !
 /// main thread (the only thread allowed to touch Lua). Non-hook events are
 /// compacted back into the ring in their original order. Called before the
 /// normal drain loop so pre-hook vetos round-trip with minimal latency.
-pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void {
+pub fn dispatchHookRequests(
+    queue: *agent_events.EventQueue,
+    engine: ?*LuaEngine,
+    window_manager: ?*WindowManager,
+) void {
     queue.mutex.lock();
     defer queue.mutex.unlock();
 
@@ -353,6 +363,17 @@ pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine
                 // thread doesn't block forever.
                 req.done.set();
             },
+            .layout_request => |req| {
+                if (window_manager) |wm| {
+                    wm.handleLayoutRequest(req);
+                } else {
+                    // No WM wired yet (test harnesses, headless eval):
+                    // release the waiter with an error so the agent thread
+                    // doesn't park on done forever.
+                    req.is_error = true;
+                    req.done.set();
+                }
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -368,7 +389,7 @@ pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine
 pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
     if (self.agent_thread == null) return false;
 
-    dispatchHookRequests(&self.event_queue, self.lua_engine);
+    dispatchHookRequests(&self.event_queue, self.lua_engine, self.window_manager);
 
     var drain: [64]agent_events.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
@@ -692,7 +713,7 @@ test "dispatchHookRequests fires Lua hook and signals done" {
     var req = Hooks.HookRequest.init(&payload);
     try queue.push(.{ .hook_request = &req });
 
-    dispatchHookRequests(&queue, &engine);
+    dispatchHookRequests(&queue, &engine, null);
 
     try std.testing.expect(req.done.isSet());
     _ = try engine.lua.getGlobal("last_turn");
@@ -725,7 +746,7 @@ test "dispatchHookRequests alone pumps hooks without a prior drainHooks call" {
 
     // No prior supervisor.drainHooks call. dispatchHookRequests alone
     // must pump the queued hook.
-    dispatchHookRequests(&queue, &engine);
+    dispatchHookRequests(&queue, &engine, null);
 
     try std.testing.expect(req.done.isSet());
     _ = try engine.lua.getGlobal("pin_turn");
@@ -763,7 +784,7 @@ test "lua_tool_request round-trips via main thread" {
     };
     try queue.push(.{ .lua_tool_request = &req });
 
-    dispatchHookRequests(&queue, &engine);
+    dispatchHookRequests(&queue, &engine, null);
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.result_content != null);
     defer if (req.result_owned) alloc.free(req.result_content.?);

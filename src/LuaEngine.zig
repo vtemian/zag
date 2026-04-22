@@ -3607,11 +3607,11 @@ test "end-to-end: config file to registry execution" {
     const pump_thread = try std.Thread.spawn(.{}, struct {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
-                AgentRunner.dispatchHookRequests(q, eng);
+                AgentRunner.dispatchHookRequests(q, eng, null);
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes by the test thread are serviced.
-            AgentRunner.dispatchHookRequests(q, eng);
+            AgentRunner.dispatchHookRequests(q, eng, null);
         }
     }.pump, .{ &queue, &engine, &stop });
     defer {

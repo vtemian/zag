@@ -1022,12 +1022,12 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
     const Pump = struct {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
-                AgentRunner.dispatchHookRequests(q, eng);
+                AgentRunner.dispatchHookRequests(q, eng, null);
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes (e.g. ToolPost after the last
             // registry.execute returns) are serviced before we join.
-            AgentRunner.dispatchHookRequests(q, eng);
+            AgentRunner.dispatchHookRequests(q, eng, null);
         }
     };
     var stop = std.atomic.Value(bool).init(false);

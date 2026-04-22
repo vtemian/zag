@@ -462,7 +462,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
 
     var done = false;
     while (!done) {
-        AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine);
+        AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine, deps.runner.window_manager);
 
         var drain_buf: [64]agent_events.AgentEvent = undefined;
         const count = deps.runner.event_queue.drain(&drain_buf);
@@ -1099,6 +1099,11 @@ pub fn main() !void {
     // sits in its final home. Attach here so Layout starts tracking node
     // create/destroy from this point on and back-registers the existing root.
     try orchestrator.window_manager.attachLayoutRegistry();
+
+    // Wire the window manager pointer into the root runner so the
+    // main-thread drain loop can service `layout_request` round-trips.
+    // Extra split panes pick this up inside `createSplitPane`.
+    root_runner.window_manager = &orchestrator.window_manager;
 
     // Register any Lua-declared tools into the dispatch registry. Config.lua
     // already ran before provider creation, so the keymap overrides,
