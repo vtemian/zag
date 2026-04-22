@@ -162,6 +162,8 @@ test "buildHeaders creates correct auth for bearer endpoint" {
         .url = "https://example.com",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
+        .default_model = "test-model",
+        .models = &.{},
     };
     var headers = try buildHeaders(&endpoint, path, allocator, .{});
     defer freeHeaders(&endpoint, &headers, allocator);
@@ -196,6 +198,8 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
         .url = "https://example.com",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
+        .default_model = "test-model",
+        .models = &.{},
     };
     var headers = try buildHeaders(&endpoint, path, allocator, .{});
     defer freeHeaders(&endpoint, &headers, allocator);
@@ -214,6 +218,8 @@ test "buildHeaders handles no-auth endpoint" {
         .url = "http://localhost:11434/v1/chat/completions",
         .auth = .none,
         .headers = &.{},
+        .default_model = "llama3",
+        .models = &.{},
     };
     // `.none` skips resolveCredential, so the auth_path is never read.
     var headers = try buildHeaders(&endpoint, "", allocator, .{});
