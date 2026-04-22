@@ -560,7 +560,11 @@ pub fn resolveCredential(
             const new_rt = if (refreshed.refresh_token.len > 0) refreshed.refresh_token else old_rt;
 
             const new_account_id = if (refreshed.id_token.len > 0)
-                try oauth.extractAccountId(alloc, refreshed.id_token)
+                try oauth.extractAccountId(
+                    alloc,
+                    refreshed.id_token,
+                    "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+                )
             else
                 try alloc.dupe(u8, old_acc);
             defer alloc.free(new_account_id);

@@ -225,28 +225,75 @@ fn decodePayload(alloc: Allocator, jwt: []const u8) ![]const u8 {
     return out;
 }
 
-pub fn extractAccountId(alloc: Allocator, id_token: []const u8) ![]const u8 {
+/// Decode a single JSON Pointer (RFC 6901) segment: `~1` → `/`, `~0` → `~`.
+/// Any other character after `~` returns error.BadEscape.
+/// Caller owns the returned buffer.
+fn unescapePointerSegment(alloc: Allocator, segment: []const u8) ![]u8 {
+    var out = try alloc.alloc(u8, segment.len); // can only shrink
+    errdefer alloc.free(out);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < segment.len) : (i += 1) {
+        if (segment[i] == '~') {
+            if (i + 1 >= segment.len) return error.BadEscape;
+            switch (segment[i + 1]) {
+                '1' => out[j] = '/',
+                '0' => out[j] = '~',
+                else => return error.BadEscape,
+            }
+            i += 1;
+            j += 1;
+        } else {
+            out[j] = segment[i];
+            j += 1;
+        }
+    }
+    return alloc.realloc(out, j);
+}
+
+/// Walk `claim_path` through the id_token's JSON payload and return the
+/// string at that location, freshly allocated. `claim_path` is an RFC 6901
+/// JSON Pointer: slash-separated object keys, with `~1` escaping a literal
+/// `/` inside a key and `~0` escaping a literal `~`.
+///
+/// Example (Codex): the escaped path
+/// `"https:~1~1api.openai.com~1auth/chatgpt_account_id"` resolves to
+/// `payload["https://api.openai.com/auth"]["chatgpt_account_id"]`. A
+/// flat single-segment path like `"sub"` needs no escaping and resolves
+/// to `payload["sub"]`.
+///
+/// Returns `error.ClaimMissing` when any intermediate segment is absent
+/// or is not an object, or when the final value is not a string.
+/// Returns `error.BadEscape` when a segment contains a malformed `~`
+/// escape. Returns `error.MalformedJwt` if the token does not split into
+/// three base64url-nopad parts or the payload is not valid JSON.
+pub fn extractAccountId(
+    alloc: Allocator,
+    id_token: []const u8,
+    claim_path: []const u8,
+) ![]const u8 {
     const payload = try decodePayload(alloc, id_token);
     defer alloc.free(payload);
 
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return error.MalformedJwt;
     defer parsed.deinit();
 
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.MalformedJwt,
+    var cur = parsed.value;
+    var it = std.mem.splitScalar(u8, claim_path, '/');
+    while (it.next()) |raw_segment| {
+        const seg = try unescapePointerSegment(alloc, raw_segment);
+        defer alloc.free(seg);
+        switch (cur) {
+            .object => |obj| {
+                cur = obj.get(seg) orelse return error.ClaimMissing;
+            },
+            else => return error.ClaimMissing,
+        }
+    }
+    return switch (cur) {
+        .string => |s| alloc.dupe(u8, s),
+        else => error.ClaimMissing,
     };
-    const auth_v = root.get("https://api.openai.com/auth") orelse return error.ClaimMissing;
-    const auth_obj = switch (auth_v) {
-        .object => |o| o,
-        else => return error.ClaimMissing,
-    };
-    const acc_v = auth_obj.get("chatgpt_account_id") orelse return error.ClaimMissing;
-    const acc = switch (acc_v) {
-        .string => |s| s,
-        else => return error.ClaimMissing,
-    };
-    return alloc.dupe(u8, acc);
 }
 
 pub fn extractExp(access_token: []const u8) !i64 {
@@ -290,7 +337,11 @@ test "extractAccountId reads chatgpt_account_id claim" {
     const jwt = try encodeTestJwt(std.testing.allocator, payload);
     defer std.testing.allocator.free(jwt);
 
-    const account_id = try extractAccountId(std.testing.allocator, jwt);
+    const account_id = try extractAccountId(
+        std.testing.allocator,
+        jwt,
+        "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+    );
     defer std.testing.allocator.free(account_id);
     try std.testing.expectEqualStrings("acc-123", account_id);
 }
@@ -309,7 +360,14 @@ test "extractAccountId returns error.ClaimMissing when path absent" {
     const jwt = try encodeTestJwt(std.testing.allocator, payload);
     defer std.testing.allocator.free(jwt);
 
-    try std.testing.expectError(error.ClaimMissing, extractAccountId(std.testing.allocator, jwt));
+    try std.testing.expectError(
+        error.ClaimMissing,
+        extractAccountId(
+            std.testing.allocator,
+            jwt,
+            "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        ),
+    );
 }
 
 test "extractExp returns error.ClaimMissing when exp absent" {
@@ -321,8 +379,62 @@ test "extractExp returns error.ClaimMissing when exp absent" {
 }
 
 test "extractAccountId returns error.MalformedJwt on bad shape" {
-    try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "only.one.dot"));
-    try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "no-dots-at-all"));
+    try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "only.one.dot", "sub"));
+    try std.testing.expectError(error.MalformedJwt, extractAccountId(std.testing.allocator, "no-dots-at-all", "sub"));
+}
+
+test "extractAccountId walks JSON pointer through id_token claims" {
+    const payload = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc-123\"}}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    const got = try extractAccountId(
+        std.testing.allocator,
+        jwt,
+        "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+    );
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("acc-123", got);
+}
+
+test "extractAccountId returns ClaimMissing when path does not resolve" {
+    const payload = "{\"sub\":\"x\"}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    try std.testing.expectError(
+        error.ClaimMissing,
+        extractAccountId(std.testing.allocator, jwt, "not/present"),
+    );
+}
+
+test "extractAccountId handles a flat single-segment path" {
+    const payload = "{\"sub\":\"user-42\",\"exp\":1700000000}";
+    const jwt = try encodeTestJwt(std.testing.allocator, payload);
+    defer std.testing.allocator.free(jwt);
+
+    const got = try extractAccountId(std.testing.allocator, jwt, "sub");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("user-42", got);
+}
+
+test "unescapePointerSegment decodes tilde-one and tilde-zero" {
+    const a = try unescapePointerSegment(std.testing.allocator, "abc");
+    defer std.testing.allocator.free(a);
+    try std.testing.expectEqualStrings("abc", a);
+
+    const b = try unescapePointerSegment(std.testing.allocator, "a~1b~0c");
+    defer std.testing.allocator.free(b);
+    try std.testing.expectEqualStrings("a/b~c", b);
+
+    try std.testing.expectError(
+        error.BadEscape,
+        unescapePointerSegment(std.testing.allocator, "a~x"),
+    );
+    try std.testing.expectError(
+        error.BadEscape,
+        unescapePointerSegment(std.testing.allocator, "trailing~"),
+    );
 }
 
 // === Token exchange (authorization_code) ===
@@ -897,7 +1009,11 @@ pub fn runLoginFlowWithCodes(
     defer tokens.deinit(alloc);
 
     // 8) Extract the chatgpt_account_id claim from the id_token.
-    const account_id = extractAccountId(alloc, tokens.id_token) catch |err| {
+    const account_id = extractAccountId(
+        alloc,
+        tokens.id_token,
+        "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+    ) catch |err| {
         sendError(&request, "id_token missing chatgpt_account_id") catch {};
         return err;
     };
