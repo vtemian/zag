@@ -821,6 +821,13 @@ fn firstRunWizardRetry(
         break :blk false;
     };
 
+    // The wizard iterates the engine's provider registry for its picker.
+    // If the engine didn't boot, fall back to a builtin-only registry so the
+    // user still gets a working choice list.
+    var wizard_fallback_registry: ?llm.Registry = if (lua_engine == null) try llm.Registry.init(allocator) else null;
+    defer if (wizard_fallback_registry) |*r| r.deinit();
+    const wizard_registry: *const llm.Registry = if (lua_engine) |eng| &eng.providers_registry else &wizard_fallback_registry.?;
+
     const deps: auth_wizard.WizardDeps = .{
         .allocator = allocator,
         .stdin = stdin,
@@ -830,6 +837,7 @@ fn firstRunWizardRetry(
         .config_path = paths.config_path,
         .scaffold_config = scaffold,
         .forced_provider = null,
+        .registry = wizard_registry,
     };
 
     const result = auth_wizard.runWizard(deps) catch |err| {
@@ -916,6 +924,12 @@ pub fn main() !void {
                 return err;
             };
             defer paths.deinit(allocator);
+            // The auth subcommands run before the Lua engine boots, so build
+            // a standalone registry for the wizard to iterate. Seeded with
+            // builtins today; once Phase I2 lands this will be empty until
+            // the user's config.lua is loaded (a concern for that task).
+            var subcmd_registry = try llm.Registry.init(allocator);
+            defer subcmd_registry.deinit();
             const deps: auth_wizard.WizardDeps = .{
                 .allocator = allocator,
                 .stdin = &stdin_reader.interface,
@@ -925,6 +939,7 @@ pub fn main() !void {
                 .config_path = paths.config_path,
                 .scaffold_config = false,
                 .forced_provider = prov,
+                .registry = &subcmd_registry,
             };
             const result = try auth_wizard.runWizard(deps);
             allocator.free(result.provider_name);
@@ -936,6 +951,8 @@ pub fn main() !void {
                 return err;
             };
             defer paths.deinit(allocator);
+            var subcmd_registry = try llm.Registry.init(allocator);
+            defer subcmd_registry.deinit();
             const deps: auth_wizard.WizardDeps = .{
                 .allocator = allocator,
                 .stdin = &stdin_reader.interface,
@@ -945,6 +962,7 @@ pub fn main() !void {
                 .config_path = paths.config_path,
                 .scaffold_config = false,
                 .forced_provider = null,
+                .registry = &subcmd_registry,
             };
             try auth_wizard.printAuthList(deps);
             return;
@@ -955,6 +973,8 @@ pub fn main() !void {
                 return err;
             };
             defer paths.deinit(allocator);
+            var subcmd_registry = try llm.Registry.init(allocator);
+            defer subcmd_registry.deinit();
             const deps: auth_wizard.WizardDeps = .{
                 .allocator = allocator,
                 .stdin = &stdin_reader.interface,
@@ -964,6 +984,7 @@ pub fn main() !void {
                 .config_path = paths.config_path,
                 .scaffold_config = false,
                 .forced_provider = null,
+                .registry = &subcmd_registry,
             };
             try auth_wizard.removeAuth(deps, prov);
             return;

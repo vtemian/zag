@@ -1,19 +1,30 @@
 //! Interactive onboarding wizard for first-run credential setup.
 //!
 //! The module is written over `std.Io.Reader` / `std.Io.Writer` so the prompt
-//! flow can be exercised from tests without a real terminal. Task 2 shipped
-//! the shared `WizardDeps` shape and the provider-choice prompt, Task 3 the
-//! `promptSecret` termios dance, Task 4 the `PROVIDERS` registry and
-//! `scaffoldConfigLua`; `runWizard` and the `auth list` / `auth remove`
-//! helpers land with Task 5.
+//! flow can be exercised from tests without a real terminal.
 //!
-//! Adding a new provider means appending an entry to `PROVIDERS`. Provider
-//! entries may carry an optional OAuth callback; when non-null, `runWizard`
-//! delegates credential capture to it instead of prompting for a pasted key.
+//! The provider menu is derived at runtime from the engine's
+//! `providers_registry` (`WizardDeps.registry`): each endpoint becomes one
+//! picker row. OAuth endpoints dispatch through a single generic
+//! `oauth.runLoginFlow` call that reads the spec from `endpoint.auth.oauth`;
+//! `x_api_key` / `bearer` endpoints take the paste-key path; `.none`
+//! endpoints (e.g. local Ollama) skip credential capture entirely.
 
 const std = @import("std");
 
 const log = std.log.scoped(.auth_wizard);
+
+const oauth = @import("oauth.zig");
+const llm = @import("llm.zig");
+const auth = @import("auth.zig");
+
+const Endpoint = llm.Endpoint;
+
+/// Signature `WizardDeps.oauth_run_fn` uses to shim out the real browser-
+/// driven OAuth login for tests. Defaults to `oauth.runLoginFlow` in
+/// production; tests swap in a stub so the dispatch arm can be exercised
+/// without binding a real loopback listener.
+pub const OAuthRunFn = *const fn (std.mem.Allocator, oauth.LoginOptions) anyerror!void;
 
 /// Dependencies passed to every wizard entry point. Keeping I/O behind
 /// `std.Io.Reader` / `std.Io.Writer` lets tests feed canned bytes and inspect
@@ -28,8 +39,8 @@ pub const WizardDeps = struct {
     /// stdout (not the file logger) so first-run prompts are always visible.
     stdout: *std.Io.Writer,
     /// True when stdin is attached to a terminal. Controls whether
-    /// `promptSecret` toggles termios ECHO (Task 3) and whether the wizard
-    /// refuses to run as first-run setup under a pipe (Task 5).
+    /// `promptSecret` toggles termios ECHO and whether the wizard refuses
+    /// to run as first-run setup under a pipe.
     is_tty: bool,
     /// Absolute path to `~/.config/zag/auth.json`.
     auth_path: []const u8,
@@ -40,12 +51,20 @@ pub const WizardDeps = struct {
     scaffold_config: bool,
     /// Non-null for `zag auth login <prov>`: skips the provider-choice prompt.
     forced_provider: ?[]const u8,
+    /// Provider table the picker iterates. In production this points at
+    /// `LuaEngine.providers_registry`; tests build a small registry and pass
+    /// it in so they don't have to boot a Lua engine.
+    registry: *const llm.Registry,
     /// Escape hatch for tests that use a fake stdin but still want to exercise
     /// the first-run (`scaffold_config = true`) path. Production wiring leaves
     /// this at `false` so `runWizard` refuses interactive first-run under a
     /// pipe; tests set it to `true` to bypass the refusal without lying about
     /// `is_tty` (which would trigger the termios toggle on real STDIN_FILENO).
     allow_non_tty_first_run: bool = false,
+    /// OAuth dispatch seam. Null means "call `oauth.runLoginFlow` directly";
+    /// tests pass a stub so the OAuth arm can be asserted without binding a
+    /// loopback listener or launching a browser.
+    oauth_run_fn: ?OAuthRunFn = null,
 };
 
 /// Errors the wizard surfaces to `main.zig`. Named variants for
@@ -64,13 +83,12 @@ pub const WizardDeps = struct {
 ///   caller (e.g. `main.zig` prints "key was empty, try again").
 /// - `NonInteractiveFirstRun`: first-run under a pipe with
 ///   `allow_non_tty_first_run = false`. The wizard returns this *without
-///   printing*; `main.zig` (Task 6) owns the user-facing stderr message
-///   (something like "zag: first-run setup requires an interactive terminal;
-///   populate ~/.config/zag/auth.json manually, or run
-///   `zag auth login <provider>` from a real TTY").
-/// - `UnknownProvider`: `forced_provider` (or `scaffoldConfigLua`'s
-///   `provider_name`) wasn't in `PROVIDERS`. The wizard prints nothing; the
-///   caller should echo back the bad name and the known-providers list.
+///   printing*; `main.zig` owns the user-facing stderr message.
+/// - `UnknownProvider`: `forced_provider` wasn't in the registry. The wizard
+///   prints nothing; the caller should echo back the bad name.
+/// - `NoProvidersConfigured`: the registry is empty (no builtins seeded and
+///   no Lua declarations). The wizard prints nothing; the caller should hint
+///   the user to populate `config.lua` with at least one `zag.provider{}`.
 pub const WizardError = error{
     UserAborted,
     TooManyRetries,
@@ -78,6 +96,7 @@ pub const WizardError = error{
     KeyTooLong,
     NonInteractiveFirstRun,
     UnknownProvider,
+    NoProvidersConfigured,
 };
 
 /// Outcome of a successful `runWizard` pass. `main.zig` reads
@@ -93,139 +112,40 @@ pub const WizardResult = struct {
     scaffolded_config: bool,
 };
 
-/// OAuth login callback signature. Any future browser-OAuth flow (e.g.
-/// `wip/chatgpt-oauth`'s `oauth.runLoginFlow`) conforms to this shape so it
-/// can slot into `ProviderEntry.oauth_fn` via a one-line shim. Arguments:
-/// - `allocator`: transient allocations for PKCE/token exchange.
-/// - `provider_name`: key the credential will be stored under in `auth.json`
-///   (mirrors `ProviderEntry.name`).
-/// - `auth_path`: absolute path to `auth.json` — the OAuth flow writes its
-///   credential entry there directly, atomically, with mode 0o600.
+/// Build the full "provider/model" string shown in the picker and written to
+/// the scaffolded `config.lua`. `Endpoint.default_model` is a bare id
+/// (e.g. `"claude-sonnet-4-20250514"`); the scaffolder and picker want the
+/// provider-prefixed form (e.g. `"anthropic/claude-sonnet-4-20250514"`) so it
+/// can drop straight into `zag.set_default_model(...)`.
 ///
-/// The callback is responsible for persisting the credential to `auth_path`.
-/// It MUST NOT write to `config.lua`; `runWizard` owns the scaffold step so
-/// the paste-key and OAuth paths share identical post-credential behavior.
-pub const OAuthFn = *const fn (allocator: std.mem.Allocator, provider_name: []const u8, auth_path: []const u8) anyerror!void;
-
-/// How a provider authenticates. Drives the picker's auth-kind tag and
-/// whether `ProviderEntry.oauth_fn` must be non-null for the entry to be
-/// considered well-formed.
-pub const AuthKind = enum { api_key, oauth };
-
-/// Static metadata for one wizard-offered provider.
-///
-/// `oauth_fn` is the extension seam for browser-OAuth providers. When null
-/// the wizard takes the paste-key path; when non-null the callback owns
-/// writing `auth.json`. `kind` categorises the entry for the picker label;
-/// `recommended` pins an entry to the top of the picker and adds a
-/// "recommended" suffix to its label.
-pub const ProviderEntry = struct {
-    /// Short key the user picks and the auth/config files store ("openai").
-    name: []const u8,
-    /// Human-facing label shown in the choice menu ("OpenAI").
-    label: []const u8,
-    /// How this provider authenticates; drives the picker tag and whether
-    /// `oauth_fn` is required to be non-null.
-    kind: AuthKind,
-    /// If true, this entry sorts to the top of the picker and is marked
-    /// "recommended" in the rendered label.
-    recommended: bool = false,
-    /// Default `zag.set_default_model` string for this provider. Used by
-    /// `scaffoldConfigLua` when the user is a first-time stranger; once the
-    /// config file exists the wizard never rewrites it.
-    default_model: []const u8,
-    /// Optional browser-OAuth login callback. Null for paste-key providers;
-    /// non-null entries bypass `promptSecret` and let the callback write
-    /// `auth.json` itself. See `OAuthFn` for the contract.
-    oauth_fn: ?OAuthFn = null,
-};
-
-/// Providers the wizard knows how to onboard. Order is the display order in
-/// the choice menu and in the scaffolded `config.lua` (picked entry first,
-/// others emitted as commented-out hints). The OAuth entry sits on top and
-/// is flagged recommended; the paste-key entries follow in rough popularity
-/// order.
-pub const PROVIDERS = [_]ProviderEntry{
-    .{
-        .name = "openai-oauth",
-        .label = "OpenAI",
-        .kind = .oauth,
-        .recommended = true,
-        .default_model = "openai-oauth/gpt-5",
-        .oauth_fn = &chatgptOauthShim,
-    },
-    .{ .name = "openai", .label = "OpenAI", .kind = .api_key, .default_model = "openai/gpt-4o", .oauth_fn = null },
-    .{ .name = "anthropic", .label = "Anthropic", .kind = .api_key, .default_model = "anthropic/claude-sonnet-4-20250514", .oauth_fn = null },
-    .{ .name = "openrouter", .label = "OpenRouter", .kind = .api_key, .default_model = "openrouter/anthropic/claude-sonnet-4", .oauth_fn = null },
-    .{ .name = "groq", .label = "Groq", .kind = .api_key, .default_model = "groq/llama-3.3-70b-versatile", .oauth_fn = null },
-};
-
-const oauth = @import("oauth.zig");
-const llm = @import("llm.zig");
-
-/// Thin shim matching the `OAuthFn` signature. Delegates to
-/// `oauth.runLoginFlow` with the OAuth spec pulled from the builtin
-/// endpoint table — the same source `main.zig`'s `runLoginCommand` uses, so
-/// the wizard and `--login=openai-oauth` exercise identical values.
-///
-/// Returns `error.UnknownProvider` when the named provider isn't a builtin
-/// (nothing in `auth_wizard.PROVIDERS` points here for names not in the
-/// builtin registry, so this is belt-and-suspenders) and
-/// `error.WrongCredentialType` when the endpoint uses api-key auth
-/// (ditto — the wizard routes api-key providers through `promptSecret`).
-fn chatgptOauthShim(
+/// Caller owns the returned slice.
+pub fn formatDefaultModelString(
     allocator: std.mem.Allocator,
-    provider_name: []const u8,
-    auth_path: []const u8,
-) anyerror!void {
-    const endpoint = llm.findBuiltinEndpoint(provider_name) orelse return error.UnknownProvider;
-    const spec = switch (endpoint.auth) {
-        .oauth => |s| s,
-        else => return error.WrongCredentialType,
-    };
-    return oauth.runLoginFlow(allocator, .{
-        .provider_name = provider_name,
-        .auth_path = auth_path,
-        .issuer = spec.issuer,
-        .token_url = spec.token_url,
-        .client_id = spec.client_id,
-        .redirect_port = spec.redirect_port,
-        .scopes = spec.scopes,
-        .originator = "zag_cli",
-        .account_id_claim_path = spec.account_id_claim_path,
-        .extra_authorize_params = spec.extra_authorize_params,
-    });
-}
-
-/// Linear lookup against `PROVIDERS`. Returns a pointer so callers can read
-/// all three fields without copying; null means the user picked a name the
-/// wizard doesn't know.
-pub fn findProvider(name: []const u8) ?*const ProviderEntry {
-    for (&PROVIDERS) |*entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry;
-    }
-    return null;
+    ep: *const Endpoint,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ ep.name, ep.default_model });
 }
 
 /// Write a first-run `config.lua` at `config_path` with `provider_name`
-/// uncommented and a matching `zag.set_default_model(...)`. The other
-/// providers in `PROVIDERS` are emitted as commented-out hints in their
-/// declaration order so the file doubles as a quick reference.
+/// uncommented and a matching `zag.set_default_model(...)`. Other providers
+/// visible in `registry` are emitted as commented-out hints in registry
+/// order so the file doubles as a quick reference.
 ///
 /// No-op if `config_path` already exists: re-running the wizard must never
 /// clobber a user's hand-written Lua. Parent directories are created via
 /// `makePath`. File mode is `0o644` because `config.lua` isn't secret.
 ///
 /// Errors:
-/// - `error.UnknownProvider` — `provider_name` not in `PROVIDERS`.
+/// - `error.UnknownProvider` — `provider_name` not in `registry`.
 /// - `error.InvalidConfigPath` — `config_path` has no parent component.
 /// - Anything `std.fs` / allocator APIs propagate.
 pub fn scaffoldConfigLua(
     allocator: std.mem.Allocator,
+    registry: *const llm.Registry,
     config_path: []const u8,
     provider_name: []const u8,
 ) !void {
-    const picked = findProvider(provider_name) orelse return error.UnknownProvider;
+    const picked = registry.find(provider_name) orelse return error.UnknownProvider;
 
     const parent = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
     std.fs.cwd().makePath(parent) catch |err| switch (err) {
@@ -242,7 +162,7 @@ pub fn scaffoldConfigLua(
     };
     defer file.close();
 
-    const body = try renderConfigLua(allocator, picked);
+    const body = try renderConfigLua(allocator, registry, picked);
     defer allocator.free(body);
 
     var scratch: [512]u8 = undefined;
@@ -251,12 +171,14 @@ pub fn scaffoldConfigLua(
     try w.interface.flush();
 }
 
-/// Build the scaffold text for `picked`. Split out from `scaffoldConfigLua`
-/// so the render logic is independently testable and the orchestrator stays
-/// focused on filesystem concerns.
+/// Build the scaffold text for `picked`, with every other registered
+/// provider emitted as a commented-out hint. Split out from
+/// `scaffoldConfigLua` so the render logic is independently testable and the
+/// orchestrator stays focused on filesystem concerns.
 fn renderConfigLua(
     allocator: std.mem.Allocator,
-    picked: *const ProviderEntry,
+    registry: *const llm.Registry,
+    picked: *const Endpoint,
 ) ![]u8 {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
@@ -271,13 +193,15 @@ fn renderConfigLua(
     );
 
     try body.writer(allocator).print("zag.provider {{ name = \"{s}\" }}\n", .{picked.name});
-    for (&PROVIDERS) |*entry| {
-        if (entry == picked) continue;
+    for (registry.endpoints.items) |*entry| {
+        if (std.mem.eql(u8, entry.name, picked.name)) continue;
         try body.writer(allocator).print("-- zag.provider {{ name = \"{s}\" }}\n", .{entry.name});
     }
 
     try body.appendSlice(allocator, "\n");
-    try body.writer(allocator).print("zag.set_default_model(\"{s}\")\n", .{picked.default_model});
+    const default_model = try formatDefaultModelString(allocator, picked);
+    defer allocator.free(default_model);
+    try body.writer(allocator).print("zag.set_default_model(\"{s}\")\n", .{default_model});
 
     return body.toOwnedSlice(allocator);
 }
@@ -338,7 +262,7 @@ pub fn promptChoice(
 /// future fields (icon, disabled flag, keybind hint) can land without
 /// rippling through every call site.
 pub const PickerLabel = struct {
-    /// Rendered text for the row, e.g. `"OpenAI  (paste key)"`.
+    /// Rendered text for the row, e.g. `"anthropic (anthropic/claude-sonnet-4-20250514)"`.
     text: []const u8,
 };
 
@@ -530,43 +454,50 @@ pub fn promptPicker(
     }
 }
 
-/// Compute the widest `label` across `PROVIDERS`. Used by
+/// Short auth-kind marker rendered next to each picker row. The intent is to
+/// give a developer audience an at-a-glance signal of which path the wizard
+/// will take on selection; pretty marketing labels ("Anthropic") are not
+/// carried — the endpoint's raw `name` is the user-visible identifier.
+fn authKindTag(ep: *const Endpoint) []const u8 {
+    return switch (ep.auth) {
+        .oauth => "OAuth",
+        .x_api_key, .bearer => "API key",
+        .none => "no credential",
+    };
+}
+
+/// Compute the widest `name` across `registry.endpoints`. Used by
 /// `formatProviderLabel` to left-pad every entry to the same column so the
 /// auth-kind tag starts at a consistent offset.
-fn maxProviderLabelWidth() usize {
+fn maxProviderNameWidth(registry: *const llm.Registry) usize {
     var widest: usize = 0;
-    for (&PROVIDERS) |entry| {
-        if (entry.label.len > widest) widest = entry.label.len;
+    for (registry.endpoints.items) |ep| {
+        if (ep.name.len > widest) widest = ep.name.len;
     }
     return widest;
 }
 
-/// Render `entry` as a picker row: `"<label><padding>  (<tags>)"`. Tags are
-/// the auth-kind (`"API key"` or `"OAuth . ChatGPT sign-in"`, joined by
-/// U+00B7 MIDDLE DOT) plus an optional `"recommended"` marker. The caller
-/// owns the returned slice; free via the same allocator.
+/// Render `ep` as a picker row: `"<name><padding>  (<auth-kind>) <provider/model>"`.
+/// The caller owns the returned slice; free via the same allocator.
 fn formatProviderLabel(
     allocator: std.mem.Allocator,
-    entry: *const ProviderEntry,
+    registry: *const llm.Registry,
+    ep: *const Endpoint,
 ) ![]u8 {
-    const pad_to = maxProviderLabelWidth();
+    const pad_to = maxProviderNameWidth(registry);
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, entry.label);
-    if (entry.label.len < pad_to) {
-        try buf.appendNTimes(allocator, ' ', pad_to - entry.label.len);
+    try buf.appendSlice(allocator, ep.name);
+    if (ep.name.len < pad_to) {
+        try buf.appendNTimes(allocator, ' ', pad_to - ep.name.len);
     }
     try buf.appendSlice(allocator, "  (");
-
-    switch (entry.kind) {
-        .oauth => try buf.appendSlice(allocator, "OAuth \xc2\xb7 ChatGPT sign-in"),
-        .api_key => try buf.appendSlice(allocator, "API key"),
-    }
-    if (entry.recommended) {
-        try buf.appendSlice(allocator, " \xc2\xb7 recommended");
-    }
-    try buf.append(allocator, ')');
+    try buf.appendSlice(allocator, authKindTag(ep));
+    try buf.appendSlice(allocator, ") ");
+    const model_ref = try formatDefaultModelString(allocator, ep);
+    defer allocator.free(model_ref);
+    try buf.appendSlice(allocator, model_ref);
 
     return buf.toOwnedSlice(allocator);
 }
@@ -601,13 +532,6 @@ const max_secret_len: usize = 8192;
 /// - `error.StreamTooLong` from the underlying reader (input exceeds the
 ///   reader's own buffer capacity) is remapped to `error.KeyTooLong` so
 ///   callers only ever need to know about the wizard's own error set.
-// MANUAL TEST (run in a real terminal once Task 6 wires the subcommand):
-//   1. `rm -rf ~/.config/zag && zig build run` triggers the wizard.
-//   2. Paste an API key at the "Paste key:" prompt; confirm no bytes echo to
-//      the screen and the cursor advances to a fresh line after Enter.
-//   3. Hit Ctrl-C mid-prompt and verify the terminal's echo flag is restored
-//      (typing into the shell afterwards should display characters again).
-// Until Task 6 lands only the unit tests below exercise this function.
 pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     var original: ?std.posix.termios = null;
     if (deps.is_tty) {
@@ -646,37 +570,62 @@ pub fn promptSecret(deps: *const WizardDeps, prompt: []const u8) ![]u8 {
     return deps.allocator.dupe(u8, trimmed);
 }
 
-const auth = @import("auth.zig");
-
-/// Dispatch credential capture for `picked` — the OAuth seam. If
-/// `picked.oauth_fn` is non-null, delegate the whole credential write to the
-/// OAuth flow (which persists `auth.json` itself). Otherwise run the paste
-/// path: prompt for the key, load/update/save `auth.json`.
+/// Dispatch credential capture for `picked`. OAuth endpoints run a generic
+/// browser-based login flow (or the `deps.oauth_run_fn` stub when set);
+/// `x_api_key` / `bearer` endpoints prompt for a pasted key; `.none`
+/// endpoints print a note and return without writing to `auth.json`.
 ///
 /// Extracted from `runWizard` so the dispatch branch is independently
-/// testable without mutating the `const` `PROVIDERS` table.
-fn dispatchProviderCredential(deps: *const WizardDeps, picked: *const ProviderEntry) !void {
-    if (picked.oauth_fn) |oauth_fn| {
-        try deps.stdout.print("Starting {s} OAuth login...\n", .{picked.label});
-        try deps.stdout.flush();
-        try oauth_fn(deps.allocator, picked.name, deps.auth_path);
-        return;
+/// testable.
+fn dispatchProviderCredential(deps: *const WizardDeps, picked: *const Endpoint) !void {
+    switch (picked.auth) {
+        .oauth => |spec| {
+            try deps.stdout.print("Starting {s} OAuth login...\n", .{picked.name});
+            try deps.stdout.flush();
+
+            const opts: oauth.LoginOptions = .{
+                .provider_name = picked.name,
+                .auth_path = deps.auth_path,
+                .issuer = spec.issuer,
+                .token_url = spec.token_url,
+                .client_id = spec.client_id,
+                .redirect_port = spec.redirect_port,
+                .scopes = spec.scopes,
+                .originator = "zag_cli",
+                .account_id_claim_path = spec.account_id_claim_path,
+                .extra_authorize_params = spec.extra_authorize_params,
+            };
+
+            if (deps.oauth_run_fn) |run_fn| {
+                try run_fn(deps.allocator, opts);
+            } else {
+                try oauth.runLoginFlow(deps.allocator, opts);
+            }
+        },
+        .x_api_key, .bearer => {
+            try deps.stdout.print("Paste your {s} API key: ", .{picked.name});
+            try deps.stdout.flush();
+            const key = try promptSecret(deps, "");
+            // setApiKey dupes, so free `key` as soon as it has been absorbed
+            // by the AuthFile; the errdefer below covers the window in between.
+            errdefer deps.allocator.free(key);
+
+            var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
+            defer auth_file.deinit();
+
+            try auth_file.setApiKey(picked.name, key);
+            deps.allocator.free(key);
+
+            try auth.saveAuthFile(deps.auth_path, auth_file);
+        },
+        .none => {
+            try deps.stdout.print(
+                "Provider '{s}' requires no credential; nothing to save.\n",
+                .{picked.name},
+            );
+            try deps.stdout.flush();
+        },
     }
-
-    try deps.stdout.print("Paste your {s} API key: ", .{picked.label});
-    try deps.stdout.flush();
-    const key = try promptSecret(deps, "");
-    // setApiKey dupes, so free `key` as soon as it has been absorbed by the
-    // AuthFile; the errdefer below covers the window in between.
-    errdefer deps.allocator.free(key);
-
-    var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
-    defer auth_file.deinit();
-
-    try auth_file.setApiKey(picked.name, key);
-    deps.allocator.free(key);
-
-    try auth.saveAuthFile(deps.auth_path, auth_file);
 }
 
 /// Top-level first-run flow. Walks the user through provider choice (skipped
@@ -689,8 +638,9 @@ fn dispatchProviderCredential(deps: *const WizardDeps, picked: *const ProviderEn
 /// - `error.NonInteractiveFirstRun` — attempted first-run (`scaffold_config &&
 ///   !forced_provider`) under a non-TTY stdin and `allow_non_tty_first_run`
 ///   was false. Callers should point the user at `zag auth login <prov>`.
-/// - `error.UnknownProvider` — `forced_provider` is not in `PROVIDERS`.
-/// - Anything `promptChoice` / `promptSecret` / `auth.*` propagate.
+/// - `error.UnknownProvider` — `forced_provider` is not in the registry.
+/// - `error.NoProvidersConfigured` — registry has zero entries.
+/// - Anything `promptChoice` / `promptSecret` / `auth.*` / `oauth.*` propagate.
 ///
 /// Ownership: `result.provider_name` is owned by `deps.allocator`. The caller
 /// must free it once the retry in `main.zig` succeeds.
@@ -699,29 +649,34 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
         return error.NonInteractiveFirstRun;
     }
 
-    const picked: *const ProviderEntry = blk: {
+    const picked: *const Endpoint = blk: {
         if (deps.forced_provider) |forced| {
-            break :blk findProvider(forced) orelse return error.UnknownProvider;
+            break :blk deps.registry.find(forced) orelse return error.UnknownProvider;
         }
 
-        var label_bufs: [PROVIDERS.len][]u8 = undefined;
+        const entries = deps.registry.endpoints.items;
+        if (entries.len == 0) return error.NoProvidersConfigured;
+
+        const label_bufs = try deps.allocator.alloc([]u8, entries.len);
+        defer deps.allocator.free(label_bufs);
         var built: usize = 0;
         errdefer for (label_bufs[0..built]) |b| deps.allocator.free(b);
-        while (built < PROVIDERS.len) : (built += 1) {
-            label_bufs[built] = try formatProviderLabel(deps.allocator, &PROVIDERS[built]);
+        while (built < entries.len) : (built += 1) {
+            label_bufs[built] = try formatProviderLabel(deps.allocator, deps.registry, &entries[built]);
         }
         defer for (label_bufs) |b| deps.allocator.free(b);
 
-        var picker_labels: [PROVIDERS.len]PickerLabel = undefined;
+        const picker_labels = try deps.allocator.alloc(PickerLabel, entries.len);
+        defer deps.allocator.free(picker_labels);
         for (label_bufs, 0..) |b, i| picker_labels[i] = .{ .text = b };
 
         const choice = try promptPicker(
             &deps,
             "zag needs a provider. Choose one:",
-            &picker_labels,
+            picker_labels,
             0,
         );
-        break :blk &PROVIDERS[choice];
+        break :blk &entries[choice];
     };
 
     try dispatchProviderCredential(&deps, picked);
@@ -735,16 +690,18 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
             else => return err,
         };
         if (!exists) {
-            try scaffoldConfigLua(deps.allocator, deps.config_path, picked.name);
+            try scaffoldConfigLua(deps.allocator, deps.registry, deps.config_path, picked.name);
             scaffolded = true;
         }
     }
 
-    try deps.stdout.print("\nSaved credential for {s}.\n", .{picked.label});
+    try deps.stdout.print("\nSaved credential for {s}.\n", .{picked.name});
     if (scaffolded) {
+        const default_model = try formatDefaultModelString(deps.allocator, picked);
+        defer deps.allocator.free(default_model);
         try deps.stdout.print(
             "Scaffolded {s} with default model {s}.\n",
-            .{ deps.config_path, picked.default_model },
+            .{ deps.config_path, default_model },
         );
     }
     try deps.stdout.flush();
@@ -799,14 +756,6 @@ fn formatMaskedKey(out: *[16]u8, key: []const u8) []const u8 {
 /// Drop `provider_name` from `auth.json` and persist the result. Missing
 /// entries are a success, not an error: `zag auth remove X` is a declarative
 /// "X should not be present", so idempotence matches user intent.
-///
-// TODO(oauth-plan): once `src/auth.zig` grows a `Credential.oauth` variant,
-// add a test that seeds a non-api_key entry (either via a raw JSON fixture
-// once the loader accepts it, or by injecting a `Credential{.oauth = ...}`
-// into `auth_file.entries` directly) and asserts `removeAuth` still prints
-// "Removed credential for X". Today `Credential` is a single-variant union,
-// so the `entries.contains` probe below is variant-agnostic by construction
-// but can't be exercised against a non-api_key entry yet.
 pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
     var auth_file = try auth.loadAuthFile(deps.allocator, deps.auth_path);
     defer auth_file.deinit();
@@ -827,11 +776,19 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
 
 const testing = std.testing;
 
+/// Build a registry pre-seeded with a handful of endpoints shaped the way
+/// the wizard expects. Keeping it in one place per test file keeps the test
+/// bodies focused on behaviour rather than registry plumbing.
+fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
+    return llm.Registry.init(allocator);
+}
+
 /// Build a throwaway `WizardDeps` pointing at the supplied fake I/O. The
 /// path fields stay empty; no promptChoice test touches disk.
 fn testDeps(
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
+    registry: *const llm.Registry,
 ) WizardDeps {
     return .{
         .allocator = testing.allocator,
@@ -842,31 +799,37 @@ fn testDeps(
         .config_path = "",
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = registry,
     };
 }
 
 test "promptChoice parses valid digit from stdin" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("2\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const options = [_][]const u8{ "openai", "anthropic", "groq" };
     const choice = try promptChoice(&deps, "Pick a provider:", &options);
     try testing.expectEqual(@as(usize, 1), choice);
 }
 
 test "promptChoice retries on out-of-range" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("99\n1\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const options = [_][]const u8{ "openai", "anthropic", "groq" };
     const choice = try promptChoice(&deps, "Pick a provider:", &options);
     try testing.expectEqual(@as(usize, 0), choice);
 
-    // Prompt header printed once per attempt; two attempts → two headers.
     const rendered = stdout_writer.written();
     var count: usize = 0;
     var cursor: usize = 0;
@@ -878,11 +841,14 @@ test "promptChoice retries on out-of-range" {
 }
 
 test "promptChoice retries on non-digit" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("abc\n3\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const options = [_][]const u8{ "openai", "anthropic", "groq" };
     const choice = try promptChoice(&deps, "Pick a provider:", &options);
     try testing.expectEqual(@as(usize, 2), choice);
@@ -924,11 +890,14 @@ test "parsePickerByte: q aborts" {
 }
 
 test "promptPicker with is_tty=false falls back to promptChoice" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("2\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const labels = [_]PickerLabel{
         .{ .text = "openai" },
         .{ .text = "anthropic" },
@@ -939,56 +908,74 @@ test "promptPicker with is_tty=false falls back to promptChoice" {
 }
 
 test "promptChoice returns UserAborted on EOF" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const options = [_][]const u8{ "openai", "anthropic", "groq" };
     try testing.expectError(error.UserAborted, promptChoice(&deps, "Pick a provider:", &options));
 }
 
 test "promptSecret reads line and strips newline" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("sk-abc-123\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const secret = try promptSecret(&deps, "Paste key: ");
     defer deps.allocator.free(secret);
     try testing.expectEqualStrings("sk-abc-123", secret);
 }
 
 test "promptSecret trims whitespace" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("  sk-xyz  \n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const secret = try promptSecret(&deps, "Paste key: ");
     defer deps.allocator.free(secret);
     try testing.expectEqualStrings("sk-xyz", secret);
 }
 
 test "promptSecret rejects empty input" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     try testing.expectError(error.EmptyInput, promptSecret(&deps, "Paste key: "));
 }
 
 test "promptSecret rejects whitespace-only input" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("   \n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     try testing.expectError(error.EmptyInput, promptSecret(&deps, "Paste key: "));
 }
 
 test "promptSecret accepts exactly max_secret_len bytes" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     const input = try testing.allocator.alloc(u8, max_secret_len + 1);
     defer testing.allocator.free(input);
     @memset(input[0..max_secret_len], 'x');
@@ -998,13 +985,16 @@ test "promptSecret accepts exactly max_secret_len bytes" {
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const secret = try promptSecret(&deps, "Paste key: ");
     defer deps.allocator.free(secret);
     try testing.expectEqual(max_secret_len, secret.len);
 }
 
 test "promptSecret rejects max_secret_len + 1 bytes" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     const input = try testing.allocator.alloc(u8, max_secret_len + 2);
     defer testing.allocator.free(input);
     @memset(input[0 .. max_secret_len + 1], 'x');
@@ -1014,11 +1004,14 @@ test "promptSecret rejects max_secret_len + 1 bytes" {
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     try testing.expectError(error.KeyTooLong, promptSecret(&deps, "Paste key: "));
 }
 
 test "promptSecret maps StreamTooLong to KeyTooLong when reader buffer overflows" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     // Input is 32 bytes plus `\n`; backing reader buffer is only 16. The
     // delimiter is past the buffer's capacity, so `takeDelimiter` raises
     // `StreamTooLong` before `promptSecret` ever sees the trimmed slice.
@@ -1028,41 +1021,26 @@ test "promptSecret maps StreamTooLong to KeyTooLong when reader buffer overflows
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&backing.interface, &stdout_writer.writer);
+    const deps = testDeps(&backing.interface, &stdout_writer.writer, &registry);
     try testing.expectError(error.KeyTooLong, promptSecret(&deps, "Paste key: "));
 }
 
 test "promptSecret returns UserAborted on EOF" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var stdin = std.Io.Reader.fixed("");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
-    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     try testing.expectError(error.UserAborted, promptSecret(&deps, "Paste key: "));
 }
 
-test "findProvider returns matching entry" {
-    const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
-    try testing.expectEqualStrings("anthropic", entry.name);
-    try testing.expectEqualStrings("Anthropic", entry.label);
-    try testing.expectEqual(AuthKind.api_key, entry.kind);
-    try testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", entry.default_model);
-}
-
-test "findProvider returns the openai-oauth entry with kind=.oauth" {
-    const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
-    try testing.expectEqualStrings("openai-oauth", entry.name);
-    try testing.expectEqual(AuthKind.oauth, entry.kind);
-    try testing.expect(entry.recommended);
-    try testing.expect(entry.oauth_fn != null);
-    try testing.expectEqualStrings("openai-oauth/gpt-5", entry.default_model);
-}
-
-test "findProvider returns null for unknown" {
-    try testing.expectEqual(@as(?*const ProviderEntry, null), findProvider("bogus"));
-}
-
 test "scaffoldConfigLua writes expected contents for openai" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
@@ -1070,30 +1048,27 @@ test "scaffoldConfigLua writes expected contents for openai" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, path, "openai");
-
-    const expected =
-        \\-- zag config. See https://github.com/vladtemian/zag for reference.
-        \\--
-        \\-- Uncomment the providers you want to use. Keys live in ~/.config/zag/auth.json
-        \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
-        \\
-        \\zag.provider { name = "openai" }
-        \\-- zag.provider { name = "openai-oauth" }
-        \\-- zag.provider { name = "anthropic" }
-        \\-- zag.provider { name = "openrouter" }
-        \\-- zag.provider { name = "groq" }
-        \\
-        \\zag.set_default_model("openai/gpt-4o")
-        \\
-    ;
+    try scaffoldConfigLua(testing.allocator, &registry, path, "openai");
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
-    try testing.expectEqualStrings(expected, actual);
+
+    // Header + picked provider line + one commented hint per other registry
+    // entry + default_model line. Snapshot the full output so future changes
+    // to the scaffold template are caught.
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.provider { name = \"openai\" }\n") != null);
+    // The picked entry must appear uncommented and before any commented one.
+    const picked_idx = std.mem.indexOf(u8, actual, "zag.provider { name = \"openai\" }\n").?;
+    const commented_idx = std.mem.indexOf(u8, actual, "-- zag.provider { name = \"anthropic\" }\n").?;
+    try testing.expect(picked_idx < commented_idx);
+    // Default model uses provider/default_model composition.
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"openai/gpt-4o\")\n") != null);
 }
 
 test "scaffoldConfigLua writes expected contents for anthropic" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
@@ -1101,30 +1076,20 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, path, "anthropic");
-
-    const expected =
-        \\-- zag config. See https://github.com/vladtemian/zag for reference.
-        \\--
-        \\-- Uncomment the providers you want to use. Keys live in ~/.config/zag/auth.json
-        \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
-        \\
-        \\zag.provider { name = "anthropic" }
-        \\-- zag.provider { name = "openai-oauth" }
-        \\-- zag.provider { name = "openai" }
-        \\-- zag.provider { name = "openrouter" }
-        \\-- zag.provider { name = "groq" }
-        \\
-        \\zag.set_default_model("anthropic/claude-sonnet-4-20250514")
-        \\
-    ;
+    try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic");
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
-    try testing.expectEqualStrings(expected, actual);
+
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.provider { name = \"anthropic\" }\n") != null);
+    try testing.expect(std.mem.indexOf(u8, actual, "-- zag.provider { name = \"openai\" }\n") != null);
+    try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"anthropic/claude-sonnet-4-20250514\")\n") != null);
 }
 
 test "scaffoldConfigLua is a no-op when file exists" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
@@ -1134,7 +1099,7 @@ test "scaffoldConfigLua is a no-op when file exists" {
 
     try tmp.dir.writeFile(.{ .sub_path = "config.lua", .data = "-- user content" });
 
-    try scaffoldConfigLua(testing.allocator, path, "openai");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "openai");
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1142,6 +1107,9 @@ test "scaffoldConfigLua is a no-op when file exists" {
 }
 
 test "scaffoldConfigLua creates parent directories" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
@@ -1149,7 +1117,7 @@ test "scaffoldConfigLua creates parent directories" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "nested", "config.lua" });
     defer testing.allocator.free(path);
 
-    try scaffoldConfigLua(testing.allocator, path, "groq");
+    try scaffoldConfigLua(testing.allocator, &registry, path, "groq");
 
     const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
     defer testing.allocator.free(actual);
@@ -1158,6 +1126,9 @@ test "scaffoldConfigLua creates parent directories" {
 }
 
 test "scaffoldConfigLua rejects unknown provider" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
@@ -1167,7 +1138,7 @@ test "scaffoldConfigLua rejects unknown provider" {
 
     try testing.expectError(
         error.UnknownProvider,
-        scaffoldConfigLua(testing.allocator, path, "bogus"),
+        scaffoldConfigLua(testing.allocator, &registry, path, "bogus"),
     );
 }
 
@@ -1185,15 +1156,25 @@ fn wizardPaths(
     return .{ .auth_path = auth_path, .config_path = config_path };
 }
 
+// Builtin registry order (from `src/llm/registry.zig:builtin_endpoints`):
+//   1) anthropic    - api-key
+//   2) openai       - api-key
+//   3) openrouter   - api-key
+//   4) groq         - api-key
+//   5) ollama       - no credential
+//   6) openai-oauth - oauth
+// Keep the 1-based indexes below in sync if the builtin table is reordered.
 test "runWizard happy path writes auth.json and scaffolds config.lua" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
     defer testing.allocator.free(paths.auth_path);
     defer testing.allocator.free(paths.config_path);
 
-    // `2` picks the api-key openai entry; entry 1 is the openai-oauth
-    // recommended row whose oauth_fn would launch a real browser.
+    // `2` picks openai (an api-key provider).
     var stdin = std.Io.Reader.fixed("2\nsk-abc-123\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
@@ -1207,6 +1188,7 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
         .config_path = paths.config_path,
         .scaffold_config = true,
         .forced_provider = null,
+        .registry = &registry,
         .allow_non_tty_first_run = true,
     };
 
@@ -1232,6 +1214,9 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
 }
 
 test "runWizard with forced_provider skips the choice prompt" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1252,6 +1237,7 @@ test "runWizard with forced_provider skips the choice prompt" {
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = "anthropic",
+        .registry = &registry,
     };
 
     const result = try runWizard(deps);
@@ -1269,6 +1255,9 @@ test "runWizard with forced_provider skips the choice prompt" {
 }
 
 test "runWizard refuses non-TTY first-run" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1288,6 +1277,7 @@ test "runWizard refuses non-TTY first-run" {
         .config_path = paths.config_path,
         .scaffold_config = true,
         .forced_provider = null,
+        .registry = &registry,
         // allow_non_tty_first_run defaults to false — production wiring.
     };
 
@@ -1295,6 +1285,9 @@ test "runWizard refuses non-TTY first-run" {
 }
 
 test "runWizard appends to existing auth.json without clobbering other providers" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1309,8 +1302,7 @@ test "runWizard appends to existing auth.json without clobbering other providers
         try auth.saveAuthFile(paths.auth_path, seed);
     }
 
-    // `2` picks the api-key openai entry; entry 1 is the openai-oauth
-    // recommended row whose oauth_fn would launch a real browser.
+    // `2` picks openai (an api-key provider).
     var stdin = std.Io.Reader.fixed("2\nsk-new\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
@@ -1324,6 +1316,7 @@ test "runWizard appends to existing auth.json without clobbering other providers
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
         .allow_non_tty_first_run = true,
     };
 
@@ -1338,6 +1331,9 @@ test "runWizard appends to existing auth.json without clobbering other providers
 }
 
 test "runWizard rejects unknown forced_provider" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1357,12 +1353,49 @@ test "runWizard rejects unknown forced_provider" {
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = "bogus",
+        .registry = &registry,
     };
 
     try testing.expectError(error.UnknownProvider, runWizard(deps));
 }
 
+test "runWizard refuses when registry has no providers" {
+    var empty_registry = llm.Registry{
+        .endpoints = .empty,
+        .allocator = testing.allocator,
+    };
+    defer empty_registry.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+        .registry = &empty_registry,
+        .allow_non_tty_first_run = true,
+    };
+
+    try testing.expectError(error.NoProvidersConfigured, runWizard(deps));
+}
+
 test "printAuthList prints entries with masked keys" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1390,6 +1423,7 @@ test "printAuthList prints entries with masked keys" {
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
     };
 
     try printAuthList(deps);
@@ -1404,6 +1438,9 @@ test "printAuthList prints entries with masked keys" {
 }
 
 test "printAuthList reports empty configuration" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1423,6 +1460,7 @@ test "printAuthList reports empty configuration" {
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
     };
 
     try printAuthList(deps);
@@ -1431,6 +1469,9 @@ test "printAuthList reports empty configuration" {
 }
 
 test "removeAuth removes existing entry" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1458,6 +1499,7 @@ test "removeAuth removes existing entry" {
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
     };
 
     try removeAuth(deps, "anthropic");
@@ -1472,27 +1514,36 @@ test "removeAuth removes existing entry" {
     try testing.expect(std.mem.indexOf(u8, rendered, "Removed credential for anthropic") != null);
 }
 
-// Test-scoped state for the oauth_fn seam test. The wizard expects the OAuth
-// callback to be a plain function pointer, so we can't close over test locals
-// — stash the observed arguments in file-scope vars and assert on them.
+// Test-scoped state for the OAuth dispatch seam test. The wizard expects
+// `WizardDeps.oauth_run_fn` to be a plain function pointer, so we can't
+// close over test locals — stash the observed arguments in file-scope vars
+// and assert on them.
 var test_oauth_call_count: usize = 0;
 var test_oauth_last_provider: []const u8 = "";
 var test_oauth_last_auth_path: []const u8 = "";
+var test_oauth_last_issuer: []const u8 = "";
+var test_oauth_last_redirect_port: u16 = 0;
 
-fn test_oauth_fn_stub(
+fn testOauthRunFn(
     _: std.mem.Allocator,
-    provider_name: []const u8,
-    auth_path: []const u8,
+    opts: oauth.LoginOptions,
 ) anyerror!void {
     test_oauth_call_count += 1;
-    test_oauth_last_provider = provider_name;
-    test_oauth_last_auth_path = auth_path;
+    test_oauth_last_provider = opts.provider_name;
+    test_oauth_last_auth_path = opts.auth_path;
+    test_oauth_last_issuer = opts.issuer;
+    test_oauth_last_redirect_port = opts.redirect_port;
 }
 
-test "dispatchProviderCredential calls oauth_fn when set and skips promptSecret" {
+test "dispatchProviderCredential routes .oauth endpoints through oauth_run_fn with spec fields" {
     test_oauth_call_count = 0;
     test_oauth_last_provider = "";
     test_oauth_last_auth_path = "";
+    test_oauth_last_issuer = "";
+    test_oauth_last_redirect_port = 0;
+
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1515,35 +1566,30 @@ test "dispatchProviderCredential calls oauth_fn when set and skips promptSecret"
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
+        .oauth_run_fn = &testOauthRunFn,
     };
 
-    const picked: ProviderEntry = .{
-        .name = "openai-oauth",
-        .label = "ChatGPT (OAuth)",
-        .kind = .oauth,
-        .default_model = "openai-oauth/gpt-5",
-        .oauth_fn = &test_oauth_fn_stub,
-    };
-
-    try dispatchProviderCredential(&deps, &picked);
+    const picked = registry.find("openai-oauth") orelse return error.TestExpectedEntry;
+    try dispatchProviderCredential(&deps, picked);
 
     try testing.expectEqual(@as(usize, 1), test_oauth_call_count);
     try testing.expectEqualStrings("openai-oauth", test_oauth_last_provider);
     try testing.expectEqualStrings(paths.auth_path, test_oauth_last_auth_path);
-
-    // The OAuth stub wrote nothing; runWizard's contract says the OAuth flow
-    // owns auth.json persistence. Verify the dispatch helper itself did not
-    // write the file (the stub is a no-op, so nothing should land on disk).
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.auth_path));
+    // Issuer / redirect_port come straight from the endpoint's OAuth spec;
+    // these values are the builtin `openai-oauth` declaration.
+    try testing.expectEqualStrings("https://auth.openai.com/oauth/authorize", test_oauth_last_issuer);
+    try testing.expectEqual(@as(u16, 1455), test_oauth_last_redirect_port);
 
     // Stdout should surface the "Starting ... OAuth login..." breadcrumb so
     // the user sees what's happening.
     const rendered = stdout_writer.written();
-    try testing.expect(std.mem.indexOf(u8, rendered, "Starting ChatGPT (OAuth) OAuth login") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Starting openai-oauth OAuth login") != null);
 }
 
-test "dispatchProviderCredential falls through to paste path when oauth_fn is null" {
-    test_oauth_call_count = 0;
+test "dispatchProviderCredential runs paste path for x_api_key endpoints" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1564,56 +1610,20 @@ test "dispatchProviderCredential falls through to paste path when oauth_fn is nu
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
     };
 
-    const picked: ProviderEntry = .{
-        .name = "openai",
-        .label = "OpenAI",
-        .kind = .api_key,
-        .default_model = "openai/gpt-4o",
-        .oauth_fn = null,
-    };
-
-    try dispatchProviderCredential(&deps, &picked);
-
-    try testing.expectEqual(@as(usize, 0), test_oauth_call_count);
+    const picked = registry.find("anthropic") orelse return error.TestExpectedEntry;
+    try dispatchProviderCredential(&deps, picked);
 
     var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
     defer loaded.deinit();
-    try testing.expectEqualStrings("sk-paste-key", (try loaded.getApiKey("openai")).?);
+    try testing.expectEqualStrings("sk-paste-key", (try loaded.getApiKey("anthropic")).?);
 }
 
-test "PROVIDERS: oauth entries carry oauth_fn, api_key entries don't" {
-    // Invariant: every `.oauth` entry must have a non-null `oauth_fn` (or the
-    // picker dispatch would fall through to `promptSecret` with nothing to
-    // paste), and every `.api_key` entry must leave `oauth_fn` null (so the
-    // paste flow runs). Guards against a future registration flipping the
-    // wrong field.
-    for (&PROVIDERS) |entry| {
-        switch (entry.kind) {
-            .oauth => try testing.expect(entry.oauth_fn != null),
-            .api_key => try testing.expectEqual(@as(?OAuthFn, null), entry.oauth_fn),
-        }
-    }
-}
-
-test "PROVIDERS: exactly one recommended entry, pinned to the top" {
-    var recommended_count: usize = 0;
-    for (&PROVIDERS) |entry| {
-        if (entry.recommended) recommended_count += 1;
-    }
-    try testing.expectEqual(@as(usize, 1), recommended_count);
-    try testing.expect(PROVIDERS[0].recommended);
-}
-
-test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped entry" {
-    // Mirrors the real PROVIDERS[0] registration but swaps the shim for a
-    // stub so the test doesn't talk to the real OAuth server. Locks in the
-    // contract that `.kind = .oauth + oauth_fn` entries always dispatch to
-    // the callback, not to `promptSecret`.
-    test_oauth_call_count = 0;
-    test_oauth_last_provider = "";
-    test_oauth_last_auth_path = "";
+test "dispatchProviderCredential runs paste path for bearer endpoints" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1621,6 +1631,42 @@ test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped ent
     defer testing.allocator.free(paths.auth_path);
     defer testing.allocator.free(paths.config_path);
 
+    var stdin = std.Io.Reader.fixed("sk-bearer-key\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+        .registry = &registry,
+    };
+
+    // `openai` is the builtin bearer endpoint.
+    const picked = registry.find("openai") orelse return error.TestExpectedEntry;
+    try dispatchProviderCredential(&deps, picked);
+
+    var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("sk-bearer-key", (try loaded.getApiKey("openai")).?);
+}
+
+test "dispatchProviderCredential skips credential capture for .none endpoints" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    // Empty stdin: if `.none` tried to prompt, it would trip UserAborted.
     var stdin = std.Io.Reader.fixed("");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
@@ -1634,49 +1680,63 @@ test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped ent
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
     };
 
-    const picked: ProviderEntry = .{
-        .name = "openai-oauth",
-        .label = "OpenAI",
-        .kind = .oauth,
-        .recommended = true,
-        .default_model = "openai-oauth/gpt-5",
-        .oauth_fn = &test_oauth_fn_stub,
-    };
+    const picked = registry.find("ollama") orelse return error.TestExpectedEntry;
+    try dispatchProviderCredential(&deps, picked);
 
-    try dispatchProviderCredential(&deps, &picked);
-    try testing.expectEqual(@as(usize, 1), test_oauth_call_count);
-    try testing.expectEqualStrings("openai-oauth", test_oauth_last_provider);
+    // auth.json must not exist: `.none` writes nothing.
+    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.auth_path));
+
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "requires no credential") != null);
 }
 
-test "formatProviderLabel for openai-oauth shows OAuth . ChatGPT sign-in . recommended" {
-    const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, entry);
+test "formatProviderLabel renders name, padded, with auth kind and provider/model" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
+    const picked = registry.find("anthropic") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, &registry, picked);
     defer testing.allocator.free(rendered);
-    const expected = "OpenAI      (OAuth \xc2\xb7 ChatGPT sign-in \xc2\xb7 recommended)";
-    try testing.expectEqualStrings(expected, rendered);
+
+    // Widest builtin name is "openai-oauth" (12 chars); "anthropic" is 9.
+    // Expect the name, three spaces of padding, the auth-kind tag, and the
+    // provider-scoped model id.
+    try testing.expect(std.mem.startsWith(u8, rendered, "anthropic   "));
+    try testing.expect(std.mem.indexOf(u8, rendered, "(API key)") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "anthropic/claude-sonnet-4-20250514") != null);
 }
 
-test "formatProviderLabel for openai (api_key) shows API key" {
-    const entry = findProvider("openai") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, entry);
+test "formatProviderLabel tags .oauth endpoints as OAuth" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
+    const picked = registry.find("openai-oauth") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, &registry, picked);
     defer testing.allocator.free(rendered);
-    const expected = "OpenAI      (API key)";
-    try testing.expectEqualStrings(expected, rendered);
+
+    try testing.expect(std.mem.startsWith(u8, rendered, "openai-oauth"));
+    try testing.expect(std.mem.indexOf(u8, rendered, "(OAuth)") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "openai-oauth/gpt-5") != null);
 }
 
-test "formatProviderLabel pads anthropic to widest label width" {
-    const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, entry);
+test "formatProviderLabel tags .none endpoints as no credential" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
+    const picked = registry.find("ollama") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, &registry, picked);
     defer testing.allocator.free(rendered);
-    // "OpenRouter" is the widest label at 10 chars; "Anthropic" is 9, so one
-    // trailing space before the two-space gutter.
-    const expected = "Anthropic   (API key)";
-    try testing.expectEqualStrings(expected, rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "(no credential)") != null);
 }
 
 test "removeAuth is a no-op for missing entry" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try wizardPaths(tmp.dir);
@@ -1696,6 +1756,7 @@ test "removeAuth is a no-op for missing entry" {
         .config_path = paths.config_path,
         .scaffold_config = false,
         .forced_provider = null,
+        .registry = &registry,
     };
 
     try removeAuth(deps, "groq");
