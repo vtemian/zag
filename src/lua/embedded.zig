@@ -43,8 +43,8 @@ test "entries manifest includes every stdlib provider" {
 test "find returns the entry for a known provider" {
     const e = find("zag.providers.anthropic").?;
     try std.testing.expectEqualStrings("zag.providers.anthropic", e.name);
-    // Code is baked at compile time; at minimum it contains our placeholder comment.
-    try std.testing.expect(std.mem.indexOf(u8, e.code, "Placeholder") != null);
+    // Code is baked at compile time; the anthropic stdlib file calls `zag.provider`.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.provider") != null);
 }
 
 test "find returns null for an unknown module" {
