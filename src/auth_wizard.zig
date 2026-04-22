@@ -838,6 +838,9 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
 
     try dispatchProviderCredential(&deps, picked);
 
+    const chosen_model = try promptModel(&deps, picked);
+    defer if (chosen_model) |m| deps.allocator.free(m);
+
     var scaffolded = false;
     if (deps.scaffold_config and deps.forced_provider == null) {
         const exists = if (std.fs.accessAbsolute(deps.config_path, .{})) |_|
@@ -847,7 +850,7 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
             else => return err,
         };
         if (!exists) {
-            try scaffoldConfigLua(deps.allocator, deps.registry, deps.config_path, picked.name, null);
+            try scaffoldConfigLua(deps.allocator, deps.registry, deps.config_path, picked.name, chosen_model);
             scaffolded = true;
         }
     }
@@ -943,6 +946,108 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
     var reg = llm.Registry.init(allocator);
     errdefer reg.deinit();
 
+    const anthropic_models = [_]llm.Endpoint.ModelRate{
+        .{
+            .id = "claude-sonnet-4-20250514",
+            .recommended = true,
+            .context_window = 200000,
+            .max_output_tokens = 8192,
+            .input_per_mtok = 3,
+            .output_per_mtok = 15,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+        .{
+            .id = "claude-opus-4-20250514",
+            .context_window = 200000,
+            .max_output_tokens = 8192,
+            .input_per_mtok = 15,
+            .output_per_mtok = 75,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+    };
+    const openai_models = [_]llm.Endpoint.ModelRate{
+        .{
+            .id = "gpt-4o",
+            .recommended = true,
+            .context_window = 128000,
+            .max_output_tokens = 16384,
+            .input_per_mtok = 2.5,
+            .output_per_mtok = 10,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+        .{
+            .id = "gpt-4o-mini",
+            .context_window = 128000,
+            .max_output_tokens = 16384,
+            .input_per_mtok = 0.15,
+            .output_per_mtok = 0.6,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+    };
+    const openrouter_models = [_]llm.Endpoint.ModelRate{
+        .{
+            .id = "anthropic/claude-sonnet-4",
+            .recommended = true,
+            .context_window = 200000,
+            .max_output_tokens = 8192,
+            .input_per_mtok = 3,
+            .output_per_mtok = 15,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+    };
+    const groq_models = [_]llm.Endpoint.ModelRate{
+        .{
+            .id = "llama-3.3-70b-versatile",
+            .recommended = true,
+            .context_window = 131072,
+            .max_output_tokens = 32768,
+            .input_per_mtok = 0.59,
+            .output_per_mtok = 0.79,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+    };
+    const ollama_models = [_]llm.Endpoint.ModelRate{
+        .{
+            .id = "llama3",
+            .recommended = true,
+            .context_window = 8192,
+            .max_output_tokens = 4096,
+            .input_per_mtok = 0,
+            .output_per_mtok = 0,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+    };
+    const openai_oauth_models = [_]llm.Endpoint.ModelRate{
+        .{
+            .id = "gpt-5.2",
+            .label = "gpt-5.2 (recommended)",
+            .recommended = true,
+            .context_window = 272000,
+            .max_output_tokens = 128000,
+            .input_per_mtok = 0,
+            .output_per_mtok = 0,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+        .{
+            .id = "gpt-5.4",
+            .label = "gpt-5.4",
+            .context_window = 272000,
+            .max_output_tokens = 128000,
+            .input_per_mtok = 0,
+            .output_per_mtok = 0,
+            .cache_write_per_mtok = null,
+            .cache_read_per_mtok = null,
+        },
+    };
+
     const entries = [_]llm.Endpoint{
         .{
             .name = "anthropic",
@@ -951,7 +1056,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
             .auth = .x_api_key,
             .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
             .default_model = "claude-sonnet-4-20250514",
-            .models = &.{},
+            .models = &anthropic_models,
         },
         .{
             .name = "openai",
@@ -960,7 +1065,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
             .auth = .bearer,
             .headers = &.{},
             .default_model = "gpt-4o",
-            .models = &.{},
+            .models = &openai_models,
         },
         .{
             .name = "openrouter",
@@ -969,7 +1074,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
             .auth = .bearer,
             .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
             .default_model = "anthropic/claude-sonnet-4",
-            .models = &.{},
+            .models = &openrouter_models,
         },
         .{
             .name = "groq",
@@ -978,7 +1083,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
             .auth = .bearer,
             .headers = &.{},
             .default_model = "llama-3.3-70b-versatile",
-            .models = &.{},
+            .models = &groq_models,
         },
         .{
             .name = "ollama",
@@ -987,7 +1092,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
             .auth = .none,
             .headers = &.{},
             .default_model = "llama3",
-            .models = &.{},
+            .models = &ollama_models,
         },
         .{
             .name = "openai-oauth",
@@ -1014,7 +1119,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
             } },
             .headers = &.{},
             .default_model = "gpt-5.2",
-            .models = &.{},
+            .models = &openai_oauth_models,
         },
     };
 
@@ -1499,8 +1604,10 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     defer testing.allocator.free(paths.auth_path);
     defer testing.allocator.free(paths.config_path);
 
-    // `2` picks openai (an api-key provider).
-    var stdin = std.Io.Reader.fixed("2\nsk-abc-123\n");
+    // `2` picks openai (an api-key provider). After the api key, `2` selects
+    // the second model (gpt-4o-mini), exercising the chosen_model override
+    // path so the scaffolded default is not the endpoint's default_model.
+    var stdin = std.Io.Reader.fixed("2\nsk-abc-123\n2\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
@@ -1531,11 +1638,14 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     defer loaded.deinit();
     try testing.expectEqualStrings("sk-abc-123", (try loaded.getApiKey("openai")).?);
 
-    // config.lua: scaffolded with the openai template.
+    // config.lua: scaffolded with the openai template and the picked model.
     const config_body = try std.fs.cwd().readFileAlloc(testing.allocator, paths.config_path, 1 << 16);
     defer testing.allocator.free(config_body);
     try testing.expect(std.mem.indexOf(u8, config_body, "require(\"zag.providers.openai\")") != null);
-    try testing.expect(std.mem.indexOf(u8, config_body, "zag.set_default_model(\"openai/gpt-4o\")") != null);
+    try testing.expect(std.mem.indexOf(u8, config_body, "zag.set_default_model(\"openai/gpt-4o-mini\")") != null);
+    // The endpoint's default_model must not leak through when the user
+    // explicitly picked a non-default row.
+    try testing.expect(std.mem.indexOf(u8, config_body, "zag.set_default_model(\"openai/gpt-4o\")\n") == null);
 }
 
 test "runWizard with forced_provider skips the choice prompt" {
@@ -1548,8 +1658,9 @@ test "runWizard with forced_provider skips the choice prompt" {
     defer testing.allocator.free(paths.auth_path);
     defer testing.allocator.free(paths.config_path);
 
-    // No digit line: promptChoice must not run.
-    var stdin = std.Io.Reader.fixed("sk-ant-key\n");
+    // No provider-picker digit: promptChoice must not run. After the api
+    // key, `1` picks the recommended model (claude-sonnet-4-20250514).
+    var stdin = std.Io.Reader.fixed("sk-ant-key\n1\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
@@ -1627,8 +1738,12 @@ test "runWizard appends to existing auth.json without clobbering other providers
         try auth.saveAuthFile(paths.auth_path, seed);
     }
 
-    // `2` picks openai (an api-key provider).
-    var stdin = std.Io.Reader.fixed("2\nsk-new\n");
+    // `2` picks openai (an api-key provider). After the api key, `1`
+    // picks the recommended model. scaffold_config is false here, so the
+    // picked model is used only by the paste-me hint path; the key
+    // invariant this test guards is that neither auth.json entry gets
+    // clobbered when a second provider is appended.
+    var stdin = std.Io.Reader.fixed("2\nsk-new\n1\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
