@@ -466,7 +466,13 @@ fn nodeStillLive(self: *WindowManager, maybe: ?*Layout.LayoutNode) bool {
 
 /// Run a keymap-bound Action. Mutating mode, layout, or compositor state
 /// lives here exclusively so handleKey stays a pure dispatcher.
-pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
+///
+/// Every tree-mutating branch routes through the ID-addressed primitive
+/// (`closeById`, etc.) so keyboard and LLM paths share one
+/// implementation. Direction-based focus (`focus_left` and friends)
+/// still goes through `doFocus`; ID primitives are targeted at explicit
+/// LLM or Lua calls.
+pub fn executeAction(self: *WindowManager, action: Keymap.Action) !void {
     switch (action) {
         .focus_left => self.doFocus(.left),
         .focus_down => self.doFocus(.down),
@@ -475,18 +481,15 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
         .split_vertical => self.doSplit(.vertical),
         .split_horizontal => self.doSplit(.horizontal),
         .close_window => {
-            const prev = self.layout.getFocusedLeaf();
-            self.layout.closeWindow();
-            self.layout.recalculate(self.screen.width, self.screen.height);
-            self.compositor.layout_dirty = true;
-            self.notifyLeafRects();
-            notifyFocusSwap(prev, self.layout.getFocusedLeaf());
+            const focus = self.layout.focused orelse return;
+            const handle = try self.handleForNode(focus);
+            try self.closeById(handle, null);
         },
         .resize => {
-            // Keyboard dispatch has no target ratio. Plugins that want
-            // resize rebind this action to a Lua action calling
-            // zag.layout.resize(id, ratio). See Task 10 for the ID-path
-            // rewrite of this switch.
+            // Keyboard dispatch carries no target ratio. Plugins that
+            // want resize rebind this action to a Lua action calling
+            // zag.layout.resize(id, ratio).
+            return error.ResizeRequiresArgument;
         },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
@@ -1337,6 +1340,58 @@ test "describe emits parseable node map" {
     try std.testing.expect(root_val == .string);
     const nodes = parsed.value.object.get("nodes") orelse return error.TestUnexpectedResult;
     try std.testing.expect(nodes == .object);
+}
+
+test "executeAction focus_left goes through handle path" {
+    const allocator = std.testing.allocator;
+
+    // executeAction needs the same full scaffolding as the split tests:
+    // `.close_window` and friends touch compositor/screen; the focus
+    // branches touch layout. Stand the lot up so the action routes
+    // realistically.
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    wm.doSplit(.vertical);
+    const original_right = wm.layout.focused.?;
+    try wm.executeAction(.focus_left);
+    try std.testing.expect(wm.layout.focused != original_right);
 }
 
 test "restorePane rebuilds both tree and messages" {
