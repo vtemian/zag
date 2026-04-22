@@ -12,6 +12,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const NodeRegistry = @import("NodeRegistry.zig");
 
 const Layout = @This();
 
@@ -72,6 +73,10 @@ root: ?*LayoutNode,
 focused: ?*LayoutNode,
 /// Allocator for all layout nodes.
 allocator: Allocator,
+/// Optional registry notified of node creation and removal. Layout still
+/// owns and frees the `*LayoutNode` memory; the registry only tracks
+/// handles for stable external addressing.
+registry: ?*NodeRegistry = null,
 
 /// Create a new empty layout with no root.
 pub fn init(allocator: Allocator) Layout {
@@ -100,6 +105,7 @@ pub fn setRoot(self: *Layout, buf: Buffer) !void {
         .buffer = buf,
         .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     } };
+    try self.trackRegister(leaf);
 
     self.root = leaf;
     self.focused = leaf;
@@ -132,7 +138,9 @@ pub fn closeWindow(self: *Layout) void {
     // If the parent split IS the root, sibling becomes the new root
     if (parent == r) {
         self.root = sibling;
+        self.trackRemove(f);
         self.allocator.destroy(f);
+        self.trackRemove(parent);
         self.allocator.destroy(parent);
         self.focused = findFirstLeaf(sibling);
         return;
@@ -145,7 +153,9 @@ pub fn closeWindow(self: *Layout) void {
     } else {
         grandparent.split.second = sibling;
     }
+    self.trackRemove(f);
     self.allocator.destroy(f);
+    self.trackRemove(parent);
     self.allocator.destroy(parent);
     self.focused = findFirstLeaf(sibling);
 }
@@ -244,6 +254,7 @@ fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer
         .buffer = new_buffer,
         .rect = existing_rect,
     } };
+    try self.trackRegister(new_leaf);
 
     // Create a new split node that wraps both
     const split = try self.allocator.create(LayoutNode);
@@ -256,6 +267,7 @@ fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_buffer
         .second = new_leaf,
         .rect = existing_rect,
     } };
+    try self.trackRegister(split);
 
     // Replace the focused node in its parent (or as root)
     if (r == f) {
@@ -412,7 +424,28 @@ fn destroyNode(self: *Layout, node: *LayoutNode) void {
             self.destroyNode(s.second);
         },
     }
+    self.trackRemove(node);
     self.allocator.destroy(node);
+}
+
+/// Register `node` with the attached registry, if any. A missing registry
+/// is a no-op so Layout remains usable standalone.
+fn trackRegister(self: *Layout, node: *LayoutNode) !void {
+    if (self.registry) |r| _ = try r.register(node);
+}
+
+/// Tombstone `node` in the attached registry, if any. The linear scan is
+/// acceptable because node counts are tiny and this only runs during
+/// destroy paths (close, replace-root).
+fn trackRemove(self: *Layout, node: *LayoutNode) void {
+    if (self.registry) |r| {
+        for (r.slots.items, 0..) |slot, i| {
+            if (slot.node == node) {
+                r.remove(.{ .index = @intCast(i), .generation = slot.generation }) catch {};
+                return;
+            }
+        }
+    }
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -706,4 +739,42 @@ test "setRoot replaces existing tree" {
 
     try layout.setRoot(cb2.buf());
     try std.testing.expectEqualStrings("second", layout.root.?.leaf.buffer.getName());
+}
+
+test "registry receives register on setRoot and split" {
+    var registry = NodeRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var layout = Layout.init(std.testing.allocator);
+    defer layout.deinit();
+    layout.registry = &registry;
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    try layout.setRoot(dummy_buf);
+    try std.testing.expectEqual(@as(usize, 1), registry.slots.items.len);
+
+    try layout.splitVertical(0.5, dummy_buf);
+    try std.testing.expectEqual(@as(usize, 3), registry.slots.items.len);
+}
+
+test "registry receives remove on closeWindow" {
+    var registry = NodeRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var layout = Layout.init(std.testing.allocator);
+    defer layout.deinit();
+    layout.registry = &registry;
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    try layout.setRoot(dummy_buf);
+    try layout.splitVertical(0.5, dummy_buf);
+    layout.closeWindow();
+
+    // After closing the focused leaf: leaf slot tombstoned, parent split tombstoned.
+    // Two of the three slots should have null node fields.
+    var null_count: usize = 0;
+    for (registry.slots.items) |slot| if (slot.node == null) {
+        null_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), null_count);
 }
