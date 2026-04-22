@@ -80,14 +80,14 @@ The trajectory follows ATIF-v1.2 and validates against
 
 Zag reads two files on startup, both under `~/.config/zag/`:
 
-- `config.lua` is user-editable. It sets the default model and declares provider names. The provider declarations are validated today but not yet load-bearing; the active provider is whatever prefix you put on `zag.set_default_model()`.
+- `config.lua` is user-editable. It enables providers from the embedded stdlib and picks the default model. `require("zag.providers.<name>")` resolves from `~/.config/zag/lua/zag/providers/<name>.lua` first (for user overrides), then from the seven stdlib modules baked into the binary (`anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `ollama`). Declare a brand-new provider by writing your own module that calls `zag.provider{ name, url, wire, auth, default_model, models, ... }` and `require()`ing it.
 - `auth.json` is machine-written by the wizard and the `zag auth` subcommands below. Do not hand-edit it. The schema is stable and documented here for reference only.
 
 Example `config.lua`:
 
 ```lua
+require("zag.providers.openai")
 zag.set_default_model("openai/gpt-4o")
-zag.provider { name = "openai" }
 ```
 
 `auth.json` schema (managed for you):
