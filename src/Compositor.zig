@@ -14,6 +14,7 @@ const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationTree = @import("ConversationTree.zig");
 const EventOrchestrator = @import("EventOrchestrator.zig");
 const Theme = @import("Theme.zig");
 const Keymap = @import("Keymap.zig");
@@ -169,6 +170,7 @@ fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
         .leaf => |leaf| {
             self.drawBufferContent(&leaf);
             leaf.buffer.clearDirty();
+            self.syncTreeSnapshot(leaf.buffer);
         },
         .split => |split| {
             self.drawAllLeaves(split.first);
@@ -198,6 +200,7 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
                 }
                 self.drawBufferContent(&leaf);
                 leaf.buffer.clearDirty();
+                self.syncTreeSnapshot(leaf.buffer);
             }
         },
         .split => |split| {
@@ -205,6 +208,30 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
             self.drawDirtyLeaves(split.second);
         },
     }
+}
+
+/// After a leaf repaint, drain the tree's dirty-node ring and invalidate
+/// the corresponding NodeLineCache entries so they don't outlive their
+/// source `Node.content.items`. On overflow (more than
+/// `DirtyRing.capacity` mutations since the last drain) we wipe the
+/// whole cache; the next frame will lazily repopulate only the nodes
+/// that end up in the visible range.
+///
+/// Also refreshes `pane.runner.node_version_snapshot` so later steps can
+/// tell tree mutations apart from view-only dirty at the pane boundary.
+fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
+    const orch = self.orchestrator orelse return;
+    const pane = orch.window_manager.paneFromBuffer(buf) orelse return;
+
+    var ids_buf: [ConversationTree.DirtyRing.capacity]u32 = undefined;
+    const drained = pane.view.tree.drainDirty(&ids_buf);
+    if (drained.overflowed) {
+        pane.view.cache.invalidateAll();
+    } else if (drained.written > 0) {
+        pane.view.cache.invalidateMany(ids_buf[0..drained.written]);
+    }
+
+    pane.runner.node_version_snapshot = pane.view.tree.currentGeneration();
 }
 
 /// Draw the content of a single buffer into its rect on the screen.

@@ -13,8 +13,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const error_detail = @import("error_detail.zig");
 
 const log = std.log.scoped(.streaming);
+
+/// Cap on the error body we drain on non-2xx status. Enough to capture a
+/// JSON `{"error": {"message": "..."}}` envelope without blowing up logs.
+const MAX_ERROR_BODY_BYTES: usize = 2048;
 
 /// Hard cap on a single SSE line. Defends against hostile or broken endpoints
 /// that stream bytes without a newline, which would otherwise grow
@@ -122,7 +127,23 @@ pub const StreamingResponse = struct {
         };
 
         if (response.head.status != .ok) {
-            log.err("streaming: HTTP status {d}", .{@intFromEnum(response.head.status)});
+            // Body drainage on the streaming path panics inside the
+            // stdlib reader on some 4xx shapes (observed on ChatGPT
+            // OAuth 401s: readSliceShort dives into defaultReadVec and
+            // aborts). Until that's understood, surface status + tag
+            // only; the plain HTTP path in http.zig still captures
+            // full body snippets for non-streaming errors.
+            log.err("streaming: HTTP {d} {s}", .{
+                @intFromEnum(response.head.status),
+                @tagName(response.head.status),
+            });
+            if (std.fmt.allocPrint(
+                allocator,
+                "HTTP {d} ({s})",
+                .{ @intFromEnum(response.head.status), @tagName(response.head.status) },
+            )) |detail| {
+                error_detail.set(allocator, detail);
+            } else |_| {}
             return error.ApiError;
         }
 

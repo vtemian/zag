@@ -10,6 +10,7 @@ const Buffer = @import("Buffer.zig");
 const Layout = @import("Layout.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const NodeLineCache = @import("NodeLineCache.zig");
+const ConversationTree = @import("ConversationTree.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
 const input = @import("input.zig");
@@ -22,73 +23,37 @@ const log = std.log.scoped(.conversation_buffer);
 /// the draft lives inline on the buffer struct with no separate alloc.
 pub const MAX_DRAFT = 4096;
 
-/// Semantic classification of a node's content.
-pub const NodeType = enum {
-    custom,
-    user_message,
-    assistant_text,
-    tool_call,
-    tool_result,
-    status,
-    err,
-    separator,
-};
+/// Re-export of the tree's node type enum, so external call sites that
+/// named it `ConversationBuffer.NodeType` keep compiling during the
+/// migration. Prefer `ConversationTree.NodeType` for new code.
+pub const NodeType = ConversationTree.NodeType;
 
-/// A single node in the buffer tree. Owns its content and children.
-pub const Node = struct {
-    /// Unique identifier within this buffer.
-    id: u32,
-    /// Semantic type used by renderers to decide formatting.
-    node_type: NodeType,
-    /// Tag for custom-typed nodes (e.g. plugin-defined types).
-    custom_tag: ?[]const u8 = null,
-    /// The textual content of this node. Owned by the node.
-    content: std.ArrayList(u8),
-    /// Child nodes (e.g. tool_result children of a tool_call).
-    children: std.ArrayList(*Node),
-    /// Whether this node's children are hidden from rendering.
-    collapsed: bool = false,
-    /// Back-pointer to the parent node, null for root children.
-    parent: ?*Node = null,
-    /// Incremented on every content mutation. `NodeLineCache` checks
-    /// this against its stored `Entry.version` to decide hit vs. miss.
-    content_version: u32 = 0,
-
-    /// Release all memory owned by this node and its descendants. The
-    /// buffer-level `NodeLineCache` owns any cached spans keyed by this
-    /// node's id; callers must drop the cache entry (or wipe the whole
-    /// cache) before or after this call as appropriate.
-    pub fn deinit(self: *Node, allocator: Allocator) void {
-        for (self.children.items) |child| {
-            child.deinit(allocator);
-            allocator.destroy(child);
-        }
-        self.children.deinit(allocator);
-        self.content.deinit(allocator);
-    }
-
-    /// Mark this node's content as changed, invalidating any cache entry
-    /// whose stored version is now stale.
-    pub fn markDirty(self: *Node) void {
-        self.content_version +%= 1;
-    }
-};
+/// Re-export of the tree's Node struct, for the same back-compat reason
+/// as `NodeType` above.
+pub const Node = ConversationTree.Node;
 
 /// Buffer identifier.
 id: u32,
 /// Human-readable buffer name (e.g. "session"). Owned.
 name: []const u8,
-/// Top-level nodes in insertion order.
-root_children: std.ArrayList(*Node),
-/// Monotonically increasing counter for assigning node IDs.
-next_id: u32,
-/// Allocator used for all buffer and node allocations.
+/// Semantic node tree, owned by value. Read as `self.tree.root_children`
+/// etc.; the mutation methods on `ConversationBuffer` (`appendNode`,
+/// `clear`, ...) delegate through to this tree for backward compat.
+tree: ConversationTree,
+/// Allocator used for all buffer-owned allocations (name, cache). The
+/// tree holds its own copy of the same allocator.
 allocator: Allocator,
 /// Scroll offset from the bottom (0 = scrolled to latest content).
 scroll_offset: u32 = 0,
-/// Whether the buffer has visual changes since the last composite.
-/// Set on content/structure mutations, cleared by the compositor.
-render_dirty: bool = false,
+/// Last `tree.generation` observed by `clearDirty`. `isDirty` returns
+/// true whenever the tree has advanced past this value, so every
+/// `appendNode`/`appendToNode`/`clear` call is automatically visible
+/// without a separate dirty flag.
+last_seen_generation: u32 = 0,
+/// Separate dirty channel for view-only changes (scroll, focus) that
+/// don't mutate the tree. `isDirty` ORs this with the generation
+/// check; `clearDirty` resets it to false.
+scroll_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 /// Memoized NodeRenderer output, keyed by (node.id, node.content_version).
@@ -113,59 +78,33 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
     return .{
         .id = id,
         .name = owned_name,
-        .root_children = .empty,
-        .next_id = 0,
+        .tree = ConversationTree.init(allocator),
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
         .cache = NodeLineCache.init(allocator),
     };
 }
 
-/// Release all memory owned by this buffer: cache, nodes, name, lists.
+/// Release all memory owned by this buffer: cache, tree, name.
 /// Messages and the session handle live on `ConversationHistory`; the
 /// agent thread, event queue, and streaming state live on `AgentRunner`.
 /// Neither is owned by the buffer.
 ///
 /// Deinit order matters: drain the cache first so entries release their
 /// spans arrays while the Node tree (and therefore the borrowed span
-/// text) is still alive. Then free the nodes.
+/// text) is still alive. Then free the tree.
 pub fn deinit(self: *ConversationBuffer) void {
     self.cache.deinit();
-    for (self.root_children.items) |node| {
-        node.deinit(self.allocator);
-        self.allocator.destroy(node);
-    }
-    self.root_children.deinit(self.allocator);
+    self.tree.deinit();
     self.allocator.free(self.name);
 }
 
 /// Create a new node and attach it to `parent`. If `parent` is null the node
-/// is appended to the buffer's root children list.
+/// is appended to the tree's root children list. Delegates to
+/// `ConversationTree.appendNode`; the tree's generation bump is what
+/// `isDirty()` observes, so no separate dirty flag is needed.
 pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
-    const node = try self.allocator.create(Node);
-    errdefer self.allocator.destroy(node);
-
-    var items: std.ArrayList(u8) = .empty;
-    try items.appendSlice(self.allocator, content);
-    errdefer items.deinit(self.allocator);
-
-    node.* = .{
-        .id = self.next_id,
-        .node_type = node_type,
-        .content = items,
-        .children = .empty,
-        .parent = parent,
-    };
-    self.next_id += 1;
-    self.render_dirty = true;
-
-    if (parent) |p| {
-        try p.children.append(self.allocator, node);
-    } else {
-        try self.root_children.append(self.allocator, node);
-    }
-
-    return node;
+    return self.tree.appendNode(parent, node_type, content);
 }
 
 /// Walk the tree and return styled display lines for the visible range.
@@ -199,7 +138,7 @@ pub fn getVisibleLines(
     var skipped: usize = 0;
     var collected: usize = 0;
 
-    for (self.root_children.items) |node| {
+    for (self.tree.root_children.items) |node| {
         if (collected >= max_lines) break;
         try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
     }
@@ -296,7 +235,7 @@ fn collectVisibleLines(
 /// Count the total number of visible lines (including children of non-collapsed nodes).
 pub fn lineCount(self: *const ConversationBuffer) !usize {
     var count: usize = 0;
-    for (self.root_children.items) |node| {
+    for (self.tree.root_children.items) |node| {
         count += try countVisibleLines(node, &self.renderer);
     }
     return count;
@@ -313,12 +252,54 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer) !usize {
     return count;
 }
 
-/// Append text to an existing node's content.
-/// Used for streaming: text deltas accumulate into one node.
+/// Append text to an existing node's content. Used for streaming: text
+/// deltas accumulate into one node. Delegates to `ConversationTree`;
+/// the tree's generation bump is what `isDirty()` observes.
 pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !void {
-    try node.content.appendSlice(self.allocator, text);
-    node.markDirty();
-    self.render_dirty = true;
+    try self.tree.appendToNode(node, text);
+}
+
+/// Result of a `readText` call: plain-text view of the visible lines,
+/// the total line count observed, and whether the tail window was
+/// truncated (i.e. the buffer had more lines than `max_lines`).
+pub const ReadResult = struct {
+    /// Joined plain-text lines separated by '\n'. Caller owns.
+    text: []u8,
+    /// Total visible lines in the buffer at the time of the call.
+    total_lines: usize,
+    /// True when `total_lines` exceeded `max_lines` and the head was
+    /// trimmed. False when the full buffer fit in the window.
+    truncated: bool,
+};
+
+/// Render the most recent `max_lines` visible lines as plain text.
+/// Used by the `pane_read` tool and similar read-only introspection
+/// paths. Always returns the tail of the buffer so plugins see the
+/// freshest turns when they ask for a small window.
+pub fn readText(
+    self: *ConversationBuffer,
+    alloc: Allocator,
+    max_lines: usize,
+    theme: *const Theme,
+) !ReadResult {
+    const total = try self.lineCount();
+    const skip = if (max_lines >= total) 0 else total - max_lines;
+    const truncated = skip > 0;
+
+    var styled = try self.getVisibleLines(alloc, self.allocator, theme, skip, max_lines);
+    defer styled.deinit(alloc);
+
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (parts.items) |p| alloc.free(p);
+        parts.deinit(alloc);
+    }
+    for (styled.items) |line| {
+        const line_text = try line.toText(alloc);
+        try parts.append(alloc, line_text);
+    }
+    const joined = try std.mem.join(alloc, "\n", parts.items);
+    return .{ .text = joined, .total_lines = total, .truncated = truncated };
 }
 
 /// Populate the node tree from loaded JSONL entries. The tool_result
@@ -343,18 +324,19 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .session_start, .session_rename => {},
         }
     }
-    self.render_dirty = true;
+    // Each appendNode already bumped tree.generation, so isDirty() will
+    // pick this up on the next compositor pass without a separate flag.
 }
 
-/// Remove all nodes from the buffer, freeing their memory.
+/// Remove all nodes from the buffer and wipe the cache. The tree's
+/// `clear` signals cache-wide invalidation via the dirty ring's
+/// overflow flag; we explicitly wipe the cache here to free those
+/// entries before their borrowed span text is freed by the tree.
+/// Also bumps tree.generation so `isDirty()` fires even if the tree
+/// was already empty.
 pub fn clear(self: *ConversationBuffer) void {
-    for (self.root_children.items) |node| {
-        node.deinit(self.allocator);
-        self.allocator.destroy(node);
-    }
-    self.root_children.clearRetainingCapacity();
-    self.next_id = 0;
-    self.render_dirty = true;
+    self.cache.invalidateAll();
+    self.tree.clear();
 }
 
 /// Append a user_message node at the root of the tree and return it.
@@ -366,8 +348,8 @@ pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
 // -- Draft input --------------------------------------------------------
 
 /// Append a single byte to the draft. No-op if the draft is full.
-/// Does not touch `render_dirty`. The compositor repaints the prompt
-/// every frame anyway.
+/// Does not touch the dirty channels; the compositor repaints the
+/// prompt every frame regardless of buffer-level dirty state.
 pub fn appendToDraft(self: *ConversationBuffer, ch: u8) void {
     if (self.draft_len >= self.draft.len) return;
     self.draft[self.draft_len] = ch;
@@ -486,7 +468,7 @@ fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     if (self.scroll_offset == offset) return;
     self.scroll_offset = offset;
-    self.render_dirty = true;
+    self.scroll_dirty = true;
 }
 
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {
@@ -496,12 +478,13 @@ fn bufLineCount(ptr: *anyopaque) anyerror!usize {
 
 fn bufIsDirty(ptr: *anyopaque) bool {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.render_dirty;
+    return self.tree.currentGeneration() != self.last_seen_generation or self.scroll_dirty;
 }
 
 fn bufClearDirty(ptr: *anyopaque) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    self.render_dirty = false;
+    self.last_seen_generation = self.tree.currentGeneration();
+    self.scroll_dirty = false;
 }
 
 /// Handle a key event aimed at the buffer's in-progress draft. The
@@ -575,7 +558,7 @@ test "init and deinit" {
 
     try std.testing.expectEqual(@as(u32, 0), cb.id);
     try std.testing.expectEqualStrings("test", cb.name);
-    try std.testing.expectEqual(@as(usize, 0), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cb.tree.root_children.items.len);
 }
 
 test "appendNode creates root-level nodes" {
@@ -588,7 +571,7 @@ test "appendNode creates root-level nodes" {
 
     try std.testing.expectEqual(@as(u32, 0), n1.id);
     try std.testing.expectEqual(@as(u32, 1), n2.id);
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
     try std.testing.expectEqualStrings("hello", n1.content.items);
     try std.testing.expectEqualStrings("hi there", n2.content.items);
 }
@@ -609,6 +592,24 @@ test "getVisibleLines returns rendered lines" {
     const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
     try std.testing.expectEqualStrings("> hello", line0);
+}
+
+test "readText emits user and assistant turns as plain text" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "readtext-test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+    _ = try cb.appendNode(null, .assistant_text, "world");
+
+    const theme = Theme.defaultTheme();
+    const out = try cb.readText(allocator, 10, &theme);
+    defer allocator.free(out.text);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.text, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.text, "world") != null);
+    try std.testing.expect(!out.truncated);
+    try std.testing.expect(out.total_lines >= 2);
 }
 
 test "buffer interface dispatches correctly" {
@@ -900,13 +901,13 @@ test "loadFromEntries builds node tree from session entries" {
 
     try cb.loadFromEntries(&entries);
 
-    try std.testing.expectEqual(@as(usize, 3), cb.root_children.items.len);
-    try std.testing.expectEqual(NodeType.user_message, cb.root_children.items[0].node_type);
-    try std.testing.expectEqual(NodeType.assistant_text, cb.root_children.items[1].node_type);
-    try std.testing.expectEqual(NodeType.tool_call, cb.root_children.items[2].node_type);
+    try std.testing.expectEqual(@as(usize, 3), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(NodeType.user_message, cb.tree.root_children.items[0].node_type);
+    try std.testing.expectEqual(NodeType.assistant_text, cb.tree.root_children.items[1].node_type);
+    try std.testing.expectEqual(NodeType.tool_call, cb.tree.root_children.items[2].node_type);
     // tool_result is a child of tool_call
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items[2].children.items.len);
-    try std.testing.expectEqual(NodeType.tool_result, cb.root_children.items[2].children.items[0].node_type);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items[2].children.items.len);
+    try std.testing.expectEqual(NodeType.tool_result, cb.tree.root_children.items[2].children.items[0].node_type);
 }
 
 test "draft starts empty" {

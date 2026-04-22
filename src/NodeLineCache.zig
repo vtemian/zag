@@ -13,8 +13,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ConversationBuffer = @import("ConversationBuffer.zig");
-const Node = ConversationBuffer.Node;
+const ConversationTree = @import("ConversationTree.zig");
+const Node = ConversationTree.Node;
 const Theme = @import("Theme.zig");
 
 const NodeLineCache = @This();

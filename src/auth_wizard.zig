@@ -285,8 +285,12 @@ pub fn promptChoice(
 /// future fields (icon, disabled flag, keybind hint) can land without
 /// rippling through every call site.
 pub const PickerLabel = struct {
-    /// Rendered text for the row, e.g. `"anthropic (anthropic/claude-sonnet-4-20250514)"`.
+    /// Rendered primary text for the row, e.g. the padded provider name
+    /// `"anthropic  "`. Rendered in bold on the cursor row.
     text: []const u8,
+    /// Optional secondary tag printed after `text`, e.g. `"(API key)"` or
+    /// `"(OAuth)"`. Always rendered dim, independent of cursor state.
+    tag: ?[]const u8 = null,
 };
 
 /// Decoded action the picker should take after consuming an input byte.
@@ -344,6 +348,8 @@ fn parsePickerByte(state: *PickerParseState, byte: u8) PickerEvent {
         },
         '\r', '\n' => .commit,
         'q', 'Q' => .abort,
+        'j' => .down,
+        'k' => .up,
         else => .noop,
     };
 }
@@ -355,9 +361,18 @@ fn writePickerRewind(writer: *std.Io.Writer, lines: usize) !void {
     try writer.print("\x1b[{d}A\x1b[J", .{lines});
 }
 
+/// SGR escape sequences used by the picker. Hard-coded rather than pulled
+/// from `Theme` because the wizard runs before the TUI and before Lua
+/// config has chosen a colorscheme; bold/dim/reset respect whatever
+/// palette the user's terminal already has.
+const sgr_bold = "\x1b[1m";
+const sgr_dim = "\x1b[2m";
+const sgr_reset = "\x1b[0m";
+
 /// Render the current picker frame: prompt, blank line, labelled rows with
-/// a `>` gutter on the cursor row, blank line, navigation hint. Flushes so
-/// the frame lands before we block on `read`.
+/// a `>` gutter on the cursor row, blank line, navigation hint. The cursor
+/// label is rendered bold; any tag (parenthetical) is rendered dim; the
+/// hint is dim. Flushes so the frame lands before we block on `read`.
 fn renderPickerFrame(
     writer: *std.Io.Writer,
     prompt: []const u8,
@@ -368,24 +383,36 @@ fn renderPickerFrame(
     try writer.writeByte('\n');
     try writer.writeByte('\n');
     for (labels, 0..) |label, i| {
-        if (i == cursor) {
-            try writer.writeAll("  > ");
+        const selected = i == cursor;
+        if (selected) {
+            try writer.writeAll("  " ++ sgr_bold ++ "> ");
+            try writer.writeAll(label.text);
+            try writer.writeAll(sgr_reset);
         } else {
             try writer.writeAll("    ");
+            try writer.writeAll(label.text);
         }
-        try writer.writeAll(label.text);
+        if (label.tag) |tag| {
+            try writer.writeAll("  " ++ sgr_dim);
+            try writer.writeAll(tag);
+            try writer.writeAll(sgr_reset);
+        }
         try writer.writeByte('\n');
     }
     try writer.writeByte('\n');
-    try writer.writeAll("up/down to navigate . Enter to select . q to abort\n");
+    try writer.writeAll(sgr_dim);
+    try writer.writeAll("up/down or j/k to navigate . Enter to select . q to abort");
+    try writer.writeAll(sgr_reset);
+    try writer.writeByte('\n');
     try writer.flush();
 }
 
-/// Count of rendered rows to rewind over when redrawing:
-/// `labels.len` label rows + 1 blank after the prompt + 1 blank before the
-/// hint + 1 hint row. The prompt itself stays on screen across redraws.
+/// Count of rendered rows to rewind over when redrawing. Matches the row
+/// count emitted by `renderPickerFrame`: 1 prompt + 1 blank + labels.len +
+/// 1 blank + 1 hint. The whole frame is rewritten each tick so the prompt
+/// gets cleaned up instead of piling up on every keypress.
 fn pickerRewindLines(labels_len: usize) usize {
-    return labels_len + 3;
+    return labels_len + 4;
 }
 
 /// Interactive arrow-key picker over raw stdin. Reads one byte at a time
@@ -500,29 +527,55 @@ fn maxProviderNameWidth(registry: *const llm.Registry) usize {
     return widest;
 }
 
-/// Render `ep` as a picker row: `"<name><padding>  (<auth-kind>) <provider/model>"`.
-/// The caller owns the returned slice; free via the same allocator.
+/// Rendered pieces of a provider picker row. `text` is the padded provider
+/// name (e.g. `"anthropic    "`) rendered bold on the cursor row; `tag` is
+/// the parenthetical auth-kind followed by the provider-scoped default
+/// model id (e.g. `"(API key) anthropic/claude-sonnet-4-20250514"`) and is
+/// always rendered dim. Splitting the two halves lets the picker renderer
+/// dim the tag independently of the name. Both slices are heap-allocated
+/// and owned by the caller; free via `deinit`.
+const ProviderRow = struct {
+    text: []u8,
+    tag: []u8,
+
+    fn deinit(self: ProviderRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.tag);
+    }
+};
+
+/// Render `ep` into a `ProviderRow`. The primary text is the endpoint name
+/// left-padded to the widest name in `registry`; the tag carries the
+/// auth-kind marker plus the provider-scoped default model id (e.g.
+/// `"(API key) anthropic/claude-sonnet-4-20250514"`). The caller owns both
+/// slices; free via `ProviderRow.deinit`.
 fn formatProviderLabel(
     allocator: std.mem.Allocator,
     registry: *const llm.Registry,
     ep: *const Endpoint,
-) ![]u8 {
+) !ProviderRow {
     const pad_to = maxProviderNameWidth(registry);
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, ep.name);
+    var text_buf: std.ArrayList(u8) = .empty;
+    errdefer text_buf.deinit(allocator);
+    try text_buf.appendSlice(allocator, ep.name);
     if (ep.name.len < pad_to) {
-        try buf.appendNTimes(allocator, ' ', pad_to - ep.name.len);
+        try text_buf.appendNTimes(allocator, ' ', pad_to - ep.name.len);
     }
-    try buf.appendSlice(allocator, "  (");
-    try buf.appendSlice(allocator, authKindTag(ep));
-    try buf.appendSlice(allocator, ") ");
+
+    var tag_buf: std.ArrayList(u8) = .empty;
+    errdefer tag_buf.deinit(allocator);
+    try tag_buf.append(allocator, '(');
+    try tag_buf.appendSlice(allocator, authKindTag(ep));
+    try tag_buf.appendSlice(allocator, ") ");
     const model_ref = try formatDefaultModelString(allocator, ep);
     defer allocator.free(model_ref);
-    try buf.appendSlice(allocator, model_ref);
+    try tag_buf.appendSlice(allocator, model_ref);
 
-    return buf.toOwnedSlice(allocator);
+    return .{
+        .text = try text_buf.toOwnedSlice(allocator),
+        .tag = try tag_buf.toOwnedSlice(allocator),
+    };
 }
 
 /// Drop a trailing `\r` so CRLF-terminated input from a Windows-era terminal
@@ -680,18 +733,18 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
         const entries = deps.registry.endpoints.items;
         if (entries.len == 0) return error.NoProvidersConfigured;
 
-        const label_bufs = try deps.allocator.alloc([]u8, entries.len);
-        defer deps.allocator.free(label_bufs);
+        const rows = try deps.allocator.alloc(ProviderRow, entries.len);
+        defer deps.allocator.free(rows);
         var built: usize = 0;
-        errdefer for (label_bufs[0..built]) |b| deps.allocator.free(b);
+        errdefer for (rows[0..built]) |r| r.deinit(deps.allocator);
         while (built < entries.len) : (built += 1) {
-            label_bufs[built] = try formatProviderLabel(deps.allocator, deps.registry, &entries[built]);
+            rows[built] = try formatProviderLabel(deps.allocator, deps.registry, &entries[built]);
         }
-        defer for (label_bufs) |b| deps.allocator.free(b);
+        defer for (rows) |r| r.deinit(deps.allocator);
 
         const picker_labels = try deps.allocator.alloc(PickerLabel, entries.len);
         defer deps.allocator.free(picker_labels);
-        for (label_bufs, 0..) |b, i| picker_labels[i] = .{ .text = b };
+        for (rows, 0..) |r, i| picker_labels[i] = .{ .text = r.text, .tag = r.tag };
 
         const choice = try promptPicker(
             &deps,
@@ -961,10 +1014,10 @@ test "promptChoice retries on non-digit" {
     try testing.expectEqual(@as(usize, 2), choice);
 }
 
-test "parsePickerByte: 'j'/'k' are noop, only arrows move" {
+test "parsePickerByte: j moves down, k moves up (vim bindings)" {
     var state: PickerParseState = .{};
-    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'j'));
-    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'k'));
+    try testing.expectEqual(PickerEvent.down, parsePickerByte(&state, 'j'));
+    try testing.expectEqual(PickerEvent.up, parsePickerByte(&state, 'k'));
 }
 
 test "parsePickerByte: down arrow is ESC [ B" {
@@ -1863,20 +1916,19 @@ test "dispatchProviderCredential skips credential capture for .none endpoints" {
     try testing.expect(std.mem.indexOf(u8, rendered, "requires no credential") != null);
 }
 
-test "formatProviderLabel renders name, padded, with auth kind and provider/model" {
+test "formatProviderLabel splits padded name from auth-kind + provider/model tag" {
     var registry = try seedTestRegistry(testing.allocator);
     defer registry.deinit();
 
     const picked = registry.find("anthropic") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, &registry, picked);
-    defer testing.allocator.free(rendered);
+    const row = try formatProviderLabel(testing.allocator, &registry, picked);
+    defer row.deinit(testing.allocator);
 
-    // Widest builtin name is "openai-oauth" (12 chars); "anthropic" is 9.
-    // Expect the name, three spaces of padding, the auth-kind tag, and the
-    // provider-scoped model id.
-    try testing.expect(std.mem.startsWith(u8, rendered, "anthropic   "));
-    try testing.expect(std.mem.indexOf(u8, rendered, "(API key)") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "anthropic/claude-sonnet-4-20250514") != null);
+    // Widest builtin name is "openai-oauth" (12 chars); "anthropic" is 9, so
+    // three spaces of padding. Tag carries the auth-kind plus the
+    // provider-scoped default model id.
+    try testing.expectEqualStrings("anthropic   ", row.text);
+    try testing.expectEqualStrings("(API key) anthropic/claude-sonnet-4-20250514", row.tag);
 }
 
 test "formatProviderLabel tags .oauth endpoints as OAuth" {
@@ -1884,12 +1936,12 @@ test "formatProviderLabel tags .oauth endpoints as OAuth" {
     defer registry.deinit();
 
     const picked = registry.find("openai-oauth") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, &registry, picked);
-    defer testing.allocator.free(rendered);
+    const row = try formatProviderLabel(testing.allocator, &registry, picked);
+    defer row.deinit(testing.allocator);
 
-    try testing.expect(std.mem.startsWith(u8, rendered, "openai-oauth"));
-    try testing.expect(std.mem.indexOf(u8, rendered, "(OAuth)") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "openai-oauth/gpt-5") != null);
+    try testing.expect(std.mem.startsWith(u8, row.text, "openai-oauth"));
+    try testing.expect(std.mem.startsWith(u8, row.tag, "(OAuth) "));
+    try testing.expect(std.mem.indexOf(u8, row.tag, "openai-oauth/gpt-5") != null);
 }
 
 test "formatProviderLabel tags .none endpoints as no credential" {
@@ -1897,10 +1949,10 @@ test "formatProviderLabel tags .none endpoints as no credential" {
     defer registry.deinit();
 
     const picked = registry.find("ollama") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, &registry, picked);
-    defer testing.allocator.free(rendered);
+    const row = try formatProviderLabel(testing.allocator, &registry, picked);
+    defer row.deinit(testing.allocator);
 
-    try testing.expect(std.mem.indexOf(u8, rendered, "(no credential)") != null);
+    try testing.expect(std.mem.startsWith(u8, row.tag, "(no credential) "));
 }
 
 test "removeAuth is a no-op for missing entry" {
