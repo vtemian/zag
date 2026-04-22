@@ -123,7 +123,7 @@ pub const Registry = struct {
 
 /// Build a registry pre-loaded with the built-in tools (read, write,
 /// edit, bash, layout_tree, layout_focus, layout_split, layout_close,
-/// layout_resize).
+/// layout_resize, pane_read).
 pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     var registry = Registry.init(allocator);
     try registry.register(read_tool.tool);
@@ -135,6 +135,7 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     try registry.register(layout_tool.split_tool);
     try registry.register(layout_tool.close_tool);
     try registry.register(layout_tool.resize_tool);
+    try registry.register(layout_tool.pane_read_tool);
     return registry;
 }
 
@@ -251,6 +252,7 @@ test "createDefaultRegistry has all tools" {
     try std.testing.expect(registry.get("layout_split") != null);
     try std.testing.expect(registry.get("layout_close") != null);
     try std.testing.expect(registry.get("layout_resize") != null);
+    try std.testing.expect(registry.get("pane_read") != null);
 }
 
 test "execute sets current_tool_name during execution" {
