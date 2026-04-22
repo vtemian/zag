@@ -517,7 +517,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
             },
         } },
         .headers = &.{},
-        .default_model = "gpt-5",
+        .default_model = "gpt-5-codex",
         .models = &.{},
     };
     try reg.add(try openai_oauth_ep.dupe(allocator));
@@ -837,7 +837,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
     defer registry.deinit();
     try std.testing.expectError(
         error.MissingCredential,
-        createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5", auth_path, allocator),
+        createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator),
     );
 }
 

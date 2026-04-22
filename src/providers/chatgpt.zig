@@ -1394,7 +1394,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
             },
         } },
         .headers = &.{},
-        .default_model = "gpt-5",
+        .default_model = "gpt-5-codex",
         .models = &.{},
     };
 
@@ -1548,7 +1548,7 @@ fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
             },
         } },
         .headers = &.{},
-        .default_model = "gpt-5",
+        .default_model = "gpt-5-codex",
         .models = &.{},
     };
     try reg.add(try ep.dupe(allocator));

@@ -22,6 +22,6 @@ zag.provider {
       account_id_header = "chatgpt-account-id",
     },
   },
-  default_model = "gpt-5",
-  models = { { id = "gpt-5" } },
+  default_model = "gpt-5-codex",
+  models = { { id = "gpt-5-codex" } },
 }
