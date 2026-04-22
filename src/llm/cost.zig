@@ -1,10 +1,6 @@
 //! Cost estimation. Consumes the `Endpoint.ModelRate` data declared by each
-//! provider endpoint in the runtime `Registry`; per-model rates are no longer
-//! centralized in a global table.
-//!
-//! This module replaces `src/pricing.zig`. During the migration both coexist;
-//! `pricing.zig` will be removed once all call sites route through the
-//! registry-driven path.
+//! provider endpoint in the runtime `Registry`; per-model rates are owned
+//! by the endpoint that serves them rather than a global table.
 
 const std = @import("std");
 const registry_mod = @import("registry.zig");

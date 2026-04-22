@@ -25,7 +25,6 @@ const Trajectory = @import("Trajectory.zig");
 const agent = @import("agent.zig");
 const agent_events = @import("agent_events.zig");
 const types = @import("types.zig");
-const pricing = @import("pricing.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const oauth = @import("oauth.zig");
 
@@ -392,12 +391,21 @@ fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_
     }
 }
 
-/// Parse "tokens: N in, M out" info messages pushed by `agent.emitTokenUsage`.
-/// Returns null when the format doesn't match; callers fall back to unknown
-/// per-turn metrics. Fragile by design: this is the only channel that
-/// currently carries token counts; a typed side channel is the right long-term
-/// fix but too invasive for this task.
-fn parseTokenInfo(text: []const u8) ?struct { input: u32, output: u32 } {
+/// Parse "tokens: N in, M out[, P cw, Q cr]" info messages pushed by
+/// `agent.emitTokenUsage`. Returns null when the format doesn't match;
+/// callers fall back to unknown per-turn metrics. The `cw`/`cr` trailing
+/// fields are optional (and may appear independently); unknown trailing
+/// tokens after a parsed prefix are ignored.
+///
+/// Fragile by design: this is the only channel that currently carries
+/// token counts; a typed side channel is the right long-term fix but too
+/// invasive for this task.
+fn parseTokenInfo(text: []const u8) ?struct {
+    input: u32,
+    output: u32,
+    cache_creation: u32 = 0,
+    cache_read: u32 = 0,
+} {
     const prefix = "tokens: ";
     if (!std.mem.startsWith(u8, text, prefix)) return null;
     const rest = text[prefix.len..];
@@ -406,7 +414,33 @@ fn parseTokenInfo(text: []const u8) ?struct { input: u32, output: u32 } {
     const after_in = rest[in_end + " in, ".len ..];
     const out_end = std.mem.indexOf(u8, after_in, " out") orelse return null;
     const output = std.fmt.parseInt(u32, after_in[0..out_end], 10) catch return null;
-    return .{ .input = input, .output = output };
+
+    var cache_creation: u32 = 0;
+    var cache_read: u32 = 0;
+    var tail = after_in[out_end + " out".len ..];
+    // Each additional field arrives as ", <n> <kind>" where <kind> is
+    // `cw` or `cr`. Unknown suffixes are ignored.
+    while (std.mem.startsWith(u8, tail, ", ")) {
+        tail = tail[", ".len..];
+        const sp = std.mem.indexOfScalar(u8, tail, ' ') orelse break;
+        const value = std.fmt.parseInt(u32, tail[0..sp], 10) catch break;
+        const after_value = tail[sp + 1 ..];
+        const kind_end = std.mem.indexOfScalar(u8, after_value, ',') orelse after_value.len;
+        const kind = after_value[0..kind_end];
+        if (std.mem.eql(u8, kind, "cw")) {
+            cache_creation = value;
+        } else if (std.mem.eql(u8, kind, "cr")) {
+            cache_read = value;
+        }
+        tail = after_value[kind_end..];
+    }
+
+    return .{
+        .input = input,
+        .output = output,
+        .cache_creation = cache_creation,
+        .cache_read = cache_read,
+    };
 }
 
 /// Inputs threaded into `runHeadlessWithProvider` after all subsystem init
@@ -418,6 +452,10 @@ const HeadlessDeps = struct {
     provider: *llm.Provider,
     model_id: []const u8,
     registry: *const tools.Registry,
+    /// Endpoint registry (`provider/model` rate cards). Borrowed from the
+    /// `ProviderResult` in the caller; not owned here. Passed to
+    /// `llm.cost.estimateCost` for per-turn cost estimation.
+    endpoint_registry: *const llm.Registry,
     lua_engine: ?*LuaEngine,
     runner: *AgentRunner,
     session: *ConversationHistory,
@@ -467,7 +505,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
         pending_synth.deinit(gpa);
     }
 
-    var pending_usage: ?pricing.Usage = null;
+    var pending_usage: ?llm.Usage = null;
     var agent_err: ?[]const u8 = null;
     defer if (agent_err) |e| gpa.free(e);
 
@@ -547,6 +585,8 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                     pending_usage = .{
                         .input_tokens = u.input,
                         .output_tokens = u.output,
+                        .cache_creation_tokens = u.cache_creation,
+                        .cache_read_tokens = u.cache_read,
                     };
                 }
             },
@@ -555,7 +595,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                     .prompt_tokens = u.input_tokens,
                     .completion_tokens = u.output_tokens,
                     .cached_tokens = if (u.cache_read_tokens > 0) u.cache_read_tokens else null,
-                    .cost_usd = pricing.estimateCost(deps.model_id, u),
+                    .cost_usd = llm.cost.estimateCost(deps.endpoint_registry, deps.model_id, u),
                 } else .{};
                 capture.endTurn(metrics) catch |err| {
                     log.warn("capture endTurn failed: {s}", .{@errorName(err)});
@@ -715,6 +755,7 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
         .provider = &provider.provider,
         .model_id = provider.model_id,
         .registry = &registry,
+        .endpoint_registry = &provider.registry,
         .lua_engine = if (lua_engine) |*eng| eng else null,
         .runner = &root_runner,
         .session = &root_session,
@@ -1194,12 +1235,44 @@ test "parseTokenInfo parses the emitTokenUsage format" {
     const u = parseTokenInfo("tokens: 42 in, 7 out").?;
     try std.testing.expectEqual(@as(u32, 42), u.input);
     try std.testing.expectEqual(@as(u32, 7), u.output);
+    try std.testing.expectEqual(@as(u32, 0), u.cache_creation);
+    try std.testing.expectEqual(@as(u32, 0), u.cache_read);
 }
 
 test "parseTokenInfo returns null on non-matching strings" {
     try std.testing.expect(parseTokenInfo("hello world") == null);
     try std.testing.expect(parseTokenInfo("tokens: abc in, 7 out") == null);
     try std.testing.expect(parseTokenInfo("tokens: 1 in,") == null);
+}
+
+test "parseTokenInfo: new form with cache counts parses all four fields" {
+    const u = parseTokenInfo("tokens: 1000 in, 500 out, 200 cw, 300 cr").?;
+    try std.testing.expectEqual(@as(u32, 1000), u.input);
+    try std.testing.expectEqual(@as(u32, 500), u.output);
+    try std.testing.expectEqual(@as(u32, 200), u.cache_creation);
+    try std.testing.expectEqual(@as(u32, 300), u.cache_read);
+}
+
+test "parseTokenInfo: old form still parses with cache counts defaulting to zero" {
+    const u = parseTokenInfo("tokens: 1000 in, 500 out").?;
+    try std.testing.expectEqual(@as(u32, 1000), u.input);
+    try std.testing.expectEqual(@as(u32, 500), u.output);
+    try std.testing.expectEqual(@as(u32, 0), u.cache_creation);
+    try std.testing.expectEqual(@as(u32, 0), u.cache_read);
+}
+
+test "parseTokenInfo: partial new form (only cw) handled" {
+    const u = parseTokenInfo("tokens: 1000 in, 500 out, 200 cw").?;
+    try std.testing.expectEqual(@as(u32, 200), u.cache_creation);
+    try std.testing.expectEqual(@as(u32, 0), u.cache_read);
+}
+
+test "parseTokenInfo: unknown trailing field is ignored" {
+    const u = parseTokenInfo("tokens: 1000 in, 500 out, 50 xx, 300 cr").?;
+    try std.testing.expectEqual(@as(u32, 1000), u.input);
+    try std.testing.expectEqual(@as(u32, 500), u.output);
+    try std.testing.expectEqual(@as(u32, 0), u.cache_creation);
+    try std.testing.expectEqual(@as(u32, 300), u.cache_read);
 }
 
 test "parseStartupArgs extracts the provider from --login=" {
