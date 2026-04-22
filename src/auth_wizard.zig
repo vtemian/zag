@@ -231,6 +231,146 @@ fn renderConfigLua(
     return body.toOwnedSlice(allocator);
 }
 
+/// Rewrite (or append) the single active `zag.set_default_model(...)`
+/// line in `config_path` so subsequent zag startups boot with the
+/// picked model. On success the file contains exactly one active call
+/// with `new_model_id`; earlier active calls are dropped, commented
+/// ones are preserved. Missing files receive a minimal append.
+///
+/// The write is atomic via temp file + rename. On any error the
+/// original file is left in place; the caller is expected to surface
+/// a paste-me hint instead.
+pub fn persistDefaultModel(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    new_model_id: []const u8,
+) !void {
+    if (std.mem.indexOfAny(u8, new_model_id, "\"\\\n\r") != null) {
+        return error.InvalidModelId;
+    }
+
+    const existing = std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 20) catch |err| switch (err) {
+        error.FileNotFound => &[_]u8{},
+        else => return err,
+    };
+    defer if (existing.len > 0) allocator.free(existing);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var last_active_line_start: ?usize = null;
+    var last_active_line_end: ?usize = null;
+
+    var it = std.mem.splitScalar(u8, existing, '\n');
+    var cursor: usize = 0;
+    while (it.next()) |line| {
+        const line_start = cursor;
+        const line_end = cursor + line.len;
+        cursor = line_end + 1;
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "--")) continue;
+        if (!std.mem.startsWith(u8, trimmed, "zag.set_default_model(")) continue;
+        last_active_line_start = line_start;
+        last_active_line_end = line_end;
+    }
+
+    if (last_active_line_start) |start| {
+        try out.appendSlice(allocator, existing[0..start]);
+        try out.writer(allocator).print(
+            "zag.set_default_model(\"{s}\")",
+            .{new_model_id},
+        );
+        try out.appendSlice(allocator, existing[last_active_line_end.?..]);
+
+        // Strip any OTHER active lines that survived the naive copy so
+        // the file keeps exactly one canonical default-model call.
+        const collapsed = try stripExtraModelLines(
+            allocator,
+            out.items,
+            new_model_id,
+        );
+        defer allocator.free(collapsed);
+        out.clearRetainingCapacity();
+        try out.appendSlice(allocator, collapsed);
+    } else {
+        try out.appendSlice(allocator, existing);
+        if (existing.len > 0 and existing[existing.len - 1] != '\n') {
+            try out.append(allocator, '\n');
+        }
+        try out.writer(allocator).print(
+            "zag.set_default_model(\"{s}\")\n",
+            .{new_model_id},
+        );
+    }
+
+    try atomicWrite(allocator, config_path, out.items);
+}
+
+fn stripExtraModelLines(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    keep_model_id: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var kept_one = false;
+
+    const target = try std.fmt.allocPrint(
+        allocator,
+        "zag.set_default_model(\"{s}\")",
+        .{keep_model_id},
+    );
+    defer allocator.free(target);
+
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        const is_active_model = !std.mem.startsWith(u8, trimmed, "--") and
+            std.mem.startsWith(u8, trimmed, "zag.set_default_model(");
+        if (is_active_model) {
+            if (std.mem.indexOf(u8, line, target) != null and !kept_one) {
+                kept_one = true;
+                try out.appendSlice(allocator, line);
+                try out.append(allocator, '\n');
+            }
+            // Drop other active model lines (including duplicates).
+            continue;
+        }
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+    // Trim the trailing newline we always add so the file doesn't
+    // grow an extra blank line on every rewrite.
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') {
+        _ = out.pop();
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn atomicWrite(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    body: []const u8,
+) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    // Ensure parent exists (matches scaffoldConfigLua semantics).
+    if (std.fs.path.dirname(path)) |parent| {
+        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+
+    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(body);
+    try file.sync();
+
+    try std.fs.cwd().rename(tmp_path, path);
+}
+
 /// Cap on how many times `promptChoice` re-asks before giving up. Five is
 /// enough to absorb typos without making a misconfigured pipe spin forever.
 const max_prompt_retries: usize = 5;
@@ -2328,4 +2468,115 @@ test "promptModel returns recommended id on immediate Enter" {
     const result = try promptModel(&deps, &ep);
     defer if (result) |m| testing.allocator.free(m);
     try testing.expectEqualStrings("m2", result.?);
+}
+
+test "persistDefaultModel replaces existing line" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_abs);
+    const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
+    defer gpa.free(path);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.lua",
+        .data =
+        \\require("zag.providers.anthropic")
+        \\zag.set_default_model("anthropic/claude-sonnet-4-20250514")
+        \\
+        ,
+    });
+
+    try persistDefaultModel(gpa, path, "openai-oauth/gpt-5.2");
+
+    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    defer gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"openai-oauth/gpt-5.2\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "anthropic/claude-sonnet-4-20250514") == null);
+}
+
+test "persistDefaultModel appends when no line exists" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_abs);
+    const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
+    defer gpa.free(path);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.lua",
+        .data = "require(\"zag.providers.anthropic\")\n",
+    });
+
+    try persistDefaultModel(gpa, path, "anthropic/claude-opus-4-20250514");
+
+    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    defer gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"anthropic/claude-opus-4-20250514\")") != null);
+}
+
+test "persistDefaultModel ignores commented-out lines" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_abs);
+    const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
+    defer gpa.free(path);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.lua",
+        .data =
+        \\-- zag.set_default_model("old/one")
+        \\require("zag.providers.anthropic")
+        \\zag.set_default_model("anthropic/claude-sonnet-4-20250514")
+        \\
+        ,
+    });
+
+    try persistDefaultModel(gpa, path, "openai/gpt-4o");
+
+    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    defer gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "-- zag.set_default_model(\"old/one\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"openai/gpt-4o\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "anthropic/claude-sonnet-4-20250514") == null);
+}
+
+test "persistDefaultModel collapses multiple active lines to one" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_abs);
+    const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
+    defer gpa.free(path);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.lua",
+        .data =
+        \\zag.set_default_model("a/one")
+        \\zag.set_default_model("a/two")
+        \\zag.set_default_model("a/three")
+        \\
+        ,
+    });
+
+    try persistDefaultModel(gpa, path, "a/final");
+
+    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    defer gpa.free(body);
+    const count = std.mem.count(u8, body, "zag.set_default_model(");
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"a/final\"") != null);
+}
+
+test "persistDefaultModel rejects ids with quote chars" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidModelId,
+        persistDefaultModel(gpa, "/tmp/nonexistent.lua", "bad\"id"),
+    );
 }
