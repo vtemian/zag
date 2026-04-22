@@ -932,7 +932,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
                 },
             } },
             .headers = &.{},
-            .default_model = "gpt-5-codex",
+            .default_model = "gpt-5",
             .models = &.{},
         },
     };

@@ -517,7 +517,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
             },
         } },
         .headers = &.{},
-        .default_model = "gpt-5-codex",
+        .default_model = "gpt-5",
         .models = &.{},
     };
     try reg.add(try openai_oauth_ep.dupe(allocator));

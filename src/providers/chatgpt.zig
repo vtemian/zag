@@ -154,13 +154,6 @@ fn serializeRequest(
     try w.writeAll(",\"tool_choice\":\"auto\"");
     try w.writeAll(",\"parallel_tool_calls\":true");
     try w.writeAll(",\"store\":false");
-    // gpt-5-codex is a reasoning model; the Codex Responses endpoint
-    // rejects requests for reasoning models without `reasoning`. We
-    // also send `include` so the model can round-trip its encrypted
-    // reasoning blob across tool calls within a turn, matching what
-    // codex-rs/core/src/client.rs does.
-    try w.writeAll(",\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"}");
-    try w.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     if (stream) {
         try w.writeAll(",\"stream\":true");
     } else {
