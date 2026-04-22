@@ -100,6 +100,9 @@ pub const Config = struct {
     provider: *llm.ProviderResult,
     /// Tool registry for dispatching tool calls.
     registry: *const tools.Registry,
+    /// Endpoint registry borrowed from the Lua engine (or a fallback).
+    /// Threaded into WindowManager so `/model` can enumerate providers.
+    endpoint_registry: ?*const llm.Registry = null,
     /// Session manager for persistence, or null if unavailable.
     session_mgr: *?Session.SessionManager,
     /// Lua plugin engine, or null if Lua init failed.
@@ -133,6 +136,7 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .compositor = cfg.compositor,
         .root_pane = cfg.root_pane,
         .provider = cfg.provider,
+        .registry = cfg.endpoint_registry,
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
