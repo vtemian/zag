@@ -24,6 +24,7 @@ const job_result_mod = @import("lua/job_result.zig");
 const hook_registry_mod = @import("lua/hook_registry.zig");
 const lua_json = @import("lua/lua_json.zig");
 const AsyncRuntime = @import("lua/AsyncRuntime.zig").AsyncRuntime;
+const embedded = @import("lua/embedded.zig");
 
 /// Whether the Lua sandbox strips dangerous globals before user code runs.
 /// Off by default: `config.lua` is user-owned code (same trust model as
@@ -188,6 +189,13 @@ pub const LuaEngine = struct {
         try registerCmdHandleMt(lua);
         try registerHttpStreamMt(lua);
 
+        // Install custom package.searchers so require() resolves
+        // `~/.config/zag/lua/a/b.lua` (user override) before falling through
+        // to the embedded stdlib baked into the binary. Standard Lua searchers
+        // remain at the tail for anything else. No-op under sandbox mode
+        // since `require`/`package` are stripped.
+        try installSearchers(allocator, lua);
+
         var keymap_registry = Keymap.Registry.init(allocator);
         errdefer keymap_registry.deinit();
         try keymap_registry.loadDefaults();
@@ -227,18 +235,13 @@ pub const LuaEngine = struct {
         return &self.input_parser;
     }
 
-    /// Resolve ~/.config/zag paths, set plugin search path, load config.lua.
-    /// All failures are logged and swallowed; missing config is not an error.
+    /// Resolve ~/.config/zag paths and load config.lua. All failures are
+    /// logged and swallowed; missing config is not an error. The user-dir
+    /// searcher that covers `~/.config/zag/lua/*.lua` is installed once in
+    /// `init`, so `require()` works here without any additional setup.
     pub fn loadUserConfig(self: *LuaEngine) void {
         const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
         defer self.allocator.free(home);
-
-        // Set plugin search path so require() finds ~/.config/zag/lua/*.lua
-        const lua_dir = std.fmt.allocPrint(self.allocator, "{s}/.config/zag/lua", .{home}) catch return;
-        defer self.allocator.free(lua_dir);
-        self.setPluginPath(lua_dir) catch |err| {
-            log.warn("failed to set lua plugin path: {}", .{err});
-        };
 
         // Load config.lua (collects zag.tool() calls)
         const config_path = std.fmt.allocPrint(self.allocator, "{s}/.config/zag/config.lua", .{home}) catch return;
@@ -3159,23 +3162,91 @@ pub const LuaEngine = struct {
         };
     }
 
-    /// Adjust package.path so that `require` can find modules in the given directory.
-    /// No-op when the sandbox is enabled: `package` and `require` are stripped.
-    pub fn setPluginPath(self: *LuaEngine, dir: []const u8) !void {
+    /// Install two custom `package.searchers` at the front of Lua's searcher
+    /// list so `require()` resolves user files first, embedded stdlib second,
+    /// and standard Lua searchers (path/cpath/preload) afterward.
+    ///
+    /// The searchers look up their context in the `_ZAG_LOADER` global: a
+    /// table with `user_dir` (string, may be empty) and `sources` (map of
+    /// dotted-module-name -> source bytes). The searcher closures capture a
+    /// local reference to this table so they keep working even if the global
+    /// is later cleared.
+    ///
+    /// No-op when the sandbox is enabled: `package` and `require` are
+    /// stripped, so adding searchers would panic on the missing globals.
+    fn installSearchers(allocator: Allocator, lua: *Lua) !void {
         if (sandbox_enabled) return;
 
-        const lua_code = try std.fmt.allocPrint(
-            self.allocator,
-            "package.path = package.path .. ';{s}/?.lua;{s}/?/init.lua'",
-            .{ dir, dir },
-        );
-        defer self.allocator.free(lua_code);
+        // Resolve the user Lua directory. Missing HOME is not fatal; the
+        // user_searcher closure treats an empty dir as "no user overrides".
+        var user_dir_owned: ?[]u8 = null;
+        defer if (user_dir_owned) |d| allocator.free(d);
+        if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+            defer allocator.free(home);
+            user_dir_owned = try std.fmt.allocPrint(allocator, "{s}/.config/zag/lua", .{home});
+        } else |_| {
+            user_dir_owned = null;
+        }
+        const user_dir: []const u8 = user_dir_owned orelse "";
 
-        const lua_code_z = try self.allocator.dupeZ(u8, lua_code);
-        defer self.allocator.free(lua_code_z);
+        // Build the carrier table: _ZAG_LOADER = { user_dir = "...",
+        // sources = { ["zag.providers.anthropic"] = "...source...", ... } }
+        lua.newTable(); // [loader]
 
-        self.lua.doString(lua_code_z) catch |err| {
-            log.err("failed to set plugin path: {}", .{err});
+        _ = lua.pushString(user_dir);
+        lua.setField(-2, "user_dir"); // [loader]
+
+        lua.newTable(); // [loader, sources]
+        for (embedded.entries) |e| {
+            _ = lua.pushString(e.code);
+            // setField wants a sentinel-terminated key. Dupe and free.
+            const name_z = try allocator.dupeZ(u8, e.name);
+            defer allocator.free(name_z);
+            lua.setField(-2, name_z);
+        }
+        lua.setField(-2, "sources"); // [loader]
+
+        lua.setGlobal("_ZAG_LOADER"); // []
+
+        // Install the searcher closures at positions 1 and 2 of
+        // package.searchers. Both close over a local `ctx` so they keep
+        // working if `_ZAG_LOADER` is ever cleared (we don't clear it today,
+        // but the guarantee is cheap and matches user expectations).
+        lua.doString(
+            \\do
+            \\  local ctx = _ZAG_LOADER
+            \\  local function user_searcher(module)
+            \\    if not ctx.user_dir or ctx.user_dir == "" then return nil end
+            \\    local rel = module:gsub("%.", "/")
+            \\    local path = ctx.user_dir .. "/" .. rel .. ".lua"
+            \\    local f = io.open(path, "rb")
+            \\    if not f then
+            \\      path = ctx.user_dir .. "/" .. rel .. "/init.lua"
+            \\      f = io.open(path, "rb")
+            \\      if not f then
+            \\        return "\n\tno user file '" .. ctx.user_dir .. "/" .. rel .. ".lua'"
+            \\      end
+            \\    end
+            \\    local chunk = f:read("*a")
+            \\    f:close()
+            \\    local fn, err = load(chunk, "@" .. path)
+            \\    if not fn then return err end
+            \\    return fn, path
+            \\  end
+            \\  local function embedded_searcher(module)
+            \\    local src = ctx.sources[module]
+            \\    if not src then
+            \\      return "\n\tno embedded module '" .. module .. "'"
+            \\    end
+            \\    local fn, err = load(src, "@<embedded:" .. module .. ">")
+            \\    if not fn then return err end
+            \\    return fn, "<embedded:" .. module .. ">"
+            \\  end
+            \\  table.insert(package.searchers, 1, user_searcher)
+            \\  table.insert(package.searchers, 2, embedded_searcher)
+            \\end
+        ) catch |err| {
+            log.err("failed to install package.searchers: {}", .{err});
             return err;
         };
     }
@@ -6588,4 +6659,90 @@ test "readHeaderList: absent field returns empty slice" {
     const headers = try LuaEngine.readHeaderList(engine.lua, -1, "headers", std.testing.allocator);
     defer std.testing.allocator.free(headers);
     try std.testing.expectEqual(@as(usize, 0), headers.len);
+}
+
+test "require('zag.providers.anthropic') resolves from embedded stdlib" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // The stdlib files are Phase-F1 placeholders (a single Lua comment,
+    // no return value). require() should complete without error and the
+    // result should be the Lua 5.4 default (boolean true) for modules
+    // that don't return anything.
+    try engine.lua.doString("ok = require('zag.providers.anthropic')");
+    _ = try engine.lua.getGlobal("ok");
+    defer engine.lua.pop(1);
+    try std.testing.expect(engine.lua.toBoolean(-1));
+}
+
+test "user dir file shadows embedded stdlib entry" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Build a temp dir with zag/providers/anthropic.lua returning a sentinel.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("zag/providers");
+    try tmp.dir.writeFile(.{
+        .sub_path = "zag/providers/anthropic.lua",
+        .data = "return 'from-user-dir'",
+    });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+
+    // Redirect _ZAG_LOADER.user_dir to the temp dir. The searcher closure
+    // reads ctx.user_dir on every call, so this takes effect immediately.
+    _ = engine.lua.pushString(base);
+    engine.lua.setGlobal("_tmp_user_dir");
+    try engine.lua.doString("_ZAG_LOADER.user_dir = _tmp_user_dir");
+
+    try engine.lua.doString("shadow = require('zag.providers.anthropic')");
+    _ = try engine.lua.getGlobal("shadow");
+    defer engine.lua.pop(1);
+    const loaded = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("from-user-dir", loaded);
+}
+
+test "require falls through to embedded when user dir file missing" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Point user_dir at an empty tmp; the user searcher finds nothing there
+    // and the embedded searcher serves the placeholder.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+    _ = engine.lua.pushString(base);
+    engine.lua.setGlobal("_tmp_user_dir");
+    try engine.lua.doString("_ZAG_LOADER.user_dir = _tmp_user_dir");
+
+    try engine.lua.doString("ok = require('zag.providers.openai')");
+    _ = try engine.lua.getGlobal("ok");
+    defer engine.lua.pop(1);
+    try std.testing.expect(engine.lua.toBoolean(-1));
+}
+
+test "require raises a clean module-not-found error for unknown names" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // No embedded entry; user dir empty/absent. require must error.
+    const result = engine.lua.doString("require('zag.providers.does_not_exist')");
+    try std.testing.expectError(error.LuaRuntime, result);
+    // Drain the error message Lua pushed so later tests start with a clean stack.
+    engine.lua.pop(1);
 }
