@@ -6,7 +6,7 @@ Zag's thesis is that the window system is the platform; everything above
 primitives is a plugin. Today an LLM running inside a zag pane can drive
 the filesystem (read/write/edit/bash) but has zero handle on the zag UI
 itself. The keymap action set exists (`focus_left/down/up/right`,
-`split_vertical/horizontal`, `close_window`, `enter_insert/normal_mode` —
+`split_vertical/horizontal`, `close_window`, `enter_insert/normal_mode`,
 see `src/Keymap.zig`) but is only reachable via keypress dispatch.
 
 Exposing the layout as a tree plus actions as tools lets any LLM observe
@@ -85,7 +85,7 @@ reuses `NodeRenderer` so the LLM sees what the user sees.
 
 Agents run on worker threads; `WindowManager` and `Layout` are
 main-thread only (they touch the screen). Tool calls round-trip through
-the event queue — the same pattern `Hooks.HookRequest` already uses.
+the event queue. Same pattern `Hooks.HookRequest` already uses.
 
 ```
 agent thread                              main thread
