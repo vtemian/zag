@@ -113,6 +113,10 @@ pub const Endpoint = struct {
     pub const ModelRate = struct {
         /// Provider-scoped model identifier (e.g., `"claude-sonnet-4-5"`).
         id: []const u8,
+        /// Optional display label shown in pickers. Null falls back to `id`.
+        label: ?[]const u8 = null,
+        /// True marks this model as the recommended default in pickers.
+        recommended: bool = false,
         /// Maximum input tokens the model accepts in one request.
         context_window: u32,
         /// Maximum output tokens the model will generate in one response.
@@ -157,10 +161,17 @@ pub const Endpoint = struct {
         const models = try allocator.alloc(ModelRate, self.models.len);
         errdefer allocator.free(models);
         var models_initialized: usize = 0;
-        errdefer for (models[0..models_initialized]) |m| allocator.free(m.id);
+        errdefer for (models[0..models_initialized]) |m| {
+            if (m.label) |l| allocator.free(l);
+            allocator.free(m.id);
+        };
         for (self.models, 0..) |m, i| {
+            const duped_label: ?[]const u8 = if (m.label) |l| try allocator.dupe(u8, l) else null;
+            errdefer if (duped_label) |l| allocator.free(l);
             models[i] = .{
                 .id = try allocator.dupe(u8, m.id),
+                .label = duped_label,
+                .recommended = m.recommended,
                 .context_window = m.context_window,
                 .max_output_tokens = m.max_output_tokens,
                 .input_per_mtok = m.input_per_mtok,
@@ -200,7 +211,10 @@ pub const Endpoint = struct {
             .oauth => |spec| freeOAuthSpec(spec, allocator),
             else => {},
         }
-        for (self.models) |m| allocator.free(m.id);
+        for (self.models) |m| {
+            if (m.label) |l| allocator.free(l);
+            allocator.free(m.id);
+        }
         allocator.free(self.models);
         allocator.free(self.default_model);
         for (self.headers) |h| {
@@ -675,6 +689,48 @@ test "Registry.add rejects duplicate names" {
     };
     try reg.add(try raw.dupe(std.testing.allocator));
     try std.testing.expectError(error.DuplicateEndpoint, reg.add(try raw.dupe(std.testing.allocator)));
+}
+
+test "ModelRate dupe round trips label and recommended" {
+    const gpa = std.testing.allocator;
+    var ep: Endpoint = .{
+        .name = "prov",
+        .serializer = .anthropic,
+        .url = "https://example.com",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "m1",
+        .models = &[_]Endpoint.ModelRate{
+            .{
+                .id = "m1",
+                .label = "Model One (recommended)",
+                .recommended = true,
+                .context_window = 100,
+                .max_output_tokens = 50,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 2.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = null,
+            },
+            .{
+                .id = "m2",
+                .label = null,
+                .recommended = false,
+                .context_window = 200,
+                .max_output_tokens = 100,
+                .input_per_mtok = 0.5,
+                .output_per_mtok = 1.5,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = null,
+            },
+        },
+    };
+    const duped = try ep.dupe(gpa);
+    defer duped.free(gpa);
+    try std.testing.expectEqualStrings("Model One (recommended)", duped.models[0].label.?);
+    try std.testing.expectEqual(true, duped.models[0].recommended);
+    try std.testing.expectEqual(@as(?[]const u8, null), duped.models[1].label);
+    try std.testing.expectEqual(false, duped.models[1].recommended);
 }
 
 test {
