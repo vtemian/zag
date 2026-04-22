@@ -20,4 +20,5 @@ test {
     _ = @import("hook_registry.zig");
     _ = @import("job_result.zig");
     _ = @import("lua_json.zig");
+    _ = @import("embedded.zig");
 }
