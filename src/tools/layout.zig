@@ -7,9 +7,12 @@
 //! block on `LayoutRequest.done` until the main-thread drain (see
 //! `AgentRunner.dispatchHookRequests`) fills in the response.
 //!
-//! This module starts with `layout_tree` (the introspection entry
-//! point). Mutating tools (focus, split, close, resize) land in a
-//! follow-up task and share the same `dispatch` helper.
+//! Beyond introspection (`layout_tree`), this module exposes the
+//! mutating surface the agent uses to rearrange panes: `layout_focus`,
+//! `layout_split`, `layout_close`, `layout_resize`. Each tool parses
+//! its input struct with `std.json.parseFromSlice` and round-trips
+//! through the shared `dispatch` helper, letting the main thread own
+//! all window-tree mutation.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -79,8 +82,192 @@ pub fn dispatch(
     };
 }
 
+const FocusInput = struct { id: []const u8 };
+const SplitInput = struct {
+    id: []const u8,
+    direction: []const u8,
+    buffer: ?struct { type: []const u8 } = null,
+};
+const CloseInput = struct { id: []const u8 };
+const ResizeInput = struct { id: []const u8, ratio: f32 };
+
+/// Move keyboard focus to a pane by id.
+pub const focus_tool: types.Tool = .{
+    .definition = .{
+        .name = "layout_focus",
+        .description = "Focus the pane identified by id.",
+        .input_schema_json =
+        \\{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}
+        ,
+        .prompt_snippet = "layout_focus: move keyboard focus to a pane by id",
+    },
+    .execute = &execute_focus,
+};
+
+fn execute_focus(
+    input_raw: []const u8,
+    allocator: std.mem.Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
+    const parsed = std.json.parseFromSlice(
+        FocusInput,
+        allocator,
+        input_raw,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        return .{
+            .content = "error: input must be { id: string }",
+            .is_error = true,
+            .owned = false,
+        };
+    };
+    defer parsed.deinit();
+    return dispatch(allocator, .{ .focus = .{ .id = parsed.value.id } });
+}
+
+/// Split a pane horizontally or vertically, optionally specifying the
+/// buffer type of the new pane.
+pub const split_tool: types.Tool = .{
+    .definition = .{
+        .name = "layout_split",
+        .description = "Split a pane into two; direction is \"horizontal\" or \"vertical\".",
+        .input_schema_json =
+        \\{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"buffer":{"type":"object","properties":{"type":{"type":"string"}},"required":["type"],"additionalProperties":false}},"required":["id","direction"],"additionalProperties":false}
+        ,
+        .prompt_snippet = "layout_split: split a pane horizontally or vertically",
+    },
+    .execute = &execute_split,
+};
+
+fn execute_split(
+    input_raw: []const u8,
+    allocator: std.mem.Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
+    const parsed = std.json.parseFromSlice(
+        SplitInput,
+        allocator,
+        input_raw,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        return .{
+            .content = "error: input must be { id: string, direction: string, buffer?: { type: string } }",
+            .is_error = true,
+            .owned = false,
+        };
+    };
+    defer parsed.deinit();
+    const buffer_type = if (parsed.value.buffer) |buf| buf.type else null;
+    return dispatch(allocator, .{ .split = .{
+        .id = parsed.value.id,
+        .direction = parsed.value.direction,
+        .buffer_type = buffer_type,
+    } });
+}
+
+/// Close the pane identified by id. The main thread refuses to close
+/// the caller's own pane.
+pub const close_tool: types.Tool = .{
+    .definition = .{
+        .name = "layout_close",
+        .description = "Close the pane identified by id.",
+        .input_schema_json =
+        \\{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}
+        ,
+        .prompt_snippet = "layout_close: close a pane by id",
+    },
+    .execute = &execute_close,
+};
+
+fn execute_close(
+    input_raw: []const u8,
+    allocator: std.mem.Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
+    const parsed = std.json.parseFromSlice(
+        CloseInput,
+        allocator,
+        input_raw,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        return .{
+            .content = "error: input must be { id: string }",
+            .is_error = true,
+            .owned = false,
+        };
+    };
+    defer parsed.deinit();
+    return dispatch(allocator, .{ .close = .{ .id = parsed.value.id } });
+}
+
+/// Adjust the split ratio of the parent of the pane identified by id.
+/// Ratio is clamped to a sensible range by the main thread.
+pub const resize_tool: types.Tool = .{
+    .definition = .{
+        .name = "layout_resize",
+        .description = "Resize the split containing the pane identified by id; ratio is between 0 and 1.",
+        .input_schema_json =
+        \\{"type":"object","properties":{"id":{"type":"string"},"ratio":{"type":"number"}},"required":["id","ratio"],"additionalProperties":false}
+        ,
+        .prompt_snippet = "layout_resize: change the split ratio around a pane",
+    },
+    .execute = &execute_resize,
+};
+
+fn execute_resize(
+    input_raw: []const u8,
+    allocator: std.mem.Allocator,
+    cancel: ?*std.atomic.Value(bool),
+) types.ToolError!types.ToolResult {
+    _ = cancel;
+    const parsed = std.json.parseFromSlice(
+        ResizeInput,
+        allocator,
+        input_raw,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        return .{
+            .content = "error: input must be { id: string, ratio: number }",
+            .is_error = true,
+            .owned = false,
+        };
+    };
+    defer parsed.deinit();
+    return dispatch(allocator, .{ .resize = .{
+        .id = parsed.value.id,
+        .ratio = parsed.value.ratio,
+    } });
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "layout_focus rejects missing id" {
+    const res = try execute_focus("{}", std.testing.allocator, null);
+    try std.testing.expect(res.is_error);
+    if (res.owned) std.testing.allocator.free(res.content);
+}
+
+test "layout_split rejects missing direction" {
+    const res = try execute_split("{\"id\":\"p1\"}", std.testing.allocator, null);
+    try std.testing.expect(res.is_error);
+    if (res.owned) std.testing.allocator.free(res.content);
+}
+
+test "layout_close rejects non-object input" {
+    const res = try execute_close("[]", std.testing.allocator, null);
+    try std.testing.expect(res.is_error);
+    if (res.owned) std.testing.allocator.free(res.content);
+}
+
+test "layout_resize rejects missing ratio" {
+    const res = try execute_resize("{\"id\":\"p1\"}", std.testing.allocator, null);
+    try std.testing.expect(res.is_error);
+    if (res.owned) std.testing.allocator.free(res.content);
 }
 
 test "dispatch returns error when no queue is bound" {
