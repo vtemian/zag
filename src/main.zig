@@ -570,7 +570,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
 
     var done = false;
     while (!done) {
-        AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine);
+        AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine, deps.runner.window_manager);
 
         var drain_buf: [64]agent_events.AgentEvent = undefined;
         const count = deps.runner.event_queue.drain(&drain_buf);
@@ -682,6 +682,10 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
             .reset_assistant_text => {},
             .hook_request => |req| req.done.set(),
             .lua_tool_request => |req| req.done.set(),
+            .layout_request => |req| {
+                req.is_error = true;
+                req.done.set();
+            },
         };
     }
 
@@ -1273,6 +1277,35 @@ pub fn main() !void {
     // this after orchestrator construction so the pointer is stable.
     compositor.orchestrator = &orchestrator;
 
+    // `&self.node_registry` is only a stable address now that `orchestrator`
+    // sits in its final home. Attach here so Layout starts tracking node
+    // create/destroy from this point on and back-registers the existing root.
+    try orchestrator.window_manager.attachLayoutRegistry();
+
+    // Wire the window manager pointer into the root runner so the
+    // main-thread drain loop can service `layout_request` round-trips.
+    // Extra split panes pick this up inside `createSplitPane`.
+    root_runner.window_manager = &orchestrator.window_manager;
+
+    // Lua bindings (zag.layout.*, zag.pane.*) call the window manager
+    // directly on the main thread. Wire after orchestrator construction
+    // so the pointer is stable for the lifetime of the engine.
+    if (lua_engine) |*eng| {
+        eng.window_manager = &orchestrator.window_manager;
+    }
+
+    // Publish the root leaf's packed handle on the root runner so the
+    // agent thread can mirror it into `tools.current_caller_pane_id`
+    // around every tool dispatch. `attachLayoutRegistry` ran above, so
+    // the root is already back-registered.
+    if (orchestrator.window_manager.layout.root) |root_node| {
+        if (orchestrator.window_manager.handleForNode(root_node)) |handle| {
+            root_runner.pane_handle_packed = @bitCast(handle);
+        } else |err| {
+            log.warn("root leaf missing from registry: {}", .{err});
+        }
+    }
+
     // Register any Lua-declared tools into the dispatch registry. Config.lua
     // already ran before provider creation, so the keymap overrides,
     // default_model, and escape-timeout are all live by this point.
@@ -1321,6 +1354,7 @@ test {
     _ = @import("auth_wizard.zig");
     _ = @import("oauth.zig");
     _ = @import("providers/chatgpt.zig");
+    _ = @import("NodeRegistry.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
@@ -1330,9 +1364,9 @@ test "appendStatusLine creates a status node on the given view" {
 
     try appendStatusLine(&view, "hello world");
 
-    try std.testing.expectEqual(@as(usize, 1), view.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("hello world", view.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), view.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.tree.root_children.items[0].node_type);
+    try std.testing.expectEqualStrings("hello world", view.tree.root_children.items[0].content.items);
 }
 
 test "parseStartupArgs recognizes --headless with required files" {

@@ -6,7 +6,7 @@
 //! bridges LLM call IDs to view tree nodes.
 //!
 //! Session↔tree sync invariant: every append to `session.messages`
-//! pairs with an append to `view.root_children`. `submitInput` is
+//! pairs with an append to `view.tree.root_children`. `submitInput` is
 //! the canonical join point for user turns (session.appendUserMessage
 //! + view.appendUserNode); tool_result events correlate to their
 //! tool_use by call_id via a HashMap on this struct. Tree and session
@@ -23,6 +23,7 @@ const ConversationHistory = @import("ConversationHistory.zig");
 const agent_events = @import("agent_events.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
@@ -54,6 +55,18 @@ wake_fd: ?std.posix.fd_t = null,
 /// Pointer to the shared Lua engine, if any. Used by the main-thread
 /// drain loop to service hook_request events pushed by the agent.
 lua_engine: ?*LuaEngine = null,
+/// Pointer to the shared window manager, if any. Used by the main-thread
+/// drain loop to service `layout_request` round-trips (the only thread
+/// allowed to mutate the window tree). Wired once after orchestrator
+/// construction; null is tolerated so off-main test harnesses keep working.
+window_manager: ?*WindowManager = null,
+/// Packed `NodeRegistry.Handle` of this runner's pane, stored as its
+/// `u32` bit pattern. The agent thread copies this into
+/// `tools.current_caller_pane_id` around every tool dispatch so layout
+/// tools can refuse destructive operations on the caller's own pane.
+/// Zero means the handle has not been populated yet (root pane before
+/// main wires it, or a fresh split before `doSplit` links the leaf).
+pane_handle_packed: u32 = 0,
 
 /// Pending tool_call nodes keyed by call_id, for parenting tool_result
 /// nodes. Supports parallel tool execution where events interleave.
@@ -66,6 +79,12 @@ last_tool_call: ?*Node = null,
 last_info: [128]u8 = .{0} ** 128,
 /// Length of the last info message.
 last_info_len: u8 = 0,
+
+/// Last `ConversationTree.generation` the compositor observed for this
+/// pane. Used by `Compositor.drawDirtyLeaves` to tell apart a genuine
+/// tree mutation from a view-state-only dirty (scroll, focus, etc.).
+/// Stays zero until the first composite that actually paints content.
+node_version_snapshot: u32 = 0,
 
 /// Create a runner bound to `view` and `session`. Neither is owned.
 pub fn init(
@@ -171,6 +190,7 @@ pub fn submit(
         &self.cancel_flag,
         deps.lua_engine,
         deps.provider_name,
+        self.pane_handle_packed,
     });
 }
 
@@ -198,6 +218,16 @@ pub fn formatAgentErrorMessage(
             "OAuth token expired. Re-run: zag --login={s}",
             .{provider_name},
         ),
+        error.ApiError => blk: {
+            // If the transport layer captured an upstream status and
+            // body, surface it so the UI shows something actionable
+            // instead of just "ApiError".
+            if (llm.error_detail.take()) |detail| {
+                defer allocator.free(detail);
+                break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{detail});
+            }
+            break :blk allocator.dupe(u8, "ApiError");
+        },
         else => allocator.dupe(u8, @errorName(err)),
     };
 }
@@ -215,11 +245,19 @@ fn threadMain(
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine,
     provider_name: []const u8,
+    pane_handle_packed: u32,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
     tools.lua_request_queue = queue;
     defer tools.lua_request_queue = null;
+
+    // Publish the caller pane's packed handle so layout tools dispatched
+    // inline on this thread can refuse destructive ops on the caller's
+    // own pane. Worker threads (`agent.executeOneToolCall`) mirror this
+    // assignment from their per-thread context.
+    tools.current_caller_pane_id = pane_handle_packed;
+    defer tools.current_caller_pane_id = null;
 
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
         // The message sits in the queue until drained; allocate owned
@@ -299,7 +337,11 @@ pub fn submitInput(self: *AgentRunner, text: []const u8, allocator: Allocator) !
 /// main thread (the only thread allowed to touch Lua). Non-hook events are
 /// compacted back into the ring in their original order. Called before the
 /// normal drain loop so pre-hook vetos round-trip with minimal latency.
-pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void {
+pub fn dispatchHookRequests(
+    queue: *agent_events.EventQueue,
+    engine: ?*LuaEngine,
+    window_manager: ?*WindowManager,
+) void {
     queue.mutex.lock();
     defer queue.mutex.unlock();
 
@@ -347,6 +389,17 @@ pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine
                 // thread doesn't block forever.
                 req.done.set();
             },
+            .layout_request => |req| {
+                if (window_manager) |wm| {
+                    wm.handleLayoutRequest(req);
+                } else {
+                    // No WM wired yet (test harnesses, headless eval):
+                    // release the waiter with an error so the agent thread
+                    // doesn't park on done forever.
+                    req.is_error = true;
+                    req.done.set();
+                }
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -362,7 +415,7 @@ pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine
 pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
     if (self.agent_thread == null) return false;
 
-    dispatchHookRequests(&self.event_queue, self.lua_engine);
+    dispatchHookRequests(&self.event_queue, self.lua_engine, self.window_manager);
 
     var drain: [64]agent_events.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
@@ -371,7 +424,7 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
     for (drain[0..count]) |event| {
         if (self.view.scroll_offset != 0) {
             self.view.scroll_offset = 0;
-            self.view.render_dirty = true;
+            self.view.scroll_dirty = true;
         }
         self.handleAgentEvent(event, allocator);
 
@@ -393,16 +446,9 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
 pub fn resetCurrentAssistantText(self: *AgentRunner) void {
     const node = self.current_assistant_node orelse return;
     self.current_assistant_node = null;
-
-    for (self.view.root_children.items, 0..) |child, i| {
-        if (child == node) {
-            _ = self.view.root_children.orderedRemove(i);
-            break;
-        }
-    }
-    node.deinit(self.view.allocator);
-    self.view.allocator.destroy(node);
-    self.view.render_dirty = true;
+    // Delegates through the tree so generation bumps and the removed
+    // id lands in `dirty_nodes` for the compositor's cache drain.
+    self.view.tree.removeNode(node);
 }
 
 /// Process a single agent event: update the view tree and persist to
@@ -528,6 +574,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         // `done` so the producer in the agent thread doesn't block forever.
         .hook_request => |req| req.done.set(),
         .lua_tool_request => |req| req.done.set(),
+        .layout_request => |req| {
+            req.is_error = true;
+            req.done.set();
+        },
     }
 }
 
@@ -548,13 +598,13 @@ test "resetCurrentAssistantText removes the in-progress node" {
     const partial = try cb.appendNode(null, .assistant_text, "partial ");
     runner.current_assistant_node = partial;
 
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
 
     runner.resetCurrentAssistantText();
 
     try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[0].node_type);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[0].node_type);
 }
 
 test "resetCurrentAssistantText is a no-op when nothing is in progress" {
@@ -571,7 +621,7 @@ test "resetCurrentAssistantText is a no-op when nothing is in progress" {
     runner.resetCurrentAssistantText();
 
     try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
 }
 
 test "text_delta after reset starts a fresh assistant node" {
@@ -586,17 +636,17 @@ test "text_delta after reset starts a fresh assistant node" {
     // Simulate a partial stream: two text deltas append to one node.
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "wor") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello wor", cb.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    try std.testing.expectEqualStrings("Hello wor", cb.tree.root_children.items[0].content.items);
 
     // Fallback: reset, then push the full response.
     runner.handleAgentEvent(.reset_assistant_text, allocator);
-    try std.testing.expectEqual(@as(usize, 0), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cb.tree.root_children.items.len);
     try std.testing.expect(runner.current_assistant_node == null);
 
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello world", cb.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    try std.testing.expectEqualStrings("Hello world", cb.tree.root_children.items[0].content.items);
 }
 
 test "handleAgentEvent correlates tool_result to tool_start via call_id" {
@@ -620,7 +670,7 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
         .call_id = try allocator.dupe(u8, "B"),
     } }, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
     try std.testing.expectEqual(@as(u32, 2), runner.pending_tool_calls.count());
 
     // tool_result for "B" (out-of-order vs starts) should parent under tool B
@@ -630,7 +680,7 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
         .is_error = false,
     } }, allocator);
 
-    const tool_b_node = cb.root_children.items[1];
+    const tool_b_node = cb.tree.root_children.items[1];
     try std.testing.expectEqual(@as(usize, 1), tool_b_node.children.items.len);
     try std.testing.expectEqualStrings("result B", tool_b_node.children.items[0].content.items);
     // Pending map no longer contains "B", still contains "A"
@@ -689,7 +739,7 @@ test "dispatchHookRequests fires Lua hook and signals done" {
     var req = Hooks.HookRequest.init(&payload);
     try queue.push(.{ .hook_request = &req });
 
-    dispatchHookRequests(&queue, &engine);
+    dispatchHookRequests(&queue, &engine, null);
 
     try std.testing.expect(req.done.isSet());
     _ = try engine.lua.getGlobal("last_turn");
@@ -722,7 +772,7 @@ test "dispatchHookRequests alone pumps hooks without a prior drainHooks call" {
 
     // No prior supervisor.drainHooks call. dispatchHookRequests alone
     // must pump the queued hook.
-    dispatchHookRequests(&queue, &engine);
+    dispatchHookRequests(&queue, &engine, null);
 
     try std.testing.expect(req.done.isSet());
     _ = try engine.lua.getGlobal("pin_turn");
@@ -760,7 +810,7 @@ test "lua_tool_request round-trips via main thread" {
     };
     try queue.push(.{ .lua_tool_request = &req });
 
-    dispatchHookRequests(&queue, &engine);
+    dispatchHookRequests(&queue, &engine, null);
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.result_content != null);
     defer if (req.result_owned) alloc.free(req.result_content.?);
@@ -808,9 +858,9 @@ test "submitInput records user message on session, tree, and resets streaming" {
     try std.testing.expect(runner.last_tool_call == null);
 
     // Tree got the stale assistant_text plus the new user_message.
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[1].node_type);
-    try std.testing.expectEqualStrings("hi", cb.root_children.items[1].content.items);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[1].node_type);
+    try std.testing.expectEqualStrings("hi", cb.tree.root_children.items[1].content.items);
 
     // Session has one user message with a single text block.
     try std.testing.expectEqual(@as(usize, 1), scb.messages.items.len);
@@ -860,9 +910,79 @@ test "formatAgentErrorMessage hints LoginExpired with provider name" {
     try std.testing.expectEqualStrings("OAuth token expired. Re-run: zag --login=openai-oauth", msg);
 }
 
-test "formatAgentErrorMessage falls back to error name for other errors" {
+test "formatAgentErrorMessage for ApiError without detail shows the error name" {
     const allocator = std.testing.allocator;
+    // Defensive clear in case a prior test left a detail in the slot.
+    llm.error_detail.clear(allocator);
     const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError", msg);
+}
+
+test "formatAgentErrorMessage for ApiError surfaces stored transport detail" {
+    const allocator = std.testing.allocator;
+    const detail = try allocator.dupe(u8, "HTTP 401 (unauthorized): {\"error\":\"bad token\"}");
+    llm.error_detail.set(allocator, detail);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings(
+        "ApiError: HTTP 401 (unauthorized): {\"error\":\"bad token\"}",
+        msg,
+    );
+}
+
+test "formatAgentErrorMessage falls back to error name for unhinted errors" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.MalformedResponse, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("MalformedResponse", msg);
+}
+
+test "current_caller_pane_id threadlocal is per-thread" {
+    // Sanity check that assigning to `tools.current_caller_pane_id` in a
+    // child thread does not bleed into the parent thread and vice versa.
+    // The real integration verification is the layout_close self-pane
+    // rejection test later in the plan.
+    tools.current_caller_pane_id = 0xAAAA_BBBB;
+    defer tools.current_caller_pane_id = null;
+
+    const Child = struct {
+        fn run(observed: *?u32, set_to: u32) void {
+            observed.* = tools.current_caller_pane_id;
+            tools.current_caller_pane_id = set_to;
+        }
+    };
+
+    var observed: ?u32 = 0xDEAD_BEEF;
+    const t = try std.Thread.spawn(.{}, Child.run, .{ &observed, 0x1111_2222 });
+    t.join();
+
+    try std.testing.expectEqual(@as(?u32, null), observed);
+    try std.testing.expectEqual(@as(?u32, 0xAAAA_BBBB), tools.current_caller_pane_id);
+}
+
+test "node_version_snapshot starts at zero; compositor sync advances it" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "snap");
+    defer cb.deinit();
+    var history = ConversationHistory.init(allocator);
+    defer history.deinit();
+    var runner = AgentRunner.init(allocator, &cb, &history);
+    defer runner.deinit();
+
+    // Default: runner hasn't observed any composite yet.
+    try std.testing.expectEqual(@as(u32, 0), runner.node_version_snapshot);
+
+    // Mutations bump the tree's generation; the runner's snapshot is
+    // intentionally stale until the next Compositor sync runs. This
+    // test pins the "runner doesn't auto-track" invariant so Step 5
+    // can observe a real delta between tree.generation and snapshot
+    // when it drains dirty_nodes.
+    _ = try cb.appendNode(null, .user_message, "x");
+    try std.testing.expect(cb.tree.currentGeneration() != 0);
+    try std.testing.expectEqual(@as(u32, 0), runner.node_version_snapshot);
+
+    // Simulate what Compositor.syncTreeSnapshot does after painting.
+    runner.node_version_snapshot = cb.tree.currentGeneration();
+    try std.testing.expectEqual(cb.tree.currentGeneration(), runner.node_version_snapshot);
 }

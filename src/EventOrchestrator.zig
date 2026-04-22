@@ -291,9 +291,11 @@ fn tick(
         self.window_manager.drainPane(entry.pane);
     }
 
-    // Check if any pane has pending visual changes
-    const any_dirty = self.window_manager.root_pane.view.render_dirty or for (self.window_manager.extra_panes.items) |entry| {
-        if (entry.pane.view.render_dirty) break true;
+    // Check if any pane has pending visual changes. `buf().isDirty()`
+    // ORs the tree-generation delta with the view-only scroll bit, so
+    // both tree mutations and scrolls trigger a spinner tick here.
+    const any_dirty = self.window_manager.root_pane.view.buf().isDirty() or for (self.window_manager.extra_panes.items) |entry| {
+        if (entry.pane.view.buf().isDirty()) break true;
     } else false;
 
     // Spinner ticks only when actual events arrive
@@ -377,7 +379,13 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // the key passes through to the mode-default logic below.
     if (self.window_manager.keymapRegistry()) |registry| {
         if (registry.lookup(self.window_manager.current_mode, k)) |action| {
-            self.window_manager.executeAction(action);
+            self.window_manager.executeAction(action) catch |err| {
+                // Bound actions can fail for well-understood reasons
+                // (e.g. `.resize` requires an argument from Lua). Log
+                // and swallow so a single unbindable action does not
+                // derail the key loop.
+                log.warn("executeAction({s}) failed: {}", .{ @tagName(action), err });
+            };
             return .redraw;
         }
     }

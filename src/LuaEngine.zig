@@ -12,6 +12,9 @@ const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
+const Layout = @import("Layout.zig");
+const NodeRegistry = @import("NodeRegistry.zig");
+const WindowManager = @import("WindowManager.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -109,6 +112,11 @@ pub const LuaEngine = struct {
     /// Both have coupled lifetimes (pool writes to queue), so they're
     /// owned together. Null until `initAsync()` runs.
     async_runtime: ?*AsyncRuntime = null,
+    /// Optional back-pointer to the live window manager. Wired by
+    /// `main.zig` once the orchestrator is in its final home; stays
+    /// null in headless mode so Lua layout bindings raise a clean
+    /// "no window manager bound" error instead of dereferencing junk.
+    window_manager: ?*WindowManager = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
     tasks: std.AutoHashMap(i32, *Task),
     /// Root scope (parent of all agent/hook scopes).
@@ -345,6 +353,31 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagFsExistsFn));
         lua.setField(-2, "exists");
         lua.setField(-2, "fs"); // zag.fs = fs_table; [zag_table]
+
+        // zag.layout; plain namespace table for window-tree inspection
+        // and mutation. Requires a live window manager, which main.zig
+        // wires via `engine.window_manager`. Headless runs leave the
+        // field null and these bindings raise a clean Lua error.
+        lua.newTable(); // [zag_table, layout_table]
+        lua.pushFunction(zlua.wrap(zagLayoutTreeFn));
+        lua.setField(-2, "tree");
+        lua.pushFunction(zlua.wrap(zagLayoutFocusFn));
+        lua.setField(-2, "focus");
+        lua.pushFunction(zlua.wrap(zagLayoutSplitFn));
+        lua.setField(-2, "split");
+        lua.pushFunction(zlua.wrap(zagLayoutCloseFn));
+        lua.setField(-2, "close");
+        lua.pushFunction(zlua.wrap(zagLayoutResizeFn));
+        lua.setField(-2, "resize");
+        lua.setField(-2, "layout"); // zag.layout = layout_table; [zag_table]
+
+        // zag.pane; per-pane inspection primitives. Mirrors the
+        // `pane_read` tool so plugins can snapshot a pane's rendered
+        // text without a tool-call round-trip.
+        lua.newTable(); // [zag_table, pane_table]
+        lua.pushFunction(zlua.wrap(zagPaneReadFn));
+        lua.setField(-2, "read");
+        lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
 
         // Private log entrypoints consumed by the Lua-side wrappers in
         // combinators.lua. User code calls `zag.log.info(fmt, ...)`; the
@@ -2031,6 +2064,194 @@ pub const LuaEngine = struct {
             return 1;
         };
         co.pushBoolean(true);
+        return 1;
+    }
+
+    /// `zag.layout.tree()`: return the live window tree as a Lua table
+    /// with `root` and `nodes` fields, mirroring the `layout_tree` tool
+    /// JSON schema. Runs on the main thread (bindings are invoked from
+    /// `config.lua` / hook / keymap contexts) so it reads the window
+    /// manager directly instead of round-tripping through the agent
+    /// event queue.
+    fn zagLayoutTreeFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.tree: no window manager bound", .{});
+        };
+        const bytes = wm.describe(engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.tree: describe failed: {s}", .{@errorName(err)}) catch "zag.layout.tree: describe failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        defer engine.allocator.free(bytes);
+        lua_json.pushJsonAsTable(lua, bytes, engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.tree: decode failed: {s}", .{@errorName(err)}) catch "zag.layout.tree: decode failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 1;
+    }
+
+    /// Parse the id string on top of the Lua stack at `arg_index` and
+    /// resolve it into a NodeRegistry.Handle. Raises a Lua error with
+    /// `op_name` prefixed on bad input. Shared by all zag.layout bindings.
+    fn requireLayoutHandle(lua: *Lua, arg_index: i32, comptime op_name: []const u8) NodeRegistry.Handle {
+        if (lua.typeOf(arg_index) != .string) {
+            lua.raiseErrorStr(op_name ++ ": id must be a string", .{});
+        }
+        const id_str = lua.toString(arg_index) catch {
+            lua.raiseErrorStr(op_name ++ ": id must be a string", .{});
+        };
+        return NodeRegistry.parseId(id_str) catch {
+            lua.raiseErrorStr(op_name ++ ": invalid id", .{});
+        };
+    }
+
+    /// `zag.layout.focus(id)`: move focus to the leaf identified by `id`.
+    fn zagLayoutFocusFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.focus: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.layout.focus");
+        wm.focusById(handle) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.focus: {s}", .{@errorName(err)}) catch "zag.layout.focus failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
+    /// `zag.layout.split(id, direction, opts?)`: split the leaf
+    /// identified by `id` along `direction` ("horizontal" or "vertical")
+    /// and return the new leaf's id string. `opts.buffer.type` is
+    /// accepted but currently only `"conversation"` (the default) is
+    /// implemented; anything else raises.
+    fn zagLayoutSplitFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.split: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.layout.split");
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.layout.split: direction must be a string", .{});
+        }
+        const dir_str = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.layout.split: direction must be a string", .{});
+        };
+        const direction: Layout.SplitDirection = if (std.mem.eql(u8, dir_str, "vertical"))
+            .vertical
+        else if (std.mem.eql(u8, dir_str, "horizontal"))
+            .horizontal
+        else {
+            lua.raiseErrorStr("zag.layout.split: direction must be \"horizontal\" or \"vertical\"", .{});
+        };
+
+        // Optional buffer table: { type = "conversation" }. Anything else
+        // is rejected so users get the same story as the tool path.
+        if (lua.isTable(3)) {
+            _ = lua.getField(3, "type");
+            defer lua.pop(1);
+            if (!lua.isNil(-1)) {
+                const bt = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.split: buffer.type must be a string", .{});
+                };
+                if (!std.mem.eql(u8, bt, "conversation")) {
+                    lua.raiseErrorStr("zag.layout.split: buffer.type not yet supported", .{});
+                }
+            }
+        }
+
+        const new_handle = wm.splitById(handle, direction) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split: {s}", .{@errorName(err)}) catch "zag.layout.split failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        const id_str = NodeRegistry.formatId(engine.allocator, new_handle) catch {
+            lua.raiseErrorStr("zag.layout.split: id format failed", .{});
+        };
+        defer engine.allocator.free(id_str);
+        _ = lua.pushString(id_str);
+        return 1;
+    }
+
+    /// `zag.layout.close(id)`: close the leaf identified by `id`.
+    /// Plugin-level calls run on the main thread as user code, so they
+    /// bypass the caller-pane guard (no caller pane exists here).
+    fn zagLayoutCloseFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.close: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.layout.close");
+        wm.closeById(handle, null) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.close: {s}", .{@errorName(err)}) catch "zag.layout.close failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
+    /// `zag.layout.resize(id, ratio)`: apply a new split ratio to the
+    /// split identified by `id`. Non-split handles are rejected by the
+    /// window manager.
+    fn zagLayoutResizeFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.resize: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.layout.resize");
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.layout.resize: ratio must be a number", .{});
+        }
+        const ratio_raw = lua.toNumber(2) catch {
+            lua.raiseErrorStr("zag.layout.resize: ratio must be a number", .{});
+        };
+        const ratio: f32 = @floatCast(ratio_raw);
+        wm.resizeById(handle, ratio) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.resize: {s}", .{@errorName(err)}) catch "zag.layout.resize failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
+    /// `zag.pane.read(id, lines?)`: return a snapshot of the pane's
+    /// rendered text as a Lua table `{ ok, text, total_lines, truncated }`,
+    /// mirroring the `pane_read` tool. `lines` caps the number of lines
+    /// returned (defaults to the WindowManager default when omitted).
+    fn zagPaneReadFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.read: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.read");
+
+        var lines_opt: ?u32 = null;
+        if (!lua.isNoneOrNil(2)) {
+            if (lua.typeOf(2) != .number) {
+                lua.raiseErrorStr("zag.pane.read: lines must be an integer", .{});
+            }
+            const n = lua.toInteger(2) catch {
+                lua.raiseErrorStr("zag.pane.read: lines must be an integer", .{});
+            };
+            if (n < 0) {
+                lua.raiseErrorStr("zag.pane.read: lines must be non-negative", .{});
+            }
+            lines_opt = @intCast(n);
+        }
+
+        const bytes = wm.readPaneById(engine.allocator, handle, lines_opt, null) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.read: {s}", .{@errorName(err)}) catch "zag.pane.read failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        defer engine.allocator.free(bytes);
+        lua_json.pushJsonAsTable(lua, bytes, engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.read: decode failed: {s}", .{@errorName(err)}) catch "zag.pane.read: decode failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
         return 1;
     }
 
@@ -4116,11 +4337,11 @@ test "end-to-end: config file to registry execution" {
     const pump_thread = try std.Thread.spawn(.{}, struct {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
-                AgentRunner.dispatchHookRequests(q, eng);
+                AgentRunner.dispatchHookRequests(q, eng, null);
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes by the test thread are serviced.
-            AgentRunner.dispatchHookRequests(q, eng);
+            AgentRunner.dispatchHookRequests(q, eng, null);
         }
     }.pump, .{ &queue, &engine, &stop });
     defer {
@@ -6491,6 +6712,24 @@ test "hook budget cancels a runaway coroutine" {
         std.mem.indexOf(u8, got, "cancelled") != null or
             std.mem.indexOf(u8, got, "budget_exceeded") != null,
     );
+}
+
+test "zag.layout.tree is registered and fails cleanly without a window manager" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+
+    // The function exists on zag.layout.
+    try eng.lua.doString("_has_tree = type(zag.layout) == 'table' and type(zag.layout.tree) == 'function'");
+    _ = try eng.lua.getGlobal("_has_tree");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    // With no window manager bound, invocation raises a Lua error.
+    try eng.lua.doString("_ok, _err = pcall(function() return zag.layout.tree() end)");
+    _ = try eng.lua.getGlobal("_ok");
+    try std.testing.expect(!eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
 }
 
 test "hook budget leaves fast hooks alone" {

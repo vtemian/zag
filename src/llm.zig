@@ -16,6 +16,7 @@ pub const Usage = cost.Usage;
 pub const Trajectory = @import("Trajectory.zig");
 pub const streaming = @import("llm/streaming.zig");
 pub const http = @import("llm/http.zig");
+pub const error_detail = @import("llm/error_detail.zig");
 const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
