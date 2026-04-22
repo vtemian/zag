@@ -26,11 +26,15 @@ pub fn buildHeaders(
     opts: auth.ResolveOptions,
 ) !std.ArrayList(std.http.Header) {
     var headers: std.ArrayList(std.http.Header) = .empty;
-    errdefer headers.deinit(allocator);
+    errdefer freeHeaders(endpoint, &headers, allocator);
 
-    // Static endpoint headers first (values borrowed, not freed by us).
+    // Static endpoint headers first. Duplicate each value so freeHeaders
+    // can free every value uniformly. Names stay borrowed (endpoint
+    // outlives the request).
     for (endpoint.headers) |h| {
-        try headers.append(allocator, .{ .name = h.name, .value = h.value });
+        const owned = try allocator.dupe(u8, h.value);
+        errdefer allocator.free(owned);
+        try headers.append(allocator, .{ .name = h.name, .value = owned });
     }
 
     switch (endpoint.auth) {
@@ -63,46 +67,44 @@ pub fn buildHeaders(
         },
         .oauth_chatgpt => {
             const resolved = try auth.resolveCredential(allocator, auth_path, endpoint.name, opts);
-            const oauth_cred = switch (resolved) {
-                .oauth => |o| o,
-                .api_key => |k| {
-                    allocator.free(k);
-                    return error.WrongCredentialType;
+            const codex_spec: Endpoint.OAuthSpec = .{
+                .issuer = "",
+                .token_url = "",
+                .client_id = "",
+                .scopes = "",
+                .redirect_port = 0,
+                .account_id_claim_path = null,
+                .extra_authorize_params = &.{},
+                .inject = .{
+                    .header = "Authorization",
+                    .prefix = "Bearer ",
+                    .extra_headers = &.{},
+                    .use_account_id = true,
+                    .account_id_header = "chatgpt-account-id",
                 },
             };
-            // Take ownership into locals we can zero-slice after handoff
-            // so errdefer stops trying to free already-transferred bytes.
-            var access_token: []const u8 = oauth_cred.access_token;
-            errdefer if (access_token.len != 0) allocator.free(access_token);
-            var account_id: []const u8 = oauth_cred.account_id;
-            errdefer if (account_id.len != 0) allocator.free(account_id);
-
-            const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
-            errdefer allocator.free(bearer);
-            allocator.free(access_token);
-            access_token = &.{};
-
-            try headers.append(allocator, .{ .name = "Authorization", .value = bearer });
-            try headers.append(allocator, .{ .name = "chatgpt-account-id", .value = account_id });
-            account_id = &.{};
+            try applyOAuthInjection(&headers, allocator, &codex_spec, resolved);
         },
     }
 
     return headers;
 }
 
-/// Free heap-allocated header values left by `buildHeaders`. Static endpoint
-/// headers live at the front (values borrowed); auth headers live at the tail
-/// (values owned). We scan the tail and free each owned slice before deiniting.
-pub fn freeHeaders(endpoint: *const Endpoint, headers: *std.ArrayList(std.http.Header), allocator: Allocator) void {
-    const owned_count: usize = switch (endpoint.auth) {
-        .none => 0,
-        .x_api_key, .bearer => 1,
-        .oauth_chatgpt => 2,
-    };
-    const total = headers.items.len;
-    const start = if (total >= owned_count) total - owned_count else 0;
-    for (headers.items[start..total]) |h| allocator.free(h.value);
+/// Free every header value and the backing ArrayList.
+///
+/// After Phase B, every `h.value` in `headers` is allocator-owned:
+///   - static endpoint headers are duped before being appended;
+///   - injection helpers (`mergeInjectedHeader` / `applyOAuthInjection`)
+///     dupe or take handed-off ownership.
+///
+/// Header names remain borrowed from the endpoint's long-lived backing
+/// store, so we don't free those.
+pub fn freeHeaders(
+    _: *const Endpoint,
+    headers: *std.ArrayList(std.http.Header),
+    allocator: Allocator,
+) void {
+    for (headers.items) |h| allocator.free(h.value);
     headers.deinit(allocator);
 }
 
@@ -319,6 +321,27 @@ test "buildHeaders handles no-auth endpoint" {
     var headers = try buildHeaders(&endpoint, "", allocator, .{});
     defer freeHeaders(&endpoint, &headers, allocator);
     try std.testing.expectEqual(@as(usize, 0), headers.items.len);
+}
+
+test "buildHeaders+freeHeaders round-trip with static endpoint headers (no leak)" {
+    const endpoint: Endpoint = .{
+        .name = "test",
+        .serializer = .openai,
+        .url = "https://x",
+        .auth = .none,
+        .headers = &.{
+            .{ .name = "anthropic-version", .value = "2023-06-01" },
+            .{ .name = "x-extra", .value = "yes" },
+        },
+        .default_model = "m",
+        .models = &.{},
+    };
+    // buildHeaders needs an auth_path even for .none; the .none arm won't read it.
+    var headers = try buildHeaders(&endpoint, "/tmp/ignored", std.testing.allocator, .{});
+    defer freeHeaders(&endpoint, &headers, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), headers.items.len);
+    try std.testing.expectEqualStrings("2023-06-01", headers.items[0].value);
+    try std.testing.expectEqualStrings("yes", headers.items[1].value);
 }
 
 test "httpPostJson returns InvalidUri on malformed endpoint" {
