@@ -527,7 +527,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
             .{ .name = "originator", .value = "zag_cli" },
             .{ .name = "User-Agent", .value = "zag_cli" },
         },
-        .default_model = "gpt-5-codex",
+        .default_model = "gpt-5.2",
         .models = &.{},
     };
     try reg.add(try openai_oauth_ep.dupe(allocator));
