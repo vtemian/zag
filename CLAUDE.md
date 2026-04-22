@@ -32,7 +32,7 @@ zag.provider { name = "openai" }
 zag.set_default_model("openai/gpt-4o")
 ```
 
-`auth.json` holds provider API keys. Create by hand, chmod `0600`; Ollama is keyless.
+`auth.json` holds provider API keys. Written by `zag auth login`; do not hand-edit. Ollama is keyless. Schema for reference only:
 
 ```json
 {
