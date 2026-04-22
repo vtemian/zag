@@ -141,9 +141,15 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
 /// Get a mutable pointer to a cell in the current grid.
 /// Row and column are zero-indexed.
 /// Caller must ensure row < height and col < width.
+///
+/// `std.debug.assert` is a deliberate exception to "no asserts in hot
+/// paths" here. The prior guard was `unreachable`, which is silent UB
+/// under ReleaseFast on a violation. assert at least catches the bug in
+/// Debug and ReleaseSafe; if profiling shows it as a hot-path cost under
+/// ReleaseFast we move the bounds check to the caller.
 pub fn getCell(self: *Screen, row: u16, col: u16) *Cell {
-    if (row >= self.height) unreachable;
-    if (col >= self.width) unreachable;
+    std.debug.assert(row < self.height);
+    std.debug.assert(col < self.width);
     const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
     return &self.current[idx];
 }
@@ -151,9 +157,10 @@ pub fn getCell(self: *Screen, row: u16, col: u16) *Cell {
 /// Get a const pointer to a cell in the current grid.
 /// Row and column are zero-indexed.
 /// Caller must ensure row < height and col < width.
+/// Asserts are a deliberate exception for the same reason as `getCell`.
 pub fn getCellConst(self: *const Screen, row: u16, col: u16) *const Cell {
-    if (row >= self.height) unreachable;
-    if (col >= self.width) unreachable;
+    std.debug.assert(row < self.height);
+    std.debug.assert(col < self.width);
     const idx = @as(usize, row) * @as(usize, self.width) + @as(usize, col);
     return &self.current[idx];
 }
