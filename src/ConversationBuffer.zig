@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const Layout = @import("Layout.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
+const NodeLineCache = @import("NodeLineCache.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
 const input = @import("input.zig");
@@ -49,16 +50,15 @@ pub const Node = struct {
     collapsed: bool = false,
     /// Back-pointer to the parent node, null for root children.
     parent: ?*Node = null,
-    /// Incremented on every content mutation. Cache checks this against stored version.
+    /// Incremented on every content mutation. `NodeLineCache` checks
+    /// this against its stored `Entry.version` to decide hit vs. miss.
     content_version: u32 = 0,
-    /// Cached rendered lines for this node. Null means not yet cached.
-    cached_lines: ?[]Theme.StyledLine = null,
-    /// The content_version at which cached_lines was computed.
-    cached_version: u32 = 0,
 
-    /// Release all memory owned by this node and its descendants.
+    /// Release all memory owned by this node and its descendants. The
+    /// buffer-level `NodeLineCache` owns any cached spans keyed by this
+    /// node's id; callers must drop the cache entry (or wipe the whole
+    /// cache) before or after this call as appropriate.
     pub fn deinit(self: *Node, allocator: Allocator) void {
-        self.clearCache(allocator);
         for (self.children.items) |child| {
             child.deinit(allocator);
             allocator.destroy(child);
@@ -67,16 +67,8 @@ pub const Node = struct {
         self.content.deinit(allocator);
     }
 
-    /// Free cached lines if present.
-    pub fn clearCache(self: *Node, allocator: Allocator) void {
-        if (self.cached_lines) |cached| {
-            for (cached) |line| line.deinit(allocator);
-            allocator.free(cached);
-            self.cached_lines = null;
-        }
-    }
-
-    /// Mark this node's content as changed, invalidating any cache.
+    /// Mark this node's content as changed, invalidating any cache entry
+    /// whose stored version is now stale.
     pub fn markDirty(self: *Node) void {
         self.content_version +%= 1;
     }
@@ -99,6 +91,11 @@ scroll_offset: u32 = 0,
 render_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
+/// Memoized NodeRenderer output, keyed by (node.id, node.content_version).
+/// Owned by the buffer and deinited alongside it; entries borrow span
+/// text from `Node.content.items` so the cache must not outlive the
+/// node tree that produced it.
+cache: NodeLineCache,
 /// In-progress text the user is editing at this pane's prompt.
 /// Becomes the next user message when Enter is pressed.
 draft: [MAX_DRAFT]u8 = undefined,
@@ -120,14 +117,20 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
         .next_id = 0,
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
+        .cache = NodeLineCache.init(allocator),
     };
 }
 
-/// Release all memory owned by this buffer: nodes, name, and lists.
+/// Release all memory owned by this buffer: cache, nodes, name, lists.
 /// Messages and the session handle live on `ConversationHistory`; the
 /// agent thread, event queue, and streaming state live on `AgentRunner`.
 /// Neither is owned by the buffer.
+///
+/// Deinit order matters: drain the cache first so entries release their
+/// spans arrays while the Node tree (and therefore the borrowed span
+/// text) is still alive. Then free the nodes.
 pub fn deinit(self: *ConversationBuffer) void {
+    self.cache.deinit();
     for (self.root_children.items) |node| {
         node.deinit(self.allocator);
         self.allocator.destroy(node);
@@ -171,19 +174,25 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
 ///
 /// `frame_alloc` backs the output `ArrayList(StyledLine)` and is expected
 /// to be a per-frame arena: the caller does not free individual spans.
-/// `cache_alloc` backs cache entries that persist across frames (the
-/// per-node `cached_lines` and each cache entry's `spans` array). On
-/// cache hit the output list shares its `spans` pointers with the cache;
-/// because those pointers are cache-owned, callers must not free them
-/// via `StyledLine.deinit`; reset the frame arena instead.
+///
+/// `cache_alloc` is part of the `Buffer.VTable` contract but unused by
+/// this impl; we own a `NodeLineCache` inside the buffer (see `cache`
+/// field) and it carries its own allocator set at `init` time. The
+/// parameter stays on the signature so the vtable surface is stable
+/// across buffer implementations.
+///
+/// On cache hit the output list shares its `spans` pointers with the
+/// cache; because those pointers are cache-owned, callers must not free
+/// them via `StyledLine.deinit`; reset the frame arena instead.
 pub fn getVisibleLines(
-    self: *const ConversationBuffer,
+    self: *ConversationBuffer,
     frame_alloc: Allocator,
     cache_alloc: Allocator,
     theme: *const Theme,
     skip: usize,
     max_lines: usize,
 ) !std.ArrayList(Theme.StyledLine) {
+    _ = cache_alloc;
     var lines: std.ArrayList(Theme.StyledLine) = .empty;
     errdefer lines.deinit(frame_alloc);
 
@@ -192,25 +201,27 @@ pub fn getVisibleLines(
 
     for (self.root_children.items) |node| {
         if (collected >= max_lines) break;
-        try collectVisibleLines(node, frame_alloc, cache_alloc, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
+        try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
     }
 
     return lines;
 }
 
 /// Recursive helper: render a node and its non-collapsed children,
-/// respecting the skip/max_lines window. Uses per-node cache when available.
+/// respecting the skip/max_lines window. Uses the buffer-owned
+/// `NodeLineCache` when the node's content_version matches a live entry.
 ///
 /// Under the StyledSpan borrowed-slice contract the cache stores the
 /// rendered `StyledLine` values directly; the spans arrays are allocated
-/// via `cache_alloc` (long-lived) and span text bytes are borrowed slices
-/// into `content.items`. Version mismatch discards the cache before any
-/// borrowed slice is dereferenced. The output list backing uses
-/// `frame_alloc` and shares spans pointers with the cache.
+/// via the cache's allocator (long-lived) and span text bytes are
+/// borrowed slices into `content.items`. Version mismatch discards the
+/// cache entry before any borrowed slice is dereferenced. The output
+/// list backing uses `frame_alloc` and shares spans pointers with the
+/// cache.
 fn collectVisibleLines(
     node: *const Node,
     frame_alloc: Allocator,
-    cache_alloc: Allocator,
+    cache: *NodeLineCache,
     renderer: *const NodeRenderer,
     lines: *std.ArrayList(Theme.StyledLine),
     theme: *const Theme,
@@ -226,11 +237,7 @@ fn collectVisibleLines(
     if (skipped.* + node_lines <= skip) {
         skipped.* += node_lines;
     } else {
-        // Cache is a transparent optimization; constCast is safe here
-        const node_mut = @as(*Node, @constCast(node));
-
-        if (node_mut.cached_lines != null and node_mut.cached_version == node.content_version) {
-            const cached = node_mut.cached_lines.?;
+        if (cache.get(node)) |cached| {
             const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
             const available = if (skip_from_node < cached.len) cached.len - skip_from_node else 0;
             const take = @min(available, max_lines - collected.*);
@@ -242,20 +249,24 @@ fn collectVisibleLines(
             skipped.* += node_lines;
             collected.* = lines.items.len;
         } else {
-            // Render into a scratch list backed by `cache_alloc`. The
-            // resulting slice of StyledLines becomes the cache entry; we
-            // also append each line into the caller's `lines` list via
+            // Render into a scratch list backed by the cache's allocator.
+            // The resulting slice of StyledLines becomes the cache entry;
+            // we also append each line into the caller's `lines` list via
             // `frame_alloc` (so the output backing has a single allocator).
+            const cache_alloc = cache.allocator;
             var scratch: std.ArrayList(Theme.StyledLine) = .empty;
             errdefer scratch.deinit(cache_alloc);
             try renderer.render(node, &scratch, cache_alloc, theme);
             const produced = scratch.items.len;
 
-            node_mut.clearCache(cache_alloc);
-            node_mut.cached_lines = try scratch.toOwnedSlice(cache_alloc);
-            node_mut.cached_version = node.content_version;
+            const owned = try scratch.toOwnedSlice(cache_alloc);
+            errdefer {
+                for (owned) |line| line.deinit(cache_alloc);
+                cache_alloc.free(owned);
+            }
+            try cache.put(node.id, node.content_version, owned);
 
-            const cached = node_mut.cached_lines.?;
+            const cached = owned;
             const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
             if (skip_from_node >= produced) {
                 // Whole node falls before the window; nothing to emit.
@@ -277,7 +288,7 @@ fn collectVisibleLines(
     if (!node.collapsed) {
         for (node.children.items) |child| {
             if (collected.* >= max_lines) return;
-            try collectVisibleLines(child, frame_alloc, cache_alloc, renderer, lines, theme, skip, max_lines, skipped, collected);
+            try collectVisibleLines(child, frame_alloc, cache, renderer, lines, theme, skip, max_lines, skipped, collected);
         }
     }
 }
@@ -452,7 +463,7 @@ const vtable: Buffer.VTable = .{
 };
 
 fn bufGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
