@@ -516,8 +516,18 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
                 .account_id_header = "chatgpt-account-id",
             },
         } },
-        .headers = &.{},
-        .default_model = "gpt-5",
+        // Codex-specific static headers. Matches what pi-mono and
+        // opencode send to `chatgpt.com/backend-api/codex/responses`:
+        // the endpoint rejects requests without `OpenAI-Beta` and the
+        // originator/User-Agent pair even with valid OAuth creds.
+        // session_id / x-client-request-id are injected per-call by the
+        // chatgpt provider since they need to vary per request.
+        .headers = &.{
+            .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
+            .{ .name = "originator", .value = "zag_cli" },
+            .{ .name = "User-Agent", .value = "zag_cli" },
+        },
+        .default_model = "gpt-5-codex",
         .models = &.{},
     };
     try reg.add(try openai_oauth_ep.dupe(allocator));

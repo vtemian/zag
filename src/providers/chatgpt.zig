@@ -154,6 +154,15 @@ fn serializeRequest(
     try w.writeAll(",\"tool_choice\":\"auto\"");
     try w.writeAll(",\"parallel_tool_calls\":true");
     try w.writeAll(",\"store\":false");
+    // Codex-specific fields. Matches pi-mono's openai-codex-responses
+    // and opencode's codex plugin, both of which target the same
+    // `chatgpt.com/backend-api/codex/responses` endpoint. The endpoint
+    // rejects requests for reasoning models without `reasoning` and
+    // (with `store: false`) requires `include` so the encrypted
+    // reasoning blob round-trips between tool calls within a turn.
+    try w.writeAll(",\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"}");
+    try w.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
+    try w.writeAll(",\"text\":{\"verbosity\":\"medium\"}");
     if (stream) {
         try w.writeAll(",\"stream\":true");
     } else {
