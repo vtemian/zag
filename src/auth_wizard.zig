@@ -296,6 +296,202 @@ pub fn promptChoice(
     return error.TooManyRetries;
 }
 
+/// One picker entry. Wrapped in a struct (instead of a plain `[]const u8`) so
+/// future fields (icon, disabled flag, keybind hint) can land without
+/// rippling through every call site.
+pub const PickerLabel = struct {
+    /// Rendered text for the row, e.g. `"OpenAI  (paste key)"`.
+    text: []const u8,
+};
+
+/// Decoded action the picker should take after consuming an input byte.
+/// Split out from `promptPicker` so the parse logic is reachable from unit
+/// tests without a real TTY. `.noop` covers both "still assembling a multi-
+/// byte escape sequence" and "byte we chose to ignore".
+const PickerEvent = union(enum) {
+    up,
+    down,
+    commit,
+    abort,
+    noop,
+};
+
+/// Running state for the tiny ESC-sequence decoder that `parsePickerByte`
+/// drives. We only recognise `ESC [ A` and `ESC [ B`; anything else inside
+/// an escape sequence resets the state and is dropped.
+const PickerParseState = struct {
+    /// Set after we see a bare `\x1b`; next byte must be `[` to continue.
+    in_escape: bool = false,
+    /// Set after we see `\x1b [`; next byte is the final direction byte.
+    expect_bracket: bool = false,
+};
+
+/// Feed one byte from stdin through the picker's escape-sequence decoder.
+/// Arrow keys arrive as the three-byte burst `\x1b`, `[`, `A|B`; the first
+/// two bytes return `.noop` and the third returns `.up` / `.down`. CR/LF
+/// commit; `q`/`Q` abort; every other byte is `.noop`.
+///
+/// Bare ESC does NOT abort: distinguishing "ESC alone" from "ESC that
+/// introduces a CSI" requires timing information this decoder doesn't have,
+/// and `ISIG` stays on in raw mode so Ctrl-C still tears the prompt down.
+fn parsePickerByte(state: *PickerParseState, byte: u8) PickerEvent {
+    if (state.expect_bracket) {
+        state.expect_bracket = false;
+        state.in_escape = false;
+        return switch (byte) {
+            'A' => .up,
+            'B' => .down,
+            else => .noop,
+        };
+    }
+    if (state.in_escape) {
+        state.in_escape = false;
+        if (byte == '[') {
+            state.expect_bracket = true;
+            return .noop;
+        }
+        return .noop;
+    }
+    return switch (byte) {
+        0x1b => blk: {
+            state.in_escape = true;
+            break :blk .noop;
+        },
+        '\r', '\n' => .commit,
+        'q', 'Q' => .abort,
+        else => .noop,
+    };
+}
+
+/// ANSI: move cursor up N rows (`ESC [ N A`), clear from cursor to end of
+/// screen (`ESC [ J`). One combined write keeps the redraw flicker-free on
+/// terminals that honour synchronized output.
+fn writePickerRewind(writer: *std.Io.Writer, lines: usize) !void {
+    try writer.print("\x1b[{d}A\x1b[J", .{lines});
+}
+
+/// Render the current picker frame: prompt, blank line, labelled rows with
+/// a `>` gutter on the cursor row, blank line, navigation hint. Flushes so
+/// the frame lands before we block on `read`.
+fn renderPickerFrame(
+    writer: *std.Io.Writer,
+    prompt: []const u8,
+    labels: []const PickerLabel,
+    cursor: usize,
+) !void {
+    try writer.writeAll(prompt);
+    try writer.writeByte('\n');
+    try writer.writeByte('\n');
+    for (labels, 0..) |label, i| {
+        if (i == cursor) {
+            try writer.writeAll("  > ");
+        } else {
+            try writer.writeAll("    ");
+        }
+        try writer.writeAll(label.text);
+        try writer.writeByte('\n');
+    }
+    try writer.writeByte('\n');
+    try writer.writeAll("up/down to navigate . Enter to select . q to abort\n");
+    try writer.flush();
+}
+
+/// Count of rendered rows to rewind over when redrawing:
+/// `labels.len` label rows + 1 blank after the prompt + 1 blank before the
+/// hint + 1 hint row. The prompt itself stays on screen across redraws.
+fn pickerRewindLines(labels_len: usize) usize {
+    return labels_len + 3;
+}
+
+/// Interactive arrow-key picker over raw stdin. Reads one byte at a time
+/// through `parsePickerByte`, redraws the list on every cursor move, and
+/// returns the zero-based index of the committed row. `q` / `Q` and bare
+/// EOF surface as `error.UserAborted`; Ctrl-C still kills the process
+/// because we deliberately leave `ISIG` enabled.
+///
+/// The non-TTY branch (`deps.is_tty == false`) delegates to `promptChoice`
+/// so tests can exercise the wizard's fallback path against fake I/O
+/// without trying to fake termios.
+pub fn promptPicker(
+    deps: *const WizardDeps,
+    prompt: []const u8,
+    labels: []const PickerLabel,
+    initial: usize,
+) !usize {
+    if (labels.len == 0) return error.UserAborted;
+
+    if (!deps.is_tty) {
+        var fallback_labels = try deps.allocator.alloc([]const u8, labels.len);
+        defer deps.allocator.free(fallback_labels);
+        for (labels, 0..) |l, i| fallback_labels[i] = l.text;
+        return promptChoice(deps, prompt, fallback_labels);
+    }
+
+    const fd = std.posix.STDIN_FILENO;
+    const original = try std.posix.tcgetattr(fd);
+    var raw = original;
+    // Per-byte reads: kill ECHO + ICANON, leave ISIG alone (Ctrl-C must work).
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    // ICRNL rewrites Enter (\r) to \n before we see it; we parse both, but
+    // turning it off keeps the byte-for-byte semantics the tests encode.
+    raw.iflag.ICRNL = false;
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    try std.posix.tcsetattr(fd, .NOW, raw);
+    defer std.posix.tcsetattr(fd, .NOW, original) catch |err| {
+        log.warn("failed to restore termios: {}", .{err});
+    };
+
+    var cursor = if (initial < labels.len) initial else 0;
+    var state: PickerParseState = .{};
+
+    try renderPickerFrame(deps.stdout, prompt, labels, cursor);
+
+    var buf: [1]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch |err| {
+            try deps.stdout.writeByte('\n');
+            try deps.stdout.flush();
+            return err;
+        };
+        if (n == 0) {
+            try deps.stdout.writeByte('\n');
+            try deps.stdout.flush();
+            return error.UserAborted;
+        }
+
+        const event = parsePickerByte(&state, buf[0]);
+        switch (event) {
+            .noop => continue,
+            .up => {
+                const new_cursor = if (cursor == 0) labels.len - 1 else cursor - 1;
+                if (new_cursor == cursor) continue;
+                cursor = new_cursor;
+                try writePickerRewind(deps.stdout, pickerRewindLines(labels.len));
+                try renderPickerFrame(deps.stdout, prompt, labels, cursor);
+            },
+            .down => {
+                const new_cursor = if (cursor + 1 >= labels.len) 0 else cursor + 1;
+                if (new_cursor == cursor) continue;
+                cursor = new_cursor;
+                try writePickerRewind(deps.stdout, pickerRewindLines(labels.len));
+                try renderPickerFrame(deps.stdout, prompt, labels, cursor);
+            },
+            .commit => {
+                try deps.stdout.writeByte('\n');
+                try deps.stdout.flush();
+                return cursor;
+            },
+            .abort => {
+                try deps.stdout.writeByte('\n');
+                try deps.stdout.flush();
+                return error.UserAborted;
+            },
+        }
+    }
+}
+
 /// Drop a trailing `\r` so CRLF-terminated input from a Windows-era terminal
 /// round-trips through `takeDelimiter('\n')` as a clean token.
 fn stripCr(line: []const u8) []const u8 {
@@ -600,6 +796,56 @@ test "promptChoice retries on non-digit" {
     const options = [_][]const u8{ "openai", "anthropic", "groq" };
     const choice = try promptChoice(&deps, "Pick a provider:", &options);
     try testing.expectEqual(@as(usize, 2), choice);
+}
+
+test "parsePickerByte: 'j'/'k' are noop, only arrows move" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'j'));
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'k'));
+}
+
+test "parsePickerByte: down arrow is ESC [ B" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 0x1b));
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, '['));
+    try testing.expectEqual(PickerEvent.down, parsePickerByte(&state, 'B'));
+}
+
+test "parsePickerByte: up arrow is ESC [ A" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 0x1b));
+    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, '['));
+    try testing.expectEqual(PickerEvent.up, parsePickerByte(&state, 'A'));
+}
+
+test "parsePickerByte: CR commits" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.commit, parsePickerByte(&state, '\r'));
+}
+
+test "parsePickerByte: LF commits" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.commit, parsePickerByte(&state, '\n'));
+}
+
+test "parsePickerByte: q aborts" {
+    var state: PickerParseState = .{};
+    try testing.expectEqual(PickerEvent.abort, parsePickerByte(&state, 'q'));
+}
+
+test "promptPicker with is_tty=false falls back to promptChoice" {
+    var stdin = std.Io.Reader.fixed("2\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps = testDeps(&stdin, &stdout_writer.writer);
+    const labels = [_]PickerLabel{
+        .{ .text = "openai" },
+        .{ .text = "anthropic" },
+        .{ .text = "groq" },
+    };
+    const choice = try promptPicker(&deps, "Pick a provider:", &labels, 0);
+    try testing.expectEqual(@as(usize, 1), choice);
 }
 
 test "promptChoice returns UserAborted on EOF" {
