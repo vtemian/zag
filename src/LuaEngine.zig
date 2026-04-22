@@ -4452,8 +4452,9 @@ test "zag.provider{}: oauth declaration materialises into .oauth variant with fu
 
 test "zag.provider{}: custom oauth provider exposes spec fields usable as LoginOptions" {
     // Integration: a fresh Lua-declared OAuth provider (not a builtin)
-    // must round-trip every field that `runLoginCommand` / `chatgptOauthShim`
-    // pull into `oauth.LoginOptions`. No HTTP is exercised; this test pins
+    // must round-trip every field that `runLoginCommand` / the wizard's
+    // OAuth dispatch pull into `oauth.LoginOptions`. No HTTP is exercised;
+    // this test pins
     // the data flow (Lua table → Endpoint.auth.oauth → caller's spec view).
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
