@@ -161,14 +161,23 @@ fn isWide(cp: u21) bool {
 /// One grapheme-ish cluster extracted from a UTF-8 iterator.
 ///
 /// `base` is the starting codepoint of the cluster. This is what gets stored
-/// in the primary Screen cell. Joined codepoints (ZWJ continuations, skin-tone
-/// modifiers, variation selectors, combining marks) are consumed silently and
-/// do not appear in the returned cluster.
+/// in the primary Screen cell when no side table is used. Joined codepoints
+/// (ZWJ continuations, skin-tone modifiers, variation selectors, combining
+/// marks) are consumed by `nextCluster` so subsequent calls start at the next
+/// cluster.
 ///
 /// `width` is the visual column count for the cluster: 0, 1, or 2.
+///
+/// `byte_len` is the total UTF-8 byte length of the cluster in the source
+/// slice: `source[start..start+byte_len]` reconstructs the full cluster,
+/// including any ZWJ joiners and continuation codepoints. For a simple
+/// single-codepoint cluster this is equivalent to the UTF-8 encoding length
+/// of `base`. Callers that need to emit the full grapheme to a terminal use
+/// this to slice the original bytes.
 pub const Cluster = struct {
     base: u21,
     width: u2,
+    byte_len: usize,
 };
 
 /// Read the next cluster from a UTF-8 iterator.
@@ -179,6 +188,7 @@ pub const Cluster = struct {
 ///
 /// Returns null if the iterator is exhausted.
 pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
+    const start = iter.i;
     const first = iter.nextCodepoint() orelse return null;
 
     // Regional indicator pair → flag, width 2. Unpaired → width 1 (the usual
@@ -187,11 +197,11 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
         const saved = iter.i;
         if (iter.nextCodepoint()) |second| {
             if (isRegionalIndicator(second)) {
-                return .{ .base = first, .width = 2 };
+                return .{ .base = first, .width = 2, .byte_len = iter.i - start };
             }
         }
         iter.i = saved;
-        return .{ .base = first, .width = 1 };
+        return .{ .base = first, .width = 1, .byte_len = iter.i - start };
     }
 
     var base_width = codepointWidth(first);
@@ -200,7 +210,7 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
     // absorb trailing joiners. They'll start their own cluster and produce
     // harmless width-0 output at the call site.
     if (base_width == 0) {
-        return .{ .base = first, .width = 0 };
+        return .{ .base = first, .width = 0, .byte_len = iter.i - start };
     }
 
     // Absorb any trailing joiners / modifiers into this cluster. Visual width
@@ -236,7 +246,7 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
         break;
     }
 
-    return .{ .base = first, .width = base_width };
+    return .{ .base = first, .width = base_width, .byte_len = iter.i - start };
 }
 
 fn isRegionalIndicator(cp: u21) bool {
@@ -365,4 +375,66 @@ test "nextCluster: trailing ZWJ with no follow-up codepoint returns the base alo
     try testing.expectEqual(@as(u21, 0x1F468), c.base);
     try testing.expectEqual(@as(u2, 2), c.width);
     try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: byte_len covers the full source slice for simple codepoints" {
+    // ASCII: 1 byte.
+    {
+        var iter = iterOf("a");
+        const c = nextCluster(&iter).?;
+        try testing.expectEqual(@as(usize, 1), c.byte_len);
+    }
+    // U+4E2D "中": 3 bytes.
+    {
+        var iter = iterOf("中");
+        const c = nextCluster(&iter).?;
+        try testing.expectEqual(@as(usize, 3), c.byte_len);
+    }
+    // U+1F600 😀: 4 bytes.
+    {
+        var iter = iterOf("😀");
+        const c = nextCluster(&iter).?;
+        try testing.expectEqual(@as(usize, 4), c.byte_len);
+    }
+}
+
+test "nextCluster: byte_len spans the full ZWJ family emoji" {
+    // 👨‍👩‍👧 = U+1F468 ZWJ U+1F469 ZWJ U+1F467.
+    // 4 + 3 + 4 + 3 + 4 = 18 bytes. The caller needs every byte to emit the
+    // full grapheme to a terminal; returning only the base loses the joiners.
+    const src = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    try testing.expectEqual(@as(usize, 18), src.len);
+    var iter = iterOf(src);
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F468), c.base);
+    try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expectEqual(@as(usize, 18), c.byte_len);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: byte_len covers emoji + VS-16" {
+    // U+2764 (3 bytes) + U+FE0F (3 bytes) = 6 bytes.
+    const src = "\u{2764}\u{FE0F}";
+    try testing.expectEqual(@as(usize, 6), src.len);
+    var iter = iterOf(src);
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(usize, 6), c.byte_len);
+}
+
+test "nextCluster: byte_len covers flag pair" {
+    // U+1F1FA (4 bytes) + U+1F1F8 (4 bytes) = 8 bytes.
+    const src = "\u{1F1FA}\u{1F1F8}";
+    try testing.expectEqual(@as(usize, 8), src.len);
+    var iter = iterOf(src);
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(usize, 8), c.byte_len);
+}
+
+test "nextCluster: byte_len covers combining mark with base" {
+    // 'a' (1) + U+0301 combining acute (2) = 3 bytes.
+    const src = "a\u{0301}";
+    try testing.expectEqual(@as(usize, 3), src.len);
+    var iter = iterOf(src);
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(usize, 3), c.byte_len);
 }

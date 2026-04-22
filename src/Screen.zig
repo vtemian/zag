@@ -55,6 +55,20 @@ pub const Cell = struct {
     /// must skip continuation cells; overwriting a wide char requires
     /// clearing both halves.
     continuation: bool = false,
+    /// Non-zero when this cell's content is a multi-codepoint grapheme
+    /// cluster (ZWJ emoji, skin-toned emoji, flag, etc.). Indexes into
+    /// `Screen.cluster_index`. Zero means the cell is a simple single
+    /// codepoint and the renderer emits `codepoint` directly. Fits inside
+    /// the existing 16-byte Cell padding, no size penalty.
+    cluster_id: u16 = 0,
+};
+
+/// Side-table entry describing a multi-codepoint cluster's bytes within
+/// `cluster_bytes`. `start` is the byte offset and `len` is the byte count
+/// of the cluster's full UTF-8 encoding.
+pub const ClusterIndex = struct {
+    start: u32,
+    len: u16,
 };
 
 /// Width of the screen in columns.
@@ -69,6 +83,20 @@ previous: []Cell,
 allocator: Allocator,
 /// Persistent output buffer reused across render() calls.
 render_buf: std.ArrayList(u8),
+/// Interned UTF-8 bytes for multi-codepoint clusters (ZWJ emoji etc.).
+/// Entries indexed by `cluster_id - 1` via `cluster_index`. Both this
+/// buffer and `cluster_index` are cleared at the end of every `render()`
+/// (after the frame's bytes have been emitted and after the copy to
+/// `previous`); the cluster_id fields on both grids are zeroed in the
+/// same step so a stale id can never dereference a recycled entry on
+/// the next frame. Capacity is retained to avoid re-growing each frame.
+cluster_bytes: std.ArrayList(u8),
+/// Offset+length side table for `cluster_bytes`. `cluster_index[id-1]`
+/// yields the slice for `cluster_id = id`. Zero cluster_id means "no
+/// cluster, render the cell's codepoint directly". The length of this
+/// list doubles as the cluster-id allocator (next id = items.len + 1);
+/// clearing it implicitly rewinds ids to 1 for the next frame.
+cluster_index: std.ArrayList(ClusterIndex),
 /// Set when the prior render exceeded `write_deadline_ms` and returned
 /// `error.WriteTimeout`. The next render wipes `previous` to force a
 /// full redraw, since the terminal received an unknown partial prefix
@@ -106,6 +134,8 @@ pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
         .previous = previous,
         .allocator = allocator,
         .render_buf = .empty,
+        .cluster_bytes = .empty,
+        .cluster_index = .empty,
         .write_timed_out = false,
     };
 }
@@ -113,6 +143,8 @@ pub fn init(allocator: Allocator, width: u16, height: u16) !Screen {
 /// Release grid memory.
 pub fn deinit(self: *Screen) void {
     self.render_buf.deinit(self.allocator);
+    self.cluster_bytes.deinit(self.allocator);
+    self.cluster_index.deinit(self.allocator);
     self.allocator.free(self.current);
     self.allocator.free(self.previous);
 }
@@ -136,6 +168,8 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
     self.width = width;
     self.height = height;
     self.render_buf.clearRetainingCapacity();
+    self.cluster_bytes.clearRetainingCapacity();
+    self.cluster_index.clearRetainingCapacity();
 }
 
 /// Get a mutable pointer to a cell in the current grid.
@@ -165,6 +199,79 @@ pub fn getCellConst(self: *const Screen, row: u16, col: u16) *const Cell {
     return &self.current[idx];
 }
 
+/// Paint one grapheme cluster starting at (row, col). `bytes` is the full
+/// UTF-8 encoding of the cluster (from `width.nextCluster`). `base` is the
+/// first codepoint; `w` is 1 or 2; `style` and `fg` apply to the primary
+/// and any wide-continuation cell.
+///
+/// When `bytes` covers only the base codepoint's UTF-8 encoding the cell
+/// renders directly from `codepoint` and no side-table entry is allocated.
+/// Otherwise the full byte run (ZWJ joiners, skin-tone modifiers, etc.) is
+/// interned and the cell's `cluster_id` points at it so the renderer can
+/// emit the complete grapheme.
+///
+/// Caller must ensure row < height and col + w <= width.
+pub fn writeCluster(
+    self: *Screen,
+    row: u16,
+    col: u16,
+    bytes: []const u8,
+    base: u21,
+    w: u2,
+    style: Style,
+    fg: Color,
+) void {
+    const cell = self.getCell(row, col);
+    cell.codepoint = base;
+    cell.style = style;
+    cell.fg = fg;
+    cell.continuation = false;
+
+    // Simple cluster: `bytes` matches the UTF-8 length of the base codepoint
+    // alone, so the renderer's single-codepoint path handles it correctly.
+    const base_len: usize = std.unicode.utf8CodepointSequenceLength(base) catch bytes.len;
+    if (bytes.len == base_len) {
+        cell.cluster_id = 0;
+    } else {
+        cell.cluster_id = self.internCluster(bytes) catch blk: {
+            // Allocation failure: fall back to base-only rendering. The
+            // cluster loses its joiners visually but the cell stays valid.
+            log.warn("cluster intern OOM, falling back to base codepoint U+{X:0>4}", .{@as(u32, base)});
+            break :blk 0;
+        };
+    }
+
+    if (w == 2) {
+        const cont = self.getCell(row, col + 1);
+        cont.codepoint = ' ';
+        cont.style = style;
+        cont.fg = fg;
+        cont.continuation = true;
+        cont.cluster_id = 0;
+    }
+}
+
+/// Append `bytes` to the side table and return a 1-based cluster_id. Caller
+/// is responsible for storing the id on a Cell. Non-zero ID guarantees the
+/// entry is reachable via `clusterBytes`.
+fn internCluster(self: *Screen, bytes: []const u8) !u16 {
+    if (self.cluster_index.items.len >= std.math.maxInt(u16)) {
+        return error.ClusterTableFull;
+    }
+    const start: u32 = @intCast(self.cluster_bytes.items.len);
+    try self.cluster_bytes.appendSlice(self.allocator, bytes);
+    errdefer self.cluster_bytes.shrinkRetainingCapacity(start);
+    try self.cluster_index.append(self.allocator, .{ .start = start, .len = @intCast(bytes.len) });
+    return @intCast(self.cluster_index.items.len);
+}
+
+/// Return the UTF-8 byte slice for a given cluster_id. Caller must ensure
+/// `id != 0` and that the id was assigned during the current frame.
+fn clusterBytes(self: *const Screen, id: u16) []const u8 {
+    const entry = self.cluster_index.items[id - 1];
+    return self.cluster_bytes.items[entry.start..][0..entry.len];
+}
+
 /// Write a UTF-8 string into the screen grid at (row, col), clipping to screen width.
 /// Decodes multi-byte UTF-8 sequences into codepoints. Invalid sequences are
 /// replaced with U+FFFD. Returns the column after the last written character.
@@ -172,23 +279,14 @@ pub fn writeStr(self: *Screen, row: u16, col: u16, text: []const u8, style: Styl
     var c = col;
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
-    while (width_mod.nextCluster(&iter)) |cluster| {
+    while (true) {
         if (row >= self.height) break;
+        const cluster_start = iter.i;
+        const cluster = width_mod.nextCluster(&iter) orelse break;
         const w = cluster.width;
         if (w == 0) continue;
         if (c + w > self.width) break;
-        const cell = self.getCell(row, c);
-        cell.codepoint = cluster.base;
-        cell.style = style;
-        cell.fg = fg;
-        cell.continuation = false;
-        if (w == 2) {
-            const cont = self.getCell(row, c + 1);
-            cont.codepoint = ' ';
-            cont.style = style;
-            cont.fg = fg;
-            cont.continuation = true;
-        }
+        self.writeCluster(row, c, text[cluster_start..][0..cluster.byte_len], cluster.base, w, style, fg);
         c += w;
     }
     return c;
@@ -210,8 +308,10 @@ pub fn writeStrWrapped(
     var col = start_col;
     const view = std.unicode.Utf8View.initUnchecked(text);
     var iter = view.iterator();
-    while (width_mod.nextCluster(&iter)) |cluster| {
+    while (true) {
         if (row >= max_row) break;
+        const cluster_start = iter.i;
+        const cluster = width_mod.nextCluster(&iter) orelse break;
         const w = cluster.width;
         if (w == 0) continue;
         if (col + w > max_col) {
@@ -220,18 +320,7 @@ pub fn writeStrWrapped(
             if (row >= max_row) break;
             if (col + w > max_col) break; // still won't fit - give up
         }
-        const cell = self.getCell(row, col);
-        cell.codepoint = cluster.base;
-        cell.style = style;
-        cell.fg = fg;
-        cell.continuation = false;
-        if (w == 2) {
-            const cont = self.getCell(row, col + 1);
-            cont.codepoint = ' ';
-            cont.style = style;
-            cont.fg = fg;
-            cont.continuation = true;
-        }
+        self.writeCluster(row, col, text[cluster_start..][0..cluster.byte_len], cluster.base, w, style, fg);
         col += w;
     }
     return .{ .row = row, .col = col };
@@ -258,8 +347,18 @@ pub fn clearRect(self: *Screen, y: u16, x: u16, width: u16, height: u16) void {
 }
 
 /// Compare two cells field by field.
+///
+/// Cluster IDs live only for the duration of a single render: `render()`
+/// zeroes every cell's `cluster_id` on both `current` and `previous`
+/// after emitting the frame, so on entry to the diff any non-zero id in
+/// either grid necessarily belongs to the frame being drawn now. A
+/// cluster cell whose bytes are unchanged from the prior frame still
+/// diffs as dirty because previous's id is 0; that conservative redraw
+/// is the price of keeping the side table bounded, and it matches the
+/// "a grapheme moved/changed/appeared/disappeared" cases we care about.
 fn cellsEqual(a: Cell, b: Cell) bool {
     if (a.codepoint != b.codepoint) return false;
+    if (a.cluster_id != b.cluster_id) return false;
     if (!colorsEqual(a.fg, b.fg)) return false;
     if (!colorsEqual(a.bg, b.bg)) return false;
     if (@as(u6, @bitCast(a.style)) != @as(u6, @bitCast(b.style))) return false;
@@ -366,7 +465,11 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
                 while (c < run_end) : (c += 1) {
                     const run_cell = self.current[row_base + c];
                     if (run_cell.continuation) continue;
-                    try writeCodepoint(writer, run_cell.codepoint);
+                    if (run_cell.cluster_id != 0) {
+                        try writer.writeAll(self.clusterBytes(run_cell.cluster_id));
+                    } else {
+                        try writeCodepoint(writer, run_cell.codepoint);
+                    }
                 }
 
                 col = run_end;
@@ -424,6 +527,25 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         var copy_span = trace.span("copy_frame");
         defer copy_span.end();
         @memcpy(self.previous, self.current);
+    }
+
+    // Tear down the per-frame cluster side table. Order matters: the
+    // memcpy above has already snapshotted `current` into `previous` with
+    // cluster_ids intact, so nothing downstream still needs the bytes. We
+    // then (a) zero cluster_id on both grids and (b) clear the side table.
+    // Because both grids are zeroed in lockstep, next frame's diff compares
+    // 0-vs-0 for unchanged cells (equal, skipped) and non-zero-vs-0 for any
+    // newly interned cluster (unequal, repainted), which is the behavior
+    // `cellsEqual` documents. Capacity is retained on both buffers so a
+    // steady stream of the same handful of clusters reuses the same
+    // backing allocation instead of malloc-ing every frame.
+    {
+        var clear_span = trace.span("cluster_reset");
+        defer clear_span.end();
+        for (self.current) |*cell| cell.cluster_id = 0;
+        for (self.previous) |*cell| cell.cluster_id = 0;
+        self.cluster_bytes.clearRetainingCapacity();
+        self.cluster_index.clearRetainingCapacity();
     }
 }
 
@@ -1289,6 +1411,135 @@ test "writeStr: combining mark fuses into preceding letter without extra cell" {
     try testing.expectEqual(@as(u16, 2), end_col);
     try testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 0).codepoint);
     try testing.expectEqual(@as(u21, 'b'), screen.getCellConst(0, 1).codepoint);
+}
+
+test "render clears cluster side table so ZWJ repaint does not grow it" {
+    var screen = try Screen.init(testing.allocator, 10, 1);
+    defer screen.deinit();
+
+    // Man + ZWJ + Woman + ZWJ + Girl = one 2-col cluster, many bytes.
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+
+    _ = screen.writeStr(0, 0, family, .{}, .default);
+    // During paint (before render) the side table must hold the cluster bytes.
+    try testing.expect(screen.cluster_bytes.items.len > 0);
+    try testing.expect(screen.cluster_index.items.len == 1);
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+    try screen.render(write_end);
+    write_end.close();
+    var scratch: [1024]u8 = undefined;
+    _ = try readPipe(read_end, &scratch);
+
+    // After render the side table must be drained; the cluster_id allocator
+    // (cluster_index.items.len + 1) must be back at 1.
+    try testing.expectEqual(@as(usize, 0), screen.cluster_bytes.items.len);
+    try testing.expectEqual(@as(usize, 0), screen.cluster_index.items.len);
+    // Both grids must have had their cluster_id fields zeroed.
+    try testing.expectEqual(@as(u16, 0), screen.current[0].cluster_id);
+    try testing.expectEqual(@as(u16, 0), screen.previous[0].cluster_id);
+
+    // Repaint the same cluster. The side table should now hold exactly one
+    // entry again - not two, not doubled.
+    _ = screen.writeStr(0, 0, family, .{}, .default);
+    try testing.expectEqual(@as(usize, 1), screen.cluster_index.items.len);
+    const bytes_after_repaint = screen.cluster_bytes.items.len;
+    try testing.expect(bytes_after_repaint > 0);
+
+    // Second render drains again.
+    const pipe2 = try std.posix.pipe();
+    const write_end2: std.fs.File = .{ .handle = pipe2[1] };
+    const read_end2: std.fs.File = .{ .handle = pipe2[0] };
+    defer read_end2.close();
+    try screen.render(write_end2);
+    write_end2.close();
+    _ = try readPipe(read_end2, &scratch);
+    try testing.expectEqual(@as(usize, 0), screen.cluster_bytes.items.len);
+    try testing.expectEqual(@as(usize, 0), screen.cluster_index.items.len);
+}
+
+test "render keeps cluster side table bounded across many frames" {
+    var screen = try Screen.init(testing.allocator, 10, 1);
+    defer screen.deinit();
+
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    // First paint+render primes the reused capacity; after it, any frame
+    // that repaints the same cluster must not cause the items.len to grow.
+    _ = screen.writeStr(0, 0, family, .{}, .default);
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [1024]u8 = undefined;
+        _ = try readPipe(read_end, &scratch);
+    }
+
+    var frame: usize = 0;
+    while (frame < 1000) : (frame += 1) {
+        _ = screen.writeStr(0, 0, family, .{}, .default);
+        // Mid-frame the side table holds exactly one cluster.
+        try testing.expectEqual(@as(usize, 1), screen.cluster_index.items.len);
+
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [1024]u8 = undefined;
+        _ = try readPipe(read_end, &scratch);
+
+        // Post-render the side table is drained every single frame.
+        try testing.expectEqual(@as(usize, 0), screen.cluster_bytes.items.len);
+        try testing.expectEqual(@as(usize, 0), screen.cluster_index.items.len);
+    }
+}
+
+test "render emits full ZWJ cluster bytes across consecutive frames" {
+    var screen = try Screen.init(testing.allocator, 10, 1);
+    defer screen.deinit();
+
+    // Man + ZWJ + Woman + ZWJ + Girl. UTF-8 of the ZWJ codepoint is E2 80 8D.
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    const zwj_bytes = "\xE2\x80\x8D";
+
+    // Frame 1.
+    _ = screen.writeStr(0, 0, family, .{}, .default);
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [1024]u8 = undefined;
+        const output = try readPipe(read_end, &scratch);
+        try testing.expect(std.mem.indexOf(u8, output, family) != null);
+        try testing.expect(std.mem.indexOf(u8, output, zwj_bytes) != null);
+    }
+
+    // Frame 2: side table is empty on entry, paint + render again, and the
+    // full cluster bytes must still reach the terminal.
+    try testing.expectEqual(@as(usize, 0), screen.cluster_bytes.items.len);
+    _ = screen.writeStr(0, 0, family, .{}, .default);
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [1024]u8 = undefined;
+        const output = try readPipe(read_end, &scratch);
+        try testing.expect(std.mem.indexOf(u8, output, family) != null);
+        try testing.expect(std.mem.indexOf(u8, output, zwj_bytes) != null);
+    }
 }
 
 test "writeStrWrapped: ZWJ emoji respects cluster width at wrap boundary" {
