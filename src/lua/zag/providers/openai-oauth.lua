@@ -22,6 +22,17 @@ zag.provider {
       account_id_header = "chatgpt-account-id",
     },
   },
-  default_model = "gpt-5-codex",
-  models = { { id = "gpt-5-codex" } },
+  headers = {
+    { name = "OpenAI-Beta", value = "responses=experimental" },
+    { name = "originator",  value = "zag_cli" },
+    { name = "User-Agent",  value = "zag_cli" },
+  },
+  default_model = "gpt-5.2",
+  models = {
+    { id = "gpt-5.2",        label = "gpt-5.2 (recommended)", recommended = true, context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
+    { id = "gpt-5.4",        label = "gpt-5.4", context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
+    { id = "gpt-5.5",        label = "gpt-5.5", context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
+    { id = "gpt-5.1-codex",  label = "gpt-5.1-codex (requires Codex plan)", context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
+    { id = "gpt-5.2-codex",  label = "gpt-5.2-codex (requires Codex plan)", context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
+  },
 }

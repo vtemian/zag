@@ -7155,6 +7155,22 @@ test "stdlib: require(zag.providers.openai-oauth) registers openai-oauth with Co
         },
         else => return error.TestUnexpectedResult,
     }
+
+    try std.testing.expect(ep.models.len >= 5);
+    try std.testing.expectEqualStrings("gpt-5.2", ep.models[0].id);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
+
+    var found_openai_beta = false;
+    var found_originator = false;
+    var found_user_agent = false;
+    for (ep.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "OpenAI-Beta")) found_openai_beta = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "originator")) found_originator = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "User-Agent")) found_user_agent = true;
+    }
+    try std.testing.expect(found_openai_beta);
+    try std.testing.expect(found_originator);
+    try std.testing.expect(found_user_agent);
 }
 
 test "stdlib: require(zag.providers.anthropic-oauth) registers Claude Max spec" {
