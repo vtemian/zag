@@ -705,3 +705,7 @@ test "signalNameToNum maps the common signals" {
     try testing.expectEqual(@as(?u8, std.posix.SIG.CONT), signalNameToNum("CONT"));
     try testing.expect(signalNameToNum("BOGUS") == null);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

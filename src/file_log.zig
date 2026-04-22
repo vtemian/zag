@@ -171,3 +171,7 @@ test "resolvePath returns $HOME/.zag/logs/<uuid>.log" {
     try std.testing.expect(std.mem.indexOf(u8, path, "/.zag/logs/") != null);
     try std.testing.expect(std.mem.endsWith(u8, path, ".log"));
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

@@ -130,3 +130,7 @@ test "Queue.push writes one byte to wake_fd" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(u8, 1), buf[0]);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

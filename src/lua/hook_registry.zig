@@ -175,7 +175,7 @@ pub const HookDispatcher = struct {
                 // wait-for-retirement loop. The offending task was still
                 // retired by the engine; the next iteration's anyHookAlive
                 // check will notice if we're truly stuck.
-                log.warn("hook drain resume failed: {} — continuing", .{err});
+                log.warn("hook drain resume failed: {}, continuing", .{err});
                 break :blk false;
             };
             if (!did_work) {
