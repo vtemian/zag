@@ -184,6 +184,25 @@ pub fn appendToNode(self: *ConversationTree, node: *Node, text: []const u8) !voi
     self.dirty_nodes.push(node.id);
 }
 
+/// Remove `node` from its parent's child list (or from the root list
+/// if `parent` is null), then free the node and all its descendants.
+/// The removed id is pushed onto `dirty_nodes` so the cache drops the
+/// corresponding entry on the next drain. Bumps `generation`.
+pub fn removeNode(self: *ConversationTree, node: *Node) void {
+    const id = node.id;
+    const list = if (node.parent) |p| &p.children else &self.root_children;
+    for (list.items, 0..) |candidate, i| {
+        if (candidate == node) {
+            _ = list.orderedRemove(i);
+            break;
+        }
+    }
+    node.deinit(self.allocator);
+    self.allocator.destroy(node);
+    self.generation +%= 1;
+    self.dirty_nodes.push(id);
+}
+
 /// Drop every node and reset the id counter. The caller's cache should
 /// be wiped (`invalidateAll`) in the same beat since every id is gone.
 pub fn clear(self: *ConversationTree) void {

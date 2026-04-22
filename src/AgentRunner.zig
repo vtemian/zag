@@ -377,7 +377,7 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
     for (drain[0..count]) |event| {
         if (self.view.scroll_offset != 0) {
             self.view.scroll_offset = 0;
-            self.view.render_dirty = true;
+            self.view.scroll_dirty = true;
         }
         self.handleAgentEvent(event, allocator);
 
@@ -399,16 +399,9 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
 pub fn resetCurrentAssistantText(self: *AgentRunner) void {
     const node = self.current_assistant_node orelse return;
     self.current_assistant_node = null;
-
-    for (self.view.tree.root_children.items, 0..) |child, i| {
-        if (child == node) {
-            _ = self.view.tree.root_children.orderedRemove(i);
-            break;
-        }
-    }
-    node.deinit(self.view.allocator);
-    self.view.allocator.destroy(node);
-    self.view.render_dirty = true;
+    // Delegates through the tree so generation bumps and the removed
+    // id lands in `dirty_nodes` for the compositor's cache drain.
+    self.view.tree.removeNode(node);
 }
 
 /// Process a single agent event: update the view tree and persist to

@@ -45,9 +45,15 @@ tree: ConversationTree,
 allocator: Allocator,
 /// Scroll offset from the bottom (0 = scrolled to latest content).
 scroll_offset: u32 = 0,
-/// Whether the buffer has visual changes since the last composite.
-/// Set on content/structure mutations, cleared by the compositor.
-render_dirty: bool = false,
+/// Last `tree.generation` observed by `clearDirty`. `isDirty` returns
+/// true whenever the tree has advanced past this value, so every
+/// `appendNode`/`appendToNode`/`clear` call is automatically visible
+/// without a separate dirty flag.
+last_seen_generation: u32 = 0,
+/// Separate dirty channel for view-only changes (scroll, focus) that
+/// don't mutate the tree. `isDirty` ORs this with the generation
+/// check; `clearDirty` resets it to false.
+scroll_dirty: bool = false,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 /// Memoized NodeRenderer output, keyed by (node.id, node.content_version).
@@ -95,12 +101,10 @@ pub fn deinit(self: *ConversationBuffer) void {
 
 /// Create a new node and attach it to `parent`. If `parent` is null the node
 /// is appended to the tree's root children list. Delegates to
-/// `ConversationTree.appendNode` and flips `render_dirty` so the
-/// compositor repaints on the next frame.
+/// `ConversationTree.appendNode`; the tree's generation bump is what
+/// `isDirty()` observes, so no separate dirty flag is needed.
 pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
-    const node = try self.tree.appendNode(parent, node_type, content);
-    self.render_dirty = true;
-    return node;
+    return self.tree.appendNode(parent, node_type, content);
 }
 
 /// Walk the tree and return styled display lines for the visible range.
@@ -249,10 +253,10 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer) !usize {
 }
 
 /// Append text to an existing node's content. Used for streaming: text
-/// deltas accumulate into one node. Delegates to `ConversationTree`.
+/// deltas accumulate into one node. Delegates to `ConversationTree`;
+/// the tree's generation bump is what `isDirty()` observes.
 pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !void {
     try self.tree.appendToNode(node, text);
-    self.render_dirty = true;
 }
 
 /// Populate the node tree from loaded JSONL entries. The tool_result
@@ -277,17 +281,19 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .session_start, .session_rename => {},
         }
     }
-    self.render_dirty = true;
+    // Each appendNode already bumped tree.generation, so isDirty() will
+    // pick this up on the next compositor pass without a separate flag.
 }
 
 /// Remove all nodes from the buffer and wipe the cache. The tree's
 /// `clear` signals cache-wide invalidation via the dirty ring's
 /// overflow flag; we explicitly wipe the cache here to free those
 /// entries before their borrowed span text is freed by the tree.
+/// Also bumps tree.generation so `isDirty()` fires even if the tree
+/// was already empty.
 pub fn clear(self: *ConversationBuffer) void {
     self.cache.invalidateAll();
     self.tree.clear();
-    self.render_dirty = true;
 }
 
 /// Append a user_message node at the root of the tree and return it.
@@ -299,8 +305,8 @@ pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
 // -- Draft input --------------------------------------------------------
 
 /// Append a single byte to the draft. No-op if the draft is full.
-/// Does not touch `render_dirty`. The compositor repaints the prompt
-/// every frame anyway.
+/// Does not touch the dirty channels; the compositor repaints the
+/// prompt every frame regardless of buffer-level dirty state.
 pub fn appendToDraft(self: *ConversationBuffer, ch: u8) void {
     if (self.draft_len >= self.draft.len) return;
     self.draft[self.draft_len] = ch;
@@ -419,7 +425,7 @@ fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     if (self.scroll_offset == offset) return;
     self.scroll_offset = offset;
-    self.render_dirty = true;
+    self.scroll_dirty = true;
 }
 
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {
@@ -429,12 +435,13 @@ fn bufLineCount(ptr: *anyopaque) anyerror!usize {
 
 fn bufIsDirty(ptr: *anyopaque) bool {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.render_dirty;
+    return self.tree.currentGeneration() != self.last_seen_generation or self.scroll_dirty;
 }
 
 fn bufClearDirty(ptr: *anyopaque) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    self.render_dirty = false;
+    self.last_seen_generation = self.tree.currentGeneration();
+    self.scroll_dirty = false;
 }
 
 /// Handle a key event aimed at the buffer's in-progress draft. The
