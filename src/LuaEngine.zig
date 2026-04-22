@@ -6668,8 +6668,8 @@ test "require('zag.providers.anthropic') resolves from embedded stdlib" {
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    // The stdlib files are Phase-F1 placeholders (a single Lua comment,
-    // no return value). require() should complete without error and the
+    // The stdlib file calls `zag.provider{...}` for its side effect and
+    // returns nothing. require() should complete without error and the
     // result should be the Lua 5.4 default (boolean true) for modules
     // that don't return anything.
     try engine.lua.doString("ok = require('zag.providers.anthropic')");
@@ -6718,7 +6718,7 @@ test "require falls through to embedded when user dir file missing" {
     engine.storeSelfPointer();
 
     // Point user_dir at an empty tmp; the user searcher finds nothing there
-    // and the embedded searcher serves the placeholder.
+    // and the embedded searcher serves the stdlib entry.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6745,4 +6745,98 @@ test "require raises a clean module-not-found error for unknown names" {
     try std.testing.expectError(error.LuaRuntime, result);
     // Drain the error message Lua pushed so later tests start with a clean stack.
     engine.lua.pop(1);
+}
+
+test "stdlib: require(zag.providers.anthropic) registers anthropic" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.anthropic')");
+
+    const ep = engine.providers_registry.find("anthropic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", ep.default_model);
+    try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
+    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    try std.testing.expect(std.meta.activeTag(ep.auth) == .x_api_key);
+    try std.testing.expectEqual(@as(usize, 1), ep.headers.len);
+    try std.testing.expectEqualStrings("anthropic-version", ep.headers[0].name);
+    try std.testing.expectEqualStrings("2023-06-01", ep.headers[0].value);
+}
+
+test "stdlib: require(zag.providers.openai) registers openai" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.openai')");
+
+    const ep = engine.providers_registry.find("openai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/chat/completions", ep.url);
+    try std.testing.expectEqualStrings("gpt-4o", ep.default_model);
+    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(usize, 2), ep.models.len);
+    try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
+    // cache_write_per_mtok is absent in the Lua file: readNullableFloat
+    // must leave it null rather than defaulting to 0.
+    try std.testing.expect(ep.models[0].cache_write_per_mtok == null);
+    try std.testing.expect(ep.models[0].cache_read_per_mtok != null);
+}
+
+test "stdlib: require(zag.providers.openrouter) registers openrouter" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.openrouter')");
+
+    const ep = engine.providers_registry.find("openrouter") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", ep.url);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", ep.default_model);
+    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(usize, 0), ep.models.len);
+    try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
+    try std.testing.expectEqual(@as(usize, 1), ep.headers.len);
+    try std.testing.expectEqualStrings("X-OpenRouter-Title", ep.headers[0].name);
+}
+
+test "stdlib: require(zag.providers.groq) registers groq" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.groq')");
+
+    const ep = engine.providers_registry.find("groq") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/chat/completions", ep.url);
+    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", ep.default_model);
+    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(usize, 0), ep.models.len);
+    try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
+}
+
+test "stdlib: require(zag.providers.ollama) registers ollama" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.providers.ollama')");
+
+    const ep = engine.providers_registry.find("ollama") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", ep.url);
+    try std.testing.expectEqualStrings("llama3", ep.default_model);
+    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(usize, 0), ep.models.len);
+    try std.testing.expect(std.meta.activeTag(ep.auth) == .none);
 }
