@@ -319,8 +319,13 @@ pub fn promptChoice(
 /// future fields (icon, disabled flag, keybind hint) can land without
 /// rippling through every call site.
 pub const PickerLabel = struct {
-    /// Rendered text for the row, e.g. `"OpenAI  (paste key)"`.
+    /// Rendered primary text for the row, e.g. `"OpenAI"` (padded to column
+    /// width by the caller). Rendered in bold on the cursor row.
     text: []const u8,
+    /// Optional secondary tag printed after `text`, e.g.
+    /// `"(OAuth \xc2\xb7 ChatGPT sign-in \xc2\xb7 recommended)"`. Always
+    /// rendered dim, independent of cursor state.
+    tag: ?[]const u8 = null,
 };
 
 /// Decoded action the picker should take after consuming an input byte.
@@ -378,6 +383,8 @@ fn parsePickerByte(state: *PickerParseState, byte: u8) PickerEvent {
         },
         '\r', '\n' => .commit,
         'q', 'Q' => .abort,
+        'j' => .down,
+        'k' => .up,
         else => .noop,
     };
 }
@@ -389,9 +396,18 @@ fn writePickerRewind(writer: *std.Io.Writer, lines: usize) !void {
     try writer.print("\x1b[{d}A\x1b[J", .{lines});
 }
 
+/// SGR escape sequences used by the picker. Hard-coded rather than pulled
+/// from `Theme` because the wizard runs before the TUI and before Lua
+/// config has chosen a colorscheme; bold/dim/reset respect whatever
+/// palette the user's terminal already has.
+const sgr_bold = "\x1b[1m";
+const sgr_dim = "\x1b[2m";
+const sgr_reset = "\x1b[0m";
+
 /// Render the current picker frame: prompt, blank line, labelled rows with
-/// a `>` gutter on the cursor row, blank line, navigation hint. Flushes so
-/// the frame lands before we block on `read`.
+/// a `>` gutter on the cursor row, blank line, navigation hint. The cursor
+/// label is rendered bold; any tag (parenthetical) is rendered dim; the
+/// hint is dim. Flushes so the frame lands before we block on `read`.
 fn renderPickerFrame(
     writer: *std.Io.Writer,
     prompt: []const u8,
@@ -402,24 +418,36 @@ fn renderPickerFrame(
     try writer.writeByte('\n');
     try writer.writeByte('\n');
     for (labels, 0..) |label, i| {
-        if (i == cursor) {
-            try writer.writeAll("  > ");
+        const selected = i == cursor;
+        if (selected) {
+            try writer.writeAll("  " ++ sgr_bold ++ "> ");
+            try writer.writeAll(label.text);
+            try writer.writeAll(sgr_reset);
         } else {
             try writer.writeAll("    ");
+            try writer.writeAll(label.text);
         }
-        try writer.writeAll(label.text);
+        if (label.tag) |tag| {
+            try writer.writeAll("  " ++ sgr_dim);
+            try writer.writeAll(tag);
+            try writer.writeAll(sgr_reset);
+        }
         try writer.writeByte('\n');
     }
     try writer.writeByte('\n');
-    try writer.writeAll("up/down to navigate . Enter to select . q to abort\n");
+    try writer.writeAll(sgr_dim);
+    try writer.writeAll("up/down or j/k to navigate . Enter to select . q to abort");
+    try writer.writeAll(sgr_reset);
+    try writer.writeByte('\n');
     try writer.flush();
 }
 
-/// Count of rendered rows to rewind over when redrawing:
-/// `labels.len` label rows + 1 blank after the prompt + 1 blank before the
-/// hint + 1 hint row. The prompt itself stays on screen across redraws.
+/// Count of rendered rows to rewind over when redrawing. Matches the row
+/// count emitted by `renderPickerFrame`: 1 prompt + 1 blank + labels.len +
+/// 1 blank + 1 hint. The whole frame is rewritten each tick so the prompt
+/// gets cleaned up instead of piling up on every keypress.
 fn pickerRewindLines(labels_len: usize) usize {
-    return labels_len + 3;
+    return labels_len + 4;
 }
 
 /// Interactive arrow-key picker over raw stdin. Reads one byte at a time
@@ -522,34 +550,54 @@ fn maxProviderLabelWidth() usize {
     return widest;
 }
 
-/// Render `entry` as a picker row: `"<label><padding>  (<tags>)"`. Tags are
-/// the auth-kind (`"API key"` or `"OAuth . ChatGPT sign-in"`, joined by
-/// U+00B7 MIDDLE DOT) plus an optional `"recommended"` marker. The caller
-/// owns the returned slice; free via the same allocator.
+/// Rendered pieces of a provider picker row. `text` is the padded provider
+/// name (e.g. `"OpenAI     "`); `tag` is the parenthetical auth-kind plus
+/// optional `"recommended"` marker. Both slices are heap-allocated and
+/// owned by the caller; free via `deinit`.
+const ProviderRow = struct {
+    text: []u8,
+    tag: []u8,
+
+    fn deinit(self: ProviderRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.tag);
+    }
+};
+
+/// Render `entry` as a padded provider name plus a separate parenthetical
+/// tag. Tags are the auth-kind (`"API key"` or
+/// `"OAuth \xc2\xb7 ChatGPT sign-in"`, joined by U+00B7 MIDDLE DOT) plus
+/// an optional `"recommended"` marker. Splitting the two halves lets the
+/// picker renderer dim the tag independently of the name.
 fn formatProviderLabel(
     allocator: std.mem.Allocator,
     entry: *const ProviderEntry,
-) ![]u8 {
+) !ProviderRow {
     const pad_to = maxProviderLabelWidth();
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, entry.label);
+    var text_buf: std.ArrayList(u8) = .empty;
+    errdefer text_buf.deinit(allocator);
+    try text_buf.appendSlice(allocator, entry.label);
     if (entry.label.len < pad_to) {
-        try buf.appendNTimes(allocator, ' ', pad_to - entry.label.len);
+        try text_buf.appendNTimes(allocator, ' ', pad_to - entry.label.len);
     }
-    try buf.appendSlice(allocator, "  (");
 
+    var tag_buf: std.ArrayList(u8) = .empty;
+    errdefer tag_buf.deinit(allocator);
+    try tag_buf.append(allocator, '(');
     switch (entry.kind) {
-        .oauth => try buf.appendSlice(allocator, "OAuth \xc2\xb7 ChatGPT sign-in"),
-        .api_key => try buf.appendSlice(allocator, "API key"),
+        .oauth => try tag_buf.appendSlice(allocator, "OAuth \xc2\xb7 ChatGPT sign-in"),
+        .api_key => try tag_buf.appendSlice(allocator, "API key"),
     }
     if (entry.recommended) {
-        try buf.appendSlice(allocator, " \xc2\xb7 recommended");
+        try tag_buf.appendSlice(allocator, " \xc2\xb7 recommended");
     }
-    try buf.append(allocator, ')');
+    try tag_buf.append(allocator, ')');
 
-    return buf.toOwnedSlice(allocator);
+    return .{
+        .text = try text_buf.toOwnedSlice(allocator),
+        .tag = try tag_buf.toOwnedSlice(allocator),
+    };
 }
 
 /// Drop a trailing `\r` so CRLF-terminated input from a Windows-era terminal
@@ -685,16 +733,16 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
             break :blk findProvider(forced) orelse return error.UnknownProvider;
         }
 
-        var label_bufs: [PROVIDERS.len][]u8 = undefined;
+        var rows: [PROVIDERS.len]ProviderRow = undefined;
         var built: usize = 0;
-        errdefer for (label_bufs[0..built]) |b| deps.allocator.free(b);
+        errdefer for (rows[0..built]) |r| r.deinit(deps.allocator);
         while (built < PROVIDERS.len) : (built += 1) {
-            label_bufs[built] = try formatProviderLabel(deps.allocator, &PROVIDERS[built]);
+            rows[built] = try formatProviderLabel(deps.allocator, &PROVIDERS[built]);
         }
-        defer for (label_bufs) |b| deps.allocator.free(b);
+        defer for (rows) |r| r.deinit(deps.allocator);
 
         var picker_labels: [PROVIDERS.len]PickerLabel = undefined;
-        for (label_bufs, 0..) |b, i| picker_labels[i] = .{ .text = b };
+        for (rows, 0..) |r, i| picker_labels[i] = .{ .text = r.text, .tag = r.tag };
 
         const choice = try promptPicker(
             &deps,
@@ -869,10 +917,10 @@ test "promptChoice retries on non-digit" {
     try testing.expectEqual(@as(usize, 2), choice);
 }
 
-test "parsePickerByte: 'j'/'k' are noop, only arrows move" {
+test "parsePickerByte: j moves down, k moves up (vim bindings)" {
     var state: PickerParseState = .{};
-    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'j'));
-    try testing.expectEqual(PickerEvent.noop, parsePickerByte(&state, 'k'));
+    try testing.expectEqual(PickerEvent.down, parsePickerByte(&state, 'j'));
+    try testing.expectEqual(PickerEvent.up, parsePickerByte(&state, 'k'));
 }
 
 test "parsePickerByte: down arrow is ESC [ B" {
@@ -1633,28 +1681,28 @@ test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped ent
 
 test "formatProviderLabel for openai-oauth shows OAuth . ChatGPT sign-in . recommended" {
     const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, entry);
-    defer testing.allocator.free(rendered);
-    const expected = "OpenAI      (OAuth \xc2\xb7 ChatGPT sign-in \xc2\xb7 recommended)";
-    try testing.expectEqualStrings(expected, rendered);
+    const row = try formatProviderLabel(testing.allocator, entry);
+    defer row.deinit(testing.allocator);
+    try testing.expectEqualStrings("OpenAI    ", row.text);
+    try testing.expectEqualStrings("(OAuth \xc2\xb7 ChatGPT sign-in \xc2\xb7 recommended)", row.tag);
 }
 
 test "formatProviderLabel for openai (api_key) shows API key" {
     const entry = findProvider("openai") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, entry);
-    defer testing.allocator.free(rendered);
-    const expected = "OpenAI      (API key)";
-    try testing.expectEqualStrings(expected, rendered);
+    const row = try formatProviderLabel(testing.allocator, entry);
+    defer row.deinit(testing.allocator);
+    try testing.expectEqualStrings("OpenAI    ", row.text);
+    try testing.expectEqualStrings("(API key)", row.tag);
 }
 
 test "formatProviderLabel pads anthropic to widest label width" {
     const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
-    const rendered = try formatProviderLabel(testing.allocator, entry);
-    defer testing.allocator.free(rendered);
+    const row = try formatProviderLabel(testing.allocator, entry);
+    defer row.deinit(testing.allocator);
     // "OpenRouter" is the widest label at 10 chars; "Anthropic" is 9, so one
-    // trailing space before the two-space gutter.
-    const expected = "Anthropic   (API key)";
-    try testing.expectEqualStrings(expected, rendered);
+    // trailing space in the padded name.
+    try testing.expectEqualStrings("Anthropic ", row.text);
+    try testing.expectEqualStrings("(API key)", row.tag);
 }
 
 test "removeAuth is a no-op for missing entry" {
