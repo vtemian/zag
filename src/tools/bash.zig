@@ -139,7 +139,8 @@ pub const definition = types.ToolDefinition{
     \\  "properties": {
     \\    "command": { "type": "string", "description": "Shell command to execute" }
     \\  },
-    \\  "required": ["command"]
+    \\  "required": ["command"],
+    \\  "additionalProperties": false
     \\}
     ,
 };

@@ -74,7 +74,8 @@ pub const definition = types.ToolDefinition{
     \\    "path": { "type": "string", "description": "Path to the file to write" },
     \\    "content": { "type": "string", "description": "Content to write to the file" }
     \\  },
-    \\  "required": ["path", "content"]
+    \\  "required": ["path", "content"],
+    \\  "additionalProperties": false
     \\}
     ,
 };

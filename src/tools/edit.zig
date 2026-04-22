@@ -153,7 +153,8 @@ pub const definition = types.ToolDefinition{
     \\    "old_text": { "type": "string", "description": "Exact text to find (must match once)" },
     \\    "new_text": { "type": "string", "description": "Text to replace old_text with" }
     \\  },
-    \\  "required": ["path", "old_text", "new_text"]
+    \\  "required": ["path", "old_text", "new_text"],
+    \\  "additionalProperties": false
     \\}
     ,
 };
