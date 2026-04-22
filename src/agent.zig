@@ -202,10 +202,26 @@ fn callLlm(
     };
 }
 
-/// Push token usage info to the UI queue.
+/// Push token usage info to the UI queue. When the response reports any
+/// cache-creation or cache-read tokens we append `, CW cw, CR cr` so the
+/// downstream parser can populate all four `llm.cost.Usage` fields.
+/// Old two-field form is preserved when both cache counts are zero so
+/// providers that don't cache don't grow the line.
 fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *agent_events.EventQueue) !void {
     var scratch: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
+    const has_cache = response.cache_creation_tokens > 0 or response.cache_read_tokens > 0;
+    const msg = if (has_cache)
+        std.fmt.bufPrint(
+            &scratch,
+            "tokens: {d} in, {d} out, {d} cw, {d} cr",
+            .{ response.input_tokens, response.output_tokens, response.cache_creation_tokens, response.cache_read_tokens },
+        ) catch "tokens: ?"
+    else
+        std.fmt.bufPrint(
+            &scratch,
+            "tokens: {d} in, {d} out",
+            .{ response.input_tokens, response.output_tokens },
+        ) catch "tokens: ?";
     const duped = try allocator.dupe(u8, msg);
     // pushWithBackpressure waits up to default_backpressure_ms for a slot
     // before giving up, logging a warn, freeing `duped` via freeOwned, and
@@ -647,6 +663,60 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "emitTokenUsage emits old two-field form when no cache counts" {
+    const allocator = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 4);
+    defer {
+        var drain_buf: [4]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+        queue.deinit();
+    }
+
+    const response = types.LlmResponse{
+        .content = &.{},
+        .stop_reason = .end_turn,
+        .input_tokens = 1000,
+        .output_tokens = 500,
+    };
+    try emitTokenUsage(response, allocator, &queue);
+
+    var drain_buf: [4]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&drain_buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    defer for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+    try std.testing.expectEqualStrings("tokens: 1000 in, 500 out", drain_buf[0].info);
+}
+
+test "emitTokenUsage extends format with cw/cr when cache counts non-zero" {
+    const allocator = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 4);
+    defer {
+        var drain_buf: [4]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+        queue.deinit();
+    }
+
+    const response = types.LlmResponse{
+        .content = &.{},
+        .stop_reason = .end_turn,
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_tokens = 200,
+        .cache_read_tokens = 300,
+    };
+    try emitTokenUsage(response, allocator, &queue);
+
+    var drain_buf: [4]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&drain_buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    defer for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+    try std.testing.expectEqualStrings("tokens: 1000 in, 500 out, 200 cw, 300 cr", drain_buf[0].info);
 }
 
 test "emitTokenUsage degrades to a drop when the queue is saturated" {

@@ -124,8 +124,8 @@ pub const Endpoint = struct {
     };
 
     /// Per-model rate card: context limits and dollar cost per million tokens.
-    /// Owned by the endpoint that serves the model, replacing the old
-    /// centralised `pricing.zig` table.
+    /// Owned by the endpoint that serves the model; `llm.cost.estimateCost`
+    /// looks entries up through the registry at turn boundaries.
     pub const ModelRate = struct {
         /// Provider-scoped model identifier (e.g., `"claude-sonnet-4-5"`).
         id: []const u8,
@@ -636,7 +636,7 @@ test "builtin anthropic endpoint carries sonnet-4 and opus-4 ModelRate entries" 
     try std.testing.expect(saw_sonnet and saw_opus);
 }
 
-test "builtin openai endpoint models match pricing.zig rates" {
+test "builtin openai endpoint seeds gpt-4o rate card" {
     var reg = try Registry.init(std.testing.allocator);
     defer reg.deinit();
     const ep = reg.find("openai").?;
@@ -652,25 +652,6 @@ test "builtin openai endpoint models match pricing.zig rates" {
         }
     }
     try std.testing.expect(saw_4o);
-}
-
-test "cost parity between llm.cost and pricing for seeded models" {
-    var reg = try Registry.init(std.testing.allocator);
-    defer reg.deinit();
-    const usage: @import("cost.zig").Usage = .{
-        .input_tokens = 1_234_567,
-        .output_tokens = 89_012,
-        .cache_creation_tokens = 45_678,
-        .cache_read_tokens = 12_345,
-    };
-    const old = @import("../pricing.zig").estimateCost("anthropic/claude-sonnet-4-20250514", .{
-        .input_tokens = usage.input_tokens,
-        .output_tokens = usage.output_tokens,
-        .cache_creation_tokens = usage.cache_creation_tokens,
-        .cache_read_tokens = usage.cache_read_tokens,
-    }).?;
-    const new = @import("cost.zig").estimateCost(&reg, "anthropic/claude-sonnet-4-20250514", usage).?;
-    try std.testing.expectApproxEqAbs(old, new, 0.000001);
 }
 
 test {

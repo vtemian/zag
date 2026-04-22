@@ -11,7 +11,6 @@ const Allocator = std.mem.Allocator;
 pub const anthropic = @import("providers/anthropic.zig");
 pub const openai = @import("providers/openai.zig");
 pub const chatgpt = @import("providers/chatgpt.zig");
-pub const pricing = @import("pricing.zig");
 pub const cost = @import("llm/cost.zig");
 pub const Usage = cost.Usage;
 pub const Trajectory = @import("Trajectory.zig");
