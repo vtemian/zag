@@ -70,7 +70,11 @@ pub fn handler(
     in_handler = true;
     defer in_handler = false;
 
-    var scratch: [4096]u8 = undefined;
+    // 32 KiB: large enough to hold a full Responses API request body
+    // snippet (cap is 16 KiB in streaming.zig) plus the prefix. stdlib
+    // bufPrint fails silently on NoSpaceLeft, so a too-small scratch
+    // silently drops long log lines (exactly what we need to debug).
+    var scratch: [32 * 1024]u8 = undefined;
     const scope_prefix = if (scope == .default) "default" else @tagName(scope);
     const prefix = formatPrefix(scratch[0..128], scope_prefix, @tagName(level)) catch return;
     const body = std.fmt.bufPrint(scratch[prefix.len..], format ++ "\n", args) catch return;
