@@ -47,6 +47,23 @@ pub const Endpoint = struct {
         none,
     };
 
+    /// Transitional tagged-union form of `Auth` that carries the full
+    /// `OAuthSpec` on the `oauth` variant instead of a provider-hardcoded
+    /// sentinel. Lives in parallel with the legacy `Auth` enum so Phases A
+    /// through H can migrate call sites one at a time; Phase I collapses the
+    /// duality by retiring `Auth`.
+    pub const AuthV2 = union(enum) {
+        /// Anthropic-style: `x-api-key: <key>`.
+        x_api_key: void,
+        /// Bearer token: `Authorization: Bearer <key>`.
+        bearer: void,
+        /// No authentication (e.g., local Ollama).
+        none: void,
+        /// OAuth access token, described generically by `OAuthSpec` rather
+        /// than a provider-specific enum tag.
+        oauth: OAuthSpec,
+    };
+
     /// A static HTTP header sent with every request to this endpoint.
     pub const Header = struct {
         /// Header field name.
@@ -437,6 +454,29 @@ test "OAuthSpec is copyable by value" {
     };
     const copy = spec;
     try std.testing.expectEqualStrings("a", copy.issuer);
+}
+
+test "AuthV2 oauth variant carries full spec" {
+    const auth: Endpoint.AuthV2 = .{ .oauth = .{
+        .issuer = "i",
+        .token_url = "t",
+        .client_id = "c",
+        .scopes = "s",
+        .redirect_port = 1,
+        .account_id_claim_path = null,
+        .extra_authorize_params = &.{},
+        .inject = .{
+            .header = "Authorization",
+            .prefix = "Bearer ",
+            .extra_headers = &.{},
+            .use_account_id = false,
+            .account_id_header = "",
+        },
+    } };
+    switch (auth) {
+        .oauth => |spec| try std.testing.expectEqualStrings("i", spec.issuer),
+        else => try std.testing.expect(false),
+    }
 }
 
 test "Endpoint.dupe copies default_model and models slice" {
