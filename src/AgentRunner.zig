@@ -218,6 +218,16 @@ pub fn formatAgentErrorMessage(
             "OAuth token expired. Re-run: zag --login={s}",
             .{provider_name},
         ),
+        error.ApiError => blk: {
+            // If the transport layer captured an upstream status and
+            // body, surface it so the UI shows something actionable
+            // instead of just "ApiError".
+            if (llm.error_detail.take()) |detail| {
+                defer allocator.free(detail);
+                break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{detail});
+            }
+            break :blk allocator.dupe(u8, "ApiError");
+        },
         else => allocator.dupe(u8, @errorName(err)),
     };
 }
@@ -900,11 +910,32 @@ test "formatAgentErrorMessage hints LoginExpired with provider name" {
     try std.testing.expectEqualStrings("OAuth token expired. Re-run: zag --login=openai-oauth", msg);
 }
 
-test "formatAgentErrorMessage falls back to error name for other errors" {
+test "formatAgentErrorMessage for ApiError without detail shows the error name" {
     const allocator = std.testing.allocator;
+    // Defensive clear in case a prior test left a detail in the slot.
+    llm.error_detail.clear(allocator);
     const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError", msg);
+}
+
+test "formatAgentErrorMessage for ApiError surfaces stored transport detail" {
+    const allocator = std.testing.allocator;
+    const detail = try allocator.dupe(u8, "HTTP 401 (unauthorized): {\"error\":\"bad token\"}");
+    llm.error_detail.set(allocator, detail);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings(
+        "ApiError: HTTP 401 (unauthorized): {\"error\":\"bad token\"}",
+        msg,
+    );
+}
+
+test "formatAgentErrorMessage falls back to error name for unhinted errors" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.MalformedResponse, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("MalformedResponse", msg);
 }
 
 test "current_caller_pane_id threadlocal is per-thread" {

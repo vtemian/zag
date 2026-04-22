@@ -9,6 +9,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Endpoint = @import("../llm.zig").Endpoint;
 const auth = @import("../auth.zig");
+const error_detail = @import("error_detail.zig");
+
+const log = std.log.scoped(.http);
+
+/// Cap on how many bytes of the response body we attach to the error
+/// detail. Enough to show a JSON error envelope; small enough to keep
+/// logs readable.
+const MAX_ERROR_BODY_BYTES: usize = 2048;
 
 /// Build HTTP headers from an endpoint's auth config plus a freshly-resolved
 /// credential out of `auth.json`. Every auth-header value is heap-allocated
@@ -133,7 +141,16 @@ pub fn httpPostJson(
     }) catch return error.ApiError;
 
     if (result.status != .ok) {
-        out.deinit();
+        const response_bytes = out.toOwnedSlice() catch &[_]u8{};
+        defer allocator.free(response_bytes);
+        const snippet = response_bytes[0..@min(response_bytes.len, MAX_ERROR_BODY_BYTES)];
+        log.err("http {d} {s}: {s}", .{ @intFromEnum(result.status), @tagName(result.status), snippet });
+        const detail = std.fmt.allocPrint(
+            allocator,
+            "HTTP {d} ({s}): {s}",
+            .{ @intFromEnum(result.status), @tagName(result.status), snippet },
+        ) catch return error.ApiError;
+        error_detail.set(allocator, detail);
         return error.ApiError;
     }
 
