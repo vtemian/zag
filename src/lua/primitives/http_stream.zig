@@ -645,3 +645,7 @@ test "HttpStreamHandle close interrupts blocked helper read" {
 
     try testing.expect(elapsed_ms < 1000);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

@@ -352,3 +352,7 @@ test "executeStat reports kind and size" {
     try testing.expectEqual(job_mod.FsKind.file, s.kind);
     try testing.expectEqual(@as(u64, 10), s.size);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

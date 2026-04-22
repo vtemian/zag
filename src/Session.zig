@@ -484,7 +484,7 @@ pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator
             }
         }
     } else |err| switch (err) {
-        error.FileNotFound => {}, // No JSONL yet — leave report at zero.
+        error.FileNotFound => {}, // No JSONL yet; leave report at zero.
         else => return err,
     }
 
@@ -949,8 +949,7 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
     try writeMetaFile(meta_path, &meta);
 
     // After a rename-based write, the tmp should no longer exist.
-    const stat_result = std.fs.cwd().statFile(stale_path);
-    try std.testing.expectError(error.FileNotFound, stat_result);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(stale_path));
 
     // The final file must be the freshly written content.
     const loaded = try readMetaFile(meta_path, allocator);

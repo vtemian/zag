@@ -105,9 +105,34 @@ fn freeCredential(alloc: Allocator, cred: Credential) void {
 /// unbounded memory into the parser.
 const max_auth_bytes: usize = 1 * 1024 * 1024;
 
+/// True iff `mode`'s group- and world-accessible bits are clear. The
+/// documented auth.json mode is `0o600`; any bit in `0o077` means the file
+/// is readable or writable by someone other than the owner, and the loader
+/// should warn loudly instead of silently accepting the drift.
+pub fn checkFileMode(mode: std.posix.mode_t) bool {
+    return (mode & 0o077) == 0;
+}
+
 /// Load the auth file at `path`. A missing file returns an empty `AuthFile`
 /// (first-run UX). Any other IO or parse failure surfaces as an error.
 pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
+    // Stat first so we can warn on wrong mode without failing the load.
+    // Windows has no POSIX mode bits, so skip the check there.
+    if (@import("builtin").os.tag != .windows) {
+        if (std.fs.cwd().statFile(path)) |stat| {
+            const mode: std.posix.mode_t = @intCast(stat.mode & 0o7777);
+            if (!checkFileMode(mode)) {
+                log.warn("auth file at '{s}' has mode 0o{o} (expected 0o600); credentials may be readable by other users", .{ path, mode });
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            // The actual load path below re-surfaces this class of error
+            // with full context; we skip the mode check and log at debug
+            // so the stat failure isn't silently discarded.
+            else => |e| log.debug("stat for mode check failed: {s}", .{@errorName(e)}),
+        }
+    }
+
     const bytes = std.fs.cwd().readFileAlloc(alloc, path, max_auth_bytes) catch |err| switch (err) {
         error.FileNotFound => return AuthFile.init(alloc),
         else => return err,
@@ -244,6 +269,18 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 }
 
 // -- Tests -----------------------------------------------------------------
+
+test "checkFileMode flags world- or group-accessible bits" {
+    // 0o600 is the documented auth.json mode. Any bit in 0o077 means the file
+    // is readable or writable by someone other than the owner, which is
+    // exactly the drift loadAuthFile warns about.
+    try std.testing.expect(checkFileMode(0o600));
+    try std.testing.expect(checkFileMode(0o400));
+    try std.testing.expect(!checkFileMode(0o644));
+    try std.testing.expect(!checkFileMode(0o660));
+    try std.testing.expect(!checkFileMode(0o666));
+    try std.testing.expect(!checkFileMode(0o777));
+}
 
 test "loadAuthFile returns empty map when file missing" {
     var tmp = std.testing.tmpDir(.{});
@@ -407,4 +444,8 @@ test "loadAuthFile rejects oauth entries with UnknownCredentialType" {
         error.UnknownCredentialType,
         loadAuthFile(std.testing.allocator, path),
     );
+}
+
+test {
+    @import("std").testing.refAllDecls(@This());
 }

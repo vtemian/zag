@@ -271,3 +271,7 @@ test "Scope.cancel leaves state active when snapshot alloc fails" {
     try testing.expect(!child.isCancelled()); // cascade never happened
     try testing.expect(root.reason == null);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

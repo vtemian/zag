@@ -378,3 +378,7 @@ test "executeExec cancels in-flight child via aborter" {
     // Must have terminated far short of the 5s sleep and well before 30s timeout.
     try testing.expect(elapsed < 1000);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
