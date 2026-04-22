@@ -364,6 +364,14 @@ pub const LuaEngine = struct {
         lua.setField(-2, "resize");
         lua.setField(-2, "layout"); // zag.layout = layout_table; [zag_table]
 
+        // zag.pane; per-pane inspection primitives. Mirrors the
+        // `pane_read` tool so plugins can snapshot a pane's rendered
+        // text without a tool-call round-trip.
+        lua.newTable(); // [zag_table, pane_table]
+        lua.pushFunction(zlua.wrap(zagPaneReadFn));
+        lua.setField(-2, "read");
+        lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
+
         // Private log entrypoints consumed by the Lua-side wrappers in
         // combinators.lua. User code calls `zag.log.info(fmt, ...)`; the
         // Lua wrapper runs string.format and hands the result to these.
@@ -2199,6 +2207,45 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("%s", .{msg.ptr});
         };
         return 0;
+    }
+
+    /// `zag.pane.read(id, lines?)`: return a snapshot of the pane's
+    /// rendered text as a Lua table `{ ok, text, total_lines, truncated }`,
+    /// mirroring the `pane_read` tool. `lines` caps the number of lines
+    /// returned (defaults to the WindowManager default when omitted).
+    fn zagPaneReadFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.read: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.read");
+
+        var lines_opt: ?u32 = null;
+        if (!lua.isNoneOrNil(2)) {
+            if (lua.typeOf(2) != .number) {
+                lua.raiseErrorStr("zag.pane.read: lines must be an integer", .{});
+            }
+            const n = lua.toInteger(2) catch {
+                lua.raiseErrorStr("zag.pane.read: lines must be an integer", .{});
+            };
+            if (n < 0) {
+                lua.raiseErrorStr("zag.pane.read: lines must be non-negative", .{});
+            }
+            lines_opt = @intCast(n);
+        }
+
+        const bytes = wm.readPaneById(engine.allocator, handle, lines_opt, null) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.read: {s}", .{@errorName(err)}) catch "zag.pane.read failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        defer engine.allocator.free(bytes);
+        lua_json.pushJsonAsTable(lua, bytes, engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.read: decode failed: {s}", .{@errorName(err)}) catch "zag.pane.read: decode failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 1;
     }
 
     /// Call once during LuaEngine.init after openLibs to register the
