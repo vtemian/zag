@@ -75,6 +75,11 @@ compositor: *Compositor,
 root_pane: Pane,
 /// LLM provider for model calls and model ID lookups (borrowed).
 provider: *llm.ProviderResult,
+/// Endpoint registry borrowed from the Lua engine (or a fallback when
+/// Lua init failed). Used by `/model` to enumerate every registered
+/// provider/model pair for the picker. Optional so tests that never
+/// touch the picker can leave it unset.
+registry: ?*const llm.Registry = null,
 /// Session manager for persistence (optional) (borrowed).
 session_mgr: *?Session.SessionManager,
 /// Lua plugin engine, or null if Lua init failed (borrowed).
@@ -108,6 +113,22 @@ current_mode: Keymap.Mode = .insert,
 /// failed). Default timeouts apply. Ownership lives on the engine
 /// otherwise; see `inputParser()`.
 fallback_input_parser: input.Parser = .{},
+/// Non-null means a model picker is waiting for the user's next input
+/// (digit or q). Each entry is an allocator-owned snapshot of the
+/// flattened (provider, model_id) list; the typed digit maps 1-based
+/// into this slice so the follow-up handler does not have to re-query
+/// the registry (which plugins may have mutated in between).
+pending_model_pick: ?[]PendingPickEntry = null,
+
+/// One flattened entry in the `/model` picker. Both strings are owned
+/// by WindowManager.allocator and freed by `clearPendingModelPick`.
+pub const PendingPickEntry = struct {
+    /// Provider name (e.g. `"anthropic"`). Owned.
+    provider: []u8,
+    /// Model id within that provider (e.g. `"claude-sonnet-4-20250514"`).
+    /// Owned.
+    model_id: []u8,
+};
 
 pub const Config = struct {
     /// Heap allocator for runtime allocations owned by the manager.
@@ -122,6 +143,10 @@ pub const Config = struct {
     root_pane: Pane,
     /// LLM provider for model calls and model ID lookups (borrowed).
     provider: *llm.ProviderResult,
+    /// Endpoint registry borrowed from the Lua engine (or a fallback).
+    /// Null only when the caller has no registry to share (e.g. a test
+    /// that never invokes the model picker).
+    registry: ?*const llm.Registry = null,
     /// Session manager for persistence, optional at the pointee (borrowed).
     session_mgr: *?Session.SessionManager,
     /// Lua plugin engine, or null if Lua init failed (borrowed).
@@ -138,6 +163,7 @@ pub fn init(cfg: Config) !WindowManager {
         .compositor = cfg.compositor,
         .root_pane = cfg.root_pane,
         .provider = cfg.provider,
+        .registry = cfg.registry,
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
@@ -188,6 +214,7 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// by the caller *before* this runs: runners hold buffers read by their
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
+    self.clearPendingModelPick();
     for (self.extra_panes.items) |entry| {
         if (entry.session_handle) |sh| {
             sh.close();
@@ -871,6 +898,91 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
 pub fn appendStatus(self: *WindowManager, text: []const u8) void {
     _ = self.root_pane.view.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
+}
+
+/// Return the provider name embedded in `self.provider.model_id`, which
+/// has the shape `"provider/id"`. Returns the whole string if no slash
+/// is present so the caller never crashes on a malformed id.
+fn currentProviderName(self: *const WindowManager) []const u8 {
+    const id = self.provider.model_id;
+    const slash = std.mem.indexOfScalar(u8, id, '/') orelse return id;
+    return id[0..slash];
+}
+
+/// Release every entry stored in `pending_model_pick` and reset the
+/// field to null. Safe to call when the field is already null.
+fn clearPendingModelPick(self: *WindowManager) void {
+    const list = self.pending_model_pick orelse return;
+    for (list) |e| {
+        self.allocator.free(e.provider);
+        self.allocator.free(e.model_id);
+    }
+    self.allocator.free(list);
+    self.pending_model_pick = null;
+}
+
+/// Render a numbered list of every registered provider/model pair into
+/// the root status buffer and stash an allocator-owned snapshot in
+/// `pending_model_pick` so the next keystroke can resolve to a pick.
+/// Marks the row whose provider/model_id matches the current provider
+/// with a `(current)` suffix.
+pub fn renderModelPicker(self: *WindowManager) !void {
+    self.clearPendingModelPick();
+
+    const registry = self.registry orelse return error.NoRegistry;
+    const current_provider = self.currentProviderName();
+    const current_model_id = blk: {
+        const id = self.provider.model_id;
+        const slash = std.mem.indexOfScalar(u8, id, '/') orelse break :blk id;
+        break :blk id[slash + 1 ..];
+    };
+
+    var entries: std.ArrayList(PendingPickEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            self.allocator.free(e.provider);
+            self.allocator.free(e.model_id);
+        }
+        entries.deinit(self.allocator);
+    }
+
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(self.allocator);
+    try header.appendSlice(self.allocator, "Pick a model:\n");
+
+    for (registry.endpoints.items) |ep| {
+        for (ep.models) |m| {
+            const idx = entries.items.len + 1;
+            const display_label = m.label orelse m.id;
+            const is_current = std.mem.eql(u8, ep.name, current_provider) and
+                std.mem.eql(u8, m.id, current_model_id);
+            const line = try std.fmt.allocPrint(
+                self.allocator,
+                "  [{d}] {s}/{s}{s}\n",
+                .{
+                    idx,
+                    ep.name,
+                    display_label,
+                    if (is_current) "  (current)" else "",
+                },
+            );
+            defer self.allocator.free(line);
+            try header.appendSlice(self.allocator, line);
+
+            const duped_provider = try self.allocator.dupe(u8, ep.name);
+            errdefer self.allocator.free(duped_provider);
+            const duped_model = try self.allocator.dupe(u8, m.id);
+            errdefer self.allocator.free(duped_model);
+            try entries.append(self.allocator, .{
+                .provider = duped_provider,
+                .model_id = duped_model,
+            });
+        }
+    }
+    try header.appendSlice(self.allocator, "Type a number and press Enter, or q to cancel.\n");
+
+    self.appendStatus(header.items);
+    self.pending_model_pick = try entries.toOwnedSlice(self.allocator);
 }
 
 /// Handle `/perf` (summary) or `/perf-dump` (write trace file).

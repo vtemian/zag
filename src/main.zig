@@ -1264,6 +1264,7 @@ pub fn main() !void {
         .root_pane = root_pane,
         .provider = &provider,
         .registry = &registry,
+        .endpoint_registry = registry_ptr,
         .session_mgr = &session_mgr,
         .lua_engine = if (lua_engine) |*eng| eng else null,
         .stdout_file = stdout_file,
