@@ -127,19 +127,24 @@ pub const StreamingResponse = struct {
         };
 
         if (response.head.status != .ok) {
-            // Body drainage on the streaming path panics inside the
-            // stdlib reader on some 4xx shapes (observed on ChatGPT
-            // OAuth 401s: readSliceShort dives into defaultReadVec and
-            // aborts). Until that's understood, surface status + tag
-            // only; the plain HTTP path in http.zig still captures
-            // full body snippets for non-streaming errors.
-            log.err("streaming: HTTP {d} {s}", .{
+            // Body drainage on the streaming path panicked in stdlib
+            // reader under some 4xx shapes so we skip it for now. To
+            // compensate for the missing response body, log the
+            // request URL and body snippet we sent: most 4xx failures
+            // are payload shape bugs, and seeing what we sent is
+            // sufficient to diagnose them. The plain HTTP path in
+            // http.zig still captures response body snippets for
+            // non-streaming errors.
+            const req_snippet = body[0..@min(body.len, MAX_ERROR_BODY_BYTES)];
+            log.err("streaming: HTTP {d} {s}. url={s} sent_body={s}", .{
                 @intFromEnum(response.head.status),
                 @tagName(response.head.status),
+                url,
+                req_snippet,
             });
             if (std.fmt.allocPrint(
                 allocator,
-                "HTTP {d} ({s})",
+                "HTTP {d} ({s}). Check ~/.zag/logs for the request body.",
                 .{ @intFromEnum(response.head.status), @tagName(response.head.status) },
             )) |detail| {
                 error_detail.set(allocator, detail);
