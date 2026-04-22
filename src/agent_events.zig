@@ -46,6 +46,11 @@ pub const AgentEvent = union(enum) {
     /// Round-trip: a worker or agent thread asks main to execute a
     /// Lua-defined tool. The request is caller-owned.
     lua_tool_request: *Hooks.LuaToolRequest,
+    /// Round-trip: a worker or agent thread asks main to perform a
+    /// layout operation (describe, focus, split, close, resize, read_pane).
+    /// The request is caller-owned; only the main thread touches the
+    /// window tree so every mutation funnels through this variant.
+    layout_request: *LayoutRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -93,7 +98,7 @@ pub const AgentEvent = union(enum) {
             // the request struct and its payload. Dropping the event from
             // the queue without delivery leaves the waiter blocked, which
             // is a design problem above this layer, not a leak here.
-            .done, .reset_assistant_text, .hook_request, .lua_tool_request => {},
+            .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request => {},
         }
     }
 };
@@ -257,6 +262,49 @@ pub const EventQueue = struct {
 /// The main thread stores true to request cancellation;
 /// the agent thread loads to check.
 pub const CancelFlag = std.atomic.Value(bool);
+
+/// Operations a layout_request can carry. Mirrors the `layout.*` tool
+/// surface the agent exposes: introspection (`describe`) plus the four
+/// mutators plus a pane read. Each variant is a plain value type; the
+/// caller owns the string slices and keeps them alive until `done` is
+/// signalled on the paired `LayoutRequest`.
+pub const LayoutOp = union(enum) {
+    describe: void,
+    focus: struct { id: []const u8 },
+    split: struct { id: []const u8, direction: []const u8, buffer_type: ?[]const u8 },
+    close: struct { id: []const u8 },
+    resize: struct { id: []const u8, ratio: f32 },
+    read_pane: struct { id: []const u8, lines: ?u32, offset: ?u32 },
+};
+
+/// Round-trip request pushed by the agent thread (or a worker
+/// sub-thread) onto the event queue. The main thread drains it,
+/// performs the window-tree mutation, populates `result_json` and
+/// `is_error`, and signals `done`. Caller owns the struct for the
+/// duration of the round trip and frees `result_json` after
+/// `done.wait()` returns when `result_owned` is true.
+pub const LayoutRequest = struct {
+    /// Requested operation plus its arguments.
+    op: LayoutOp,
+    /// JSON response bytes. Main thread writes before signalling `done`;
+    /// agent thread reads after `done.wait()` and frees when
+    /// `result_owned` is true.
+    result_json: ?[]const u8 = null,
+    /// True when the op failed. The result bytes carry the error detail.
+    is_error: bool = false,
+    /// True when `result_json` is heap-allocated and must be freed by
+    /// the waiter. Main-thread error paths that fail to allocate set
+    /// this to false and leave `result_json` null.
+    result_owned: bool = true,
+    /// Signalled by the main thread when the response fields are set.
+    done: std.Thread.ResetEvent = .{},
+
+    /// Construct a request with the given op. All response fields start
+    /// empty; the main thread fills them before `done.set()`.
+    pub fn init(op: LayoutOp) LayoutRequest {
+        return .{ .op = op };
+    }
+};
 
 // -- Tests -------------------------------------------------------------------
 
@@ -488,6 +536,14 @@ test "pushWithBackpressure drops after budget, no leak" {
     const err = queue.pushWithBackpressure(.{ .info = payload }, 10);
     try std.testing.expectError(error.EventDropped, err);
     try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
+}
+
+test "layout_request can be pushed and peeked" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 4);
+    defer queue.deinit();
+    var req = LayoutRequest.init(.{ .describe = {} });
+    try queue.push(.{ .layout_request = &req });
+    try std.testing.expectEqual(@as(usize, 1), queue.len);
 }
 
 test "push and drain lua_tool_request event" {
