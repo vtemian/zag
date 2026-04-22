@@ -379,7 +379,13 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // the key passes through to the mode-default logic below.
     if (self.window_manager.keymapRegistry()) |registry| {
         if (registry.lookup(self.window_manager.current_mode, k)) |action| {
-            self.window_manager.executeAction(action);
+            self.window_manager.executeAction(action) catch |err| {
+                // Bound actions can fail for well-understood reasons
+                // (e.g. `.resize` requires an argument from Lua). Log
+                // and swallow so a single unbindable action does not
+                // derail the key loop.
+                log.warn("executeAction({s}) failed: {}", .{ @tagName(action), err });
+            };
             return .redraw;
         }
     }
