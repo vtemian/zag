@@ -2424,6 +2424,140 @@ pub const LuaEngine = struct {
         return 0;
     }
 
+    // -- Lua table reader helpers (used by zag.provider, future schema work) ---
+
+    /// Required vs optional semantics for `readStringField`. Required mode
+    /// raises on missing/nil; optional mode returns null.
+    const FieldMode = enum { required, optional };
+
+    /// Read a string field from the Lua table at `table_idx` and duplicate
+    /// the value onto `allocator`. Returns `null` in optional mode when the
+    /// field is absent or nil. Logs a descriptive warning and returns
+    /// `error.LuaError` in required mode when the field is missing or when
+    /// the value is present but not a string.
+    ///
+    /// Caller owns the returned memory. The stack is left untouched (the
+    /// getField/pop happens inside).
+    fn readStringField(
+        lua: *Lua,
+        table_idx: i32,
+        name: [:0]const u8,
+        mode: FieldMode,
+        allocator: Allocator,
+    ) !?[]const u8 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) {
+            return switch (mode) {
+                .optional => null,
+                .required => blk: {
+                    log.warn("zag.provider(): required string field '{s}' missing", .{name});
+                    break :blk error.LuaError;
+                },
+            };
+        }
+        if (lua.typeOf(-1) != .string) {
+            log.warn("zag.provider(): field '{s}' must be a string", .{name});
+            return error.LuaError;
+        }
+        const borrowed = lua.toString(-1) catch {
+            log.warn("zag.provider(): field '{s}' could not be read as a string", .{name});
+            return error.LuaError;
+        };
+        return try allocator.dupe(u8, borrowed);
+    }
+
+    /// Read a headers field from the Lua table at `table_idx`. Accepts two
+    /// shapes:
+    ///   (a) Array of pairs:   { { name = "x", value = "1" }, { name = "y", value = "2" } }
+    ///   (b) Map of strings:   { ["x"] = "1", ["y"] = "2" }
+    ///
+    /// Returns an owned slice of `llm.Endpoint.Header`. An absent or nil
+    /// field yields an empty slice. Order is preserved for form (a);
+    /// iteration order for form (b) is Lua-implementation-defined, so
+    /// callers that need deterministic order must use form (a).
+    ///
+    /// Each `.name` and `.value` is duped onto `allocator`. Caller owns
+    /// both the outer slice and each duped string.
+    fn readHeaderList(
+        lua: *Lua,
+        table_idx: i32,
+        name: [:0]const u8,
+        allocator: Allocator,
+    ) ![]llm.Endpoint.Header {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return try allocator.alloc(llm.Endpoint.Header, 0);
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider(): field '{s}' must be a table (array or map)", .{name});
+            return error.LuaError;
+        }
+
+        // Absolute index for the inner table so `pushNil`/`next` interleaving
+        // and helper pushes don't invalidate relative offsets.
+        const inner = lua.absIndex(-1);
+
+        var headers: std.ArrayList(llm.Endpoint.Header) = .empty;
+        errdefer {
+            for (headers.items) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            headers.deinit(allocator);
+        }
+
+        if (lua_json.isLuaArray(lua, inner)) {
+            const len = lua.rawLen(inner);
+            for (0..len) |i| {
+                _ = lua.rawGetIndex(inner, @intCast(i + 1));
+                defer lua.pop(1);
+                if (!lua.isTable(-1)) {
+                    log.warn("zag.provider(): field '{s}' entry {d} must be a table", .{ name, i + 1 });
+                    return error.LuaError;
+                }
+                const header_name = (try readStringField(lua, -1, "name", .required, allocator)) orelse unreachable;
+                errdefer allocator.free(header_name);
+                const header_value = (try readStringField(lua, -1, "value", .required, allocator)) orelse unreachable;
+                errdefer allocator.free(header_value);
+                try headers.append(allocator, .{ .name = header_name, .value = header_value });
+            }
+        } else {
+            // Map form: iterate with next() against the absolute inner index.
+            lua.pushNil();
+            while (lua.next(inner)) {
+                // Stack: [..., inner_table, ..., key, value]
+                if (lua.typeOf(-2) != .string) {
+                    log.warn("zag.provider(): field '{s}' map keys must be strings", .{name});
+                    lua.pop(2);
+                    return error.LuaError;
+                }
+                if (lua.typeOf(-1) != .string) {
+                    log.warn("zag.provider(): field '{s}' map values must be strings", .{name});
+                    lua.pop(2);
+                    return error.LuaError;
+                }
+                const k_borrowed = lua.toString(-2) catch {
+                    lua.pop(2);
+                    return error.LuaError;
+                };
+                const v_borrowed = lua.toString(-1) catch {
+                    lua.pop(2);
+                    return error.LuaError;
+                };
+                const k_owned = try allocator.dupe(u8, k_borrowed);
+                errdefer allocator.free(k_owned);
+                const v_owned = try allocator.dupe(u8, v_borrowed);
+                errdefer allocator.free(v_owned);
+                try headers.append(allocator, .{ .name = k_owned, .value = v_owned });
+                lua.pop(1); // pop value; keep key for next iteration
+            }
+        }
+
+        return try headers.toOwnedSlice(allocator);
+    }
+
     /// Zig function backing `zag.provider{ name = "..." }`.
     /// Validates `name` against `llm.builtin_endpoints` and appends the duped
     /// string to `engine.enabled_providers`. Unknown names, missing `name`
@@ -5802,4 +5936,144 @@ test "hook budget leaves fast hooks alone" {
     _ = try eng.lua.getGlobal("_fast_ran");
     defer eng.lua.pop(1);
     try std.testing.expect(eng.lua.toBoolean(-1));
+}
+
+test "readStringField: required string returns duped slice" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("t = { name = \"hello\" }");
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    const got = try LuaEngine.readStringField(engine.lua, -1, "name", .required, std.testing.allocator);
+    defer std.testing.allocator.free(got.?);
+    try std.testing.expectEqualStrings("hello", got.?);
+}
+
+test "readStringField: missing field in required mode returns error.LuaError" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("t = {}");
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    try std.testing.expectError(
+        error.LuaError,
+        LuaEngine.readStringField(engine.lua, -1, "name", .required, std.testing.allocator),
+    );
+}
+
+test "readStringField: missing field in optional mode returns null" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("t = {}");
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    const got = try LuaEngine.readStringField(engine.lua, -1, "name", .optional, std.testing.allocator);
+    try std.testing.expect(got == null);
+}
+
+test "readStringField: non-string field rejected" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("t = { name = 42 }");
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    try std.testing.expectError(
+        error.LuaError,
+        LuaEngine.readStringField(engine.lua, -1, "name", .required, std.testing.allocator),
+    );
+}
+
+test "readHeaderList: array-of-pairs form preserves order" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\t = { headers = {
+        \\    { name = "a", value = "1" },
+        \\    { name = "b", value = "2" },
+        \\} }
+    );
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    const headers = try LuaEngine.readHeaderList(engine.lua, -1, "headers", std.testing.allocator);
+    defer {
+        for (headers) |h| {
+            std.testing.allocator.free(h.name);
+            std.testing.allocator.free(h.value);
+        }
+        std.testing.allocator.free(headers);
+    }
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings("a", headers[0].name);
+    try std.testing.expectEqualStrings("1", headers[0].value);
+    try std.testing.expectEqualStrings("b", headers[1].name);
+    try std.testing.expectEqualStrings("2", headers[1].value);
+}
+
+test "readHeaderList: map-of-strings form parses both entries" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\t = { headers = {
+        \\    ["Header-A"] = "1",
+        \\    ["Header-B"] = "2",
+        \\} }
+    );
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    const headers = try LuaEngine.readHeaderList(engine.lua, -1, "headers", std.testing.allocator);
+    defer {
+        for (headers) |h| {
+            std.testing.allocator.free(h.name);
+            std.testing.allocator.free(h.value);
+        }
+        std.testing.allocator.free(headers);
+    }
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+
+    // Lua 5.4 string-keyed iteration order is implementation-defined.
+    var saw_a = false;
+    var saw_b = false;
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.name, "Header-A")) {
+            try std.testing.expectEqualStrings("1", h.value);
+            saw_a = true;
+        }
+        if (std.mem.eql(u8, h.name, "Header-B")) {
+            try std.testing.expectEqualStrings("2", h.value);
+            saw_b = true;
+        }
+    }
+    try std.testing.expect(saw_a and saw_b);
+}
+
+test "readHeaderList: absent field returns empty slice" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("t = {}");
+    _ = try engine.lua.getGlobal("t");
+    defer engine.lua.pop(1);
+
+    const headers = try LuaEngine.readHeaderList(engine.lua, -1, "headers", std.testing.allocator);
+    defer std.testing.allocator.free(headers);
+    try std.testing.expectEqual(@as(usize, 0), headers.len);
 }
