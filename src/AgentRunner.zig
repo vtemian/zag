@@ -6,7 +6,7 @@
 //! bridges LLM call IDs to view tree nodes.
 //!
 //! Session↔tree sync invariant: every append to `session.messages`
-//! pairs with an append to `view.root_children`. `submitInput` is
+//! pairs with an append to `view.tree.root_children`. `submitInput` is
 //! the canonical join point for user turns (session.appendUserMessage
 //! + view.appendUserNode); tool_result events correlate to their
 //! tool_use by call_id via a HashMap on this struct. Tree and session
@@ -394,9 +394,9 @@ pub fn resetCurrentAssistantText(self: *AgentRunner) void {
     const node = self.current_assistant_node orelse return;
     self.current_assistant_node = null;
 
-    for (self.view.root_children.items, 0..) |child, i| {
+    for (self.view.tree.root_children.items, 0..) |child, i| {
         if (child == node) {
-            _ = self.view.root_children.orderedRemove(i);
+            _ = self.view.tree.root_children.orderedRemove(i);
             break;
         }
     }
@@ -548,13 +548,13 @@ test "resetCurrentAssistantText removes the in-progress node" {
     const partial = try cb.appendNode(null, .assistant_text, "partial ");
     runner.current_assistant_node = partial;
 
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
 
     runner.resetCurrentAssistantText();
 
     try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[0].node_type);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[0].node_type);
 }
 
 test "resetCurrentAssistantText is a no-op when nothing is in progress" {
@@ -571,7 +571,7 @@ test "resetCurrentAssistantText is a no-op when nothing is in progress" {
     runner.resetCurrentAssistantText();
 
     try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
 }
 
 test "text_delta after reset starts a fresh assistant node" {
@@ -586,17 +586,17 @@ test "text_delta after reset starts a fresh assistant node" {
     // Simulate a partial stream: two text deltas append to one node.
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "wor") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello wor", cb.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    try std.testing.expectEqualStrings("Hello wor", cb.tree.root_children.items[0].content.items);
 
     // Fallback: reset, then push the full response.
     runner.handleAgentEvent(.reset_assistant_text, allocator);
-    try std.testing.expectEqual(@as(usize, 0), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cb.tree.root_children.items.len);
     try std.testing.expect(runner.current_assistant_node == null);
 
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello world", cb.root_children.items[0].content.items);
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    try std.testing.expectEqualStrings("Hello world", cb.tree.root_children.items[0].content.items);
 }
 
 test "handleAgentEvent correlates tool_result to tool_start via call_id" {
@@ -620,7 +620,7 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
         .call_id = try allocator.dupe(u8, "B"),
     } }, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
     try std.testing.expectEqual(@as(u32, 2), runner.pending_tool_calls.count());
 
     // tool_result for "B" (out-of-order vs starts) should parent under tool B
@@ -630,7 +630,7 @@ test "handleAgentEvent correlates tool_result to tool_start via call_id" {
         .is_error = false,
     } }, allocator);
 
-    const tool_b_node = cb.root_children.items[1];
+    const tool_b_node = cb.tree.root_children.items[1];
     try std.testing.expectEqual(@as(usize, 1), tool_b_node.children.items.len);
     try std.testing.expectEqualStrings("result B", tool_b_node.children.items[0].content.items);
     // Pending map no longer contains "B", still contains "A"
@@ -808,9 +808,9 @@ test "submitInput records user message on session, tree, and resets streaming" {
     try std.testing.expect(runner.last_tool_call == null);
 
     // Tree got the stale assistant_text plus the new user_message.
-    try std.testing.expectEqual(@as(usize, 2), cb.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.root_children.items[1].node_type);
-    try std.testing.expectEqualStrings("hi", cb.root_children.items[1].content.items);
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[1].node_type);
+    try std.testing.expectEqualStrings("hi", cb.tree.root_children.items[1].content.items);
 
     // Session has one user message with a single text block.
     try std.testing.expectEqual(@as(usize, 1), scb.messages.items.len);
