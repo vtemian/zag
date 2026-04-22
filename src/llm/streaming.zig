@@ -127,23 +127,20 @@ pub const StreamingResponse = struct {
         };
 
         if (response.head.status != .ok) {
-            // Drain the error body so the UI can show the provider's
-            // actual message instead of just "ApiError". Capped to
-            // MAX_ERROR_BODY_BYTES so a misbehaving endpoint cannot
-            // blow up logs.
-            var body_buf: [MAX_ERROR_BODY_BYTES]u8 = undefined;
-            const err_reader = response.reader(&self.transfer_buf);
-            const n = err_reader.readSliceShort(&body_buf) catch 0;
-            const snippet = body_buf[0..n];
-            log.err("streaming: HTTP {d} {s}: {s}", .{
+            // Body drainage on the streaming path panics inside the
+            // stdlib reader on some 4xx shapes (observed on ChatGPT
+            // OAuth 401s: readSliceShort dives into defaultReadVec and
+            // aborts). Until that's understood, surface status + tag
+            // only; the plain HTTP path in http.zig still captures
+            // full body snippets for non-streaming errors.
+            log.err("streaming: HTTP {d} {s}", .{
                 @intFromEnum(response.head.status),
                 @tagName(response.head.status),
-                snippet,
             });
             if (std.fmt.allocPrint(
                 allocator,
-                "HTTP {d} ({s}): {s}",
-                .{ @intFromEnum(response.head.status), @tagName(response.head.status), snippet },
+                "HTTP {d} ({s})",
+                .{ @intFromEnum(response.head.status), @tagName(response.head.status) },
             )) |detail| {
                 error_detail.set(allocator, detail);
             } else |_| {}
