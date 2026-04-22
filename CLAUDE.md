@@ -24,17 +24,17 @@ Requires: Zig 0.15+. Dependencies: ziglua (Lua 5.4, compiled from source).
 
 Two files, both optional, both under `~/.config/zag/`.
 
-`config.lua` declares providers and the default model:
+`config.lua` enables providers (via the embedded stdlib) and picks the default model:
 
 ```lua
-zag.provider { name = "anthropic" }
-zag.provider { name = "openai" }
+require("zag.providers.anthropic")
+require("zag.providers.openai")
 zag.set_default_model("openai/gpt-4o")
 ```
 
-The first-run wizard scaffolds the OAuth equivalent, `openai-oauth/gpt-5`, when you pick the recommended entry.
+The stdlib lives inside the binary under `zag.providers.*`: `anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `ollama`. Drop a file at `~/.config/zag/lua/zag/providers/<name>.lua` to override a stdlib entry. Declare a brand-new provider by writing its own module and `require()`ing it — `zag.provider{...}` takes the full endpoint schema (url, wire, auth, headers, default_model, models). The first-run wizard scaffolds `openai-oauth/gpt-5-codex` when you pick the recommended entry.
 
-`auth.json` holds provider API keys. Written by `zag auth login`; do not hand-edit. Ollama is keyless. Schema for reference only:
+`auth.json` holds provider API keys and OAuth tokens. Written by `zag auth login`; do not hand-edit. Ollama is keyless. Schema for reference only:
 
 ```json
 {
