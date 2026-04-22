@@ -572,6 +572,10 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
             .reset_assistant_text => {},
             .hook_request => |req| req.done.set(),
             .lua_tool_request => |req| req.done.set(),
+            .layout_request => |req| {
+                req.is_error = true;
+                req.done.set();
+            },
         };
     }
 

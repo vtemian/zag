@@ -821,6 +821,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                 // on null engine) still unblocks its pusher.
                 .hook_request => |req| req.done.set(),
                 .lua_tool_request => |req| req.done.set(),
+                .layout_request => |req| {
+                    req.is_error = true;
+                    req.done.set();
+                },
                 .done, .reset_assistant_text => {},
             }
         }

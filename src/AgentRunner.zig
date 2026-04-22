@@ -527,6 +527,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         // `done` so the producer in the agent thread doesn't block forever.
         .hook_request => |req| req.done.set(),
         .lua_tool_request => |req| req.done.set(),
+        .layout_request => |req| {
+            req.is_error = true;
+            req.done.set();
+        },
     }
 }
 
