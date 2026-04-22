@@ -873,6 +873,40 @@ pub const CommandResult = enum { handled, quit, not_a_command };
 /// Try to handle input as a slash command. Returns .not_a_command if
 /// the input doesn't match any known command.
 pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
+    // When a model picker is pending, the next submitted line is a
+    // follow-up (digit or q), not a slash command. Intercept before the
+    // slash-command matches so "2", "q", and "999" don't fall through.
+    if (self.pending_model_pick) |list| {
+        const trimmed = std.mem.trim(u8, command, " \t");
+        if (std.mem.eql(u8, trimmed, "q") or std.mem.eql(u8, trimmed, "Q")) {
+            self.clearPendingModelPick();
+            self.appendStatus("model pick cancelled");
+            return .handled;
+        }
+        const idx = std.fmt.parseInt(usize, trimmed, 10) catch {
+            self.appendStatus("type a number from the list or q to cancel");
+            return .handled;
+        };
+        if (idx == 0 or idx > list.len) {
+            self.appendStatus("number out of range; type a valid row or q");
+            return .handled;
+        }
+        const pick = list[idx - 1];
+        self.swapProvider(pick.provider, pick.model_id) catch |err| {
+            var scratch: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &scratch,
+                "model swap failed: {s}",
+                .{@errorName(err)},
+            ) catch "model swap failed";
+            self.appendStatus(msg);
+            self.clearPendingModelPick();
+            return .handled;
+        };
+        self.clearPendingModelPick();
+        return .handled;
+    }
+
     if (std.mem.eql(u8, command, "/quit") or std.mem.eql(u8, command, "/q")) {
         return .quit;
     }
@@ -891,6 +925,22 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
     }
 
     return .not_a_command;
+}
+
+/// Swap the live provider to `provider_name/model_id`.
+///
+/// Stub for Task 12: the real cancel, drain, and rebuild logic lands in
+/// Task 13. Keeping the symbol live so the pending-pick handler and its
+/// tests can exercise the happy and failure branches before the swap
+/// implementation exists.
+pub fn swapProvider(
+    self: *WindowManager,
+    provider_name: []const u8,
+    model_id: []const u8,
+) !void {
+    _ = self;
+    _ = provider_name;
+    _ = model_id;
 }
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
@@ -1916,4 +1966,154 @@ test "restorePane rebuilds both tree and messages" {
     try std.testing.expectEqual(types.Role.user, scb.messages.items[0].role);
     try std.testing.expectEqual(types.Role.assistant, scb.messages.items[1].role);
     try std.testing.expect(scb.session_handle != null);
+}
+
+// -- Model picker test scaffolding -------------------------------------------
+// The picker tests need a WindowManager whose `provider.model_id`,
+// `registry`, and `root_pane.view` are real enough that `renderModelPicker`
+// and `handleCommand` run end-to-end. Stand up the minimum once here so
+// the three Task 12 tests stay readable.
+
+const PickerFixture = struct {
+    allocator: std.mem.Allocator,
+    registry: llm.Registry,
+    provider: llm.ProviderResult,
+    session: ConversationHistory,
+    view: ConversationBuffer,
+    runner: AgentRunner,
+    layout: Layout,
+    wm: WindowManager,
+
+    fn deinit(self: *PickerFixture) void {
+        self.wm.deinit();
+        self.layout.deinit();
+        self.runner.deinit();
+        self.view.deinit();
+        self.session.deinit();
+        self.allocator.free(self.provider.model_id);
+        self.provider.registry.deinit();
+        self.registry.deinit();
+    }
+};
+
+fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
+    f.allocator = allocator;
+
+    // Registry with two endpoints, two models each. Ollama-like shape so
+    // `auth = .none` keeps credential lookups out of the test path.
+    f.registry = llm.Registry.init(allocator);
+    errdefer f.registry.deinit();
+
+    const ep_a: llm.Endpoint = .{
+        .name = "provA",
+        .serializer = .openai,
+        .url = "https://a.example",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "a1",
+        .models = &[_]llm.Endpoint.ModelRate{
+            .{ .id = "a1", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+            .{ .id = "a2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+        },
+    };
+    const duped_a = try ep_a.dupe(allocator);
+    try f.registry.add(duped_a);
+
+    const ep_b: llm.Endpoint = .{
+        .name = "provB",
+        .serializer = .openai,
+        .url = "https://b.example",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "b1",
+        .models = &[_]llm.Endpoint.ModelRate{
+            .{ .id = "b1", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+            .{ .id = "b2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+        },
+    };
+    const duped_b = try ep_b.dupe(allocator);
+    try f.registry.add(duped_b);
+
+    // A stub ProviderResult that the picker only reads `model_id` from.
+    // Fields not touched by the picker path stay uninitialised; deinit is
+    // never called on this stub, so its internal state and inner registry
+    // are irrelevant. We free `model_id` explicitly in
+    // `PickerFixture.deinit`.
+    f.provider = .{
+        .provider = undefined,
+        .model_id = try allocator.dupe(u8, "provA/a1"),
+        .state = undefined,
+        .auth_path = "",
+        .registry = llm.Registry.init(allocator),
+        .allocator = allocator,
+        .serializer = .openai,
+    };
+
+    f.session = ConversationHistory.init(allocator);
+    f.view = try ConversationBuffer.init(allocator, 0, "root");
+    f.runner = AgentRunner.init(allocator, &f.view, &f.session);
+    f.layout = Layout.init(allocator);
+
+    f.wm = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &f.layout,
+        .compositor = undefined,
+        .root_pane = .{ .view = &f.view, .session = &f.session, .runner = &f.runner },
+        .provider = &f.provider,
+        .registry = &f.registry,
+        .session_mgr = undefined,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+}
+
+test "handleCommand resolves digit input when pending_model_pick is set" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.renderModelPicker();
+    try std.testing.expect(f.wm.pending_model_pick != null);
+    try std.testing.expect(f.wm.pending_model_pick.?.len >= 2);
+
+    // Typing "2" picks entry index 1. swapProvider is a stub in Task 12,
+    // so the happy path must clear the pending pick and return .handled
+    // without mutating provider.model_id.
+    const result = f.wm.handleCommand("2");
+    try std.testing.expectEqual(CommandResult.handled, result);
+    try std.testing.expectEqual(@as(?[]PendingPickEntry, null), f.wm.pending_model_pick);
+}
+
+test "handleCommand cancels pending pick on q" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.renderModelPicker();
+    const result = f.wm.handleCommand("q");
+    try std.testing.expectEqual(CommandResult.handled, result);
+    try std.testing.expectEqual(@as(?[]PendingPickEntry, null), f.wm.pending_model_pick);
+}
+
+test "handleCommand reports bad digit and keeps pick active" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.renderModelPicker();
+
+    // Out-of-range number: pick stays open so the user can retry.
+    const out_of_range = f.wm.handleCommand("999");
+    try std.testing.expectEqual(CommandResult.handled, out_of_range);
+    try std.testing.expect(f.wm.pending_model_pick != null);
+
+    // Non-digit junk: pick also stays open.
+    const junk = f.wm.handleCommand("hello");
+    try std.testing.expectEqual(CommandResult.handled, junk);
+    try std.testing.expect(f.wm.pending_model_pick != null);
 }
