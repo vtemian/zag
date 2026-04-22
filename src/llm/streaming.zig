@@ -146,7 +146,14 @@ pub const StreamingResponse = struct {
     /// Returns the line content without trailing '\n' or '\r\n', or
     /// `null` when the stream has ended.
     /// The returned slice is valid until the next `readLine` call.
-    pub fn readLine(self: *StreamingResponse) !?[]const u8 {
+    ///
+    /// When `cancel` is non-null, the flag is polled after every network
+    /// chunk. A blocked syscall is NOT interruptible here: the granularity
+    /// is between chunks, so a stalled endpoint can delay observation until
+    /// the TCP stack unblocks (or the OS socket timeout fires). Per-chunk
+    /// is adequate in practice because SSE endpoints send keep-alive
+    /// comments every few seconds.
+    pub fn readLine(self: *StreamingResponse, cancel: ?*std.atomic.Value(bool)) !?[]const u8 {
         self.pending_line.clearRetainingCapacity();
 
         // First, consume any leftover bytes from a previous read.
@@ -166,6 +173,9 @@ pub const StreamingResponse = struct {
 
         // Read from the network until we find a newline or hit end of stream.
         while (true) {
+            if (cancel) |flag| {
+                if (flag.load(.acquire)) return error.Cancelled;
+            }
             var chunk: [4096]u8 = undefined;
             const n = self.body_reader.readSliceShort(&chunk) catch
                 return error.ApiError;
@@ -221,7 +231,9 @@ pub const StreamingResponse = struct {
     /// Read SSE events from the stream, yielding one at a time.
     /// Accumulates "event:" and "data:" fields across lines, dispatches on
     /// blank line. Skips comment lines (including pings). Checks the cancel
-    /// flag between lines. Returns null at end of stream or cancellation.
+    /// flag between lines AND between network chunks inside `readLine`;
+    /// returns `error.Cancelled` when the flag is set. Returns null at
+    /// end of stream.
     ///
     /// The returned slices point into `event_buf` and `event_data` and are
     /// valid until the next call.
@@ -235,9 +247,9 @@ pub const StreamingResponse = struct {
         event_data.clearRetainingCapacity();
 
         while (true) {
-            if (cancel.load(.acquire)) return null;
+            if (cancel.load(.acquire)) return error.Cancelled;
 
-            const maybe_line = try self.readLine();
+            const maybe_line = try self.readLine(cancel);
             const line = maybe_line orelse {
                 // End of stream: return a final event if data accumulated
                 if (event_data.items.len > 0) {
@@ -334,7 +346,31 @@ test "readLine caps pending_line at MAX_SSE_LINE" {
     defer sr.pending_line.deinit(allocator);
     defer sr.remainder.deinit(allocator);
 
-    try std.testing.expectError(error.SseLineTooLong, sr.readLine());
+    try std.testing.expectError(error.SseLineTooLong, sr.readLine(null));
+}
+
+test "readLine returns Cancelled when the cancel flag is set before a chunk" {
+    const allocator = std.testing.allocator;
+
+    // A well-behaved payload the loop would otherwise consume happily.
+    // Cancel is checked at the top of each network read, so it fires
+    // before a single byte comes back.
+    var fake = std.Io.Reader.fixed("data: hello\n\n");
+
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, sr.readLine(&cancel));
 }
 
 test "StreamingResponse.create returns InvalidUri on malformed endpoint" {

@@ -25,7 +25,7 @@ const log = std.log.scoped(.llm);
 /// Unexpected stdlib errors (HTTP plumbing, JSON parse) are logged and
 /// remapped to `ApiError` at the provider boundary so the vtable surface
 /// stays small and callers can switch exhaustively.
-pub const ProviderError = std.mem.Allocator.Error || error{
+pub const ProviderError = std.mem.Allocator.Error || CancelError || error{
     /// Upstream endpoint returned a non-2xx status, malformed transport
     /// framing, or any other transport-layer failure that couldn't be
     /// classified more specifically.
@@ -42,6 +42,16 @@ pub const ProviderError = std.mem.Allocator.Error || error{
     SseEventDataTooLarge,
 };
 
+/// Cooperative-cancellation error, composed into ProviderError via `||`.
+/// Kept as its own small set so non-provider subsystems (streaming reader,
+/// bash tool) can depend on `CancelError` without pulling the full
+/// provider surface.
+pub const CancelError = error{
+    /// The caller's cancel flag was observed set; work was aborted
+    /// cooperatively. The stream/child is torn down before returning.
+    Cancelled,
+};
+
 /// Remap an arbitrary error to the narrow `ProviderError` surface.
 /// Errors already in the set pass through; anything else is logged and
 /// returned as `ApiError`. Used at provider entry points so stdlib HTTP
@@ -55,6 +65,7 @@ pub fn mapProviderError(err: anyerror) ProviderError {
         error.MissingApiKey => error.MissingApiKey,
         error.SseLineTooLong => error.SseLineTooLong,
         error.SseEventDataTooLarge => error.SseEventDataTooLarge,
+        error.Cancelled => error.Cancelled,
         else => blk: {
             log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
             break :blk error.ApiError;
