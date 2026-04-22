@@ -864,6 +864,14 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
             .{ deps.config_path, default_model },
         );
     }
+    if (chosen_model) |m| {
+        if (!scaffolded) {
+            try deps.stdout.print(
+                "\nAdd to {s} to make permanent:\n  zag.set_default_model(\"{s}/{s}\")\n",
+                .{ deps.config_path, picked.name, m },
+            );
+        }
+    }
     try deps.stdout.flush();
 
     const provider_name = try deps.allocator.dupe(u8, picked.name);
@@ -1688,6 +1696,51 @@ test "runWizard with forced_provider skips the choice prompt" {
 
     // config.lua must NOT exist: forced mode is credential-only.
     try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.config_path));
+}
+
+test "runWizard on forced_provider prints paste-me model hint, does not scaffold" {
+    var registry = try seedTestRegistry(testing.allocator);
+    defer registry.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    // Simulates `zag auth login anthropic`: no provider picker digit,
+    // then the api key, then `1` for the recommended model row.
+    var stdin = std.Io.Reader.fixed("sk-ant-key\n1\n");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = "anthropic",
+        .registry = &registry,
+    };
+
+    const result = try runWizard(deps);
+    defer testing.allocator.free(result.provider_name);
+
+    try testing.expect(!result.scaffolded_config);
+
+    // The paste-me hint must surface the chosen model string so the user
+    // can copy-paste it into config.lua themselves.
+    const rendered = stdout_writer.written();
+    try testing.expect(std.mem.indexOf(u8, rendered, "zag.set_default_model(\"anthropic/claude-sonnet-4-20250514\")") != null);
+
+    // config.lua must NOT exist on disk: the hint is print-only.
+    try testing.expectError(
+        error.FileNotFound,
+        std.fs.accessAbsolute(paths.config_path, .{}),
+    );
 }
 
 test "runWizard refuses non-TTY first-run" {
