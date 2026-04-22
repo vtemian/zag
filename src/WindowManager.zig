@@ -341,6 +341,118 @@ pub fn resizeById(
     self.notifyLeafRects();
 }
 
+/// Serialize the current window tree as JSON so plugins and LLM tools
+/// can introspect the layout without touching internal pointers. The
+/// output shape is:
+///
+///   { "root": "n<u32>" | null,
+///     "focus": "n<u32>" | null,
+///     "nodes": { "n<u32>": {...}, ... } }
+///
+/// Each node is either a split (`kind`, `dir`, `ratio`, `children` ids)
+/// or a pane (`kind`, `buffer.type`). Buffer metadata beyond the type
+/// tag is deliberately minimal; richer introspection belongs in a
+/// plugin-facing helper layered on top of this primitive.
+///
+/// Caller owns the returned bytes.
+pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
+    var aw: std.io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var jw: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try jw.beginObject();
+
+    try jw.objectField("root");
+    if (self.layout.root) |root| {
+        const id = try self.handleForNode(root);
+        const id_str = try NodeRegistry.formatId(alloc, id);
+        defer alloc.free(id_str);
+        try jw.write(id_str);
+    } else {
+        try jw.write(null);
+    }
+
+    try jw.objectField("focus");
+    if (self.layout.focused) |f| {
+        const id = try self.handleForNode(f);
+        const id_str = try NodeRegistry.formatId(alloc, id);
+        defer alloc.free(id_str);
+        try jw.write(id_str);
+    } else {
+        try jw.write(null);
+    }
+
+    try jw.objectField("nodes");
+    try jw.beginObject();
+    for (self.node_registry.slots.items, 0..) |slot, i| {
+        const node = slot.node orelse continue;
+        const id: NodeRegistry.Handle = .{ .index = @intCast(i), .generation = slot.generation };
+        const id_str = try NodeRegistry.formatId(alloc, id);
+        defer alloc.free(id_str);
+        try jw.objectField(id_str);
+        try self.writeNodeJson(&jw, node, alloc);
+    }
+    try jw.endObject();
+
+    try jw.endObject();
+    return try aw.toOwnedSlice();
+}
+
+/// Reverse lookup: find the handle that currently addresses `node`.
+/// Returns `error.HandleMissing` if the node is not registered, which
+/// would indicate a registry/layout desync.
+fn handleForNode(self: *WindowManager, node: *Layout.LayoutNode) !NodeRegistry.Handle {
+    for (self.node_registry.slots.items, 0..) |slot, i| {
+        if (slot.node == node) return .{
+            .index = @intCast(i),
+            .generation = slot.generation,
+        };
+    }
+    return error.HandleMissing;
+}
+
+/// Emit a single node object into `jw`. Splits carry direction, ratio,
+/// and child ids; leaves carry only the buffer type for now.
+fn writeNodeJson(
+    self: *WindowManager,
+    jw: anytype,
+    node: *Layout.LayoutNode,
+    alloc: Allocator,
+) !void {
+    try jw.beginObject();
+    switch (node.*) {
+        .split => |s| {
+            try jw.objectField("kind");
+            try jw.write("split");
+            try jw.objectField("dir");
+            try jw.write(@tagName(s.direction));
+            try jw.objectField("ratio");
+            try jw.write(s.ratio);
+            try jw.objectField("children");
+            try jw.beginArray();
+            const first_id = try self.handleForNode(s.first);
+            const first_str = try NodeRegistry.formatId(alloc, first_id);
+            defer alloc.free(first_str);
+            try jw.write(first_str);
+            const second_id = try self.handleForNode(s.second);
+            const second_str = try NodeRegistry.formatId(alloc, second_id);
+            defer alloc.free(second_str);
+            try jw.write(second_str);
+            try jw.endArray();
+        },
+        .leaf => {
+            try jw.objectField("kind");
+            try jw.write("pane");
+            try jw.objectField("buffer");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("conversation");
+            try jw.endObject();
+        },
+    }
+    try jw.endObject();
+}
+
 /// Return true if `maybe` still points at a live node in the registry.
 /// Used to decide whether a remembered focus pointer can be restored
 /// after a tree mutation.
@@ -1167,6 +1279,64 @@ test "resizeById applies ratio to parent split" {
     };
     try wm.resizeById(root_handle, 0.25);
     try std.testing.expectEqual(@as(f32, 0.25), wm.layout.root.?.split.ratio);
+}
+
+test "describe emits parseable node map" {
+    const allocator = std.testing.allocator;
+
+    // Same scaffolding as the splitById/resizeById tests: real Screen
+    // and Compositor are required because `doSplit` writes
+    // `compositor.layout_dirty` and reads `screen.width/height`.
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    wm.doSplit(.vertical);
+
+    const bytes = try wm.describe(allocator);
+    defer allocator.free(bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root_val = parsed.value.object.get("root") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(root_val == .string);
+    const nodes = parsed.value.object.get("nodes") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nodes == .object);
 }
 
 test "restorePane rebuilds both tree and messages" {
