@@ -234,6 +234,12 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) void {
             self.notifyLeafRects();
             notifyFocusSwap(prev, self.layout.getFocusedLeaf());
         },
+        .resize => {
+            // Keyboard dispatch has no target ratio. Plugins that want
+            // resize rebind this action to a Lua action calling
+            // zag.layout.resize(id, ratio). See Task 10 for the ID-path
+            // rewrite of this switch.
+        },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
     }

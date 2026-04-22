@@ -25,6 +25,7 @@ pub const Action = enum {
     split_vertical,
     split_horizontal,
     close_window,
+    resize,
     enter_insert_mode,
     enter_normal_mode,
 };
@@ -39,6 +40,7 @@ pub fn parseActionName(name: []const u8) ?Action {
         .{ "split_vertical", .split_vertical },
         .{ "split_horizontal", .split_horizontal },
         .{ "close_window", .close_window },
+        .{ "resize", .resize },
         .{ "enter_insert_mode", .enter_insert_mode },
         .{ "enter_normal_mode", .enter_normal_mode },
     };
@@ -218,7 +220,7 @@ test "Mode enum has two variants" {
 
 test "Action enum covers the built-in action names" {
     // Checks the count; the string mapping is covered in Task 3.
-    try std.testing.expectEqual(@as(usize, 9), @typeInfo(Action).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 10), @typeInfo(Action).@"enum".fields.len);
 }
 
 test "parseActionName maps known and rejects unknown" {
@@ -323,4 +325,8 @@ test "loadDefaults installs the nine built-in bindings" {
     try std.testing.expectEqual(Action.split_vertical, r.lookup(.normal, .{ .key = .{ .char = 'v' }, .modifiers = .{} }).?);
     try std.testing.expectEqual(Action.enter_normal_mode, r.lookup(.insert, .{ .key = .escape, .modifiers = .{} }).?);
     try std.testing.expectEqual(Action.enter_insert_mode, r.lookup(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }).?);
+}
+
+test "parseActionName recognizes resize" {
+    try std.testing.expectEqual(@as(?Action, .resize), parseActionName("resize"));
 }
