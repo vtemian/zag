@@ -183,7 +183,7 @@ fn callLlm(
         // If streaming already rendered partial text, discard it so the
         // full fallback response doesn't appear concatenated to the partial.
         if (stream_ctx.text_count > 0) {
-            queue.tryPush(allocator, .reset_assistant_text);
+            queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
         }
         // Push text to queue since streaming callback didn't fire (or was reset)
         for (fallback.content) |block| {
@@ -193,7 +193,7 @@ fn callLlm(
                         log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
                         continue;
                     };
-                    queue.tryPush(allocator, .{ .text_delta = duped });
+                    queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
                 },
                 else => {},
             }
@@ -207,9 +207,11 @@ fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *age
     var scratch: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch, "tokens: {d} in, {d} out", .{ response.input_tokens, response.output_tokens }) catch "tokens: ?";
     const duped = try allocator.dupe(u8, msg);
-    // tryPush frees `duped` internally on QueueFull (via freeOwned) and bumps
-    // the dropped counter; no error propagates.
-    queue.tryPush(allocator, .{ .info = duped });
+    // pushWithBackpressure waits up to default_backpressure_ms for a slot
+    // before giving up, logging a warn, freeing `duped` via freeOwned, and
+    // bumping the dropped counter. Losing a token-usage line is cosmetic,
+    // so swallow error.EventDropped.
+    queue.pushWithBackpressure(.{ .info = duped }, agent_events.default_backpressure_ms) catch {};
 }
 
 /// Extract tool_use blocks from a response into an owned slice.
@@ -396,22 +398,22 @@ fn runToolStep(
                 errdefer allocator.free(start_id);
                 const start_input = try allocator.dupe(u8, tc.input_raw);
                 errdefer allocator.free(start_input);
-                queue.tryPush(allocator, .{ .tool_start = .{
+                queue.pushWithBackpressure(.{ .tool_start = .{
                     .name = start_name,
                     .call_id = start_id,
                     .input_raw = start_input,
-                } });
+                } }, agent_events.default_backpressure_ms) catch {};
             }
 
             const result_content = try allocator.dupe(u8, synth);
             errdefer allocator.free(result_content);
             const result_id = try allocator.dupe(u8, tc.id);
             errdefer allocator.free(result_id);
-            queue.tryPush(allocator, .{ .tool_result = .{
+            queue.pushWithBackpressure(.{ .tool_result = .{
                 .content = result_content,
                 .is_error = true,
                 .call_id = result_id,
-            } });
+            } }, agent_events.default_backpressure_ms) catch {};
 
             return .{ .content = synth, .is_error = true, .owned = true };
         },
@@ -426,11 +428,11 @@ fn runToolStep(
                 errdefer allocator.free(start_id);
                 const start_input = try allocator.dupe(u8, effective_input);
                 errdefer allocator.free(start_input);
-                queue.tryPush(allocator, .{ .tool_start = .{
+                queue.pushWithBackpressure(.{ .tool_start = .{
                     .name = start_name,
                     .call_id = start_id,
                     .input_raw = start_input,
-                } });
+                } }, agent_events.default_backpressure_ms) catch {};
             }
 
             const t0 = std.time.milliTimestamp();
@@ -462,11 +464,11 @@ fn runToolStep(
             errdefer allocator.free(result_content);
             const result_id = try allocator.dupe(u8, tc.id);
             errdefer allocator.free(result_id);
-            queue.tryPush(allocator, .{ .tool_result = .{
+            queue.pushWithBackpressure(.{ .tool_result = .{
                 .content = result_content,
                 .is_error = final.is_error,
                 .call_id = result_id,
-            } });
+            } }, agent_events.default_backpressure_ms) catch {};
 
             return final;
         },
@@ -635,9 +637,12 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         .done => .done,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
     };
-    // Pass the allocator that produced the duped payload so tryPush can
-    // free on QueueFull. Otherwise we leak the bytes on every drop.
-    stream_ctx.queue.tryPush(alloc, agent_event);
+    // On backpressure budget expiry, pushWithBackpressure frees the duped
+    // payload via freeOwned and logs a warn. Streaming deltas are the
+    // highest-volume producer in the agent loop; a bounded wait keeps the
+    // user-visible transcript intact across a slow render frame instead of
+    // silently losing tokens.
+    stream_ctx.queue.pushWithBackpressure(agent_event, agent_events.default_backpressure_ms) catch {};
 }
 
 test {
