@@ -1105,6 +1105,18 @@ pub fn main() !void {
     // Extra split panes pick this up inside `createSplitPane`.
     root_runner.window_manager = &orchestrator.window_manager;
 
+    // Publish the root leaf's packed handle on the root runner so the
+    // agent thread can mirror it into `tools.current_caller_pane_id`
+    // around every tool dispatch. `attachLayoutRegistry` ran above, so
+    // the root is already back-registered.
+    if (orchestrator.window_manager.layout.root) |root_node| {
+        if (orchestrator.window_manager.handleForNode(root_node)) |handle| {
+            root_runner.pane_handle_packed = @bitCast(handle);
+        } else |err| {
+            log.warn("root leaf missing from registry: {}", .{err});
+        }
+    }
+
     // Register any Lua-declared tools into the dispatch registry. Config.lua
     // already ran before provider creation, so the keymap overrides,
     // default_model, and escape-timeout are all live by this point.

@@ -564,7 +564,7 @@ pub fn readPaneById(
 /// Reverse lookup: find the handle that currently addresses `node`.
 /// Returns `error.HandleMissing` if the node is not registered, which
 /// would indicate a registry/layout desync.
-fn handleForNode(self: *WindowManager, node: *Layout.LayoutNode) !NodeRegistry.Handle {
+pub fn handleForNode(self: *WindowManager, node: *Layout.LayoutNode) !NodeRegistry.Handle {
     for (self.node_registry.slots.items, 0..) |slot, i| {
         if (slot.node == node) return .{
             .index = @intCast(i),
@@ -698,6 +698,18 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
         log.warn("split failed: {}", .{err});
         return;
     };
+    // `splitFocused` leaves focus on the freshly-registered new leaf.
+    // Pack its handle onto the runner so the agent thread can publish it
+    // into `tools.current_caller_pane_id` around every tool dispatch.
+    // createSplitPane runs before the split (the new buffer has to exist
+    // first), so this is the earliest point the handle is known.
+    if (self.layout.focused) |new_leaf| {
+        if (self.handleForNode(new_leaf)) |handle| {
+            pane.runner.pane_handle_packed = @bitCast(handle);
+        } else |err| {
+            log.warn("new leaf missing from registry after split: {}", .{err});
+        }
+    }
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
