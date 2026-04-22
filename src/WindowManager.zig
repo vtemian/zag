@@ -519,9 +519,14 @@ pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutReques
     req.done.set();
 }
 
-/// Read a pane's textual content. Stub until Task 14 wires
-/// ConversationBuffer.readText. Returns an "unimplemented" payload on
-/// live leaves and rejects splits so the failure surface is explicit.
+/// Read a pane's textual content as a JSON envelope:
+///   { "ok": true, "text": <string>, "total_lines": <u>, "truncated": <b> }
+///
+/// Resolves the handle, requires a leaf, then calls
+/// `ConversationBuffer.readText` using the compositor's theme so the
+/// rendered text matches what the user would see on screen. The
+/// `offset` parameter is reserved for future paging; today only the
+/// tail window is returned.
 pub fn readPaneById(
     self: *WindowManager,
     alloc: Allocator,
@@ -529,11 +534,31 @@ pub fn readPaneById(
     lines: ?u32,
     offset: ?u32,
 ) ![]u8 {
-    _ = lines;
     _ = offset;
     const node = try self.node_registry.resolve(handle);
     if (node.* != .leaf) return error.NotALeaf;
-    return std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"unimplemented\"}}", .{});
+    const buf = node.leaf.buffer;
+    const conv_buf = ConversationBuffer.fromBuffer(buf);
+    const max_lines: usize = if (lines) |n| @intCast(n) else 100;
+    const result = try conv_buf.readText(alloc, max_lines, self.compositor.theme);
+    defer alloc.free(result.text);
+
+    var aw: std.io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var jw: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try jw.beginObject();
+    try jw.objectField("ok");
+    try jw.write(true);
+    try jw.objectField("text");
+    try jw.write(result.text);
+    try jw.objectField("total_lines");
+    try jw.write(result.total_lines);
+    try jw.objectField("truncated");
+    try jw.write(result.truncated);
+    try jw.endObject();
+
+    return try aw.toOwnedSlice();
 }
 
 /// Reverse lookup: find the handle that currently addresses `node`.
@@ -1636,6 +1661,76 @@ test "executeAction focus_left goes through handle path" {
     const original_right = wm.layout.focused.?;
     try wm.executeAction(.focus_left);
     try std.testing.expect(wm.layout.focused != original_right);
+}
+
+test "readPaneById returns rendered text with metadata" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    // Seed the root pane's buffer with a user message so readText has
+    // something to render.
+    _ = try view.appendNode(null, .user_message, "hello");
+
+    const root = wm.layout.root.?;
+    const handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == root) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+
+    const bytes = try wm.readPaneById(allocator, handle, 50, null);
+    defer allocator.free(bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("ok").?.bool);
+    const text_val = parsed.value.object.get("text") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(text_val == .string);
+    try std.testing.expect(std.mem.indexOf(u8, text_val.string, "hello") != null);
+    try std.testing.expect(parsed.value.object.get("total_lines") != null);
+    try std.testing.expect(parsed.value.object.get("truncated") != null);
 }
 
 test "restorePane rebuilds both tree and messages" {
