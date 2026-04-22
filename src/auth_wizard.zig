@@ -107,34 +107,29 @@ pub const WizardResult = struct {
 /// the paste-key and OAuth paths share identical post-credential behavior.
 pub const OAuthFn = *const fn (allocator: std.mem.Allocator, provider_name: []const u8, auth_path: []const u8) anyerror!void;
 
+/// How a provider authenticates. Drives the picker's auth-kind tag and
+/// whether `ProviderEntry.oauth_fn` must be non-null for the entry to be
+/// considered well-formed.
+pub const AuthKind = enum { api_key, oauth };
+
 /// Static metadata for one wizard-offered provider.
 ///
 /// `oauth_fn` is the extension seam for browser-OAuth providers. When null
-/// (the default, and every entry's value on `main` today), `runWizard` takes
-/// the paste-key path. When non-null, `runWizard` delegates to the callback
-/// and skips `promptSecret` entirely; the callback owns writing `auth.json`.
-///
-/// Integration note: when `wip/chatgpt-oauth` lands on main, wiring is a
-/// one-line registration. The OAuth plan registers ChatGPT as a separate
-/// provider key (`openai-oauth`, distinct from `openai`), so the expected
-/// shape is to append a new entry:
-///
-///     .{
-///         .name = "openai-oauth",
-///         .label = "ChatGPT (OAuth)",
-///         .default_model = "openai-oauth/gpt-5",
-///         .oauth_fn = oauth.runLoginFlowForOpenAI,
-///     },
-///
-/// where `runLoginFlowForOpenAI` is a thin shim around
-/// `oauth.runLoginFlow(alloc, .{ .provider_name = ..., .auth_path = ... })`.
-/// If a future plan instead attaches OAuth to an existing entry, the same
-/// seam applies — just mutate that entry's `oauth_fn` in place.
+/// the wizard takes the paste-key path; when non-null the callback owns
+/// writing `auth.json`. `kind` categorises the entry for the picker label;
+/// `recommended` pins an entry to the top of the picker and adds a
+/// "recommended" suffix to its label.
 pub const ProviderEntry = struct {
     /// Short key the user picks and the auth/config files store ("openai").
     name: []const u8,
     /// Human-facing label shown in the choice menu ("OpenAI").
     label: []const u8,
+    /// How this provider authenticates; drives the picker tag and whether
+    /// `oauth_fn` is required to be non-null.
+    kind: AuthKind,
+    /// If true, this entry sorts to the top of the picker and is marked
+    /// "recommended" in the rendered label.
+    recommended: bool = false,
     /// Default `zag.set_default_model` string for this provider. Used by
     /// `scaffoldConfigLua` when the user is a first-time stranger; once the
     /// config file exists the wizard never rewrites it.
@@ -147,17 +142,41 @@ pub const ProviderEntry = struct {
 
 /// Providers the wizard knows how to onboard. Order is the display order in
 /// the choice menu and in the scaffolded `config.lua` (picked entry first,
-/// others emitted as commented-out hints).
-///
-/// Every entry sets `oauth_fn` to `null` explicitly; the paste-key flow is
-/// the only onboarding path in this plan. When `wip/chatgpt-oauth` merges,
-/// a new `openai-oauth` entry with a non-null `oauth_fn` joins this table.
+/// others emitted as commented-out hints). The OAuth entry sits on top and
+/// is flagged recommended; the paste-key entries follow in rough popularity
+/// order.
 pub const PROVIDERS = [_]ProviderEntry{
-    .{ .name = "openai", .label = "OpenAI", .default_model = "openai/gpt-4o", .oauth_fn = null },
-    .{ .name = "anthropic", .label = "Anthropic", .default_model = "anthropic/claude-sonnet-4-20250514", .oauth_fn = null },
-    .{ .name = "openrouter", .label = "OpenRouter", .default_model = "openrouter/anthropic/claude-sonnet-4", .oauth_fn = null },
-    .{ .name = "groq", .label = "Groq", .default_model = "groq/llama-3.3-70b-versatile", .oauth_fn = null },
+    .{
+        .name = "openai-oauth",
+        .label = "OpenAI",
+        .kind = .oauth,
+        .recommended = true,
+        .default_model = "openai-oauth/gpt-5",
+        .oauth_fn = &chatgptOauthShim,
+    },
+    .{ .name = "openai", .label = "OpenAI", .kind = .api_key, .default_model = "openai/gpt-4o", .oauth_fn = null },
+    .{ .name = "anthropic", .label = "Anthropic", .kind = .api_key, .default_model = "anthropic/claude-sonnet-4-20250514", .oauth_fn = null },
+    .{ .name = "openrouter", .label = "OpenRouter", .kind = .api_key, .default_model = "openrouter/anthropic/claude-sonnet-4", .oauth_fn = null },
+    .{ .name = "groq", .label = "Groq", .kind = .api_key, .default_model = "groq/llama-3.3-70b-versatile", .oauth_fn = null },
 };
+
+const oauth = @import("oauth.zig");
+
+/// Thin shim matching the `OAuthFn` signature. Delegates to
+/// `oauth.runLoginFlow` with the OpenAI/ChatGPT defaults baked into
+/// `oauth.LoginOptions` (issuer, client_id, port, scopes, originator).
+/// Keeping this in lockstep with `main.zig`'s `runLoginCommand` means the
+/// wizard and `--login=openai-oauth` exercise the same code path.
+fn chatgptOauthShim(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    auth_path: []const u8,
+) anyerror!void {
+    return oauth.runLoginFlow(allocator, .{
+        .provider_name = provider_name,
+        .auth_path = auth_path,
+    });
+}
 
 /// Linear lookup against `PROVIDERS`. Returns a pointer so callers can read
 /// all three fields without copying; null means the user picked a name the
@@ -492,6 +511,47 @@ pub fn promptPicker(
     }
 }
 
+/// Compute the widest `label` across `PROVIDERS`. Used by
+/// `formatProviderLabel` to left-pad every entry to the same column so the
+/// auth-kind tag starts at a consistent offset.
+fn maxProviderLabelWidth() usize {
+    var widest: usize = 0;
+    for (&PROVIDERS) |entry| {
+        if (entry.label.len > widest) widest = entry.label.len;
+    }
+    return widest;
+}
+
+/// Render `entry` as a picker row: `"<label><padding>  (<tags>)"`. Tags are
+/// the auth-kind (`"API key"` or `"OAuth . ChatGPT sign-in"`, joined by
+/// U+00B7 MIDDLE DOT) plus an optional `"recommended"` marker. The caller
+/// owns the returned slice; free via the same allocator.
+fn formatProviderLabel(
+    allocator: std.mem.Allocator,
+    entry: *const ProviderEntry,
+) ![]u8 {
+    const pad_to = maxProviderLabelWidth();
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, entry.label);
+    if (entry.label.len < pad_to) {
+        try buf.appendNTimes(allocator, ' ', pad_to - entry.label.len);
+    }
+    try buf.appendSlice(allocator, "  (");
+
+    switch (entry.kind) {
+        .oauth => try buf.appendSlice(allocator, "OAuth \xc2\xb7 ChatGPT sign-in"),
+        .api_key => try buf.appendSlice(allocator, "API key"),
+    }
+    if (entry.recommended) {
+        try buf.appendSlice(allocator, " \xc2\xb7 recommended");
+    }
+    try buf.append(allocator, ')');
+
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Drop a trailing `\r` so CRLF-terminated input from a Windows-era terminal
 /// round-trips through `takeDelimiter('\n')` as a clean token.
 fn stripCr(line: []const u8) []const u8 {
@@ -624,13 +684,24 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
         if (deps.forced_provider) |forced| {
             break :blk findProvider(forced) orelse return error.UnknownProvider;
         }
-        try deps.stdout.writeAll("zag needs a provider. Choose one:\n");
-        try deps.stdout.flush();
 
-        var labels: [PROVIDERS.len][]const u8 = undefined;
-        for (&PROVIDERS, 0..) |entry, i| labels[i] = entry.label;
+        var label_bufs: [PROVIDERS.len][]u8 = undefined;
+        var built: usize = 0;
+        errdefer for (label_bufs[0..built]) |b| deps.allocator.free(b);
+        while (built < PROVIDERS.len) : (built += 1) {
+            label_bufs[built] = try formatProviderLabel(deps.allocator, &PROVIDERS[built]);
+        }
+        defer for (label_bufs) |b| deps.allocator.free(b);
 
-        const choice = try promptChoice(&deps, "", &labels);
+        var picker_labels: [PROVIDERS.len]PickerLabel = undefined;
+        for (label_bufs, 0..) |b, i| picker_labels[i] = .{ .text = b };
+
+        const choice = try promptPicker(
+            &deps,
+            "zag needs a provider. Choose one:",
+            &picker_labels,
+            0,
+        );
         break :blk &PROVIDERS[choice];
     };
 
@@ -955,7 +1026,17 @@ test "findProvider returns matching entry" {
     const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
     try testing.expectEqualStrings("anthropic", entry.name);
     try testing.expectEqualStrings("Anthropic", entry.label);
+    try testing.expectEqual(AuthKind.api_key, entry.kind);
     try testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", entry.default_model);
+}
+
+test "findProvider returns the openai-oauth entry with kind=.oauth" {
+    const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
+    try testing.expectEqualStrings("openai-oauth", entry.name);
+    try testing.expectEqual(AuthKind.oauth, entry.kind);
+    try testing.expect(entry.recommended);
+    try testing.expect(entry.oauth_fn != null);
+    try testing.expectEqualStrings("openai-oauth/gpt-5", entry.default_model);
 }
 
 test "findProvider returns null for unknown" {
@@ -979,6 +1060,7 @@ test "scaffoldConfigLua writes expected contents for openai" {
         \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
         \\
         \\zag.provider { name = "openai" }
+        \\-- zag.provider { name = "openai-oauth" }
         \\-- zag.provider { name = "anthropic" }
         \\-- zag.provider { name = "openrouter" }
         \\-- zag.provider { name = "groq" }
@@ -1009,6 +1091,7 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
         \\-- (written by `zag auth login <provider>`); you should never hand-edit it.
         \\
         \\zag.provider { name = "anthropic" }
+        \\-- zag.provider { name = "openai-oauth" }
         \\-- zag.provider { name = "openai" }
         \\-- zag.provider { name = "openrouter" }
         \\-- zag.provider { name = "groq" }
@@ -1090,7 +1173,9 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     defer testing.allocator.free(paths.auth_path);
     defer testing.allocator.free(paths.config_path);
 
-    var stdin = std.Io.Reader.fixed("1\nsk-abc-123\n");
+    // `2` picks the api-key openai entry; entry 1 is the openai-oauth
+    // recommended row whose oauth_fn would launch a real browser.
+    var stdin = std.Io.Reader.fixed("2\nsk-abc-123\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
@@ -1205,7 +1290,9 @@ test "runWizard appends to existing auth.json without clobbering other providers
         try auth.saveAuthFile(paths.auth_path, seed);
     }
 
-    var stdin = std.Io.Reader.fixed("1\nsk-new\n");
+    // `2` picks the api-key openai entry; entry 1 is the openai-oauth
+    // recommended row whose oauth_fn would launch a real browser.
+    var stdin = std.Io.Reader.fixed("2\nsk-new\n");
     var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout_writer.deinit();
 
@@ -1414,6 +1501,7 @@ test "dispatchProviderCredential calls oauth_fn when set and skips promptSecret"
     const picked: ProviderEntry = .{
         .name = "openai-oauth",
         .label = "ChatGPT (OAuth)",
+        .kind = .oauth,
         .default_model = "openai-oauth/gpt-5",
         .oauth_fn = &test_oauth_fn_stub,
     };
@@ -1462,6 +1550,7 @@ test "dispatchProviderCredential falls through to paste path when oauth_fn is nu
     const picked: ProviderEntry = .{
         .name = "openai",
         .label = "OpenAI",
+        .kind = .api_key,
         .default_model = "openai/gpt-4o",
         .oauth_fn = null,
     };
@@ -1475,13 +1564,97 @@ test "dispatchProviderCredential falls through to paste path when oauth_fn is nu
     try testing.expectEqualStrings("sk-paste-key", (try loaded.getApiKey("openai")).?);
 }
 
-test "PROVIDERS entries all default oauth_fn to null" {
-    // The paste-key flow is the only onboarding path in this plan. Guard
-    // against an accidental registration landing in a different PR by
-    // asserting every entry's oauth_fn is explicitly null.
+test "PROVIDERS: oauth entries carry oauth_fn, api_key entries don't" {
+    // Invariant: every `.oauth` entry must have a non-null `oauth_fn` (or the
+    // picker dispatch would fall through to `promptSecret` with nothing to
+    // paste), and every `.api_key` entry must leave `oauth_fn` null (so the
+    // paste flow runs). Guards against a future registration flipping the
+    // wrong field.
     for (&PROVIDERS) |entry| {
-        try testing.expectEqual(@as(?OAuthFn, null), entry.oauth_fn);
+        switch (entry.kind) {
+            .oauth => try testing.expect(entry.oauth_fn != null),
+            .api_key => try testing.expectEqual(@as(?OAuthFn, null), entry.oauth_fn),
+        }
     }
+}
+
+test "PROVIDERS: exactly one recommended entry, pinned to the top" {
+    var recommended_count: usize = 0;
+    for (&PROVIDERS) |entry| {
+        if (entry.recommended) recommended_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), recommended_count);
+    try testing.expect(PROVIDERS[0].recommended);
+}
+
+test "dispatchProviderCredential invokes oauth_fn for an openai-oauth-shaped entry" {
+    // Mirrors the real PROVIDERS[0] registration but swaps the shim for a
+    // stub so the test doesn't talk to the real OAuth server. Locks in the
+    // contract that `.kind = .oauth + oauth_fn` entries always dispatch to
+    // the callback, not to `promptSecret`.
+    test_oauth_call_count = 0;
+    test_oauth_last_provider = "";
+    test_oauth_last_auth_path = "";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try wizardPaths(tmp.dir);
+    defer testing.allocator.free(paths.auth_path);
+    defer testing.allocator.free(paths.config_path);
+
+    var stdin = std.Io.Reader.fixed("");
+    var stdout_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_writer.deinit();
+
+    const deps: WizardDeps = .{
+        .allocator = testing.allocator,
+        .stdin = &stdin,
+        .stdout = &stdout_writer.writer,
+        .is_tty = false,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = false,
+        .forced_provider = null,
+    };
+
+    const picked: ProviderEntry = .{
+        .name = "openai-oauth",
+        .label = "OpenAI",
+        .kind = .oauth,
+        .recommended = true,
+        .default_model = "openai-oauth/gpt-5",
+        .oauth_fn = &test_oauth_fn_stub,
+    };
+
+    try dispatchProviderCredential(&deps, &picked);
+    try testing.expectEqual(@as(usize, 1), test_oauth_call_count);
+    try testing.expectEqualStrings("openai-oauth", test_oauth_last_provider);
+}
+
+test "formatProviderLabel for openai-oauth shows OAuth . ChatGPT sign-in . recommended" {
+    const entry = findProvider("openai-oauth") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, entry);
+    defer testing.allocator.free(rendered);
+    const expected = "OpenAI      (OAuth \xc2\xb7 ChatGPT sign-in \xc2\xb7 recommended)";
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "formatProviderLabel for openai (api_key) shows API key" {
+    const entry = findProvider("openai") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, entry);
+    defer testing.allocator.free(rendered);
+    const expected = "OpenAI      (API key)";
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "formatProviderLabel pads anthropic to widest label width" {
+    const entry = findProvider("anthropic") orelse return error.TestExpectedEntry;
+    const rendered = try formatProviderLabel(testing.allocator, entry);
+    defer testing.allocator.free(rendered);
+    // "OpenRouter" is the widest label at 10 chars; "Anthropic" is 9, so one
+    // trailing space before the two-space gutter.
+    const expected = "Anthropic   (API key)";
+    try testing.expectEqualStrings(expected, rendered);
 }
 
 test "removeAuth is a no-op for missing entry" {
