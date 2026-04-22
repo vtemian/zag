@@ -267,7 +267,7 @@ pub fn persistDefaultModel(
         const line_start = cursor;
         const line_end = cursor + line.len;
         cursor = line_end + 1;
-        const trimmed = std.mem.trim(u8, line, " \t");
+        const trimmed = std.mem.trim(u8, line, " \t\r");
         if (std.mem.startsWith(u8, trimmed, "--")) continue;
         if (!std.mem.startsWith(u8, trimmed, "zag.set_default_model(")) continue;
         last_active_line_start = line_start;
@@ -324,7 +324,7 @@ fn stripExtraModelLines(
 
     var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
+        const trimmed = std.mem.trim(u8, line, " \t\r");
         const is_active_model = !std.mem.startsWith(u8, trimmed, "--") and
             std.mem.startsWith(u8, trimmed, "zag.set_default_model(");
         if (is_active_model) {
