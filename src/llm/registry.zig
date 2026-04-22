@@ -365,6 +365,37 @@ pub const Registry = struct {
         try self.endpoints.append(self.allocator, ep);
     }
 
+    /// Drop the endpoint with the given `name`, freeing its heap storage.
+    /// Returns true if an entry was removed, false if no match existed.
+    /// Used by the `zag.provider{}` Lua binding to implement override
+    /// semantics: a full-schema Lua declaration removes any builtin of the
+    /// same name before `add` installs the new entry.
+    pub fn remove(self: *Registry, name: []const u8) bool {
+        for (self.endpoints.items, 0..) |ep, i| {
+            if (std.mem.eql(u8, ep.name, name)) {
+                ep.free(self.allocator);
+                _ = self.endpoints.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Deep-copy all endpoints into a fresh Registry backed by `allocator`.
+    /// Used when a consumer needs an independent copy whose lifetime is
+    /// decoupled from the source (e.g. `ProviderResult` outliving the
+    /// LuaEngine's registry in tests).
+    pub fn dupe(self: *const Registry, allocator: Allocator) !Registry {
+        var copy = Registry{ .endpoints = .empty, .allocator = allocator };
+        errdefer copy.deinit();
+        for (self.endpoints.items) |ep| {
+            const duped = try ep.dupe(allocator);
+            errdefer duped.free(allocator);
+            try copy.endpoints.append(allocator, duped);
+        }
+        return copy;
+    }
+
     /// Release all heap-owned endpoints and backing storage.
     pub fn deinit(self: *Registry) void {
         for (self.endpoints.items) |ep| ep.free(self.allocator);
@@ -592,6 +623,50 @@ test "Registry.add takes ownership of an already-dupe'd endpoint" {
 
     const found = reg.find("custom").?;
     try std.testing.expectEqualStrings("m", found.default_model);
+}
+
+test "Registry.remove drops an existing entry and returns true" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    try std.testing.expect(reg.find("anthropic") != null);
+    try std.testing.expect(reg.remove("anthropic"));
+    try std.testing.expect(reg.find("anthropic") == null);
+}
+
+test "Registry.remove returns false when name is absent" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    try std.testing.expect(!reg.remove("not-a-provider"));
+}
+
+test "Registry.remove followed by add implements override" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const replacement: Endpoint = .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://custom.example.com/messages",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "custom-model",
+        .models = &.{},
+    };
+    _ = reg.remove("anthropic");
+    try reg.add(try replacement.dupe(std.testing.allocator));
+    const got = reg.find("anthropic").?;
+    try std.testing.expectEqualStrings("https://custom.example.com/messages", got.url);
+    try std.testing.expectEqualStrings("custom-model", got.default_model);
+}
+
+test "Registry.dupe produces an independent deep copy" {
+    var reg = try Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var copy = try reg.dupe(std.testing.allocator);
+    defer copy.deinit();
+    const orig = reg.find("anthropic").?;
+    const dup = copy.find("anthropic").?;
+    try std.testing.expectEqualStrings(orig.url, dup.url);
+    try std.testing.expect(orig.url.ptr != dup.url.ptr);
 }
 
 test "Registry.add rejects duplicate names" {
