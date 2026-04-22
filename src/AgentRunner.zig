@@ -67,6 +67,12 @@ last_info: [128]u8 = .{0} ** 128,
 /// Length of the last info message.
 last_info_len: u8 = 0,
 
+/// Last `ConversationTree.generation` the compositor observed for this
+/// pane. Used by `Compositor.drawDirtyLeaves` to tell apart a genuine
+/// tree mutation from a view-state-only dirty (scroll, focus, etc.).
+/// Stays zero until the first composite that actually paints content.
+node_version_snapshot: u32 = 0,
+
 /// Create a runner bound to `view` and `session`. Neither is owned.
 pub fn init(
     allocator: Allocator,
@@ -865,4 +871,30 @@ test "formatAgentErrorMessage falls back to error name for other errors" {
     const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError", msg);
+}
+
+test "node_version_snapshot starts at zero; compositor sync advances it" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "snap");
+    defer cb.deinit();
+    var history = ConversationHistory.init(allocator);
+    defer history.deinit();
+    var runner = AgentRunner.init(allocator, &cb, &history);
+    defer runner.deinit();
+
+    // Default: runner hasn't observed any composite yet.
+    try std.testing.expectEqual(@as(u32, 0), runner.node_version_snapshot);
+
+    // Mutations bump the tree's generation; the runner's snapshot is
+    // intentionally stale until the next Compositor sync runs. This
+    // test pins the "runner doesn't auto-track" invariant so Step 5
+    // can observe a real delta between tree.generation and snapshot
+    // when it drains dirty_nodes.
+    _ = try cb.appendNode(null, .user_message, "x");
+    try std.testing.expect(cb.tree.currentGeneration() != 0);
+    try std.testing.expectEqual(@as(u32, 0), runner.node_version_snapshot);
+
+    // Simulate what Compositor.syncTreeSnapshot does after painting.
+    runner.node_version_snapshot = cb.tree.currentGeneration();
+    try std.testing.expectEqual(cb.tree.currentGeneration(), runner.node_version_snapshot);
 }
