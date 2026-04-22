@@ -7092,7 +7092,8 @@ test "stdlib: require(zag.providers.openrouter) registers openrouter" {
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", ep.default_model);
     try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
-    try std.testing.expectEqual(@as(usize, 0), ep.models.len);
+    try std.testing.expect(ep.models.len >= 1);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
     try std.testing.expectEqual(@as(usize, 1), ep.headers.len);
     try std.testing.expectEqualStrings("X-OpenRouter-Title", ep.headers[0].name);
@@ -7111,7 +7112,8 @@ test "stdlib: require(zag.providers.groq) registers groq" {
     try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", ep.default_model);
     try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
-    try std.testing.expectEqual(@as(usize, 0), ep.models.len);
+    try std.testing.expect(ep.models.len >= 1);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
 }
 
@@ -7128,7 +7130,8 @@ test "stdlib: require(zag.providers.ollama) registers ollama" {
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("llama3", ep.default_model);
     try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
-    try std.testing.expectEqual(@as(usize, 0), ep.models.len);
+    try std.testing.expect(ep.models.len >= 1);
+    try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .none);
 }
 
