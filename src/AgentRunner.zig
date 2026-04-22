@@ -221,15 +221,58 @@ pub fn formatAgentErrorMessage(
         error.ApiError => blk: {
             // If the transport layer captured an upstream status and
             // body, surface it so the UI shows something actionable
-            // instead of just "ApiError".
+            // instead of just "ApiError". When the body is a JSON shape
+            // we recognise (Codex `detail`, OpenAI/Anthropic
+            // `error.message`), unwrap it to the human-readable string;
+            // otherwise show the raw captured detail.
             if (llm.error_detail.take()) |detail| {
                 defer allocator.free(detail);
+                if (std.mem.indexOfScalar(u8, detail, '{')) |json_start| {
+                    const json_slice = detail[json_start..];
+                    if (extractApiErrorMessage(allocator, json_slice)) |pretty| {
+                        defer allocator.free(pretty);
+                        break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{pretty});
+                    } else |_| {}
+                }
                 break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{detail});
             }
             break :blk allocator.dupe(u8, "ApiError");
         },
         else => allocator.dupe(u8, @errorName(err)),
     };
+}
+
+/// Try to extract a human-readable error message from a provider
+/// response body. Recognises the Codex shape `{"detail":"..."}` and the
+/// OpenAI/Anthropic shape `{"error":{"message":"..."}}`. Returns an
+/// allocator-owned copy of the extracted string, or `error.UnexpectedShape`
+/// when the body does not match either form.
+fn extractApiErrorMessage(
+    allocator: Allocator,
+    json_body: []const u8,
+) ![]u8 {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        json_body,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.UnexpectedShape;
+    const root = parsed.value.object;
+
+    if (root.get("detail")) |detail_val| {
+        if (detail_val == .string) return allocator.dupe(u8, detail_val.string);
+    }
+    if (root.get("error")) |err_val| {
+        if (err_val == .object) {
+            if (err_val.object.get("message")) |msg_val| {
+                if (msg_val == .string) return allocator.dupe(u8, msg_val.string);
+            }
+        }
+    }
+    return error.UnexpectedShape;
 }
 
 /// Background agent thread entry point. Runs the agent loop and
@@ -929,6 +972,42 @@ test "formatAgentErrorMessage for ApiError surfaces stored transport detail" {
         "ApiError: HTTP 401 (unauthorized): {\"error\":\"bad token\"}",
         msg,
     );
+}
+
+test "formatAgentErrorMessage extracts Codex detail from HTTP 400 body" {
+    const allocator = std.testing.allocator;
+    const detail = try allocator.dupe(
+        u8,
+        "HTTP 400 (bad_request): {\"detail\":\"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.\"}",
+    );
+    llm.error_detail.set(allocator, detail);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings(
+        "ApiError: The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
+        msg,
+    );
+}
+
+test "formatAgentErrorMessage extracts OpenAI error.message shape" {
+    const allocator = std.testing.allocator;
+    const detail = try allocator.dupe(
+        u8,
+        "HTTP 401 (unauthorized): {\"error\":{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\"}}",
+    );
+    llm.error_detail.set(allocator, detail);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("ApiError: Invalid API key", msg);
+}
+
+test "formatAgentErrorMessage falls through when detail body is not JSON" {
+    const allocator = std.testing.allocator;
+    const detail = try allocator.dupe(u8, "HTTP 502 (bad_gateway): upstream gone");
+    llm.error_detail.set(allocator, detail);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator);
+    defer allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "HTTP 502") != null);
 }
 
 test "formatAgentErrorMessage falls back to error name for unhinted errors" {
