@@ -107,6 +107,8 @@ test "generateState produces base64url-nopad of 32 random bytes" {
 // === Authorize URL ===
 
 pub const AuthorizeParams = struct {
+    /// Full authorize endpoint URL (e.g., `https://auth.openai.com/oauth/authorize`).
+    /// The path is NOT appended here; callers supply the complete URL.
     issuer: []const u8,
     client_id: []const u8,
     redirect_uri: []const u8,
@@ -125,7 +127,7 @@ pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
     errdefer aw.deinit();
 
     try aw.writer.writeAll(p.issuer);
-    try aw.writer.writeAll("/oauth/authorize?response_type=code");
+    try aw.writer.writeAll("?response_type=code");
 
     try writeParam(&aw.writer, "client_id", p.client_id);
     try writeParam(&aw.writer, "redirect_uri", p.redirect_uri);
@@ -148,7 +150,7 @@ fn writeParam(w: *std.io.Writer, key: []const u8, value: []const u8) !void {
 
 test "buildAuthorizeUrl includes all Codex-required params, percent-encoded" {
     const url = try buildAuthorizeUrl(std.testing.allocator, .{
-        .issuer = "https://auth.openai.com",
+        .issuer = "https://auth.openai.com/oauth/authorize",
         .client_id = "app_test",
         .redirect_uri = "http://localhost:1455/auth/callback",
         .challenge = "abc123",
@@ -183,7 +185,7 @@ test "buildAuthorizeUrl includes all Codex-required params, percent-encoded" {
 
 test "buildAuthorizeUrl preserves Codex query-parameter order" {
     const url = try buildAuthorizeUrl(std.testing.allocator, .{
-        .issuer = "https://auth.openai.com",
+        .issuer = "https://auth.openai.com/oauth/authorize",
         .client_id = "id",
         .redirect_uri = "http://localhost:1455/auth/callback",
         .challenge = "c",
@@ -930,16 +932,50 @@ test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
 // `port = 0` and `skip_browser = true` knobs for in-process testing.
 
 pub const LoginOptions = struct {
+    /// Name the credential is stored under in auth.json.
     provider_name: []const u8,
+    /// Absolute path to auth.json (the flow writes here atomically).
     auth_path: []const u8,
-    issuer: []const u8 = "https://auth.openai.com",
-    client_id: []const u8 = "app_EMoamEEZ73f0CkXaXp7hrann",
-    port: u16 = 1455,
-    scopes: []const u8 = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+    /// Authorize endpoint URL (full, including `/authorize`). Required.
+    issuer: []const u8,
+    /// Token endpoint URL (the `/token` endpoint used later for refresh).
+    /// Previously synthesised as `{issuer}/oauth/token`; now per-provider.
+    token_url: []const u8,
+    /// OAuth client_id registered with the provider.
+    client_id: []const u8,
+    /// Loopback port for the local callback listener. Previously a 1455
+    /// constant; now per-provider because each app registers a specific
+    /// redirect_uri with the issuer.
+    redirect_port: u16,
+    /// Space-separated OAuth scopes to request.
+    scopes: []const u8,
+    /// Identifier sent with the authorize URL (UA/client hint). Safe default
+    /// across providers; override for ones that care.
     originator: []const u8 = "zag_cli",
+    /// Optional RFC 6901 JSON pointer for an account_id claim in the id_token.
+    /// Null means the provider does not expose a per-account id and no
+    /// extraction occurs (an empty string is stored in `OAuthCred`).
+    account_id_claim_path: ?[]const u8,
+    /// Extra query parameters appended to the authorize URL verbatim
+    /// (e.g., provider-specific flags). Empty means none.
+    extra_authorize_params: []const Endpoint.Header = &.{},
     /// Tests pass `true` to keep the real browser from launching.
     skip_browser: bool = false,
 };
+
+test "LoginOptions requires token_url / redirect_port / account_id_claim_path" {
+    const fields = @typeInfo(LoginOptions).@"struct".fields;
+    var saw = std.StringHashMap(void).init(std.testing.allocator);
+    defer saw.deinit();
+    inline for (fields) |f| try saw.put(f.name, {});
+    try std.testing.expect(saw.contains("issuer"));
+    try std.testing.expect(saw.contains("client_id"));
+    try std.testing.expect(saw.contains("redirect_port"));
+    try std.testing.expect(saw.contains("scopes"));
+    try std.testing.expect(saw.contains("token_url"));
+    try std.testing.expect(saw.contains("account_id_claim_path"));
+    try std.testing.expect(saw.contains("extra_authorize_params"));
+}
 
 pub fn runLoginFlow(alloc: Allocator, opts: LoginOptions) !void {
     const pkce = try generatePkce(alloc);
@@ -961,7 +997,7 @@ pub fn runLoginFlowWithCodes(
     state: []const u8,
 ) !void {
     // 1) Bind the callback listener.
-    const addr = try std.net.Address.parseIp("127.0.0.1", opts.port);
+    const addr = try std.net.Address.parseIp("127.0.0.1", opts.redirect_port);
     var listener = try addr.listen(.{ .reuse_address = true });
     defer listener.deinit();
     const bound_port = listener.listen_address.getPort();
@@ -973,9 +1009,9 @@ pub fn runLoginFlowWithCodes(
     );
     defer alloc.free(redirect_uri);
 
-    // 2) Build the authorize URL. Codex-specific flags are hardcoded here for
-    // now; Phase C3 plumbs them through `LoginOptions` so stdlib Lua files own
-    // them per-provider.
+    // 2) Build the authorize URL. Provider-specific flags come from
+    // `opts.extra_authorize_params`; callers supply Codex flags inline until
+    // Phase H pulls them from the endpoint registry.
     const auth_url = try buildAuthorizeUrl(alloc, .{
         .issuer = opts.issuer,
         .client_id = opts.client_id,
@@ -984,10 +1020,7 @@ pub fn runLoginFlowWithCodes(
         .state = state,
         .scopes = opts.scopes,
         .originator = opts.originator,
-        .extra_params = &.{
-            .{ .name = "id_token_add_organizations", .value = "true" },
-            .{ .name = "codex_cli_simplified_flow", .value = "true" },
-        },
+        .extra_params = opts.extra_authorize_params,
     });
     defer alloc.free(auth_url);
 
@@ -1049,11 +1082,8 @@ pub fn runLoginFlowWithCodes(
     }
 
     // 7) Exchange the authorization code for tokens.
-    const token_url = try std.fmt.allocPrint(alloc, "{s}/oauth/token", .{opts.issuer});
-    defer alloc.free(token_url);
-
     const tokens = exchangeCode(alloc, .{
-        .token_url = token_url,
+        .token_url = opts.token_url,
         .code = code,
         .verifier = pkce.verifier,
         .redirect_uri = redirect_uri,
@@ -1064,15 +1094,15 @@ pub fn runLoginFlowWithCodes(
     };
     defer tokens.deinit(alloc);
 
-    // 8) Extract the chatgpt_account_id claim from the id_token.
-    const account_id = extractAccountId(
-        alloc,
-        tokens.id_token,
-        "https:~1~1api.openai.com~1auth/chatgpt_account_id",
-    ) catch |err| {
-        sendError(&request, "id_token missing chatgpt_account_id") catch {};
-        return err;
-    };
+    // 8) Extract the account_id claim from the id_token when the provider
+    // exposes one; otherwise persist an empty string (legal in `OAuthCred`).
+    const account_id = if (opts.account_id_claim_path) |path|
+        extractAccountId(alloc, tokens.id_token, path) catch |err| {
+            sendError(&request, "id_token missing account_id claim") catch {};
+            return err;
+        }
+    else
+        try alloc.dupe(u8, "");
     defer alloc.free(account_id);
 
     // 9) Persist into auth.json.
@@ -1252,8 +1282,10 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     // Bring up the mock issuer.
     var issuer = try MockIssuer.start();
     defer issuer.deinit();
-    const issuer_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{issuer.port});
-    defer std.testing.allocator.free(issuer_url);
+    const authorize_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/oauth/authorize", .{issuer.port});
+    defer std.testing.allocator.free(authorize_url);
+    const token_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/oauth/token", .{issuer.port});
+    defer std.testing.allocator.free(token_url);
     const issuer_thread = try std.Thread.spawn(.{}, MockIssuer.run, .{&issuer.server});
     defer issuer_thread.join();
 
@@ -1306,9 +1338,16 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     try runLoginFlowWithCodes(std.testing.allocator, .{
         .provider_name = "openai-oauth",
         .auth_path = auth_path,
-        .issuer = issuer_url,
+        .issuer = authorize_url,
+        .token_url = token_url,
         .client_id = "app_test",
-        .port = callback_port,
+        .redirect_port = callback_port,
+        .scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
+        .extra_authorize_params = &.{
+            .{ .name = "id_token_add_organizations", .value = "true" },
+            .{ .name = "codex_cli_simplified_flow", .value = "true" },
+        },
         .skip_browser = true,
     }, pkce, state);
 
@@ -1370,9 +1409,12 @@ test "runLoginFlowWithCodes rejects mismatched state" {
     const result = runLoginFlowWithCodes(std.testing.allocator, .{
         .provider_name = "openai-oauth",
         .auth_path = auth_path,
-        .issuer = "http://127.0.0.1:1",
+        .issuer = "http://127.0.0.1:1/oauth/authorize",
+        .token_url = "http://127.0.0.1:1/oauth/token",
         .client_id = "app_test",
-        .port = callback_port,
+        .redirect_port = callback_port,
+        .scopes = "openid",
+        .account_id_claim_path = "https:~1~1api.openai.com~1auth/chatgpt_account_id",
         .skip_browser = true,
     }, pkce, "EXPECTED");
 
