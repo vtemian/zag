@@ -47,6 +47,76 @@ pub const Endpoint = struct {
         value: []const u8,
     };
 
+    /// OAuth flow parameters for a provider. Describes the Authorization Code
+    /// + PKCE dance (issuer, token URL, client id, scopes, loopback port) and
+    /// how the resulting access token is carried into API requests via
+    /// `inject`. Generic enough that provider-specific hardcodes in `oauth.zig`
+    /// and `auth.zig` can be replaced by a single `OAuthSpec` lookup per
+    /// endpoint.
+    pub const OAuthSpec = struct {
+        /// OAuth issuer base URL (used to build the authorize endpoint).
+        issuer: []const u8,
+        /// Token endpoint URL for the Authorization Code / refresh exchange.
+        token_url: []const u8,
+        /// OAuth `client_id` registered with the provider.
+        client_id: []const u8,
+        /// Space-separated list of OAuth scopes to request.
+        scopes: []const u8,
+        /// Loopback port the local redirect listener binds to.
+        redirect_port: u16,
+        /// Optional JWT claim path whose value is extracted as the account id
+        /// (e.g., `"https://api.openai.com/auth.chatgpt_account_id"`). `null`
+        /// means this provider does not expose a per-account identifier.
+        account_id_claim_path: ?[]const u8,
+        /// Extra query parameters appended to the authorize URL (e.g.,
+        /// provider-specific hints). Empty slice means no extras.
+        extra_authorize_params: []const Header,
+        /// How the resolved access token is injected into outgoing requests.
+        inject: InjectSpec,
+    };
+
+    /// Recipe describing how an OAuth access token becomes HTTP headers on a
+    /// request. Kept separate from `OAuthSpec` so the same injection logic can
+    /// be unit-tested with a synthetic `auth.Resolved` and so future auth
+    /// schemes can reuse the shape.
+    pub const InjectSpec = struct {
+        /// Name of the header that carries the access token itself.
+        header: []const u8,
+        /// Literal prefix prepended to the token value (e.g., `"Bearer "`).
+        prefix: []const u8,
+        /// Additional static headers emitted alongside the token header. If a
+        /// name here collides with an endpoint's static header, values are
+        /// merged with a comma rather than overwritten.
+        extra_headers: []const Header,
+        /// When true, emit `account_id_header: <account id>` alongside the
+        /// token header.
+        use_account_id: bool,
+        /// Header name used when `use_account_id` is true. Empty otherwise.
+        account_id_header: []const u8,
+    };
+
+    /// Per-model rate card: context limits and dollar cost per million tokens.
+    /// Owned by the endpoint that serves the model, replacing the old
+    /// centralised `pricing.zig` table.
+    pub const ModelRate = struct {
+        /// Provider-scoped model identifier (e.g., `"claude-sonnet-4-5"`).
+        id: []const u8,
+        /// Maximum input tokens the model accepts in one request.
+        context_window: u32,
+        /// Maximum output tokens the model will generate in one response.
+        max_output_tokens: u32,
+        /// Input price, US dollars per million tokens.
+        input_per_mtok: f64,
+        /// Output price, US dollars per million tokens.
+        output_per_mtok: f64,
+        /// Cache-write price per million tokens, or null if the model does
+        /// not bill cache writes separately.
+        cache_write_per_mtok: ?f64,
+        /// Cache-read price per million tokens, or null if the model does
+        /// not bill cache reads separately.
+        cache_read_per_mtok: ?f64,
+    };
+
     /// Deep-copy all strings onto the heap. Caller must call free().
     pub fn dupe(self: Endpoint, allocator: Allocator) !Endpoint {
         const name = try allocator.dupe(u8, self.name);
@@ -285,6 +355,41 @@ test "findBuiltinEndpoint returns the OAuth endpoint for openai-oauth" {
 test "findBuiltinEndpoint returns null for unknown names" {
     try std.testing.expect(findBuiltinEndpoint("bogus") == null);
     try std.testing.expect(findBuiltinEndpoint("") == null);
+}
+
+test "ModelRate defaults: cache rates optional" {
+    const rate: Endpoint.ModelRate = .{
+        .id = "test",
+        .context_window = 0,
+        .max_output_tokens = 0,
+        .input_per_mtok = 0,
+        .output_per_mtok = 0,
+        .cache_write_per_mtok = null,
+        .cache_read_per_mtok = null,
+    };
+    try std.testing.expectEqualStrings("test", rate.id);
+    try std.testing.expect(rate.cache_read_per_mtok == null);
+}
+
+test "OAuthSpec is copyable by value" {
+    const spec: Endpoint.OAuthSpec = .{
+        .issuer = "a",
+        .token_url = "b",
+        .client_id = "c",
+        .scopes = "d",
+        .redirect_port = 1455,
+        .account_id_claim_path = null,
+        .extra_authorize_params = &.{},
+        .inject = .{
+            .header = "Authorization",
+            .prefix = "Bearer ",
+            .extra_headers = &.{},
+            .use_account_id = false,
+            .account_id_header = "",
+        },
+    };
+    const copy = spec;
+    try std.testing.expectEqualStrings("a", copy.issuer);
 }
 
 test {
