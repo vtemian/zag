@@ -60,6 +60,13 @@ lua_engine: ?*LuaEngine = null,
 /// allowed to mutate the window tree). Wired once after orchestrator
 /// construction; null is tolerated so off-main test harnesses keep working.
 window_manager: ?*WindowManager = null,
+/// Packed `NodeRegistry.Handle` of this runner's pane, stored as its
+/// `u32` bit pattern. The agent thread copies this into
+/// `tools.current_caller_pane_id` around every tool dispatch so layout
+/// tools can refuse destructive operations on the caller's own pane.
+/// Zero means the handle has not been populated yet (root pane before
+/// main wires it, or a fresh split before `doSplit` links the leaf).
+pane_handle_packed: u32 = 0,
 
 /// Pending tool_call nodes keyed by call_id, for parenting tool_result
 /// nodes. Supports parallel tool execution where events interleave.
@@ -183,6 +190,7 @@ pub fn submit(
         &self.cancel_flag,
         deps.lua_engine,
         deps.provider_name,
+        self.pane_handle_packed,
     });
 }
 
@@ -227,11 +235,19 @@ fn threadMain(
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine,
     provider_name: []const u8,
+    pane_handle_packed: u32,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
     tools.lua_request_queue = queue;
     defer tools.lua_request_queue = null;
+
+    // Publish the caller pane's packed handle so layout tools dispatched
+    // inline on this thread can refuse destructive ops on the caller's
+    // own pane. Worker threads (`agent.executeOneToolCall`) mirror this
+    // assignment from their per-thread context.
+    tools.current_caller_pane_id = pane_handle_packed;
+    defer tools.current_caller_pane_id = null;
 
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
         // The message sits in the queue until drained; allocate owned
@@ -889,6 +905,29 @@ test "formatAgentErrorMessage falls back to error name for other errors" {
     const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError", msg);
+}
+
+test "current_caller_pane_id threadlocal is per-thread" {
+    // Sanity check that assigning to `tools.current_caller_pane_id` in a
+    // child thread does not bleed into the parent thread and vice versa.
+    // The real integration verification is the layout_close self-pane
+    // rejection test later in the plan.
+    tools.current_caller_pane_id = 0xAAAA_BBBB;
+    defer tools.current_caller_pane_id = null;
+
+    const Child = struct {
+        fn run(observed: *?u32, set_to: u32) void {
+            observed.* = tools.current_caller_pane_id;
+            tools.current_caller_pane_id = set_to;
+        }
+    };
+
+    var observed: ?u32 = 0xDEAD_BEEF;
+    const t = try std.Thread.spawn(.{}, Child.run, .{ &observed, 0x1111_2222 });
+    t.join();
+
+    try std.testing.expectEqual(@as(?u32, null), observed);
+    try std.testing.expectEqual(@as(?u32, 0xAAAA_BBBB), tools.current_caller_pane_id);
 }
 
 test "node_version_snapshot starts at zero; compositor sync advances it" {

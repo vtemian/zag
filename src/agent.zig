@@ -94,7 +94,7 @@ pub fn runLoopStreaming(
         defer allocator.free(tool_calls);
 
         if (tool_calls.len > 0) {
-            const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine);
+            const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine, tools.current_caller_pane_id);
             try messages.append(allocator, .{ .role = .user, .content = results });
         }
 
@@ -248,6 +248,12 @@ const ToolCallContext = struct {
     cancel: *agent_events.CancelFlag,
     results: []ToolCallResult,
     lua_engine: ?*LuaEngine.LuaEngine,
+    /// Packed `NodeRegistry.Handle` of the pane whose agent dispatched
+    /// this batch. Null means the caller pane is unknown (test harnesses,
+    /// headless evals with no WindowManager). Worker threads republish
+    /// this into `tools.current_caller_pane_id` so layout tools see the
+    /// same caller id the inline path does.
+    caller_pane_id: ?u32,
 };
 
 /// Outcome of firing a `ToolPre` hook round-trip. On `.proceed`, the
@@ -484,6 +490,13 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
     tools.lua_request_queue = ctx.queue;
     defer tools.lua_request_queue = null;
 
+    // Mirror the caller pane id from the parent agent thread so layout
+    // tools running on this worker can refuse destructive ops on their
+    // own pane. Threadlocals do not inherit across `Thread.spawn`, so we
+    // republish it here for the duration of this worker's execution.
+    tools.current_caller_pane_id = ctx.caller_pane_id;
+    defer tools.current_caller_pane_id = null;
+
     const step = runToolStep(
         ctx.tool_call,
         ctx.registry,
@@ -513,6 +526,7 @@ pub fn executeTools(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
+    caller_pane_id: ?u32,
 ) ![]types.ContentBlock {
     if (tool_calls.len == 0) return &.{};
 
@@ -552,6 +566,7 @@ pub fn executeTools(
             .cancel = cancel,
             .results = results,
             .lua_engine = lua_engine,
+            .caller_pane_id = caller_pane_id,
         };
         handles[i] = std.Thread.spawn(.{}, executeOneToolCall, .{&contexts[i]}) catch |err| {
             log.err("failed to spawn tool thread: {s}", .{@errorName(err)});
@@ -847,7 +862,7 @@ test "single tool call runs inline without threading" {
         .{ .id = "call_1", .name = "echo_fast", .input_raw = "{}" },
     };
 
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null, null);
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
 
@@ -881,7 +896,7 @@ test "parallel execution preserves result order" {
         .{ .id = "call_fast", .name = "echo_fast", .input_raw = "{}" },
     };
 
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null, null);
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
 
@@ -930,7 +945,7 @@ test "parallel execution is faster than sequential" {
         std.debug.print("skipping benchmark: no monotonic clock ({s})\n", .{@errorName(err)});
         return;
     };
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null, null);
     const elapsed_ns = timer.read();
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
@@ -960,7 +975,7 @@ test "cancel flag is respected in parallel execution" {
         .{ .id = "call_2", .name = "echo_slow", .input_raw = "{}" },
     };
 
-    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null);
+    const blocks = try executeTools(&tool_calls, &registry, allocator, &queue, &cancel, null, null);
     defer freeToolResults(blocks, allocator);
     defer drainAndFreeQueue(&queue, allocator);
 
@@ -1042,7 +1057,7 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
     tools.lua_request_queue = &queue;
     defer tools.lua_request_queue = null;
 
-    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine);
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
     defer freeToolResults(blocks, alloc);
 
     // Drain whatever lifecycle events the executor pushed (tool_start,
