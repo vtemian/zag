@@ -185,6 +185,12 @@ fn writeTools(defs: []const types.ToolDefinition, w: anytype) !void {
         try w.writeAll("\"description\":");
         try std.json.Stringify.value(def.description, .{}, w);
         try w.print(",\"parameters\":{s}", .{def.input_schema_json});
+        // Codex requires an explicit `strict` on every tool; the endpoint
+        // returns HTTP 400 without it. `false` means "validate against
+        // schema but tolerate optional fields", matching pi-mono's
+        // convertResponsesTools(..., { strict: null }) default after the
+        // null-to-false fallback.
+        try w.writeAll(",\"strict\":false");
         try w.writeAll("}");
     }
     try w.writeAll("]");
