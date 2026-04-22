@@ -651,13 +651,8 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
         if (err == error.MissingCredential) {
             const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
             const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
-            const spec = llm.parseModelString(model_id);
             var scratch: [512]u8 = undefined;
-            const message = std.fmt.bufPrint(
-                &scratch,
-                "zag: no credentials for provider '{s}' in ~/.config/zag/auth.json\n",
-                .{spec.provider_name},
-            ) catch "zag: no credentials for configured provider in ~/.config/zag/auth.json\n";
+            const message = formatMissingCredentialHint(&scratch, model_id);
             _ = stderr_file.write(message) catch {};
         }
         return err;
@@ -975,6 +970,21 @@ pub fn main() !void {
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
     var provider = llm.createProviderFromEnv(default_model, allocator) catch |err| first_try: {
         if (err != error.MissingCredential) return err;
+
+        // OAuth providers can't be fixed by the api-key wizard — point the
+        // user at `zag --login=<provider>` and exit with the original error.
+        const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
+        const spec = llm.parseModelString(model_id);
+        if (llm.findBuiltinEndpoint(spec.provider_name)) |ep| {
+            if (ep.auth == .oauth_chatgpt) {
+                const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                var scratch: [512]u8 = undefined;
+                const message = formatMissingCredentialHint(&scratch, model_id);
+                _ = stderr_file.write(message) catch {};
+                return err;
+            }
+        }
+
         break :first_try try firstRunWizardRetry(
             allocator,
             if (lua_engine) |*eng| eng else null,
