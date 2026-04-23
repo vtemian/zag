@@ -990,7 +990,14 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
         return .handled;
     }
 
-    const cmd = self.command_registry.lookup(command) orelse return .not_a_command;
+    // Lua plugins register into the engine-owned command registry;
+    // check that first so `zag.command{name="quit"}` shadows the Zig
+    // built-in keyed on the same slash form.
+    const plugin_hit: ?CommandRegistry.Command = if (self.lua_engine) |engine|
+        engine.command_registry.lookup(command)
+    else
+        null;
+    const cmd = plugin_hit orelse self.command_registry.lookup(command) orelse return .not_a_command;
     switch (cmd) {
         .built_in => |b| switch (b) {
             .quit => return .quit,

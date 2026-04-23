@@ -44,24 +44,30 @@ pub fn deinit(self: *CommandRegistry) void {
 
 /// Register a zig-baked command. If the slash name is already taken,
 /// the old entry is replaced (the previous key is freed so storage
-/// does not leak).
+/// does not leak). Built-in variants carry no allocator-owned state,
+/// so the displaced `Command` is discarded here.
 pub fn registerBuiltIn(
     self: *CommandRegistry,
     slash_name: []const u8,
     kind: BuiltIn,
 ) !void {
-    try self.put(slash_name, .{ .built_in = kind });
+    _ = try self.put(slash_name, .{ .built_in = kind });
 }
 
 /// Register a Lua-backed command. `ref` is a registry reference held
 /// by the Lua engine; the engine's registry teardown is what
 /// ultimately releases the callback, not this map.
+///
+/// Returns the displaced entry when the slash name was already taken,
+/// otherwise null. Callers that own Lua registry refs (i.e. `zag.command{}`)
+/// must inspect the return value and `lua.unref` any `.lua_callback` slot
+/// they are replacing, or the prior ref leaks until VM teardown.
 pub fn registerLua(
     self: *CommandRegistry,
     slash_name: []const u8,
     ref: i32,
-) !void {
-    try self.put(slash_name, .{ .lua_callback = ref });
+) !?Command {
+    return self.put(slash_name, .{ .lua_callback = ref });
 }
 
 /// Lookup by the full slash-prefixed form (e.g. `"/quit"`). Returns
@@ -71,11 +77,12 @@ pub fn lookup(self: *const CommandRegistry, command: []const u8) ?Command {
     return self.entries.get(command);
 }
 
-fn put(self: *CommandRegistry, slash_name: []const u8, command: Command) !void {
+fn put(self: *CommandRegistry, slash_name: []const u8, command: Command) !?Command {
     const gop = try self.entries.getOrPut(slash_name);
     if (gop.found_existing) {
+        const displaced = gop.value_ptr.*;
         gop.value_ptr.* = command;
-        return;
+        return displaced;
     }
     const key = self.allocator.dupe(u8, slash_name) catch |err| {
         // Roll back the reserved slot so the transient key pointer (the
@@ -85,6 +92,7 @@ fn put(self: *CommandRegistry, slash_name: []const u8, command: Command) !void {
     };
     gop.key_ptr.* = key;
     gop.value_ptr.* = command;
+    return null;
 }
 
 test "registerBuiltIn + lookup round trip" {
@@ -106,7 +114,7 @@ test "lookup miss returns null" {
 test "registerLua stores callback ref" {
     var r = CommandRegistry.init(std.testing.allocator);
     defer r.deinit();
-    try r.registerLua("/greet", 42);
+    _ = try r.registerLua("/greet", 42);
     const hit = r.lookup("/greet") orelse return error.TestExpected;
     try std.testing.expect(hit == .lua_callback);
     try std.testing.expectEqual(@as(i32, 42), hit.lua_callback);
@@ -116,17 +124,39 @@ test "registerLua shadows a built-in keyed on the same name" {
     var r = CommandRegistry.init(std.testing.allocator);
     defer r.deinit();
     try r.registerBuiltIn("/quit", .quit);
-    try r.registerLua("/quit", 7);
+    _ = try r.registerLua("/quit", 7);
     const hit = r.lookup("/quit") orelse return error.TestExpected;
     try std.testing.expect(hit == .lua_callback);
     try std.testing.expectEqual(@as(i32, 7), hit.lua_callback);
+}
+
+test "registerLua returns the displaced entry on overwrite" {
+    var r = CommandRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    try r.registerBuiltIn("/model", .model);
+    const first = try r.registerLua("/model", 100);
+    try std.testing.expect(first != null);
+    try std.testing.expect(first.? == .built_in);
+    try std.testing.expectEqual(BuiltIn.model, first.?.built_in);
+
+    const second = try r.registerLua("/model", 101);
+    try std.testing.expect(second != null);
+    try std.testing.expect(second.? == .lua_callback);
+    try std.testing.expectEqual(@as(i32, 100), second.?.lua_callback);
+}
+
+test "registerLua returns null on fresh insert" {
+    var r = CommandRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const displaced = try r.registerLua("/greet", 11);
+    try std.testing.expectEqual(@as(?Command, null), displaced);
 }
 
 test "deinit frees every duped key" {
     var r = CommandRegistry.init(std.testing.allocator);
     try r.registerBuiltIn("/quit", .quit);
     try r.registerBuiltIn("/perf", .perf);
-    try r.registerLua("/greet", 11);
+    _ = try r.registerLua("/greet", 11);
     r.deinit();
 }
 

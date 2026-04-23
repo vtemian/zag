@@ -11,6 +11,7 @@ const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
+const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
 const Layout = @import("Layout.zig");
@@ -93,6 +94,12 @@ pub const LuaEngine = struct {
     /// overwrite entries here, and the window manager reads from it via
     /// `keymapRegistry()` when dispatching keys.
     keymap_registry: Keymap.Registry,
+    /// Slash-command registry for plugin-defined commands. Starts empty
+    /// and fills via `zag.command{}`. The window manager owns its own
+    /// registry for built-ins (`/quit`, `/perf`, `/model`, ...) and
+    /// checks this one first so Lua plugins can shadow built-ins under
+    /// the same slash name.
+    command_registry: CommandRegistry,
     /// Persistent escape-sequence parser owned by the engine. Defaults
     /// match `input.Parser{}`, so `zag.set_escape_timeout_ms()` from
     /// `config.lua` lands here during `loadUserConfig`; the orchestrator
@@ -226,6 +233,7 @@ pub const LuaEngine = struct {
             .hook_dispatcher = hook_registry_mod.HookDispatcher.init(allocator),
             .providers_registry = providers_registry,
             .keymap_registry = keymap_registry,
+            .command_registry = CommandRegistry.init(allocator),
             .tasks = std.AutoHashMap(i32, *Task).init(allocator),
         };
     }
@@ -290,6 +298,18 @@ pub const LuaEngine = struct {
             }
         }
         self.keymap_registry.deinit();
+        // Release Lua callback refs held by slash commands registered
+        // through `zag.command{}`. Same rationale as the keymap loop
+        // above: otherwise the refs leak until the VM itself is torn
+        // down on the next line.
+        var cmd_iter = self.command_registry.entries.iterator();
+        while (cmd_iter.next()) |entry| {
+            switch (entry.value_ptr.*) {
+                .lua_callback => |ref| self.lua.unref(zlua.registry_index, ref),
+                .built_in => {},
+            }
+        }
+        self.command_registry.deinit();
         self.lua.deinit();
     }
 
@@ -305,6 +325,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "hook_del");
         lua.pushFunction(zlua.wrap(zagKeymapFn));
         lua.setField(-2, "keymap");
+        lua.pushFunction(zlua.wrap(zagCommandFn));
+        lua.setField(-2, "command");
         lua.pushFunction(zlua.wrap(zagSetEscapeTimeoutMsFn));
         lua.setField(-2, "set_escape_timeout_ms");
         lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
@@ -2457,6 +2479,79 @@ pub const LuaEngine = struct {
         });
 
         log.info("registered Lua tool: {s}", .{tool_name_owned});
+        return 0;
+    }
+
+    /// Zig function backing `zag.command{name, fn, desc?}`.
+    /// Registers a slash command into the engine-owned `command_registry`.
+    /// Built-ins keyed on the same slash form are shadowed by the new
+    /// Lua callback; the window manager checks the engine's registry
+    /// before its own, so plugins always win.
+    fn zagCommandFn(lua: *Lua) !i32 {
+        return zagCommandFnInner(lua) catch |err| {
+            log.warn("zag.command() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagCommandFnInner(lua: *Lua) !i32 {
+        if (!lua.isTable(1)) {
+            log.warn("zag.command() expects a table argument", .{});
+            return error.LuaError;
+        }
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.command(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        // `name` is required. Borrowed from the Lua VM; we stringify it
+        // with the leading slash into a local buffer before any call that
+        // could pop the string off the stack.
+        _ = lua.getField(1, "name");
+        if (!lua.isString(-1)) {
+            log.warn("zag.command(): 'name' field must be a string", .{});
+            lua.pop(1);
+            return error.LuaError;
+        }
+        const raw_name = lua.toString(-1) catch {
+            log.warn("zag.command(): 'name' field must be a string", .{});
+            lua.pop(1);
+            return error.LuaError;
+        };
+        // The Lua form omits the leading slash so `zag.command{name="model"}`
+        // reads naturally; the registry keys on the user-visible form.
+        var slash_buf: [128]u8 = undefined;
+        const slash_name = std.fmt.bufPrint(&slash_buf, "/{s}", .{raw_name}) catch {
+            log.warn("zag.command(): name '{s}' too long", .{raw_name});
+            lua.pop(1);
+            return error.LuaError;
+        };
+        lua.pop(1);
+
+        // `fn` is required; grab it last so the registry ref is the top
+        // of stack when we call `lua.ref`.
+        _ = lua.getField(1, "fn");
+        if (!lua.isFunction(-1)) {
+            log.warn("zag.command(): 'fn' field must be a function", .{});
+            lua.pop(1);
+            return error.LuaError;
+        }
+        const func_ref = lua.ref(zlua.registry_index) catch {
+            log.warn("zag.command(): failed to create function reference", .{});
+            return error.LuaError;
+        };
+        errdefer lua.unref(zlua.registry_index, func_ref);
+
+        const displaced = try engine.command_registry.registerLua(slash_name, func_ref);
+        if (displaced) |prev| switch (prev) {
+            .lua_callback => |old_ref| lua.unref(zlua.registry_index, old_ref),
+            .built_in => log.info("command {s} shadowed by Lua plugin", .{slash_name}),
+        };
+
         return 0;
     }
 
@@ -4789,6 +4884,151 @@ test "zag.keymap table form rejects neither fn nor action" {
     );
     try std.testing.expectError(error.LuaRuntime, result);
     engine.lua.pop(1);
+}
+
+test "zag.command{} registers a lua-callback command" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.count = 0
+        \\zag.command {
+        \\  name = "model",
+        \\  fn = function() _G.count = _G.count + 1 end,
+        \\}
+    );
+
+    const hit = engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    try std.testing.expect(hit == .lua_callback);
+
+    engine.invokeCallback(hit.lua_callback);
+    _ = try engine.lua.getGlobal("count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.command{} shadow wins over a built-in keyed on the same slash" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // The engine's command_registry is empty by default; simulate what
+    // WindowManager does at init by dropping a built-in entry in the
+    // *engine* registry directly. The dispatch preference rule in the
+    // window manager checks the engine registry first, so this models
+    // the shadow lookup order.
+    try engine.command_registry.registerBuiltIn("/quit", .quit);
+    try engine.lua.doString(
+        \\_G.shadow_fired = false
+        \\zag.command {
+        \\  name = "quit",
+        \\  fn = function() _G.shadow_fired = true end,
+        \\}
+    );
+
+    const hit = engine.command_registry.lookup("/quit") orelse
+        return error.TestExpectedCommand;
+    try std.testing.expect(hit == .lua_callback);
+
+    engine.invokeCallback(hit.lua_callback);
+    _ = try engine.lua.getGlobal("shadow_fired");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.command{} rejects missing fn" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.command { name = "foo" }
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.command{} rejects missing name" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.command { fn = function() end }
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.command{} re-registration unrefs the displaced callback" {
+    // Probe for a ref-leak by comparing registry growth on two paths:
+    //  (a) N distinct slash names => N fresh allocations, registry grows by ~N.
+    //  (b) N overwrites of the same slash name => each overwrite MUST
+    //      unref the displaced ref so the freelist recycles its slot,
+    //      keeping registry growth roughly flat and much smaller than N.
+    // If `zagCommandFn` forgets to unref the displaced slot, path (b)
+    // grows the same way path (a) does, which this test rejects.
+    const N: usize = 16;
+
+    // Path (a): N fresh names, measure how the registry grows per
+    // independent Lua callback. Scope to its own engine so the two
+    // probes don't cross-contaminate.
+    const growth_fresh: u32 = blk: {
+        var engine = try LuaEngine.init(std.testing.allocator);
+        defer engine.deinit();
+        engine.storeSelfPointer();
+
+        try engine.lua.doString("_G.fresh_seed = 0");
+        const baseline: u32 = @intCast(engine.lua.rawLen(zlua.registry_index));
+
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            var buf: [128]u8 = undefined;
+            const src = try std.fmt.bufPrintZ(
+                &buf,
+                "zag.command {{ name = \"probe{d}\", fn = function() end }}",
+                .{i},
+            );
+            try engine.lua.doString(src);
+        }
+        const after: u32 = @intCast(engine.lua.rawLen(zlua.registry_index));
+        break :blk after - baseline;
+    };
+
+    // Path (b): N overwrites of the same slash name. If unref works the
+    // freelist recycles the slot each iteration; registry stays flat
+    // (modulo whatever doString itself may park).
+    const growth_overwrite: u32 = blk: {
+        var engine = try LuaEngine.init(std.testing.allocator);
+        defer engine.deinit();
+        engine.storeSelfPointer();
+
+        try engine.lua.doString(
+            \\zag.command { name = "probe", fn = function() end }
+        );
+        const baseline: u32 = @intCast(engine.lua.rawLen(zlua.registry_index));
+
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            try engine.lua.doString(
+                \\zag.command { name = "probe", fn = function() end }
+            );
+        }
+        const after: u32 = @intCast(engine.lua.rawLen(zlua.registry_index));
+        break :blk after - baseline;
+    };
+
+    // The overwrite path must recycle slots. We allow a small slack for
+    // Lua-VM bookkeeping (compiled chunks interned during doString) but
+    // demand it is far below the linear fresh-allocation path.
+    try std.testing.expect(growth_fresh >= N);
+    try std.testing.expect(growth_overwrite < growth_fresh / 2);
 }
 
 test "LuaEngine init populates keymap defaults" {
