@@ -412,13 +412,26 @@ pub const LuaEngine = struct {
         lua.setField(-2, "resize");
         lua.setField(-2, "layout"); // zag.layout = layout_table; [zag_table]
 
-        // zag.pane; per-pane inspection primitives. Mirrors the
-        // `pane_read` tool so plugins can snapshot a pane's rendered
-        // text without a tool-call round-trip.
+        // zag.pane; per-pane inspection + mutation primitives. Mirrors
+        // the `pane_read` tool for reads, and carries `set_model` /
+        // `current_model` so a Lua picker plugin can drive the same
+        // swap pathway the built-in `/model` command uses.
         lua.newTable(); // [zag_table, pane_table]
         lua.pushFunction(zlua.wrap(zagPaneReadFn));
         lua.setField(-2, "read");
+        lua.pushFunction(zlua.wrap(zagPaneSetModelFn));
+        lua.setField(-2, "set_model");
+        lua.pushFunction(zlua.wrap(zagPaneCurrentModelFn));
+        lua.setField(-2, "current_model");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
+
+        // zag.providers; read-only view of the endpoint registry so a
+        // Lua model picker can enumerate providers/models without
+        // re-implementing the stdlib bookkeeping.
+        lua.newTable(); // [zag_table, providers_table]
+        lua.pushFunction(zlua.wrap(zagProvidersListFn));
+        lua.setField(-2, "list");
+        lua.setField(-2, "providers"); // zag.providers = providers_table; [zag_table]
 
         // zag.buffer; buffer primitives for Lua plugins. Each binding
         // resolves a `"b<u32>"` handle string through the live
@@ -2351,6 +2364,97 @@ pub const LuaEngine = struct {
             const msg = std.fmt.bufPrintZ(&buf, "zag.pane.read: decode failed: {s}", .{@errorName(err)}) catch "zag.pane.read: decode failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
         };
+        return 1;
+    }
+
+    /// `zag.pane.set_model(pane_id, "<provider>/<id>")`: swap the pane's
+    /// model override. Goes through the same drain/build/persist pipeline
+    /// the `/model` command triggers, so the call may block briefly while
+    /// an in-flight agent turn is cancelled.
+    fn zagPaneSetModelFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.set_model: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.set_model");
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.pane.set_model: model must be a string", .{});
+        }
+        const model_string = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.pane.set_model: model must be a string", .{});
+        };
+        const slash = std.mem.indexOfScalar(u8, model_string, '/') orelse {
+            lua.raiseErrorStr("zag.pane.set_model: model must be \"provider/id\"", .{});
+        };
+        if (slash == 0 or slash == model_string.len - 1) {
+            lua.raiseErrorStr("zag.pane.set_model: model must be \"provider/id\"", .{});
+        }
+        const provider_name = model_string[0..slash];
+        const model_id = model_string[slash + 1 ..];
+        wm.swapProviderForPane(handle, provider_name, model_id) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.set_model: {s}", .{@errorName(err)}) catch "zag.pane.set_model failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
+    /// `zag.pane.current_model(pane_id)`: return the resolved
+    /// `"provider/id"` model string the pane is currently using
+    /// (per-pane override if present, shared default otherwise).
+    fn zagPaneCurrentModelFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.current_model: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.current_model");
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.current_model: {s}", .{@errorName(err)}) catch "zag.pane.current_model failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        const resolved = wm.providerFor(pane);
+        _ = lua.pushString(resolved.model_id);
+        return 1;
+    }
+
+    /// `zag.providers.list()`: snapshot the endpoint registry as a Lua
+    /// table keyed by provider name. Each entry carries `default_model`
+    /// and a `models` array of `{ id, label?, recommended }` rows so a
+    /// Lua picker can render them without touching the Zig registry.
+    fn zagProvidersListFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        lua.newTable();
+        for (engine.providers_registry.endpoints.items) |ep| {
+            lua.newTable();
+
+            _ = lua.pushString(ep.default_model);
+            lua.setField(-2, "default_model");
+
+            lua.newTable();
+            for (ep.models, 0..) |m, idx| {
+                lua.newTable();
+                _ = lua.pushString(m.id);
+                lua.setField(-2, "id");
+                if (m.label) |lbl| {
+                    _ = lua.pushString(lbl);
+                    lua.setField(-2, "label");
+                }
+                lua.pushBoolean(m.recommended);
+                lua.setField(-2, "recommended");
+                // Lua arrays are 1-indexed; rawSetIndex writes at that slot.
+                lua.rawSetIndex(-2, @intCast(idx + 1));
+            }
+            lua.setField(-2, "models");
+
+            // Copy the name for the key so the `[]const u8` slice does
+            // not escape the loop body.
+            var name_buf: [64]u8 = undefined;
+            const key = std.fmt.bufPrintZ(&name_buf, "{s}", .{ep.name}) catch {
+                lua.raiseErrorStr("zag.providers.list: name too long", .{});
+            };
+            lua.setField(-2, key);
+        }
         return 1;
     }
 

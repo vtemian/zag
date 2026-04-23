@@ -1144,17 +1144,74 @@ pub fn swapProvider(
     provider_name: []const u8,
     model_id: []const u8,
 ) !void {
+    const focused_node = self.layout.focused orelse
+        return self.swapProviderForRootFallback(provider_name, model_id);
+    const handle = self.handleForNode(focused_node) catch {
+        // No registry slot for the focused node means something is out
+        // of sync; fall back to the root pane's slot so the swap still
+        // lands somewhere sensible.
+        return self.swapProviderForRootFallback(provider_name, model_id);
+    };
+    try self.swapProviderForPane(handle, provider_name, model_id);
+}
+
+/// When the focused leaf has no registry slot (shouldn't happen under
+/// normal use; WindowManager eagerly registers every pane), fall back
+/// to a direct `*Pane`-driven swap on `&root_pane`. Duplicates the few
+/// lines that `swapProviderForPane` would otherwise do so the caller
+/// never gets a silent failure.
+fn swapProviderForRootFallback(
+    self: *WindowManager,
+    provider_name: []const u8,
+    model_id: []const u8,
+) !void {
+    return self.swapProviderOnPanePtr(&self.root_pane, provider_name, model_id);
+}
+
+/// Swap the model for the pane identified by `handle`. All the
+/// cancel/drain/persistence/status logic lives here; `swapProvider`
+/// is the focused-pane convenience wrapper.
+pub fn swapProviderForPane(
+    self: *WindowManager,
+    handle: NodeRegistry.Handle,
+    provider_name: []const u8,
+    model_id: []const u8,
+) !void {
+    const pane = try self.paneFromHandle(handle);
+    return self.swapProviderOnPanePtr(pane, provider_name, model_id);
+}
+
+/// Resolve a node handle to the `*Pane` whose buffer the leaf carries.
+/// Rejects splits and unregistered panes loudly; handles that point at
+/// a scratch-backed pane still succeed.
+pub fn paneFromHandle(self: *WindowManager, handle: NodeRegistry.Handle) !*Pane {
+    const node = try self.node_registry.resolve(handle);
+    if (node.* != .leaf) return error.NotALeaf;
+    const leaf_buffer = node.leaf.buffer;
+    if (self.root_pane.buffer.ptr == leaf_buffer.ptr) return &self.root_pane;
+    for (self.extra_panes.items) |*entry| {
+        if (entry.pane.buffer.ptr == leaf_buffer.ptr) return &entry.pane;
+    }
+    return error.PaneNotFound;
+}
+
+/// Shared core. Given a resolved `*Pane`, drain any in-flight turn,
+/// build the new provider, move it onto the pane's override slot, and
+/// announce the result. Every swapProvider* path ends up here.
+fn swapProviderOnPanePtr(
+    self: *WindowManager,
+    pane: *Pane,
+    provider_name: []const u8,
+    model_id: []const u8,
+) !void {
     const registry = self.registry orelse return error.NoRegistry;
 
-    // Step 1: drain any in-flight turn on the focused pane's runner.
-    // getFocusedPanePtr falls back to &root_pane when no leaf is focused.
-    // The drain polls cooperatively; a stuck tool or streaming HTTP
-    // call would otherwise hang the TUI forever, so we cap the wait.
-    // A scratch-focused pane has no runner, so the drain is skipped
-    // entirely — there is no agent turn that could be reading the old
-    // provider.
-    const focused = self.getFocusedPanePtr();
-    if (focused.runner) |runner| {
+    // Step 1: drain any in-flight turn on the pane's runner. The drain
+    // polls cooperatively; a stuck tool or streaming HTTP call would
+    // otherwise hang the TUI forever, so we cap the wait. A scratch
+    // pane has no runner, so the drain is skipped entirely: there is
+    // no agent turn that could be reading the old provider.
+    if (pane.runner) |runner| {
         if (runner.isAgentRunning()) {
             runner.cancelAgent();
             const timeout_ms: u64 = 5_000;
@@ -1187,10 +1244,10 @@ pub fn swapProvider(
     );
     errdefer new_result.deinit();
 
-    // Step 3: store the new provider on the FOCUSED pane's override.
-    // The shared `self.provider` slot is left untouched so other panes
+    // Step 3: store the new provider on the pane's override. The
+    // shared `self.provider` slot is left untouched so other panes
     // keep reading the global default via `providerFor`.
-    if (focused.provider) |existing| {
+    if (pane.provider) |existing| {
         // Pane already owns an override: deinit the old payload in
         // place and overwrite with the new one. The heap slot is
         // reused, so no alloc / free churn on repeated swaps.
@@ -1206,7 +1263,7 @@ pub fn swapProvider(
         const owned = try self.allocator.create(llm.ProviderResult);
         errdefer self.allocator.destroy(owned);
         owned.* = new_result;
-        focused.provider = owned;
+        pane.provider = owned;
     }
 
     // Step 4: try to persist the pick to config.lua. On any failure fall
@@ -2662,6 +2719,122 @@ test "zag.layout.split rejects a malformed buffer handle string" {
     engine.lua.pop(1);
 }
 
+test "layout_split tool mounts scratch buffer by handle end-to-end" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    // Seed a scratch on the registry. The tool receives the handle as a
+    // `"b<u32>"` string in its JSON input, the same shape a Lua plugin
+    // or an agent-authored call would produce.
+    const bh = try wm.buffer_registry.createScratch("picker");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id_str);
+    const buf_id_str = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buf_id_str);
+
+    // Stand up an EventQueue and drain thread so `dispatch` has
+    // something to hand the LayoutRequest to. The tool call blocks on
+    // `req.done.wait()` until the drainer pops the event and passes it
+    // to `handleLayoutRequest`.
+    var queue = try agent_events.EventQueue.initBounded(allocator, 4);
+    defer queue.deinit();
+
+    const Drainer = struct {
+        queue: *agent_events.EventQueue,
+        wm: *WindowManager,
+
+        fn run(self: *@This()) void {
+            var slot: [1]agent_events.AgentEvent = undefined;
+            while (true) {
+                const n = self.queue.drain(&slot);
+                if (n == 0) {
+                    std.Thread.sleep(std.time.ns_per_ms);
+                    continue;
+                }
+                switch (slot[0]) {
+                    .layout_request => |req| {
+                        self.wm.handleLayoutRequest(req);
+                        return;
+                    },
+                    else => return,
+                }
+            }
+        }
+    };
+    var drainer: Drainer = .{ .queue = &queue, .wm = wm };
+    const drain_thread = try std.Thread.spawn(.{}, Drainer.run, .{&drainer});
+    defer drain_thread.join();
+
+    const saved_queue = tools.lua_request_queue;
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = saved_queue;
+
+    const input_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"{s}\",\"direction\":\"vertical\",\"buffer\":\"{s}\"}}",
+        .{ pane_id_str, buf_id_str },
+    );
+    defer allocator.free(input_json);
+
+    const tool_result = try @import("tools/layout.zig").split_tool.execute(
+        input_json,
+        allocator,
+        null,
+    );
+    defer if (tool_result.owned) allocator.free(tool_result.content);
+
+    try std.testing.expect(!tool_result.is_error);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, tool_result.content, .{});
+    defer parsed.deinit();
+    const new_id_str = parsed.value.object.get("new_id").?.string;
+    const new_id = try NodeRegistry.parseId(new_id_str);
+    const new_node = try wm.node_registry.resolve(new_id);
+    try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
+}
+
 test "readPaneById returns rendered text with metadata" {
     const allocator = std.testing.allocator;
 
@@ -3063,6 +3236,151 @@ test "swapProvider replaces existing override in place" {
     try std.testing.expectEqualStrings("provA/a2", second_slot.model_id);
     // Shared default still untouched across both swaps.
     try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
+}
+
+test "swapProviderForPane targets the pane identified by handle" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    // Wire the node registry and seed the root leaf so the handle path
+    // resolves to `&f.wm.root_pane`. The PickerFixture skips this
+    // bookkeeping by default (the swapProvider tests above work through
+    // the root fallback), but handle-based swaps require the registry.
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+
+    try f.wm.swapProviderForPane(root_handle, "provB", "b2");
+
+    const override = f.wm.root_pane.provider orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("provB/b2", override.model_id);
+    // Shared default is still untouched; swapProviderForPane is a
+    // per-pane primitive.
+    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
+}
+
+test "zag.pane.set_model swaps via the Lua surface" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id_str);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_model("{s}", "provB/b1")
+    , .{pane_id_str}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    const override = f.wm.root_pane.provider orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("provB/b1", override.model_id);
+    try std.testing.expectEqualStrings("provB/b1", f.wm.providerFor(&f.wm.root_pane).model_id);
+}
+
+test "zag.pane.current_model returns the resolved model string" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id_str);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.model = zag.pane.current_model("{s}")
+    , .{pane_id_str}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("model");
+    defer engine.lua.pop(1);
+    const got = try engine.lua.toString(-1);
+    // No override set, so the resolved model is the shared default.
+    try std.testing.expectEqualStrings("provA/a1", got);
+
+    // After a swap, current_model reflects the override.
+    try f.wm.swapProviderForPane(root_handle, "provB", "b2");
+    const script2 = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.model2 = zag.pane.current_model("{s}")
+    , .{pane_id_str}, 0);
+    defer allocator.free(script2);
+    try engine.lua.doString(script2);
+    _ = try engine.lua.getGlobal("model2");
+    defer engine.lua.pop(1);
+    try std.testing.expectEqualStrings("provB/b2", try engine.lua.toString(-1));
+}
+
+test "zag.providers.list reflects the endpoint registry" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Seed the engine's own providers_registry with one endpoint so the
+    // Lua table has something to iterate. Using the engine-owned
+    // registry (not a fixture-local one) matches how the real startup
+    // wires it through `zag.provider{...}`.
+    const ep: llm.Endpoint = .{
+        .name = "provX",
+        .serializer = .openai,
+        .url = "https://x.example",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "x1",
+        .models = &[_]llm.Endpoint.ModelRate{
+            .{ .id = "x1", .label = "X One", .recommended = true, .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+            .{ .id = "x2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+        },
+    };
+    try engine.providers_registry.add(try ep.dupe(allocator));
+
+    try engine.lua.doString(
+        \\local t = zag.providers.list()
+        \\_G.count = 0
+        \\for _ in pairs(t) do _G.count = _G.count + 1 end
+        \\_G.default_x = t.provX and t.provX.default_model or nil
+        \\_G.first_id = t.provX and t.provX.models[1].id or nil
+        \\_G.first_label = t.provX and t.provX.models[1].label or nil
+        \\_G.first_recommended = t.provX and t.provX.models[1].recommended or nil
+    );
+    _ = try engine.lua.getGlobal("count");
+    try std.testing.expect((try engine.lua.toInteger(-1)) >= 1);
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("default_x");
+    try std.testing.expectEqualStrings("x1", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("first_id");
+    try std.testing.expectEqualStrings("x1", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("first_label");
+    try std.testing.expectEqualStrings("X One", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("first_recommended");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
 }
 
 test "renderModelPicker marks focused pane's current model" {
