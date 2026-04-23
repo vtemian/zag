@@ -1,6 +1,7 @@
 //! Slash command registry. Built-in commands (`/quit`, `/perf`,
-//! `/perf-dump`, `/model`) are registered at WindowManager init;
-//! Lua plugins add more via `zag.command{}`.
+//! `/perf-dump`) are registered at WindowManager init; Lua plugins add
+//! more via `zag.command{}`, and the embedded `zag.builtin.*` plugins
+//! (e.g. the `/model` picker) register through the same Lua path.
 //!
 //! Keys are the user-visible form including the leading slash so the
 //! match is a plain string equality. Lua registrations shadow built-ins
@@ -14,7 +15,7 @@ const CommandRegistry = @This();
 /// Zig-baked commands dispatched by the window manager itself. Lua
 /// plugins declare their own commands through `registerLua`, which
 /// stores a registry ref instead of one of these tags.
-pub const BuiltIn = enum { quit, perf, perf_dump, model };
+pub const BuiltIn = enum { quit, perf, perf_dump };
 
 /// One command entry. Built-ins dispatch inline in `handleCommand`;
 /// Lua callbacks fire through `LuaEngine.invokeCallback`.
@@ -133,13 +134,13 @@ test "registerLua shadows a built-in keyed on the same name" {
 test "registerLua returns the displaced entry on overwrite" {
     var r = CommandRegistry.init(std.testing.allocator);
     defer r.deinit();
-    try r.registerBuiltIn("/model", .model);
-    const first = try r.registerLua("/model", 100);
+    try r.registerBuiltIn("/quit", .quit);
+    const first = try r.registerLua("/quit", 100);
     try std.testing.expect(first != null);
     try std.testing.expect(first.? == .built_in);
-    try std.testing.expectEqual(BuiltIn.model, first.?.built_in);
+    try std.testing.expectEqual(BuiltIn.quit, first.?.built_in);
 
-    const second = try r.registerLua("/model", 101);
+    const second = try r.registerLua("/quit", 101);
     try std.testing.expect(second != null);
     try std.testing.expect(second.? == .lua_callback);
     try std.testing.expectEqual(@as(i32, 100), second.?.lua_callback);

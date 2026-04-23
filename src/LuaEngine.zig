@@ -281,6 +281,29 @@ pub const LuaEngine = struct {
         };
     }
 
+    /// Require every embedded `zag.builtin.*` module so the side effects
+    /// (slash command and keymap registrations) land in the engine's
+    /// registries. Must be called before `loadUserConfig` so a user's
+    /// `zag.command{name="model", fn=...}` override wins via the
+    /// command registry's last-write-wins semantics.
+    ///
+    /// Failures are logged and swallowed; a broken builtin must never
+    /// block engine startup.
+    pub fn loadBuiltinPlugins(self: *LuaEngine) void {
+        self.storeSelfPointer();
+        for (embedded.entries) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "zag.builtin.")) continue;
+            var src_buf: [128]u8 = undefined;
+            const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
+                log.warn("builtin plugin: module name too long: {s}", .{entry.name});
+                continue;
+            };
+            self.lua.doString(src) catch |err| {
+                log.warn("builtin plugin load failed: {s}: {}", .{ entry.name, err });
+            };
+        }
+    }
+
     /// Shut down the VM and free all owned tool metadata.
     pub fn deinit(self: *LuaEngine) void {
         for (self.tools.items) |tool| {

@@ -218,6 +218,7 @@ fn renderConfigLua(
 
     try body.appendSlice(allocator, "\n-- Uncomment to enable additional providers:\n");
     for (embedded.entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "zag.providers.")) continue;
         const short = stripProviderPrefix(entry.name);
         if (std.mem.eql(u8, short, picked.name)) continue;
         try body.writer(allocator).print("-- require(\"zag.providers.{s}\")\n", .{short});
@@ -1630,6 +1631,7 @@ test "scaffoldConfigLua lists every other stdlib provider in the commented block
     defer testing.allocator.free(actual);
 
     for (embedded.entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "zag.providers.")) continue;
         const short = stripProviderPrefix(entry.name);
         if (std.mem.eql(u8, short, "ollama")) continue;
         const line = try std.fmt.allocPrint(

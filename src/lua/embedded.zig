@@ -25,6 +25,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.providers.openrouter", .code = @embedFile("zag/providers/openrouter.lua") },
     .{ .name = "zag.providers.groq", .code = @embedFile("zag/providers/groq.lua") },
     .{ .name = "zag.providers.ollama", .code = @embedFile("zag/providers/ollama.lua") },
+    .{ .name = "zag.builtin.model_picker", .code = @embedFile("zag/builtin/model_picker.lua") },
 };
 
 /// Find an entry by its dotted module name. Returns null if not found.
@@ -35,9 +36,15 @@ pub fn find(name: []const u8) ?Entry {
     return null;
 }
 
-test "entries manifest includes every stdlib provider" {
-    // Compile-time count check — if you add a new provider above, bump this.
-    try std.testing.expectEqual(@as(usize, 7), entries.len);
+test "entries manifest includes every stdlib provider and builtin" {
+    // Compile-time count check. Bump when adding a new embedded module.
+    try std.testing.expectEqual(@as(usize, 8), entries.len);
+}
+
+test "find returns the entry for the builtin model picker" {
+    const e = find("zag.builtin.model_picker").?;
+    try std.testing.expectEqualStrings("zag.builtin.model_picker", e.name);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.command") != null);
 }
 
 test "find returns the entry for a known provider" {
