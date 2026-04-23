@@ -1293,6 +1293,7 @@ pub fn main() !void {
     // so the pointer is stable for the lifetime of the engine.
     if (lua_engine) |*eng| {
         eng.window_manager = &orchestrator.window_manager;
+        eng.buffer_registry = &orchestrator.window_manager.buffer_registry;
     }
 
     // Publish the root leaf's packed handle on the root runner so the

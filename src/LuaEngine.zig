@@ -11,6 +11,7 @@ const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
+const ScratchBuffer = @import("buffers/scratch.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
@@ -125,6 +126,13 @@ pub const LuaEngine = struct {
     /// null in headless mode so Lua layout bindings raise a clean
     /// "no window manager bound" error instead of dereferencing junk.
     window_manager: ?*WindowManager = null,
+    /// Optional back-pointer to the live buffer registry. Wired by
+    /// `main.zig` (points at `WindowManager.buffer_registry`). Tests
+    /// can set it directly to a stand-alone registry. Null when no
+    /// window manager is bound; in that case `zag.buffer.*` bindings
+    /// raise a clean Lua error, and `zag.keymap{buffer=...}` cannot
+    /// resolve handle strings.
+    buffer_registry: ?*BufferRegistry = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
     tasks: std.AutoHashMap(i32, *Task),
     /// Root scope (parent of all agent/hook scopes).
@@ -410,6 +418,30 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagPaneReadFn));
         lua.setField(-2, "read");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
+
+        // zag.buffer; buffer primitives for Lua plugins. Each binding
+        // resolves a `"b<u32>"` handle string through the live
+        // `BufferRegistry` (wired by main.zig) and operates on the
+        // underlying entry. Only `.scratch` is valid at this point;
+        // future kinds add arms to the match below.
+        lua.newTable(); // [zag_table, buffer_table]
+        lua.pushFunction(zlua.wrap(zagBufferCreateFn));
+        lua.setField(-2, "create");
+        lua.pushFunction(zlua.wrap(zagBufferSetLinesFn));
+        lua.setField(-2, "set_lines");
+        lua.pushFunction(zlua.wrap(zagBufferGetLinesFn));
+        lua.setField(-2, "get_lines");
+        lua.pushFunction(zlua.wrap(zagBufferLineCountFn));
+        lua.setField(-2, "line_count");
+        lua.pushFunction(zlua.wrap(zagBufferCursorRowFn));
+        lua.setField(-2, "cursor_row");
+        lua.pushFunction(zlua.wrap(zagBufferSetCursorRowFn));
+        lua.setField(-2, "set_cursor_row");
+        lua.pushFunction(zlua.wrap(zagBufferCurrentLineFn));
+        lua.setField(-2, "current_line");
+        lua.pushFunction(zlua.wrap(zagBufferDeleteFn));
+        lua.setField(-2, "delete");
+        lua.setField(-2, "buffer"); // zag.buffer = buffer_table; [zag_table]
 
         // Private log entrypoints consumed by the Lua-side wrappers in
         // combinators.lua. User code calls `zag.log.info(fmt, ...)`; the
@@ -2287,6 +2319,256 @@ pub const LuaEngine = struct {
         return 1;
     }
 
+    /// Shared prelude for every `zag.buffer.*` binding (except `create`).
+    /// Parses the handle string on the Lua stack at `arg_index`, resolves
+    /// it through the live `BufferRegistry`, and returns the entry. Any
+    /// failure surfaces as a Lua error prefixed with `op_name` so plugin
+    /// authors get a pointed diagnostic instead of a stack trace into
+    /// bufGetId.
+    fn requireBufferEntry(
+        lua: *Lua,
+        arg_index: i32,
+        comptime op_name: []const u8,
+    ) BufferRegistry.Entry {
+        const engine = getEngineFromState(lua);
+        const registry = engine.buffer_registry orelse {
+            lua.raiseErrorStr(op_name ++ ": no buffer registry bound", .{});
+        };
+        if (lua.typeOf(arg_index) != .string) {
+            lua.raiseErrorStr(op_name ++ ": handle must be a string", .{});
+        }
+        const handle_str = lua.toString(arg_index) catch {
+            lua.raiseErrorStr(op_name ++ ": handle must be a string", .{});
+        };
+        const handle = BufferRegistry.parseId(handle_str) catch {
+            lua.raiseErrorStr(op_name ++ ": invalid handle", .{});
+        };
+        const entry = registry.resolve(handle) catch {
+            lua.raiseErrorStr(op_name ++ ": stale handle", .{});
+        };
+        return entry;
+    }
+
+    /// `zag.buffer.create{ kind = "scratch", name? = "..." }`: allocate a
+    /// new buffer in the live registry and return its handle string.
+    /// Only `.scratch` is valid at this point; future kinds add arms to
+    /// the switch and their own factory wiring.
+    fn zagBufferCreateFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const registry = engine.buffer_registry orelse {
+            lua.raiseErrorStr("zag.buffer.create: no buffer registry bound", .{});
+        };
+        if (!lua.isTable(1)) {
+            lua.raiseErrorStr("zag.buffer.create: argument must be a table", .{});
+        }
+
+        _ = lua.getField(1, "kind");
+        if (lua.typeOf(-1) != .string) {
+            lua.raiseErrorStr("zag.buffer.create: field 'kind' must be a string", .{});
+        }
+        const kind_str = lua.toString(-1) catch {
+            lua.raiseErrorStr("zag.buffer.create: field 'kind' must be a string", .{});
+        };
+        // Dup before popping: the Lua string lives in the table slot we
+        // release on pop, and the later string comparison reads through.
+        // `toString` returns a borrowed slice that parseKind copies out
+        // under eql; `kind_str` stays valid until pop.
+        const is_scratch = std.mem.eql(u8, kind_str, "scratch");
+        lua.pop(1);
+        if (!is_scratch) {
+            lua.raiseErrorStr("zag.buffer.create: unknown kind (only \"scratch\" is supported)", .{});
+        }
+
+        var name_buf: []const u8 = "scratch";
+        _ = lua.getField(1, "name");
+        if (!lua.isNil(-1)) {
+            if (lua.typeOf(-1) != .string) {
+                lua.raiseErrorStr("zag.buffer.create: field 'name' must be a string", .{});
+            }
+            name_buf = lua.toString(-1) catch {
+                lua.raiseErrorStr("zag.buffer.create: field 'name' must be a string", .{});
+            };
+        }
+        // Name is copied into the ScratchBuffer's own allocation inside
+        // `createScratch`, so letting the Lua slice go away after this
+        // call is safe.
+        const handle = registry.createScratch(name_buf) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.create: {s}", .{@errorName(err)}) catch "zag.buffer.create failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        lua.pop(1);
+
+        const id_str = BufferRegistry.formatId(engine.allocator, handle) catch {
+            // Best effort: if we can't format the id, the buffer still
+            // lives in the registry. Remove it so we don't leak a slot
+            // the caller can't name.
+            registry.remove(handle) catch {};
+            lua.raiseErrorStr("zag.buffer.create: id format failed", .{});
+        };
+        defer engine.allocator.free(id_str);
+        _ = lua.pushString(id_str);
+        return 1;
+    }
+
+    /// `zag.buffer.set_lines(handle, lines_table)`: replace the buffer's
+    /// lines with the array-style Lua table on the stack.
+    fn zagBufferSetLinesFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.set_lines");
+        if (!lua.isTable(2)) {
+            lua.raiseErrorStr("zag.buffer.set_lines: arg 2 must be a table", .{});
+        }
+        const engine = getEngineFromState(lua);
+
+        const len = lua.rawLen(2);
+        // Gather the lines into a transient slice before handing off to
+        // setLines. ScratchBuffer.setLines dupes every entry, so the
+        // caller-side borrowed Lua strings are fine to discard on return.
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(engine.allocator);
+        lines.ensureTotalCapacity(engine.allocator, len) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.set_lines: {s}", .{@errorName(err)}) catch "zag.buffer.set_lines failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        for (0..len) |i| {
+            _ = lua.rawGetIndex(2, @intCast(i + 1));
+            if (lua.typeOf(-1) != .string) {
+                lua.pop(1);
+                lua.raiseErrorStr("zag.buffer.set_lines: entries must be strings", .{});
+            }
+            const s = lua.toString(-1) catch {
+                lua.pop(1);
+                lua.raiseErrorStr("zag.buffer.set_lines: entries must be strings", .{});
+            };
+            lines.appendAssumeCapacity(s);
+            // Leave the string on the stack until after setLines dupes
+            // it, in case Lua reuses the slice. setLines copies every
+            // entry immediately so we can pop once at the end of the
+            // loop body.
+            lua.pop(1);
+        }
+
+        switch (entry) {
+            .scratch => |sb| {
+                sb.setLines(lines.items) catch |err| {
+                    var buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.set_lines: {s}", .{@errorName(err)}) catch "zag.buffer.set_lines failed";
+                    lua.raiseErrorStr("%s", .{msg.ptr});
+                };
+            },
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.get_lines(handle)`: return the buffer's lines as an
+    /// array-style Lua table.
+    fn zagBufferGetLinesFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.get_lines");
+        switch (entry) {
+            .scratch => |sb| {
+                lua.newTable();
+                for (sb.lines.items, 0..) |line, i| {
+                    _ = lua.pushString(line);
+                    lua.rawSetIndex(-2, @intCast(i + 1));
+                }
+                return 1;
+            },
+        }
+    }
+
+    /// `zag.buffer.line_count(handle)`: return the buffer's line count.
+    fn zagBufferLineCountFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.line_count");
+        switch (entry) {
+            .scratch => |sb| {
+                lua.pushInteger(@intCast(sb.lines.items.len));
+                return 1;
+            },
+        }
+    }
+
+    /// `zag.buffer.cursor_row(handle)`: return the 1-indexed cursor row.
+    /// Returns 0 when the buffer is empty (no row under the cursor).
+    fn zagBufferCursorRowFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.cursor_row");
+        switch (entry) {
+            .scratch => |sb| {
+                if (sb.lines.items.len == 0) {
+                    lua.pushInteger(0);
+                } else {
+                    lua.pushInteger(@intCast(sb.cursor_row + 1));
+                }
+                return 1;
+            },
+        }
+    }
+
+    /// `zag.buffer.set_cursor_row(handle, row)`: accept a 1-indexed row
+    /// and clamp against the current line count.
+    fn zagBufferSetCursorRowFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.set_cursor_row");
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.buffer.set_cursor_row: row must be an integer", .{});
+        }
+        const row = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.buffer.set_cursor_row: row must be an integer", .{});
+        };
+        if (row < 1) {
+            lua.raiseErrorStr("zag.buffer.set_cursor_row: row must be >= 1", .{});
+        }
+        switch (entry) {
+            .scratch => |sb| {
+                const zero_based: u32 = @intCast(row - 1);
+                const count: u32 = @intCast(sb.lines.items.len);
+                sb.cursor_row = if (count == 0) 0 else @min(zero_based, count - 1);
+                sb.dirty = true;
+            },
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.current_line(handle)`: return the line at the cursor
+    /// or nil when the buffer is empty.
+    fn zagBufferCurrentLineFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.current_line");
+        switch (entry) {
+            .scratch => |sb| {
+                if (sb.currentLine()) |line| {
+                    _ = lua.pushString(line);
+                } else {
+                    lua.pushNil();
+                }
+                return 1;
+            },
+        }
+    }
+
+    /// `zag.buffer.delete(handle)`: destroy the buffer and free its
+    /// registry slot. The handle's generation advances so subsequent
+    /// lookups surface `stale handle`.
+    fn zagBufferDeleteFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const registry = engine.buffer_registry orelse {
+            lua.raiseErrorStr("zag.buffer.delete: no buffer registry bound", .{});
+        };
+        if (lua.typeOf(1) != .string) {
+            lua.raiseErrorStr("zag.buffer.delete: handle must be a string", .{});
+        }
+        const handle_str = lua.toString(1) catch {
+            lua.raiseErrorStr("zag.buffer.delete: handle must be a string", .{});
+        };
+        const handle = BufferRegistry.parseId(handle_str) catch {
+            lua.raiseErrorStr("zag.buffer.delete: invalid handle", .{});
+        };
+        registry.remove(handle) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.delete: {s}", .{@errorName(err)}) catch "zag.buffer.delete failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
     /// Call once during LuaEngine.init after openLibs to register the
     /// TaskHandle metatable so userdata created from zag.spawn can find
     /// methods via __index.
@@ -2736,7 +3018,13 @@ pub const LuaEngine = struct {
         };
         lua.pop(1);
 
-        // Optional buffer handle string.
+        // Optional buffer handle string. Resolve the handle through the
+        // live BufferRegistry and store the resulting `Buffer.getId()`
+        // value in `binding.buffer_id` so it matches what
+        // `EventOrchestrator` passes to `registry.lookup` at dispatch
+        // time (`focused.view.buf().getId()`). Storing the packed Handle
+        // directly would create two disjoint u32 namespaces and the
+        // binding would never fire in production.
         var buffer_id: ?u32 = null;
         _ = lua.getField(1, "buffer");
         if (!lua.isNil(-1)) {
@@ -2752,7 +3040,16 @@ pub const LuaEngine = struct {
                 log.err("zag.keymap{{}}: invalid buffer handle '{s}'", .{handle_str});
                 return error.LuaError;
             };
-            buffer_id = @bitCast(handle);
+            const engine_for_resolve = try keymapEnginePointer(lua);
+            const registry = engine_for_resolve.buffer_registry orelse {
+                log.warn("zag.keymap{{}}: no buffer registry bound; cannot resolve '{s}'", .{handle_str});
+                return error.LuaError;
+            };
+            const entry = registry.asBuffer(handle) catch {
+                log.warn("zag.keymap{{}}: stale buffer handle '{s}'", .{handle_str});
+                return error.LuaError;
+            };
+            buffer_id = entry.getId();
         }
         lua.pop(1);
 
@@ -4815,11 +5112,17 @@ test "zag.keymap table form with buffer scope only fires for that buffer" {
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    // Encode a fabricated buffer handle as "b<u32>" so the test doesn't
-    // need a live BufferRegistry. Any parseable id will do.
-    const handle: BufferRegistry.Handle = .{ .index = 7, .generation = 3 };
-    const packed_u32: u32 = @bitCast(handle);
-    const id_str = try std.fmt.allocPrint(alloc, "b{d}", .{packed_u32});
+    // The scope binding requires a live `BufferRegistry` so the engine
+    // can resolve the handle string into the concrete `Buffer.getId()`
+    // that `EventOrchestrator` passes at dispatch time. Stand up a
+    // registry locally; no WindowManager is needed for this test.
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const handle = try buffer_registry.createScratch("picker");
+    const buffer_id = (try buffer_registry.asBuffer(handle)).getId();
+    const id_str = try BufferRegistry.formatId(alloc, handle);
     defer alloc.free(id_str);
 
     const script = try std.fmt.allocPrintSentinel(alloc,
@@ -4834,12 +5137,13 @@ test "zag.keymap table form with buffer scope only fires for that buffer" {
     try engine.lua.doString(script);
 
     const registry = engine.keymapRegistry();
-    // Matches when the scoped buffer is focused.
+    // Matches when the scoped buffer is focused. `buffer_id` is what
+    // `EventOrchestrator` would pass through at dispatch time.
     try std.testing.expect(
         registry.lookup(
             .normal,
             .{ .key = .{ .char = 'x' }, .modifiers = .{} },
-            packed_u32,
+            buffer_id,
         ).? == .close_window,
     );
     // Another focused buffer does not see the scoped binding, and there
@@ -4848,7 +5152,7 @@ test "zag.keymap table form with buffer scope only fires for that buffer" {
         registry.lookup(
             .normal,
             .{ .key = .{ .char = 'x' }, .modifiers = .{} },
-            packed_u32 +% 1,
+            buffer_id +% 1,
         ) == null,
     );
 }
@@ -7713,4 +8017,237 @@ test "stdlib: require(zag.providers.anthropic-oauth) registers Claude Max spec" 
     }
     try std.testing.expect(ep.models.len >= 2);
     try std.testing.expectEqual(true, ep.models[0].recommended);
+}
+
+test "zag.buffer.create returns a resolvable handle" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "scratch", name = "picker" }
+    );
+    _ = try engine.lua.getGlobal("handle");
+    defer engine.lua.pop(1);
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    const entry = try buffer_registry.resolve(handle);
+    try std.testing.expect(entry == .scratch);
+    try std.testing.expectEqualStrings("picker", entry.scratch.name);
+}
+
+test "zag.buffer.create rejects unknown kinds" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\zag.buffer.create { kind = "graphics" }
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_lines + get_lines + line_count round trip" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch", name = "t" }
+        \\zag.buffer.set_lines(b, { "alpha", "beta", "gamma" })
+        \\_G.n = zag.buffer.line_count(b)
+        \\local lines = zag.buffer.get_lines(b)
+        \\_G.second = lines[2]
+    );
+    _ = try engine.lua.getGlobal("n");
+    try std.testing.expectEqual(@as(i64, 3), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("second");
+    try std.testing.expectEqualStrings("beta", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.cursor_row is 1-indexed and set_cursor_row round trips" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch", name = "t" }
+        \\zag.buffer.set_lines(b, { "one", "two", "three" })
+        \\_G.initial = zag.buffer.cursor_row(b)
+        \\zag.buffer.set_cursor_row(b, 2)
+        \\_G.after = zag.buffer.cursor_row(b)
+        \\_G.line = zag.buffer.current_line(b)
+    );
+    _ = try engine.lua.getGlobal("initial");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("after");
+    try std.testing.expectEqual(@as(i64, 2), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("line");
+    try std.testing.expectEqualStrings("two", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.current_line returns nil on empty buffer" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\_G.is_nil = zag.buffer.current_line(b) == nil
+    );
+    _ = try engine.lua.getGlobal("is_nil");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.delete releases the slot and later lookups fail" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.delete(_G.handle)
+    );
+    _ = try engine.lua.getGlobal("handle");
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    try std.testing.expectError(BufferRegistry.Error.StaleBuffer, buffer_registry.resolve(handle));
+    engine.lua.pop(1);
+
+    // Re-using the same handle on any later zag.buffer.* call surfaces
+    // as a Lua error; the registry layer caught the dangling reference.
+    const result = engine.lua.doString(
+        \\zag.buffer.line_count(_G.handle)
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer + zag.keymap e2e: bound key resolves through BufferRegistry" {
+    // End-to-end invariant check for the buffer_id identity fix.
+    // `zag.keymap{buffer = h, ...}` stores `Buffer.getId()` as the scope
+    // key; `EventOrchestrator.dispatchKey` passes `focused.view.buf().getId()`
+    // at lookup time. Both must land on the same u32 or buffer-scoped
+    // bindings never fire in production.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.fired = 0
+        \\local b = zag.buffer.create { kind = "scratch", name = "picker" }
+        \\_G.handle = b
+        \\zag.keymap {
+        \\  mode = "normal",
+        \\  key = "x",
+        \\  buffer = b,
+        \\  fn = function() _G.fired = _G.fired + 1 end,
+        \\}
+    );
+
+    // Recover the concrete Buffer.getId() the orchestrator would pass.
+    _ = try engine.lua.getGlobal("handle");
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    engine.lua.pop(1);
+    const focused_buffer_id = (try buffer_registry.asBuffer(handle)).getId();
+
+    // Dispatch-path lookup: keyed on the sequential buffer id, not on
+    // the packed handle. With Option A wired, these land on the same
+    // u32 and the binding resolves.
+    const hit = engine.keymapRegistry().lookup(
+        .normal,
+        .{ .key = .{ .char = 'x' }, .modifiers = .{} },
+        focused_buffer_id,
+    ) orelse return error.TestExpectedBinding;
+    try std.testing.expect(hit == .lua_callback);
+
+    engine.invokeCallback(hit.lua_callback);
+    _ = try engine.lua.getGlobal("fired");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // Another focused buffer id (e.g. a second, independent scratch)
+    // does NOT hit the binding: scope is per-buffer, not global.
+    const other_id = focused_buffer_id +% 1;
+    try std.testing.expect(
+        engine.keymapRegistry().lookup(
+            .normal,
+            .{ .key = .{ .char = 'x' }, .modifiers = .{} },
+            other_id,
+        ) == null,
+    );
+}
+
+test "zag.keymap rejects a handle that doesn't live in the registry" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    // Fabricate a parseable-but-unregistered handle.
+    const bogus: BufferRegistry.Handle = .{ .index = 99, .generation = 0 };
+    const id_str = try BufferRegistry.formatId(alloc, bogus);
+    defer alloc.free(id_str);
+    const script = try std.fmt.allocPrintSentinel(alloc,
+        \\zag.keymap {{
+        \\  mode = "normal",
+        \\  key = "x",
+        \\  buffer = "{s}",
+        \\  action = "close_window",
+        \\}}
+    , .{id_str}, 0);
+    defer alloc.free(script);
+    const result = engine.lua.doString(script);
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
 }
