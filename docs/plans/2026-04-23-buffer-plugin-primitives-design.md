@@ -218,6 +218,71 @@ the integration proof that all five primitives compose correctly.
    ship the builtin plugin and always load it unless config.lua
    opts out.
 
+## Implementation status
+
+Completed on `buffer-plugin-primitives` in 12 feature commits plus 2
+docs commits. `zig build`, `zig build test` (997 tests, 3 skipped),
+`zig fmt --check .` all exit 0.
+
+```
+7143fa4 lua/builtin: /model is now a plugin using the primitive set
+e579d67 lua: expose zag.pane.set_model for plugin-driven model swaps
+ed769f7 lua,tools: zag.layout.split and layout_split accept an existing buffer handle
+594da23 layout: split accepts an existing buffer handle via LayoutOp.split.buffer
+6a96417 lua: expose zag.buffer.{create,set_lines,get_lines,line_count,cursor_row,set_cursor_row,current_line,delete}
+1187c80 lua: expose zag.command for plugin slash commands
+c75f5f7 wm: factor slash command dispatch into CommandRegistry
+dbf9684 lua: extend zag.keymap with table form, buffer scope, fn callbacks
+8c50225 wm: dispatch Keymap.Action.lua_callback through LuaEngine.invokeCallback
+eabd212 keymap: add per-buffer scope and lua_callback action variant
+ffef40b wm: add BufferRegistry for Lua-managed scratch buffers
+4f90273 buffers/scratch: add minimal Buffer impl with cursor and j/k motion
+```
+
+## Manual verification
+
+Headless end-to-end smoke (confirms the default agent path still works
+after every primitive change):
+
+```
+echo 'what is 3*7?' > /tmp/bp_smoke.txt
+./zig-out/bin/zag --headless \
+    --instruction-file=/tmp/bp_smoke.txt \
+    --trajectory-out=/tmp/bp_traj.json
+```
+
+Trajectory step 3 returns `3 * 7 = 21`. Confirmed on the final commit.
+
+Picker smoke (requires a real TTY):
+
+```
+zig build run
+# In the TUI, type "/model" and press Enter.
+# Expected:
+#   A new horizontal split appears with a scratch buffer listing
+#   every provider/model entry in `zag.providers.list()`.
+#   j or <Down> moves the cursor; k or <Up> moves it up. The
+#   cursor row is highlighted.
+#   Press <CR> on a row: the picker closes, the original pane's
+#   model swaps to the picked entry, status line reads
+#   `model -> <provider>/<id>` plus the paste-me hint or saved
+#   confirmation.
+#   Press q or <Esc>: the picker closes with no model change.
+# Quit zag.
+```
+
+Plugin override smoke (power-user path):
+
+```
+# Write ~/.config/zag/lua/my/picker.lua that calls
+#   zag.command { name = "model", fn = my_open }
+# then `require("my.picker")` from config.lua.
+# The user's registration shadows the builtin per CommandRegistry
+# last-write-wins semantics. Confirmed via inline test
+# `zag.command overrides an existing built-in` (added in commit
+# 1187c80 or thereabouts).
+```
+
 ## Non-goals retained
 
 - No floats.
