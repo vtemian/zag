@@ -3243,6 +3243,21 @@ pub const LuaEngine = struct {
         return try self.hook_dispatcher.fireHook(payload, self.lua, &sink);
     }
 
+    /// Invoke a zero-arg Lua callback stored at `ref` in the registry.
+    /// Used by `WindowManager.executeAction` to dispatch
+    /// `Keymap.Action.lua_callback` bindings. Errors are logged and
+    /// swallowed; the keymap layer must not propagate Lua failures into
+    /// the terminal event loop.
+    pub fn invokeCallback(self: *LuaEngine, ref: i32) void {
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, ref);
+        lua.protectedCall(.{ .args = 0, .results = 0 }) catch |err| {
+            const msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("lua callback raised: {} ({s})", .{ err, msg });
+            lua.pop(1);
+        };
+    }
+
     // -- ResumeSink implementations -------------------------------------------
 
     fn sinkSpawnHook(ctx: *anyopaque, payload: *Hooks.HookPayload) anyerror!i32 {
