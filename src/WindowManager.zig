@@ -2447,6 +2447,221 @@ test "executeAction lua_callback without an engine is a no-op" {
     try wm.executeAction(.{ .lua_callback = 99 });
 }
 
+test "zag.layout.split attaches a registered scratch buffer by handle" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    // Wire the engine's WM + buffer registry references so the Lua
+    // bindings resolve through the live objects rather than failing
+    // with "no window manager bound" / "no buffer registry bound".
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    // Seed the buffer registry and format its handle as `"b<u32>"` so
+    // Lua sees the same opaque string a plugin would.
+    const bh = try wm.buffer_registry.createScratch("picker");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const buf_id_str = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buf_id_str);
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id_str);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.new_id = zag.layout.split("{s}", "horizontal", {{ buffer = "{s}" }})
+    , .{ pane_id_str, buf_id_str }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("new_id");
+    defer engine.lua.pop(1);
+    const new_id_str = try engine.lua.toString(-1);
+    const new_id = try NodeRegistry.parseId(new_id_str);
+    const new_node = try wm.node_registry.resolve(new_id);
+    try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
+}
+
+test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form working" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id_str);
+
+    // Legacy table form: the new pane gets a fresh ConversationBuffer
+    // built by doSplit (not borrowed), so its pointer differs from the
+    // root pane's pointer but the call succeeds.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.new_id = zag.layout.split("{s}", "horizontal", {{ buffer = {{ type = "conversation" }} }})
+    , .{pane_id_str}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("new_id");
+    defer engine.lua.pop(1);
+    const new_id_str = try engine.lua.toString(-1);
+    const new_id = try NodeRegistry.parseId(new_id_str);
+    _ = try wm.node_registry.resolve(new_id);
+}
+
+test "zag.layout.split rejects a malformed buffer handle string" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id_str);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.layout.split("{s}", "horizontal", {{ buffer = "not-a-handle" }})
+    , .{pane_id_str}, 0);
+    defer allocator.free(script);
+    const result = engine.lua.doString(script);
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
 test "readPaneById returns rendered text with metadata" {
     const allocator = std.testing.allocator;
 

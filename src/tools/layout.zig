@@ -18,6 +18,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const agent_events = @import("../agent_events.zig");
 const tools_mod = @import("../tools.zig");
+const BufferRegistry = @import("../BufferRegistry.zig");
 
 /// Definition + execute-fn pair for the `layout_tree` tool. Registered
 /// in `tools.createDefaultRegistry` so the agent sees it alongside
@@ -83,10 +84,15 @@ pub fn dispatch(
 }
 
 const FocusInput = struct { id: []const u8 };
+/// `buffer` is polymorphic: either `{ "type": "conversation" }` (the
+/// legacy form, maps to `SplitBuffer.kind`) or a `"b<u32>"` handle
+/// string (maps to `SplitBuffer.handle`). JSON does not express sum
+/// types natively, so accept `std.json.Value` and branch at parse
+/// time.
 const SplitInput = struct {
     id: []const u8,
     direction: []const u8,
-    buffer: ?struct { type: []const u8 } = null,
+    buffer: ?std.json.Value = null,
 };
 const CloseInput = struct { id: []const u8 };
 const ResizeInput = struct { id: []const u8, ratio: f32 };
@@ -127,13 +133,17 @@ fn execute_focus(
 }
 
 /// Split a pane horizontally or vertically, optionally specifying the
-/// buffer type of the new pane.
+/// buffer for the new pane.
+///
+/// `buffer` accepts either an object (`{ "type": "conversation" }`) or
+/// a `"b<u32>"` handle string identifying an existing registry buffer.
+/// The schema advertises both shapes via `oneOf`.
 pub const split_tool: types.Tool = .{
     .definition = .{
         .name = "layout_split",
         .description = "Split a pane into two; direction is \"horizontal\" or \"vertical\".",
         .input_schema_json =
-        \\{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"buffer":{"type":"object","properties":{"type":{"type":"string"}},"required":["type"],"additionalProperties":false}},"required":["id","direction"],"additionalProperties":false}
+        \\{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"buffer":{"oneOf":[{"type":"object","properties":{"type":{"type":"string"}},"required":["type"],"additionalProperties":false},{"type":"string"}]}},"required":["id","direction"],"additionalProperties":false}
         ,
         .prompt_snippet = "layout_split: split a pane horizontally or vertically",
     },
@@ -153,16 +163,47 @@ fn execute_split(
         .{ .ignore_unknown_fields = true },
     ) catch {
         return .{
-            .content = "error: input must be { id: string, direction: string, buffer?: { type: string } }",
+            .content = "error: input must be { id: string, direction: string, buffer?: object|string }",
             .is_error = true,
             .owned = false,
         };
     };
     defer parsed.deinit();
-    const split_buffer: ?agent_events.SplitBuffer = if (parsed.value.buffer) |buf|
-        .{ .kind = buf.type }
-    else
-        null;
+
+    // Branch on the buffer selector's JSON shape. Object implies the
+    // legacy `{type: "conversation"}` form; string implies an opaque
+    // `"b<u32>"` registry handle. Anything else is a client bug.
+    const split_buffer: ?agent_events.SplitBuffer = blk: {
+        const raw_value = parsed.value.buffer orelse break :blk null;
+        switch (raw_value) {
+            .object => |obj| {
+                const type_val = obj.get("type") orelse return .{
+                    .content = "error: buffer object must include a string 'type' field",
+                    .is_error = true,
+                    .owned = false,
+                };
+                if (type_val != .string) return .{
+                    .content = "error: buffer.type must be a string",
+                    .is_error = true,
+                    .owned = false,
+                };
+                break :blk .{ .kind = type_val.string };
+            },
+            .string => |s| {
+                const bh = BufferRegistry.parseId(s) catch return .{
+                    .content = "error: buffer handle must be a \"b<u32>\" string",
+                    .is_error = true,
+                    .owned = false,
+                };
+                break :blk .{ .handle = @bitCast(bh) };
+            },
+            else => return .{
+                .content = "error: buffer must be an object or a handle string",
+                .is_error = true,
+                .owned = false,
+            },
+        }
+    };
     return dispatch(allocator, .{ .split = .{
         .id = parsed.value.id,
         .direction = parsed.value.direction,
@@ -323,6 +364,27 @@ test "layout_close rejects non-object input" {
 
 test "layout_resize rejects missing ratio" {
     const res = try execute_resize("{\"id\":\"p1\"}", std.testing.allocator, null);
+    try std.testing.expect(res.is_error);
+    if (res.owned) std.testing.allocator.free(res.content);
+}
+
+test "layout_split rejects malformed buffer handle string" {
+    const res = try execute_split(
+        "{\"id\":\"p1\",\"direction\":\"horizontal\",\"buffer\":\"not-a-handle\"}",
+        std.testing.allocator,
+        null,
+    );
+    try std.testing.expect(res.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, res.content, "buffer handle") != null);
+    if (res.owned) std.testing.allocator.free(res.content);
+}
+
+test "layout_split rejects non-string non-object buffer" {
+    const res = try execute_split(
+        "{\"id\":\"p1\",\"direction\":\"horizontal\",\"buffer\":42}",
+        std.testing.allocator,
+        null,
+    );
     try std.testing.expect(res.is_error);
     if (res.owned) std.testing.allocator.free(res.content);
 }

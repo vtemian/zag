@@ -10,6 +10,7 @@ const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
+const Buffer = @import("Buffer.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const ScratchBuffer = @import("buffers/scratch.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
@@ -2188,9 +2189,15 @@ pub const LuaEngine = struct {
 
     /// `zag.layout.split(id, direction, opts?)`: split the leaf
     /// identified by `id` along `direction` ("horizontal" or "vertical")
-    /// and return the new leaf's id string. `opts.buffer.type` is
-    /// accepted but currently only `"conversation"` (the default) is
-    /// implemented; anything else raises.
+    /// and return the new leaf's id string.
+    ///
+    /// `opts.buffer` picks the buffer the new pane shows. Two forms:
+    ///   * `{ type = "conversation" }`: fresh conversation buffer (the
+    ///     default when `opts.buffer` is omitted). Other `type` values
+    ///     are rejected.
+    ///   * `"b<u32>"`: an opaque `BufferRegistry` handle string. The new
+    ///     pane borrows that buffer by pointer; the registry keeps it
+    ///     alive.
     fn zagLayoutSplitFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const wm = engine.window_manager orelse {
@@ -2211,22 +2218,50 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.layout.split: direction must be \"horizontal\" or \"vertical\"", .{});
         };
 
-        // Optional buffer table: { type = "conversation" }. Anything else
-        // is rejected so users get the same story as the tool path.
+        // Optional opts table at arg 3: `{ buffer = <selector> }`. The
+        // selector is either a table (legacy `{ type = "conversation" }`)
+        // or a string (`"b<u32>"` handle). Anything else raises so the
+        // caller sees the failure on the first call, not later when the
+        // pane shows up empty.
+        var attached: ?Buffer = null;
         if (lua.isTable(3)) {
-            _ = lua.getField(3, "type");
+            _ = lua.getField(3, "buffer");
             defer lua.pop(1);
-            if (!lua.isNil(-1)) {
-                const bt = lua.toString(-1) catch {
-                    lua.raiseErrorStr("zag.layout.split: buffer.type must be a string", .{});
-                };
-                if (!std.mem.eql(u8, bt, "conversation")) {
-                    lua.raiseErrorStr("zag.layout.split: buffer.type not yet supported", .{});
-                }
+            switch (lua.typeOf(-1)) {
+                .nil, .none => {},
+                .string => {
+                    const raw = lua.toString(-1) catch {
+                        lua.raiseErrorStr("zag.layout.split: buffer handle must be a string", .{});
+                    };
+                    const bh = BufferRegistry.parseId(raw) catch {
+                        lua.raiseErrorStr("zag.layout.split: invalid buffer handle", .{});
+                    };
+                    const buffer_registry = engine.buffer_registry orelse {
+                        lua.raiseErrorStr("zag.layout.split: no buffer registry bound", .{});
+                    };
+                    attached = buffer_registry.asBuffer(bh) catch {
+                        lua.raiseErrorStr("zag.layout.split: stale buffer handle", .{});
+                    };
+                },
+                .table => {
+                    _ = lua.getField(-1, "type");
+                    defer lua.pop(1);
+                    if (!lua.isNil(-1)) {
+                        const bt = lua.toString(-1) catch {
+                            lua.raiseErrorStr("zag.layout.split: buffer.type must be a string", .{});
+                        };
+                        if (!std.mem.eql(u8, bt, "conversation")) {
+                            lua.raiseErrorStr("zag.layout.split: buffer.type not yet supported", .{});
+                        }
+                    }
+                },
+                else => {
+                    lua.raiseErrorStr("zag.layout.split: buffer must be a table or handle string", .{});
+                },
             }
         }
 
-        const new_handle = wm.splitById(handle, direction, null) catch |err| {
+        const new_handle = wm.splitById(handle, direction, attached) catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split: {s}", .{@errorName(err)}) catch "zag.layout.split failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
