@@ -28,6 +28,7 @@ const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const Keymap = @import("Keymap.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
+const BufferRegistry = @import("BufferRegistry.zig");
 const agent_events = @import("agent_events.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const types = @import("types.zig");
@@ -98,6 +99,10 @@ wake_write_fd: posix.fd_t,
 /// `registry` back-pointer once `attachLayoutRegistry` wires them
 /// together. Frees all slot storage on `deinit`.
 node_registry: NodeRegistry,
+/// Stable IDs for Lua-managed buffers (scratch buffers today, more
+/// kinds later). Owns the heap storage for every registered buffer
+/// and destroys it on `deinit`.
+buffer_registry: BufferRegistry,
 /// Extra panes created by splits, tracked for cleanup.
 extra_panes: std.ArrayList(PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
@@ -174,6 +179,7 @@ pub fn init(cfg: Config) !WindowManager {
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
         .node_registry = NodeRegistry.init(cfg.allocator),
+        .buffer_registry = BufferRegistry.init(cfg.allocator),
     };
 }
 
@@ -221,6 +227,11 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
     self.clearPendingModelPick();
+    // Tear down the buffer registry before panes so a future pane that
+    // borrows a registered buffer cannot dangle past registry teardown.
+    // Today no pane references a scratch buffer, but the ordering keeps
+    // the invariant easy to reason about when that changes.
+    self.buffer_registry.deinit();
     // Free pane-local provider overrides after each runner's thread has
     // been joined but before the runner/view/session objects are
     // destroyed. The agent worker may hold a borrow of the provider for
@@ -1456,6 +1467,7 @@ test "WindowManager exposes a NodeRegistry" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1504,6 +1516,7 @@ test "focus by handle updates focused leaf" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1557,6 +1570,7 @@ test "focus by handle rejects stale id" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1601,6 +1615,7 @@ test "splitById creates a new leaf and returns its handle" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1658,6 +1673,7 @@ test "closeById removes a leaf and keeps the sibling" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1710,6 +1726,7 @@ test "closeById rejects the caller's own pane" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1763,6 +1780,7 @@ test "resizeById applies ratio to parent split" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1826,6 +1844,7 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1876,6 +1895,7 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1929,6 +1949,7 @@ test "describe emits parseable node map" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1988,6 +2009,7 @@ test "executeAction focus_left goes through handle path" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2036,6 +2058,7 @@ test "readPaneById returns rendered text with metadata" {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2219,6 +2242,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
         .lua_engine = null,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
 }
 
