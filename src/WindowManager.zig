@@ -29,6 +29,7 @@ const Session = @import("Session.zig");
 const Keymap = @import("Keymap.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
+const CommandRegistry = @import("CommandRegistry.zig");
 const agent_events = @import("agent_events.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const types = @import("types.zig");
@@ -103,6 +104,9 @@ node_registry: NodeRegistry,
 /// kinds later). Owns the heap storage for every registered buffer
 /// and destroys it on `deinit`.
 buffer_registry: BufferRegistry,
+/// Slash-command dispatch table. Built-ins are populated during
+/// `init`; Lua plugins append via `zag.command{}`.
+command_registry: CommandRegistry,
 /// Extra panes created by splits, tracked for cleanup.
 extra_panes: std.ArrayList(PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
@@ -167,7 +171,7 @@ pub const Config = struct {
 };
 
 pub fn init(cfg: Config) !WindowManager {
-    return .{
+    var wm: WindowManager = .{
         .allocator = cfg.allocator,
         .screen = cfg.screen,
         .layout = cfg.layout,
@@ -180,7 +184,17 @@ pub fn init(cfg: Config) !WindowManager {
         .wake_write_fd = cfg.wake_write_fd,
         .node_registry = NodeRegistry.init(cfg.allocator),
         .buffer_registry = BufferRegistry.init(cfg.allocator),
+        .command_registry = CommandRegistry.init(cfg.allocator),
     };
+    errdefer wm.command_registry.deinit();
+
+    try wm.command_registry.registerBuiltIn("/quit", .quit);
+    try wm.command_registry.registerBuiltIn("/q", .quit);
+    try wm.command_registry.registerBuiltIn("/perf", .perf);
+    try wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
+    try wm.command_registry.registerBuiltIn("/model", .model);
+
+    return wm;
 }
 
 /// Point the borrowed `Layout` at this manager's `node_registry` so every
@@ -232,6 +246,10 @@ pub fn deinit(self: *WindowManager) void {
     // Today no pane references a scratch buffer, but the ordering keeps
     // the invariant easy to reason about when that changes.
     self.buffer_registry.deinit();
+    // Command registry only owns duped key bytes and callback refs; no
+    // pane state touches it, so order with buffer_registry is
+    // indifferent.
+    self.command_registry.deinit();
     // Free pane-local provider overrides after each runner's thread has
     // been joined but before the runner/view/session objects are
     // destroyed. The agent worker may hold a borrow of the provider for
@@ -972,24 +990,31 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
         return .handled;
     }
 
-    if (std.mem.eql(u8, command, "/quit") or std.mem.eql(u8, command, "/q")) {
-        return .quit;
+    const cmd = self.command_registry.lookup(command) orelse return .not_a_command;
+    switch (cmd) {
+        .built_in => |b| switch (b) {
+            .quit => return .quit,
+            .perf, .perf_dump => {
+                self.handlePerfCommand(command);
+                return .handled;
+            },
+            .model => {
+                self.renderModelPicker() catch |err| {
+                    log.warn("renderModelPicker failed: {}", .{err});
+                    self.appendStatus("could not render model picker");
+                };
+                return .handled;
+            },
+        },
+        .lua_callback => |ref| {
+            if (self.lua_engine) |engine| {
+                engine.invokeCallback(ref);
+            } else {
+                log.warn("lua_callback command fired without a Lua engine; ref={d}", .{ref});
+            }
+            return .handled;
+        },
     }
-
-    if (std.mem.eql(u8, command, "/perf") or std.mem.eql(u8, command, "/perf-dump")) {
-        self.handlePerfCommand(command);
-        return .handled;
-    }
-
-    if (std.mem.eql(u8, command, "/model")) {
-        self.renderModelPicker() catch |err| {
-            log.warn("renderModelPicker failed: {}", .{err});
-            self.appendStatus("could not render model picker");
-        };
-        return .handled;
-    }
-
-    return .not_a_command;
 }
 
 /// Swap the live provider to `provider_name/model_id`.
@@ -1480,6 +1505,7 @@ test "WindowManager exposes a NodeRegistry" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1529,6 +1555,7 @@ test "focus by handle updates focused leaf" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1583,6 +1610,7 @@ test "focus by handle rejects stale id" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1628,6 +1656,7 @@ test "splitById creates a new leaf and returns its handle" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1686,6 +1715,7 @@ test "closeById removes a leaf and keeps the sibling" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1739,6 +1769,7 @@ test "closeById rejects the caller's own pane" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1793,6 +1824,7 @@ test "resizeById applies ratio to parent split" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1857,6 +1889,7 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1908,6 +1941,7 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -1962,6 +1996,7 @@ test "describe emits parseable node map" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2022,6 +2057,7 @@ test "executeAction focus_left goes through handle path" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2086,6 +2122,7 @@ test "executeAction lua_callback runs the Lua function via the engine" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2138,6 +2175,7 @@ test "executeAction lua_callback without an engine is a no-op" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2184,6 +2222,7 @@ test "readPaneById returns rendered text with metadata" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
@@ -2368,7 +2407,16 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
     };
+    // Bypass of `WindowManager.init` skips the built-in registration;
+    // replay it here so `handleCommand` dispatches through the same
+    // table real users hit.
+    try f.wm.command_registry.registerBuiltIn("/quit", .quit);
+    try f.wm.command_registry.registerBuiltIn("/q", .quit);
+    try f.wm.command_registry.registerBuiltIn("/perf", .perf);
+    try f.wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
+    try f.wm.command_registry.registerBuiltIn("/model", .model);
 }
 
 test "handleCommand resolves digit input when pending_model_pick is set" {
