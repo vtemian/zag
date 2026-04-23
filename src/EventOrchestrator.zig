@@ -295,11 +295,13 @@ fn tick(
         self.window_manager.drainPane(entry.pane);
     }
 
-    // Check if any pane has pending visual changes. `buf().isDirty()`
+    // Check if any pane has pending visual changes. `buffer.isDirty()`
     // ORs the tree-generation delta with the view-only scroll bit, so
     // both tree mutations and scrolls trigger a spinner tick here.
-    const any_dirty = self.window_manager.root_pane.view.buf().isDirty() or for (self.window_manager.extra_panes.items) |entry| {
-        if (entry.pane.view.buf().isDirty()) break true;
+    // Scratch-backed panes drive `isDirty()` through their own vtable
+    // path; the check is uniform across pane kinds.
+    const any_dirty = self.window_manager.root_pane.buffer.isDirty() or for (self.window_manager.extra_panes.items) |entry| {
+        if (entry.pane.buffer.isDirty()) break true;
     } else false;
 
     // Spinner ticks only when actual events arrive
@@ -321,11 +323,13 @@ fn tick(
     }
 
     const focused = self.window_manager.getFocusedPane();
-    const agent_running = focused.runner.isAgentRunning();
+    // A scratch-focused pane has no runner; the status row should read
+    // "idle" there, not spin a nonexistent agent.
+    const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
     const status = if (self.window_manager.transient_status_len > 0)
         self.window_manager.transient_status[0..self.window_manager.transient_status_len]
     else if (agent_running) blk: {
-        const info = focused.runner.lastInfo();
+        const info = focused.runner.?.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
     self.window_manager.compositor.composite(self.window_manager.layout, .{
@@ -367,9 +371,13 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         switch (k.key) {
             .char => |ch| {
                 if (ch == 'c') {
-                    if (focused.runner.isAgentRunning()) {
-                        focused.runner.cancelAgent();
-                        return .none;
+                    // Scratch-backed panes have no runner; Ctrl-C on
+                    // them falls through to the app-level quit.
+                    if (focused.runner) |r| {
+                        if (r.isAgentRunning()) {
+                            r.cancelAgent();
+                            return .none;
+                        }
                     }
                     return .quit;
                 }
@@ -384,7 +392,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // focused buffer's id narrows the search so buffer-local bindings
     // win over globals.
     if (self.window_manager.keymapRegistry()) |registry| {
-        const focused_id = focused.view.buf().getId();
+        const focused_id = focused.buffer.getId();
         if (registry.lookup(self.window_manager.current_mode, k, focused_id)) |action| {
             self.window_manager.executeAction(action) catch |err| {
                 // Bound actions can fail for well-understood reasons
@@ -406,7 +414,25 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // the focused buffer, which owns draft editing through its vtable.
     switch (k.key) {
         .enter => {
-            const draft = focused.view.getDraft();
+            // The Enter submit pipeline is conversation-only: it reads a
+            // draft, runs slash commands, and hands text to the agent
+            // runner. Scratch-backed panes have no view/runner, so Enter
+            // there falls through to the buffer's own vtable (where a
+            // plugin-bound keymap or the buffer's handleKey decides).
+            const view = focused.view orelse {
+                return switch (focused.buffer.handleKey(k)) {
+                    .consumed => .redraw,
+                    .passthrough => .none,
+                };
+            };
+            const runner = focused.runner orelse {
+                return switch (focused.buffer.handleKey(k)) {
+                    .consumed => .redraw,
+                    .passthrough => .none,
+                };
+            };
+
+            const draft = view.getDraft();
             if (draft.len == 0) return .none;
 
             // Commands fire regardless of agent state; a running agent
@@ -416,14 +442,14 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 .quit => return .quit,
                 .handled => {
                     var scratch: [ConversationBuffer.MAX_DRAFT]u8 = undefined;
-                    _ = focused.view.consumeDraft(&scratch);
+                    _ = view.consumeDraft(&scratch);
                     return .redraw;
                 },
                 .not_a_command => {
-                    if (focused.runner.isAgentRunning()) return .none;
+                    if (runner.isAgentRunning()) return .none;
 
                     var scratch: [ConversationBuffer.MAX_DRAFT]u8 = undefined;
-                    const user_input = focused.view.consumeDraft(&scratch);
+                    const user_input = view.consumeDraft(&scratch);
                     self.onUserInputSubmitted(focused, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
                         return .none;
@@ -449,7 +475,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
             return .redraw;
         },
         else => {
-            return switch (focused.view.buf().handleKey(k)) {
+            return switch (focused.buffer.handleKey(k)) {
                 .consumed => .redraw,
                 .passthrough => .none,
             };
@@ -475,7 +501,10 @@ fn handlePaste(self: *EventOrchestrator, bytes: []const u8) void {
     self.window_manager.transient_status_len = 0;
     if (self.window_manager.current_mode != .insert) return;
     const focused = self.window_manager.getFocusedPane();
-    focused.view.appendPaste(bytes);
+    // Only conversation panes carry a draft; a paste on a scratch pane
+    // has nowhere to land, so drop it.
+    const view = focused.view orelse return;
+    view.appendPaste(bytes);
 }
 
 fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
@@ -507,6 +536,23 @@ fn onUserInputSubmitted(
     pane: Pane,
     text: []const u8,
 ) !void {
+    // The submit pipeline is conversation-only. Callers (the Enter
+    // handler) already unwrap `pane.view`/`pane.runner` before invoking
+    // us, so the orelse here is defensive: if a future call site forgets
+    // the check, we log and noop instead of dereferencing null.
+    const view = pane.view orelse {
+        log.warn("onUserInputSubmitted: non-agent pane", .{});
+        return;
+    };
+    const runner = pane.runner orelse {
+        log.warn("onUserInputSubmitted: non-agent pane", .{});
+        return;
+    };
+    const session = pane.session orelse {
+        log.warn("onUserInputSubmitted: non-agent pane", .{});
+        return;
+    };
+
     // Fire UserMessagePre synchronously. Hooks may veto (return cancel) or
     // rewrite the text. `working_text` is the effective text used for the
     // rest of submit; a rewrite slice is owned by the LuaEngine registry
@@ -527,7 +573,7 @@ fn onUserInputSubmitted(
         };
         if (veto) |reason| {
             defer self.allocator.free(reason);
-            _ = try pane.view.appendNode(null, .err, reason);
+            _ = try view.appendNode(null, .err, reason);
             return;
         }
         if (payload.user_message_pre.text_rewrite) |rewritten| {
@@ -536,7 +582,7 @@ fn onUserInputSubmitted(
         }
     }
 
-    try pane.runner.submitInput(working_text, self.allocator);
+    try runner.submitInput(working_text, self.allocator);
 
     if (self.lua_engine) |eng| {
         var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
@@ -548,10 +594,10 @@ fn onUserInputSubmitted(
         };
     }
 
-    if (pane.runner.isAgentRunning()) return;
+    if (runner.isAgentRunning()) return;
 
     const spec = llm.parseModelString(self.provider.model_id);
-    try pane.runner.submit(&pane.session.messages, .{
+    try runner.submit(&session.messages, .{
         .allocator = self.allocator,
         .wake_write_fd = self.wake_write_fd,
         .lua_engine = self.lua_engine,
@@ -571,15 +617,20 @@ pub fn shutdownAgents(self: *EventOrchestrator) void {
     var buf: [cap]*AgentRunner = undefined;
     var len: usize = 0;
 
-    buf[len] = self.window_manager.root_pane.runner;
-    len += 1;
+    if (self.window_manager.root_pane.runner) |r| {
+        buf[len] = r;
+        len += 1;
+    }
     for (self.window_manager.extra_panes.items) |entry| {
         if (len >= cap) {
             log.warn("shutdown: more than {d} panes, stopping early", .{cap});
             break;
         }
-        buf[len] = entry.pane.runner;
-        len += 1;
+        // Scratch-backed panes have no agent thread to stop.
+        if (entry.pane.runner) |r| {
+            buf[len] = r;
+            len += 1;
+        }
     }
     AgentRunner.shutdownAll(buf[0..len]);
 }

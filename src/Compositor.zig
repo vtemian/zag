@@ -222,16 +222,21 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
 fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
     const orch = self.orchestrator orelse return;
     const pane = orch.window_manager.paneFromBuffer(buf) orelse return;
+    // Scratch-backed panes have no ConversationBuffer/AgentRunner; the
+    // tree cache is a conversation-only concept so there is nothing to
+    // sync for them.
+    const view = pane.view orelse return;
+    const runner = pane.runner orelse return;
 
     var ids_buf: [ConversationTree.DirtyRing.capacity]u32 = undefined;
-    const drained = pane.view.tree.drainDirty(&ids_buf);
+    const drained = view.tree.drainDirty(&ids_buf);
     if (drained.overflowed) {
-        pane.view.cache.invalidateAll();
+        view.cache.invalidateAll();
     } else if (drained.written > 0) {
-        pane.view.cache.invalidateMany(ids_buf[0..drained.written]);
+        view.cache.invalidateMany(ids_buf[0..drained.written]);
     }
 
-    pane.runner.node_version_snapshot = pane.view.tree.currentGeneration();
+    runner.node_version_snapshot = view.tree.currentGeneration();
 }
 
 /// Draw the content of a single buffer into its rect on the screen.
@@ -575,7 +580,7 @@ fn buildStatusKey(self: *const Compositor, focused: *const Layout.LayoutNode, in
     var dropped: u64 = 0;
     if (self.orchestrator) |orch| {
         if (orch.window_manager.paneFromBuffer(leaf.buffer)) |pane| {
-            dropped = pane.runner.droppedEventCount();
+            if (pane.runner) |runner| dropped = runner.droppedEventCount();
         }
     }
     return .{
@@ -632,7 +637,7 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
     // orchestrator (e.g. in unit tests).
     if (self.orchestrator) |orch| {
         if (orch.window_manager.paneFromBuffer(leaf.buffer)) |pane| {
-            const dropped = pane.runner.droppedEventCount();
+            const dropped = if (pane.runner) |runner| runner.droppedEventCount() else 0;
             if (dropped > 0) {
                 var drops_scratch: [32]u8 = undefined;
                 const drops_label = std.fmt.bufPrint(&drops_scratch, " [drops: {d}]", .{dropped}) catch return;

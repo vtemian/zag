@@ -159,11 +159,14 @@ fn execute_split(
         };
     };
     defer parsed.deinit();
-    const buffer_type = if (parsed.value.buffer) |buf| buf.type else null;
+    const split_buffer: ?agent_events.SplitBuffer = if (parsed.value.buffer) |buf|
+        .{ .kind = buf.type }
+    else
+        null;
     return dispatch(allocator, .{ .split = .{
         .id = parsed.value.id,
         .direction = parsed.value.direction,
-        .buffer_type = buffer_type,
+        .buffer = split_buffer,
     } });
 }
 

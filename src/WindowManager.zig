@@ -43,16 +43,28 @@ const WindowManager = @This();
 /// Characters for the animated spinner.
 pub const spinner_chars = "|/-\\";
 
-/// Pane composition: view + session + runner. Mirrors the coordinator's
-/// view of a pane so callers needing all three compose them through this
-/// struct; each field is a borrowed pointer with coupled lifetimes.
+/// Pane composition: a rendered Buffer plus the optional agent-pane
+/// trio (ConversationBuffer + ConversationHistory + AgentRunner). The
+/// `buffer` field is always valid — it carries the type-erased Buffer
+/// the compositor renders. Agent panes own the conversation triple;
+/// scratch-backed panes borrow their Buffer from `BufferRegistry` and
+/// leave the trio null. Every read site of `runner`, `session`, or
+/// `view` must tolerate null so scratch panes do not crash code paths
+/// that were originally written for a single pane kind.
 pub const Pane = struct {
-    /// Conversation buffer rendered for this pane.
-    view: *ConversationBuffer,
-    /// Message history and turn state backing the view.
-    session: *ConversationHistory,
-    /// Agent worker driving LLM calls and tool execution for this pane.
-    runner: *AgentRunner,
+    /// Type-erased Buffer rendered for this pane. Always valid. For
+    /// agent panes this matches `view.?.buf()`; for scratch-backed
+    /// panes it is the Buffer borrowed out of `BufferRegistry`.
+    buffer: Buffer,
+    /// Conversation buffer backing the pane. Non-null for agent panes;
+    /// null for scratch-backed panes that borrow a Buffer from the
+    /// registry.
+    view: ?*ConversationBuffer,
+    /// Message history and turn state. Non-null exactly when `view` is.
+    session: ?*ConversationHistory,
+    /// Agent worker driving LLM calls and tool execution. Non-null
+    /// exactly when `view` is.
+    runner: ?*AgentRunner,
     /// Pane-local model override. `null` means the pane reads the shared
     /// `WindowManager.provider`. Non-null means this pane owns the
     /// `ProviderResult` pointed to; `WindowManager.deinit` frees it
@@ -241,14 +253,8 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
     self.clearPendingModelPick();
-    // Tear down the buffer registry before panes so a future pane that
-    // borrows a registered buffer cannot dangle past registry teardown.
-    // Today no pane references a scratch buffer, but the ordering keeps
-    // the invariant easy to reason about when that changes.
-    self.buffer_registry.deinit();
     // Command registry only owns duped key bytes and callback refs; no
-    // pane state touches it, so order with buffer_registry is
-    // indifferent.
+    // pane state touches it, so order is indifferent.
     self.command_registry.deinit();
     // Free pane-local provider overrides after each runner's thread has
     // been joined but before the runner/view/session objects are
@@ -267,18 +273,29 @@ pub fn deinit(self: *WindowManager) void {
             sh.close();
             self.allocator.destroy(sh);
         }
-        entry.pane.runner.deinit();
+        if (entry.pane.runner) |r| {
+            r.deinit();
+            self.allocator.destroy(r);
+        }
         if (entry.pane.provider) |p| {
             p.deinit();
             self.allocator.destroy(p);
         }
-        self.allocator.destroy(entry.pane.runner);
-        entry.pane.view.deinit();
-        self.allocator.destroy(entry.pane.view);
-        entry.pane.session.deinit();
-        self.allocator.destroy(entry.pane.session);
+        if (entry.pane.view) |v| {
+            v.deinit();
+            self.allocator.destroy(v);
+        }
+        if (entry.pane.session) |s| {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
     }
     self.extra_panes.deinit(self.allocator);
+    // Tear down the buffer registry AFTER panes. Scratch-backed panes
+    // borrow their Buffer out of the registry; destroying the registry
+    // first would free the underlying ScratchBuffer while the pane
+    // (and the layout leaf referencing it) is still live.
+    self.buffer_registry.deinit();
     // Layout is borrowed and its `deinit` runs AFTER ours under main.zig's
     // LIFO defer chain. Detach first so Layout's destroyNode walk does not
     // touch freed registry slots after `node_registry.deinit`.
@@ -345,13 +362,23 @@ pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
 }
 
 /// Split the leaf identified by `handle` and return the handle of the
-/// freshly created leaf. Temporarily refocuses the target so the existing
-/// `doSplit` path applies; refactoring `Layout.split*` to accept a node
-/// pointer would be a bigger change we defer until more call sites want it.
+/// freshly created leaf. When `attached` is null the new leaf holds a
+/// freshly allocated conversation pane (today's default). When
+/// `attached` is set, the new leaf borrows that Buffer directly — no
+/// AgentRunner / ConversationHistory / ConversationBuffer is allocated
+/// and the pane is entered into `extra_panes` with `runner`, `session`
+/// and `view` all null. Callers that pass `attached` must keep the
+/// backing Buffer alive for the life of the pane (today that means the
+/// `BufferRegistry` stays live, which `deinit` guarantees).
+///
+/// Temporarily refocuses the target so the existing `doSplit` path
+/// applies; refactoring `Layout.split*` to accept a node pointer would
+/// be a bigger change we defer until more call sites want it.
 pub fn splitById(
     self: *WindowManager,
     handle: NodeRegistry.Handle,
     direction: Layout.SplitDirection,
+    attached: ?Buffer,
 ) !NodeRegistry.Handle {
     const target = try self.node_registry.resolve(handle);
     if (target.* != .leaf) return error.NotALeaf;
@@ -360,9 +387,13 @@ pub fn splitById(
     self.layout.focused = target;
     defer self.layout.focused = prev_focus;
 
-    self.doSplit(direction);
+    if (attached) |b| {
+        try self.doSplitWithBuffer(direction, b);
+    } else {
+        self.doSplit(direction);
+    }
 
-    // `doSplit` leaves focus on the new leaf. Look its handle up in the
+    // `doSplit*` leaves focus on the new leaf. Look its handle up in the
     // registry so the caller can address the new pane by ID.
     const new_node = self.layout.focused orelse return error.FocusLost;
     for (self.node_registry.slots.items, 0..) |slot, i| {
@@ -539,12 +570,31 @@ pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutReques
                     .horizontal
                 else
                     break :blk errorOutcome(alloc, "invalid_direction");
-                if (args.buffer_type) |bt| {
-                    if (!std.mem.eql(u8, bt, "conversation")) {
-                        break :blk errorOutcome(alloc, "buffer_kind_not_yet_supported");
+                // Resolve the SplitBuffer selector into an optional borrowed
+                // Buffer. `null` and `.kind = "conversation"` both take the
+                // default conversation-pane path (splitById with no
+                // preattached buffer); any other kind is rejected. A
+                // `.handle` variant resolves through BufferRegistry; a
+                // stale or malformed handle fails loudly so the caller
+                // sees which side was wrong.
+                const attached: ?Buffer = blk_attached: {
+                    const sb = args.buffer orelse break :blk_attached null;
+                    switch (sb) {
+                        .kind => |k| {
+                            if (!std.mem.eql(u8, k, "conversation")) {
+                                break :blk errorOutcome(alloc, "buffer_kind_not_yet_supported");
+                            }
+                            break :blk_attached null;
+                        },
+                        .handle => |raw| {
+                            const bh: BufferRegistry.Handle = @bitCast(raw);
+                            const resolved = self.buffer_registry.asBuffer(bh) catch
+                                break :blk errorOutcome(alloc, "stale_buffer");
+                            break :blk_attached resolved;
+                        },
                     }
-                }
-                const new_id = self.splitById(handle, dir) catch |err|
+                };
+                const new_id = self.splitById(handle, dir, attached) catch |err|
                     break :blk errorOutcome(alloc, @errorName(err));
                 const id_str = NodeRegistry.formatId(alloc, new_id) catch
                     break :blk errorOutcome(alloc, "oom");
@@ -779,7 +829,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
         log.warn("split pane creation failed: {}", .{err});
         return;
     };
-    const b = pane.view.buf();
+    const b = pane.buffer;
     const split = switch (direction) {
         .vertical => self.layout.splitVertical(0.5, b),
         .horizontal => self.layout.splitHorizontal(0.5, b),
@@ -792,10 +842,11 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     // Pack its handle onto the runner so the agent thread can publish it
     // into `tools.current_caller_pane_id` around every tool dispatch.
     // createSplitPane runs before the split (the new buffer has to exist
-    // first), so this is the earliest point the handle is known.
+    // first), so this is the earliest point the handle is known. Only
+    // agent panes carry a runner, so the null branch is a no-op.
     if (self.layout.focused) |new_leaf| {
         if (self.handleForNode(new_leaf)) |handle| {
-            pane.runner.pane_handle_packed = @bitCast(handle);
+            if (pane.runner) |r| r.pane_handle_packed = @bitCast(handle);
         } else |err| {
             log.warn("new leaf missing from registry after split: {}", .{err});
         }
@@ -812,6 +863,43 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
 
     // Transient announce; cleared on the next key event.
     self.transient_status_len = formatSplitAnnounce(&self.transient_status, scratch_id);
+}
+
+/// Split the focused window, attaching an already-built Buffer (borrowed
+/// from `buffer_registry` or similar) to the new pane. No AgentRunner,
+/// ConversationHistory, or ConversationBuffer is allocated; the pane is
+/// tracked in `extra_panes` so `paneFromBuffer` / `getFocusedPane` can
+/// find it, but every runner/session reader must tolerate null.
+pub fn doSplitWithBuffer(
+    self: *WindowManager,
+    direction: Layout.SplitDirection,
+    attached: Buffer,
+) !void {
+    const prev_focus = self.layout.getFocusedLeaf();
+
+    const pane: Pane = .{
+        .buffer = attached,
+        .view = null,
+        .session = null,
+        .runner = null,
+    };
+    try self.extra_panes.append(self.allocator, .{ .pane = pane });
+    // On any downstream failure undo the append so extra_panes and the
+    // live layout stay in sync (no half-registered pane).
+    errdefer _ = self.extra_panes.pop();
+
+    switch (direction) {
+        .vertical => try self.layout.splitVertical(0.5, attached),
+        .horizontal => try self.layout.splitHorizontal(0.5, attached),
+    }
+
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+
+    // Non-agent panes stay in whatever mode the user was in; there is
+    // no draft to type into.
 }
 
 /// A freshly created pane is almost always going to be typed into, so we
@@ -863,7 +951,7 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
 
-    const pane: Pane = .{ .view = cb, .session = cs, .runner = runner };
+    const pane: Pane = .{ .buffer = cb.buf(), .view = cb, .session = cs, .runner = runner };
 
     // Register the entry before attaching the session handle so any
     // subsequent `paneFromBuffer` call already sees this pane.
@@ -875,8 +963,11 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     return pane;
 }
 
-/// Try to create and attach a session to a pane. Returns the handle or null.
+/// Try to create and attach a session to a pane. Returns the handle or
+/// null. Non-agent panes (those without a ConversationHistory) always
+/// return null; a scratch-backed pane has no message history to bind.
 pub fn attachSession(self: *WindowManager, pane: Pane) ?*Session.SessionHandle {
+    const session = pane.session orelse return null;
     const mgr = &(self.session_mgr.* orelse return null);
     const h = self.allocator.create(Session.SessionHandle) catch return null;
     h.* = mgr.createSession(self.provider.model_id) catch |err| {
@@ -884,7 +975,7 @@ pub fn attachSession(self: *WindowManager, pane: Pane) ?*Session.SessionHandle {
         self.allocator.destroy(h);
         return null;
     };
-    pane.session.attachSession(h);
+    session.attachSession(h);
     return h;
 }
 
@@ -902,9 +993,9 @@ pub fn getFocusedPane(self: *WindowManager) Pane {
 /// `getFocusedPane`, matching its total-function contract.
 pub fn getFocusedPanePtr(self: *WindowManager) *Pane {
     const leaf = self.layout.getFocusedLeaf() orelse return &self.root_pane;
-    if (self.root_pane.view.buf().ptr == leaf.buffer.ptr) return &self.root_pane;
+    if (self.root_pane.buffer.ptr == leaf.buffer.ptr) return &self.root_pane;
     for (self.extra_panes.items) |*entry| {
-        if (entry.pane.view.buf().ptr == leaf.buffer.ptr) return &entry.pane;
+        if (entry.pane.buffer.ptr == leaf.buffer.ptr) return &entry.pane;
     }
     return &self.root_pane;
 }
@@ -920,9 +1011,9 @@ pub fn providerFor(self: *const WindowManager, pane: *const Pane) *llm.ProviderR
 /// pane matches, which Compositor and any other reader should treat as a
 /// soft failure rather than a crash.
 pub fn paneFromBuffer(self: *WindowManager, b: Buffer) ?Pane {
-    if (self.root_pane.view.buf().ptr == b.ptr) return self.root_pane;
+    if (self.root_pane.buffer.ptr == b.ptr) return self.root_pane;
     for (self.extra_panes.items) |entry| {
-        if (entry.pane.view.buf().ptr == b.ptr) return entry.pane;
+        if (entry.pane.buffer.ptr == b.ptr) return entry.pane;
     }
     return null;
 }
@@ -933,6 +1024,13 @@ pub fn paneFromBuffer(self: *WindowManager, b: Buffer) ?Pane {
 /// `ConversationBuffer.restoreFromSession` coordinator now that the view
 /// no longer holds a session reference.
 pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Allocator) !void {
+    // Session restore only makes sense for agent panes. A scratch-backed
+    // pane has no conversation to rehydrate, so bail out loudly — the
+    // only caller today is main.zig's `--session=<id>` boot path, which
+    // owns a freshly-allocated agent pane.
+    const view = pane.view orelse return error.NotAnAgentPane;
+    const session = pane.session orelse return error.NotAnAgentPane;
+
     const session_id = handle.id[0..handle.id_len];
     const entries = try Session.loadEntries(session_id, allocator);
     defer {
@@ -940,13 +1038,13 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
         allocator.free(entries);
     }
 
-    try pane.view.loadFromEntries(entries);
-    try pane.session.rebuildMessages(entries, allocator);
-    pane.session.attachSession(handle);
+    try view.loadFromEntries(entries);
+    try session.rebuildMessages(entries, allocator);
+    session.attachSession(handle);
 
     if (handle.meta.name_len > 0) {
-        allocator.free(pane.view.name);
-        pane.view.name = try allocator.dupe(u8, handle.meta.nameSlice());
+        allocator.free(view.name);
+        view.name = try allocator.dupe(u8, handle.meta.nameSlice());
     }
 }
 
@@ -1052,19 +1150,23 @@ pub fn swapProvider(
     // getFocusedPanePtr falls back to &root_pane when no leaf is focused.
     // The drain polls cooperatively; a stuck tool or streaming HTTP
     // call would otherwise hang the TUI forever, so we cap the wait.
+    // A scratch-focused pane has no runner, so the drain is skipped
+    // entirely — there is no agent turn that could be reading the old
+    // provider.
     const focused = self.getFocusedPanePtr();
-    const runner = focused.runner;
-    if (runner.isAgentRunning()) {
-        runner.cancelAgent();
-        const timeout_ms: u64 = 5_000;
-        var waited_ms: u64 = 0;
-        while (runner.isAgentRunning()) : (waited_ms += 1) {
-            if (waited_ms >= timeout_ms) return error.SwapTimeout;
-            _ = runner.drainEvents(self.allocator);
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+    if (focused.runner) |runner| {
+        if (runner.isAgentRunning()) {
+            runner.cancelAgent();
+            const timeout_ms: u64 = 5_000;
+            var waited_ms: u64 = 0;
+            while (runner.isAgentRunning()) : (waited_ms += 1) {
+                if (waited_ms >= timeout_ms) return error.SwapTimeout;
+                _ = runner.drainEvents(self.allocator);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
         }
+        runner.shutdown();
     }
-    runner.shutdown();
 
     // Step 2: build the new provider BEFORE touching the old, so a
     // failure leaves the old provider live. Auth still comes from
@@ -1157,9 +1259,11 @@ fn buildConfigPathFromAuth(
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
 /// the underlying allocation failure and logs it; callers don't need to
-/// propagate status-message errors.
+/// propagate status-message errors. Root is always an agent pane; the
+/// null guard here is a belt-and-braces invariant check.
 pub fn appendStatus(self: *WindowManager, text: []const u8) void {
-    _ = self.root_pane.view.appendNode(null, .status, text) catch |err|
+    const view = self.root_pane.view orelse return;
+    _ = view.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
 }
 
@@ -1307,8 +1411,10 @@ fn dumpTraceFile(self: *WindowManager) void {
 
 /// Drain a pane's agent events and auto-name its session on first completion.
 /// Hook dispatch is folded into AgentRunner.drainEvents (dispatchHookRequests).
+/// Non-agent panes (no runner) have nothing to drain.
 pub fn drainPane(self: *WindowManager, pane: Pane) void {
-    if (pane.runner.drainEvents(self.allocator)) {
+    const runner = pane.runner orelse return;
+    if (runner.drainEvents(self.allocator)) {
         self.autoNameSession(pane);
     }
 }
@@ -1317,10 +1423,11 @@ pub fn drainPane(self: *WindowManager, pane: Pane) void {
 /// ask the provider for a 3-5 word title and rename the session.
 /// Best-effort: any failure is logged and swallowed.
 fn autoNameSession(self: *WindowManager, pane: Pane) void {
-    const sh = pane.session.session_handle orelse return;
+    const session = pane.session orelse return;
+    const sh = session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
-    const inputs = pane.session.sessionSummaryInputs() orelse return;
+    const inputs = session.sessionSummaryInputs() orelse return;
 
     const summary = self.generateSessionName(inputs) catch |err| {
         log.debug("auto-name failed: {}", .{err});
@@ -1467,16 +1574,16 @@ test "Pane composes view + session + runner" {
         allocator.destroy(runner);
     }
 
-    const pane: Pane = .{ .view = view, .session = session, .runner = runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = view, .session = session, .runner = runner };
 
     // All three objects are reachable through the Pane. Runner sees the
     // same view pointer; view sees its own name.
-    try std.testing.expectEqual(view, pane.view);
-    try std.testing.expectEqual(session, pane.session);
-    try std.testing.expectEqual(runner, pane.runner);
-    try std.testing.expectEqual(view, pane.runner.view);
-    try std.testing.expectEqual(session, pane.runner.session);
-    try std.testing.expectEqualStrings("pane-test", pane.view.name);
+    try std.testing.expectEqual(view, pane.view.?);
+    try std.testing.expectEqual(session, pane.session.?);
+    try std.testing.expectEqual(runner, pane.runner.?);
+    try std.testing.expectEqual(view, pane.runner.?.view);
+    try std.testing.expectEqual(session, pane.runner.?.session);
+    try std.testing.expectEqualStrings("pane-test", pane.view.?.name);
 }
 
 test "WindowManager exposes a NodeRegistry" {
@@ -1496,7 +1603,7 @@ test "WindowManager exposes a NodeRegistry" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -1544,7 +1651,7 @@ test "focus by handle updates focused leaf" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -1601,7 +1708,7 @@ test "focus by handle rejects stale id" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -1645,7 +1752,7 @@ test "splitById creates a new leaf and returns its handle" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -1681,7 +1788,7 @@ test "splitById creates a new leaf and returns its handle" {
         }
         unreachable;
     };
-    const new_id = try wm.splitById(root_handle, .vertical);
+    const new_id = try wm.splitById(root_handle, .vertical, null);
     const new_node = try wm.node_registry.resolve(new_id);
     try std.testing.expect(new_node.* == .leaf);
 }
@@ -1704,7 +1811,7 @@ test "closeById removes a leaf and keeps the sibling" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -1760,7 +1867,7 @@ test "closeById rejects the caller's own pane" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -1813,7 +1920,7 @@ test "resizeById applies ratio to parent split" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -1878,7 +1985,7 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -1932,7 +2039,7 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -1964,6 +2071,153 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "invalid_id") != null);
 }
 
+test "handleLayoutRequest split attaches registered buffer by handle" {
+    const allocator = std.testing.allocator;
+
+    // Real screen/compositor: doSplitWithBuffer writes layout_dirty and
+    // reads width/height for recalculate. A real ScratchBuffer lives on
+    // the BufferRegistry so the handle resolves to a concrete Buffer
+    // the new pane can borrow.
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    // Seed the registry with a scratch buffer and use its packed handle
+    // as the `.split.buffer.handle` argument. The new pane's buffer
+    // pointer must match the registry's scratch-buffer pointer (not a
+    // new ConversationBuffer).
+    const bh = try wm.buffer_registry.createScratch("picker");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const scratch_id = scratch_buf.getId();
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    var id_buf: [16]u8 = undefined;
+    const id_str = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
+
+    var req = agent_events.LayoutRequest.init(.{ .split = .{
+        .id = id_str,
+        .direction = "vertical",
+        .buffer = .{ .handle = @bitCast(bh) },
+    } });
+    wm.handleLayoutRequest(&req);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(!req.is_error);
+    const bytes = req.result_json orelse return error.TestUnexpectedResult;
+    defer if (req.result_owned) allocator.free(bytes);
+
+    // The response carries `new_id`; resolve it and confirm the leaf
+    // the main thread built borrows the scratch buffer by pointer.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const new_id_str = parsed.value.object.get("new_id").?.string;
+    const new_id: NodeRegistry.Handle = try NodeRegistry.parseId(new_id_str);
+    const new_node = try wm.node_registry.resolve(new_id);
+    try std.testing.expectEqual(@as(u32, scratch_id), new_node.leaf.buffer.getId());
+    try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
+
+    // The scratch pane is tracked in extra_panes but carries null
+    // runner/session/view — scratch buffers are not agent panes.
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+    const scratch_pane = wm.extra_panes.items[0].pane;
+    try std.testing.expectEqual(@as(?*AgentRunner, null), scratch_pane.runner);
+    try std.testing.expectEqual(@as(?*ConversationHistory, null), scratch_pane.session);
+    try std.testing.expectEqual(@as(?*ConversationBuffer, null), scratch_pane.view);
+    try std.testing.expectEqual(scratch_buf.ptr, scratch_pane.buffer.ptr);
+}
+
+test "handleLayoutRequest split rejects stale buffer handle" {
+    const allocator = std.testing.allocator;
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = undefined,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    var id_buf: [16]u8 = undefined;
+    const id_str = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
+
+    // Bogus handle: index 99 is past slot_count.
+    const bogus: BufferRegistry.Handle = .{ .index = 99, .generation = 0 };
+    var req = agent_events.LayoutRequest.init(.{ .split = .{
+        .id = id_str,
+        .direction = "vertical",
+        .buffer = .{ .handle = @bitCast(bogus) },
+    } });
+    wm.handleLayoutRequest(&req);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const bytes = req.result_json orelse return error.TestUnexpectedResult;
+    defer if (req.result_owned) allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "stale_buffer") != null);
+}
+
 test "describe emits parseable node map" {
     const allocator = std.testing.allocator;
 
@@ -1985,7 +2239,7 @@ test "describe emits parseable node map" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2046,7 +2300,7 @@ test "executeAction focus_left goes through handle path" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2111,7 +2365,7 @@ test "executeAction lua_callback runs the Lua function via the engine" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2164,7 +2418,7 @@ test "executeAction lua_callback without an engine is a no-op" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2211,7 +2465,7 @@ test "readPaneById returns rendered text with metadata" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, &view, &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2313,7 +2567,7 @@ test "restorePane rebuilds both tree and messages" {
     var runner = AgentRunner.init(allocator, &cb, &scb);
     defer runner.deinit();
 
-    const pane: Pane = .{ .view = &cb, .session = &scb, .runner = &runner };
+    const pane: Pane = .{ .buffer = cb.buf(), .view = &cb, .session = &scb, .runner = &runner };
     try restorePane(pane, &handle, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
@@ -2406,7 +2660,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
         .screen = undefined,
         .layout = &f.layout,
         .compositor = undefined,
-        .root_pane = .{ .view = &f.view, .session = &f.session, .runner = &f.runner },
+        .root_pane = .{ .buffer = f.view.buf(), .view = &f.view, .session = &f.session, .runner = &f.runner },
         .provider = &f.provider,
         .registry = &f.registry,
         .session_mgr = undefined,
@@ -2618,7 +2872,7 @@ test "renderModelPicker marks focused pane's current model" {
 
     // The picker emits the numbered list as a single status node. Pull
     // the last root-level node off the tree and inspect its text.
-    const root_children = f.wm.root_pane.view.tree.root_children.items;
+    const root_children = f.wm.root_pane.view.?.tree.root_children.items;
     try std.testing.expect(root_children.len > 0);
     const status_node = root_children[root_children.len - 1];
     const body = status_node.content.items;
