@@ -2226,7 +2226,7 @@ pub const LuaEngine = struct {
             }
         }
 
-        const new_handle = wm.splitById(handle, direction) catch |err| {
+        const new_handle = wm.splitById(handle, direction, null) catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split: {s}", .{@errorName(err)}) catch "zag.layout.split failed";
             lua.raiseErrorStr("%s", .{msg.ptr});

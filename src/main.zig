@@ -1218,6 +1218,7 @@ pub fn main() !void {
     defer if (session_handle) |*sh| sh.close();
 
     const root_pane: EventOrchestrator.Pane = .{
+        .buffer = root_buffer.buf(),
         .view = &root_buffer,
         .session = &root_session,
         .runner = &root_runner,

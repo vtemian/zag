@@ -263,6 +263,21 @@ pub const EventQueue = struct {
 /// the agent thread loads to check.
 pub const CancelFlag = std.atomic.Value(bool);
 
+/// Selector for what kind of buffer the split op should attach to its
+/// new pane. Back-compat form `.kind = "conversation"` mirrors the old
+/// `buffer_type` string; `.handle` carries a packed
+/// `BufferRegistry.Handle` so plugins can mount an already-registered
+/// buffer (scratch today, more kinds later) into the fresh pane.
+pub const SplitBuffer = union(enum) {
+    /// Named buffer kind. Only `"conversation"` is implemented today;
+    /// any other string resolves to `buffer_kind_not_yet_supported`.
+    kind: []const u8,
+    /// Packed `BufferRegistry.Handle` (see `BufferRegistry.parseId`).
+    /// The main thread resolves it at request time; a stale or invalid
+    /// handle surfaces as `stale_buffer` / `invalid_buffer_id`.
+    handle: u32,
+};
+
 /// Operations a layout_request can carry. Mirrors the `layout.*` tool
 /// surface the agent exposes: introspection (`describe`) plus the four
 /// mutators plus a pane read. Each variant is a plain value type; the
@@ -271,7 +286,7 @@ pub const CancelFlag = std.atomic.Value(bool);
 pub const LayoutOp = union(enum) {
     describe: void,
     focus: struct { id: []const u8 },
-    split: struct { id: []const u8, direction: []const u8, buffer_type: ?[]const u8 },
+    split: struct { id: []const u8, direction: []const u8, buffer: ?SplitBuffer },
     close: struct { id: []const u8 },
     resize: struct { id: []const u8, ratio: f32 },
     read_pane: struct { id: []const u8, lines: ?u32, offset: ?u32 },
