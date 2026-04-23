@@ -2594,7 +2594,10 @@ pub const LuaEngine = struct {
         lua.pop(1);
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
-        try engine.keymap_registry.register(mode, spec, action);
+        // Positional-arg binding is always global (buffer_id = null).
+        // Buffer-scoped bindings and lua-callback actions arrive via the
+        // table form added in Task 5.
+        try engine.keymap_registry.register(mode, spec, null, action);
         return 0;
     }
 
@@ -4511,16 +4514,14 @@ test "zag.keymap registers into the engine-owned registry" {
     );
 
     const registry = engine.keymapRegistry();
-    try std.testing.expectEqual(
-        Keymap.Action.focus_right,
-        registry.lookup(.normal, .{ .key = .{ .char = 'w' }, .modifiers = .{} }).?,
+    try std.testing.expect(
+        registry.lookup(.normal, .{ .key = .{ .char = 'w' }, .modifiers = .{} }, null).? == .focus_right,
     );
-    try std.testing.expectEqual(
-        Keymap.Action.close_window,
+    try std.testing.expect(
         registry.lookup(.normal, .{
             .key = .{ .char = 'q' },
             .modifiers = .{ .ctrl = true },
-        }).?,
+        }, null).? == .close_window,
     );
 }
 
@@ -4529,13 +4530,11 @@ test "LuaEngine init populates keymap defaults" {
     defer engine.deinit();
 
     const registry = engine.keymapRegistry();
-    try std.testing.expectEqual(
-        Keymap.Action.focus_left,
-        registry.lookup(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }).?,
+    try std.testing.expect(
+        registry.lookup(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }, null).? == .focus_left,
     );
-    try std.testing.expectEqual(
-        Keymap.Action.enter_insert_mode,
-        registry.lookup(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }).?,
+    try std.testing.expect(
+        registry.lookup(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }, null).? == .enter_insert_mode,
     );
 }
 
