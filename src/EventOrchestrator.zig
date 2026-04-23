@@ -380,9 +380,12 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
 
     // Keymap dispatch: run the bound action if any. The registry lives
     // on the Lua engine; when Lua init failed there is no registry so
-    // the key passes through to the mode-default logic below.
+    // the key passes through to the mode-default logic below. The
+    // focused buffer's id narrows the search so buffer-local bindings
+    // win over globals.
     if (self.window_manager.keymapRegistry()) |registry| {
-        if (registry.lookup(self.window_manager.current_mode, k)) |action| {
+        const focused_id = focused.view.buf().getId();
+        if (registry.lookup(self.window_manager.current_mode, k, focused_id)) |action| {
             self.window_manager.executeAction(action) catch |err| {
                 // Bound actions can fail for well-understood reasons
                 // (e.g. `.resize` requires an argument from Lua). Log

@@ -716,6 +716,9 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) !void {
         },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
+        // TODO(Task 4): invoke the Lua callback via LuaEngine. Ignored
+        // here so Task 3 can land the Action union independently.
+        .lua_callback => |_| {},
     }
 }
 
@@ -730,8 +733,9 @@ pub fn modeAfterKey(
     mode: Keymap.Mode,
     event: input.KeyEvent,
     registry: *const Keymap.Registry,
+    focused_buffer_id: ?u32,
 ) Keymap.Mode {
-    const action = registry.lookup(mode, event) orelse return mode;
+    const action = registry.lookup(mode, event, focused_buffer_id) orelse return mode;
     return switch (action) {
         .enter_insert_mode => .insert,
         .enter_normal_mode => .normal,
@@ -1368,7 +1372,7 @@ test "modeAfterKey: Esc transitions insert -> normal" {
     defer registry.deinit();
     try registry.loadDefaults();
 
-    const after = modeAfterKey(.insert, .{ .key = .escape, .modifiers = .{} }, &registry);
+    const after = modeAfterKey(.insert, .{ .key = .escape, .modifiers = .{} }, &registry, null);
     try std.testing.expectEqual(Keymap.Mode.normal, after);
 }
 
@@ -1377,7 +1381,7 @@ test "modeAfterKey: i transitions normal -> insert" {
     defer registry.deinit();
     try registry.loadDefaults();
 
-    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }, &registry);
+    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'i' }, .modifiers = .{} }, &registry, null);
     try std.testing.expectEqual(Keymap.Mode.insert, after);
 }
 
@@ -1386,7 +1390,7 @@ test "modeAfterKey: unbound key preserves mode" {
     defer registry.deinit();
     try registry.loadDefaults();
 
-    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'z' }, .modifiers = .{} }, &registry);
+    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'z' }, .modifiers = .{} }, &registry, null);
     try std.testing.expectEqual(Keymap.Mode.normal, after);
 }
 
@@ -1395,7 +1399,7 @@ test "modeAfterKey: non-mode action (focus_left) keeps mode" {
     defer registry.deinit();
     try registry.loadDefaults();
 
-    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }, &registry);
+    const after = modeAfterKey(.normal, .{ .key = .{ .char = 'h' }, .modifiers = .{} }, &registry, null);
     try std.testing.expectEqual(Keymap.Mode.normal, after);
 }
 
