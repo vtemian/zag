@@ -140,22 +140,6 @@ current_mode: Keymap.Mode = .insert,
 /// failed). Default timeouts apply. Ownership lives on the engine
 /// otherwise; see `inputParser()`.
 fallback_input_parser: input.Parser = .{},
-/// Non-null means a model picker is waiting for the user's next input
-/// (digit or q). Each entry is an allocator-owned snapshot of the
-/// flattened (provider, model_id) list; the typed digit maps 1-based
-/// into this slice so the follow-up handler does not have to re-query
-/// the registry (which plugins may have mutated in between).
-pending_model_pick: ?[]PendingPickEntry = null,
-
-/// One flattened entry in the `/model` picker. Both strings are owned
-/// by WindowManager.allocator and freed by `clearPendingModelPick`.
-pub const PendingPickEntry = struct {
-    /// Provider name (e.g. `"anthropic"`). Owned.
-    provider: []u8,
-    /// Model id within that provider (e.g. `"claude-sonnet-4-20250514"`).
-    /// Owned.
-    model_id: []u8,
-};
 
 pub const Config = struct {
     /// Heap allocator for runtime allocations owned by the manager.
@@ -204,7 +188,6 @@ pub fn init(cfg: Config) !WindowManager {
     try wm.command_registry.registerBuiltIn("/q", .quit);
     try wm.command_registry.registerBuiltIn("/perf", .perf);
     try wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
-    try wm.command_registry.registerBuiltIn("/model", .model);
 
     return wm;
 }
@@ -252,7 +235,6 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// by the caller *before* this runs: runners hold buffers read by their
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
-    self.clearPendingModelPick();
     // Command registry only owns duped key bytes and callback refs; no
     // pane state touches it, so order is indifferent.
     self.command_registry.deinit();
@@ -1054,43 +1036,10 @@ pub const CommandResult = enum { handled, quit, not_a_command };
 /// Try to handle input as a slash command. Returns .not_a_command if
 /// the input doesn't match any known command.
 pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
-    // When a model picker is pending, the next submitted line is a
-    // follow-up (digit or q), not a slash command. Intercept before the
-    // slash-command matches so "2", "q", and "999" don't fall through.
-    if (self.pending_model_pick) |list| {
-        const trimmed = std.mem.trim(u8, command, " \t");
-        if (std.mem.eql(u8, trimmed, "q") or std.mem.eql(u8, trimmed, "Q")) {
-            self.clearPendingModelPick();
-            self.appendStatus("model pick cancelled");
-            return .handled;
-        }
-        const idx = std.fmt.parseInt(usize, trimmed, 10) catch {
-            self.appendStatus("type a number from the list or q to cancel");
-            return .handled;
-        };
-        if (idx == 0 or idx > list.len) {
-            self.appendStatus("number out of range; type a valid row or q");
-            return .handled;
-        }
-        const pick = list[idx - 1];
-        self.swapProvider(pick.provider, pick.model_id) catch |err| {
-            var scratch: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &scratch,
-                "model swap failed: {s}",
-                .{@errorName(err)},
-            ) catch "model swap failed";
-            self.appendStatus(msg);
-            self.clearPendingModelPick();
-            return .handled;
-        };
-        self.clearPendingModelPick();
-        return .handled;
-    }
-
     // Lua plugins register into the engine-owned command registry;
     // check that first so `zag.command{name="quit"}` shadows the Zig
-    // built-in keyed on the same slash form.
+    // built-in keyed on the same slash form. The builtin `/model` picker
+    // (zag.builtin.model_picker) lands in the engine registry too.
     const plugin_hit: ?CommandRegistry.Command = if (self.lua_engine) |engine|
         engine.command_registry.lookup(command)
     else
@@ -1101,13 +1050,6 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
             .quit => return .quit,
             .perf, .perf_dump => {
                 self.handlePerfCommand(command);
-                return .handled;
-            },
-            .model => {
-                self.renderModelPicker() catch |err| {
-                    log.warn("renderModelPicker failed: {}", .{err});
-                    self.appendStatus("could not render model picker");
-                };
                 return .handled;
             },
         },
@@ -1331,88 +1273,6 @@ fn currentProviderName(self: *const WindowManager) []const u8 {
     const id = self.provider.model_id;
     const slash = std.mem.indexOfScalar(u8, id, '/') orelse return id;
     return id[0..slash];
-}
-
-/// Release every entry stored in `pending_model_pick` and reset the
-/// field to null. Safe to call when the field is already null.
-fn clearPendingModelPick(self: *WindowManager) void {
-    const list = self.pending_model_pick orelse return;
-    for (list) |e| {
-        self.allocator.free(e.provider);
-        self.allocator.free(e.model_id);
-    }
-    self.allocator.free(list);
-    self.pending_model_pick = null;
-}
-
-/// Render a numbered list of every registered provider/model pair into
-/// the root status buffer and stash an allocator-owned snapshot in
-/// `pending_model_pick` so the next keystroke can resolve to a pick.
-/// Marks the row whose provider/model_id matches the current provider
-/// with a `(current)` suffix.
-pub fn renderModelPicker(self: *WindowManager) !void {
-    self.clearPendingModelPick();
-
-    const registry = self.registry orelse return error.NoRegistry;
-    // The picker marks the CURRENT model of the focused pane, not the
-    // shared default, so a split pane with its own override sees its
-    // own row highlighted.
-    const focused = self.getFocusedPanePtr();
-    const current = self.providerFor(focused);
-    const current_model_id_full = current.model_id;
-    const slash_idx = std.mem.indexOfScalar(u8, current_model_id_full, '/');
-    const current_provider = if (slash_idx) |i| current_model_id_full[0..i] else current_model_id_full;
-    const current_model_id = if (slash_idx) |i| current_model_id_full[i + 1 ..] else current_model_id_full;
-
-    var entries: std.ArrayList(PendingPickEntry) = .empty;
-    errdefer {
-        for (entries.items) |e| {
-            self.allocator.free(e.provider);
-            self.allocator.free(e.model_id);
-        }
-        entries.deinit(self.allocator);
-    }
-
-    var header: std.ArrayList(u8) = .empty;
-    defer header.deinit(self.allocator);
-    try header.appendSlice(self.allocator, "Pick a model:\n");
-
-    for (registry.endpoints.items) |ep| {
-        for (ep.models) |m| {
-            const idx = entries.items.len + 1;
-            const display_label = m.label orelse m.id;
-            const is_current = std.mem.eql(u8, ep.name, current_provider) and
-                std.mem.eql(u8, m.id, current_model_id);
-            const line = try std.fmt.allocPrint(
-                self.allocator,
-                "  [{d}] {s}/{s}{s}\n",
-                .{
-                    idx,
-                    ep.name,
-                    display_label,
-                    if (is_current) "  (current)" else "",
-                },
-            );
-            defer self.allocator.free(line);
-            try header.appendSlice(self.allocator, line);
-
-            const duped_provider = try self.allocator.dupe(u8, ep.name);
-            errdefer self.allocator.free(duped_provider);
-            const duped_model = try self.allocator.dupe(u8, m.id);
-            errdefer self.allocator.free(duped_model);
-            try entries.append(self.allocator, .{
-                .provider = duped_provider,
-                .model_id = duped_model,
-            });
-        }
-    }
-    try header.appendSlice(self.allocator, "Type a number and press Enter, or q to cancel.\n");
-
-    // Claim the pending-pick slot BEFORE painting the UI so a typed
-    // digit cannot arrive before the slot is set (which would fall
-    // through as a slash command and confuse the user).
-    self.pending_model_pick = try entries.toOwnedSlice(self.allocator);
-    self.appendStatus(header.items);
 }
 
 /// Handle `/perf` (summary) or `/perf-dump` (write trace file).
@@ -2967,11 +2827,11 @@ test "restorePane rebuilds both tree and messages" {
     try std.testing.expect(scb.session_handle != null);
 }
 
-// -- Model picker test scaffolding -------------------------------------------
-// The picker and swap tests need a WindowManager with a real enough
-// ProviderResult that `renderModelPicker`, `handleCommand`, and
-// `swapProvider` all run end-to-end. `.auth = .none` endpoints keep the
-// credential file out of the test path.
+// -- Provider swap test scaffolding ------------------------------------------
+// The swap and pane-set-model tests need a WindowManager with a real
+// enough ProviderResult that `swapProvider`, `swapProviderForPane`, and
+// `zag.pane.set_model` all run end-to-end. `.auth = .none` endpoints
+// keep the credential file out of the test path.
 
 const PickerFixture = struct {
     allocator: std.mem.Allocator,
@@ -3065,59 +2925,6 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
     try f.wm.command_registry.registerBuiltIn("/q", .quit);
     try f.wm.command_registry.registerBuiltIn("/perf", .perf);
     try f.wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
-    try f.wm.command_registry.registerBuiltIn("/model", .model);
-}
-
-test "handleCommand resolves digit input when pending_model_pick is set" {
-    const allocator = std.testing.allocator;
-    var f: PickerFixture = undefined;
-    try buildPickerFixture(allocator, &f);
-    defer f.deinit();
-
-    try f.wm.renderModelPicker();
-    try std.testing.expect(f.wm.pending_model_pick != null);
-    try std.testing.expect(f.wm.pending_model_pick.?.len >= 2);
-
-    // Typing "2" picks entry index 1. The happy path must clear the
-    // pending pick, return .handled, and route through swapProvider so
-    // the focused pane's active provider reflects the new choice
-    // (provA/a2 in this fixture). The shared default is NOT mutated.
-    const result = f.wm.handleCommand("2");
-    try std.testing.expectEqual(CommandResult.handled, result);
-    try std.testing.expectEqual(@as(?[]PendingPickEntry, null), f.wm.pending_model_pick);
-    try std.testing.expectEqualStrings("provA/a2", f.wm.providerFor(&f.wm.root_pane).model_id);
-    try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
-}
-
-test "handleCommand cancels pending pick on q" {
-    const allocator = std.testing.allocator;
-    var f: PickerFixture = undefined;
-    try buildPickerFixture(allocator, &f);
-    defer f.deinit();
-
-    try f.wm.renderModelPicker();
-    const result = f.wm.handleCommand("q");
-    try std.testing.expectEqual(CommandResult.handled, result);
-    try std.testing.expectEqual(@as(?[]PendingPickEntry, null), f.wm.pending_model_pick);
-}
-
-test "handleCommand reports bad digit and keeps pick active" {
-    const allocator = std.testing.allocator;
-    var f: PickerFixture = undefined;
-    try buildPickerFixture(allocator, &f);
-    defer f.deinit();
-
-    try f.wm.renderModelPicker();
-
-    // Out-of-range number: pick stays open so the user can retry.
-    const out_of_range = f.wm.handleCommand("999");
-    try std.testing.expectEqual(CommandResult.handled, out_of_range);
-    try std.testing.expect(f.wm.pending_model_pick != null);
-
-    // Non-digit junk: pick also stays open.
-    const junk = f.wm.handleCommand("hello");
-    try std.testing.expectEqual(CommandResult.handled, junk);
-    try std.testing.expect(f.wm.pending_model_pick != null);
 }
 
 test "swapProvider rebuilds ProviderResult and updates model_id" {
@@ -3383,35 +3190,218 @@ test "zag.providers.list reflects the endpoint registry" {
     engine.lua.pop(1);
 }
 
-test "renderModelPicker marks focused pane's current model" {
+test "loadBuiltinPlugins registers /model as a Lua callback" {
     const allocator = std.testing.allocator;
-    var f: PickerFixture = undefined;
-    try buildPickerFixture(allocator, &f);
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.loadBuiltinPlugins();
+
+    const hit = engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    try std.testing.expect(hit == .lua_callback);
+}
+
+/// Integration fixture for the `/model` plugin: wires a real Lua engine,
+/// window manager, layout, and providers registry so a Lua-side call to
+/// the `/model` command runs end-to-end against live primitives. The
+/// fixture skips main.zig's `ProviderResult` bootstrap because the
+/// picker only touches `zag.providers.list()` and `zag.pane.current_model`
+/// through engine state, not the live provider.
+const ModelPickerPluginFixture = struct {
+    allocator: std.mem.Allocator,
+    registry: llm.Registry,
+    provider: llm.ProviderResult,
+    session: ConversationHistory,
+    view: ConversationBuffer,
+    runner: AgentRunner,
+    layout: Layout,
+    screen: Screen,
+    theme: @import("Theme.zig"),
+    compositor: Compositor,
+    wm: *WindowManager,
+    engine: LuaEngine,
+
+    fn init(self: *ModelPickerPluginFixture, allocator: std.mem.Allocator) !void {
+        self.allocator = allocator;
+
+        self.registry = llm.Registry.init(allocator);
+        errdefer self.registry.deinit();
+
+        const ep_a: llm.Endpoint = .{
+            .name = "provA",
+            .serializer = .openai,
+            .url = "https://a.example",
+            .auth = .none,
+            .headers = &.{},
+            .default_model = "a1",
+            .models = &[_]llm.Endpoint.ModelRate{
+                .{ .id = "a1", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+                .{ .id = "a2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+            },
+        };
+        try self.registry.add(try ep_a.dupe(allocator));
+
+        self.provider = try llm.createProviderFromLuaConfig(
+            &self.registry,
+            "provA/a1",
+            "/tmp/zag_test_unused_credentials",
+            allocator,
+        );
+        errdefer self.provider.deinit();
+
+        self.session = ConversationHistory.init(allocator);
+        errdefer self.session.deinit();
+        self.view = try ConversationBuffer.init(allocator, 0, "root");
+        errdefer self.view.deinit();
+        self.runner = AgentRunner.init(allocator, &self.view, &self.session);
+        errdefer self.runner.deinit();
+
+        self.screen = try Screen.init(allocator, 80, 24);
+        errdefer self.screen.deinit();
+        self.theme = @import("Theme.zig").defaultTheme();
+        self.compositor = Compositor.init(&self.screen, allocator, &self.theme);
+        errdefer self.compositor.deinit();
+        self.layout = Layout.init(allocator);
+        errdefer self.layout.deinit();
+
+        self.engine = try LuaEngine.init(allocator);
+        errdefer self.engine.deinit();
+
+        // Seed the engine's own provider registry so `zag.providers.list()`
+        // has something to iterate. Plugins read the engine registry, not
+        // the fixture registry.
+        const engine_ep: llm.Endpoint = .{
+            .name = "provA",
+            .serializer = .openai,
+            .url = "https://a.example",
+            .auth = .none,
+            .headers = &.{},
+            .default_model = "a1",
+            .models = &[_]llm.Endpoint.ModelRate{
+                .{ .id = "a1", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+                .{ .id = "a2", .context_window = 1000, .max_output_tokens = 500, .input_per_mtok = 0, .output_per_mtok = 0, .cache_write_per_mtok = null, .cache_read_per_mtok = null },
+            },
+        };
+        try self.engine.providers_registry.add(try engine_ep.dupe(allocator));
+
+        self.wm = try allocator.create(WindowManager);
+        errdefer allocator.destroy(self.wm);
+
+        self.wm.* = .{
+            .allocator = allocator,
+            .screen = &self.screen,
+            .layout = &self.layout,
+            .compositor = &self.compositor,
+            .root_pane = .{ .buffer = self.view.buf(), .view = &self.view, .session = &self.session, .runner = &self.runner },
+            .provider = &self.provider,
+            .registry = &self.engine.providers_registry,
+            .session_mgr = undefined,
+            .lua_engine = &self.engine,
+            .wake_write_fd = 0,
+            .node_registry = NodeRegistry.init(allocator),
+            .buffer_registry = BufferRegistry.init(allocator),
+            .command_registry = CommandRegistry.init(allocator),
+        };
+        try self.wm.command_registry.registerBuiltIn("/quit", .quit);
+        try self.wm.command_registry.registerBuiltIn("/q", .quit);
+        try self.wm.command_registry.registerBuiltIn("/perf", .perf);
+        try self.wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
+
+        try self.wm.attachLayoutRegistry();
+        try self.layout.setRoot(self.view.buf());
+        self.layout.recalculate(self.screen.width, self.screen.height);
+
+        self.engine.window_manager = self.wm;
+        self.engine.buffer_registry = &self.wm.buffer_registry;
+        self.engine.loadBuiltinPlugins();
+    }
+
+    fn deinit(self: *ModelPickerPluginFixture) void {
+        self.wm.deinit();
+        self.allocator.destroy(self.wm);
+        self.engine.deinit();
+        self.layout.deinit();
+        self.compositor.deinit();
+        self.screen.deinit();
+        self.runner.deinit();
+        self.view.deinit();
+        self.session.deinit();
+        self.provider.deinit();
+        self.registry.deinit();
+    }
+};
+
+test "/model plugin opens a split pane with a scratch buffer" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
     defer f.deinit();
 
-    // Plant an override on the root pane so the picker should mark
-    // provB/b1 as `(current)` rather than the shared default provA/a1.
-    const override = try allocator.create(llm.ProviderResult);
-    errdefer allocator.destroy(override);
-    override.* = try llm.createProviderFromLuaConfig(
-        &f.registry,
-        "provB/b1",
-        "/tmp/zag_test_unused_credentials",
-        allocator,
-    );
-    f.wm.root_pane.provider = override;
+    const leaf_count_before = countLeaves(f.layout.root);
 
-    try f.wm.renderModelPicker();
+    // Invoke the registered callback directly; this is exactly what
+    // WindowManager.handleCommand would do when the user types /model.
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    try std.testing.expect(cmd == .lua_callback);
+    f.engine.invokeCallback(cmd.lua_callback);
 
-    // The picker emits the numbered list as a single status node. Pull
-    // the last root-level node off the tree and inspect its text.
-    const root_children = f.wm.root_pane.view.?.tree.root_children.items;
-    try std.testing.expect(root_children.len > 0);
-    const status_node = root_children[root_children.len - 1];
-    const body = status_node.content.items;
+    try std.testing.expectEqual(leaf_count_before + 1, countLeaves(f.layout.root));
 
-    const b1_marker = "provB/b1  (current)";
-    const a1_marker = "provA/a1  (current)";
-    try std.testing.expect(std.mem.indexOf(u8, body, b1_marker) != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, a1_marker) == null);
+    // The new pane's buffer must be a scratch buffer (id matched by the
+    // sole entry in `wm.buffer_registry.slots`).
+    try std.testing.expectEqual(@as(usize, 1), f.wm.buffer_registry.slots.items.len);
+    const scratch_slot = f.wm.buffer_registry.slots.items[0];
+    try std.testing.expect(scratch_slot.entry != null);
+    try std.testing.expect(scratch_slot.entry.? == .scratch);
+
+    // And a buffer-scoped keymap binding for <CR> should now exist.
+    const scratch_buffer = scratch_slot.entry.?.scratch;
+    const hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .enter, .modifiers = .{} },
+        scratch_buffer.buf().getId(),
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(hit == .lua_callback);
+}
+
+test "/model plugin commit fires set_model for the cursor row" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    f.engine.invokeCallback(cmd.lua_callback);
+
+    // Move cursor to row 2 (the second model entry, provA/a2) and fire
+    // the buffer-scoped <CR> binding; the callback should swap the
+    // focused pane's model to "provA/a2" via `zag.pane.set_model`.
+    const scratch_slot = f.wm.buffer_registry.slots.items[0];
+    const scratch_buffer = scratch_slot.entry.?.scratch;
+    scratch_buffer.cursor_row = 1; // 0-based; entries[2] in Lua = row 2
+
+    const hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .enter, .modifiers = .{} },
+        scratch_buffer.buf().getId(),
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(hit == .lua_callback);
+    f.engine.invokeCallback(hit.lua_callback);
+
+    const override = f.wm.root_pane.provider orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("provA/a2", override.model_id);
+}
+
+/// Count every leaf node reachable from `root`. Used by the picker
+/// plugin tests to assert that invoking `/model` added exactly one
+/// pane, regardless of how `Layout` happened to position it.
+fn countLeaves(root: ?*Layout.LayoutNode) usize {
+    const node = root orelse return 0;
+    return switch (node.*) {
+        .leaf => 1,
+        .split => |s| countLeaves(s.first) + countLeaves(s.second),
+    };
 }

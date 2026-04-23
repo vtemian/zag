@@ -260,6 +260,7 @@ fn bootstrapStdlibProviders(engine: *LuaEngine) usize {
     engine.storeSelfPointer();
     var loaded: usize = 0;
     for (embedded.entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "zag.providers.")) continue;
         var src_buf: [128]u8 = undefined;
         const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
             log.warn("stdlib bootstrap: module name too long: {s}", .{entry.name});
@@ -748,6 +749,11 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
     defer if (lua_engine) |*eng| eng.deinit();
 
     if (lua_engine) |*eng| {
+        // Register embedded builtins (e.g. zag.builtin.model_picker) first
+        // so the user's config.lua can shadow them via the same slash name;
+        // the command registry's last-write-wins semantics give the user
+        // override without any special plumbing here.
+        eng.loadBuiltinPlugins();
         eng.loadUserConfig();
         if (eng.providers_registry.endpoints.items.len == 0) {
             log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
@@ -1134,6 +1140,11 @@ pub fn main() !void {
     defer if (lua_engine) |*eng| eng.deinit();
 
     if (lua_engine) |*eng| {
+        // Builtins (zag.builtin.*) register their slash commands before
+        // config.lua runs so a user override via `zag.command{name="..."}`
+        // shadows the default; the command registry's last-write-wins
+        // semantics deliver that outcome without extra plumbing.
+        eng.loadBuiltinPlugins();
         eng.loadUserConfig();
         // If the user has no config.lua (or declared zero providers), the
         // registry is empty and nothing would work. Load the embedded stdlib
@@ -1588,9 +1599,16 @@ test "bootstrapStdlibProviders populates an empty engine registry" {
 
     try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
 
+    // Count how many embedded entries are provider stdlib modules; the
+    // loader now skips anything outside the `zag.providers.*` prefix
+    // (e.g. the `zag.builtin.*` picker plugins).
+    var expected_providers: usize = 0;
+    for (embedded.entries) |e| {
+        if (std.mem.startsWith(u8, e.name, "zag.providers.")) expected_providers += 1;
+    }
     const loaded = bootstrapStdlibProviders(&engine);
-    try std.testing.expectEqual(embedded.entries.len, loaded);
-    try std.testing.expectEqual(embedded.entries.len, engine.providers_registry.endpoints.items.len);
+    try std.testing.expectEqual(expected_providers, loaded);
+    try std.testing.expectEqual(expected_providers, engine.providers_registry.endpoints.items.len);
 
     // Spot-check: anthropic (api-key) and openai-oauth (oauth) both installed.
     try std.testing.expect(engine.providers_registry.find("anthropic") != null);
