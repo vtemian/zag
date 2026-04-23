@@ -716,9 +716,17 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) !void {
         },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
-        // TODO(Task 4): invoke the Lua callback via LuaEngine. Ignored
-        // here so Task 3 can land the Action union independently.
-        .lua_callback => |_| {},
+        // Dispatch a Lua function registered via `zag.keymap{...}` with
+        // a function action. When no Lua engine is attached (standalone
+        // tests), the binding silently no-ops; it could not have been
+        // registered in that harness in the first place.
+        .lua_callback => |ref| {
+            if (self.lua_engine) |engine| {
+                engine.invokeCallback(ref);
+            } else {
+                log.warn("lua_callback action fired without a Lua engine; ref={d}", .{ref});
+            }
+        },
     }
 }
 
@@ -2025,6 +2033,119 @@ test "executeAction focus_left goes through handle path" {
     const original_right = wm.layout.focused.?;
     try wm.executeAction(.focus_left);
     try std.testing.expect(wm.layout.focused != original_right);
+}
+
+test "executeAction lua_callback runs the Lua function via the engine" {
+    const allocator = std.testing.allocator;
+    const zlua = @import("zlua");
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    // Seed a Lua function that bumps a global counter, then stash it
+    // in the registry. `lua.ref` pops the top of stack and returns the
+    // integer ref that keymap bindings carry in `.lua_callback`.
+    try engine.lua.doString(
+        \\_counter = 0
+        \\function _bump() _counter = _counter + 1 end
+    );
+    _ = try engine.lua.getGlobal("_bump");
+    const ref = try engine.lua.ref(zlua.registry_index);
+    defer engine.lua.unref(zlua.registry_index, ref);
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    try wm.executeAction(.{ .lua_callback = ref });
+    try wm.executeAction(.{ .lua_callback = ref });
+
+    _ = try engine.lua.getGlobal("_counter");
+    defer engine.lua.pop(1);
+    const counter = try engine.lua.toInteger(-1);
+    try std.testing.expectEqual(@as(i64, 2), counter);
+}
+
+test "executeAction lua_callback without an engine is a no-op" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    try wm.executeAction(.{ .lua_callback = 99 });
 }
 
 test "readPaneById returns rendered text with metadata" {
