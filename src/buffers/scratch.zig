@@ -242,6 +242,29 @@ test "cursor_row clamps when setLines shrinks the list" {
     try std.testing.expectEqual(@as(u32, 0), sb.cursor_row);
 }
 
+test "cursor_row clamps to last line when setLines shrinks to non-empty" {
+    // Exercises the `len > 0` branch of the clamp: cursor starts past the
+    // new end, must land on `lines.len - 1` rather than 0.
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 1, "test");
+    defer sb.destroy();
+    try sb.setLines(&.{ "a", "b", "c", "d", "e" });
+    sb.cursor_row = 4;
+    try sb.setLines(&.{ "x", "y", "z" });
+    try std.testing.expectEqual(@as(u32, 2), sb.cursor_row);
+}
+
+test "cursor_row resets to 0 when setLines empties the list" {
+    // Exercises the `len == 0` branch of the clamp.
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 1, "test");
+    defer sb.destroy();
+    try sb.setLines(&.{ "a", "b", "c" });
+    sb.cursor_row = 2;
+    try sb.setLines(&.{});
+    try std.testing.expectEqual(@as(u32, 0), sb.cursor_row);
+}
+
 test "handleKey j moves down, k moves up, stops at edges" {
     const gpa = std.testing.allocator;
     var sb = try ScratchBuffer.create(gpa, 1, "test");

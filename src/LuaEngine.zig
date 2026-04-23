@@ -3933,6 +3933,9 @@ pub const LuaEngine = struct {
     /// swallowed; the keymap layer must not propagate Lua failures into
     /// the terminal event loop.
     pub fn invokeCallback(self: *LuaEngine, ref: i32) void {
+        // Obviously-invalid refs never resolve to a callable; short-circuit
+        // before the registry lookup to avoid pushing nil and calling it.
+        if (ref == zlua.ref_nil or ref == 0) return;
         const lua = self.lua;
         _ = lua.rawGetIndex(zlua.registry_index, ref);
         lua.protectedCall(.{ .args = 0, .results = 0 }) catch |err| {
@@ -4576,6 +4579,17 @@ test "LuaEngine.init starts with an empty providers_registry" {
     try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
     try std.testing.expectEqual(@as(?*const llm.Endpoint, null), engine.providers_registry.find("anthropic"));
     try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
+}
+
+test "invokeCallback is a no-op on ref_nil and 0" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    // Neither call should crash or touch the Lua stack.
+    const top_before = engine.lua.getTop();
+    engine.invokeCallback(0);
+    engine.invokeCallback(zlua.ref_nil);
+    try std.testing.expectEqual(top_before, engine.lua.getTop());
 }
 
 test "LuaEngine initAsync and deinitAsync work" {

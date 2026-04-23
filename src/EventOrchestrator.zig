@@ -22,11 +22,16 @@ const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationHistory = @import("ConversationHistory.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const WindowManager = @import("WindowManager.zig");
+const NodeRegistry = @import("NodeRegistry.zig");
+const BufferRegistry = @import("BufferRegistry.zig");
+const CommandRegistry = @import("CommandRegistry.zig");
+const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const trace = @import("Metrics.zig");
 
@@ -681,4 +686,128 @@ test "shutdownAgents uses BoundedArray capacity that fits 1 root + typical split
     // runner list path).
     const realistic_ceiling: usize = 16;
     try std.testing.expect(realistic_ceiling <= shutdown_runner_cap);
+}
+
+test "handleKey routes Enter to a focused scratch pane without crashing" {
+    // End-to-end: stand up a WindowManager with a registered scratch
+    // buffer, split-mount it via handleLayoutRequest (which leaves focus
+    // on the new leaf), then dispatch an Enter key through the
+    // orchestrator's handleKey path. Scratch panes carry no view/runner
+    // so the insert-mode `.enter` arm must fall through to the buffer's
+    // own handleKey (which passthroughs Enter) and return `.none`.
+    //
+    // The scratch ScratchBuffer exposes a `j/k` cursor; we assert it is
+    // still zero after Enter, which proves handleKey reached the buffer
+    // and did not crash but also did not wrongly treat Enter as motion.
+    const allocator = std.testing.allocator;
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const root_pane: WindowManager.Pane = .{
+        .buffer = view.buf(),
+        .view = &view,
+        .session = &session_scratch,
+        .runner = &runner,
+    };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    // Seed a scratch buffer with two lines so we can later read back the
+    // cursor row and confirm Enter did not move it.
+    const bh = try wm.buffer_registry.createScratch("picker");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const ScratchBuffer = @import("buffers/scratch.zig");
+    const scratch_ptr: *ScratchBuffer = @ptrCast(@alignCast(scratch_buf.ptr));
+    try scratch_ptr.setLines(&.{ "one", "two" });
+
+    // Split the root to mount the scratch buffer. Focus lands on the new
+    // leaf automatically (doSplit's contract).
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    var id_buf: [16]u8 = undefined;
+    const id_str = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
+    var req = agent_events.LayoutRequest.init(.{ .split = .{
+        .id = id_str,
+        .direction = "vertical",
+        .buffer = .{ .handle = @bitCast(bh) },
+    } });
+    wm.handleLayoutRequest(&req);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(!req.is_error);
+    const bytes = req.result_json orelse return error.TestUnexpectedResult;
+    defer if (req.result_owned) allocator.free(bytes);
+
+    // `handleLayoutRequest` restores the caller's focus on return; the
+    // test explicitly wants the scratch pane to be focused, so look up
+    // the new leaf's handle and move focus there.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const new_id_str = parsed.value.object.get("new_id").?.string;
+    const new_handle: NodeRegistry.Handle = try NodeRegistry.parseId(new_id_str);
+    try wm.focusById(new_handle);
+
+    // Sanity: focused pane is the scratch, not root.
+    const focused = wm.getFocusedPane();
+    try std.testing.expectEqual(scratch_buf.ptr, focused.buffer.ptr);
+    try std.testing.expectEqual(@as(?*AgentRunner, null), focused.runner);
+
+    // Force insert mode so the Enter arm of the switch actually runs;
+    // normal mode would short-circuit before the switch.
+    wm.current_mode = .insert;
+
+    // Drive handleKey directly. The orchestrator only touches
+    // `self.window_manager` on this path, so other fields stay undefined.
+    // We move the WindowManager *value* into the orchestrator and move it
+    // back afterwards so there is one owner at all times (ArrayLists and
+    // the node_registry hold allocations; double-ownership would
+    // double-free on deinit). Between move-in and move-out, `wm.*` must
+    // not be touched.
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = wm.*;
+
+    const ev: input.KeyEvent = .{ .key = .enter, .modifiers = .{} };
+    const action = orch.handleKey(ev);
+    try std.testing.expectEqual(Action.none, action);
+
+    // Scratch's handleKey treats Enter as passthrough, so the cursor
+    // stays put. Reaching this line at all means no crash on the path.
+    try std.testing.expectEqual(@as(u32, 0), scratch_ptr.cursor_row);
+
+    // Move the (possibly mutated) WindowManager back so `defer wm.deinit()`
+    // frees the canonical copy.
+    wm.* = orch.window_manager;
 }
