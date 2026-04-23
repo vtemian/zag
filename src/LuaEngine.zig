@@ -10,6 +10,7 @@ const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
+const BufferRegistry = @import("BufferRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
 const Layout = @import("Layout.zig");
@@ -279,6 +280,15 @@ pub const LuaEngine = struct {
         self.hook_dispatcher.deinit();
         self.providers_registry.deinit();
         if (self.default_model) |m| self.allocator.free(m);
+        // Release every Lua callback ref a keymap binding still holds.
+        // Bindings stored as `Action.lua_callback` own a registry slot
+        // that would otherwise leak when the VM is torn down.
+        for (self.keymap_registry.bindings.items) |b| {
+            switch (b.action) {
+                .lua_callback => |ref| self.lua.unref(zlua.registry_index, ref),
+                else => {},
+            }
+        }
         self.keymap_registry.deinit();
         self.lua.deinit();
     }
@@ -2542,28 +2552,35 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// Zig function backing `zag.keymap(mode, key, action)`.
-    /// Writes a binding into `engine.keymap_registry`. The registry is
-    /// owned by the engine and always present, so no null check is needed.
+    /// Zig function backing `zag.keymap(...)`. Accepts either the
+    /// positional string form `(mode, key, action)` or a single table
+    /// form `{ mode, key, buffer?, fn? | action? }` where exactly one of
+    /// `fn` (a Lua function -> `Action.lua_callback`) or `action` (a
+    /// string naming a built-in action) must be present, and `buffer` is
+    /// the `"b<u32>"` handle string produced by `BufferRegistry.formatId`.
     fn zagKeymapFn(lua: *Lua) !i32 {
         return zagKeymapFnInner(lua) catch |err| {
-            log.err("zag.keymap() failed: {}", .{err});
+            // User-config schema errors surface as warn (same as zag.provider).
+            // The inner call site logs its own specific diagnostic before
+            // returning; this is the final fallback line.
+            log.warn("zag.keymap() failed: {}", .{err});
             return err;
         };
     }
 
     fn zagKeymapFnInner(lua: *Lua) !i32 {
+        if (lua.isTable(1)) return zagKeymapTableFormInner(lua);
+        return zagKeymapPositionalFormInner(lua);
+    }
+
+    fn zagKeymapPositionalFormInner(lua: *Lua) !i32 {
         // All three string args are borrowed from the Lua VM; read them
         // before any stack-mutating calls below.
         const mode_name = lua.toString(1) catch {
             log.err("zag.keymap(): arg 1 (mode) must be a string", .{});
             return error.LuaError;
         };
-        const mode: Keymap.Mode = if (std.mem.eql(u8, mode_name, "normal"))
-            .normal
-        else if (std.mem.eql(u8, mode_name, "insert"))
-            .insert
-        else {
+        const mode = parseModeName(mode_name) orelse {
             log.err("zag.keymap(): unknown mode '{s}'", .{mode_name});
             return error.LuaError;
         };
@@ -2586,19 +2603,132 @@ pub const LuaEngine = struct {
             return error.LuaError;
         };
 
+        const engine = try keymapEnginePointer(lua);
+        try engine.keymap_registry.register(mode, spec, null, action);
+        return 0;
+    }
+
+    fn zagKeymapTableFormInner(lua: *Lua) !i32 {
+        // Read mode.
+        _ = lua.getField(1, "mode");
+        if (lua.typeOf(-1) != .string) {
+            log.err("zag.keymap{{}}: field 'mode' must be a string", .{});
+            return error.LuaError;
+        }
+        const mode_name = lua.toString(-1) catch {
+            log.err("zag.keymap{{}}: field 'mode' must be a string", .{});
+            return error.LuaError;
+        };
+        const mode = parseModeName(mode_name) orelse {
+            log.err("zag.keymap{{}}: unknown mode '{s}'", .{mode_name});
+            return error.LuaError;
+        };
+        lua.pop(1);
+
+        // Read key.
+        _ = lua.getField(1, "key");
+        if (lua.typeOf(-1) != .string) {
+            log.err("zag.keymap{{}}: field 'key' must be a string", .{});
+            return error.LuaError;
+        }
+        const key = lua.toString(-1) catch {
+            log.err("zag.keymap{{}}: field 'key' must be a string", .{});
+            return error.LuaError;
+        };
+        const spec = Keymap.parseKeySpec(key) catch {
+            log.err("zag.keymap{{}}: invalid key spec '{s}'", .{key});
+            return error.LuaError;
+        };
+        lua.pop(1);
+
+        // Optional buffer handle string.
+        var buffer_id: ?u32 = null;
+        _ = lua.getField(1, "buffer");
+        if (!lua.isNil(-1)) {
+            if (lua.typeOf(-1) != .string) {
+                log.err("zag.keymap{{}}: field 'buffer' must be a \"b<id>\" handle string", .{});
+                return error.LuaError;
+            }
+            const handle_str = lua.toString(-1) catch {
+                log.err("zag.keymap{{}}: field 'buffer' must be a \"b<id>\" handle string", .{});
+                return error.LuaError;
+            };
+            const handle = BufferRegistry.parseId(handle_str) catch {
+                log.err("zag.keymap{{}}: invalid buffer handle '{s}'", .{handle_str});
+                return error.LuaError;
+            };
+            buffer_id = @bitCast(handle);
+        }
+        lua.pop(1);
+
+        // Detect action vs fn. Exactly one must be present.
+        _ = lua.getField(1, "action");
+        const has_action = !lua.isNil(-1);
+        lua.pop(1);
+
+        _ = lua.getField(1, "fn");
+        const has_fn = !lua.isNil(-1);
+        lua.pop(1);
+
+        if (has_action and has_fn) {
+            log.warn("zag.keymap{{}}: 'action' and 'fn' are mutually exclusive", .{});
+            return error.LuaError;
+        }
+        if (!has_action and !has_fn) {
+            log.warn("zag.keymap{{}}: exactly one of 'action' or 'fn' is required", .{});
+            return error.LuaError;
+        }
+
+        const engine = try keymapEnginePointer(lua);
+
+        if (has_action) {
+            _ = lua.getField(1, "action");
+            if (lua.typeOf(-1) != .string) {
+                log.err("zag.keymap{{}}: field 'action' must be a string", .{});
+                return error.LuaError;
+            }
+            const action_name = lua.toString(-1) catch {
+                log.err("zag.keymap{{}}: field 'action' must be a string", .{});
+                return error.LuaError;
+            };
+            const action = Keymap.parseActionName(action_name) orelse {
+                log.err("zag.keymap{{}}: unknown action '{s}'", .{action_name});
+                return error.LuaError;
+            };
+            lua.pop(1);
+            try engine.keymap_registry.register(mode, spec, buffer_id, action);
+            return 0;
+        }
+
+        // fn form: stash the Lua function in the registry and store the
+        // ref in an `Action.lua_callback` payload. Teardown in `deinit`
+        // unrefs every `.lua_callback` binding so the registry entry is
+        // eligible for collection.
+        _ = lua.getField(1, "fn");
+        if (!lua.isFunction(-1)) {
+            log.err("zag.keymap{{}}: field 'fn' must be a function", .{});
+            return error.LuaError;
+        }
+        const cb_ref = try lua.ref(zlua.registry_index);
+        errdefer lua.unref(zlua.registry_index, cb_ref);
+        try engine.keymap_registry.register(mode, spec, buffer_id, .{ .lua_callback = cb_ref });
+        return 0;
+    }
+
+    fn parseModeName(name: []const u8) ?Keymap.Mode {
+        if (std.mem.eql(u8, name, "normal")) return .normal;
+        if (std.mem.eql(u8, name, "insert")) return .insert;
+        return null;
+    }
+
+    fn keymapEnginePointer(lua: *Lua) !*LuaEngine {
         _ = lua.getField(zlua.registry_index, "_zag_engine");
         const ptr = lua.toPointer(-1) catch {
             log.err("zag.keymap(): engine pointer not set (call storeSelfPointer first)", .{});
             return error.LuaError;
         };
         lua.pop(1);
-        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
-
-        // Positional-arg binding is always global (buffer_id = null).
-        // Buffer-scoped bindings and lua-callback actions arrive via the
-        // table form added in Task 5.
-        try engine.keymap_registry.register(mode, spec, null, action);
-        return 0;
+        return @ptrCast(@alignCast(@constCast(ptr)));
     }
 
     /// Zig function backing `zag.set_escape_timeout_ms(ms)`.
@@ -4538,6 +4668,127 @@ test "zag.keymap registers into the engine-owned registry" {
             .modifiers = .{ .ctrl = true },
         }, null).? == .close_window,
     );
+}
+
+test "zag.keymap table form with action = string wires a named action" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.keymap { mode = "normal", key = "w", action = "focus_right" }
+    );
+
+    const registry = engine.keymapRegistry();
+    try std.testing.expect(
+        registry.lookup(.normal, .{ .key = .{ .char = 'w' }, .modifiers = .{} }, null).? == .focus_right,
+    );
+}
+
+test "zag.keymap table form with fn registers a lua_callback binding" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.fired = false
+        \\zag.keymap {
+        \\  mode = "normal",
+        \\  key = "<CR>",
+        \\  fn = function() _G.fired = true end,
+        \\}
+    );
+
+    const hit = engine.keymapRegistry().lookup(
+        .normal,
+        .{ .key = .enter, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedBinding;
+    try std.testing.expect(hit == .lua_callback);
+
+    engine.invokeCallback(hit.lua_callback);
+    _ = try engine.lua.getGlobal("fired");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.keymap table form with buffer scope only fires for that buffer" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Encode a fabricated buffer handle as "b<u32>" so the test doesn't
+    // need a live BufferRegistry. Any parseable id will do.
+    const handle: BufferRegistry.Handle = .{ .index = 7, .generation = 3 };
+    const packed_u32: u32 = @bitCast(handle);
+    const id_str = try std.fmt.allocPrint(alloc, "b{d}", .{packed_u32});
+    defer alloc.free(id_str);
+
+    const script = try std.fmt.allocPrintSentinel(alloc,
+        \\zag.keymap {{
+        \\  mode = "normal",
+        \\  key = "x",
+        \\  buffer = "{s}",
+        \\  action = "close_window",
+        \\}}
+    , .{id_str}, 0);
+    defer alloc.free(script);
+    try engine.lua.doString(script);
+
+    const registry = engine.keymapRegistry();
+    // Matches when the scoped buffer is focused.
+    try std.testing.expect(
+        registry.lookup(
+            .normal,
+            .{ .key = .{ .char = 'x' }, .modifiers = .{} },
+            packed_u32,
+        ).? == .close_window,
+    );
+    // Another focused buffer does not see the scoped binding, and there
+    // is no global `x` in the defaults.
+    try std.testing.expect(
+        registry.lookup(
+            .normal,
+            .{ .key = .{ .char = 'x' }, .modifiers = .{} },
+            packed_u32 +% 1,
+        ) == null,
+    );
+}
+
+test "zag.keymap table form rejects both fn and action" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.keymap {
+        \\  mode = "normal",
+        \\  key = "w",
+        \\  action = "focus_right",
+        \\  fn = function() end,
+        \\}
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.keymap table form rejects neither fn nor action" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.keymap { mode = "normal", key = "w" }
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
 }
 
 test "LuaEngine init populates keymap defaults" {
