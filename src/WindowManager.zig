@@ -979,6 +979,14 @@ pub fn getFocusedPanePtr(self: *WindowManager) *Pane {
     for (self.extra_panes.items) |*entry| {
         if (entry.pane.buffer.ptr == leaf.buffer.ptr) return &entry.pane;
     }
+    // A focused leaf that matches neither root nor any extra_panes entry
+    // means the pane registry and the layout tree drifted out of sync. The
+    // fallback keeps the UI alive but silently misroutes actions (e.g.
+    // swapProvider) to the root agent, so surface it loudly.
+    log.warn(
+        "focused leaf buffer id={d} name=\"{s}\" not in extra_panes; falling back to root_pane",
+        .{ leaf.buffer.getId(), leaf.buffer.getName() },
+    );
     return &self.root_pane;
 }
 

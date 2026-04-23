@@ -396,3 +396,18 @@ test "Action.lua_callback carries a Lua registry ref" {
     try std.testing.expect(a == .lua_callback);
     try std.testing.expectEqual(@as(i32, 7), a.lua_callback);
 }
+
+test "registry lookup skips Pass 1 entirely when focused_buffer_id is null" {
+    // Invariant: with no global binding registered, a keystroke whose only
+    // matches are buffer-local (to *any* buffer) must not fire when no
+    // buffer is focused. Pass 1 is keyed on `focused_buffer_id` and must
+    // be skipped, not short-circuited to the first buffer-local match.
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+    const spec: KeySpec = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
+    try r.register(.normal, spec, 42, .focus_down);
+    try r.register(.normal, spec, 43, .focus_up);
+
+    const ev: input.KeyEvent = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
+    try std.testing.expectEqual(@as(?Action, null), r.lookup(.normal, ev, null));
+}
