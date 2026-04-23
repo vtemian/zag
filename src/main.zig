@@ -1356,6 +1356,7 @@ test {
     _ = @import("oauth.zig");
     _ = @import("providers/chatgpt.zig");
     _ = @import("NodeRegistry.zig");
+    _ = @import("buffers/scratch.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
