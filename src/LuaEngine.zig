@@ -4402,14 +4402,12 @@ pub const LuaEngine = struct {
     /// nil. Render errors are logged and swallowed (null return) so a
     /// single buggy layer cannot crash the assembled prompt.
     ///
-    /// Currently expected to run on the main thread: Lua is not safe to
-    /// call from the agent worker thread. `agent.runLoopStreaming`
-    /// today only registers built-in (Zig) layers in its per-turn
-    /// fallback registry, so in practice this thunk fires only from
-    /// main-thread tests and future main-thread render paths. When
-    /// Task 3.3+ wires a production Lua layer, the agent-thread render
-    /// will round-trip through an event type analogous to
-    /// `lua_tool_request`.
+    /// Runs on the main thread. Lua is not safe to call from the agent
+    /// worker thread, so `agent.runLoopStreaming` marshals assembly
+    /// through a `prompt_assembly_request` event serviced by
+    /// `AgentRunner.dispatchHookRequests` (mirroring `lua_tool_request`).
+    /// Callers that already hold the main thread (tests, headless
+    /// preview, first-run wizard) invoke `renderPromptLayers` directly.
     fn renderLuaLayer(ctx: *const prompt.LayerContext, alloc: Allocator) anyerror!?[]const u8 {
         const engine = active_render_engine orelse {
             log.warn("prompt layer render: no active engine bound", .{});

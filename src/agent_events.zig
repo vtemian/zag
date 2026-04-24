@@ -10,6 +10,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Hooks = @import("Hooks.zig");
+const prompt = @import("prompt.zig");
 
 const log = std.log.scoped(.agent_events);
 
@@ -57,6 +58,13 @@ pub const AgentEvent = union(enum) {
     /// The request is caller-owned; only the main thread touches the
     /// window tree so every mutation funnels through this variant.
     layout_request: *LayoutRequest,
+    /// Round-trip: the agent thread asks main to render the Lua prompt
+    /// layer registry into an `AssembledPrompt`. Lua state is pinned to
+    /// the main thread, so layer render functions (including the
+    /// built-in Zig ones, for simplicity) execute on main. The agent
+    /// blocks on `request.done` after pushing. The request is
+    /// caller-owned; the queue holds a borrowed pointer.
+    prompt_assembly_request: *PromptAssemblyRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -105,7 +113,7 @@ pub const AgentEvent = union(enum) {
             // the request struct and its payload. Dropping the event from
             // the queue without delivery leaves the waiter blocked, which
             // is a design problem above this layer, not a leak here.
-            .thinking_stop, .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request => {},
+            .thinking_stop, .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request, .prompt_assembly_request => {},
         }
     }
 };
@@ -325,6 +333,40 @@ pub const LayoutRequest = struct {
     /// empty; the main thread fills them before `done.set()`.
     pub fn init(op: LayoutOp) LayoutRequest {
         return .{ .op = op };
+    }
+};
+
+/// Round-trip request pushed by the agent thread so the main thread
+/// can render the Lua prompt layer registry. Only the main thread may
+/// drive Lua, so any turn with a `*LuaEngine` marshals assembly here
+/// rather than touching `renderPromptLayers` from the worker.
+///
+/// Lifecycle: the agent builds `ctx` on its stack, initializes this
+/// struct with the worker's allocator, pushes the event, then parks
+/// on `done.wait()`. The main thread populates either `result` (on
+/// success) or `error_name` (on failure), signals `done`, and returns.
+/// The waiter owns the returned `AssembledPrompt` and must call
+/// `deinit` on it even though the arena was allocated on the main
+/// thread: both threads use the same process-wide GPA.
+pub const PromptAssemblyRequest = struct {
+    /// Layer context for this turn. Main thread reads fields; it must
+    /// not retain pointers past `done.set()` because the slices live
+    /// on the agent thread's stack.
+    ctx: *const prompt.LayerContext,
+    /// Allocator used for the `AssembledPrompt`'s arena and for any
+    /// interior scratch. Caller promises thread-safety.
+    allocator: Allocator,
+    /// Signalled by the main thread when either `result` or
+    /// `error_name` has been filled in.
+    done: std.Thread.ResetEvent = .{},
+    /// Populated on success. Null when `error_name` is set.
+    result: ?prompt.AssembledPrompt = null,
+    /// Populated on failure with `@errorName` of whatever went wrong
+    /// during render. Null when `result` is set.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(ctx: *const prompt.LayerContext, allocator: Allocator) PromptAssemblyRequest {
+        return .{ .ctx = ctx, .allocator = allocator };
     }
 };
 
@@ -566,6 +608,32 @@ test "layout_request can be pushed and peeked" {
     var req = LayoutRequest.init(.{ .describe = {} });
     try queue.push(.{ .layout_request = &req });
     try std.testing.expectEqual(@as(usize, 1), queue.len);
+}
+
+test "push and drain prompt_assembly_request event" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    defer queue.deinit();
+
+    const ctx: prompt.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    var req = PromptAssemblyRequest.init(&ctx, std.testing.allocator);
+
+    try queue.push(.{ .prompt_assembly_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings(
+        "test",
+        buf[0].prompt_assembly_request.ctx.model.provider_name,
+    );
 }
 
 test "push and drain lua_tool_request event" {
