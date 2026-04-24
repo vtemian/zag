@@ -1401,6 +1401,7 @@ test {
     _ = @import("Viewport.zig");
     _ = @import("ulid.zig");
     _ = @import("frontmatter.zig");
+    _ = @import("skills.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
