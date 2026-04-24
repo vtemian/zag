@@ -24,6 +24,10 @@ pub const ContentBlock = union(enum) {
     tool_use: ToolUse,
     /// The result of executing a tool, sent back to the assistant.
     tool_result: ToolResultBlock,
+    /// A model reasoning block with optional cryptographic signature.
+    thinking: Thinking,
+    /// An opaque redacted reasoning block returned as ciphertext by the provider.
+    redacted_thinking: RedactedThinking,
 
     /// Plain text content from the user or assistant.
     pub const Text = struct {
@@ -41,6 +45,33 @@ pub const ContentBlock = union(enum) {
         input_raw: []const u8,
     };
 
+    /// Visible chain-of-thought reasoning produced by a model.
+    ///
+    /// Anthropic extended thinking ships a signature that must be echoed
+    /// back on subsequent turns; OpenAI reasoning flavours do not.
+    pub const Thinking = struct {
+        /// The reasoning text as surfaced by the provider.
+        text: []const u8,
+        /// Provider-issued signature required to replay this block on later turns.
+        signature: ?[]const u8,
+        /// Which wire protocol produced this block; dictates how it is re-serialized.
+        provider: ThinkingProvider,
+    };
+
+    /// An opaque encrypted reasoning block the provider asks us to preserve verbatim.
+    pub const RedactedThinking = struct {
+        /// Provider-issued ciphertext; opaque to us, echoed back untouched.
+        data: []const u8,
+    };
+
+    /// Which provider wire protocol produced a thinking block.
+    pub const ThinkingProvider = enum {
+        anthropic,
+        openai_responses,
+        openai_chat,
+        none,
+    };
+
     /// Free all owned strings inside this content block.
     pub fn freeOwned(self: ContentBlock, allocator: Allocator) void {
         switch (self) {
@@ -54,6 +85,11 @@ pub const ContentBlock = union(enum) {
                 allocator.free(tr.tool_use_id);
                 allocator.free(tr.content);
             },
+            .thinking => |t| {
+                allocator.free(t.text);
+                if (t.signature) |s| allocator.free(s);
+            },
+            .redacted_thinking => |r| allocator.free(r.data),
         }
     }
 
@@ -245,6 +281,22 @@ test "ContentBlock variants are distinguishable" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "Thinking and RedactedThinking variants compile and freeOwned handles them" {
+    const alloc = std.testing.allocator;
+    const thinking_text = try alloc.dupe(u8, "reasoning...");
+    const sig = try alloc.dupe(u8, "sig-bytes");
+    var block = ContentBlock{ .thinking = .{
+        .text = thinking_text,
+        .signature = sig,
+        .provider = .anthropic,
+    } };
+    block.freeOwned(alloc);
+
+    const data = try alloc.dupe(u8, "redacted-ciphertext");
+    var redacted = ContentBlock{ .redacted_thinking = .{ .data = data } };
+    redacted.freeOwned(alloc);
 }
 
 test "ToolResult defaults is_error to false" {
