@@ -53,9 +53,15 @@ pub const ContentBlock = union(enum) {
         /// The reasoning text as surfaced by the provider.
         text: []const u8,
         /// Provider-issued signature required to replay this block on later turns.
+        /// On OpenAI Responses API this stores the `encrypted_content` blob that
+        /// must be echoed back verbatim inside the `reasoning` input item.
         signature: ?[]const u8,
         /// Which wire protocol produced this block; dictates how it is re-serialized.
         provider: ThinkingProvider,
+        /// Provider-assigned id. Null for Anthropic (thinking blocks are not
+        /// addressable); populated for OpenAI Responses reasoning items so the
+        /// follow-up request can reference the same item by id.
+        id: ?[]const u8 = null,
     };
 
     /// An opaque encrypted reasoning block the provider asks us to preserve verbatim.
@@ -88,6 +94,7 @@ pub const ContentBlock = union(enum) {
             .thinking => |t| {
                 allocator.free(t.text);
                 if (t.signature) |s| allocator.free(s);
+                if (t.id) |id| allocator.free(id);
             },
             .redacted_thinking => |r| allocator.free(r.data),
         }
@@ -297,6 +304,20 @@ test "Thinking and RedactedThinking variants compile and freeOwned handles them"
     const data = try alloc.dupe(u8, "redacted-ciphertext");
     var redacted = ContentBlock{ .redacted_thinking = .{ .data = data } };
     redacted.freeOwned(alloc);
+}
+
+test "Thinking with id is freed by freeOwned" {
+    const alloc = std.testing.allocator;
+    const thinking_text = try alloc.dupe(u8, "reasoning...");
+    const enc = try alloc.dupe(u8, "encrypted-blob");
+    const id = try alloc.dupe(u8, "rs_abc123");
+    var block = ContentBlock{ .thinking = .{
+        .text = thinking_text,
+        .signature = enc,
+        .provider = .openai_responses,
+        .id = id,
+    } };
+    block.freeOwned(alloc);
 }
 
 test "ToolResult defaults is_error to false" {

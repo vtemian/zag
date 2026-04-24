@@ -451,10 +451,11 @@ pub const ResponseBuilder = struct {
         try self.blocks.append(allocator, .{ .text = .{ .text = duped } });
     }
 
-    /// Add a thinking content block. Dupes text and (if present) signature.
+    /// Add a thinking content block. Dupes text, signature, and id if present.
     ///
     /// `provider` records which wire protocol produced the block so it can be
-    /// re-serialized on later turns (Anthropic requires echoing the signature).
+    /// re-serialized on later turns (Anthropic requires echoing the signature;
+    /// OpenAI Responses requires echoing the encrypted_content + id).
     pub fn addThinking(
         self: *ResponseBuilder,
         text: []const u8,
@@ -462,14 +463,31 @@ pub const ResponseBuilder = struct {
         provider: types.ContentBlock.ThinkingProvider,
         allocator: Allocator,
     ) !void {
+        try self.addThinkingWithId(text, signature, null, provider, allocator);
+    }
+
+    /// Variant of `addThinking` that also records a provider-assigned id. Used
+    /// by the OpenAI Responses wire (Codex) where each reasoning item carries
+    /// an `rs_...` identifier the follow-up request has to reference.
+    pub fn addThinkingWithId(
+        self: *ResponseBuilder,
+        text: []const u8,
+        signature: ?[]const u8,
+        id: ?[]const u8,
+        provider: types.ContentBlock.ThinkingProvider,
+        allocator: Allocator,
+    ) !void {
         const duped_text = try allocator.dupe(u8, text);
         errdefer allocator.free(duped_text);
         const duped_sig: ?[]const u8 = if (signature) |s| try allocator.dupe(u8, s) else null;
         errdefer if (duped_sig) |s| allocator.free(s);
+        const duped_id: ?[]const u8 = if (id) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (duped_id) |v| allocator.free(v);
         try self.blocks.append(allocator, .{ .thinking = .{
             .text = duped_text,
             .signature = duped_sig,
             .provider = provider,
+            .id = duped_id,
         } });
     }
 
