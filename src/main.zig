@@ -1400,6 +1400,7 @@ test {
     _ = @import("png_decode.zig");
     _ = @import("Viewport.zig");
     _ = @import("ulid.zig");
+    _ = @import("frontmatter.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
