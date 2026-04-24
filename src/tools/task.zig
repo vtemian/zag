@@ -301,6 +301,10 @@ fn handleChildEvent(
             req.is_error = true;
             req.done.set();
         },
+        .prompt_assembly_request => |req| {
+            req.error_name = "subagent_unsupported";
+            req.done.set();
+        },
     }
 }
 
