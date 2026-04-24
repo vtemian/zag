@@ -102,6 +102,57 @@ pub const Runner = struct {
         }
     }
 
+    pub fn executeExpectText(self: *Runner, raw: []const u8) !void {
+        const pattern = stripRegexDelims(raw);
+        const dump = try self.grid.plainText();
+        defer self.alloc.free(dump);
+        if (std.mem.indexOf(u8, dump, pattern) == null) return error.ExpectTextNotFound;
+    }
+
+    pub fn executeSnapshot(self: *Runner, label: []const u8, artifacts_dir: []const u8) !void {
+        const dump = try self.grid.plainText();
+        defer self.alloc.free(dump);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}.grid", .{ artifacts_dir, label });
+        defer self.alloc.free(path);
+        const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(dump);
+    }
+
+    pub fn executeWaitExit(self: *Runner, deadline_ms: u32) !void {
+        const deadline = std.time.milliTimestamp() + deadline_ms;
+        while (true) {
+            const remaining = @max(@as(i64, 0), deadline - std.time.milliTimestamp());
+            if (remaining == 0) return error.WaitExitTimeout;
+            const status = try self.pumpOnce(@intCast(@min(remaining, 250)));
+            if (status == .exited) return;
+        }
+    }
+
+    pub fn executeSetEnv(self: *Runner, raw: []const u8) !void {
+        const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.MissingEquals;
+        try self.env.put(raw[0..eq], raw[eq + 1 ..]);
+    }
+
+    pub fn executeSpawn(self: *Runner, program: []const u8) !void {
+        if (self.child != null) return error.AlreadySpawned;
+        const prog_z = try self.alloc.dupeZ(u8, program);
+        defer self.alloc.free(prog_z);
+        const argv = [_][*:0]const u8{prog_z.ptr};
+        var envp: std.ArrayList([*:0]const u8) = .empty;
+        defer {
+            for (envp.items) |e| self.alloc.free(std.mem.span(e));
+            envp.deinit(self.alloc);
+        }
+        var it = self.env.iterator();
+        while (it.next()) |kv| {
+            const joined = try std.fmt.allocPrintSentinel(self.alloc, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* }, 0);
+            errdefer self.alloc.free(joined);
+            try envp.append(self.alloc, joined.ptr);
+        }
+        self.child = try Spawn.spawn(&argv, envp.items, 80, 24);
+    }
+
     fn stripRegexDelims(raw: []const u8) []const u8 {
         if (raw.len >= 2 and raw[0] == '/' and raw[raw.len - 1] == '/') return raw[1 .. raw.len - 1];
         return raw;
@@ -141,4 +192,54 @@ test "executeSend writes to pty master" {
     try std.testing.expect(nready > 0);
     const n = try posix.read(r.child.?.pty.master, &buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "hello") != null);
+}
+
+test "executeExpectText fails when pattern absent and passes when present" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    r.grid.feed("hello world");
+    try r.executeExpectText("/hello/");
+    try std.testing.expectError(error.ExpectTextNotFound, r.executeExpectText("/xyz/"));
+}
+
+test "executeSnapshot writes grid dump to artifacts_dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    r.grid.feed("snapshot body");
+    try r.executeSnapshot("shot1", dir_path);
+
+    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "shot1.grid", 64 * 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "snapshot body") != null);
+}
+
+test "executeWaitExit returns when child exits" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    const argv = [_][*:0]const u8{"/usr/bin/true"};
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try r.executeWaitExit(2000);
+}
+
+test "executeSetEnv stores KEY=VALUE" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    try r.executeSetEnv("FOO=bar");
+    try std.testing.expectEqualStrings("bar", r.env.get("FOO").?);
+    try std.testing.expectError(error.MissingEquals, r.executeSetEnv("FOO"));
+}
+
+test "executeSpawn fails when child already exists" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    const argv = [_][*:0]const u8{ "/bin/cat", "-u" };
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try std.testing.expectError(error.AlreadySpawned, r.executeSpawn("/bin/cat"));
 }
