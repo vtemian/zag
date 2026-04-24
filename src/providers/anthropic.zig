@@ -262,19 +262,56 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
 }
 
 /// State for accumulating a single content block during streaming.
-const StreamingBlock = struct {
-    block_type: enum { text, tool_use },
-    /// Accumulated text for text blocks or tool input JSON for tool_use blocks.
-    content: std.ArrayList(u8),
-    /// Tool use ID (only for tool_use blocks).
-    tool_id: []const u8,
-    /// Tool name (only for tool_use blocks).
-    tool_name: []const u8,
+///
+/// Tagged union so each variant carries only what it actually needs.
+/// The SSE parser appends a variant at `content_block_start` and the
+/// per-delta handlers mutate the buffers in place.
+const StreamingBlock = union(enum) {
+    text: TextState,
+    tool_use: ToolUseState,
+    thinking: ThinkingState,
+    redacted_thinking: RedactedThinkingState,
+
+    const TextState = struct {
+        /// Accumulated `text_delta` bytes.
+        content: std.ArrayList(u8),
+    };
+
+    const ToolUseState = struct {
+        /// Accumulated `input_json_delta` partial JSON fragments.
+        content: std.ArrayList(u8),
+        /// Allocator-owned tool use id from `content_block_start`.
+        tool_id: []const u8,
+        /// Allocator-owned tool name from `content_block_start`.
+        tool_name: []const u8,
+    };
+
+    const ThinkingState = struct {
+        /// Accumulated `thinking_delta` bytes. Flushed into `ContentBlock.thinking.text`.
+        text: std.ArrayList(u8),
+        /// Last-seen `signature_delta` value. Anthropic replaces (not appends) signatures.
+        signature: ?std.ArrayList(u8),
+    };
+
+    const RedactedThinkingState = struct {
+        /// Opaque ciphertext copied verbatim from `content_block_start.data`.
+        data: std.ArrayList(u8),
+    };
 
     fn deinit(self: *StreamingBlock, alloc: Allocator) void {
-        self.content.deinit(alloc);
-        if (self.tool_id.len > 0) alloc.free(self.tool_id);
-        if (self.tool_name.len > 0) alloc.free(self.tool_name);
+        switch (self.*) {
+            .text => |*t| t.content.deinit(alloc),
+            .tool_use => |*tu| {
+                tu.content.deinit(alloc);
+                alloc.free(tu.tool_id);
+                alloc.free(tu.tool_name);
+            },
+            .thinking => |*th| {
+                th.text.deinit(alloc);
+                if (th.signature) |*s| s.deinit(alloc);
+            },
+            .redacted_thinking => |*r| r.data.deinit(alloc),
+        }
     }
 };
 
@@ -323,9 +360,14 @@ fn parseSseStream(
     errdefer builder.deinit(allocator);
 
     for (blocks.items) |*b| {
-        switch (b.block_type) {
-            .text => try builder.addText(b.content.items, allocator),
-            .tool_use => try builder.addToolUse(b.tool_id, b.tool_name, b.content.items, allocator),
+        switch (b.*) {
+            .text => |*t| try builder.addText(t.content.items, allocator),
+            .tool_use => |*tu| try builder.addToolUse(tu.tool_id, tu.tool_name, tu.content.items, allocator),
+            .thinking => |*th| {
+                const sig: ?[]const u8 = if (th.signature) |*s| s.items else null;
+                try builder.addThinking(th.text.items, sig, .anthropic, allocator);
+            },
+            .redacted_thinking => |*r| try builder.addRedactedThinking(r.data.items, allocator),
         }
     }
 
@@ -378,12 +420,7 @@ pub fn processSseEvent(
             const block_kind = cb_obj.get("type").?.string;
 
             if (std.mem.eql(u8, block_kind, "text")) {
-                try blocks.append(allocator, .{
-                    .block_type = .text,
-                    .content = .empty,
-                    .tool_id = "",
-                    .tool_name = "",
-                });
+                try blocks.append(allocator, .{ .text = .{ .content = .empty } });
             } else if (std.mem.eql(u8, block_kind, "tool_use")) {
                 const id = try allocator.dupe(u8, cb_obj.get("id").?.string);
                 errdefer allocator.free(id);
@@ -392,12 +429,25 @@ pub fn processSseEvent(
 
                 callback.on_event(callback.ctx, .{ .tool_start = name });
 
-                try blocks.append(allocator, .{
-                    .block_type = .tool_use,
+                try blocks.append(allocator, .{ .tool_use = .{
                     .content = .empty,
                     .tool_id = id,
                     .tool_name = name,
-                });
+                } });
+            } else if (std.mem.eql(u8, block_kind, "thinking")) {
+                try blocks.append(allocator, .{ .thinking = .{
+                    .text = .empty,
+                    .signature = null,
+                } });
+            } else if (std.mem.eql(u8, block_kind, "redacted_thinking")) {
+                // `redacted_thinking` ships its ciphertext inline on the start
+                // frame rather than via deltas; stash it immediately.
+                var cipher: std.ArrayList(u8) = .empty;
+                errdefer cipher.deinit(allocator);
+                if (cb_obj.get("data")) |d| {
+                    try cipher.appendSlice(allocator, d.string);
+                }
+                try blocks.append(allocator, .{ .redacted_thinking = .{ .data = cipher } });
             }
         }
     } else if (std.mem.eql(u8, event_type, "content_block_delta")) {
@@ -409,14 +459,45 @@ pub fn processSseEvent(
                 const text = delta_obj.get("text").?.string;
                 if (blocks.items.len > 0) {
                     const current = &blocks.items[blocks.items.len - 1];
-                    try current.content.appendSlice(allocator, text);
+                    if (current.* == .text) {
+                        try current.text.content.appendSlice(allocator, text);
+                    }
                 }
                 callback.on_event(callback.ctx, .{ .text_delta = text });
             } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
                 const partial = delta_obj.get("partial_json").?.string;
                 if (blocks.items.len > 0) {
                     const current = &blocks.items[blocks.items.len - 1];
-                    try current.content.appendSlice(allocator, partial);
+                    if (current.* == .tool_use) {
+                        try current.tool_use.content.appendSlice(allocator, partial);
+                    }
+                }
+            } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
+                // Buffer thinking text onto the current block. Task 1.4
+                // will route this through a dedicated `StreamEvent`; for
+                // now the parser keeps it internal so the agent loop sees
+                // no behavior change.
+                const text = delta_obj.get("thinking").?.string;
+                if (blocks.items.len > 0) {
+                    const current = &blocks.items[blocks.items.len - 1];
+                    if (current.* == .thinking) {
+                        try current.thinking.text.appendSlice(allocator, text);
+                    }
+                }
+            } else if (std.mem.eql(u8, delta_type, "signature_delta")) {
+                // Anthropic emits a single `signature_delta` per thinking
+                // block as a full replacement, not an append. Drop any
+                // prior buffer before copying in the new value.
+                const sig = delta_obj.get("signature").?.string;
+                if (blocks.items.len > 0) {
+                    const current = &blocks.items[blocks.items.len - 1];
+                    if (current.* == .thinking) {
+                        if (current.thinking.signature) |*existing| existing.deinit(allocator);
+                        var buf: std.ArrayList(u8) = .empty;
+                        errdefer buf.deinit(allocator);
+                        try buf.appendSlice(allocator, sig);
+                        current.thinking.signature = buf;
+                    }
                 }
             }
         }
@@ -692,12 +773,7 @@ test "processSseEvent handles text_delta" {
         blocks.deinit(allocator);
     }
 
-    try blocks.append(allocator, .{
-        .block_type = .text,
-        .content = .empty,
-        .tool_id = "",
-        .tool_name = "",
-    });
+    try blocks.append(allocator, .{ .text = .{ .content = .empty } });
 
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -721,7 +797,7 @@ test "processSseEvent handles text_delta" {
     const data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}";
     try processSseEvent("content_block_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
-    try std.testing.expectEqualStrings("Hello", blocks.items[0].content.items);
+    try std.testing.expectEqualStrings("Hello", blocks.items[0].text.content.items);
     try std.testing.expectEqual(@as(u32, 1), counter.text_delta_count);
 }
 
@@ -757,8 +833,9 @@ test "processSseEvent handles content_block_start for tool_use" {
     try processSseEvent("content_block_start", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
     try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
-    try std.testing.expectEqualStrings("toolu_123", blocks.items[0].tool_id);
-    try std.testing.expectEqualStrings("bash", blocks.items[0].tool_name);
+    try std.testing.expect(blocks.items[0] == .tool_use);
+    try std.testing.expectEqualStrings("toolu_123", blocks.items[0].tool_use.tool_id);
+    try std.testing.expectEqualStrings("bash", blocks.items[0].tool_use.tool_name);
     try std.testing.expectEqual(@as(u32, 1), counter.tool_start_count);
 }
 
@@ -862,12 +939,11 @@ test "processSseEvent accumulates input_json_delta for tool use" {
 
     const id = try allocator.dupe(u8, "toolu_456");
     const name = try allocator.dupe(u8, "read");
-    try blocks.append(allocator, .{
-        .block_type = .tool_use,
+    try blocks.append(allocator, .{ .tool_use = .{
         .content = .empty,
         .tool_id = id,
         .tool_name = name,
-    });
+    } });
 
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -887,7 +963,145 @@ test "processSseEvent accumulates input_json_delta for tool use" {
     const data2 = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"th\\\":\\\"foo\\\"}\"}}";
     try processSseEvent("content_block_delta", data2, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
 
-    try std.testing.expectEqualStrings("{\"path\":\"foo\"}", blocks.items[0].content.items);
+    try std.testing.expectEqualStrings("{\"path\":\"foo\"}", blocks.items[0].tool_use.content.items);
+}
+
+/// Drive `processSseEvent` with a sequence of frames using a no-op callback.
+/// Tests for thinking / redacted_thinking don't need to observe callbacks yet
+/// (Task 1.4 adds the callback bridge), so this helper cuts the per-test noise.
+fn feedSseFrames(
+    allocator: Allocator,
+    blocks: *std.ArrayList(StreamingBlock),
+    frames: []const struct { event_type: []const u8, data: []const u8 },
+) !void {
+    const Sink = struct {
+        fn onEvent(_: *anyopaque, _: llm.StreamEvent) void {}
+    };
+    var sink: u8 = 0;
+    const callback: llm.StreamCallback = .{ .ctx = &sink, .on_event = &Sink.onEvent };
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
+
+    for (frames) |f| {
+        try processSseEvent(
+            f.event_type,
+            f.data,
+            allocator,
+            blocks,
+            &stop_reason,
+            &input_tokens,
+            &output_tokens,
+            &cache_creation_tokens,
+            &cache_read_tokens,
+            callback,
+        );
+    }
+}
+
+test "processSseEvent handles thinking content_block_start" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    try feedSseFrames(allocator, &blocks, &.{
+        .{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}",
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expect(blocks.items[0] == .thinking);
+    try std.testing.expectEqual(@as(usize, 0), blocks.items[0].thinking.text.items.len);
+    try std.testing.expect(blocks.items[0].thinking.signature == null);
+}
+
+test "processSseEvent accumulates thinking_delta text" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    try feedSseFrames(allocator, &blocks, &.{
+        .{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}",
+        },
+        .{
+            .event_type = "content_block_delta",
+            .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me \"}}",
+        },
+        .{
+            .event_type = "content_block_delta",
+            .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"consider.\"}}",
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expect(blocks.items[0] == .thinking);
+    try std.testing.expectEqualStrings("Let me consider.", blocks.items[0].thinking.text.items);
+    try std.testing.expect(blocks.items[0].thinking.signature == null);
+}
+
+test "processSseEvent records signature_delta as signature replacement" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    try feedSseFrames(allocator, &blocks, &.{
+        .{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}",
+        },
+        .{
+            .event_type = "content_block_delta",
+            .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-first\"}}",
+        },
+        .{
+            .event_type = "content_block_delta",
+            .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-final\"}}",
+        },
+    });
+
+    try std.testing.expect(blocks.items[0] == .thinking);
+    const sig = blocks.items[0].thinking.signature orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sig-final", sig.items);
+}
+
+test "processSseEvent captures redacted_thinking ciphertext inline" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    try feedSseFrames(allocator, &blocks, &.{
+        .{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-ciphertext\"}}",
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expect(blocks.items[0] == .redacted_thinking);
+    try std.testing.expectEqualStrings("opaque-ciphertext", blocks.items[0].redacted_thinking.data.items);
 }
 
 test "anthropic body places system as top-level field" {
