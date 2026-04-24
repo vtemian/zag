@@ -34,6 +34,56 @@ const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
 const bash_tool = @import("tools/bash.zig");
 const layout_tool = @import("tools/layout.zig");
+const task_tool = @import("tools/task.zig");
+
+const subagents_mod = @import("subagents.zig");
+const llm = @import("llm.zig");
+const Session = @import("Session.zig");
+const LuaEngine_mod = @import("LuaEngine.zig");
+
+/// Per-thread context consumed by the `task` tool. Set by AgentRunner
+/// before spawning the agent thread and republished by parallel tool
+/// workers so the task tool can reach the parent runner's provider,
+/// subagent registry, session handle, and depth counter without adding
+/// a context argument to every tool's execute signature.
+///
+/// Null when task delegation is not wired (e.g. unit tests with no
+/// subagents registered, or headless test harnesses). The task tool
+/// surfaces this as a tool-result error rather than crashing.
+pub const TaskContext = struct {
+    /// Heap allocator used by the child agent thread and its queue.
+    allocator: std.mem.Allocator,
+    /// Subagent registry consulted for name lookup.
+    subagents: *const subagents_mod.SubagentRegistry,
+    /// LLM provider to share with the child. v1 ignores the subagent's
+    /// own `model` field and always reuses this provider.
+    provider: llm.Provider,
+    /// Provider name for child `formatAgentErrorMessage` calls.
+    provider_name: []const u8,
+    /// Parent's tool registry. The task tool builds a `Subset` view
+    /// against the subagent's allowlist and passes that down.
+    registry: *const Registry,
+    /// Session handle where `task_start` / `task_end` audit entries
+    /// are persisted, and which the child's ConversationHistory
+    /// attaches to so its events interleave with the parent's.
+    session_handle: ?*Session.SessionHandle,
+    /// Optional Lua engine. Shared with the child so hooks and
+    /// Lua-defined tools still fire inside delegated work.
+    lua_engine: ?*LuaEngine_mod.LuaEngine,
+    /// Parent runner's current task depth. The task tool reads this
+    /// for the recursion cap and passes `depth + 1` to the child.
+    task_depth: u8,
+    /// Wake fd for the main loop. Copied into the child queue so its
+    /// agent thread can wake the main poll() when it produces events
+    /// that need to round-trip through Lua.
+    wake_fd: ?std.posix.fd_t,
+};
+
+/// Threadlocal slot holding the active `TaskContext` for the current
+/// thread. AgentRunner sets this before its thread main runs; parallel
+/// tool workers copy from their spawning thread via ToolCallContext.
+/// Null in tests that do not wire task delegation.
+pub threadlocal var task_context: ?*const TaskContext = null;
 
 /// A name-indexed collection of tools that supports registration, lookup, and execution.
 pub const Registry = struct {
@@ -187,6 +237,19 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     try registry.register(layout_tool.resize_tool);
     try registry.register(layout_tool.pane_read_tool);
     return registry;
+}
+
+/// Register the built-in `task` tool on `registry` when the
+/// subagent registry has at least one entry. Called from main.zig
+/// after config.lua has run so the advertised tool list reflects
+/// the user's declared delegates. A no-op on empty registries so
+/// the model doesn't see a `task` tool it can never usefully call.
+pub fn registerTaskTool(
+    registry: *Registry,
+    subagents: *const subagents_mod.SubagentRegistry,
+) !void {
+    if (subagents.entries.items.len == 0) return;
+    try registry.register(task_tool.tool);
 }
 
 /// Static function pointer shared by all Lua-defined tools. Runs on the

@@ -581,6 +581,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
         .provider = deps.provider.*,
         .provider_name = spec.provider_name,
         .registry = deps.registry,
+        .subagents = if (deps.lua_engine) |eng| eng.subagentRegistry() else null,
     });
 
     // Synthetic ids for tool_start events without a provider-assigned call_id
@@ -844,6 +845,9 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
         root_runner.lua_engine = eng;
         eng.registerTools(&registry) catch |err| {
             log.warn("failed to register lua tools: {}", .{err});
+        };
+        tools.registerTaskTool(&registry, eng.subagentRegistry()) catch |err| {
+            log.warn("failed to register task tool: {}", .{err});
         };
     }
 
@@ -1384,6 +1388,12 @@ pub fn main() !void {
     if (lua_engine) |*eng| {
         eng.registerTools(&registry) catch |err| {
             log.warn("failed to register lua tools: {}", .{err});
+        };
+        // Advertise the built-in `task` tool only when the user
+        // declared at least one subagent. A no-op registry would
+        // emit a tool the model cannot usefully call.
+        tools.registerTaskTool(&registry, eng.subagentRegistry()) catch |err| {
+            log.warn("failed to register task tool: {}", .{err});
         };
     }
 

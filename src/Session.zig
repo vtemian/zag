@@ -32,6 +32,14 @@ pub const EntryType = enum {
     /// Opaque encrypted reasoning block. `encrypted_data` holds the
     /// ciphertext to replay verbatim on later turns.
     thinking_redacted,
+    /// Start of a delegated subagent invocation from the `task` tool.
+    /// `content` carries the JSON-encoded `{agent, prompt}` payload so
+    /// replay can reconstruct what was asked of the subagent.
+    task_start,
+    /// End of a delegated subagent invocation. `content` carries the
+    /// subagent's final assistant text as returned to the parent as the
+    /// `task` tool result.
+    task_end,
 
     pub fn toSlice(self: EntryType) []const u8 {
         return switch (self) {
@@ -45,6 +53,8 @@ pub const EntryType = enum {
             .session_rename => "session_rename",
             .thinking => "thinking",
             .thinking_redacted => "thinking_redacted",
+            .task_start => "task_start",
+            .task_end => "task_end",
         };
     }
 
@@ -60,6 +70,8 @@ pub const EntryType = enum {
             .{ "session_rename", EntryType.session_rename },
             .{ "thinking", EntryType.thinking },
             .{ "thinking_redacted", EntryType.thinking_redacted },
+            .{ "task_start", EntryType.task_start },
+            .{ "task_end", EntryType.task_end },
         };
         inline for (map) |pair| {
             if (std.mem.eql(u8, s, pair[0])) return pair[1];
@@ -1154,7 +1166,7 @@ test "EntryType toSlice and fromSlice round-trip" {
         .session_start,     .user_message,   .assistant_text,
         .tool_call,         .tool_result,    .info,
         .err,               .session_rename, .thinking,
-        .thinking_redacted,
+        .thinking_redacted, .task_start,     .task_end,
     };
     for (types_to_test) |t| {
         const s = t.toSlice();
@@ -1162,6 +1174,49 @@ test "EntryType toSlice and fromSlice round-trip" {
         try std.testing.expectEqual(t, recovered.?);
     }
     try std.testing.expect(EntryType.fromSlice("bogus") == null);
+}
+
+test "task_start round-trips through JSONL" {
+    const allocator = std.testing.allocator;
+
+    var original = Entry{
+        .entry_type = .task_start,
+        .content = "{\"agent\":\"reviewer\",\"prompt\":\"review the diff\"}",
+        .timestamp = 111,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.task_start, parsed.entry_type);
+    try std.testing.expectEqualStrings(
+        "{\"agent\":\"reviewer\",\"prompt\":\"review the diff\"}",
+        parsed.content,
+    );
+    try std.testing.expectEqual(@as(i64, 111), parsed.timestamp);
+}
+
+test "task_end round-trips through JSONL" {
+    const allocator = std.testing.allocator;
+
+    var original = Entry{
+        .entry_type = .task_end,
+        .content = "reviewer says: looks good",
+        .timestamp = 222,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.task_end, parsed.entry_type);
+    try std.testing.expectEqualStrings("reviewer says: looks good", parsed.content);
+    try std.testing.expectEqual(@as(i64, 222), parsed.timestamp);
 }
 
 test "create, append, and load round-trip" {

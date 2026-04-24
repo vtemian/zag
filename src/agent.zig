@@ -280,6 +280,13 @@ const ToolCallContext = struct {
     /// this into `tools.current_caller_pane_id` so layout tools see the
     /// same caller id the inline path does.
     caller_pane_id: ?u32,
+    /// Snapshot of the agent thread's `tools.task_context`. Worker
+    /// threads republish this into their own threadlocal so the built-in
+    /// `task` tool can reach the runner's subagent registry, provider,
+    /// and session handle even when the call runs in parallel. Null when
+    /// the parent runner never wired a TaskContext (no subagents, test
+    /// harness).
+    task_ctx: ?*const tools.TaskContext,
 };
 
 /// Outcome of firing a `ToolPre` hook round-trip. On `.proceed`, the
@@ -523,6 +530,12 @@ fn executeOneToolCall(ctx: *const ToolCallContext) void {
     tools.current_caller_pane_id = ctx.caller_pane_id;
     defer tools.current_caller_pane_id = null;
 
+    // Mirror the task-delegation context from the parent agent thread so
+    // `task` tool calls dispatched on this worker can find the runner's
+    // subagent registry. Threadlocals do not inherit across spawn.
+    tools.task_context = ctx.task_ctx;
+    defer tools.task_context = null;
+
     const step = runToolStep(
         ctx.tool_call,
         ctx.registry,
@@ -593,6 +606,9 @@ pub fn executeTools(
             .results = results,
             .lua_engine = lua_engine,
             .caller_pane_id = caller_pane_id,
+            // Inherit the parent agent thread's TaskContext so this
+            // worker can dispatch `task` tool calls with full context.
+            .task_ctx = tools.task_context,
         };
         handles[i] = std.Thread.spawn(.{}, executeOneToolCall, .{&contexts[i]}) catch |err| {
             log.err("failed to spawn tool thread: {s}", .{@errorName(err)});

@@ -259,8 +259,11 @@ pub fn loadFromEntriesFlat(self: *ConversationTree, entries: []const Session.Ent
             .info => .status,
             .err => .err,
             // session_start / session_rename are audit entries, not
-            // visible tree content.
-            .session_start, .session_rename => continue,
+            // visible tree content. task_start / task_end mark the
+            // boundaries of a delegated subagent invocation; the
+            // parent's tool_result already carries the subagent's
+            // output, so rendering task markers as nodes would duplicate.
+            .session_start, .session_rename, .task_start, .task_end => continue,
             // Thinking entries become dedicated nodes. The redacted
             // variant surfaces its ciphertext-length marker from
             // `encrypted_data` rather than `content`.

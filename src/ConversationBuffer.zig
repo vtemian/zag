@@ -325,6 +325,11 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .info => _ = try self.appendNode(null, .status, entry.content),
             .err => _ = try self.appendNode(null, .err, entry.content),
             .session_start, .session_rename => {},
+            // `task_start` / `task_end` are audit markers for subagent
+            // delegation. The subagent's own output is persisted inline
+            // as the parent's tool_result, so replaying them as separate
+            // nodes would duplicate content in the buffer view.
+            .task_start, .task_end => {},
             .thinking => {
                 const node = try self.appendNode(null, .thinking, entry.content);
                 // Replay has no streaming context; collapse so the

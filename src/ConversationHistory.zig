@@ -165,7 +165,7 @@ pub fn rebuildMessages(self: *ConversationHistory, entries: []const Session.Entr
                     .data = duped_data,
                 } });
             },
-            .info, .err, .session_start, .session_rename => {},
+            .info, .err, .session_start, .session_rename, .task_start, .task_end => {},
         }
     }
 

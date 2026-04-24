@@ -611,6 +611,7 @@ fn onUserInputSubmitted(
         .provider = self.provider.provider,
         .provider_name = spec.provider_name,
         .registry = self.registry,
+        .subagents = if (self.lua_engine) |eng| eng.subagentRegistry() else null,
     });
 }
 
