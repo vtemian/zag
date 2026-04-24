@@ -61,10 +61,15 @@ pub fn main() !u8 {
 fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var artifacts_override: ?[]const u8 = null;
     var scenario_path: ?[]const u8 = null;
+    var mock_script_path: ?[]const u8 = null;
 
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--artifacts=")) {
             artifacts_override = arg["--artifacts=".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--mock=")) {
+            mock_script_path = arg["--mock=".len..];
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -98,7 +103,10 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return exit_harness_error;
     };
 
-    const result = Scenario.runFile(alloc, path, .{ .artifacts_dir = artifacts_dir }) catch |e| {
+    const result = Scenario.runFile(alloc, path, .{
+        .artifacts_dir = artifacts_dir,
+        .mock_script_path = mock_script_path,
+    }) catch |e| {
         reportFmt("zag-sim run: {s}: {s}\n", .{ path, @errorName(e) });
         return exit_harness_error;
     };
@@ -130,7 +138,7 @@ fn printUsage(file: std.fs.File) void {
         \\zag-sim — terminal scenario driver
         \\
         \\usage:
-        \\  zag-sim run <scenario.zsm> [--artifacts=<dir>]
+        \\  zag-sim run <scenario.zsm> [--artifacts=<dir>] [--mock=<script.json>]
         \\  zag-sim --help | -h
         \\
         \\exit codes:

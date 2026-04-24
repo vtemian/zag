@@ -4,6 +4,9 @@ const Spawn = @import("Spawn.zig");
 const Grid = @import("Grid.zig");
 const Dsl = @import("Dsl.zig");
 const Args = @import("Args.zig");
+const MockServer = @import("MockServer.zig");
+const MockScript = @import("MockScript.zig");
+const ConfigScaffold = @import("ConfigScaffold.zig");
 
 pub const Outcome = enum(u8) {
     pass = 0,
@@ -12,11 +15,40 @@ pub const Outcome = enum(u8) {
     harness_error = 3,
 };
 
+/// Bundle of side-effects that back the `--mock` flag: a running HTTP server,
+/// the loaded script it replays, and a throwaway config root that zag reads.
+/// Heap-owned so `Runner.deinit` can tear everything down in the right order
+/// (server first: shutdown → deinit, then script, then filesystem scratch).
+/// Zag has no `ZAG_CONFIG_DIR` / `XDG_CONFIG_HOME` override — it always reads
+/// `$HOME/.config/zag/config.lua` (see `src/LuaEngine.zig:270-274`). We steer
+/// it by pointing `HOME` at our tempdir and scaffolding the config inside.
+pub const MockHarness = struct {
+    server: *MockServer,
+    script: *MockScript,
+    /// Temp root used as the spawned zag's `$HOME`. Absolute path, owned.
+    tmp_root: []u8,
+    /// `<tmp_root>/.config/zag` — where `config.lua` was scaffolded.
+    config_dir: []u8,
+
+    pub fn deinit(self: *MockHarness, alloc: std.mem.Allocator) void {
+        self.server.shutdown();
+        self.server.deinit();
+        self.script.destroy();
+        // Best-effort cleanup. Leaving it under $TMPDIR is OK if removal fails
+        // (the OS wipes $TMPDIR on reboot on macOS; Linux tmpfs is similar).
+        std.fs.cwd().deleteTree(self.tmp_root) catch {};
+        alloc.free(self.config_dir);
+        alloc.free(self.tmp_root);
+    }
+};
+
 pub const Runner = struct {
     alloc: std.mem.Allocator,
     child: ?Spawn.Spawned = null,
     grid: *Grid,
     env: std.process.EnvMap,
+    /// Optional mock-provider harness. Set by `attachMock`, freed by `deinit`.
+    mock: ?*MockHarness = null,
 
     pub fn init(alloc: std.mem.Allocator) !Runner {
         return .{
@@ -34,6 +66,52 @@ pub const Runner = struct {
         }
         self.grid.destroy();
         self.env.deinit();
+        if (self.mock) |h| {
+            h.deinit(self.alloc);
+            self.alloc.destroy(h);
+            self.mock = null;
+        }
+    }
+
+    /// Load the mock script at `script_path`, spin up an in-process HTTP mock
+    /// on an ephemeral port, scaffold a `config.lua` that points at it, and
+    /// stage `HOME` on `self.env` so the next `executeSpawn` inherits it.
+    /// Must be called before `executeSpawn`.
+    pub fn attachMock(self: *Runner, script_path: []const u8) !void {
+        if (self.mock != null) return error.MockAlreadyAttached;
+
+        const script = try MockScript.loadFromFile(self.alloc, script_path);
+        errdefer script.destroy();
+
+        const server = try MockServer.startWithScript(self.alloc, script);
+        errdefer {
+            server.shutdown();
+            server.deinit();
+        }
+
+        const tmp_root = try mintTempDir(self.alloc);
+        errdefer {
+            std.fs.cwd().deleteTree(tmp_root) catch {};
+            self.alloc.free(tmp_root);
+        }
+
+        const config_dir = try std.fs.path.join(self.alloc, &.{ tmp_root, ".config", "zag" });
+        errdefer self.alloc.free(config_dir);
+        try std.fs.cwd().makePath(config_dir);
+
+        try ConfigScaffold.writeMockConfig(self.alloc, config_dir, server.getPort());
+
+        // HOME is the only knob we need: zag derives config + log dirs from it.
+        try self.env.put("HOME", tmp_root);
+
+        const harness = try self.alloc.create(MockHarness);
+        harness.* = .{
+            .server = server,
+            .script = script,
+            .tmp_root = tmp_root,
+            .config_dir = config_dir,
+        };
+        self.mock = harness;
     }
 
     pub fn executeSend(self: *Runner, raw: []const u8) !void {
@@ -159,6 +237,18 @@ pub const Runner = struct {
     }
 };
 
+/// Mint a fresh `<TMPDIR>/zag-sim-<pid>-<ts>` directory. Caller owns the
+/// returned path and is responsible for `deleteTree`-ing it.
+fn mintTempDir(alloc: std.mem.Allocator) ![]u8 {
+    const tmp_root = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const pid: i32 = @intCast(std.c.getpid());
+    const ts = std.time.milliTimestamp();
+    const path = try std.fmt.allocPrint(alloc, "{s}/zag-sim-{d}-{d}", .{ tmp_root, pid, ts });
+    errdefer alloc.free(path);
+    try std.fs.cwd().makePath(path);
+    return path;
+}
+
 test "executeWaitText finds echoed literal within timeout" {
     var r = try Runner.init(std.testing.allocator);
     defer r.deinit();
@@ -242,4 +332,42 @@ test "executeSpawn fails when child already exists" {
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
     try std.testing.expectError(error.AlreadySpawned, r.executeSpawn("/bin/cat"));
+}
+
+test "attachMock points HOME at a scaffolded config dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "script.json",
+        .data =
+        \\{"turns":[{"chunks":[{"delta":{"content":"hi"}},{"finish_reason":"stop"}]}]}
+        ,
+    });
+
+    const tmp_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_abs);
+    const script_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_abs, "script.json" });
+    defer std.testing.allocator.free(script_path);
+
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    try r.attachMock(script_path);
+
+    // HOME should now point at a tempdir that contains .config/zag/config.lua.
+    const home = r.env.get("HOME") orelse return error.HomeNotSet;
+    try std.testing.expect(std.mem.indexOf(u8, home, "zag-sim-") != null);
+
+    const harness = r.mock orelse return error.MockNotAttached;
+    try std.testing.expectEqualStrings(home, harness.tmp_root);
+
+    const cfg_path = try std.fs.path.join(std.testing.allocator, &.{ harness.config_dir, "config.lua" });
+    defer std.testing.allocator.free(cfg_path);
+    const bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, cfg_path, 64 * 1024);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "127.0.0.1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "mock/mock-model") != null);
+
+    // Double-attach is rejected.
+    try std.testing.expectError(error.MockAlreadyAttached, r.attachMock(script_path));
 }
