@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.conversation_session);
 const types = @import("types.zig");
 const Session = @import("Session.zig");
+const ulid = @import("ulid.zig");
 
 const ConversationHistory = @This();
 
@@ -22,6 +23,11 @@ session_handle: ?*Session.SessionHandle = null,
 /// compositor consults this to surface a status-bar warning; once
 /// tripped it stays true for the remainder of the session.
 persist_failed: bool = false,
+/// Id of the most recently persisted event in this session. Each new
+/// event uses this as its `parent_id` unless the caller already set
+/// one explicitly, so events form a linked chain rooted at the first
+/// user message.
+last_persisted_id: ?ulid.Ulid = null,
 
 pub fn init(allocator: Allocator) ConversationHistory {
     return .{ .allocator = allocator };
@@ -52,9 +58,18 @@ pub fn appendUserMessage(self: *ConversationHistory, text: []const u8) !void {
 /// Persist an event to the session JSONL file, if a session is attached.
 /// Propagates errors so callers can decide whether to log and flip the
 /// `persist_failed` flag or abort the operation.
+///
+/// Auto-threads `parent_id` from `last_persisted_id` when the caller
+/// hasn't set one explicitly, and records the persisted id so the next
+/// event in the turn can chain off of it.
 pub fn persistEvent(self: *ConversationHistory, entry: Session.Entry) !void {
     const sh = self.session_handle orelse return;
-    try sh.appendEntry(entry);
+    var entry_with_parent = entry;
+    if (entry_with_parent.parent_id == null) {
+        entry_with_parent.parent_id = self.last_persisted_id;
+    }
+    const persisted_id = try sh.appendEntry(entry_with_parent);
+    self.last_persisted_id = persisted_id;
 }
 
 /// Persist a user_message entry with the current timestamp. Convenience
@@ -245,6 +260,69 @@ test "persistEvent is a no-op when no session is attached" {
         .timestamp = 0,
     });
     try std.testing.expect(s.persist_failed == false);
+}
+
+fn restoreCwd(abs_path: []const u8) void {
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
+    defer dir.close();
+    dir.setAsCwd() catch {};
+}
+
+test "persistEvent chains parent_ids across a turn" {
+    const allocator = std.testing.allocator;
+
+    // SessionManager and loadEntries use std.fs.cwd(); chdir into the
+    // tmpdir so .zag/sessions resolves underneath it, then restore on
+    // exit. Matches the pattern used by the clobber-regression test in
+    // Session.zig.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("anthropic/claude-sonnet-4-20250514");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    var history = ConversationHistory.init(allocator);
+    defer history.deinit();
+    history.attachSession(&handle);
+
+    // Persist three events; each should auto-thread parent_id from the
+    // prior event (or from the session_start row written by createSession).
+    try history.persistEvent(.{ .entry_type = .user_message, .content = "hi", .timestamp = 1 });
+    try history.persistEvent(.{ .entry_type = .assistant_text, .content = "hello", .timestamp = 2 });
+    try history.persistEvent(.{ .entry_type = .tool_call, .tool_name = "read", .tool_input = "{}", .timestamp = 3 });
+    handle.close();
+
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // createSession wrote session_start, then three more events above.
+    try std.testing.expectEqual(@as(usize, 4), loaded.len);
+
+    // Row 0 (session_start) has null parent: written by SessionManager
+    // before the history attached, so it's the session's root.
+    try std.testing.expect(loaded[0].parent_id == null);
+    // Row 1 (user_message) is the first event the history persisted.
+    // ConversationHistory.last_persisted_id is still null here because
+    // session_start went straight through SessionHandle.appendEntry, so
+    // the user_message legitimately has no parent from the history's
+    // point of view. It roots the conversation chain.
+    try std.testing.expect(loaded[1].parent_id == null);
+    // Row 2 (assistant_text) chains off user_message.
+    try std.testing.expect(loaded[2].parent_id != null);
+    try std.testing.expectEqualSlices(u8, &loaded[1].id, &loaded[2].parent_id.?);
+    // Row 3 (tool_call) chains off assistant_text.
+    try std.testing.expect(loaded[3].parent_id != null);
+    try std.testing.expectEqualSlices(u8, &loaded[2].id, &loaded[3].parent_id.?);
 }
 
 test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
