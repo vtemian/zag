@@ -86,6 +86,36 @@ On `swapProviderForPane` (WindowManager.zig lines 1124-1249), the existing cance
 - Each task = one commit. Do not batch tasks.
 - Before starting Task 1, run `zig build test` and record the baseline pass/fail count. Every task must preserve or improve on the baseline.
 
+**Thread-safety invariant.** `Sink.push` is called only from the main-thread drain loop (`AgentRunner.drainEvents`). The agent worker thread enqueues `AgentEvent`s into the runner's event_queue; it never calls `Sink.push` directly. All Sink implementations in this plan assume single-threaded access to their internal state. Document this at the top of `src/Sink.zig` and `src/sinks/BufferSink.zig`.
+
+**Preserved existing behaviour.** Session persistence and Sink event emission are independent code paths. If `session.persistEvent` fails (disk full, permission error), the runner flips `persist_failed`, the UI shows a status warning, and the in-memory node tree still reflects the event. This divergence exists today; this plan does not fix or worsen it.
+
+---
+
+## Task 0: Pre-flight baseline + signature verification
+
+**Files:** none (read-only check)
+
+Before any code changes, run:
+
+```
+zig build test 2>&1 | tee /tmp/zag_baseline_tests.txt
+zig fmt --check .
+zig build
+```
+
+Record the test count and any pre-existing failures in `/tmp/zag_baseline_tests.txt`. Every subsequent task must preserve or improve on this count.
+
+Verify three signatures the plan assumes:
+
+1. **`AgentRunner.init`**. Open `/Users/whitemonk/projects/ai/zag/src/AgentRunner.zig` around line 95. Confirm it returns `AgentRunner` (value) not `!AgentRunner`. If it's value-returning, Task 9's `runner.* = AgentRunner.init(...)` in-place reassignment works. If it's error-returning, restructure Task 9 to allocate the runner AFTER the sink.
+2. **`ConversationBuffer.appendNode`**. Confirm it returns `!*Node`. If it returns `!void`, BufferSink needs a different way to capture the returned node for correlation tracking (likely via a follow-up `tree.lastAppended()` helper).
+3. **`ConversationBuffer.appendUserNode`**. Confirm its return type. BufferSink's `.run_start` handler calls it via `catch return`; if it's non-failing `void`, drop the catch.
+
+Write the observed signatures into the plan's Architecture summary as footnotes before proceeding. If any signature mismatches this plan's assumptions, revise the plan text first; do not start Task 1 with stale assumptions.
+
+**Commit:** none (discovery step).
+
 ---
 
 ## Task 1: `Sink` interface + Event union
@@ -710,7 +740,7 @@ pub fn submitInput(self: *AgentRunner, text: []const u8) !void {
 - `reset_assistant_text` (line 605): `self.sink.push(.assistant_reset)`.
 - `info` (line 588): unchanged; writes to `last_info` buffer, no Sink event.
 
-Lines 475-477 (scroll_offset reset on drain): this is pane UI state, not content. Move it to the orchestrator drain loop if needed (EventOrchestrator.zig). For v1, drop this code path from AgentRunner entirely; the compositor will redraw with whatever scroll the viewport holds and the user can scroll manually after an agent turn. If interactive smoke shows missing "scroll to bottom on new output" UX, add it back in a later plan as an orchestrator concern.
+Lines 475-477 (scroll_offset reset on drain): this is pane UI state, not content. Remove it from AgentRunner entirely. The replacement lives in the orchestrator drain loop (Task 9) so the Runner stays pure.
 
 **Step 1: update tests**
 
@@ -823,66 +853,72 @@ for (self.extra_panes.items) |entry| {
 
 Note: BufferSink deinit must run before the buffer's deinit (BufferSink borrows the buffer pointer). The order above is correct — runner first (no more events pushed), then sink (frees correlation map), then view (buffer).
 
-For the **root pane in main.zig**, the wiring is:
+For the **root pane in main.zig**, use the same post-init attach pattern as extras. The Pane value is passed by value into `EventOrchestrator.init`, which copies it into `orchestrator.window_manager.root_pane`. After init returns, that location is stable for the rest of the program, and we attach the viewport pointer from there. The root BufferSink lives on main's stack because its lifetime matches main's defer chain; that's the only asymmetry between root and extras, and it's deliberate (extras outlive main.zig's stack frame on their own ArrayList, root doesn't).
 
 ```zig
-// Existing setup:
+// main.zig, around the existing root_pane construction site (~line 1220)
+
 var root_session = ConversationHistory.init(allocator);
 defer root_session.deinit();
 
 var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
 defer root_buffer.deinit();
 
-// NEW: viewport and sink need a stable root_pane location. The Pane lives
-// inside orchestrator after EventOrchestrator.init. Two-phase init:
-//
-// Phase 1: construct a Pane value with a temporary sink (Null) and pass to
-// orchestrator so it can take ownership.
-// Phase 2: after orchestrator.init returns, replace the root_pane's runner
-// sink with a BufferSink wired to the real buffer + viewport.
-//
-// To keep ordering simple, do this instead:
-// - Allocate BufferSink on main.zig's stack (lives as long as main()).
-// - Attach viewport + sink before orchestrator.init.
-// - Root pane's runner.sink points at the stack-allocated BufferSink.
-
-var root_runner_storage: AgentRunner = undefined;
-defer root_runner_storage.deinit();
-
-// Pane viewport lives inside the Pane inside WindowManager inside
-// EventOrchestrator. Its address is stable only after orchestrator.init.
-// We need the viewport before init. Two paths:
-//
-// A. Store the Viewport separately on main's stack, attach it to the buffer,
-//    and leave the Pane's inline viewport unused for the root pane.
-// B. Move Viewport out of Pane entirely into a separate heap allocation
-//    that the Pane points at.
-//
-// Pick A for v1 (simpler, no new heap). The Pane.viewport field exists for
-// extras; the root pane's viewport lives on main's stack.
-
-var root_viewport: Viewport = .{};
-root_buffer.attachViewport(&root_viewport);
-
+// BufferSink needs a pointer to root_buffer (stable, already declared).
+// Its lifetime matches main's defer chain; heap not needed.
 var root_buffer_sink = BufferSink.init(allocator, &root_buffer);
 defer root_buffer_sink.deinit();
 
-root_runner_storage = AgentRunner.init(
+var root_runner = AgentRunner.init(
     allocator,
     root_buffer_sink.sink(),
     &root_session,
 );
+defer root_runner.deinit();
 
+// Pane is passed by value; Pane.viewport is inline. Final stable address
+// lives in orchestrator.window_manager.root_pane.viewport (after init).
 const root_pane_value: EventOrchestrator.Pane = .{
     .buffer = root_buffer.buf(),
     .view = &root_buffer,
     .session = &root_session,
-    .runner = &root_runner_storage,
-    .viewport = root_viewport,  // copy; Pane.viewport unused for root
+    .runner = &root_runner,
+    .viewport = .{},  // default; buffer pointer is attached after orchestrator.init
 };
+
+var orchestrator = try EventOrchestrator.init(.{
+    // ...
+    .root_pane = root_pane_value,
+    // ...
+});
+defer orchestrator.deinit();
+
+// Attach AFTER init, now that root_pane's storage is stable.
+root_buffer.attachViewport(&orchestrator.window_manager.root_pane.viewport);
 ```
 
-(Path A accepts some awkwardness: `Pane.viewport` is only used for split panes. Add a comment flagging this. If it bothers us later, switch to path B (heap-allocated Viewport) in a cleanup commit.)
+Symmetric with extras: both use `Pane.viewport: Viewport = .{}` inline; both attach after final placement. The asymmetry is only in who owns the BufferSink (root = main's stack, extras = heap under `PaneEntry.sink_storage`), which is driven by Pane lifetime, not by viewport shape.
+
+**Scroll-to-bottom in the orchestrator drain loop**
+
+AgentRunner no longer resets `view.scroll_offset` on drain (that lived at AgentRunner.zig:475-477 and is removed in Task 8). The orchestrator takes over. In `EventOrchestrator`'s per-pane drain step (currently around lines 298-301 per the audit):
+
+```zig
+// For every pane whose runner drained events this tick, snap viewport to bottom
+// so new assistant/tool output is visible. Mirrors the UX that used to live in
+// AgentRunner.drainEvents directly.
+for (panes) |pane| {
+    if (pane.runner) |runner| {
+        if (runner.drainEvents(self.allocator)) |drained_any| {
+            if (drained_any) {
+                pane.viewport.setScrollOffset(0);
+            }
+        }
+    }
+}
+```
+
+If `drainEvents` already returns a `bool` indicating "any event processed this tick", reuse that. If it returns `void`, change its signature in Task 8 to return `bool` (any_drained) so the orchestrator can gate the scroll reset.
 
 **Step 1: tests**
 
@@ -896,7 +932,7 @@ If the test is too heavyweight for unit-test scope, keep it manual and run via t
 
 **Step 2: implementation**
 
-Apply main.zig + WindowManager changes. Run tests.
+Apply main.zig + WindowManager + EventOrchestrator changes. Run tests.
 
 **Verification**
 
@@ -904,10 +940,10 @@ Apply main.zig + WindowManager changes. Run tests.
 zig build test
 zig fmt --check .
 zig build
-./zig-out/bin/zag  # interactive smoke
+./zig-out/bin/zag  # interactive smoke: confirm scroll snaps to bottom on assistant output
 ```
 
-**Commit:** `wm: thread BufferSink through pane construction and teardown`
+**Commit:** `wm: thread BufferSink through pane construction; orchestrator drives scroll reset`
 
 ---
 
@@ -955,5 +991,9 @@ Task 8 (AgentRunner → Sink) is the highest-risk task: if live agent runs misbe
 ## Open questions (surfaced by audit)
 
 1. **Draft ownership.** Today `ConversationBuffer.draft` is one-pane-per-buffer; fine for v1. If visual mode or shared-buffer multi-pane lands, draft moves to Pane. Flag only, no change this plan.
-2. **Scroll-to-bottom on new agent output.** Today AgentRunner resets `view.scroll_offset = 0` on drain. This plan drops that. If interactive UX degrades, add `pane.viewport.setScrollOffset(0)` in the orchestrator's drain loop as a follow-up.
-3. **Root viewport placement.** Path A (stack Viewport for root, inline Pane.viewport for extras) is asymmetric. If it bothers us during review, switch to heap-allocated Viewport everywhere. Not blocking for v1.
+
+## Resolved (decisions made during plan review)
+
+- **Scroll-to-bottom on new agent output.** Moves to the orchestrator's per-pane drain loop (Task 9). Runner stays pure (content events only); display coordination belongs to the orchestrator.
+- **Root viewport placement.** Inline `Pane.viewport: Viewport = .{}` for both root and extras. Both attach the buffer's viewport pointer after the Pane reaches its final stable address (post-`extra_panes.append` for extras; post-`orchestrator.init` for root). No heap allocation needed for Viewport; the only asymmetry is BufferSink ownership (root: main's stack; extras: heap under `PaneEntry.sink_storage`), which is driven by Pane lifetime, not viewport shape.
+- **Signature pre-flight.** Added as Task 0. `AgentRunner.init` and `ConversationBuffer.appendNode` return types must be verified against this plan's assumptions before Task 1 begins.
