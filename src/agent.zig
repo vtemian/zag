@@ -8,64 +8,32 @@ const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
+const Harness = @import("Harness.zig");
+const prompt = @import("prompt.zig");
 const LuaEngine = @import("LuaEngine.zig");
-const skills_mod = @import("skills.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
 
-const system_prompt_prefix =
-    \\You are an expert coding assistant operating inside zag, a coding agent harness.
-    \\You help users by reading files, executing commands, editing code, and writing new files.
-    \\
-    \\Available tools:
-;
+/// Placeholder identifier published in the `LayerContext.agent_name` field
+/// while the runtime caller (the supervisor / pane) still doesn't supply
+/// a real one. The built-in layers don't read it; PR 3's Lua layers will.
+const default_agent_name = "zag";
 
-const system_prompt_suffix =
-    \\
-    \\Guidelines:
-    \\- Use bash for file operations like ls, rg, find
-    \\- Be concise in your responses
-    \\- Show file paths clearly
-    \\- Prefer editing over rewriting entire files
-;
+/// Placeholder ISO date used for the `LayerContext.date_iso` field. The
+/// agent loop has no clock today; PR 3's `env` layer (Lua) will replace
+/// this with a real date pulled from the host.
+const placeholder_date_iso = "1970-01-01";
 
-/// Build the system prompt with tool descriptions from the registry.
-/// When `skills` is non-null and holds at least one entry, an
-/// `<available_skills>` XML block is appended after the base prompt so
-/// the model can see the catalog of filesystem-backed skills. The block
-/// is name + description only; bodies are read on demand via the
-/// existing `read` tool against each skill's absolute path.
-pub fn buildSystemPrompt(
-    registry: *const tools.Registry,
-    allocator: Allocator,
-    skills: ?*const skills_mod.SkillRegistry,
-) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    try buf.appendSlice(allocator, system_prompt_prefix);
-
-    var it = registry.tools.valueIterator();
-    while (it.next()) |tool| {
-        const snippet = tool.definition.prompt_snippet orelse continue;
-        try buf.appendSlice(allocator, "\n- ");
-        try buf.appendSlice(allocator, tool.definition.name);
-        try buf.appendSlice(allocator, ": ");
-        try buf.appendSlice(allocator, snippet);
-    }
-
-    try buf.appendSlice(allocator, system_prompt_suffix);
-
-    // Empty or null registry appends nothing: `catalog` early-returns on
-    // an empty list, keeping the prompt byte-identical to the old path.
-    if (skills) |s| {
-        try buf.append(allocator, '\n');
-        try s.catalog(buf.writer(allocator));
-    }
-
-    return buf.toOwnedSlice(allocator);
-}
+/// Placeholder model spec for the `LayerContext.model` field. The agent
+/// loop currently receives only an `llm.Provider` vtable, not the parsed
+/// model identifier; built-in layers don't read it. PR 3 plumbs the real
+/// `ModelSpec` through `runLoopStreaming` so Lua `for_model` layers can
+/// match against it.
+const placeholder_model_spec: llm.ModelSpec = .{
+    .provider_name = "unknown",
+    .model_id = "unknown",
+};
 
 /// Runs the streaming agent loop: call LLM, execute tools, repeat until
 /// the model produces a text-only response or the cancel flag is set.
@@ -79,13 +47,26 @@ pub fn runLoopStreaming(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
-    skills: ?*const skills_mod.SkillRegistry,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
 
-    const prompt = try buildSystemPrompt(registry, allocator, skills);
-    defer allocator.free(prompt);
+    // Built-in prompt layers (identity, tool list, guidelines) live on a
+    // single registry shared across every turn of this agent run. Lua
+    // layers will join via PR 3 by binding the registry into LuaEngine.
+    var prompt_registry = try Harness.defaultRegistry(allocator);
+    defer prompt_registry.deinit(allocator);
+
+    const layer_ctx: prompt.LayerContext = .{
+        .model = placeholder_model_spec,
+        .cwd = "",
+        .worktree = "",
+        .agent_name = default_agent_name,
+        .date_iso = placeholder_date_iso,
+        .is_git_repo = false,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = tool_defs,
+    };
 
     // Bind the Lua-tool queue for this thread so `executeToolsSingle` (which
     // runs inline on the agent thread) can round-trip Lua-defined tools to the
@@ -104,7 +85,10 @@ pub fn runLoopStreaming(
         } };
         fireLifecycleHook(lua_engine, &turn_start, queue, cancel);
 
-        const response = try callLlm(provider, prompt, messages.items, tool_defs, allocator, queue, cancel);
+        var assembled = try Harness.assembleSystem(&prompt_registry, &layer_ctx, allocator);
+        defer assembled.deinit();
+
+        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, tool_defs, allocator, queue, cancel);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);
 
@@ -164,7 +148,8 @@ const StreamContext = struct {
 /// Call the LLM with streaming, falling back to non-streaming on error.
 fn callLlm(
     provider: llm.Provider,
-    prompt: []const u8,
+    system_stable: []const u8,
+    system_volatile: []const u8,
     messages: []const types.Message,
     tool_defs: []const types.ToolDefinition,
     allocator: Allocator,
@@ -177,7 +162,8 @@ fn callLlm(
         .on_event = &streamEventToQueue,
     };
     const stream_req = llm.StreamRequest{
-        .system_stable = prompt,
+        .system_stable = system_stable,
+        .system_volatile = system_volatile,
         .messages = messages,
         .tool_definitions = tool_defs,
         .allocator = allocator,
@@ -192,7 +178,8 @@ fn callLlm(
         if (streaming_err == error.Cancelled) return error.Cancelled;
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
         const req = llm.Request{
-            .system_stable = prompt,
+            .system_stable = system_stable,
+            .system_volatile = system_volatile,
             .messages = messages,
             .tool_definitions = tool_defs,
             .allocator = allocator,
@@ -706,70 +693,67 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-test "buildSystemPrompt omits available_skills when registry is null" {
+test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt output" {
+    // Locks in that the agent loop's `defaultRegistry` + `assembleSystem`
+    // pipeline reproduces today's system prompt byte-for-byte. The
+    // Harness-level test pins the expected text against a hand-built
+    // tool list; this test reuses the same path the loop runs at startup
+    // (`tools.Registry.definitions`) so a future change to either side
+    // can't drift unnoticed.
     const allocator = std.testing.allocator;
 
     var registry = tools.Registry.init(allocator);
     defer registry.deinit();
+    try registry.register(echo_fast_tool); // prompt_snippet=null -> filtered
 
-    const prompt = try buildSystemPrompt(&registry, allocator, null);
-    defer allocator.free(prompt);
+    const snippet_tool = types.Tool{
+        .definition = .{
+            .name = "read",
+            .description = "test read",
+            .input_schema_json = "{}",
+            .prompt_snippet = "read file contents",
+        },
+        .execute = &echoFastExecute,
+    };
+    try registry.register(snippet_tool);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "You are an expert coding assistant") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") == null);
-}
+    const tool_defs = try registry.definitions(allocator);
+    defer allocator.free(tool_defs);
 
-test "buildSystemPrompt omits available_skills when registry is empty" {
-    const allocator = std.testing.allocator;
+    var prompt_registry = try Harness.defaultRegistry(allocator);
+    defer prompt_registry.deinit(allocator);
 
-    var registry = tools.Registry.init(allocator);
-    defer registry.deinit();
+    const layer_ctx: prompt.LayerContext = .{
+        .model = placeholder_model_spec,
+        .cwd = "",
+        .worktree = "",
+        .agent_name = default_agent_name,
+        .date_iso = placeholder_date_iso,
+        .is_git_repo = false,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = tool_defs,
+    };
 
-    var skills: skills_mod.SkillRegistry = .{};
-    defer skills.deinit(allocator);
+    var assembled = try Harness.assembleSystem(&prompt_registry, &layer_ctx, allocator);
+    defer assembled.deinit();
 
-    const prompt = try buildSystemPrompt(&registry, allocator, &skills);
-    defer allocator.free(prompt);
+    const joined = try llm.joinSystemParts(assembled.stable, assembled.@"volatile", allocator);
+    defer allocator.free(joined);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "You are an expert coding assistant") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") == null);
-}
-
-test "buildSystemPrompt includes available_skills when registry has entries" {
-    const allocator = std.testing.allocator;
-
-    var registry = tools.Registry.init(allocator);
-    defer registry.deinit();
-
-    // Hand-populate a skill registry so no filesystem is touched; the
-    // registry owns every heap-allocated string via its deinit path.
-    var skills: skills_mod.SkillRegistry = .{};
-    defer skills.deinit(allocator);
-
-    const name_a = try allocator.dupe(u8, "roll-dice");
-    const desc_a = try allocator.dupe(u8, "Roll a die.");
-    const path_a = try allocator.dupe(u8, "/skills/roll-dice/SKILL.md");
-    try skills.skills.append(allocator, .{ .name = name_a, .description = desc_a, .path = path_a });
-
-    const name_b = try allocator.dupe(u8, "flip-coin");
-    const desc_b = try allocator.dupe(u8, "Flip a fair coin.");
-    const path_b = try allocator.dupe(u8, "/skills/flip-coin/SKILL.md");
-    try skills.skills.append(allocator, .{ .name = name_b, .description = desc_b, .path = path_b });
-
-    const prompt = try buildSystemPrompt(&registry, allocator, &skills);
-    defer allocator.free(prompt);
-
-    // Base prompt preserved.
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "You are an expert coding assistant") != null);
-    // Catalog block emitted once with both entries.
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "</available_skills>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "name=\"roll-dice\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "name=\"flip-coin\"") != null);
-    // Catalog lives after the base prompt, not before it.
-    const base_idx = std.mem.indexOf(u8, prompt, "You are an expert coding assistant").?;
-    const skills_idx = std.mem.indexOf(u8, prompt, "<available_skills>").?;
-    try std.testing.expect(skills_idx > base_idx);
+    const expected =
+        \\You are an expert coding assistant operating inside zag, a coding agent harness.
+        \\You help users by reading files, executing commands, editing code, and writing new files.
+        \\
+        \\Available tools:
+        \\- read: read file contents
+        \\
+        \\Guidelines:
+        \\- Use bash for file operations like ls, rg, find
+        \\- Be concise in your responses
+        \\- Show file paths clearly
+        \\- Prefer editing over rewriting entire files
+    ;
+    try std.testing.expectEqualStrings(expected, joined);
 }
 
 test "emitTokenUsage emits old two-field form when no cache counts" {

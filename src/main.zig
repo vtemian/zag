@@ -24,6 +24,8 @@ const EventOrchestrator = @import("EventOrchestrator.zig");
 const Trajectory = @import("Trajectory.zig");
 const agent = @import("agent.zig");
 const agent_events = @import("agent_events.zig");
+const Harness = @import("Harness.zig");
+const prompt = @import("prompt.zig");
 const types = @import("types.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const oauth = @import("oauth.zig");
@@ -535,7 +537,31 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     const instruction = try std.fs.cwd().readFileAlloc(gpa, deps.mode.instruction_file, 1 << 20);
     defer gpa.free(instruction);
 
-    const system_prompt = try agent.buildSystemPrompt(deps.registry, gpa, deps.runner.skills);
+    // Reproduce the agent loop's prompt assembly so the captured
+    // trajectory's `system_prompt` field matches what the LLM saw on the
+    // wire. The headless run never streams the assembled value through
+    // its own `LayerContext`; we just need the joined string for ATIF.
+    const tool_defs = try deps.registry.definitions(gpa);
+    defer gpa.free(tool_defs);
+
+    var prompt_registry = try Harness.defaultRegistry(gpa);
+    defer prompt_registry.deinit(gpa);
+
+    const layer_ctx: prompt.LayerContext = .{
+        .model = llm.parseModelString(deps.model_id),
+        .cwd = "",
+        .worktree = "",
+        .agent_name = "zag",
+        .date_iso = "1970-01-01",
+        .is_git_repo = false,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = tool_defs,
+    };
+
+    var assembled = try Harness.assembleSystem(&prompt_registry, &layer_ctx, gpa);
+    defer assembled.deinit();
+
+    const system_prompt = try llm.joinSystemParts(assembled.stable, assembled.@"volatile", gpa);
     defer gpa.free(system_prompt);
 
     try deps.runner.submitInput(instruction);
