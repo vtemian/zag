@@ -54,11 +54,14 @@ pub fn runLoopStreaming(
     defer allocator.free(tool_defs);
 
     // Built-in prompt layers (identity, skills catalog, tool list,
-    // guidelines) live on a single registry shared across every turn of
-    // this agent run. Lua layers will join via PR 3 by binding the
-    // registry into LuaEngine.
-    var prompt_registry = try Harness.defaultRegistry(allocator);
-    defer prompt_registry.deinit(allocator);
+    // guidelines) live on a single registry shared across every turn
+    // of this agent run. When a Lua engine is wired in, we render
+    // against `engine.prompt_registry` so layers registered from
+    // `config.lua` join the assembly. Tests and headless paths that
+    // pass `null` still get the four built-ins via `defaultRegistry`.
+    var fallback_registry: ?prompt.Registry = null;
+    defer if (fallback_registry) |*r| r.deinit(allocator);
+    if (lua_engine == null) fallback_registry = try Harness.defaultRegistry(allocator);
 
     const layer_ctx: prompt.LayerContext = .{
         .model = placeholder_model_spec,
@@ -89,7 +92,10 @@ pub fn runLoopStreaming(
         } };
         fireLifecycleHook(lua_engine, &turn_start, queue, cancel);
 
-        var assembled = try Harness.assembleSystem(&prompt_registry, &layer_ctx, allocator);
+        var assembled = if (lua_engine) |eng|
+            try eng.renderPromptLayers(&layer_ctx, allocator)
+        else
+            try Harness.assembleSystem(&fallback_registry.?, &layer_ctx, allocator);
         defer assembled.deinit();
 
         const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, tool_defs, allocator, queue, cancel);

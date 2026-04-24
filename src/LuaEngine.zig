@@ -21,6 +21,7 @@ const Layout = @import("Layout.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
 const subagents_mod = @import("subagents.zig");
 const frontmatter_mod = @import("frontmatter.zig");
+const prompt = @import("prompt.zig");
 const WindowManager = @import("WindowManager.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
@@ -124,6 +125,18 @@ pub const LuaEngine = struct {
     /// produced the entry. The `task` tool and future inspection
     /// bindings read through `subagentRegistry()`.
     subagents: subagents_mod.SubagentRegistry = .{},
+    /// System-prompt layer registry shared across turns. Built-in layers
+    /// (identity, skills catalog, tool list, guidelines) are seeded at
+    /// `init`. Lua plugins append more via `zag.prompt.layer{...}`; each
+    /// Lua layer stashes its render function in the Lua registry and
+    /// stores the slot index on `Layer.lua_ref`. The agent loop drives
+    /// `assembleSystem` through `renderPromptLayers` per turn.
+    prompt_registry: prompt.Registry = .{},
+    /// Owned names of Lua-registered prompt layers. `Layer.name` is a
+    /// borrowed slice; we dupe the Lua-side string into this list so
+    /// `deinit` can free every entry without walking the registry's
+    /// layers for ownership bookkeeping.
+    prompt_layer_names: std.ArrayList([]const u8) = .empty,
     /// Default model string set via `zag.set_default_model("prov/id")`.
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
@@ -237,6 +250,13 @@ pub const LuaEngine = struct {
         var providers_registry = llm.Registry.init(allocator);
         errdefer providers_registry.deinit();
 
+        // Seed the prompt layer registry with the always-on built-ins
+        // (identity, skills catalog, tool list, guidelines). Lua plugins
+        // append more via `zag.prompt.layer{...}` during config load.
+        var prompt_registry_value: prompt.Registry = .{};
+        errdefer prompt_registry_value.deinit(allocator);
+        try prompt.registerBuiltinLayers(&prompt_registry_value, allocator);
+
         // Install pure-Lua combinators that build on zag.spawn / :join /
         // :cancel / zag.sleep. These have to run after the primitive
         // bindings exist but don't depend on any engine state.
@@ -253,6 +273,7 @@ pub const LuaEngine = struct {
             .keymap_registry = keymap_registry,
             .command_registry = CommandRegistry.init(allocator),
             .tasks = std.AutoHashMap(i32, *Task).init(allocator),
+            .prompt_registry = prompt_registry_value,
         };
     }
 
@@ -330,6 +351,16 @@ pub const LuaEngine = struct {
             if (tool.prompt_snippet) |s| self.allocator.free(s);
         }
         self.tools.deinit(self.allocator);
+        // Unref every Lua callback held by Lua-registered prompt layers
+        // and free the names we duped when the layer was registered.
+        // Built-in layers carry a `lua_ref` of null and borrow their
+        // names from rodata, so they skip both paths.
+        for (self.prompt_registry.layers.items) |layer| {
+            if (layer.lua_ref) |ref| self.lua.unref(zlua.registry_index, ref);
+        }
+        for (self.prompt_layer_names.items) |name| self.allocator.free(name);
+        self.prompt_layer_names.deinit(self.allocator);
+        self.prompt_registry.deinit(self.allocator);
         for (self.hook_dispatcher.registry.hooks.items) |h| {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
@@ -485,6 +516,14 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagSubagentRegisterFn));
         lua.setField(-2, "register");
         lua.setField(-2, "subagent"); // zag.subagent = subagent_table; [zag_table]
+
+        // zag.prompt; system-prompt layer registration. `layer{}` appends
+        // to the engine's shared `prompt.Registry`; the agent loop drives
+        // render through `renderPromptLayers` each turn. See Task 3.1.
+        lua.newTable(); // [zag_table, prompt_table]
+        lua.pushFunction(zlua.wrap(zagPromptLayerFn));
+        lua.setField(-2, "layer");
+        lua.setField(-2, "prompt"); // zag.prompt = prompt_table; [zag_table]
 
         // zag.buffer; buffer primitives for Lua plugins. Each binding
         // resolves a `"b<u32>"` handle string through the live
@@ -4102,7 +4141,7 @@ pub const LuaEngine = struct {
 
         const name = requireSubagentString(lua, 1, "name");
         const description = requireSubagentString(lua, 1, "description");
-        const prompt = requireSubagentString(lua, 1, "prompt");
+        const prompt_text = requireSubagentString(lua, 1, "prompt");
         const model = optionalSubagentString(lua, 1, "model");
 
         // Tools list is optional. Read into a transient slice of borrowed
@@ -4140,7 +4179,7 @@ pub const LuaEngine = struct {
         const sa: subagents_mod.Subagent = .{
             .name = name,
             .description = description,
-            .prompt = prompt,
+            .prompt = prompt_text,
             .model = model,
             .tools = tools_slice,
         };
@@ -4214,6 +4253,340 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.subagent.register: field '" ++ name ++ "' could not be read", .{});
         };
         return s;
+    }
+
+    // -- zag.prompt ------------------------------------------------------------
+
+    /// Thread-local engine handle consulted by `renderLuaLayer`. Set by
+    /// `renderPromptLayers` around `Registry.render` so the thunk can
+    /// find the Lua state that owns a layer's `lua_ref`. Thread-local
+    /// (rather than a module global) so concurrent tests and subagents
+    /// don't step on each other.
+    threadlocal var active_render_engine: ?*LuaEngine = null;
+
+    /// Zig function backing `zag.prompt.layer{name, priority, cache_class, render}`.
+    ///
+    /// Fields:
+    /// - `name` (string, required): stable layer identifier.
+    /// - `priority` (int, optional, default 500): lower runs first. Built-ins
+    ///   sit at 5 / 50 / 100 / 910; pick spaces between them to slot in.
+    /// - `cache_class` (string, optional, default "volatile"): either
+    ///   "stable" (lands in the cache-prefix half) or "volatile" (lands
+    ///   in the churn tail).
+    /// - `render` (function, required): called per turn with a context
+    ///   table. Return a string to contribute, or nil to opt out.
+    ///
+    /// The context table exposes the borrowed `LayerContext` fields that
+    /// carry plain strings today: `model` (provider/id strings),
+    /// `agent_name`, `cwd`, `worktree`, `date_iso`, `is_git_repo`,
+    /// `platform`. `tools` is a sequence of `{name, description}` pairs;
+    /// `skills` appears as a list of names derived from the live
+    /// `SkillRegistry`. Each render call rebuilds the table so layer
+    /// code never aliases Zig-side storage past its own return.
+    fn zagPromptLayerFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        if (!lua.isTable(1)) {
+            lua.raiseErrorStr("zag.prompt.layer: arg 1 must be a table", .{});
+        }
+
+        // name (required string).
+        _ = lua.getField(1, "name");
+        if (lua.isNil(-1)) {
+            lua.raiseErrorStr("zag.prompt.layer: required field 'name' missing", .{});
+        }
+        if (lua.typeOf(-1) != .string) {
+            lua.raiseErrorStr("zag.prompt.layer: field 'name' must be a string", .{});
+        }
+        const name_raw = lua.toString(-1) catch {
+            lua.raiseErrorStr("zag.prompt.layer: field 'name' could not be read", .{});
+        };
+        lua.pop(1);
+
+        // priority (optional int, default 500).
+        var priority: i32 = 500;
+        _ = lua.getField(1, "priority");
+        if (!lua.isNil(-1)) {
+            if (!lua.isInteger(-1)) {
+                lua.raiseErrorStr("zag.prompt.layer: field 'priority' must be an integer", .{});
+            }
+            const p = lua.toInteger(-1) catch {
+                lua.raiseErrorStr("zag.prompt.layer: field 'priority' could not be read", .{});
+            };
+            priority = std.math.cast(i32, p) orelse {
+                lua.raiseErrorStr("zag.prompt.layer: field 'priority' out of range", .{});
+            };
+        }
+        lua.pop(1);
+
+        // cache_class (optional string, default "volatile").
+        var cache_class: prompt.CacheClass = .@"volatile";
+        _ = lua.getField(1, "cache_class");
+        if (!lua.isNil(-1)) {
+            if (lua.typeOf(-1) != .string) {
+                lua.raiseErrorStr("zag.prompt.layer: field 'cache_class' must be a string", .{});
+            }
+            const cc = lua.toString(-1) catch {
+                lua.raiseErrorStr("zag.prompt.layer: field 'cache_class' could not be read", .{});
+            };
+            if (std.mem.eql(u8, cc, "stable")) {
+                cache_class = .stable;
+            } else if (std.mem.eql(u8, cc, "volatile")) {
+                cache_class = .@"volatile";
+            } else {
+                lua.raiseErrorStr("zag.prompt.layer: field 'cache_class' must be 'stable' or 'volatile'", .{});
+            }
+        }
+        lua.pop(1);
+
+        // render (required function). Push and ref; on any error after
+        // this we must unref the slot.
+        _ = lua.getField(1, "render");
+        if (lua.isNil(-1)) {
+            lua.raiseErrorStr("zag.prompt.layer: required field 'render' missing", .{});
+        }
+        if (!lua.isFunction(-1)) {
+            lua.raiseErrorStr("zag.prompt.layer: field 'render' must be a function", .{});
+        }
+        const fn_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr("zag.prompt.layer: failed to ref render function", .{});
+        };
+
+        // Dupe the name so it outlives this Lua frame. Track it on the
+        // engine's `prompt_layer_names` for a clean free on deinit.
+        const name_owned = engine.allocator.dupe(u8, name_raw) catch {
+            lua.unref(zlua.registry_index, fn_ref);
+            lua.raiseErrorStr("zag.prompt.layer: out of memory duping name", .{});
+        };
+
+        engine.prompt_layer_names.append(engine.allocator, name_owned) catch {
+            engine.allocator.free(name_owned);
+            lua.unref(zlua.registry_index, fn_ref);
+            lua.raiseErrorStr("zag.prompt.layer: out of memory tracking layer name", .{});
+        };
+
+        engine.prompt_registry.add(engine.allocator, .{
+            .name = name_owned,
+            .priority = priority,
+            .cache_class = cache_class,
+            .source = .lua,
+            .render_fn = renderLuaLayer,
+            .lua_ref = fn_ref,
+        }) catch |err| {
+            // Roll back the name tracking and ref before surfacing.
+            _ = engine.prompt_layer_names.pop();
+            engine.allocator.free(name_owned);
+            lua.unref(zlua.registry_index, fn_ref);
+            switch (err) {
+                error.StableFrozen => lua.raiseErrorStr(
+                    "zag.prompt.layer: cannot register a 'stable' layer after the first render",
+                    .{},
+                ),
+                error.OutOfMemory => lua.raiseErrorStr(
+                    "zag.prompt.layer: out of memory appending layer",
+                    .{},
+                ),
+            }
+        };
+
+        return 0;
+    }
+
+    /// Render thunk used by every Lua-registered layer. Looks up the
+    /// engine via the thread-local `active_render_engine` set by
+    /// `renderPromptLayers`, pushes a context table onto the Lua stack,
+    /// and invokes the ref stored on the layer. Returns an owned slice
+    /// allocated with `alloc`, or null when the Lua function returns
+    /// nil. Render errors are logged and swallowed (null return) so a
+    /// single buggy layer cannot crash the assembled prompt.
+    ///
+    /// Currently expected to run on the main thread: Lua is not safe to
+    /// call from the agent worker thread. `agent.runLoopStreaming`
+    /// today only registers built-in (Zig) layers in its per-turn
+    /// fallback registry, so in practice this thunk fires only from
+    /// main-thread tests and future main-thread render paths. When
+    /// Task 3.3+ wires a production Lua layer, the agent-thread render
+    /// will round-trip through an event type analogous to
+    /// `lua_tool_request`.
+    fn renderLuaLayer(ctx: *const prompt.LayerContext, alloc: Allocator) anyerror!?[]const u8 {
+        const engine = active_render_engine orelse {
+            log.warn("prompt layer render: no active engine bound", .{});
+            return null;
+        };
+        const layer = active_render_layer orelse {
+            log.warn("prompt layer render: no active layer bound", .{});
+            return null;
+        };
+        const fn_ref = layer.lua_ref orelse {
+            log.warn("prompt layer render: layer '{s}' missing lua_ref", .{layer.name});
+            return null;
+        };
+
+        const lua = engine.lua;
+
+        _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn("prompt layer '{s}': registry slot is not a function", .{layer.name});
+            return null;
+        }
+        pushLayerContextTable(lua, ctx);
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("prompt layer '{s}' raised: {s}", .{ layer.name, err_msg });
+            lua.pop(1);
+            return null;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return null;
+        if (lua.typeOf(-1) != .string) {
+            log.warn("prompt layer '{s}' returned non-string (type {s})", .{ layer.name, @tagName(lua.typeOf(-1)) });
+            return null;
+        }
+        const out = lua.toString(-1) catch {
+            log.warn("prompt layer '{s}' return value could not be read", .{layer.name});
+            return null;
+        };
+        return try alloc.dupe(u8, out);
+    }
+
+    /// Paired with `active_render_engine`. `renderPromptLayers` sets both
+    /// per layer so the thunk can cheaply identify which registry entry
+    /// it is servicing without carrying user-data on the Layer type.
+    threadlocal var active_render_layer: ?*const prompt.Layer = null;
+
+    /// Render the engine's prompt registry against `ctx`. Wraps
+    /// `Registry.render` with the thread-local plumbing Lua layer
+    /// thunks read from. Caller owns the returned `AssembledPrompt`.
+    pub fn renderPromptLayers(
+        self: *LuaEngine,
+        ctx: *const prompt.LayerContext,
+        alloc: Allocator,
+    ) !prompt.AssembledPrompt {
+        const prior_engine = active_render_engine;
+        const prior_layer = active_render_layer;
+        active_render_engine = self;
+        defer {
+            active_render_engine = prior_engine;
+            active_render_layer = prior_layer;
+        }
+        return try renderWithPerLayerBinding(&self.prompt_registry, ctx, alloc);
+    }
+
+    /// Wrapper around `Registry.render` that updates `active_render_layer`
+    /// as the sort loop advances. We can't intercept Registry.render
+    /// itself without touching prompt.zig, so the adapter re-implements
+    /// the minimal render loop here.
+    fn renderWithPerLayerBinding(
+        registry: *prompt.Registry,
+        ctx: *const prompt.LayerContext,
+        alloc: Allocator,
+    ) !prompt.AssembledPrompt {
+        var arena_state: std.heap.ArenaAllocator = .init(alloc);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Stable sort preserves registration order across ties. Match
+        // `Registry.render`'s sort-on-scratch-copy so the registry keeps
+        // its registration order.
+        const sorted = try arena.dupe(prompt.Layer, registry.layers.items);
+        std.mem.sort(prompt.Layer, sorted, {}, layerLessThanForLua);
+
+        var stable_buf: std.ArrayList(u8) = .empty;
+        var volatile_buf: std.ArrayList(u8) = .empty;
+
+        for (sorted) |*layer| {
+            active_render_layer = layer;
+            const rendered = try layer.render_fn(ctx, arena);
+            active_render_layer = null;
+            const text = rendered orelse continue;
+            if (text.len == 0) continue;
+
+            const target = switch (layer.cache_class) {
+                .stable => &stable_buf,
+                .@"volatile" => &volatile_buf,
+            };
+            if (target.items.len > 0) try target.appendSlice(arena, "\n\n");
+            try target.appendSlice(arena, text);
+        }
+
+        const stable = try stable_buf.toOwnedSlice(arena);
+        const volatile_part = try volatile_buf.toOwnedSlice(arena);
+
+        registry.stable_frozen = true;
+
+        return .{
+            .stable = stable,
+            .@"volatile" = volatile_part,
+            .arena = arena_state,
+        };
+    }
+
+    fn layerLessThanForLua(_: void, a: prompt.Layer, b: prompt.Layer) bool {
+        return a.priority < b.priority;
+    }
+
+    /// Push a Lua table describing `ctx` onto `lua`'s stack. Exposes the
+    /// borrowed scalar fields plus a `tools` sequence with `{name,
+    /// description}` entries and a `skills` sequence of skill names.
+    /// Kept narrow on purpose: layer authors generally reach for a few
+    /// well-known strings, and anything richer (raw tool schemas, live
+    /// skill registries) is better served by Zig-side layers.
+    fn pushLayerContextTable(lua: *Lua, ctx: *const prompt.LayerContext) void {
+        lua.newTable();
+
+        // Scalar strings borrow Lua's copy semantics: pushString dupes
+        // into Lua's internal string table, so the borrowed `ctx` slices
+        // don't need to outlive this call.
+        _ = lua.pushString(ctx.model.provider_name);
+        lua.setField(-2, "provider");
+        _ = lua.pushString(ctx.model.model_id);
+        lua.setField(-2, "model_id");
+
+        // Convenience alias: "model" as a pre-joined "provider/model_id"
+        // string. Saves layers from concatenating the two pieces.
+        var model_buf: [256]u8 = undefined;
+        const joined = std.fmt.bufPrint(&model_buf, "{s}/{s}", .{ ctx.model.provider_name, ctx.model.model_id }) catch ctx.model.model_id;
+        _ = lua.pushString(joined);
+        lua.setField(-2, "model");
+
+        _ = lua.pushString(ctx.cwd);
+        lua.setField(-2, "cwd");
+        _ = lua.pushString(ctx.worktree);
+        lua.setField(-2, "worktree");
+        _ = lua.pushString(ctx.agent_name);
+        lua.setField(-2, "agent_name");
+        _ = lua.pushString(ctx.date_iso);
+        lua.setField(-2, "date_iso");
+        lua.pushBoolean(ctx.is_git_repo);
+        lua.setField(-2, "is_git_repo");
+        _ = lua.pushString(ctx.platform);
+        lua.setField(-2, "platform");
+
+        // tools: sequence of { name = ..., description = ... } tables.
+        lua.newTable();
+        for (ctx.tools, 0..) |def, i| {
+            lua.newTable();
+            _ = lua.pushString(def.name);
+            lua.setField(-2, "name");
+            _ = lua.pushString(def.description);
+            lua.setField(-2, "description");
+            lua.rawSetIndex(-2, @intCast(i + 1));
+        }
+        lua.setField(-2, "tools");
+
+        // skills: sequence of skill names. Empty when ctx.skills is null
+        // or the registry has no entries; the layer can len-check it.
+        lua.newTable();
+        if (ctx.skills) |skills_reg| {
+            for (skills_reg.skills.items, 0..) |skill, i| {
+                _ = lua.pushString(skill.name);
+                lua.rawSetIndex(-2, @intCast(i + 1));
+            }
+        }
+        lua.setField(-2, "skills");
     }
 
     // -- zag.log / zag.notify --------------------------------------------------
@@ -9030,6 +9403,268 @@ test "zag.subagent.register rejects invalid name" {
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "Bad_Name") != null);
 
     try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
+}
+
+fn fakePromptLayerContext() prompt.LayerContext {
+    return .{
+        .model = .{ .provider_name = "anthropic", .model_id = "claude-sonnet-4-5" },
+        .cwd = "/tmp/zag-test",
+        .worktree = "/tmp/zag-test",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+}
+
+test "zag.prompt.layer registers a volatile layer that renders a string" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.env",
+        \\  priority = 900,
+        \\  cache_class = "volatile",
+        \\  render = function(ctx)
+        \\    return "Hello from Lua (" .. ctx.agent_name .. ")"
+        \\  end,
+        \\}
+    );
+
+    // Built-in 4 + Lua 1 = 5 layers in the shared registry.
+    try std.testing.expectEqual(@as(usize, 5), engine.prompt_registry.layers.items.len);
+
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "Hello from Lua (zag)") != null);
+}
+
+test "zag.prompt.layer cache_class=stable lands in the stable half" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.identity-tail",
+        \\  priority = 80,
+        \\  cache_class = "stable",
+        \\  render = function(_)
+        \\    return "STABLE-LUA-LAYER"
+        \\  end,
+        \\}
+    );
+
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.stable, "STABLE-LUA-LAYER") != null);
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, assembled.@"volatile", "STABLE-LUA-LAYER"));
+}
+
+test "zag.prompt.layer returning nil is skipped" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.nil-layer",
+        \\  priority = 900,
+        \\  cache_class = "volatile",
+        \\  render = function(_)
+        \\    return nil
+        \\  end,
+        \\}
+    );
+
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    // Volatile half contains the built-in guidelines and nothing extra.
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "Guidelines:") != null);
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, assembled.@"volatile", "nil-layer"));
+}
+
+test "zag.prompt.layer erroring is logged and skipped" {
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.kaboom",
+        \\  priority = 900,
+        \\  cache_class = "volatile",
+        \\  render = function(_)
+        \\    error("intentional test failure")
+        \\  end,
+        \\}
+        \\zag.prompt.layer{
+        \\  name = "lua.survivor",
+        \\  priority = 905,
+        \\  cache_class = "volatile",
+        \\  render = function(_)
+        \\    return "I survived"
+        \\  end,
+        \\}
+    );
+
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "I survived") != null);
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, assembled.@"volatile", "kaboom"));
+}
+
+test "zag.prompt.layer exposes ctx fields to Lua" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.ctx-probe",
+        \\  priority = 900,
+        \\  cache_class = "volatile",
+        \\  render = function(ctx)
+        \\    return string.format(
+        \\      "m=%s p=%s m_id=%s cwd=%s plat=%s git=%s date=%s tools=%d skills=%d",
+        \\      ctx.model,
+        \\      ctx.provider,
+        \\      ctx.model_id,
+        \\      ctx.cwd,
+        \\      ctx.platform,
+        \\      tostring(ctx.is_git_repo),
+        \\      ctx.date_iso,
+        \\      #ctx.tools,
+        \\      #ctx.skills
+        \\    )
+        \\  end,
+        \\}
+    );
+
+    var ctx = fakePromptLayerContext();
+    const defs = [_]types.ToolDefinition{
+        .{ .name = "read", .description = "read files", .input_schema_json = "{}", .prompt_snippet = null },
+        .{ .name = "bash", .description = "shell", .input_schema_json = "{}", .prompt_snippet = null },
+    };
+    ctx.tools = &defs;
+    ctx.is_git_repo = true;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "m=anthropic/claude-sonnet-4-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "p=anthropic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "m_id=claude-sonnet-4-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "cwd=/tmp/zag-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "plat=darwin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "git=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "tools=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "skills=0") != null);
+}
+
+test "zag.prompt.layer rejects missing fields" {
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Missing name.
+    try engine.lua.doString(
+        \\_ok1, _err1 = pcall(function()
+        \\  zag.prompt.layer{
+        \\    render = function() return "x" end,
+        \\  }
+        \\end)
+    );
+    _ = try engine.lua.getGlobal("_ok1");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    // Missing render.
+    try engine.lua.doString(
+        \\_ok2, _err2 = pcall(function()
+        \\  zag.prompt.layer{
+        \\    name = "noop",
+        \\  }
+        \\end)
+    );
+    _ = try engine.lua.getGlobal("_ok2");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    // Built-ins only; no partial Lua layer appended.
+    try std.testing.expectEqual(@as(usize, 4), engine.prompt_registry.layers.items.len);
+}
+
+test "zag.prompt.layer rejects bad cache_class" {
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_ok, _err = pcall(function()
+        \\  zag.prompt.layer{
+        \\    name = "bogus",
+        \\    cache_class = "super-stable",
+        \\    render = function() return "x" end,
+        \\  }
+        \\end)
+    );
+
+    _ = try engine.lua.getGlobal("_ok");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_err");
+    defer engine.lua.pop(1);
+    const err_msg = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "cache_class") != null);
+
+    try std.testing.expectEqual(@as(usize, 4), engine.prompt_registry.layers.items.len);
+}
+
+test "zag.prompt.layer engine deinit frees lua refs and names" {
+    // testing.allocator checks for leaks on deinit; a missing unref or
+    // free in the engine teardown path would fail this test. Register
+    // a handful of Lua layers so the loop actually has work to do.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.a",
+        \\  cache_class = "volatile",
+        \\  render = function() return "a" end,
+        \\}
+        \\zag.prompt.layer{
+        \\  name = "lua.b",
+        \\  priority = 200,
+        \\  cache_class = "stable",
+        \\  render = function() return "b" end,
+        \\}
+        \\zag.prompt.layer{
+        \\  name = "lua.c",
+        \\  render = function() return nil end,
+        \\}
+    );
+
+    // Built-ins 4 + Lua 3 = 7.
+    try std.testing.expectEqual(@as(usize, 7), engine.prompt_registry.layers.items.len);
+
+    engine.deinit();
 }
 
 test "zag.parse_frontmatter returns fields and body" {
