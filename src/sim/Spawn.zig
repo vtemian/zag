@@ -20,11 +20,20 @@ pub fn spawn(
     rows: u16,
 ) !Spawned {
     const pty = try Pty.open(cols, rows);
-    errdefer pty.close();
+    // No errdefer here: ownership splits after fork, so each error path
+    // below performs targeted cleanup on the fds it still owns.
 
-    const err_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    const err_pipe = posix.pipe2(.{ .CLOEXEC = true }) catch |e| {
+        pty.close();
+        return e;
+    };
 
-    const pid = try posix.fork();
+    const pid = posix.fork() catch |e| {
+        posix.close(err_pipe[0]);
+        posix.close(err_pipe[1]);
+        pty.close();
+        return e;
+    };
     if (pid == 0) {
         posix.close(err_pipe[0]);
         childPreExec(pty) catch |e| reportAndExit(err_pipe[1], e);
@@ -44,14 +53,14 @@ pub fn spawn(
 
     posix.close(err_pipe[1]);
     posix.close(pty.slave);
-    // Slave is owned by child now; parent should not close it again on error.
-    // Build a Pty view with only master for the caller.
+    // Slave is owned by child now; parent only owns `pty.master`.
 
     var buf: [@sizeOf(anyerror)]u8 = undefined;
     const n = posix.read(err_pipe[0], &buf) catch 0;
     posix.close(err_pipe[0]);
     if (n > 0) {
         _ = posix.waitpid(pid, 0);
+        posix.close(pty.master);
         return error.ChildSetupFailed;
     }
     return .{ .pid = pid, .pty = .{ .master = pty.master, .slave = -1 } };
@@ -90,7 +99,8 @@ test "spawn /bin/cat round-trips one byte" {
     var out: [8]u8 = undefined;
     // Set a 1s timeout via poll; cat echoes input in line buffered mode.
     var fds = [_]posix.pollfd{.{ .fd = sp.pty.master, .events = posix.POLL.IN, .revents = 0 }};
-    _ = try posix.poll(&fds, 1000);
+    const nready = try posix.poll(&fds, 1000);
+    try std.testing.expect(nready > 0);
     const n = try posix.read(sp.pty.master, &out);
     try std.testing.expect(n > 0);
     try std.testing.expect(std.mem.indexOfScalar(u8, out[0..n], 'x') != null);
