@@ -307,6 +307,66 @@ zig build run
 
 **Commit:** `docs: manual smoke notes for skills and subagents` (update this plan file with the smoke results)
 
+### Automated validation (2026-04-24)
+
+- `zig build test` green (1187+ tests, all tasks additive).
+- `zig fmt --check .` green.
+- `zig build` green.
+- Headless smoke (`./zig-out/bin/zag --headless ...`) produces a two-line
+  session JSONL with ULIDs on every event and `parent_id` chain intact.
+  Trajectory returns `7 * 8 = 56` from `openai-oauth/gpt-5.2`.
+
+### Manual TTY smoke (Vlad to run)
+
+Skills smoke (requires the TUI):
+
+```
+mkdir -p .zag/skills/roll-dice
+cat > .zag/skills/roll-dice/SKILL.md <<'EOF'
+---
+name: roll-dice
+description: Roll a die. Use when asked to roll N-sided dice.
+---
+Run `echo $((RANDOM % N + 1))` via bash.
+EOF
+zig build run
+# In the TUI: "roll a d20"
+# Expect: LLM sees roll-dice in the <available_skills> block of the
+#   system prompt, uses the read tool to load SKILL.md, runs bash,
+#   returns a number 1-20.
+```
+
+Subagent smoke:
+
+```
+# Append to ~/.config/zag/config.lua:
+#   zag.subagent.register{
+#     name = "reviewer",
+#     description = "Review the staged diff for quality issues",
+#     prompt = "You are a code reviewer. Read the diff and list findings.",
+#   }
+zig build run
+# In the TUI: "please use the reviewer subagent to review my staged diff"
+# Expect: parent LLM emits task(agent="reviewer", prompt="..."); the
+#   child runner spawns with a Collector sink, shares the parent's
+#   provider (v1 ignores the model frontmatter field), runs to
+#   completion; the tool result is the child's final message text.
+# Inspect: jq -r '.type' .zag/sessions/<id>.jsonl | sort | uniq -c
+#   Expect task_start + task_end pair alongside user/assistant/tool rows.
+```
+
+### v1 simplifications tracked for follow-up
+
+- Subagent's `model` frontmatter field is ignored; the child always
+  uses the parent's provider. Follow-up wires per-subagent providers.
+- `task_end` metrics carry only the subagent's final text; no token or
+  turn counts yet.
+- Child runner's streaming events (thinking, tool calls) drain into
+  the Collector but don't render anywhere; visual-mode in
+  [#1](https://github.com/vtemian/zag/issues/1) will expose them.
+- Skill body is NOT prefetched; the LLM reads the absolute SKILL.md
+  path via the existing `read` tool on demand.
+
 ---
 
 ## Rollback
