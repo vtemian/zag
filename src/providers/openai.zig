@@ -172,6 +172,7 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
             .text => has_text = true,
             .tool_use => has_tool_use = true,
             .tool_result => has_tool_result = true,
+            .thinking, .redacted_thinking => {}, // Chat Completions has no reasoning field; stripped upstream
         }
     }
 
