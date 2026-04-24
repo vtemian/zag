@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
+const Harness = @import("../Harness.zig");
 const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
 
@@ -159,7 +160,12 @@ fn serializeRequest(
     try writeToolDefinitions(tool_definitions, w);
     try w.writeAll(",");
 
-    try writeMessages(model, messages, w);
+    // Drop `.thinking` / `.redacted_thinking` blocks from prior-turn
+    // assistant messages before serialization. Anthropic rejects stale
+    // signatures; the UI and the session log keep the full history.
+    const shaped_messages = try Harness.stripThinkingAcrossTurns(messages, allocator);
+    defer Harness.freeShaped(shaped_messages, messages, allocator);
+    try writeMessages(model, shaped_messages, w);
 
     try w.writeAll("}");
     return out.toOwnedSlice();
