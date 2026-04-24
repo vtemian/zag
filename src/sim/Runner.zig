@@ -65,7 +65,8 @@ test "executeSend writes to pty master" {
     // Cat should echo; read it back.
     var buf: [64]u8 = undefined;
     var fds = [_]posix.pollfd{.{ .fd = r.child.?.pty.master, .events = posix.POLL.IN, .revents = 0 }};
-    _ = try posix.poll(&fds, 1000);
+    const nready = try posix.poll(&fds, 1000);
+    try std.testing.expect(nready > 0);
     const n = try posix.read(r.child.?.pty.master, &buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "hello") != null);
 }
