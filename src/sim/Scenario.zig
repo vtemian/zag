@@ -1,0 +1,168 @@
+//! Top-level driver: parse a `.zsm` source, execute each step against a
+//! `Runner`, and collapse the outcome into `Runner.Outcome` plus enough
+//! context for the artifacts layer (phase 4) to surface the failing step.
+
+const std = @import("std");
+const Dsl = @import("Dsl.zig");
+const Args = @import("Args.zig");
+const Runner = @import("Runner.zig").Runner;
+const Outcome = @import("Runner.zig").Outcome;
+
+/// Result of driving a scenario to completion (or the first failing step).
+pub const RunResult = struct {
+    /// Collapsed outcome code. Mirrors `Runner.Outcome` exit-code semantics.
+    outcome: Outcome,
+    /// Line number of the step that failed, if any. 1-based as emitted by Dsl.
+    failing_step_line: ?u32 = null,
+    /// Verb of the step that failed, if any.
+    failing_step_verb: ?Dsl.Verb = null,
+    /// `@errorName` of the underlying error. Points at Zig's static error-name
+    /// table, so the caller does not need to free it.
+    error_name: ?[]const u8 = null,
+};
+
+/// Knobs the scenario driver needs but the `.zsm` source doesn't yet carry.
+pub const RunOptions = struct {
+    /// Directory where `snapshot` steps write their grid dumps. Must exist.
+    artifacts_dir: []const u8,
+    /// Default timeout for `wait_text` / `wait_exit` when the step itself
+    /// doesn't specify one. Per-step overrides arrive in a later task.
+    wait_default_ms: u32 = 10_000,
+};
+
+/// Readable cap on scenario file size. Scenarios are hand-written; anything
+/// larger is almost certainly a mistake.
+const max_scenario_bytes: usize = std.math.maxInt(u32);
+
+/// Read `path` from disk, then delegate to `runSource`. `path` may be
+/// absolute or relative to the process cwd.
+pub fn runFile(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    opts: RunOptions,
+) !RunResult {
+    const src = try std.fs.cwd().readFileAlloc(alloc, path, max_scenario_bytes);
+    defer alloc.free(src);
+    return runSource(alloc, src, opts);
+}
+
+/// Parse `src` and execute the resulting steps sequentially. Returns on the
+/// first failing step or after the last successful one.
+pub fn runSource(
+    alloc: std.mem.Allocator,
+    src: []const u8,
+    opts: RunOptions,
+) !RunResult {
+    const steps = Dsl.parse(alloc, src) catch |e| return RunResult{
+        .outcome = .harness_error,
+        .error_name = @errorName(e),
+    };
+    defer alloc.free(steps);
+
+    var r = try Runner.init(alloc);
+    defer r.deinit();
+
+    for (steps) |step| {
+        executeStep(&r, step, opts) catch |e| return RunResult{
+            .outcome = classify(e),
+            .failing_step_line = step.line_no,
+            .failing_step_verb = step.verb,
+            .error_name = @errorName(e),
+        };
+    }
+
+    return .{ .outcome = .pass };
+}
+
+fn executeStep(r: *Runner, step: Dsl.Step, opts: RunOptions) !void {
+    switch (step.verb) {
+        .comment => {},
+        .set_env => try r.executeSetEnv(step.args),
+        .spawn => try r.executeSpawn(step.args),
+        .send => try r.executeSend(step.args),
+        .wait_text => try r.executeWaitText(step.args, opts.wait_default_ms),
+        .wait_idle => {
+            const ms = try Args.parseDurationMs(step.args);
+            try r.executeWaitIdle(ms);
+        },
+        .wait_exit => try r.executeWaitExit(opts.wait_default_ms),
+        .expect_text => try r.executeExpectText(step.args),
+        .snapshot => try r.executeSnapshot(step.args, opts.artifacts_dir),
+    }
+}
+
+/// Map a runtime error to an `Outcome`. Anything not explicitly listed falls
+/// into `harness_error` — that includes parse errors, spawn failures, and
+/// fd/read problems, which all signal the harness itself couldn't run the
+/// scenario as written.
+fn classify(e: anyerror) Outcome {
+    return switch (e) {
+        error.ExpectTextNotFound,
+        error.WaitTextTimeout,
+        error.WaitExitTimeout,
+        => .assertion_failed,
+        error.ChildExitedDuringWait => .child_crashed,
+        else => .harness_error,
+    };
+}
+
+// --- tests ------------------------------------------------------------------
+
+fn tmpArtifacts(tmp: *std.testing.TmpDir) ![]u8 {
+    return tmp.dir.realpathAlloc(std.testing.allocator, ".");
+}
+
+test "runSource happy-path script against cat passes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const artifacts_dir = try tmpArtifacts(&tmp);
+    defer std.testing.allocator.free(artifacts_dir);
+
+    const src =
+        \\spawn /bin/cat
+        \\send "hi" <Enter>
+        \\wait_text /hi/
+        \\send <C-d>
+        \\wait_exit
+    ;
+    const res = try runSource(std.testing.allocator, src, .{
+        .artifacts_dir = artifacts_dir,
+        .wait_default_ms = 3_000,
+    });
+    try std.testing.expectEqual(Outcome.pass, res.outcome);
+}
+
+test "runSource expect_text mismatch returns assertion_failed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const artifacts_dir = try tmpArtifacts(&tmp);
+    defer std.testing.allocator.free(artifacts_dir);
+
+    const src =
+        \\spawn /bin/cat
+        \\send "foo"
+        \\expect_text /xyz/
+    ;
+    const res = try runSource(std.testing.allocator, src, .{
+        .artifacts_dir = artifacts_dir,
+        .wait_default_ms = 1_000,
+    });
+    try std.testing.expectEqual(Outcome.assertion_failed, res.outcome);
+    try std.testing.expectEqual(Dsl.Verb.expect_text, res.failing_step_verb.?);
+    try std.testing.expectEqual(@as(u32, 3), res.failing_step_line.?);
+    try std.testing.expectEqualStrings("ExpectTextNotFound", res.error_name.?);
+}
+
+test "runSource unknown verb returns harness_error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const artifacts_dir = try tmpArtifacts(&tmp);
+    defer std.testing.allocator.free(artifacts_dir);
+
+    const src = "nope foo\n";
+    const res = try runSource(std.testing.allocator, src, .{
+        .artifacts_dir = artifacts_dir,
+    });
+    try std.testing.expectEqual(Outcome.harness_error, res.outcome);
+    try std.testing.expect(std.mem.indexOf(u8, res.error_name.?, "UnknownVerb") != null);
+}
