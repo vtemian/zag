@@ -473,10 +473,9 @@ pub fn processSseEvent(
                     }
                 }
             } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
-                // Buffer thinking text onto the current block. Task 1.4
-                // will route this through a dedicated `StreamEvent`; for
-                // now the parser keeps it internal so the agent loop sees
-                // no behavior change.
+                // Buffer thinking text onto the current block and forward
+                // the delta to the callback so consumers (ConversationBuffer,
+                // trajectory writer) can stream it in real time.
                 const text = delta_obj.get("thinking").?.string;
                 if (blocks.items.len > 0) {
                     const current = &blocks.items[blocks.items.len - 1];
@@ -484,6 +483,7 @@ pub fn processSseEvent(
                         try current.thinking.text.appendSlice(allocator, text);
                     }
                 }
+                callback.on_event(callback.ctx, .{ .thinking_delta = .{ .text = text } });
             } else if (std.mem.eql(u8, delta_type, "signature_delta")) {
                 // Anthropic emits a single `signature_delta` per thinking
                 // block as a full replacement, not an append. Drop any
@@ -499,6 +499,18 @@ pub fn processSseEvent(
                         current.thinking.signature = buf;
                     }
                 }
+            }
+        }
+    } else if (std.mem.eql(u8, event_type, "content_block_stop")) {
+        // Fire `thinking_stop` when the block that just closed is a thinking
+        // block so consumers can flush an in-flight thinking node before the
+        // next content block (text or tool_use) begins. Anthropic addresses
+        // blocks by index but the parser keeps them in insertion order, so
+        // the most recent block matches the one that just closed.
+        if (blocks.items.len > 0) {
+            const current = &blocks.items[blocks.items.len - 1];
+            if (current.* == .thinking) {
+                callback.on_event(callback.ctx, .thinking_stop);
             }
         }
     } else if (std.mem.eql(u8, event_type, "message_delta")) {
@@ -1052,6 +1064,139 @@ test "processSseEvent accumulates thinking_delta text" {
     try std.testing.expect(blocks.items[0] == .thinking);
     try std.testing.expectEqualStrings("Let me consider.", blocks.items[0].thinking.text.items);
     try std.testing.expect(blocks.items[0].thinking.signature == null);
+}
+
+test "processSseEvent emits thinking_delta and thinking_stop events" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    const Recorder = struct {
+        alloc: Allocator,
+        thinking_delta_count: u32 = 0,
+        thinking_stop_count: u32 = 0,
+        concatenated: std.ArrayList(u8) = .empty,
+
+        fn onEvent(ctx: *anyopaque, event: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .thinking_delta => |td| {
+                    self.thinking_delta_count += 1;
+                    self.concatenated.appendSlice(self.alloc, td.text) catch return;
+                },
+                .thinking_stop => self.thinking_stop_count += 1,
+                else => {},
+            }
+        }
+    };
+    var recorder: Recorder = .{ .alloc = allocator };
+    defer recorder.concatenated.deinit(allocator);
+    const callback: llm.StreamCallback = .{ .ctx = &recorder, .on_event = &Recorder.onEvent };
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
+
+    const frames = [_]struct { event_type: []const u8, data: []const u8 }{
+        .{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}",
+        },
+        .{
+            .event_type = "content_block_delta",
+            .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one.\"}}",
+        },
+        .{
+            .event_type = "content_block_delta",
+            .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" step two.\"}}",
+        },
+        .{
+            .event_type = "content_block_stop",
+            .data = "{\"type\":\"content_block_stop\",\"index\":0}",
+        },
+    };
+
+    for (frames) |f| {
+        try processSseEvent(
+            f.event_type,
+            f.data,
+            allocator,
+            &blocks,
+            &stop_reason,
+            &input_tokens,
+            &output_tokens,
+            &cache_creation_tokens,
+            &cache_read_tokens,
+            callback,
+        );
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), recorder.thinking_delta_count);
+    try std.testing.expectEqual(@as(u32, 1), recorder.thinking_stop_count);
+    try std.testing.expectEqualStrings("step one. step two.", recorder.concatenated.items);
+}
+
+test "processSseEvent skips thinking_stop for non-thinking blocks" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer {
+        for (blocks.items) |*b| b.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    const Recorder = struct {
+        thinking_stop_count: u32 = 0,
+        fn onEvent(ctx: *anyopaque, event: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .thinking_stop => self.thinking_stop_count += 1,
+                else => {},
+            }
+        }
+    };
+    var recorder: Recorder = .{};
+    const callback: llm.StreamCallback = .{ .ctx = &recorder, .on_event = &Recorder.onEvent };
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
+
+    const frames = [_]struct { event_type: []const u8, data: []const u8 }{
+        .{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+        },
+        .{
+            .event_type = "content_block_stop",
+            .data = "{\"type\":\"content_block_stop\",\"index\":0}",
+        },
+    };
+
+    for (frames) |f| {
+        try processSseEvent(
+            f.event_type,
+            f.data,
+            allocator,
+            &blocks,
+            &stop_reason,
+            &input_tokens,
+            &output_tokens,
+            &cache_creation_tokens,
+            &cache_read_tokens,
+            callback,
+        );
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), recorder.thinking_stop_count);
 }
 
 test "processSseEvent records signature_delta as signature replacement" {

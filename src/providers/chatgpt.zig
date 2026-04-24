@@ -894,6 +894,8 @@ const EventRecorder = struct {
                 .kind = .done,
                 .payload = self.allocator.dupe(u8, "") catch return,
             },
+            // Anthropic-only variants; chatgpt wire never produces these.
+            .thinking_delta, .thinking_stop => return,
             .err => |t| .{
                 .kind = .err,
                 .payload = self.allocator.dupe(u8, t) catch return,
@@ -1325,6 +1327,8 @@ const RecordingCallback = struct {
             .info => |t| .{ .kind = .info, .payload = self.alloc.dupe(u8, t) catch return },
             .done => .{ .kind = .done, .payload = self.alloc.dupe(u8, "") catch return },
             .err => |t| .{ .kind = .err, .payload = self.alloc.dupe(u8, t) catch return },
+            // Anthropic-only variants; chatgpt wire never produces these.
+            .thinking_delta, .thinking_stop => return,
         };
         self.events.append(self.alloc, tagged) catch {};
     }
