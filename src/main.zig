@@ -1370,6 +1370,7 @@ test {
     _ = @import("providers/chatgpt.zig");
     _ = @import("NodeRegistry.zig");
     _ = @import("buffers/scratch.zig");
+    _ = @import("buffers/graphics.zig");
     _ = @import("BufferRegistry.zig");
     _ = @import("Sink.zig");
     _ = @import("sinks/Null.zig");
