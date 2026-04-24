@@ -26,6 +26,7 @@ const Hooks = @import("Hooks.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
+const skills_mod = @import("skills.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
 
@@ -81,6 +82,12 @@ last_info_len: u8 = 0,
 /// Stays zero until the first composite that actually paints content.
 node_version_snapshot: u32 = 0,
 
+/// Optional filesystem-backed skill catalog. When non-null and non-empty
+/// the agent loop appends an `<available_skills>` block to every LLM
+/// request's system prompt. Null (the default) preserves the legacy
+/// system-prompt shape byte-for-byte.
+skills: ?*const skills_mod.SkillRegistry = null,
+
 /// Create a runner bound to `sink` and `session`. Neither is owned;
 /// the caller guarantees the sink outlives this runner's agent thread.
 pub fn init(
@@ -126,6 +133,13 @@ pub fn isAgentRunning(self: *const AgentRunner) bool {
 /// to wait for the thread to exit.
 pub fn cancelAgent(self: *AgentRunner) void {
     self.cancel_flag.store(true, .release);
+}
+
+/// Attach a filesystem-backed skill catalog. The registry is borrowed;
+/// the caller must outlive this runner. Passing null clears the
+/// attachment (and restores the legacy skills-free system prompt).
+pub fn attachSkills(self: *AgentRunner, registry: ?*const skills_mod.SkillRegistry) void {
+    self.skills = registry;
 }
 
 /// Spawn-time borrows needed by `submit`. Bundled so callers only pass
@@ -184,6 +198,7 @@ pub fn submit(
         deps.lua_engine,
         deps.provider_name,
         self.pane_handle_packed,
+        self.skills,
     });
 }
 
@@ -282,6 +297,7 @@ fn threadMain(
     lua_engine: ?*LuaEngine,
     provider_name: []const u8,
     pane_handle_packed: u32,
+    skills: ?*const skills_mod.SkillRegistry,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -295,7 +311,7 @@ fn threadMain(
     tools.current_caller_pane_id = pane_handle_packed;
     defer tools.current_caller_pane_id = null;
 
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine) catch |err| {
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
         // queue counter and `.done` is still pushed so the UI returns to

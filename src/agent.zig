@@ -9,6 +9,7 @@ const tools = @import("tools.zig");
 const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const LuaEngine = @import("LuaEngine.zig");
+const skills_mod = @import("skills.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -30,7 +31,16 @@ const system_prompt_suffix =
 ;
 
 /// Build the system prompt with tool descriptions from the registry.
-pub fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) ![]const u8 {
+/// When `skills` is non-null and holds at least one entry, an
+/// `<available_skills>` XML block is appended after the base prompt so
+/// the model can see the catalog of filesystem-backed skills. The block
+/// is name + description only; bodies are read on demand via the
+/// existing `read` tool against each skill's absolute path.
+pub fn buildSystemPrompt(
+    registry: *const tools.Registry,
+    allocator: Allocator,
+    skills: ?*const skills_mod.SkillRegistry,
+) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -47,6 +57,13 @@ pub fn buildSystemPrompt(registry: *const tools.Registry, allocator: Allocator) 
 
     try buf.appendSlice(allocator, system_prompt_suffix);
 
+    // Empty or null registry appends nothing: `catalog` early-returns on
+    // an empty list, keeping the prompt byte-identical to the old path.
+    if (skills) |s| {
+        try buf.append(allocator, '\n');
+        try s.catalog(buf.writer(allocator));
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -62,11 +79,12 @@ pub fn runLoopStreaming(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
+    skills: ?*const skills_mod.SkillRegistry,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
 
-    const prompt = try buildSystemPrompt(registry, allocator);
+    const prompt = try buildSystemPrompt(registry, allocator, skills);
     defer allocator.free(prompt);
 
     // Bind the Lua-tool queue for this thread so `executeToolsSingle` (which
@@ -686,6 +704,72 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "buildSystemPrompt omits available_skills when registry is null" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+
+    const prompt = try buildSystemPrompt(&registry, allocator, null);
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "You are an expert coding assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") == null);
+}
+
+test "buildSystemPrompt omits available_skills when registry is empty" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+
+    var skills: skills_mod.SkillRegistry = .{};
+    defer skills.deinit(allocator);
+
+    const prompt = try buildSystemPrompt(&registry, allocator, &skills);
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "You are an expert coding assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") == null);
+}
+
+test "buildSystemPrompt includes available_skills when registry has entries" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+
+    // Hand-populate a skill registry so no filesystem is touched; the
+    // registry owns every heap-allocated string via its deinit path.
+    var skills: skills_mod.SkillRegistry = .{};
+    defer skills.deinit(allocator);
+
+    const name_a = try allocator.dupe(u8, "roll-dice");
+    const desc_a = try allocator.dupe(u8, "Roll a die.");
+    const path_a = try allocator.dupe(u8, "/skills/roll-dice/SKILL.md");
+    try skills.skills.append(allocator, .{ .name = name_a, .description = desc_a, .path = path_a });
+
+    const name_b = try allocator.dupe(u8, "flip-coin");
+    const desc_b = try allocator.dupe(u8, "Flip a fair coin.");
+    const path_b = try allocator.dupe(u8, "/skills/flip-coin/SKILL.md");
+    try skills.skills.append(allocator, .{ .name = name_b, .description = desc_b, .path = path_b });
+
+    const prompt = try buildSystemPrompt(&registry, allocator, &skills);
+    defer allocator.free(prompt);
+
+    // Base prompt preserved.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "You are an expert coding assistant") != null);
+    // Catalog block emitted once with both entries.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "</available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "name=\"roll-dice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "name=\"flip-coin\"") != null);
+    // Catalog lives after the base prompt, not before it.
+    const base_idx = std.mem.indexOf(u8, prompt, "You are an expert coding assistant").?;
+    const skills_idx = std.mem.indexOf(u8, prompt, "<available_skills>").?;
+    try std.testing.expect(skills_idx > base_idx);
 }
 
 test "emitTokenUsage emits old two-field form when no cache counts" {
