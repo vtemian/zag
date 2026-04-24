@@ -318,18 +318,22 @@ pub const LuaEngine = struct {
         };
     }
 
-    /// Require every embedded `zag.builtin.*` module so the side effects
-    /// (slash command and keymap registrations) land in the engine's
-    /// registries. Must be called before `loadUserConfig` so a user's
-    /// `zag.command{name="model", fn=...}` override wins via the
-    /// command registry's last-write-wins semantics.
+    /// Require every embedded `zag.builtin.*` and `zag.layers.*` module
+    /// so the side effects (slash command registrations, keymap bindings,
+    /// prompt layer registrations) land in the engine's registries. Must
+    /// be called before `loadUserConfig` so a user's overrides win via
+    /// the command registry's last-write-wins semantics and so that
+    /// stable-class prompt layers register before the user's config has
+    /// a chance to trigger the first render.
     ///
     /// Failures are logged and swallowed; a broken builtin must never
     /// block engine startup.
     pub fn loadBuiltinPlugins(self: *LuaEngine) void {
         self.storeSelfPointer();
         for (embedded.entries) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "zag.builtin.")) continue;
+            const is_builtin = std.mem.startsWith(u8, entry.name, "zag.builtin.");
+            const is_layer = std.mem.startsWith(u8, entry.name, "zag.layers.");
+            if (!is_builtin and !is_layer) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -10082,6 +10086,114 @@ test "zag.prompt.for_model engine deinit frees table refs and names" {
     try std.testing.expectEqual(@as(usize, 7), engine.prompt_registry.layers.items.len);
 
     engine.deinit();
+}
+
+test "zag.layers.env emits environment block from LayerContext" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.layers.env')");
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = "/home/vlad/zag";
+    ctx.worktree = "/home/vlad/zag";
+    ctx.date_iso = "2026-04-22";
+    ctx.platform = "macos";
+    ctx.is_git_repo = true;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    const expected =
+        \\<environment>
+        \\cwd: /home/vlad/zag
+        \\date: 2026-04-22
+        \\platform: macos
+        \\git: yes
+        \\</environment>
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", expected) != null);
+}
+
+test "zag.layers.env omits worktree line when equal to cwd" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.layers.env')");
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = "/a/b";
+    ctx.worktree = "/a/b";
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    // `worktree:` would only appear when ctx.worktree differs from ctx.cwd.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.@"volatile", "worktree:"),
+    );
+}
+
+test "zag.layers.env emits worktree line when distinct from cwd" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.layers.env')");
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = "/repo/sub/dir";
+    ctx.worktree = "/repo";
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "worktree: /repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembled.@"volatile", "cwd: /repo/sub/dir") != null);
+}
+
+test "zag.layers.env omits git line when is_git_repo is false" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.layers.env')");
+
+    var ctx = fakePromptLayerContext();
+    ctx.is_git_repo = false;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.@"volatile", "git: yes"),
+    );
+}
+
+test "loadBuiltinPlugins eager-loads zag.layers.* entries" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Pre-load: the registry holds only the four built-in Zig layers
+    // that `LuaEngine.init` seeded.
+    try std.testing.expectEqual(@as(usize, 4), engine.prompt_registry.layers.items.len);
+
+    engine.loadBuiltinPlugins();
+
+    // Post-load: env layer should now be registered alongside the
+    // four Zig builtins.
+    var found_env = false;
+    for (engine.prompt_registry.layers.items) |layer| {
+        if (std.mem.eql(u8, layer.name, "env")) {
+            found_env = true;
+            try std.testing.expectEqual(prompt.CacheClass.@"volatile", layer.cache_class);
+            try std.testing.expectEqual(@as(i32, 10), layer.priority);
+        }
+    }
+    try std.testing.expect(found_env);
 }
 
 test "zag.parse_frontmatter returns fields and body" {
