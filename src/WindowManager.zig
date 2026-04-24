@@ -22,6 +22,7 @@ const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
+const BufferSink = @import("sinks/BufferSink.zig").BufferSink;
 const Viewport = @import("Viewport.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
@@ -88,6 +89,11 @@ pub const PaneEntry = struct {
     pane: Pane,
     /// Session handle for persistence, or null if persistence is unavailable.
     session_handle: ?*Session.SessionHandle = null,
+    /// Heap-allocated BufferSink backing this pane's runner. Owned by
+    /// the PaneEntry so the sink outlives the runner during teardown:
+    /// the runner is freed first (no more sink.push), then the sink
+    /// releases its correlation map, then the buffer it borrowed.
+    sink_storage: ?*BufferSink = null,
 };
 
 /// Heap allocator for runtime allocations.
@@ -266,6 +272,13 @@ pub fn deinit(self: *WindowManager) void {
         if (entry.pane.runner) |r| {
             r.deinit();
             self.allocator.destroy(r);
+        }
+        // BufferSink releases the correlation map. Freed after the runner
+        // (no more sink.push calls) and before the view (which the sink
+        // borrows a pointer to).
+        if (entry.sink_storage) |bs| {
+            bs.deinit();
+            self.allocator.destroy(bs);
         }
         if (entry.pane.provider) |p| {
             p.deinit();
@@ -909,8 +922,9 @@ pub fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
     return @intCast(written.len);
 }
 
-/// Create a new split pane: session + view + runner + optional persistence
-/// handle, tracked for cleanup. Returns the freshly composed `Pane`.
+/// Create a new split pane: session + view + sink + runner + optional
+/// persistence handle, tracked for cleanup. Returns the freshly
+/// composed `Pane`.
 pub fn createSplitPane(self: *WindowManager) !Pane {
     const cs = try self.allocator.create(ConversationHistory);
     errdefer self.allocator.destroy(cs);
@@ -925,9 +939,17 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
     errdefer cb.deinit();
 
+    // BufferSink is heap-allocated so the PaneEntry can free it during
+    // teardown after the runner is joined. Must be built before the
+    // runner so the runner's immutable sink handle is live from day one.
+    const bs = try self.allocator.create(BufferSink);
+    errdefer self.allocator.destroy(bs);
+    bs.* = BufferSink.init(self.allocator, cb);
+    errdefer bs.deinit();
+
     const runner = try self.allocator.create(AgentRunner);
     errdefer self.allocator.destroy(runner);
-    runner.* = AgentRunner.init(self.allocator, cb, cs);
+    runner.* = AgentRunner.init(self.allocator, bs.sink(), cs);
     errdefer runner.deinit();
 
     // Wake pipe so agent events on this pane interrupt the coordinator's
@@ -944,8 +966,9 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     const pane: Pane = .{ .buffer = cb.buf(), .view = cb, .session = cs, .runner = runner };
 
     // Register the entry before attaching the session handle so any
-    // subsequent `paneFromBuffer` call already sees this pane.
-    try self.extra_panes.append(self.allocator, .{ .pane = pane });
+    // subsequent `paneFromBuffer` call already sees this pane. The
+    // sink_storage slot carries ownership of the heap BufferSink.
+    try self.extra_panes.append(self.allocator, .{ .pane = pane, .sink_storage = bs });
 
     // The Pane now lives at its final address inside `extra_panes`, so
     // resolve the stable entry and wire the buffer's display-state
@@ -1350,13 +1373,21 @@ fn dumpTraceFile(self: *WindowManager) void {
     self.appendStatus(dump_msg);
 }
 
-/// Drain a pane's agent events and auto-name its session on first completion.
-/// Hook dispatch is folded into AgentRunner.drainEvents (dispatchHookRequests).
-/// Non-agent panes (no runner) have nothing to drain.
-pub fn drainPane(self: *WindowManager, pane: Pane) void {
+/// Drain a pane's agent events, snap the pane viewport to the bottom
+/// whenever any event was processed, and auto-name the session on first
+/// completion. Hook dispatch is folded into AgentRunner.drainEvents
+/// (dispatchHookRequests). Non-agent panes (no runner) have nothing to
+/// drain. The pane pointer must reference the pane's final stable
+/// storage (root_pane or an extra_panes entry) so the viewport write
+/// lands on the right slot.
+pub fn drainPane(self: *WindowManager, pane: *Pane) void {
     const runner = pane.runner orelse return;
-    if (runner.drainEvents(self.allocator)) {
-        self.autoNameSession(pane);
+    const result = runner.drainEvents(self.allocator);
+    if (result.any_drained) {
+        pane.viewport.setScrollOffset(0);
+    }
+    if (result.finished) {
+        self.autoNameSession(pane.*);
     }
 }
 
@@ -1430,6 +1461,19 @@ fn generateSessionName(
 test {
     @import("std").testing.refAllDecls(@This());
 }
+
+/// Test helper: drop-every-event Sink for tests that construct an
+/// AgentRunner without caring about its output channel.
+const Sink = @import("Sink.zig").Sink;
+const SinkEvent = @import("Sink.zig").Event;
+const TestNullSink = struct {
+    fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+    fn deinitVT(_: *anyopaque) void {}
+    const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+    fn sink() Sink {
+        return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+    }
+};
 
 test "formatSplitAnnounce writes the standard announce for id 1" {
     var buf: [64]u8 = undefined;
@@ -1509,7 +1553,7 @@ test "Pane composes view + session + runner" {
     }
 
     const runner = try allocator.create(AgentRunner);
-    runner.* = AgentRunner.init(allocator, view, session);
+    runner.* = AgentRunner.init(allocator, TestNullSink.sink(), session);
     defer {
         runner.deinit();
         allocator.destroy(runner);
@@ -1517,12 +1561,11 @@ test "Pane composes view + session + runner" {
 
     const pane: Pane = .{ .buffer = view.buf(), .view = view, .session = session, .runner = runner };
 
-    // All three objects are reachable through the Pane. Runner sees the
-    // same view pointer; view sees its own name.
+    // All three objects are reachable through the Pane. The runner holds
+    // the session directly; the view lives on the pane.
     try std.testing.expectEqual(view, pane.view.?);
     try std.testing.expectEqual(session, pane.session.?);
     try std.testing.expectEqual(runner, pane.runner.?);
-    try std.testing.expectEqual(view, pane.runner.?.view);
     try std.testing.expectEqual(session, pane.runner.?.session);
     try std.testing.expectEqualStrings("pane-test", pane.view.?.name);
 }
@@ -1541,7 +1584,7 @@ test "extra pane viewport is attached to its buffer" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1595,7 +1638,7 @@ test "WindowManager exposes a NodeRegistry" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1643,7 +1686,7 @@ test "focus by handle updates focused leaf" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1700,7 +1743,7 @@ test "focus by handle rejects stale id" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1744,7 +1787,7 @@ test "splitById creates a new leaf and returns its handle" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1803,7 +1846,7 @@ test "closeById removes a leaf and keeps the sibling" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1859,7 +1902,7 @@ test "closeById rejects the caller's own pane" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1912,7 +1955,7 @@ test "resizeById applies ratio to parent split" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -1977,7 +2020,7 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2031,7 +2074,7 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2085,7 +2128,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2167,7 +2210,7 @@ test "handleLayoutRequest split rejects stale buffer handle" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2231,7 +2274,7 @@ test "describe emits parseable node map" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2292,7 +2335,7 @@ test "executeAction focus_left goes through handle path" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2357,7 +2400,7 @@ test "executeAction lua_callback runs the Lua function via the engine" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2410,7 +2453,7 @@ test "executeAction lua_callback without an engine is a no-op" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2461,7 +2504,7 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2540,7 +2583,7 @@ test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form wo
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2612,7 +2655,7 @@ test "zag.layout.split rejects a malformed buffer handle string" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2672,7 +2715,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2788,7 +2831,7 @@ test "readPaneById returns rendered text with metadata" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
 
@@ -2889,7 +2932,7 @@ test "restorePane rebuilds both tree and messages" {
     defer scb.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "restored");
     defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &scb);
     defer runner.deinit();
 
     const pane: Pane = .{ .buffer = cb.buf(), .view = &cb, .session = &scb, .runner = &runner };
@@ -2977,7 +3020,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
 
     f.session = ConversationHistory.init(allocator);
     f.view = try ConversationBuffer.init(allocator, 0, "root");
-    f.runner = AgentRunner.init(allocator, &f.view, &f.session);
+    f.runner = AgentRunner.init(allocator, TestNullSink.sink(), &f.session);
     f.layout = Layout.init(allocator);
 
     f.wm = .{
@@ -3330,7 +3373,7 @@ const ModelPickerPluginFixture = struct {
         errdefer self.session.deinit();
         self.view = try ConversationBuffer.init(allocator, 0, "root");
         errdefer self.view.deinit();
-        self.runner = AgentRunner.init(allocator, &self.view, &self.session);
+        self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.session);
         errdefer self.runner.deinit();
 
         self.screen = try Screen.init(allocator, 80, 24);

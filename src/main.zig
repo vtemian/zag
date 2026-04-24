@@ -28,6 +28,7 @@ const types = @import("types.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const oauth = @import("oauth.zig");
 const embedded = @import("lua/embedded.zig");
+const BufferSink = @import("sinks/BufferSink.zig").BufferSink;
 
 const log = std.log.scoped(.main);
 
@@ -537,7 +538,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     const system_prompt = try agent.buildSystemPrompt(deps.registry, gpa);
     defer gpa.free(system_prompt);
 
-    try deps.runner.submitInput(instruction, gpa);
+    try deps.runner.submitInput(instruction);
 
     var capture = Trajectory.Capture.init(gpa);
     defer capture.deinit();
@@ -726,7 +727,13 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
     var root_buffer = try ConversationBuffer.init(gpa, 0, "session");
     defer root_buffer.deinit();
 
-    var root_runner = AgentRunner.init(gpa, &root_buffer, &root_session);
+    // BufferSink owns the node-correlation state that used to live on
+    // the runner. Its lifetime matches main's defer chain, so it stays
+    // on the stack rather than in a heap slot.
+    var root_buffer_sink = BufferSink.init(gpa, &root_buffer);
+    defer root_buffer_sink.deinit();
+
+    var root_runner = AgentRunner.init(gpa, root_buffer_sink.sink(), &root_session);
     defer root_runner.deinit();
 
     const wake_fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
@@ -1107,7 +1114,13 @@ pub fn main() !void {
     var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
     defer root_buffer.deinit();
 
-    var root_runner = AgentRunner.init(allocator, &root_buffer, &root_session);
+    // BufferSink owns the node-correlation state that used to live on
+    // the runner. Its lifetime matches main's defer chain, so it stays
+    // on the stack rather than in a heap slot.
+    var root_buffer_sink = BufferSink.init(allocator, &root_buffer);
+    defer root_buffer_sink.deinit();
+
+    var root_runner = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_session);
     defer root_runner.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH

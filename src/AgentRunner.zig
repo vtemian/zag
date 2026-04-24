@@ -1,19 +1,17 @@
 //! AgentRunner: agent thread lifecycle and event coordination.
 //!
-//! Coordinates between the view (ConversationBuffer) and the session
-//! (ConversationHistory). Owns the agent thread, event queue, cancel
-//! flag, Lua engine pointer, and streaming/correlation state that
-//! bridges LLM call IDs to view tree nodes.
+//! Owns the agent thread, event queue, cancel flag, Lua engine pointer,
+//! and the Sink output channel. Persists turn events to the session via
+//! a borrowed `*ConversationHistory`. Display mutations flow through
+//! `sink.push(...)`; the runner no longer touches any view directly.
 //!
-//! Session↔tree sync invariant: every append to `session.messages`
-//! pairs with an append to `view.tree.root_children`. `submitInput` is
-//! the canonical join point for user turns (session.appendUserMessage
-//! + view.appendUserNode); tool_result events correlate to their
-//! tool_use by call_id via a HashMap on this struct. Tree and session
-//! may briefly diverge during streaming (deltas land on the tree
-//! before the whole assistant message is committed to the session),
-//! but `persist*` calls at turn boundaries close the gap before the
-//! next turn begins.
+//! `submitInput` is the canonical join point for user turns: it appends
+//! to the session history, persists the user message, and pushes a
+//! `run_start` event on the sink. Content events produced by the agent
+//! thread (text deltas, tool use/results, errors) are pulled from the
+//! in-memory queue by `drainEvents` on the main thread and translated
+//! into `Sink.Event`s; session persistence stays inline, independent of
+//! the sink.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -28,16 +26,20 @@ const Hooks = @import("Hooks.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
-const Node = ConversationBuffer.Node;
+const Sink = @import("Sink.zig").Sink;
+const SinkEvent = @import("Sink.zig").Event;
 
 const AgentRunner = @This();
 
-/// View this runner updates. Borrowed; the orchestrator owns the lifetime.
-view: *ConversationBuffer,
+/// Output channel for content events. Immutable after init. The sink
+/// owns any node-correlation state (current assistant node, call_id
+/// map); the runner holds only this pointer-with-vtable.
+sink: Sink,
 /// Session state this runner persists into. Borrowed; the orchestrator
 /// owns the lifetime.
 session: *ConversationHistory,
-/// Allocator for pending_tool_calls keys and any transient runner state.
+/// Heap allocator for transient runner state (event payload dups from
+/// the worker thread, last_info scratch, error formatting).
 allocator: Allocator,
 
 /// Background agent thread, if one is running.
@@ -68,13 +70,6 @@ window_manager: ?*WindowManager = null,
 /// main wires it, or a fresh split before `doSplit` links the leaf).
 pane_handle_packed: u32 = 0,
 
-/// Pending tool_call nodes keyed by call_id, for parenting tool_result
-/// nodes. Supports parallel tool execution where events interleave.
-pending_tool_calls: std.StringHashMap(*Node) = undefined,
-/// Current assistant text node being streamed to.
-current_assistant_node: ?*Node = null,
-/// Fallback for tool_start events without a call_id (streaming previews).
-last_tool_call: ?*Node = null,
 /// Last info message (token counts) for status bar display.
 last_info: [128]u8 = .{0} ** 128,
 /// Length of the last info message.
@@ -86,28 +81,26 @@ last_info_len: u8 = 0,
 /// Stays zero until the first composite that actually paints content.
 node_version_snapshot: u32 = 0,
 
-/// Create a runner bound to `view` and `session`. Neither is owned.
+/// Create a runner bound to `sink` and `session`. Neither is owned;
+/// the caller guarantees the sink outlives this runner's agent thread.
 pub fn init(
     allocator: Allocator,
-    view: *ConversationBuffer,
+    sink: Sink,
     session: *ConversationHistory,
 ) AgentRunner {
     return .{
         .allocator = allocator,
-        .view = view,
+        .sink = sink,
         .session = session,
-        .pending_tool_calls = std.StringHashMap(*Node).init(allocator),
     };
 }
 
 /// Release runner-owned state. Joins the agent thread and tears down
-/// the event queue if either is live. Does not deinit `view` or
-/// `session`; the orchestrator owns those.
+/// the event queue if either is live. Does not deinit the sink or
+/// the session; the owner that constructed them frees them after the
+/// runner's thread is joined.
 pub fn deinit(self: *AgentRunner) void {
     self.shutdown();
-    var it = self.pending_tool_calls.keyIterator();
-    while (it.next()) |key| self.allocator.free(@constCast(key.*));
-    self.pending_tool_calls.deinit();
 }
 
 /// Cancel and join the agent thread if running. Tear down the event
@@ -350,30 +343,15 @@ pub fn droppedEventCount(self: *const AgentRunner) u64 {
     return self.event_queue.dropped.load(.monotonic);
 }
 
-/// Reset streaming/correlation state so the next agent run renders from
-/// a clean slate. Does not touch the pending_tool_calls map, which must
-/// be empty at this point (otherwise there's a correlation leak and the
-/// next run would reparent tool_results under stale nodes).
-pub fn resetStreamingState(self: *AgentRunner) void {
-    self.current_assistant_node = null;
-    self.last_tool_call = null;
-}
-
-/// Submit user input: record it on the session history, paint a user
-/// node on the view, persist a JSONL entry, and reset streaming state
-/// so the next agent run starts from a clean UI. The view and session
-/// are coordinated here rather than on either half alone.
-///
-/// The runner does not spawn the agent thread. Agent lifecycle belongs
-/// to the orchestrator, which calls this method and then decides
-/// whether to start the agent.
-pub fn submitInput(self: *AgentRunner, text: []const u8, allocator: Allocator) !void {
-    _ = allocator;
-
+/// Submit user input: record it on the session history, persist a
+/// JSONL entry, and push a `run_start` event so the sink can paint a
+/// user node (or otherwise surface the turn). The runner does not
+/// spawn the agent thread; the orchestrator calls this method and
+/// then decides whether to start the agent.
+pub fn submitInput(self: *AgentRunner, text: []const u8) !void {
     try self.session.appendUserMessage(text);
-    _ = try self.view.appendUserNode(text);
     self.session.persistUserMessage(text);
-    self.resetStreamingState();
+    self.sink.push(.{ .run_start = .{ .user_text = text } });
 }
 
 /// Pull any hook_request events out of the queue and service them on the
@@ -454,18 +432,28 @@ pub fn dispatchHookRequests(
     queue.tail = write;
 }
 
-/// Drain pending agent events. Returns true if the agent finished this frame.
-pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
-    if (self.agent_thread == null) return false;
+/// Outcome of a per-tick drain. `any_drained` is true when at least one
+/// event was processed this tick (used by the orchestrator to snap the
+/// pane viewport to the bottom). `finished` is true when a `.done`
+/// event arrived and the worker thread has been joined (used by the
+/// window manager to trigger session auto-naming).
+pub const DrainResult = struct {
+    any_drained: bool = false,
+    finished: bool = false,
+};
+
+/// Drain pending agent events.
+pub fn drainEvents(self: *AgentRunner, allocator: Allocator) DrainResult {
+    if (self.agent_thread == null) return .{};
 
     dispatchHookRequests(&self.event_queue, self.lua_engine, self.window_manager);
 
     var drain: [64]agent_events.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
-    var finished = false;
+    var result: DrainResult = .{};
 
     for (drain[0..count]) |event| {
-        self.view.buf().setScrollOffset(0);
+        result.any_drained = true;
         self.handleAgentEvent(event, allocator);
 
         if (event == .done) {
@@ -473,26 +461,17 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
             self.agent_thread = null;
             self.event_queue.deinit();
             self.queue_active = false;
-            finished = true;
+            result.finished = true;
         }
     }
 
-    return finished;
+    return result;
 }
 
-/// Discard the in-progress assistant text node. Used when a partial
-/// streamed response is being replaced by a non-streaming fallback:
-/// the UI rebuilds from a clean state when the next text_delta arrives.
-pub fn resetCurrentAssistantText(self: *AgentRunner) void {
-    const node = self.current_assistant_node orelse return;
-    self.current_assistant_node = null;
-    // Delegates through the tree so generation bumps and the removed
-    // id lands in `dirty_nodes` for the compositor's cache drain.
-    self.view.tree.removeNode(node);
-}
-
-/// Process a single agent event: update the view tree and persist to
-/// session. Fires post-hooks into the Lua engine when one is attached.
+/// Process a single agent event: translate content into sink events
+/// and persist to session. Fires post-hooks into the Lua engine when
+/// one is attached. The sink owns all node-correlation state; the
+/// runner just forwards the event payload.
 pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allocator: Allocator) void {
     switch (event) {
         .text_delta => |text| {
@@ -505,16 +484,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                     break :blk null;
                 };
             }
-            if (self.current_assistant_node) |node| {
-                self.view.appendToNode(node, text) catch |err| {
-                    log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
-                };
-            } else {
-                self.current_assistant_node = self.view.appendNode(null, .assistant_text, text) catch |err| blk: {
-                    log.warn("dropped assistant text delta: {s}", .{@errorName(err)});
-                    break :blk null;
-                };
-            }
+            self.sink.push(.{ .assistant_delta = .{ .text = text } });
             self.session.persistEvent(.{
                 .entry_type = .assistant_text,
                 .content = text,
@@ -527,17 +497,12 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         .tool_start => |ev| {
             defer allocator.free(ev.name);
             defer if (ev.input_raw) |raw| allocator.free(raw);
-            self.current_assistant_node = null;
-            const node = self.view.appendNode(null, .tool_call, ev.name) catch null;
-            self.last_tool_call = node;
-            // If we have a call_id, store in the map for result correlation
-            if (ev.call_id) |id| {
-                if (node) |n| {
-                    self.pending_tool_calls.put(id, n) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
-                } else {
-                    allocator.free(id);
-                }
-            }
+            defer if (ev.call_id) |id| allocator.free(id);
+            self.sink.push(.{ .tool_use = .{
+                .name = ev.name,
+                .call_id = ev.call_id,
+                .input_raw = ev.input_raw,
+            } });
             self.session.persistEvent(.{
                 .entry_type = .tool_call,
                 .tool_name = ev.name,
@@ -549,18 +514,12 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         },
         .tool_result => |result| {
             defer allocator.free(result.content);
-            // Find the parent tool_call node: by call_id if available, else fallback
-            const parent = if (result.call_id) |id| blk: {
-                const removed = self.pending_tool_calls.fetchRemove(id);
-                // Free both the lookup key (from tool_result) and stored key (from tool_start)
-                allocator.free(id);
-                if (removed) |kv| {
-                    allocator.free(@constCast(kv.key));
-                    break :blk kv.value;
-                }
-                break :blk self.last_tool_call;
-            } else self.last_tool_call;
-            _ = self.view.appendNode(parent, .tool_result, result.content) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
+            defer if (result.call_id) |id| allocator.free(id);
+            self.sink.push(.{ .tool_result = .{
+                .content = result.content,
+                .is_error = result.is_error,
+                .call_id = result.call_id,
+            } });
             self.session.persistEvent(.{
                 .entry_type = .tool_result,
                 .content = result.content,
@@ -586,9 +545,9 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                     break :blk null;
                 };
             }
-            self.current_assistant_node = null;
+            self.sink.push(.run_end);
         },
-        .reset_assistant_text => self.resetCurrentAssistantText(),
+        .reset_assistant_text => self.sink.push(.assistant_reset),
         .err => |text| {
             defer allocator.free(text);
             if (self.lua_engine) |eng| {
@@ -598,7 +557,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                     break :blk null;
                 };
             }
-            _ = self.view.appendNode(null, .err, text) catch |err| log.warn("dropped event: {s}", .{@errorName(err)});
+            self.sink.push(.{ .error_event = .{ .text = text } });
             self.session.persistEvent(.{
                 .entry_type = .err,
                 .content = text,
@@ -625,116 +584,167 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-test "resetCurrentAssistantText removes the in-progress node" {
+/// Test helper: captures every Sink.Event the runner pushes so tests can
+/// assert on sequence/shape. Event payloads that the runner frees
+/// immediately after `push` (text_delta content, tool names, call_ids,
+/// tool_result content, error text) are duped on capture so tests can
+/// inspect them after control returns from `handleAgentEvent`.
+const MockSink = struct {
+    events: std.ArrayList(SinkEvent) = .empty,
+    owned: std.ArrayList([]u8) = .empty,
+    alloc: Allocator,
+
+    fn dupe(self: *MockSink, s: []const u8) []const u8 {
+        const copy = self.alloc.dupe(u8, s) catch return s;
+        self.owned.append(self.alloc, copy) catch {
+            self.alloc.free(copy);
+            return s;
+        };
+        return copy;
+    }
+
+    fn dupeOpt(self: *MockSink, s: ?[]const u8) ?[]const u8 {
+        return if (s) |x| self.dupe(x) else null;
+    }
+
+    fn pushVT(ptr: *anyopaque, e: SinkEvent) void {
+        const self: *MockSink = @ptrCast(@alignCast(ptr));
+        const captured: SinkEvent = switch (e) {
+            .run_start => |ev| .{ .run_start = .{ .user_text = self.dupe(ev.user_text) } },
+            .assistant_delta => |ev| .{ .assistant_delta = .{ .text = self.dupe(ev.text) } },
+            .assistant_reset => .assistant_reset,
+            .tool_use => |ev| .{ .tool_use = .{
+                .name = self.dupe(ev.name),
+                .call_id = self.dupeOpt(ev.call_id),
+                .input_raw = self.dupeOpt(ev.input_raw),
+            } },
+            .tool_result => |ev| .{ .tool_result = .{
+                .content = self.dupe(ev.content),
+                .is_error = ev.is_error,
+                .call_id = self.dupeOpt(ev.call_id),
+            } },
+            .run_end => .run_end,
+            .error_event => |ev| .{ .error_event = .{ .text = self.dupe(ev.text) } },
+        };
+        self.events.append(self.alloc, captured) catch {};
+    }
+    fn deinitVT(_: *anyopaque) void {}
+    const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+
+    pub fn init(alloc: Allocator) MockSink {
+        return .{ .alloc = alloc };
+    }
+    pub fn sink(self: *MockSink) Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    pub fn deinit(self: *MockSink) void {
+        for (self.owned.items) |s| self.alloc.free(s);
+        self.owned.deinit(self.alloc);
+        self.events.deinit(self.alloc);
+    }
+};
+
+/// Null sink helper for tests that do not observe output.
+const NullSink = struct {
+    fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+    fn deinitVT(_: *anyopaque) void {}
+    const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+    pub fn sink() Sink {
+        // ptr is unused; pass a non-null dummy so @ptrCast/@alignCast on
+        // ptr in the vtable is well-formed if an implementation ever
+        // inspects it. Using a pointer to the vtable itself is convenient
+        // and harmless since no vtable method reads through it.
+        return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+    }
+};
+
+test "handleAgentEvent .reset_assistant_text pushes assistant_reset" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-test");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    _ = try cb.appendNode(null, .user_message, "hi");
-    const partial = try cb.appendNode(null, .assistant_text, "partial ");
-    runner.current_assistant_node = partial;
+    runner.handleAgentEvent(.reset_assistant_text, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
-
-    runner.resetCurrentAssistantText();
-
-    try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[0].node_type);
+    try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
+    try std.testing.expectEqual(SinkEvent.assistant_reset, std.meta.activeTag(mock.events.items[0]));
 }
 
-test "resetCurrentAssistantText is a no-op when nothing is in progress" {
+test "text_delta emits assistant_delta sink event" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-noop");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    _ = try cb.appendNode(null, .user_message, "hi");
-
-    runner.resetCurrentAssistantText();
-
-    try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
-}
-
-test "text_delta after reset starts a fresh assistant node" {
-    const allocator = std.testing.allocator;
-    var scb = ConversationHistory.init(allocator);
-    defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "reset-flow");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
-    defer runner.deinit();
-
-    // Simulate a partial stream: two text deltas append to one node.
+    // Two deltas followed by a reset then a third delta. The runner just
+    // forwards each event; node-correlation is the sink's responsibility.
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "wor") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello wor", cb.tree.root_children.items[0].content.items);
-
-    // Fallback: reset, then push the full response.
     runner.handleAgentEvent(.reset_assistant_text, allocator);
-    try std.testing.expectEqual(@as(usize, 0), cb.tree.root_children.items.len);
-    try std.testing.expect(runner.current_assistant_node == null);
-
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
-    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
-    try std.testing.expectEqualStrings("Hello world", cb.tree.root_children.items[0].content.items);
+
+    try std.testing.expectEqual(@as(usize, 4), mock.events.items.len);
+    try std.testing.expectEqualStrings("Hello ", mock.events.items[0].assistant_delta.text);
+    try std.testing.expectEqualStrings("wor", mock.events.items[1].assistant_delta.text);
+    try std.testing.expectEqual(SinkEvent.assistant_reset, std.meta.activeTag(mock.events.items[2]));
+    try std.testing.expectEqualStrings("Hello world", mock.events.items[3].assistant_delta.text);
 }
 
-test "handleAgentEvent correlates tool_result to tool_start via call_id" {
+test "handleAgentEvent .tool_start emits a tool_use sink event" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "tool-corr");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    // First tool_start with call_id "A"
     runner.handleAgentEvent(.{ .tool_start = .{
         .name = try allocator.dupe(u8, "bash"),
         .call_id = try allocator.dupe(u8, "A"),
     } }, allocator);
 
-    // Second tool_start with call_id "B"
-    runner.handleAgentEvent(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, "read"),
-        .call_id = try allocator.dupe(u8, "B"),
-    } }, allocator);
+    try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
+    const ev = mock.events.items[0].tool_use;
+    try std.testing.expectEqualStrings("bash", ev.name);
+    try std.testing.expect(ev.call_id != null);
+    try std.testing.expectEqualStrings("A", ev.call_id.?);
+}
 
-    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
-    try std.testing.expectEqual(@as(u32, 2), runner.pending_tool_calls.count());
+test "handleAgentEvent .tool_result emits a tool_result sink event" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
 
-    // tool_result for "B" (out-of-order vs starts) should parent under tool B
     runner.handleAgentEvent(.{ .tool_result = .{
         .call_id = try allocator.dupe(u8, "B"),
         .content = try allocator.dupe(u8, "result B"),
         .is_error = false,
     } }, allocator);
 
-    const tool_b_node = cb.tree.root_children.items[1];
-    try std.testing.expectEqual(@as(usize, 1), tool_b_node.children.items.len);
-    try std.testing.expectEqualStrings("result B", tool_b_node.children.items[0].content.items);
-    // Pending map no longer contains "B", still contains "A"
-    try std.testing.expectEqual(@as(u32, 1), runner.pending_tool_calls.count());
-    try std.testing.expect(runner.pending_tool_calls.get("A") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
+    const ev = mock.events.items[0].tool_result;
+    try std.testing.expectEqualStrings("result B", ev.content);
+    try std.testing.expect(ev.call_id != null);
+    try std.testing.expectEqualStrings("B", ev.call_id.?);
+    try std.testing.expect(!ev.is_error);
 }
 
 test "wake_fd default is null" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "wake-default");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
 
     try std.testing.expect(runner.wake_fd == null);
@@ -746,9 +756,7 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "wake-propagate");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
 
     runner.wake_fd = 777;
@@ -878,42 +886,31 @@ test "text_delta fires post-hook with text" {
     engine.lua.pop(1);
 }
 
-test "submitInput records user message on session, tree, and resets streaming" {
+test "submitInput pushes run_start and persists via session" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "submit-runner");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    // Seed streaming state; submit must clear it before returning.
-    const stale = try cb.appendNode(null, .assistant_text, "stale");
-    runner.current_assistant_node = stale;
-
-    try runner.submitInput("hi", allocator);
-
-    // Streaming state cleared.
-    try std.testing.expect(runner.current_assistant_node == null);
-    try std.testing.expect(runner.last_tool_call == null);
-
-    // Tree got the stale assistant_text plus the new user_message.
-    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, cb.tree.root_children.items[1].node_type);
-    try std.testing.expectEqualStrings("hi", cb.tree.root_children.items[1].content.items);
+    try runner.submitInput("hi");
 
     // Session has one user message with a single text block.
     try std.testing.expectEqual(@as(usize, 1), scb.messages.items.len);
     try std.testing.expectEqualStrings("hi", scb.messages.items[0].content[0].text.text);
+
+    // Sink received a single run_start with the expected user_text.
+    try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
+    try std.testing.expectEqualStrings("hi", mock.events.items[0].run_start.user_text);
 }
 
 test "drainEvents joins thread and deinits queue on .done" {
     const allocator = std.testing.allocator;
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
-    var cb = try ConversationBuffer.init(allocator, 0, "drain-test");
-    defer cb.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &scb);
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
 
     // Simulate the spawn setup without a real agent thread: just the queue.
@@ -929,9 +926,10 @@ test "drainEvents joins thread and deinits queue on .done" {
     // Push a done event
     try runner.event_queue.push(.done);
 
-    const finished = runner.drainEvents(allocator);
+    const result = runner.drainEvents(allocator);
 
-    try std.testing.expect(finished);
+    try std.testing.expect(result.finished);
+    try std.testing.expect(result.any_drained);
     try std.testing.expect(runner.agent_thread == null);
     try std.testing.expect(!runner.queue_active);
 }
@@ -1043,7 +1041,7 @@ test "node_version_snapshot starts at zero; compositor sync advances it" {
     defer cb.deinit();
     var history = ConversationHistory.init(allocator);
     defer history.deinit();
-    var runner = AgentRunner.init(allocator, &cb, &history);
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &history);
     defer runner.deinit();
 
     // Default: runner hasn't observed any composite yet.
