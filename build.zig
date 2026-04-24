@@ -56,6 +56,38 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zag");
     run_step.dependOn(&run_cmd.step);
 
+    // --- zag-sim ------------------------------------------------------------
+    const sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sim_mod.addImport("build_options", build_options.createModule());
+    if (b.lazyDependency("ghostty", .{})) |dep| {
+        sim_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    }
+    sim_mod.link_libc = true;
+    if (target.result.os.tag == .linux) {
+        sim_mod.linkSystemLibrary("util", .{});
+    }
+
+    const sim_exe = b.addExecutable(.{
+        .name = "zag-sim",
+        .root_module = sim_mod,
+    });
+    b.installArtifact(sim_exe);
+
+    const sim_run_cmd = b.addRunArtifact(sim_exe);
+    sim_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| sim_run_cmd.addArgs(args);
+    const sim_run_step = b.step("sim", "Run zag-sim");
+    sim_run_step.dependOn(&sim_run_cmd.step);
+
+    const sim_tests = b.addTest(.{ .root_module = sim_mod });
+    const run_sim_tests = b.addRunArtifact(sim_tests);
+    const sim_test_step = b.step("test-sim", "Run zag-sim unit + non-zag tests");
+    sim_test_step.dependOn(&run_sim_tests.step);
+
     const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
     const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
     script.addArtifactArg(exe);
