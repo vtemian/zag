@@ -1413,6 +1413,7 @@ test {
     _ = @import("ulid.zig");
     _ = @import("frontmatter.zig");
     _ = @import("skills.zig");
+    _ = @import("subagents.zig");
     _ = @import("Harness.zig");
 }
 
