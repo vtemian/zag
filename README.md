@@ -12,16 +12,16 @@ Think Neovim's architecture, applied to AI agents.
 
 ## Current state
 
-~39,500 lines of Zig across 34 files. One external dependency (ziglua, for Lua 5.4). ~8.4 MB release binary.
-
 What actually runs today:
 
 - Full-screen TUI with vim-style modal editing and binary-tree window splits
 - Per-pane agent loop with streaming, cooperative cancellation, and per-turn steering hooks
+- Runtime model switching: `/model` opens a numbered picker that swaps provider + model live, mid-session, without restart
 - Crash-safe session persistence (append-only JSONL, fsync per append, atomic metadata rename)
-- Five providers through two serializers: Anthropic, OpenAI, OpenRouter, Groq, Ollama
-- Four built-in tools: `read`, `write`, `edit`, `bash`. Multiple tool calls in a single turn run in parallel
-- Neovim-style Lua plugin surface: tools, hooks, keymaps
+- Seven providers through two wire formats: Anthropic, Anthropic OAuth (Claude Max/Pro), OpenAI, OpenAI OAuth (ChatGPT sign-in), OpenRouter, Groq, Ollama
+- Built-in tools: `read`, `write`, `edit`, `bash`, plus window-tree tools (`layout_tree`, `layout_focus`, `layout_split`, `layout_close`, `layout_resize`) that let the agent see and restructure your workspace. Multiple tool calls in a single turn run in parallel
+- Neovim-style Lua plugin surface: tools, hooks, keymaps, provider definitions
+- Async plugin runtime with coroutine-friendly primitives for HTTP, subprocess, filesystem, timers, and task combinators
 - Span-based metrics framework with Chrome Trace Event output, compile-time toggled
 
 ## Running it
@@ -44,25 +44,28 @@ On a clean machine, `zig build run` drops you into an interactive onboarding wiz
 ```
 zag needs a provider. Choose one:
 
-  > OpenAI       (OAuth · ChatGPT sign-in · recommended)
-    OpenAI       (API key)
-    Anthropic    (API key)
-    OpenRouter   (API key)
-    Groq         (API key)
+  > anthropic       (API key)      anthropic/claude-sonnet-4-20250514
+    anthropic-oauth (OAuth)        anthropic-oauth/claude-sonnet-4-20250514
+    openai          (API key)      openai/gpt-4o
+    openai-oauth    (OAuth)        openai-oauth/gpt-5.2
+    openrouter      (API key)      openrouter/anthropic/claude-sonnet-4
+    groq            (API key)      groq/llama-3.3-70b-versatile
+    ollama          (no credential) ollama/llama3
 
 ↑/↓ to navigate · Enter to select · Esc to abort
 ```
 
-The recommended entry is **OpenAI (OAuth · ChatGPT sign-in)**. It uses a browser sign-in, so there is no key to paste and no dashboard to visit. The remaining four entries use long-lived API keys.
+API-key rows prompt for a paste with echo disabled. OAuth rows open your browser to the provider's authorize endpoint, catch the callback on `localhost`, and store the resulting tokens in `~/.config/zag/auth.json` (mode `0600`). The Ollama row needs no credential at all.
 
-Two flows, depending on which entry you pick:
-
-- **OAuth** (`openai-oauth`): zag opens your default browser to `auth.openai.com`, you sign in with your ChatGPT account, the OAuth callback hits `localhost:1455`, and zag stores the resulting tokens in `~/.config/zag/auth.json` (mode `0600`). The wizard then scaffolds `~/.config/zag/config.lua` and continues into the TUI.
-- **API key**: zag prompts for the key with terminal echo disabled, writes `~/.config/zag/auth.json` atomically (mode `0600`), and scaffolds a matching `~/.config/zag/config.lua` with `zag.set_default_model(...)` pointing at a sensible default. Then it continues into the TUI.
-
-Supported providers today: `openai-oauth` (recommended), `openai`, `anthropic`, `openrouter`, `groq`. Ollama is keyless, does not appear in the picker, and can be enabled by editing `config.lua` directly.
+Once a provider is picked the wizard shows a second picker for the model (the row flagged `(recommended)` starts pre-selected), scaffolds `~/.config/zag/config.lua` with `zag.set_default_model(...)`, and continues into the TUI.
 
 If you already have a `config.lua` the wizard leaves it alone and only writes `auth.json`.
+
+## Runtime model switching
+
+Inside the TUI, type `/model` at the prompt to open a numbered picker listing every `provider/model` pair currently registered. Select one and zag cancels the in-flight agent turn, drains the provider cleanly (with a 5 s safety cap), rebuilds the provider result, and resumes the same session with the new model. No restart, no lost history.
+
+This pairs naturally with adding your own provider definitions in `config.lua` — new entries show up in the picker automatically.
 
 ## Headless mode (harbor / Terminal-Bench)
 
@@ -86,18 +89,21 @@ Zag reads two files on startup, both under `~/.config/zag/`:
 Example `config.lua`:
 
 ```lua
-require("zag.providers.openai")
-zag.set_default_model("openai/gpt-4o")
+require("zag.providers.openai-oauth")
+require("zag.providers.anthropic")
+zag.set_default_model("openai-oauth/gpt-5.2")
 ```
 
 `auth.json` schema (managed for you):
 
 ```json
 {
-  "anthropic":  { "type": "api_key", "key": "sk-ant-..." },
-  "openai":     { "type": "api_key", "key": "sk-..." },
-  "openrouter": { "type": "api_key", "key": "sk-or-..." },
-  "groq":       { "type": "api_key", "key": "gsk_..." }
+  "anthropic":       { "type": "api_key", "key": "sk-ant-..." },
+  "openai":          { "type": "api_key", "key": "sk-..." },
+  "openrouter":      { "type": "api_key", "key": "sk-or-..." },
+  "groq":            { "type": "api_key", "key": "gsk_..." },
+  "openai-oauth":    { "type": "oauth", "access_token": "...", "refresh_token": "..." },
+  "anthropic-oauth": { "type": "oauth", "access_token": "...", "refresh_token": "..." }
 }
 ```
 
@@ -106,12 +112,12 @@ zag.set_default_model("openai/gpt-4o")
 Manage provider credentials with the `zag auth` subcommands. Each runs the same atomic, mode-`0600` write path as the first-run wizard, so `auth.json` never ends up partially written.
 
 ```bash
-zag auth login <provider>    # add or replace a credential (openai-oauth, openai, anthropic, openrouter, groq)
+zag auth login <provider>    # add or replace a credential
 zag auth list                # list configured providers with masked keys
 zag auth remove <provider>   # delete a credential
 ```
 
-`zag auth login openai-oauth` triggers the browser OAuth flow described above; `zag auth login <other>` prompts for a key paste with echo disabled. Either form is the canonical way to rotate a credential: run it again for the same provider and the entry is replaced in place.
+`zag auth login openai-oauth` or `zag auth login anthropic-oauth` triggers the browser OAuth flow; the API-key providers prompt for a key paste with echo disabled. Either form is the canonical way to rotate a credential: run it again for the same provider and the entry is replaced in place.
 
 ## Window system
 
@@ -125,8 +131,6 @@ h j k l  focus in that direction
 q        close the focused window
 i / Esc  insert / normal mode
 ```
-
-Rendering is a two-allocator contract. A per-frame arena is reset each tick for output line lists; a long-lived allocator backs per-node style caches, keyed by a content version counter. Stable frames allocate nothing sustained. The compositor selectively redraws only dirty leaves when the layout itself hasn't changed.
 
 ## Modal editing
 
@@ -194,7 +198,18 @@ Config entry point: `~/.config/zag/config.lua`. Modules load from `~/.config/zag
 
 ## Plugins
 
-Zag embeds Lua 5.4 and ships an async plugin runtime: hooks, custom tools, keymaps, and coroutine-friendly primitives for HTTP, subprocess, and filesystem work. Drop a `~/.config/zag/config.lua` and you can veto tool calls, rewrite user messages, register new tools, or run background pollers without ever blocking the TUI.
+Zag embeds Lua 5.4 and ships an async plugin runtime. Hooks, custom tools, keymaps, and coroutine-friendly primitives for HTTP, subprocess, and filesystem work are all first-class. Drop a `~/.config/zag/config.lua` and you can veto tool calls, rewrite user messages, register new tools, or run background pollers without ever blocking the TUI.
+
+Primitives exposed on the `zag.*` table:
+
+- `zag.spawn(fn, ...)` / `zag.detach(fn, ...)` — coroutine task handles with `:join()`, `:cancel()`, `:done()`
+- `zag.sleep(ms)` — yield the current coroutine
+- `zag.all(tasks)`, `zag.race(tasks)`, `zag.timeout(ms, task)` — task combinators
+- `zag.cmd(cmd, args...)` — spawn subprocesses with stdin/stdout/stderr, `:lines()` iterator, `:kill()`, timeouts
+- `zag.http.get/post/stream` — non-blocking HTTP with streaming body iteration
+- `zag.fs.read/write/append/mkdir/remove/list/stat/exists` — filesystem I/O
+- `zag.layout.tree/focus/split/close/resize`, `zag.pane.read` — introspect and mutate the window system
+- `zag.log.debug/info/warn/err`, `zag.notify` — structured logging and notifications
 
 See the [plugin authoring guide](docs/plugins/README.md) for event tables, the primitive reference, error conventions, and worked examples (remote policy hooks, git watchers, file watchers).
 
@@ -212,56 +227,18 @@ Performance is a feature, not an afterthought.
 - Wide characters and graphemes are fused. `width.nextCluster()` groups a base codepoint with its combining marks, ZWJ sequences, skin-tone modifiers, and variation selectors before width classification and cell placement.
 - Parallel tool execution writes into disjoint slots of a shared result array, so no mutex is needed on the hot path.
 - `-Dmetrics=true` compiles in a lock-free ring buffer of span events that dumps to a Chrome Trace Event JSON file. When the flag is off, every call site becomes a no-op the compiler erases.
-- A `CountingAllocator` wraps the root allocator when metrics are on and records per-frame allocation counts and peak bytes.
-
-Design docs: [`docs/plans/2026-04-16-rendering-performance-plan.md`](docs/plans/2026-04-16-rendering-performance-plan.md), [`docs/plans/2026-04-17-grapheme-width-fusion-plan.md`](docs/plans/2026-04-17-grapheme-width-fusion-plan.md).
-
-## Layout
-
-```
-src/
-  main.zig               entry point
-  EventOrchestrator.zig  main event loop (input + agent events + composite)
-  WindowManager.zig      pane forest, focus, splits, per-pane state
-  Layout.zig             binary tree of splits
-  Buffer.zig             runtime-polymorphic buffer interface
-  ConversationBuffer.zig agent view (node tree, draft input)
-  NodeRenderer.zig       per-node-type rendering with custom overrides
-  MarkdownParser.zig     line-by-line markdown to styled lines
-  Theme.zig              colors, highlights, spacing, borders
-  Compositor.zig         merges buffers into the screen grid
-  Screen.zig             double-buffered cell grid + ANSI diff
-  Terminal.zig           raw mode, alt screen, SIGWINCH wake pipe
-  input.zig              keyboard + mouse parser
-  width.zig              grapheme + display-width classifier
-  agent.zig              agent loop (LLM, tools, repeat, hook dispatch)
-  AgentRunner.zig        per-pane agent lifecycle (thread, queue, cancel)
-  agent_events.zig       event taxonomy (text_delta, tool_*, done, hook_request, ...)
-  Session.zig            JSONL persistence, atomic meta rename
-  ConversationSession.zig  message history + session handle
-  LuaEngine.zig          Lua VM, config loading, tool and hook bridges
-  Hooks.zig              hook registry and dispatch
-  Keymap.zig             modal key bindings
-  llm.zig                provider interface, endpoint registry, model parser
-  providers/             anthropic.zig, openai.zig
-  tools.zig              registry + dispatch + schema validation
-  tools/                 read.zig, write.zig, edit.zig, bash.zig
-  json_schema.zig        hand-rolled subset validator
-  Metrics.zig            span-based tracing + counting allocator
-  file_log.zig           per-process debug log
-```
 
 ## What's next
 
 Rough shape, not a promise.
 
-- Async Lua plugin runtime (coroutine-based I/O, `zag.http` / `zag.cmd` / `zag.fs`)
+- Persisting `/model` picks to `config.lua` and per-pane model overrides
 - Floating windows (slash-command autocomplete, popups)
 - libghostty-vt integration
 - Tree-sitter buffer for syntax-aware code browsing
 - More buffer kinds (git, files, diagnostics) as plugins
 
-Active design work lives in [`docs/plans/`](docs/plans/). There are 40+ plans in there documenting the trade-offs and the reasoning, not just the what.
+Active design work lives in [`docs/plans/`](docs/plans/). There are 50+ plans in there documenting the trade-offs and the reasoning, not just the what.
 
 ## Inspiration
 
