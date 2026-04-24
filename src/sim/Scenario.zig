@@ -28,6 +28,10 @@ pub const RunOptions = struct {
     /// Default timeout for `wait_text` / `wait_exit` when the step itself
     /// doesn't specify one. Per-step overrides arrive in a later task.
     wait_default_ms: u32 = 10_000,
+    /// Path to a mock-provider script. When set, the runner stands up an
+    /// in-process HTTP mock + throwaway `config.lua` before any `spawn`
+    /// step runs, and points the child's `$HOME` at the scaffolded dir.
+    mock_script_path: ?[]const u8 = null,
 };
 
 /// Readable cap on scenario file size. Scenarios are hand-written; anything
@@ -61,6 +65,13 @@ pub fn runSource(
 
     var r = try Runner.init(alloc);
     defer r.deinit();
+
+    if (opts.mock_script_path) |mock_path| {
+        r.attachMock(mock_path) catch |e| return RunResult{
+            .outcome = .harness_error,
+            .error_name = @errorName(e),
+        };
+    }
 
     for (steps) |step| {
         executeStep(&r, step, opts) catch |e| return RunResult{
