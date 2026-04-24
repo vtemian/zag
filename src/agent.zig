@@ -10,6 +10,7 @@ const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const Harness = @import("Harness.zig");
 const prompt = @import("prompt.zig");
+const skills_mod = @import("skills.zig");
 const LuaEngine = @import("LuaEngine.zig");
 const Allocator = std.mem.Allocator;
 
@@ -47,13 +48,15 @@ pub fn runLoopStreaming(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
+    skills: ?*const skills_mod.SkillRegistry,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
 
-    // Built-in prompt layers (identity, tool list, guidelines) live on a
-    // single registry shared across every turn of this agent run. Lua
-    // layers will join via PR 3 by binding the registry into LuaEngine.
+    // Built-in prompt layers (identity, skills catalog, tool list,
+    // guidelines) live on a single registry shared across every turn of
+    // this agent run. Lua layers will join via PR 3 by binding the
+    // registry into LuaEngine.
     var prompt_registry = try Harness.defaultRegistry(allocator);
     defer prompt_registry.deinit(allocator);
 
@@ -66,6 +69,7 @@ pub fn runLoopStreaming(
         .is_git_repo = false,
         .platform = @tagName(@import("builtin").target.os.tag),
         .tools = tool_defs,
+        .skills = skills,
     };
 
     // Bind the Lua-tool queue for this thread so `executeToolsSingle` (which
@@ -754,6 +758,55 @@ test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt o
         \\- Prefer editing over rewriting entire files
     ;
     try std.testing.expectEqualStrings(expected, joined);
+}
+
+test "runLoopStreaming wires SkillRegistry into the assembled system prompt" {
+    // Mirrors the assembly path runLoopStreaming runs per turn. When a
+    // non-empty SkillRegistry is threaded through, the assembled prompt
+    // must include the `<available_skills>` block emitted by the
+    // `builtin.skills_catalog` layer. When the registry is null or
+    // empty, no block appears.
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+
+    const tool_defs = try registry.definitions(allocator);
+    defer allocator.free(tool_defs);
+
+    var skills: skills_mod.SkillRegistry = .{};
+    defer skills.deinit(allocator);
+    try skills.skills.append(allocator, .{
+        .name = try allocator.dupe(u8, "roll-dice"),
+        .description = try allocator.dupe(u8, "Roll a die."),
+        .path = try allocator.dupe(u8, "/abs/path/SKILL.md"),
+    });
+
+    var prompt_registry = try Harness.defaultRegistry(allocator);
+    defer prompt_registry.deinit(allocator);
+
+    const layer_ctx: prompt.LayerContext = .{
+        .model = placeholder_model_spec,
+        .cwd = "",
+        .worktree = "",
+        .agent_name = default_agent_name,
+        .date_iso = placeholder_date_iso,
+        .is_git_repo = false,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = tool_defs,
+        .skills = &skills,
+    };
+
+    var assembled = try Harness.assembleSystem(&prompt_registry, &layer_ctx, allocator);
+    defer assembled.deinit();
+
+    const joined = try llm.joinSystemParts(assembled.stable, assembled.@"volatile", allocator);
+    defer allocator.free(joined);
+
+    try std.testing.expect(std.mem.indexOf(u8, joined, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "name=\"roll-dice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "Roll a die.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "</available_skills>") != null);
 }
 
 test "emitTokenUsage emits old two-field form when no cache counts" {

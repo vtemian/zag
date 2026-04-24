@@ -359,15 +359,16 @@ fn fakeLayerContext() prompt.LayerContext {
     };
 }
 
-test "defaultRegistry seeds the three built-in layers" {
+test "defaultRegistry seeds the four built-in layers" {
     const alloc = std.testing.allocator;
     var registry = try defaultRegistry(alloc);
     defer registry.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), registry.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 4), registry.layers.items.len);
     try std.testing.expectEqualStrings("builtin.identity", registry.layers.items[0].name);
-    try std.testing.expectEqualStrings("builtin.tool_list", registry.layers.items[1].name);
-    try std.testing.expectEqualStrings("builtin.guidelines", registry.layers.items[2].name);
+    try std.testing.expectEqualStrings("builtin.skills_catalog", registry.layers.items[1].name);
+    try std.testing.expectEqualStrings("builtin.tool_list", registry.layers.items[2].name);
+    try std.testing.expectEqualStrings("builtin.guidelines", registry.layers.items[3].name);
 }
 
 test "assembleSystem renders identity + tool_list into stable and guidelines into volatile" {

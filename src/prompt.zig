@@ -13,6 +13,7 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const types = @import("types.zig");
+const skills_mod = @import("skills.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,6 +45,12 @@ pub const LayerContext = struct {
     platform: []const u8,
     /// Tool definitions the agent will advertise to the model this turn.
     tools: []const types.ToolDefinition,
+    /// Filesystem-discovered skills the agent should advertise to the
+    /// model this turn. Null means no registry was wired (the
+    /// `builtin.skills_catalog` layer renders nothing). An empty registry
+    /// is also rendered as nothing so the `<available_skills>` block
+    /// only appears when there is at least one entry to enumerate.
+    skills: ?*const skills_mod.SkillRegistry = null,
 };
 
 /// A single contribution to the assembled system prompt.
@@ -197,13 +204,34 @@ fn renderBuiltinGuidelines(_: *const LayerContext, alloc: Allocator) anyerror!?[
     return try alloc.dupe(u8, builtin_guidelines_text);
 }
 
-/// Register the three always-on layers that together reproduce today's
-/// `buildSystemPrompt` output: identity (prefix), tool list (middle),
-/// guidelines (suffix).
+fn renderBuiltinSkillsCatalog(ctx: *const LayerContext, alloc: Allocator) anyerror!?[]const u8 {
+    const registry = ctx.skills orelse return null;
+    if (registry.skills.items.len == 0) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try registry.catalog(buf.writer(alloc));
+
+    // `SkillRegistry.catalog` writes a trailing newline after the closing
+    // tag; `Registry.render` joins layers with "\n\n", so trim the tail
+    // to avoid stacking blank lines in the assembled prompt.
+    const written = buf.items;
+    const trimmed_len = if (written.len > 0 and written[written.len - 1] == '\n') written.len - 1 else written.len;
+    return try alloc.dupe(u8, written[0..trimmed_len]);
+}
+
+/// Register the four always-on layers that together reproduce today's
+/// `buildSystemPrompt` output plus the skills catalog injection that
+/// the WIP version of `buildSystemPrompt` was reaching for: identity
+/// (prefix), skills catalog (after identity, before tool list), tool
+/// list (middle), guidelines (suffix).
 ///
 /// Priorities are spaced so Lua-registered layers can slot in between
-/// without reshuffling builtins: identity=5, tool_list=100,
-/// guidelines=910.
+/// without reshuffling builtins: identity=5, skills_catalog=50,
+/// tool_list=100, guidelines=910. The skills layer is stable so it
+/// joins the cache prefix; skill discovery happens at registry init,
+/// not per turn.
 pub fn registerBuiltinLayers(reg: *Registry, alloc: Allocator) !void {
     try reg.add(alloc, .{
         .name = "builtin.identity",
@@ -211,6 +239,13 @@ pub fn registerBuiltinLayers(reg: *Registry, alloc: Allocator) !void {
         .cache_class = .stable,
         .source = .builtin,
         .render_fn = renderBuiltinIdentity,
+    });
+    try reg.add(alloc, .{
+        .name = "builtin.skills_catalog",
+        .priority = 50,
+        .cache_class = .stable,
+        .source = .builtin,
+        .render_fn = renderBuiltinSkillsCatalog,
     });
     try reg.add(alloc, .{
         .name = "builtin.tool_list",
@@ -567,7 +602,7 @@ test "registerBuiltinLayers assembles identity + tools + guidelines" {
     defer reg.deinit(alloc);
 
     try registerBuiltinLayers(&reg, alloc);
-    try std.testing.expectEqual(@as(usize, 3), reg.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 4), reg.layers.items.len);
 
     var ctx = fakeContext();
     const defs = [_]types.ToolDefinition{
@@ -592,4 +627,87 @@ test "registerBuiltinLayers assembles identity + tools + guidelines" {
     ;
     try std.testing.expectEqualStrings(expected_stable, assembled.stable);
     try std.testing.expectEqualStrings(builtin_guidelines_text, assembled.@"volatile");
+}
+
+test "builtin skills_catalog returns null when ctx.skills is null" {
+    const alloc = std.testing.allocator;
+    const ctx = fakeContext();
+    try std.testing.expectEqual(@as(?*const skills_mod.SkillRegistry, null), ctx.skills);
+
+    const rendered = try renderBuiltinSkillsCatalog(&ctx, alloc);
+    try std.testing.expectEqual(@as(?[]const u8, null), rendered);
+}
+
+test "builtin skills_catalog returns null when registry is empty" {
+    const alloc = std.testing.allocator;
+    var registry: skills_mod.SkillRegistry = .{};
+    defer registry.deinit(alloc);
+
+    var ctx = fakeContext();
+    ctx.skills = &registry;
+
+    const rendered = try renderBuiltinSkillsCatalog(&ctx, alloc);
+    try std.testing.expectEqual(@as(?[]const u8, null), rendered);
+}
+
+test "builtin skills_catalog renders <available_skills> when registry has entries" {
+    const alloc = std.testing.allocator;
+    var registry: skills_mod.SkillRegistry = .{};
+    defer registry.deinit(alloc);
+
+    try registry.skills.append(alloc, .{
+        .name = try alloc.dupe(u8, "roll-dice"),
+        .description = try alloc.dupe(u8, "Roll a die."),
+        .path = try alloc.dupe(u8, "/abs/path/SKILL.md"),
+    });
+
+    var ctx = fakeContext();
+    ctx.skills = &registry;
+
+    const rendered = (try renderBuiltinSkillsCatalog(&ctx, alloc)) orelse unreachable;
+    defer alloc.free(rendered);
+
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "<available_skills>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "</available_skills>"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "name=\"roll-dice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Roll a die.") != null);
+}
+
+test "registerBuiltinLayers slots skills_catalog between identity and tool_list" {
+    const alloc = std.testing.allocator;
+
+    var reg: Registry = .{};
+    defer reg.deinit(alloc);
+    try registerBuiltinLayers(&reg, alloc);
+
+    var registry: skills_mod.SkillRegistry = .{};
+    defer registry.deinit(alloc);
+    try registry.skills.append(alloc, .{
+        .name = try alloc.dupe(u8, "roll-dice"),
+        .description = try alloc.dupe(u8, "Roll a die."),
+        .path = try alloc.dupe(u8, "/abs/path/SKILL.md"),
+    });
+
+    var ctx = fakeContext();
+    ctx.skills = &registry;
+    const defs = [_]types.ToolDefinition{
+        .{
+            .name = "read",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = "read file contents",
+        },
+    };
+    ctx.tools = &defs;
+
+    var assembled = try reg.render(&ctx, alloc);
+    defer assembled.deinit();
+
+    // Stable half: identity, then skills_catalog, then tool_list, joined
+    // by "\n\n". The skills block must land between identity and tools.
+    const skills_pos = std.mem.indexOf(u8, assembled.stable, "<available_skills>") orelse return error.TestExpectedSkillsBlock;
+    const identity_pos = std.mem.indexOf(u8, assembled.stable, "expert coding assistant") orelse return error.TestExpectedIdentity;
+    const tools_pos = std.mem.indexOf(u8, assembled.stable, "Available tools:") orelse return error.TestExpectedTools;
+    try std.testing.expect(identity_pos < skills_pos);
+    try std.testing.expect(skills_pos < tools_pos);
 }

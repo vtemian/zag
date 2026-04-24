@@ -556,6 +556,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
         .is_git_repo = false,
         .platform = @tagName(@import("builtin").target.os.tag),
         .tools = tool_defs,
+        .skills = deps.runner.skills,
     };
 
     var assembled = try Harness.assembleSystem(&prompt_registry, &layer_ctx, gpa);
