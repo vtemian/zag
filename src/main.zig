@@ -1375,6 +1375,7 @@ test {
     _ = @import("Sink.zig");
     _ = @import("sinks/Null.zig");
     _ = @import("sinks/Collector.zig");
+    _ = @import("sinks/BufferSink.zig");
     _ = @import("halfblock.zig");
     _ = @import("png_decode.zig");
     _ = @import("Viewport.zig");
