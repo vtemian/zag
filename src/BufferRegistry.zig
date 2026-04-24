@@ -10,26 +10,30 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ScratchBuffer = @import("buffers/scratch.zig");
+const GraphicsBuffer = @import("buffers/graphics.zig");
 const Buffer = @import("Buffer.zig");
 
 const BufferRegistry = @This();
 
 pub const Error = error{StaleBuffer};
 
-pub const Kind = enum { scratch };
+pub const Kind = enum { scratch, graphics };
 
 pub const Entry = union(Kind) {
     scratch: *ScratchBuffer,
+    graphics: *GraphicsBuffer,
 
     fn destroy(self: Entry) void {
         switch (self) {
             .scratch => |p| p.destroy(),
+            .graphics => |p| p.destroy(),
         }
     }
 
     fn asBuffer(self: Entry) Buffer {
         return switch (self) {
             .scratch => |p| p.buf(),
+            .graphics => |p| p.buf(),
         };
     }
 };
@@ -71,6 +75,14 @@ pub fn createScratch(self: *BufferRegistry, name: []const u8) !Handle {
     const sb = try ScratchBuffer.create(self.allocator, buffer_id, name);
     errdefer sb.destroy();
     return try self.insert(.{ .scratch = sb });
+}
+
+pub fn createGraphics(self: *BufferRegistry, name: []const u8) !Handle {
+    const buffer_id = self.next_buffer_id;
+    self.next_buffer_id += 1;
+    const gb = try GraphicsBuffer.create(self.allocator, buffer_id, name);
+    errdefer gb.destroy();
+    return try self.insert(.{ .graphics = gb });
 }
 
 fn insert(self: *BufferRegistry, entry: Entry) !Handle {
@@ -142,6 +154,38 @@ test "generation bumps on slot reuse" {
     try std.testing.expectEqual(h1.index, h2.index);
     try std.testing.expect(h1.generation != h2.generation);
     try std.testing.expectError(Error.StaleBuffer, r.resolve(h1));
+}
+
+test "createGraphics returns a resolvable handle" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createGraphics("viewer");
+    const entry = try r.resolve(h);
+    try std.testing.expect(entry == .graphics);
+}
+
+test "asBuffer on graphics entry returns a Buffer backed by the GraphicsBuffer" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createGraphics("viewer");
+    const entry = try r.resolve(h);
+    const gb = entry.graphics;
+    const b = try r.asBuffer(h);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(gb)), b.ptr);
+    try std.testing.expectEqualStrings("viewer", b.getName());
+    try std.testing.expectEqual(gb.id, b.getId());
+
+    const scratch_handle = try r.createScratch("other");
+    const scratch_buf = try r.asBuffer(scratch_handle);
+    try std.testing.expect(b.vtable != scratch_buf.vtable);
+}
+
+test "remove on graphics entry destroys the GraphicsBuffer" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createGraphics("viewer");
+    try r.remove(h);
+    try std.testing.expectError(Error.StaleBuffer, r.resolve(h));
 }
 
 test "formatId and parseId round trip" {
