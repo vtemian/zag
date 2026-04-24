@@ -668,11 +668,13 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
         .done => .done,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
-        // Task 1.10 routes `thinking_delta` into a ConversationBuffer
-        // thinking node; Task 1.11 persists it to the trajectory. Until
-        // those land we drop the deltas so the agent loop keeps behaving
-        // exactly as before.
-        .thinking_delta, .thinking_stop => return,
+        // Thinking is surfaced as its own AgentRunner/ConversationBuffer
+        // node. Task 1.11 will also fan this into the trajectory capture.
+        .thinking_delta => |td| blk: {
+            const duped = alloc.dupe(u8, td.text) catch return;
+            break :blk .{ .thinking_delta = duped };
+        },
+        .thinking_stop => .thinking_stop,
     };
     // On backpressure budget expiry, pushWithBackpressure frees the duped
     // payload via freeOwned and logs a warn. Streaming deltas are the
@@ -896,6 +898,7 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
         for (buf[0..count]) |ev| {
             switch (ev) {
                 .text_delta => |s| allocator.free(s),
+                .thinking_delta => |s| allocator.free(s),
                 .tool_start => |s| {
                     allocator.free(s.name);
                     if (s.call_id) |id| allocator.free(id);
@@ -917,7 +920,7 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                     req.is_error = true;
                     req.done.set();
                 },
-                .done, .reset_assistant_text => {},
+                .thinking_stop, .done, .reset_assistant_text => {},
             }
         }
     }

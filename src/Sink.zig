@@ -12,6 +12,13 @@ pub const Event = union(enum) {
     run_start: struct { user_text: []const u8 },
     assistant_delta: struct { text: []const u8 },
     assistant_reset,
+    /// Extended-thinking text delta. Sink implementations render the
+    /// reasoning block alongside the assistant turn; those that don't
+    /// care about reasoning (Collector, Null) drop these.
+    thinking_delta: struct { text: []const u8 },
+    /// End of an extended-thinking block. Sinks fold the live thinking
+    /// node so a later delta opens a fresh one instead of mis-appending.
+    thinking_stop,
     tool_use: struct {
         name: []const u8,
         call_id: ?[]const u8 = null,

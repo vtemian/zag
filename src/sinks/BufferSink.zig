@@ -35,6 +35,11 @@ pub const BufferSink = struct {
     /// call_id (some providers emit unkeyed results). Always the most
     /// recent tool_call node seen this turn.
     last_tool_call: ?*Node = null,
+    /// Live extended-thinking node. Lives across consecutive
+    /// `.thinking_delta` events and closes on `.thinking_stop` or any
+    /// content boundary (assistant_delta, tool_use, error, run_end)
+    /// so a missed thinking_stop can't mis-parent later events.
+    current_thinking_node: ?*Node = null,
 
     pub fn init(alloc: Allocator, buffer: *ConversationBuffer) BufferSink {
         return .{ .alloc = alloc, .buffer = buffer };
@@ -56,9 +61,14 @@ pub const BufferSink = struct {
             .run_start => |e| {
                 _ = self.buffer.appendUserNode(e.user_text) catch return;
                 self.current_assistant_node = null;
+                self.current_thinking_node = null;
                 self.last_tool_call = null;
             },
             .assistant_delta => |e| {
+                // The first visible assistant token closes any open
+                // thinking block; leaving it live would let the next
+                // thinking_delta (new turn) fall into stale reasoning.
+                self.current_thinking_node = null;
                 if (self.current_assistant_node) |node| {
                     self.buffer.appendToNode(node, e.text) catch return;
                 } else {
@@ -72,7 +82,31 @@ pub const BufferSink = struct {
                     self.current_assistant_node = null;
                 }
             },
+            .thinking_delta => |e| {
+                if (self.current_thinking_node) |node| {
+                    self.buffer.appendToNode(node, e.text) catch return;
+                } else {
+                    const node = self.buffer.appendNode(null, .thinking, e.text) catch return;
+                    // Live streaming: expanded while tokens arrive; the
+                    // `.thinking_stop` event folds it when the block ends.
+                    node.collapsed = false;
+                    self.current_thinking_node = node;
+                }
+            },
+            .thinking_stop => {
+                if (self.current_thinking_node) |node| {
+                    node.collapsed = true;
+                    node.markDirty();
+                    self.buffer.tree.generation +%= 1;
+                    self.buffer.tree.dirty_nodes.push(node.id);
+                }
+                self.current_thinking_node = null;
+            },
             .tool_use => |e| {
+                // Boundary: close any live assistant/thinking node before
+                // opening a tool call, otherwise later deltas mis-parent.
+                self.current_assistant_node = null;
+                self.current_thinking_node = null;
                 const node = self.buffer.appendNode(null, .tool_call, e.name) catch return;
                 self.last_tool_call = node;
                 if (e.call_id) |id| {
@@ -96,8 +130,10 @@ pub const BufferSink = struct {
             },
             .run_end => {
                 self.current_assistant_node = null;
+                self.current_thinking_node = null;
             },
             .error_event => |e| {
+                self.current_thinking_node = null;
                 _ = self.buffer.appendNode(null, .err, e.text) catch return;
             },
         }

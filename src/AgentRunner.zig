@@ -494,6 +494,26 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 self.session.persist_failed = true;
             };
         },
+        .thinking_delta => |text| {
+            defer allocator.free(text);
+            self.sink.push(.{ .thinking_delta = .{ .text = text } });
+            // Persist per-delta so a crash mid-stream still preserves
+            // reasoning text. The history-rebuild path concatenates
+            // consecutive thinking entries on replay, same as
+            // assistant_text.
+            self.session.persistEvent(.{
+                .entry_type = .thinking,
+                .content = text,
+                .thinking_provider = "anthropic",
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
+        },
+        .thinking_stop => {
+            self.sink.push(.thinking_stop);
+        },
         .tool_start => |ev| {
             defer allocator.free(ev.name);
             defer if (ev.input_raw) |raw| allocator.free(raw);
@@ -613,6 +633,8 @@ const MockSink = struct {
             .run_start => |ev| .{ .run_start = .{ .user_text = self.dupe(ev.user_text) } },
             .assistant_delta => |ev| .{ .assistant_delta = .{ .text = self.dupe(ev.text) } },
             .assistant_reset => .assistant_reset,
+            .thinking_delta => |ev| .{ .thinking_delta = .{ .text = self.dupe(ev.text) } },
+            .thinking_stop => .thinking_stop,
             .tool_use => |ev| .{ .tool_use = .{
                 .name = self.dupe(ev.name),
                 .call_id = self.dupeOpt(ev.call_id),
@@ -715,6 +737,81 @@ test "handleAgentEvent .tool_start emits a tool_use sink event" {
     try std.testing.expectEqualStrings("bash", ev.name);
     try std.testing.expect(ev.call_id != null);
     try std.testing.expectEqualStrings("A", ev.call_id.?);
+}
+
+test "thinking_delta emits a thinking_delta sink event" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "let me ") }, allocator);
+    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "reason") }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
+    try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
+    try std.testing.expectEqualStrings("let me ", mock.events.items[0].thinking_delta.text);
+    try std.testing.expectEqualStrings("reason", mock.events.items[1].thinking_delta.text);
+}
+
+test "thinking_stop emits a thinking_stop sink event" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "hmm") }, allocator);
+    runner.handleAgentEvent(.thinking_stop, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
+    try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
+    try std.testing.expectEqual(SinkEvent.thinking_stop, std.meta.activeTag(mock.events.items[1]));
+}
+
+test "text_delta after thinking_delta still emits two sink events in order" {
+    // Thinking-to-text boundary used to live on the runner as a
+    // current_thinking_node reset; now the sink owns that correlation,
+    // so all the runner is responsible for is forwarding the events
+    // in sequence. The BufferSink tests pin the node-level behaviour.
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "reason") }, allocator);
+    runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "answer") }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
+    try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
+    try std.testing.expectEqual(SinkEvent.assistant_delta, std.meta.activeTag(mock.events.items[1]));
+}
+
+test "tool_start after thinking_delta emits both sink events in order" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "plan") }, allocator);
+    runner.handleAgentEvent(.{ .tool_start = .{
+        .name = try allocator.dupe(u8, "bash"),
+    } }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
+    try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
+    try std.testing.expectEqual(SinkEvent.tool_use, std.meta.activeTag(mock.events.items[1]));
 }
 
 test "handleAgentEvent .tool_result emits a tool_result sink event" {

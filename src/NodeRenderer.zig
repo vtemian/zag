@@ -31,6 +31,12 @@ const Prefixes = struct {
     const err = "error: ";
     const separator = "---";
     const indent_pad_max = " " ** 64;
+    /// Collapsed thinking header: leading marker, static label. Using
+    /// ASCII "> " / "v " glyphs keeps the renderer terminal-safe without
+    /// depending on font support for the triangle code points.
+    const thinking_collapsed = "> thinking (folded, Ctrl-R to expand)";
+    const thinking_expanded_header = "v thinking";
+    const thinking_redacted = "> thinking (redacted)";
 };
 
 /// Function signature for a custom node renderer.
@@ -106,7 +112,21 @@ pub fn render(
 pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     return switch (node.node_type) {
         .separator => 1,
-        .tool_call, .err => 1,
+        .tool_call, .err, .thinking_redacted => 1,
+        .thinking => blk: {
+            // Collapsed thinking nodes render as a single header line; the
+            // body is hidden until the user hits Ctrl-R.
+            if (node.collapsed) break :blk 1;
+            const content = node.content.items;
+            // Expanded form is a header line plus one line per body line.
+            if (content.len == 0) break :blk 1;
+            var count: usize = 2; // header + first body line
+            for (content) |c| {
+                if (c == '\n') count += 1;
+            }
+            if (content[content.len - 1] == '\n') count -= 1;
+            break :blk count;
+        },
         .user_message, .assistant_text, .tool_result, .status, .custom => blk: {
             // Count newlines to determine line count.
             // splitAndAppend skips the trailing empty segment after a final '\n',
@@ -240,6 +260,29 @@ fn renderDefault(
         .separator => {
             const style = theme.highlights.status;
             try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.separator, style));
+            return;
+        },
+        .thinking => {
+            // Reuse `tool_result` highlight for the dim/muted look; the
+            // reasoning stream is metadata, not a primary voice in the
+            // conversation, so it should read as de-emphasised.
+            const style = theme.highlights.tool_result;
+            if (node.collapsed) {
+                try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_collapsed, style));
+                return;
+            }
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_expanded_header, style));
+            if (content.len == 0) return;
+            // Body lines: split on newlines and render each in the same
+            // dim style. Skipping markdown parse keeps the output visually
+            // distinct from assistant_text and avoids parser state mixing
+            // into a block of raw reasoning text.
+            try splitAndAppend(lines, allocator, content, style, null, null);
+            return;
+        },
+        .thinking_redacted => {
+            const style = theme.highlights.tool_result;
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_redacted, style));
             return;
         },
     }
@@ -605,6 +648,96 @@ test "custom override replaces default renderer" {
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("CUSTOM RENDERED", text);
+}
+
+test "renderDefault thinking collapsed emits one header line" {
+    const allocator = std.testing.allocator;
+
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(allocator, "reasoning body\nover two lines");
+    defer content.deinit(allocator);
+
+    const node = Node{
+        .id = 0,
+        .node_type = .thinking,
+        .content = content,
+        .children = .empty,
+        .collapsed = true,
+    };
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(&node, &lines, allocator, &theme);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    const text = try lines.items[0].toText(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "thinking") != null);
+    try std.testing.expect(std.mem.startsWith(u8, text, ">"));
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(&node));
+}
+
+test "renderDefault thinking expanded emits header plus body lines" {
+    const allocator = std.testing.allocator;
+
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(allocator, "step one\nstep two\nstep three");
+    defer content.deinit(allocator);
+
+    const node = Node{
+        .id = 0,
+        .node_type = .thinking,
+        .content = content,
+        .children = .empty,
+        .collapsed = false,
+    };
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(&node, &lines, allocator, &theme);
+    // header + 3 body lines
+    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expect(std.mem.startsWith(u8, header, "v thinking"));
+
+    const body0 = try lines.items[1].toText(allocator);
+    defer allocator.free(body0);
+    try std.testing.expectEqualStrings("step one", body0);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(@as(usize, 4), renderer.lineCountForNode(&node));
+}
+
+test "renderDefault thinking_redacted emits a single redacted header" {
+    const allocator = std.testing.allocator;
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(allocator);
+
+    const node = Node{
+        .id = 0,
+        .node_type = .thinking_redacted,
+        .content = content,
+        .children = .empty,
+        .collapsed = true,
+    };
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(&node, &lines, allocator, &theme);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    const text = try lines.items[0].toText(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "redacted") != null);
 }
 
 test "lineCountForNode returns 1 for all types" {
