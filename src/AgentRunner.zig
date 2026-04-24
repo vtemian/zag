@@ -82,10 +82,10 @@ last_info_len: u8 = 0,
 /// Stays zero until the first composite that actually paints content.
 node_version_snapshot: u32 = 0,
 
-/// Optional filesystem-backed skill catalog. When non-null and non-empty
-/// the agent loop appends an `<available_skills>` block to every LLM
-/// request's system prompt. Null (the default) preserves the legacy
-/// system-prompt shape byte-for-byte.
+/// Filesystem-discovered skill registry to advertise to the model
+/// through the `builtin.skills_catalog` prompt layer. Borrowed; the
+/// orchestrator that constructs the registry owns its lifetime.
+/// Null disables the layer (no `<available_skills>` block emitted).
 skills: ?*const skills_mod.SkillRegistry = null,
 
 /// Create a runner bound to `sink` and `session`. Neither is owned;
@@ -135,13 +135,6 @@ pub fn cancelAgent(self: *AgentRunner) void {
     self.cancel_flag.store(true, .release);
 }
 
-/// Attach a filesystem-backed skill catalog. The registry is borrowed;
-/// the caller must outlive this runner. Passing null clears the
-/// attachment (and restores the legacy skills-free system prompt).
-pub fn attachSkills(self: *AgentRunner, registry: ?*const skills_mod.SkillRegistry) void {
-    self.skills = registry;
-}
-
 /// Spawn-time borrows needed by `submit`. Bundled so callers only pass
 /// one argument and so we can grow the set without rippling signatures.
 pub const SpawnDeps = struct {
@@ -161,6 +154,9 @@ pub const SpawnDeps = struct {
     provider_name: []const u8,
     /// Tool registry dispatched from the agent loop.
     registry: *const tools.Registry,
+    /// Optional skill registry to advertise via the
+    /// `builtin.skills_catalog` prompt layer. Null skips the layer.
+    skills: ?*const skills_mod.SkillRegistry = null,
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -198,7 +194,7 @@ pub fn submit(
         deps.lua_engine,
         deps.provider_name,
         self.pane_handle_packed,
-        self.skills,
+        deps.skills orelse self.skills,
     });
 }
 
