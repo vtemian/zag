@@ -316,13 +316,17 @@ pub const TurnMetrics = struct {
 };
 
 /// One agent turn captured live from the event stream.
-/// All slices inside `text`, `tool_calls`, and `tool_results` are owned by
-/// `Capture`'s internal arena.
+/// All slices inside `text`, `reasoning_text`, `tool_calls`, and `tool_results`
+/// are owned by `Capture`'s internal arena.
 pub const CapturedTurn = struct {
     /// Wall-clock timestamp of the turn start, in milliseconds since epoch.
     started_at_ms: i64,
     /// Concatenated assistant text deltas observed during the turn.
     text: std.ArrayList(u8),
+    /// Concatenated thinking/reasoning deltas observed during the turn.
+    /// Multiple thinking blocks in one turn are joined by a single `\n`
+    /// separator recorded at each `thinking_stop`.
+    reasoning_text: std.ArrayList(u8),
     /// Tool calls the assistant emitted during this turn.
     tool_calls: std.ArrayList(ToolCall),
     /// Tool results observed during this turn (one per call).
@@ -371,6 +375,7 @@ pub const Capture = struct {
         try self.turns.append(self.allocator, .{
             .started_at_ms = timestamp_ms,
             .text = .empty,
+            .reasoning_text = .empty,
             .tool_calls = .empty,
             .tool_results = .empty,
         });
@@ -383,6 +388,24 @@ pub const Capture = struct {
     pub fn addTextDelta(self: *Capture, delta: []const u8) !void {
         const turn = self.cur orelse return error.NoActiveTurn;
         try turn.text.appendSlice(self.arena.allocator(), delta);
+    }
+
+    /// Append a thinking/reasoning delta to the current turn. The bytes are
+    /// copied into the arena so the caller may free its copy immediately.
+    /// Per-turn concatenation lands in `Step.reasoning_content` at `build`.
+    pub fn addThinkingDelta(self: *Capture, delta: []const u8) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        try turn.reasoning_text.appendSlice(self.arena.allocator(), delta);
+    }
+
+    /// Mark the end of a thinking block. Multiple blocks within one turn are
+    /// joined by a single `\n` separator so consumers can tell them apart.
+    /// No-op when the turn has no reasoning text yet (idempotent).
+    pub fn addThinkingStop(self: *Capture) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        if (turn.reasoning_text.items.len == 0) return;
+        if (turn.reasoning_text.items[turn.reasoning_text.items.len - 1] == '\n') return;
+        try turn.reasoning_text.append(self.arena.allocator(), '\n');
     }
 
     /// Record a tool invocation on the current turn. All three strings are
@@ -501,12 +524,24 @@ pub const Capture = struct {
             const ts_view = try formatIso8601(turn.started_at_ms, &ts_buf);
             const timestamp = try arena_alloc.dupe(u8, ts_view);
 
+            const reasoning_content: ?[]const u8 = if (turn.reasoning_text.items.len == 0)
+                null
+            else blk: {
+                // Trim a single trailing separator newline left by a final
+                // `addThinkingStop`; multi-block content keeps its internal
+                // separators.
+                const raw = turn.reasoning_text.items;
+                if (raw[raw.len - 1] == '\n') break :blk raw[0 .. raw.len - 1];
+                break :blk raw;
+            };
+
             steps[2 + i] = .{
                 .step_id = @intCast(3 + i),
                 .timestamp = timestamp,
                 .source = .agent,
                 .model_name = opts.model,
                 .message = turn.text.items,
+                .reasoning_content = reasoning_content,
                 .tool_calls = tool_calls,
                 .observation = observation,
                 .metrics = if (turn.metrics) |m| .{
@@ -829,6 +864,100 @@ test "Capture.build cleans up inner slices on mid-loop OOM" {
         .model = "anthropic/claude-sonnet-4-20250514",
     });
     try std.testing.expectError(error.OutOfMemory, result);
+}
+
+test "Capture accumulates thinking deltas into step.reasoning_content" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addThinkingDelta("let me ");
+    try cap.addThinkingDelta("reason about this");
+    try cap.addThinkingStop();
+    try cap.addTextDelta("the answer is 42");
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expectEqualStrings("the answer is 42", traj.steps[2].message);
+    try std.testing.expect(traj.steps[2].reasoning_content != null);
+    try std.testing.expectEqualStrings("let me reason about this", traj.steps[2].reasoning_content.?);
+}
+
+test "Capture joins multiple thinking blocks with a newline separator" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addThinkingDelta("first block");
+    try cap.addThinkingStop();
+    try cap.addThinkingDelta("second block");
+    try cap.addThinkingStop();
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expectEqualStrings("first block\nsecond block", traj.steps[2].reasoning_content.?);
+}
+
+test "build omits reasoning_content when no thinking was captured" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addTextDelta("plain response");
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expect(traj.steps[2].reasoning_content == null);
+}
+
+test "serialize emits reasoning_content when populated" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addThinkingDelta("thinking out loud");
+    try cap.addThinkingStop();
+    try cap.addTextDelta("answer");
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    var out: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+    const body = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_content\":\"thinking out loud\"") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
 }
 
 test {
