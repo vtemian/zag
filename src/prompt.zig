@@ -160,6 +160,147 @@ fn layerLessThan(_: void, a: Layer, b: Layer) bool {
     return a.priority < b.priority;
 }
 
+// -- Environment snapshot ---------------------------------------------------
+
+/// Owned environment snapshot for the `LayerContext` fields that reflect
+/// host state: current working directory, git worktree root, ISO date
+/// string, and the is-git-repo flag. Lives on the stack of the caller
+/// that builds a `LayerContext`; release with `deinit` once the context
+/// is no longer read.
+///
+/// Computed outside the Lua VM so the same values can be shared between
+/// main-thread and agent-thread contexts without any Lua round trip.
+/// Keeping the struct here (rather than in `agent.zig`) lets headless
+/// runs, tests, and the future harness integration all share one source
+/// of truth for the shape.
+pub const EnvSnapshot = struct {
+    /// Absolute path of the process's current directory at snapshot time.
+    /// Owned.
+    cwd: []const u8,
+    /// Absolute path of the surrounding git worktree. Equals `cwd` when
+    /// no `.git` was found in the walk up the filesystem; the two slices
+    /// share backing storage in that case, so call `deinit` only once.
+    /// Owned.
+    worktree: []const u8,
+    /// ISO-8601 date (UTC) of the form `YYYY-MM-DD`. Owned.
+    date_iso: []const u8,
+    /// True when a `.git` file or directory was found at or above `cwd`.
+    is_git_repo: bool,
+    /// True when `worktree` is a distinct allocation from `cwd` and must
+    /// be freed independently. Flipped by `capture` when the walk up the
+    /// filesystem finds a `.git` entry that differs from `cwd`.
+    worktree_owned: bool,
+    allocator: Allocator,
+
+    /// Capture a fresh snapshot. On any I/O failure the field degrades
+    /// gracefully rather than propagating the error, so a read-only
+    /// filesystem or a sandbox that forbids `getcwd` still produces a
+    /// usable context. `cwd` falls back to the empty string; `worktree`
+    /// mirrors `cwd`; `is_git_repo` is false; `date_iso` uses the UTC
+    /// `std.time.timestamp` result.
+    pub fn capture(alloc: Allocator) !EnvSnapshot {
+        const cwd = std.process.getCwdAlloc(alloc) catch |err| blk: {
+            log.warn("env snapshot: getcwd failed: {}", .{err});
+            break :blk try alloc.dupe(u8, "");
+        };
+        errdefer alloc.free(cwd);
+
+        // Walk up from cwd looking for a `.git` entry. Stops at the root
+        // (the parent-of-root loop terminator) so a path outside any
+        // repository simply drops through with `is_git_repo = false`.
+        const found = findGitToplevel(alloc, cwd) catch |err| blk: {
+            log.warn("env snapshot: git walk failed: {}", .{err});
+            break :blk null;
+        };
+
+        var worktree: []const u8 = cwd;
+        var worktree_owned = false;
+        var is_git_repo = false;
+        if (found) |root| {
+            is_git_repo = true;
+            if (std.mem.eql(u8, root, cwd)) {
+                alloc.free(root);
+            } else {
+                worktree = root;
+                worktree_owned = true;
+            }
+        }
+
+        const date_iso = try formatIsoDate(alloc, std.time.timestamp());
+        errdefer alloc.free(date_iso);
+
+        return .{
+            .cwd = cwd,
+            .worktree = worktree,
+            .date_iso = date_iso,
+            .is_git_repo = is_git_repo,
+            .worktree_owned = worktree_owned,
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *EnvSnapshot) void {
+        self.allocator.free(self.date_iso);
+        if (self.worktree_owned) self.allocator.free(self.worktree);
+        self.allocator.free(self.cwd);
+    }
+};
+
+const log = std.log.scoped(.prompt);
+
+/// Walk up the filesystem from `start` looking for a `.git` entry
+/// (directory or regular file; the latter indicates a linked worktree
+/// under `git worktree add`). Returns an owned, allocator-duped absolute
+/// path to the directory that contains the `.git` entry, or null when
+/// the walk reaches the filesystem root without finding one.
+fn findGitToplevel(alloc: Allocator, start: []const u8) !?[]const u8 {
+    if (start.len == 0) return null;
+
+    // Work on a mutable copy so we can repeatedly trim the trailing
+    // path component. Cap at the input length; the walk only shrinks.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.appendSlice(alloc, start);
+
+    while (true) {
+        const slice = buf.items;
+        if (slice.len == 0) return null;
+
+        // Check `<slice>/.git` existence. Either a directory (normal
+        // repo) or a regular file (linked worktree pointer) qualifies.
+        var dir = std.fs.openDirAbsolute(slice, .{}) catch return null;
+        defer dir.close();
+        if (dir.access(".git", .{})) |_| {
+            return try alloc.dupe(u8, slice);
+        } else |_| {}
+
+        // Strip the last path component. If we're already at "/" (a
+        // single '/' remains), we have nowhere further to climb.
+        const last_sep = std.mem.lastIndexOfScalar(u8, slice, '/') orelse return null;
+        if (last_sep == 0) {
+            // Reached the root without finding .git.
+            return null;
+        }
+        buf.shrinkRetainingCapacity(last_sep);
+    }
+}
+
+/// Format `unix_seconds` as ISO-8601 date (`YYYY-MM-DD`). UTC, no TZ
+/// suffix: the env layer only needs the calendar date, so higher
+/// precision would just churn on every turn.
+fn formatIsoDate(alloc: Allocator, unix_seconds: i64) ![]const u8 {
+    const secs: u64 = if (unix_seconds < 0) 0 else @intCast(unix_seconds);
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ed = es.getEpochDay();
+    const ym = ed.calculateYearDay();
+    const md = ym.calculateMonthDay();
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        ym.year,
+        md.month.numeric(),
+        @as(u16, md.day_index) + 1,
+    });
+}
+
 // -- Built-in layers --------------------------------------------------------
 
 const builtin_identity_text =
@@ -671,6 +812,62 @@ test "builtin skills_catalog renders <available_skills> when registry has entrie
     try std.testing.expect(std.mem.endsWith(u8, rendered, "</available_skills>"));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "name=\"roll-dice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Roll a die.") != null);
+}
+
+test "formatIsoDate matches YYYY-MM-DD for a known epoch" {
+    const alloc = std.testing.allocator;
+    // 1700000000 = 2023-11-14T22:13:20Z, so the UTC date is 2023-11-14.
+    const out = try formatIsoDate(alloc, 1_700_000_000);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("2023-11-14", out);
+}
+
+test "formatIsoDate clamps negative input to epoch zero" {
+    const alloc = std.testing.allocator;
+    const out = try formatIsoDate(alloc, -42);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("1970-01-01", out);
+}
+
+test "findGitToplevel returns null outside any repo" {
+    const alloc = std.testing.allocator;
+
+    // `/tmp` is never a git toplevel on a sane CI machine. Guard the
+    // test by refusing to run if some chaotic environment has planted a
+    // `.git` at the filesystem root.
+    const found = try findGitToplevel(alloc, "/tmp");
+    try std.testing.expect(found == null);
+}
+
+test "findGitToplevel finds the repo root from a subdirectory" {
+    const alloc = std.testing.allocator;
+
+    // Discover the actual zag repo path from the process cwd so this
+    // test works inside worktrees. getCwdAlloc may fail in odd
+    // sandboxes; skip the check rather than erroring out.
+    const here = std.process.getCwdAlloc(alloc) catch return;
+    defer alloc.free(here);
+
+    const found = try findGitToplevel(alloc, here);
+    if (found) |root| {
+        defer alloc.free(root);
+        try std.testing.expect(root.len > 0);
+    }
+}
+
+test "EnvSnapshot.capture populates cwd, date, and git flag" {
+    const alloc = std.testing.allocator;
+
+    var snap = try EnvSnapshot.capture(alloc);
+    defer snap.deinit();
+
+    try std.testing.expect(snap.date_iso.len == 10);
+    try std.testing.expectEqual(@as(u8, '-'), snap.date_iso[4]);
+    try std.testing.expectEqual(@as(u8, '-'), snap.date_iso[7]);
+
+    if (snap.is_git_repo) {
+        try std.testing.expect(snap.worktree.len > 0);
+    }
 }
 
 test "registerBuiltinLayers slots skills_catalog between identity and tool_list" {

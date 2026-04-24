@@ -24,6 +24,7 @@ const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const WindowManager = @import("WindowManager.zig");
 const Hooks = @import("Hooks.zig");
 const llm = @import("llm.zig");
+const prompt_mod = @import("prompt.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
@@ -479,6 +480,22 @@ pub fn dispatchHookRequests(
                     req.done.set();
                 }
             },
+            .prompt_assembly_request => |req| {
+                if (engine) |eng| {
+                    if (eng.renderPromptLayers(req.ctx, req.allocator)) |assembled| {
+                        req.result = assembled;
+                    } else |err| {
+                        req.error_name = @errorName(err);
+                    }
+                } else {
+                    // No engine means no Lua layers; the agent thread's
+                    // non-Lua fallback path owns assembly in that case.
+                    // Surface an error so a misrouted request doesn't
+                    // wedge the worker.
+                    req.error_name = "no_engine";
+                }
+                req.done.set();
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -653,6 +670,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         .lua_tool_request => |req| req.done.set(),
         .layout_request => |req| {
             req.is_error = true;
+            req.done.set();
+        },
+        .prompt_assembly_request => |req| {
+            req.error_name = "drained_without_dispatch";
             req.done.set();
         },
     }
@@ -1018,6 +1039,77 @@ test "lua_tool_request round-trips via main thread" {
     try std.testing.expect(req.result_content != null);
     defer if (req.result_owned) alloc.free(req.result_content.?);
     try std.testing.expect(std.mem.indexOf(u8, req.result_content.?, "ok: 1") != null);
+}
+
+test "prompt_assembly_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.round-trip-probe",
+        \\  priority = 900,
+        \\  cache_class = "volatile",
+        \\  render = function(ctx)
+        \\    return "ROUND-TRIP-PROBE cwd=" .. ctx.cwd
+        \\  end,
+        \\}
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const ctx: prompt_mod.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp/zag-dispatch",
+        .worktree = "/tmp/zag-dispatch",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    var req = agent_events.PromptAssemblyRequest.init(&ctx, alloc);
+
+    try queue.push(.{ .prompt_assembly_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    var assembled = req.result.?;
+    defer assembled.deinit();
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.@"volatile", "ROUND-TRIP-PROBE cwd=/tmp/zag-dispatch") != null,
+    );
+}
+
+test "prompt_assembly_request with no engine signals error_name" {
+    const alloc = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const ctx: prompt_mod.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    var req = agent_events.PromptAssemblyRequest.init(&ctx, alloc);
+
+    try queue.push(.{ .prompt_assembly_request = &req });
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name != null);
 }
 
 test "text_delta fires post-hook with text" {

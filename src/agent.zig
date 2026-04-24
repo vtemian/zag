@@ -21,11 +21,6 @@ const log = std.log.scoped(.agent);
 /// a real one. The built-in layers don't read it; PR 3's Lua layers will.
 const default_agent_name = "zag";
 
-/// Placeholder ISO date used for the `LayerContext.date_iso` field. The
-/// agent loop has no clock today; PR 3's `env` layer (Lua) will replace
-/// this with a real date pulled from the host.
-const placeholder_date_iso = "1970-01-01";
-
 /// Placeholder model spec for the `LayerContext.model` field. The agent
 /// loop currently receives only an `llm.Provider` vtable, not the parsed
 /// model identifier; built-in layers don't read it. PR 3 plumbs the real
@@ -63,13 +58,20 @@ pub fn runLoopStreaming(
     defer if (fallback_registry) |*r| r.deinit(allocator);
     if (lua_engine == null) fallback_registry = try Harness.defaultRegistry(allocator);
 
+    // Real host environment: cwd, worktree, ISO date, is-git-repo. Safe
+    // to capture from the worker thread because none of the underlying
+    // syscalls touch Lua state. The snapshot owns its string buffers;
+    // `layer_ctx` borrows from it for the lifetime of the loop.
+    var env_snapshot = try prompt.EnvSnapshot.capture(allocator);
+    defer env_snapshot.deinit();
+
     const layer_ctx: prompt.LayerContext = .{
         .model = placeholder_model_spec,
-        .cwd = "",
-        .worktree = "",
+        .cwd = env_snapshot.cwd,
+        .worktree = env_snapshot.worktree,
         .agent_name = default_agent_name,
-        .date_iso = placeholder_date_iso,
-        .is_git_repo = false,
+        .date_iso = env_snapshot.date_iso,
+        .is_git_repo = env_snapshot.is_git_repo,
         .platform = @tagName(@import("builtin").target.os.tag),
         .tools = tool_defs,
         .skills = skills,
@@ -92,10 +94,15 @@ pub fn runLoopStreaming(
         } };
         fireLifecycleHook(lua_engine, &turn_start, queue, cancel);
 
-        var assembled = if (lua_engine) |eng|
-            try eng.renderPromptLayers(&layer_ctx, allocator)
+        // Lua state is pinned to the main thread, so routing prompt
+        // assembly through the event queue (agent pushes, main renders,
+        // agent waits) is the only safe path when a Lua engine is
+        // present. Engine-less callers keep the inline Zig-only path
+        // because `fallback_registry` only holds builtin render_fns.
+        var assembled = if (lua_engine == null)
+            try Harness.assembleSystem(&fallback_registry.?, &layer_ctx, allocator)
         else
-            try Harness.assembleSystem(&fallback_registry.?, &layer_ctx, allocator);
+            try marshalPromptAssembly(&layer_ctx, allocator, queue, cancel);
         defer assembled.deinit();
 
         const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, tool_defs, allocator, queue, cancel);
@@ -120,6 +127,44 @@ pub fn runLoopStreaming(
 
         if (tool_calls.len == 0) break;
     }
+}
+
+/// Push a `prompt_assembly_request` onto the event queue and park until
+/// the main thread renders the Lua prompt registry. Polls `cancel` every
+/// 50ms so a user interrupt still tears down the wait. On cancellation,
+/// the still-queued request is serviced by `dispatchHookRequests` (or
+/// the drain fall-through) and signals `done` with an error_name; we
+/// surface `error.Cancelled` to the caller so the turn unwinds cleanly.
+fn marshalPromptAssembly(
+    ctx: *const prompt.LayerContext,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !prompt.AssembledPrompt {
+    var req = agent_events.PromptAssemblyRequest.init(ctx, allocator);
+    queue.push(.{ .prompt_assembly_request = &req }) catch return error.EventQueueFull;
+
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| break else |_| {
+            if (cancel.load(.acquire)) {
+                // The main thread still owns the request until it pops
+                // from the queue and signals done. Wait one more poll
+                // interval so we don't free a request still being read.
+                req.done.wait();
+                if (req.result) |assembled| {
+                    var owned = assembled;
+                    owned.deinit();
+                }
+                return error.Cancelled;
+            }
+        }
+    }
+
+    if (req.result) |assembled| return assembled;
+    if (req.error_name) |name| {
+        log.warn("prompt assembly marshalling failed: {s}", .{name});
+    }
+    return error.PromptAssemblyFailed;
 }
 
 /// Fire an observer-only lifecycle hook (TurnStart/TurnEnd/AgentDone etc.).
@@ -754,7 +799,7 @@ test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt o
         .cwd = "",
         .worktree = "",
         .agent_name = default_agent_name,
-        .date_iso = placeholder_date_iso,
+        .date_iso = "1970-01-01",
         .is_git_repo = false,
         .platform = @tagName(@import("builtin").target.os.tag),
         .tools = tool_defs,
@@ -812,7 +857,7 @@ test "runLoopStreaming wires SkillRegistry into the assembled system prompt" {
         .cwd = "",
         .worktree = "",
         .agent_name = default_agent_name,
-        .date_iso = placeholder_date_iso,
+        .date_iso = "1970-01-01",
         .is_git_repo = false,
         .platform = @tagName(@import("builtin").target.os.tag),
         .tools = tool_defs,
@@ -1061,6 +1106,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                 .lua_tool_request => |req| req.done.set(),
                 .layout_request => |req| {
                     req.is_error = true;
+                    req.done.set();
+                },
+                .prompt_assembly_request => |req| {
+                    req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
                 .thinking_stop, .done, .reset_assistant_text => {},

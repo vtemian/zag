@@ -547,13 +547,16 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     var prompt_registry = try Harness.defaultRegistry(gpa);
     defer prompt_registry.deinit(gpa);
 
+    var env_snapshot = try prompt.EnvSnapshot.capture(gpa);
+    defer env_snapshot.deinit();
+
     const layer_ctx: prompt.LayerContext = .{
         .model = llm.parseModelString(deps.model_id),
-        .cwd = "",
-        .worktree = "",
+        .cwd = env_snapshot.cwd,
+        .worktree = env_snapshot.worktree,
         .agent_name = "zag",
-        .date_iso = "1970-01-01",
-        .is_git_repo = false,
+        .date_iso = env_snapshot.date_iso,
+        .is_git_repo = env_snapshot.is_git_repo,
         .platform = @tagName(@import("builtin").target.os.tag),
         .tools = tool_defs,
         .skills = deps.runner.skills,
@@ -725,6 +728,10 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
             .lua_tool_request => |req| req.done.set(),
             .layout_request => |req| {
                 req.is_error = true;
+                req.done.set();
+            },
+            .prompt_assembly_request => |req| {
+                req.error_name = "drained_without_dispatch";
                 req.done.set();
             },
         };
