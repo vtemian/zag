@@ -4,6 +4,7 @@ comptime {
     _ = @import("Pty.zig");
     _ = @import("Spawn.zig");
     _ = @import("Grid.zig");
+    _ = @import("phase1_e2e_test.zig");
 }
 
 pub fn main() !u8 {
