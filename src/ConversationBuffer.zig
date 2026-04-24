@@ -13,6 +13,7 @@ const NodeLineCache = @import("NodeLineCache.zig");
 const ConversationTree = @import("ConversationTree.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
+const Viewport = @import("Viewport.zig");
 const input = @import("input.zig");
 
 const ConversationBuffer = @This();
@@ -43,17 +44,11 @@ tree: ConversationTree,
 /// Allocator used for all buffer-owned allocations (name, cache). The
 /// tree holds its own copy of the same allocator.
 allocator: Allocator,
-/// Scroll offset from the bottom (0 = scrolled to latest content).
-scroll_offset: u32 = 0,
-/// Last `tree.generation` observed by `clearDirty`. `isDirty` returns
-/// true whenever the tree has advanced past this value, so every
-/// `appendNode`/`appendToNode`/`clear` call is automatically visible
-/// without a separate dirty flag.
-last_seen_generation: u32 = 0,
-/// Separate dirty channel for view-only changes (scroll, focus) that
-/// don't mutate the tree. `isDirty` ORs this with the generation
-/// check; `clearDirty` resets it to false.
-scroll_dirty: bool = false,
+/// Borrowed pointer to the Pane's display-state bundle. Set via
+/// `attachViewport` after the owning Pane's storage stabilises. When
+/// null (e.g. headless or test setup with no pane), display-state
+/// vtable methods degrade to safe no-ops.
+viewport: ?*Viewport = null,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 /// Memoized NodeRenderer output, keyed by (node.id, node.content_version).
@@ -97,6 +92,14 @@ pub fn deinit(self: *ConversationBuffer) void {
     self.cache.deinit();
     self.tree.deinit();
     self.allocator.free(self.name);
+}
+
+/// Attach a borrowed Viewport pointer. The Pane owns the Viewport
+/// storage and must outlive this buffer. Display-state vtable methods
+/// delegate through this pointer; before `attachViewport` runs, those
+/// methods are safe no-ops.
+pub fn attachViewport(self: *ConversationBuffer, viewport: *Viewport) void {
+    self.viewport = viewport;
 }
 
 /// Create a new node and attach it to `parent`. If `parent` is null the node
@@ -461,14 +464,12 @@ fn bufGetId(ptr: *anyopaque) u32 {
 
 fn bufGetScrollOffset(ptr: *anyopaque) u32 {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.scroll_offset;
+    return if (self.viewport) |v| v.scroll_offset else 0;
 }
 
 fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    if (self.scroll_offset == offset) return;
-    self.scroll_offset = offset;
-    self.scroll_dirty = true;
+    if (self.viewport) |v| v.setScrollOffset(offset);
 }
 
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {
@@ -478,13 +479,12 @@ fn bufLineCount(ptr: *anyopaque) anyerror!usize {
 
 fn bufIsDirty(ptr: *anyopaque) bool {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.tree.currentGeneration() != self.last_seen_generation or self.scroll_dirty;
+    return if (self.viewport) |v| v.isDirty(self.tree.currentGeneration()) else false;
 }
 
 fn bufClearDirty(ptr: *anyopaque) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    self.last_seen_generation = self.tree.currentGeneration();
-    self.scroll_dirty = false;
+    if (self.viewport) |v| v.clearDirty(self.tree.currentGeneration());
 }
 
 /// Handle a key event aimed at the buffer's in-progress draft. The
@@ -528,8 +528,8 @@ fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
 }
 
 fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    _ = ptr;
-    _ = rect;
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    if (self.viewport) |v| v.onResize(rect);
 }
 
 fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
@@ -617,6 +617,9 @@ test "buffer interface dispatches correctly" {
     var cb = try ConversationBuffer.init(allocator, 7, "iface-test");
     defer cb.deinit();
 
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
     const b = cb.buf();
     try std.testing.expectEqualStrings("iface-test", b.getName());
     try std.testing.expectEqual(@as(u32, 7), b.getId());
@@ -624,7 +627,7 @@ test "buffer interface dispatches correctly" {
 
     b.setScrollOffset(10);
     try std.testing.expectEqual(@as(u32, 10), b.getScrollOffset());
-    try std.testing.expectEqual(@as(u32, 10), cb.scroll_offset);
+    try std.testing.expectEqual(@as(u32, 10), viewport.scroll_offset);
 }
 
 test "fromBuffer roundtrips correctly" {
@@ -813,6 +816,9 @@ test "buffer starts clean" {
     var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
 
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
     const b = cb.buf();
     try std.testing.expect(!b.isDirty());
 }
@@ -821,6 +827,9 @@ test "appendNode marks buffer dirty" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
 
     _ = try cb.appendNode(null, .user_message, "hello");
     const b = cb.buf();
@@ -831,6 +840,9 @@ test "clearDirty resets the flag" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
 
     _ = try cb.appendNode(null, .user_message, "hello");
     var b = cb.buf();
@@ -845,6 +857,9 @@ test "appendToNode marks buffer dirty" {
     var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
 
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
     const node = try cb.appendNode(null, .user_message, "hello");
     var b = cb.buf();
     b.clearDirty();
@@ -857,6 +872,9 @@ test "setScrollOffset marks dirty only when value changes" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
 
     var b = cb.buf();
 

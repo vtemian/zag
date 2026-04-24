@@ -465,10 +465,7 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
     var finished = false;
 
     for (drain[0..count]) |event| {
-        if (self.view.scroll_offset != 0) {
-            self.view.scroll_offset = 0;
-            self.view.scroll_dirty = true;
-        }
+        self.view.buf().setScrollOffset(0);
         self.handleAgentEvent(event, allocator);
 
         if (event == .done) {
