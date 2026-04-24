@@ -153,6 +153,81 @@ fn layerLessThan(_: void, a: Layer, b: Layer) bool {
     return a.priority < b.priority;
 }
 
+// -- Built-in layers --------------------------------------------------------
+
+const builtin_identity_text =
+    \\You are an expert coding assistant operating inside zag, a coding agent harness.
+    \\You help users by reading files, executing commands, editing code, and writing new files.
+;
+
+const builtin_guidelines_text =
+    \\Guidelines:
+    \\- Use bash for file operations like ls, rg, find
+    \\- Be concise in your responses
+    \\- Show file paths clearly
+    \\- Prefer editing over rewriting entire files
+;
+
+fn renderBuiltinIdentity(_: *const LayerContext, alloc: Allocator) anyerror!?[]const u8 {
+    return try alloc.dupe(u8, builtin_identity_text);
+}
+
+fn renderBuiltinToolList(ctx: *const LayerContext, alloc: Allocator) anyerror!?[]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "Available tools:");
+    var emitted: usize = 0;
+    for (ctx.tools) |def| {
+        const snippet = def.prompt_snippet orelse continue;
+        try buf.appendSlice(alloc, "\n- ");
+        try buf.appendSlice(alloc, def.name);
+        try buf.appendSlice(alloc, ": ");
+        try buf.appendSlice(alloc, snippet);
+        emitted += 1;
+    }
+    // Drop the layer entirely when no tools carry snippets; the bare
+    // "Available tools:" header would be misleading on its own.
+    if (emitted == 0) return null;
+
+    return try buf.toOwnedSlice(alloc);
+}
+
+fn renderBuiltinGuidelines(_: *const LayerContext, alloc: Allocator) anyerror!?[]const u8 {
+    return try alloc.dupe(u8, builtin_guidelines_text);
+}
+
+/// Register the three always-on layers that together reproduce today's
+/// `buildSystemPrompt` output: identity (prefix), tool list (middle),
+/// guidelines (suffix).
+///
+/// Priorities are spaced so Lua-registered layers can slot in between
+/// without reshuffling builtins: identity=5, tool_list=100,
+/// guidelines=910.
+pub fn registerBuiltinLayers(reg: *Registry, alloc: Allocator) !void {
+    try reg.add(alloc, .{
+        .name = "builtin.identity",
+        .priority = 5,
+        .cache_class = .stable,
+        .source = .builtin,
+        .render_fn = renderBuiltinIdentity,
+    });
+    try reg.add(alloc, .{
+        .name = "builtin.tool_list",
+        .priority = 100,
+        .cache_class = .stable,
+        .source = .builtin,
+        .render_fn = renderBuiltinToolList,
+    });
+    try reg.add(alloc, .{
+        .name = "builtin.guidelines",
+        .priority = 910,
+        .cache_class = .@"volatile",
+        .source = .builtin,
+        .render_fn = renderBuiltinGuidelines,
+    });
+}
+
 // -- Tests ------------------------------------------------------------------
 
 test {
@@ -414,4 +489,107 @@ test "AssembledPrompt.deinit frees arena" {
     // testing.allocator asserts no leaks on defer, so a missing deinit
     // here would fail the test.
     assembled.deinit();
+}
+
+test "builtin identity renders the expected prefix" {
+    const alloc = std.testing.allocator;
+    const ctx = fakeContext();
+    const rendered = (try renderBuiltinIdentity(&ctx, alloc)) orelse unreachable;
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(builtin_identity_text, rendered);
+}
+
+test "builtin guidelines renders the expected suffix" {
+    const alloc = std.testing.allocator;
+    const ctx = fakeContext();
+    const rendered = (try renderBuiltinGuidelines(&ctx, alloc)) orelse unreachable;
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(builtin_guidelines_text, rendered);
+}
+
+test "builtin tool list formats snippets and skips tools without one" {
+    const alloc = std.testing.allocator;
+    var ctx = fakeContext();
+    const defs = [_]types.ToolDefinition{
+        .{
+            .name = "read",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = "read file contents",
+        },
+        .{
+            .name = "secret",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = null,
+        },
+        .{
+            .name = "bash",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = "run shell commands",
+        },
+    };
+    ctx.tools = &defs;
+
+    const rendered = (try renderBuiltinToolList(&ctx, alloc)) orelse unreachable;
+    defer alloc.free(rendered);
+
+    const expected =
+        \\Available tools:
+        \\- read: read file contents
+        \\- bash: run shell commands
+    ;
+    try std.testing.expectEqualStrings(expected, rendered);
+}
+
+test "builtin tool list returns null when no tools carry snippets" {
+    const alloc = std.testing.allocator;
+    var ctx = fakeContext();
+    const defs = [_]types.ToolDefinition{
+        .{
+            .name = "silent",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = null,
+        },
+    };
+    ctx.tools = &defs;
+
+    const rendered = try renderBuiltinToolList(&ctx, alloc);
+    try std.testing.expectEqual(@as(?[]const u8, null), rendered);
+}
+
+test "registerBuiltinLayers assembles identity + tools + guidelines" {
+    const alloc = std.testing.allocator;
+
+    var reg: Registry = .{};
+    defer reg.deinit(alloc);
+
+    try registerBuiltinLayers(&reg, alloc);
+    try std.testing.expectEqual(@as(usize, 3), reg.layers.items.len);
+
+    var ctx = fakeContext();
+    const defs = [_]types.ToolDefinition{
+        .{
+            .name = "read",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = "read file contents",
+        },
+    };
+    ctx.tools = &defs;
+
+    var assembled = try reg.render(&ctx, alloc);
+    defer assembled.deinit();
+
+    const expected_stable =
+        \\You are an expert coding assistant operating inside zag, a coding agent harness.
+        \\You help users by reading files, executing commands, editing code, and writing new files.
+        \\
+        \\Available tools:
+        \\- read: read file contents
+    ;
+    try std.testing.expectEqualStrings(expected_stable, assembled.stable);
+    try std.testing.expectEqualStrings(builtin_guidelines_text, assembled.@"volatile");
 }
