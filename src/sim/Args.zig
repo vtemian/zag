@@ -23,7 +23,9 @@ pub fn parseSend(raw: []const u8, out: *std.ArrayList(SendArg), alloc: std.mem.A
             const end = std.mem.indexOfScalarPos(u8, raw, i + 1, '>') orelse return error.UnterminatedKeysym;
             const inside = raw[i + 1 .. end];
             if (std.ascii.startsWithIgnoreCase(inside, "C-") and inside.len == 3) {
-                try out.append(alloc, .{ .ctrl = std.ascii.toLower(inside[2]) });
+                const letter = std.ascii.toLower(inside[2]);
+                if (letter < 'a' or letter > 'z') return error.InvalidCtrlKey;
+                try out.append(alloc, .{ .ctrl = letter });
             } else {
                 const sym = try parseKeySym(inside);
                 try out.append(alloc, .{ .keysym = sym });
@@ -82,6 +84,12 @@ test "parseSend ctrl" {
     defer args.deinit(std.testing.allocator);
     try parseSend("<C-c>", &args, std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 'c'), args.items[0].ctrl);
+}
+
+test "parseSend rejects non-letter ctrl keys" {
+    var args: std.ArrayList(SendArg) = .empty;
+    defer args.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidCtrlKey, parseSend("<C-0>", &args, std.testing.allocator));
 }
 
 test "parseDurationMs all forms" {
