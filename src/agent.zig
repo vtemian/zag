@@ -668,6 +668,11 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
         .done => .done,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
+        // Task 1.10 routes `thinking_delta` into a ConversationBuffer
+        // thinking node; Task 1.11 persists it to the trajectory. Until
+        // those land we drop the deltas so the agent loop keeps behaving
+        // exactly as before.
+        .thinking_delta, .thinking_stop => return,
     };
     // On backpressure budget expiry, pushWithBackpressure frees the duped
     // payload via freeOwned and logs a warn. Streaming deltas are the

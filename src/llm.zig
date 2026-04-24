@@ -95,6 +95,13 @@ pub fn mapProviderError(err: anyerror) ProviderError {
 pub const StreamEvent = union(enum) {
     /// Partial text from the LLM response.
     text_delta: []const u8,
+    /// Partial extended-thinking text. The `text` slice is borrowed from
+    /// the SSE parser's scratch buffer and is only valid for the duration
+    /// of the callback; consumers must copy before stashing.
+    thinking_delta: struct { text: []const u8 },
+    /// End of a thinking block. Lets consumers flush an in-flight thinking
+    /// node before the next content block (text or tool_use) begins.
+    thinking_stop,
     /// A tool call was started by the LLM (content is the tool name).
     tool_start: []const u8,
     /// Informational message (token counts, etc.).
