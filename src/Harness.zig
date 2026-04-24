@@ -1,20 +1,26 @@
-//! Harness-level message shaping utilities.
+//! Harness-level message and prompt shaping utilities.
 //!
-//! For PR 1 this holds only `stripThinkingAcrossTurns`, the on-the-wire
-//! filter that drops `.thinking` and `.redacted_thinking` blocks from
-//! prior-turn assistant messages before a provider serializes them.
+//! Two responsibilities live here:
 //!
-//! The UI and the session log keep every thinking block forever; we
-//! only prune them right before a request leaves the process so the
-//! model never re-sees its old chain-of-thought. Anthropic requires
-//! the current turn's thinking blocks (with their signatures) to stay
-//! attached across within-turn tool loops, so the filter preserves
-//! them there.
+//! 1. `stripThinkingAcrossTurns` is the on-the-wire filter that drops
+//!    `.thinking` and `.redacted_thinking` blocks from prior-turn
+//!    assistant messages before a provider serializes them. The UI and
+//!    the session log keep every thinking block forever; we only prune
+//!    them right before a request leaves the process so the model
+//!    never re-sees its old chain-of-thought. Anthropic requires the
+//!    current turn's thinking blocks (with their signatures) to stay
+//!    attached across within-turn tool loops, so the filter preserves
+//!    them there.
 //!
-//! PR 2 will expand this module into the full prompt-shaping harness
-//! (system prompt assembly, tool-result trimming, context compaction).
+//! 2. `defaultRegistry` + `assembleSystem` drive system-prompt layer
+//!    assembly. `defaultRegistry` hands back a `prompt.Registry` with
+//!    the three built-in layers (identity, tool_list, guidelines)
+//!    already registered; `assembleSystem` is the thin wrapper
+//!    `agent.zig` will call once per turn to produce a split
+//!    stable/volatile prompt.
 
 const std = @import("std");
+const prompt = @import("prompt.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -140,6 +146,37 @@ fn filterThinking(
         },
     };
     return out;
+}
+
+/// Build a `prompt.Registry` seeded with the three always-on built-in
+/// layers (identity, tool_list, guidelines). The caller owns the
+/// returned registry and must call `deinit(allocator)` on it.
+///
+/// Lua-registered layers get appended on top of this baseline; the
+/// built-in priorities (5, 100, 910) leave room for plugins to slot
+/// in before, between, or after them.
+pub fn defaultRegistry(allocator: Allocator) !prompt.Registry {
+    var registry: prompt.Registry = .{};
+    errdefer registry.deinit(allocator);
+    try prompt.registerBuiltinLayers(&registry, allocator);
+    return registry;
+}
+
+/// Render the given registry against `ctx` and return the resulting
+/// `AssembledPrompt`. The prompt owns an arena; the caller must
+/// `deinit` it to release both slices plus any scratch the layer
+/// render_fns allocated during this pass.
+///
+/// Thin wrapper over `Registry.render` so `agent.zig` and future
+/// call sites have a single entry point even once the harness grows
+/// additional pre- and post-processing (hook dispatch, caching
+/// policy) around the raw render call.
+pub fn assembleSystem(
+    registry: *prompt.Registry,
+    ctx: *const prompt.LayerContext,
+    allocator: Allocator,
+) !prompt.AssembledPrompt {
+    return registry.render(ctx, allocator);
 }
 
 // -- Tests ------------------------------------------------------------------
@@ -307,4 +344,73 @@ test "stripThinkingAcrossTurns with no user message leaves history untouched" {
 
     const stripped = try stripThinkingAcrossTurns(&messages, arena);
     try std.testing.expectEqual(@as(usize, 2), stripped[0].content.len);
+}
+
+fn fakeLayerContext() prompt.LayerContext {
+    return .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+}
+
+test "defaultRegistry seeds the three built-in layers" {
+    const alloc = std.testing.allocator;
+    var registry = try defaultRegistry(alloc);
+    defer registry.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), registry.layers.items.len);
+    try std.testing.expectEqualStrings("builtin.identity", registry.layers.items[0].name);
+    try std.testing.expectEqualStrings("builtin.tool_list", registry.layers.items[1].name);
+    try std.testing.expectEqualStrings("builtin.guidelines", registry.layers.items[2].name);
+}
+
+test "assembleSystem renders identity + tool_list into stable and guidelines into volatile" {
+    const alloc = std.testing.allocator;
+    var registry = try defaultRegistry(alloc);
+    defer registry.deinit(alloc);
+
+    var ctx = fakeLayerContext();
+    const defs = [_]types.ToolDefinition{
+        .{
+            .name = "read",
+            .description = "",
+            .input_schema_json = "{}",
+            .prompt_snippet = "read file contents",
+        },
+    };
+    ctx.tools = &defs;
+
+    var assembled = try assembleSystem(&registry, &ctx, alloc);
+    defer assembled.deinit();
+
+    // The joined output (stable + "\n\n" + volatile) must match what
+    // today's `buildSystemPrompt` produces so Task 2.5 can swap the
+    // call site with no behaviour change.
+    const joined = try std.mem.concat(alloc, u8, &.{
+        assembled.stable,
+        "\n\n",
+        assembled.@"volatile",
+    });
+    defer alloc.free(joined);
+
+    const expected =
+        \\You are an expert coding assistant operating inside zag, a coding agent harness.
+        \\You help users by reading files, executing commands, editing code, and writing new files.
+        \\
+        \\Available tools:
+        \\- read: read file contents
+        \\
+        \\Guidelines:
+        \\- Use bash for file operations like ls, rg, find
+        \\- Be concise in your responses
+        \\- Show file paths clearly
+        \\- Prefer editing over rewriting entire files
+    ;
+    try std.testing.expectEqualStrings(expected, joined);
 }
