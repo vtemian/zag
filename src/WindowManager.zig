@@ -22,6 +22,7 @@ const Buffer = @import("Buffer.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
+const Viewport = @import("Viewport.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
@@ -70,6 +71,13 @@ pub const Pane = struct {
     /// `ProviderResult` pointed to; `WindowManager.deinit` frees it
     /// alongside the pane.
     provider: ?*llm.ProviderResult = null,
+    /// Pane-owned display state (scroll offset, dirty flag, cached rect).
+    /// Stored inline so its address is stable once the enclosing Pane
+    /// lives at its final storage site; agent panes attach the buffer to
+    /// this Viewport so Buffer vtable calls delegate through pane state.
+    /// Scratch-backed panes leave it at defaults; they have no
+    /// ConversationBuffer to attach.
+    viewport: Viewport = .{},
 };
 
 /// A registered pane plus the persistence handle that keeps it tied to
@@ -939,6 +947,14 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     // subsequent `paneFromBuffer` call already sees this pane.
     try self.extra_panes.append(self.allocator, .{ .pane = pane });
 
+    // The Pane now lives at its final address inside `extra_panes`, so
+    // resolve the stable entry and wire the buffer's display-state
+    // delegation through the pane-owned Viewport.
+    const entry = &self.extra_panes.items[self.extra_panes.items.len - 1];
+    if (entry.pane.view) |v| {
+        v.attachViewport(&entry.pane.viewport);
+    }
+
     const sh = self.attachSession(pane);
     self.extra_panes.items[self.extra_panes.items.len - 1].session_handle = sh;
 
@@ -1509,6 +1525,59 @@ test "Pane composes view + session + runner" {
     try std.testing.expectEqual(view, pane.runner.?.view);
     try std.testing.expectEqual(session, pane.runner.?.session);
     try std.testing.expectEqualStrings("pane-test", pane.view.?.name);
+}
+
+test "extra pane viewport is attached to its buffer" {
+    const allocator = std.testing.allocator;
+
+    // Root scaffolding: Layout is created but not driven (we never call
+    // doSplit, just createSplitPane directly), so Screen/Compositor can
+    // stay undefined. session_mgr points at a null optional so
+    // attachSession falls through without touching disk.
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    const created = try wm.createSplitPane();
+    _ = created;
+
+    const entry = &wm.extra_panes.items[wm.extra_panes.items.len - 1];
+    const cb = entry.pane.view.?;
+
+    // The buffer now routes display-state through the pane-owned Viewport.
+    try std.testing.expectEqual(&entry.pane.viewport, cb.viewport.?);
+
+    // Flipping scroll on the pane's Viewport must reflect through the
+    // Buffer vtable, proving the attach actually wired the delegation.
+    entry.pane.viewport.setScrollOffset(7);
+    try std.testing.expectEqual(@as(u32, 7), entry.pane.buffer.getScrollOffset());
 }
 
 test "WindowManager exposes a NodeRegistry" {

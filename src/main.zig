@@ -1300,6 +1300,13 @@ pub fn main() !void {
     // Extra split panes pick this up inside `createSplitPane`.
     root_runner.window_manager = &orchestrator.window_manager;
 
+    // The root Pane was passed by value into EventOrchestrator.init and
+    // now lives at a stable address inside orchestrator.window_manager.
+    // Attach the root buffer to the pane-owned Viewport so Buffer vtable
+    // calls (scroll offset, dirty, cached rect) delegate through pane
+    // state rather than the buffer's private fallback.
+    root_buffer.attachViewport(&orchestrator.window_manager.root_pane.viewport);
+
     // Lua bindings (zag.layout.*, zag.pane.*) call the window manager
     // directly on the main thread. Wire after orchestrator construction
     // so the pointer is stable for the lifetime of the engine.
