@@ -122,6 +122,36 @@ pub const StreamCallback = struct {
     on_event: *const fn (ctx: *anyopaque, event: StreamEvent) void,
 };
 
+/// Extended-thinking knob requested by the caller. Providers that don't
+/// understand a given variant either coerce to their closest equivalent
+/// (Codex maps `.adaptive` to `reasoning.effort`) or silently ignore it.
+pub const ThinkingConfig = union(enum) {
+    /// Explicitly disable thinking. Distinct from `null` (unset) so a
+    /// caller can override a provider's default-on behavior.
+    disabled,
+    /// Fixed thinking budget. `budget_tokens` is the cap Anthropic places
+    /// on reasoning tokens; providers without a token budget ignore it.
+    enabled: struct { budget_tokens: u32 },
+    /// Let the provider pick the depth based on task difficulty. Anthropic
+    /// emits `thinking:{type:"adaptive"}` paired with `output_config.effort`.
+    adaptive: struct { effort: Effort },
+
+    pub const Effort = enum { low, medium, high };
+};
+
+/// Report whether a Claude model identifier advertises extended-thinking
+/// support. Substring match, not an exhaustive catalog — the set of
+/// thinking-capable Claude models grows and this function is the one place
+/// to extend when a new family ships. PR 3 moves this decision into Lua.
+pub fn supportsExtendedThinking(model_id: []const u8) bool {
+    // Claude 4 opus / sonnet families (incl. 4-5 point-releases).
+    if (std.mem.indexOf(u8, model_id, "opus-4") != null) return true;
+    if (std.mem.indexOf(u8, model_id, "sonnet-4") != null) return true;
+    // Claude 3.7 sonnet (the first thinking-capable Claude).
+    if (std.mem.indexOf(u8, model_id, "3-7-sonnet") != null) return true;
+    return false;
+}
+
 /// The neutral input shape that every provider vtable accepts.
 ///
 /// Provider-specific wire-format concerns (system placement, tool
@@ -139,6 +169,10 @@ pub const Request = struct {
     tool_definitions: []const types.ToolDefinition,
     /// Allocator for response allocations owned by the caller.
     allocator: Allocator,
+    /// Optional extended-thinking override. `null` lets the provider pick
+    /// a sensible default for the model (Anthropic turns thinking on for
+    /// any thinking-capable Claude).
+    thinking: ?ThinkingConfig = null,
 };
 
 /// Streaming variant: everything in `Request` plus the callback and
@@ -157,6 +191,8 @@ pub const StreamRequest = struct {
     callback: StreamCallback,
     /// Cancellation flag polled by the provider to abort mid-stream.
     cancel: *std.atomic.Value(bool),
+    /// Optional extended-thinking override. See `Request.thinking`.
+    thinking: ?ThinkingConfig = null,
 };
 
 /// Wire format for request/response serialization.
@@ -733,6 +769,20 @@ test "parseModelString handles nested slashes for openrouter" {
     const result = parseModelString("openrouter/anthropic/claude-sonnet-4");
     try std.testing.expectEqualStrings("openrouter", result.provider_name);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", result.model_id);
+}
+
+test "supportsExtendedThinking recognizes thinking-capable Claudes" {
+    try std.testing.expect(supportsExtendedThinking("claude-sonnet-4-20250514"));
+    try std.testing.expect(supportsExtendedThinking("claude-sonnet-4-5-20250929"));
+    try std.testing.expect(supportsExtendedThinking("claude-opus-4-20250514"));
+    try std.testing.expect(supportsExtendedThinking("claude-3-7-sonnet-20250219"));
+}
+
+test "supportsExtendedThinking rejects older Claudes" {
+    try std.testing.expect(!supportsExtendedThinking("claude-3-5-sonnet-20241022"));
+    try std.testing.expect(!supportsExtendedThinking("claude-3-5-haiku-20241022"));
+    try std.testing.expect(!supportsExtendedThinking("claude-3-opus-20240229"));
+    try std.testing.expect(!supportsExtendedThinking("gpt-4o"));
 }
 
 test "createProviderFromLuaConfig reads model from engine and key from auth.json" {

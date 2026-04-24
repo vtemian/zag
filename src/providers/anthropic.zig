@@ -13,6 +13,22 @@ const log = std.log.scoped(.anthropic);
 
 const default_max_tokens = 8192;
 
+/// Default thinking budget Anthropic advertises as a safe floor for the
+/// thinking-capable Claude families. Picked to match the plan (PR 1) —
+/// PR 3 will let Lua layers raise or lower this per call.
+const default_thinking_budget_tokens: u32 = 4096;
+
+/// Resolve the thinking parameter for this request. Explicit caller config
+/// wins; when nothing is set, thinking-capable Claude models get the
+/// default budget and older Claudes stay silent.
+fn resolveThinking(model: []const u8, override: ?llm.ThinkingConfig) ?llm.ThinkingConfig {
+    if (override) |cfg| return cfg;
+    if (llm.supportsExtendedThinking(model)) {
+        return .{ .enabled = .{ .budget_tokens = default_thinking_budget_tokens } };
+    }
+    return null;
+}
+
 /// Anthropic serializer state.
 pub const AnthropicSerializer = struct {
     /// Endpoint connection details (URL, auth, headers).
@@ -48,7 +64,8 @@ pub const AnthropicSerializer = struct {
     ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        const thinking = resolveThinking(self.model, req.thinking);
+        const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -73,7 +90,8 @@ pub const AnthropicSerializer = struct {
     ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        const thinking = resolveThinking(self.model, req.thinking);
+        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -93,9 +111,10 @@ pub fn buildRequestBody(
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, thinking, allocator);
 }
 
 /// Same as buildRequestBody but with "stream": true.
@@ -104,9 +123,10 @@ pub fn buildStreamingRequestBody(
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, thinking, allocator);
 }
 
 /// Serializes a full Anthropic Messages API request into JSON.
@@ -118,6 +138,7 @@ fn serializeRequest(
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
     max_tokens: u32,
+    thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -128,6 +149,8 @@ fn serializeRequest(
     try w.print("\"model\":\"{s}\",", .{model});
     try w.print("\"max_tokens\":{d},", .{max_tokens});
     if (stream) try w.writeAll("\"stream\":true,");
+
+    try writeThinking(thinking, w);
 
     try w.writeAll("\"system\":");
     try std.json.Stringify.value(system_prompt, .{}, w);
@@ -140,6 +163,28 @@ fn serializeRequest(
 
     try w.writeAll("}");
     return out.toOwnedSlice();
+}
+
+/// Emit the `thinking` (and, for adaptive, `output_config`) fields when
+/// configured. Each emitted field ends with a trailing comma so the caller
+/// can continue appending siblings without bookkeeping.
+fn writeThinking(thinking: ?llm.ThinkingConfig, w: anytype) !void {
+    const cfg = thinking orelse return;
+    switch (cfg) {
+        .disabled => {},
+        .enabled => |e| {
+            try w.print("\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}},", .{e.budget_tokens});
+        },
+        .adaptive => |a| {
+            try w.writeAll("\"thinking\":{\"type\":\"adaptive\"},");
+            const effort = switch (a.effort) {
+                .low => "low",
+                .medium => "medium",
+                .high => "high",
+            };
+            try w.print("\"output_config\":{{\"effort\":\"{s}\"}},", .{effort});
+        },
+    }
 }
 
 fn writeToolDefinitions(defs: []const types.ToolDefinition, w: anytype) !void {
@@ -720,7 +765,7 @@ test "buildRequestBody produces valid JSON" {
     };
 
     const model = "claude-sonnet-4-20250514";
-    const body = try buildRequestBody(model, "You are a helper.", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody(model, "You are a helper.", &messages, &tool_defs, null, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -751,7 +796,7 @@ test "buildRequestBody uses provided model string" {
     };
 
     const model = "claude-opus-4-20250514";
-    const body = try buildRequestBody(model, "system", &messages, &.{}, allocator);
+    const body = try buildRequestBody(model, "system", &messages, &.{}, null, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -766,7 +811,7 @@ test "buildStreamingRequestBody includes stream:true" {
 
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("claude-sonnet-4-20250514", "system", &messages, &.{}, allocator);
+    const body = try buildStreamingRequestBody("claude-sonnet-4-20250514", "system", &messages, &.{}, null, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1251,7 +1296,7 @@ test "processSseEvent captures redacted_thinking ciphertext inline" {
 
 test "anthropic body places system as top-level field" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"system\":\"sys\"") != null);
 }
@@ -1262,7 +1307,7 @@ test "anthropic wraps tool as bare object" {
         .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"t\",") != null);
@@ -1272,7 +1317,7 @@ test "anthropic wraps tool as bare object" {
 
 test "anthropic emits empty tools array" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1283,9 +1328,87 @@ test "anthropic emits empty tools array" {
 
 test "streaming flag is included when requested" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, true, 128, testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, true, 128, null, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "serializeRequest omits thinking when null" {
+    const testing = std.testing;
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, null, testing.allocator);
+    defer testing.allocator.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"output_config\"") == null);
+}
+
+test "serializeRequest omits thinking when .disabled" {
+    const testing = std.testing;
+    const cfg: ?llm.ThinkingConfig = .disabled;
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    defer testing.allocator.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+}
+
+test "serializeRequest emits thinking with enabled budget" {
+    const testing = std.testing;
+    const cfg: ?llm.ThinkingConfig = .{ .enabled = .{ .budget_tokens = 4096 } };
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const thinking_obj = parsed.value.object.get("thinking").?.object;
+    try testing.expectEqualStrings("enabled", thinking_obj.get("type").?.string);
+    try testing.expectEqual(@as(i64, 4096), thinking_obj.get("budget_tokens").?.integer);
+    try testing.expect(parsed.value.object.get("output_config") == null);
+}
+
+test "serializeRequest emits adaptive thinking and sibling output_config" {
+    const testing = std.testing;
+    const cfg: ?llm.ThinkingConfig = .{ .adaptive = .{ .effort = .medium } };
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const thinking_obj = root.get("thinking").?.object;
+    try testing.expectEqualStrings("adaptive", thinking_obj.get("type").?.string);
+    try testing.expect(thinking_obj.get("budget_tokens") == null);
+
+    const output_config = root.get("output_config").?.object;
+    try testing.expectEqualStrings("medium", output_config.get("effort").?.string);
+}
+
+test "resolveThinking defaults enabled for thinking-capable Claudes" {
+    const testing = std.testing;
+    // sonnet-4 family supports thinking.
+    const resolved_sonnet = resolveThinking("claude-sonnet-4-20250514", null).?;
+    try testing.expect(resolved_sonnet == .enabled);
+    try testing.expectEqual(default_thinking_budget_tokens, resolved_sonnet.enabled.budget_tokens);
+
+    // opus-4 family supports thinking.
+    const resolved_opus = resolveThinking("claude-opus-4-20250514", null).?;
+    try testing.expect(resolved_opus == .enabled);
+
+    // 3-7-sonnet supports thinking.
+    const resolved_37 = resolveThinking("claude-3-7-sonnet-20250219", null).?;
+    try testing.expect(resolved_37 == .enabled);
+}
+
+test "resolveThinking returns null for pre-thinking Claudes" {
+    const testing = std.testing;
+    try testing.expect(resolveThinking("claude-3-5-sonnet-20241022", null) == null);
+    try testing.expect(resolveThinking("claude-3-5-haiku-20241022", null) == null);
+}
+
+test "resolveThinking honors explicit override even when model would default" {
+    const testing = std.testing;
+    const override: ?llm.ThinkingConfig = .disabled;
+    const resolved = resolveThinking("claude-sonnet-4-20250514", override).?;
+    try testing.expect(resolved == .disabled);
 }
 
 test "anthropic writeMessage serializes tool_use content block" {
