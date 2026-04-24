@@ -5,6 +5,7 @@ comptime {
     _ = @import("Spawn.zig");
     _ = @import("Grid.zig");
     _ = @import("Dsl.zig");
+    _ = @import("Args.zig");
     _ = @import("phase1_e2e_test.zig");
 }
 
