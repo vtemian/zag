@@ -25,6 +25,13 @@ pub const EntryType = enum {
     info,
     err,
     session_rename,
+    /// Visible reasoning block produced by a thinking-capable model.
+    /// `content` carries the reasoning text; `signature` and
+    /// `thinking_provider` round-trip the provider handshake bits.
+    thinking,
+    /// Opaque encrypted reasoning block. `encrypted_data` holds the
+    /// ciphertext to replay verbatim on later turns.
+    thinking_redacted,
 
     pub fn toSlice(self: EntryType) []const u8 {
         return switch (self) {
@@ -36,6 +43,8 @@ pub const EntryType = enum {
             .info => "info",
             .err => "err",
             .session_rename => "session_rename",
+            .thinking => "thinking",
+            .thinking_redacted => "thinking_redacted",
         };
     }
 
@@ -49,6 +58,8 @@ pub const EntryType = enum {
             .{ "info", EntryType.info },
             .{ "err", EntryType.err },
             .{ "session_rename", EntryType.session_rename },
+            .{ "thinking", EntryType.thinking },
+            .{ "thinking_redacted", EntryType.thinking_redacted },
         };
         inline for (map) |pair| {
             if (std.mem.eql(u8, s, pair[0])) return pair[1];
@@ -78,6 +89,17 @@ pub const Entry = struct {
     /// ULID of the parent event in the conversation tree, or null for
     /// root events (first user message in a session).
     parent_id: ?ulid.Ulid = null,
+    /// Provider-issued signature for `.thinking` entries. Anthropic uses a
+    /// short signature; OpenAI Responses stores `encrypted_content` here.
+    /// Null on non-thinking entries or when the provider did not emit one.
+    signature: ?[]const u8 = null,
+    /// Wire protocol that produced a `.thinking` entry. One of
+    /// "anthropic", "openai_responses", "openai_chat", "none".
+    /// Null on non-thinking entries.
+    thinking_provider: ?[]const u8 = null,
+    /// Ciphertext for `.thinking_redacted` entries. Echoed back verbatim
+    /// on later turns. Null on every other entry type.
+    encrypted_data: ?[]const u8 = null,
 };
 
 /// Return true when `id` is the all-zeros sentinel produced by the
@@ -489,6 +511,9 @@ pub fn freeEntry(entry: Entry, allocator: Allocator) void {
     if (entry.content.len > 0) allocator.free(entry.content);
     if (entry.tool_name.len > 0) allocator.free(entry.tool_name);
     if (entry.tool_input.len > 0) allocator.free(entry.tool_input);
+    if (entry.signature) |s| allocator.free(s);
+    if (entry.thinking_provider) |tp| allocator.free(tp);
+    if (entry.encrypted_data) |ed| allocator.free(ed);
 }
 
 /// Outcome of a session's crash-recovery pass. `actual_line_count` is the
@@ -616,6 +641,21 @@ fn serializeEntry(entry: *Entry, buf: []u8) ![]const u8 {
         try w.writeAll(",\"is_error\":true");
     }
 
+    if (entry.signature) |sig| {
+        try w.writeAll(",\"signature\":");
+        try writeJsonString(w, sig);
+    }
+
+    if (entry.thinking_provider) |tp| {
+        try w.writeAll(",\"thinking_provider\":");
+        try writeJsonString(w, tp);
+    }
+
+    if (entry.encrypted_data) |ed| {
+        try w.writeAll(",\"encrypted_data\":");
+        try writeJsonString(w, ed);
+    }
+
     try w.print(",\"ts\":{d}", .{entry.timestamp});
     try w.writeAll("}");
 
@@ -679,6 +719,21 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         else => {},
     };
 
+    const signature = if (obj.get("signature")) |v| switch (v) {
+        .string => |s| try allocator.dupe(u8, s),
+        else => null,
+    } else null;
+
+    const thinking_provider = if (obj.get("thinking_provider")) |v| switch (v) {
+        .string => |s| try allocator.dupe(u8, s),
+        else => null,
+    } else null;
+
+    const encrypted_data = if (obj.get("encrypted_data")) |v| switch (v) {
+        .string => |s| try allocator.dupe(u8, s),
+        else => null,
+    } else null;
+
     return Entry{
         .entry_type = entry_type,
         .content = content,
@@ -688,6 +743,9 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         .timestamp = timestamp,
         .id = id,
         .parent_id = parent_id,
+        .signature = signature,
+        .thinking_provider = thinking_provider,
+        .encrypted_data = encrypted_data,
     };
 }
 
@@ -845,6 +903,69 @@ test "serializeEntry with tool fields" {
     try std.testing.expectEqual(EntryType.tool_call, parsed.entry_type);
     try std.testing.expectEqualStrings("bash", parsed.tool_name);
     try std.testing.expectEqualStrings("{\"cmd\":\"ls\"}", parsed.tool_input);
+}
+
+test "Entry round-trips thinking through JSONL with signature and provider" {
+    const allocator = std.testing.allocator;
+
+    const original = Entry{
+        .entry_type = .thinking,
+        .content = "step-by-step reasoning...",
+        .signature = "sig_abc123",
+        .thinking_provider = "anthropic",
+        .timestamp = 555,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.thinking, parsed.entry_type);
+    try std.testing.expectEqualStrings("step-by-step reasoning...", parsed.content);
+    try std.testing.expectEqualStrings("sig_abc123", parsed.signature.?);
+    try std.testing.expectEqualStrings("anthropic", parsed.thinking_provider.?);
+    try std.testing.expect(parsed.encrypted_data == null);
+    try std.testing.expectEqual(@as(i64, 555), parsed.timestamp);
+}
+
+test "Entry round-trips thinking_redacted through JSONL with encrypted_data" {
+    const allocator = std.testing.allocator;
+
+    const original = Entry{
+        .entry_type = .thinking_redacted,
+        .encrypted_data = "ciphertext-blob",
+        .timestamp = 777,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.thinking_redacted, parsed.entry_type);
+    try std.testing.expectEqualStrings("ciphertext-blob", parsed.encrypted_data.?);
+    try std.testing.expect(parsed.signature == null);
+    try std.testing.expect(parsed.thinking_provider == null);
+}
+
+test "parseEntry leaves new optional fields null on legacy lines" {
+    // A JSONL line written before this task carries no thinking fields.
+    // Loading must not crash and optionals must stay null so old sessions
+    // replay cleanly.
+    const allocator = std.testing.allocator;
+    const legacy_line = "{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":1}";
+
+    const parsed = try parseEntry(legacy_line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.user_message, parsed.entry_type);
+    try std.testing.expectEqualStrings("hi", parsed.content);
+    try std.testing.expect(parsed.signature == null);
+    try std.testing.expect(parsed.thinking_provider == null);
+    try std.testing.expect(parsed.encrypted_data == null);
 }
 
 test "serializeEntry with is_error flag" {
@@ -1030,9 +1151,10 @@ test "round-trip: append then load reflects generated id" {
 
 test "EntryType toSlice and fromSlice round-trip" {
     const types_to_test = [_]EntryType{
-        .session_start, .user_message,   .assistant_text,
-        .tool_call,     .tool_result,    .info,
-        .err,           .session_rename,
+        .session_start,     .user_message,   .assistant_text,
+        .tool_call,         .tool_result,    .info,
+        .err,               .session_rename, .thinking,
+        .thinking_redacted,
     };
     for (types_to_test) |t| {
         const s = t.toSlice();

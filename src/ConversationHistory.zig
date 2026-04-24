@@ -143,6 +143,28 @@ pub fn rebuildMessages(self: *ConversationHistory, entries: []const Session.Entr
                     .is_error = entry.is_error,
                 } });
             },
+            .thinking => {
+                try self.flushToolResultMessage(&tool_result_blocks, allocator);
+                const duped_text = try allocator.dupe(u8, entry.content);
+                errdefer allocator.free(duped_text);
+                const duped_sig = if (entry.signature) |s|
+                    try allocator.dupe(u8, s)
+                else
+                    null;
+                try assistant_blocks.append(allocator, .{ .thinking = .{
+                    .text = duped_text,
+                    .signature = duped_sig,
+                    .provider = parseThinkingProvider(entry.thinking_provider),
+                    .id = null,
+                } });
+            },
+            .thinking_redacted => {
+                try self.flushToolResultMessage(&tool_result_blocks, allocator);
+                const duped_data = try allocator.dupe(u8, entry.encrypted_data orelse "");
+                try assistant_blocks.append(allocator, .{ .redacted_thinking = .{
+                    .data = duped_data,
+                } });
+            },
             .info, .err, .session_start, .session_rename => {},
         }
     }
@@ -194,6 +216,14 @@ pub fn sessionSummaryInputs(self: *const ConversationHistory) ?SessionSummaryInp
         }
     }
     return null;
+}
+
+fn parseThinkingProvider(s: ?[]const u8) types.ContentBlock.ThinkingProvider {
+    const name = s orelse return .none;
+    if (std.mem.eql(u8, name, "anthropic")) return .anthropic;
+    if (std.mem.eql(u8, name, "openai_responses")) return .openai_responses;
+    if (std.mem.eql(u8, name, "openai_chat")) return .openai_chat;
+    return .none;
 }
 
 fn extractFirstText(msg: types.Message) ?[]const u8 {
@@ -361,6 +391,96 @@ test "rebuildMessages reconstructs synthetic tool IDs and role alternation" {
     // tool_result user message references synth_0
     switch (scb.messages.items[2].content[0]) {
         .tool_result => |tr| try std.testing.expectEqualStrings("synth_0", tr.tool_use_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "rebuildMessages places thinking block before text in the same assistant message" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
+        .{
+            .entry_type = .thinking,
+            .content = "deliberating...",
+            .signature = "sig_xyz",
+            .thinking_provider = "anthropic",
+            .timestamp = 1,
+        },
+        .{ .entry_type = .assistant_text, .content = "hello back", .timestamp = 2 },
+    };
+
+    try scb.rebuildMessages(&entries, allocator);
+
+    // user, assistant(thinking + text)
+    try std.testing.expectEqual(@as(usize, 2), scb.messages.items.len);
+    try std.testing.expectEqual(types.Role.assistant, scb.messages.items[1].role);
+    try std.testing.expectEqual(@as(usize, 2), scb.messages.items[1].content.len);
+
+    switch (scb.messages.items[1].content[0]) {
+        .thinking => |t| {
+            try std.testing.expectEqualStrings("deliberating...", t.text);
+            try std.testing.expectEqualStrings("sig_xyz", t.signature.?);
+            try std.testing.expectEqual(types.ContentBlock.ThinkingProvider.anthropic, t.provider);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (scb.messages.items[1].content[1]) {
+        .text => |t| try std.testing.expectEqualStrings("hello back", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "rebuildMessages reconstructs redacted_thinking from encrypted_data" {
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
+        .{
+            .entry_type = .thinking_redacted,
+            .encrypted_data = "opaque-ciphertext",
+            .timestamp = 1,
+        },
+        .{ .entry_type = .assistant_text, .content = "ok", .timestamp = 2 },
+    };
+
+    try scb.rebuildMessages(&entries, allocator);
+    try std.testing.expectEqual(@as(usize, 2), scb.messages.items.len);
+
+    switch (scb.messages.items[1].content[0]) {
+        .redacted_thinking => |r| try std.testing.expectEqualStrings("opaque-ciphertext", r.data),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "rebuildMessages tolerates thinking entry missing signature and provider" {
+    // A sparse thinking entry (no signature, no provider) must still produce
+    // a valid thinking block with provider=.none and signature=null. This
+    // protects replay of sessions written by earlier builds that didn't
+    // yet emit the provider field.
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
+        .{ .entry_type = .thinking, .content = "partial", .timestamp = 1 },
+        .{ .entry_type = .assistant_text, .content = "done", .timestamp = 2 },
+    };
+
+    try scb.rebuildMessages(&entries, allocator);
+    try std.testing.expectEqual(@as(usize, 2), scb.messages.items.len);
+
+    switch (scb.messages.items[1].content[0]) {
+        .thinking => |t| {
+            try std.testing.expectEqualStrings("partial", t.text);
+            try std.testing.expect(t.signature == null);
+            try std.testing.expectEqual(types.ContentBlock.ThinkingProvider.none, t.provider);
+        },
         else => return error.TestUnexpectedResult,
     }
 }
