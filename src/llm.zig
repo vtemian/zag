@@ -408,6 +408,35 @@ pub const ResponseBuilder = struct {
         try self.blocks.append(allocator, .{ .text = .{ .text = duped } });
     }
 
+    /// Add a thinking content block. Dupes text and (if present) signature.
+    ///
+    /// `provider` records which wire protocol produced the block so it can be
+    /// re-serialized on later turns (Anthropic requires echoing the signature).
+    pub fn addThinking(
+        self: *ResponseBuilder,
+        text: []const u8,
+        signature: ?[]const u8,
+        provider: types.ContentBlock.ThinkingProvider,
+        allocator: Allocator,
+    ) !void {
+        const duped_text = try allocator.dupe(u8, text);
+        errdefer allocator.free(duped_text);
+        const duped_sig: ?[]const u8 = if (signature) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (duped_sig) |s| allocator.free(s);
+        try self.blocks.append(allocator, .{ .thinking = .{
+            .text = duped_text,
+            .signature = duped_sig,
+            .provider = provider,
+        } });
+    }
+
+    /// Add a redacted_thinking content block. Dupes the opaque ciphertext.
+    pub fn addRedactedThinking(self: *ResponseBuilder, data: []const u8, allocator: Allocator) !void {
+        const duped = try allocator.dupe(u8, data);
+        errdefer allocator.free(duped);
+        try self.blocks.append(allocator, .{ .redacted_thinking = .{ .data = duped } });
+    }
+
     /// Add a tool_use content block. Dupes id, name, and input_raw.
     pub fn addToolUse(self: *ResponseBuilder, id: []const u8, name: []const u8, input_raw: []const u8, allocator: Allocator) !void {
         const duped_id = try allocator.dupe(u8, id);
