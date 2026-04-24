@@ -19,6 +19,7 @@ comptime {
     _ = @import("Runner.zig");
     _ = @import("Scenario.zig");
     _ = @import("MockServer.zig");
+    _ = @import("MockScript.zig");
     _ = @import("phase1_e2e_test.zig");
 }
 
