@@ -1371,6 +1371,7 @@ test {
     _ = @import("NodeRegistry.zig");
     _ = @import("buffers/scratch.zig");
     _ = @import("BufferRegistry.zig");
+    _ = @import("Sink.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
