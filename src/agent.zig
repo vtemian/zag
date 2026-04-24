@@ -238,6 +238,7 @@ fn collectToolCalls(content: []const types.ContentBlock, allocator: Allocator) !
         switch (block) {
             .tool_use => |tu| try calls.append(allocator, tu),
             .text, .tool_result => {},
+            .thinking, .redacted_thinking => {}, // Task 1.6/1.7 will carry thinking across turns; not a tool call
         }
     }
     return calls.toOwnedSlice(allocator);
@@ -773,6 +774,7 @@ test "user message is appended with correct role and content" {
                     .text => |t| allocator.free(t.text),
                     .tool_use => {},
                     .tool_result => {},
+                    .thinking, .redacted_thinking => {}, // test fixture never constructs thinking blocks
                 }
             }
             allocator.free(msg.content);

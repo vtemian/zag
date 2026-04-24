@@ -191,6 +191,7 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
                 try std.json.Stringify.value(tr.content, .{}, w);
                 try w.writeAll("}");
             },
+            .thinking, .redacted_thinking => {}, // Task 1.6 replaces with real thinking-block serialization
         }
     }
 

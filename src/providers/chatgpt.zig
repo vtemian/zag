@@ -221,6 +221,7 @@ fn writeInput(messages: []const types.Message, w: anytype) !void {
                     first = false;
                     try writeFunctionCallOutputItem(tr, w);
                 },
+                .thinking, .redacted_thinking => {}, // Task 1.7 wires Responses-API reasoning round-trip
             }
         }
     }
