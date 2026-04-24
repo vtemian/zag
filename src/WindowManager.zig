@@ -1433,7 +1433,7 @@ fn generateSessionName(
     };
 
     const req = llm.Request{
-        .system_prompt = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
+        .system_stable = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
         .messages = &summary_msgs,
         .tool_definitions = &.{},
         .allocator = allocator,

@@ -159,10 +159,16 @@ pub fn supportsExtendedThinking(model_id: []const u8) bool {
 /// A provider receives exactly this struct by const pointer and
 /// emits its own request body.
 pub const Request = struct {
-    /// Free-text system prompt. How it lands in the wire format is
-    /// the provider's problem; Anthropic uses a top-level `system`
-    /// field, OpenAI injects a `role: "system"` message.
-    system_prompt: []const u8,
+    /// Stable portion of the system prompt. Content that doesn't change
+    /// across turns (identity, tool list, guidelines). PR 5 will let
+    /// Anthropic attach a `cache_control` breakpoint after this segment
+    /// so the prefix stays cache-warm; for now providers simply
+    /// concatenate stable + "\n\n" + volatile into a single system field.
+    system_stable: []const u8 = "",
+    /// Volatile portion of the system prompt. Per-turn content like
+    /// environment snapshots or date stamps that would bust a prefix
+    /// cache if included in `system_stable`.
+    system_volatile: []const u8 = "",
     /// Conversation history in chronological order.
     messages: []const types.Message,
     /// Tools offered to the LLM for this turn. May be empty.
@@ -173,14 +179,38 @@ pub const Request = struct {
     /// a sensible default for the model (Anthropic turns thinking on for
     /// any thinking-capable Claude).
     thinking: ?ThinkingConfig = null,
+
+    /// Join the stable and volatile halves with "\n\n" into a single
+    /// owned string. Providers that can only emit one system field
+    /// (OpenAI Chat Completions, Responses/ChatGPT) call this; the
+    /// Anthropic path will use the parts directly once PR 5 introduces
+    /// the 2-element `system` array with `cache_control`.
+    ///
+    /// If one half is empty the separator is omitted so a purely stable
+    /// prompt round-trips byte-for-byte with the pre-split API.
+    pub fn joinedSystem(self: *const Request, allocator: Allocator) ![]u8 {
+        return joinSystemParts(self.system_stable, self.system_volatile, allocator);
+    }
 };
+
+/// Concatenate the two system prompt halves with a blank-line separator.
+/// Caller owns the returned slice. When either half is empty the other
+/// is returned as a pure dupe so the joined form is byte-identical to
+/// the original single-string representation.
+pub fn joinSystemParts(stable: []const u8, per_turn: []const u8, allocator: Allocator) ![]u8 {
+    if (stable.len == 0) return allocator.dupe(u8, per_turn);
+    if (per_turn.len == 0) return allocator.dupe(u8, stable);
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ stable, per_turn });
+}
 
 /// Streaming variant: everything in `Request` plus the callback and
 /// cancellation token. Kept as its own type (not an optional inside
 /// `Request`) so the vtable signature remains unambiguous.
 pub const StreamRequest = struct {
-    /// System prompt prepended to the conversation. Steers model behavior.
-    system_prompt: []const u8,
+    /// Stable portion of the system prompt. See `Request.system_stable`.
+    system_stable: []const u8 = "",
+    /// Volatile portion of the system prompt. See `Request.system_volatile`.
+    system_volatile: []const u8 = "",
     /// Conversation history sent to the model, oldest first.
     messages: []const types.Message,
     /// Tools the model may call during this turn.
@@ -193,6 +223,11 @@ pub const StreamRequest = struct {
     cancel: *std.atomic.Value(bool),
     /// Optional extended-thinking override. See `Request.thinking`.
     thinking: ?ThinkingConfig = null,
+
+    /// Join the stable and volatile halves. See `Request.joinedSystem`.
+    pub fn joinedSystem(self: *const StreamRequest, allocator: Allocator) ![]u8 {
+        return joinSystemParts(self.system_stable, self.system_volatile, allocator);
+    }
 };
 
 /// Wire format for request/response serialization.
@@ -663,7 +698,8 @@ test "Provider vtable call dispatches correctly" {
             req: *const StreamRequest,
         ) ProviderError!types.LlmResponse {
             const fallback_req = Request{
-                .system_prompt = req.system_prompt,
+                .system_stable = req.system_stable,
+                .system_volatile = req.system_volatile,
                 .messages = req.messages,
                 .tool_definitions = req.tool_definitions,
                 .allocator = req.allocator,
@@ -680,7 +716,7 @@ test "Provider vtable call dispatches correctly" {
     const p = test_impl.provider();
 
     const req = Request{
-        .system_prompt = "system",
+        .system_stable = "system",
         .messages = &.{},
         .tool_definitions = &.{},
         .allocator = allocator,
@@ -750,7 +786,7 @@ test "Provider callStreaming dispatches to vtable" {
     var cancel = std.atomic.Value(bool).init(false);
     const callback: StreamCallback = .{ .ctx = &counter, .on_event = &Counter.onEvent };
     const stream_req = StreamRequest{
-        .system_prompt = "system",
+        .system_stable = "system",
         .messages = &.{},
         .tool_definitions = &.{},
         .allocator = allocator,
@@ -1050,7 +1086,7 @@ test "Provider.call accepts a Request struct" {
     // arguments one-for-one. Will start failing with a compile error
     // the moment Provider.call signature doesn't match Request.
     const req = Request{
-        .system_prompt = "sys",
+        .system_stable = "sys",
         .messages = &.{},
         .tool_definitions = &.{},
         .allocator = std.testing.allocator,
@@ -1059,4 +1095,63 @@ test "Provider.call accepts a Request struct" {
     // Intentionally no call yet; this file compiles because Request
     // is a plain struct. Task 2 updates Provider.call to take *const
     // Request and this test is extended to call a mock provider.
+}
+
+test "joinSystemParts concatenates stable and per-turn with blank-line separator" {
+    const allocator = std.testing.allocator;
+    const joined = try joinSystemParts("stable", "per-turn", allocator);
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("stable\n\nper-turn", joined);
+}
+
+test "joinSystemParts omits separator when either half is empty" {
+    const allocator = std.testing.allocator;
+
+    const only_stable = try joinSystemParts("stable", "", allocator);
+    defer allocator.free(only_stable);
+    try std.testing.expectEqualStrings("stable", only_stable);
+
+    const only_per_turn = try joinSystemParts("", "per-turn", allocator);
+    defer allocator.free(only_per_turn);
+    try std.testing.expectEqualStrings("per-turn", only_per_turn);
+
+    const empty = try joinSystemParts("", "", allocator);
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+}
+
+test "Request.joinedSystem round-trips a single-string prompt via system_stable" {
+    const allocator = std.testing.allocator;
+    const req = Request{
+        .system_stable = "you are zag",
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const joined = try req.joinedSystem(allocator);
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("you are zag", joined);
+}
+
+test "StreamRequest.joinedSystem folds stable and per-turn halves" {
+    const allocator = std.testing.allocator;
+    var cancel = std.atomic.Value(bool).init(false);
+    const noop: StreamCallback = .{
+        .ctx = @ptrFromInt(@alignOf(u8)),
+        .on_event = struct {
+            fn on(_: *anyopaque, _: StreamEvent) void {}
+        }.on,
+    };
+    const req = StreamRequest{
+        .system_stable = "identity + tools",
+        .system_volatile = "date: 2026-04-22",
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = allocator,
+        .callback = noop,
+        .cancel = &cancel,
+    };
+    const joined = try req.joinedSystem(allocator);
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("identity + tools\n\ndate: 2026-04-22", joined);
 }

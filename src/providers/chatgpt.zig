@@ -62,7 +62,9 @@ pub const ChatgptSerializer = struct {
     ) !types.LlmResponse {
         const self: *ChatgptSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        const system_joined = try req.joinedSystem(req.allocator);
+        defer req.allocator.free(system_joined);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -91,7 +93,9 @@ pub const ChatgptSerializer = struct {
     ) !types.LlmResponse {
         const self: *ChatgptSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        const system_joined = try req.joinedSystem(req.allocator);
+        defer req.allocator.free(system_joined);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -1912,7 +1916,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     const messages = [_]types.Message{.{ .role = .user, .content = &content }};
 
     const response = try provider.callStreaming(&.{
-        .system_prompt = "be brief",
+        .system_stable = "be brief",
         .messages = &messages,
         .tool_definitions = &.{},
         .allocator = allocator,
@@ -2047,4 +2051,36 @@ fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
     };
     try reg.add(try ep.dupe(allocator));
     return reg;
+}
+
+test "Request.joinedSystem matches single-string chatgpt body byte-for-byte" {
+    // Responses API exposes a single `instructions` string, so split
+    // and single-string requests must serialize identically. Pin this
+    // for the same reason as the Anthropic / OpenAI tests.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const split_req = llm.Request{
+        .system_stable = "zag identity",
+        .system_volatile = "current cwd: /tmp",
+        .messages = &messages,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const joined = try split_req.joinedSystem(allocator);
+    defer allocator.free(joined);
+
+    const split_body = try buildRequestBody("gpt-5-codex", joined, &messages, &.{}, allocator);
+    defer allocator.free(split_body);
+
+    const single_body = try buildRequestBody(
+        "gpt-5-codex",
+        "zag identity\n\ncurrent cwd: /tmp",
+        &messages,
+        &.{},
+        allocator,
+    );
+    defer allocator.free(single_body);
+
+    try std.testing.expectEqualStrings(single_body, split_body);
 }
