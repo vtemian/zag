@@ -7,8 +7,8 @@
             .hash = "zlua-0.1.0-hGRpCww-BQCx3cX6zbKWfTgOx6B7Peo4P17RK2hm7-xV",
         },
         .zigimg = .{
-            .url = "git+https://github.com/zigimg/zigimg.git#c7e81a13bff1cf4c5b7f085a8360f9d551143d40",
-            .hash = "zigimg-0.1.0-8_eo2uScFwCnpzB1Y2n_jf3euDfMEeCLxJE_E5_W5BNe",
+            .url = "git+https://github.com/zigimg/zigimg.git?ref=zigimg_zig_0.15.1#362cdd6bce109f7bc674be134cddd378f52da5d4",
+            .hash = "zigimg-0.1.0-8_eo2jNrFQD4mu3EAUkfQRmCkyfprdIXc8JQ6uyxhjSQ",
         },
     },
     .fingerprint = 0x9179a895b492806,
