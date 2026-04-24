@@ -1399,6 +1399,7 @@ test {
     _ = @import("halfblock.zig");
     _ = @import("png_decode.zig");
     _ = @import("Viewport.zig");
+    _ = @import("ulid.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
