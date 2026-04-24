@@ -105,3 +105,9 @@ test "spawn /bin/cat round-trips one byte" {
     try std.testing.expect(n > 0);
     try std.testing.expect(std.mem.indexOfScalar(u8, out[0..n], 'x') != null);
 }
+
+test "spawn nonexistent binary returns ChildSetupFailed" {
+    const argv = [_][*:0]const u8{"/does/not/exist"};
+    const envp = [_][*:0]const u8{};
+    try std.testing.expectError(error.ChildSetupFailed, spawn(&argv, &envp, 80, 24));
+}
