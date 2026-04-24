@@ -325,6 +325,10 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .info => _ = try self.appendNode(null, .status, entry.content),
             .err => _ = try self.appendNode(null, .err, entry.content),
             .session_start, .session_rename => {},
+            // Thinking entries participate in LLM replay via ConversationHistory
+            // but do not yet surface as their own tree node type. Task 1.10
+            // adds a dedicated NodeType.thinking and expands this switch.
+            .thinking, .thinking_redacted => {},
         }
     }
     // Each appendNode already bumped tree.generation, so isDirty() will

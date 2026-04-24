@@ -253,6 +253,10 @@ pub fn loadFromEntriesFlat(self: *ConversationTree, entries: []const Session.Ent
             // session_start / session_rename are audit entries, not
             // visible tree content.
             .session_start, .session_rename => continue,
+            // Thinking entries round-trip via ConversationHistory for LLM
+            // replay; Task 1.10 will add a dedicated NodeType and surface
+            // them in the tree. For now they are not rendered.
+            .thinking, .thinking_redacted => continue,
         };
         _ = try self.appendNode(null, node_type, entry.content);
     }
