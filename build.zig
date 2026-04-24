@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const zigimg_dep = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -32,6 +37,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("build_options", build_options.createModule());
     exe_mod.addImport("zlua", zlua_dep.module("zlua"));
+    exe_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
 
     const exe = b.addExecutable(.{
         .name = "zag",
@@ -63,6 +69,7 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("build_options", build_options.createModule());
     test_mod.addImport("zlua", zlua_dep.module("zlua"));
+    test_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
