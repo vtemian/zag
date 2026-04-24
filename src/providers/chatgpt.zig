@@ -15,6 +15,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
+const Harness = @import("../Harness.zig");
 const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
 
@@ -145,8 +146,14 @@ fn serializeRequest(
         try std.json.Stringify.value(system_prompt, .{}, w);
     }
 
+    // Drop prior-turn thinking blocks before serialization. Current-turn
+    // reasoning items (with `encrypted_content`) must still round-trip so
+    // the Responses API can resume the same chain-of-thought mid-tool-loop.
+    const shaped_messages = try Harness.stripThinkingAcrossTurns(messages, allocator);
+    defer Harness.freeShaped(shaped_messages, messages, allocator);
+
     try w.writeAll(",");
-    try writeInput(messages, w);
+    try writeInput(shaped_messages, w);
 
     try w.writeAll(",");
     try writeTools(tool_definitions, w);
