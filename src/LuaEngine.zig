@@ -2619,6 +2619,7 @@ pub const LuaEngine = struct {
                     lua.raiseErrorStr("%s", .{msg.ptr});
                 };
             },
+            .graphics => lua.raiseErrorStr("zag.buffer.set_lines: not supported on graphics buffers", .{}),
         }
         return 0;
     }
@@ -2636,6 +2637,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
+            .graphics => lua.raiseErrorStr("zag.buffer.get_lines: not supported on graphics buffers", .{}),
         }
     }
 
@@ -2647,6 +2649,7 @@ pub const LuaEngine = struct {
                 lua.pushInteger(@intCast(sb.lines.items.len));
                 return 1;
             },
+            .graphics => lua.raiseErrorStr("zag.buffer.line_count: not supported on graphics buffers", .{}),
         }
     }
 
@@ -2663,6 +2666,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
+            .graphics => lua.raiseErrorStr("zag.buffer.cursor_row: not supported on graphics buffers", .{}),
         }
     }
 
@@ -2686,6 +2690,7 @@ pub const LuaEngine = struct {
                 sb.cursor_row = if (count == 0) 0 else @min(zero_based, count - 1);
                 sb.dirty = true;
             },
+            .graphics => lua.raiseErrorStr("zag.buffer.set_cursor_row: not supported on graphics buffers", .{}),
         }
         return 0;
     }
@@ -2703,6 +2708,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
+            .graphics => lua.raiseErrorStr("zag.buffer.current_line: not supported on graphics buffers", .{}),
         }
     }
 
