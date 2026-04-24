@@ -195,7 +195,7 @@ pub const SessionManager = struct {
         @memcpy(handle.id[0..id_len], id);
 
         // Write session_start entry
-        handle.appendEntry(.{
+        _ = handle.appendEntry(.{
             .entry_type = .session_start,
             .timestamp = now,
         }) catch |e| {
@@ -349,10 +349,10 @@ pub const SessionHandle = struct {
 
     /// Append an entry to the JSONL file and update the meta file. The
     /// serializer fabricates a fresh ULID into the outgoing row when the
-    /// caller leaves `entry.id` as the zero sentinel; Task 3 switches to
-    /// a variant that returns the generated id so callers can chain
-    /// `parent_id` explicitly.
-    pub fn appendEntry(self: *SessionHandle, entry: Entry) !void {
+    /// caller leaves `entry.id` as the zero sentinel. Returns the id that
+    /// was persisted (either the caller's explicit id or the freshly
+    /// generated one) so callers can chain `parent_id` on the next event.
+    pub fn appendEntry(self: *SessionHandle, entry: Entry) !ulid.Ulid {
         var buf: [8192]u8 = undefined;
         var entry_mut = entry;
         const json = serializeEntry(&entry_mut, &buf) catch |e| {
@@ -391,6 +391,8 @@ pub const SessionHandle = struct {
         self.updateMeta() catch |e| {
             log.warn("failed to update meta after append: {}", .{e});
         };
+
+        return entry_mut.id;
     }
 
     /// Rename the session. Updates the meta file.
@@ -405,7 +407,7 @@ pub const SessionHandle = struct {
         // Also write a session_rename entry. Meta is already on disk at
         // this point; if the audit entry fails we'd silently drift from
         // the audit log, so log the failure rather than swallowing.
-        self.appendEntry(.{
+        _ = self.appendEntry(.{
             .entry_type = .session_rename,
             .content = new_name,
             .timestamp = self.meta.updated,
@@ -1211,9 +1213,9 @@ test "appendEntry appends without clobbering previous rows" {
     const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
     defer allocator.free(session_id);
 
-    try handle.appendEntry(.{ .entry_type = .user_message, .content = "first", .timestamp = 1 });
-    try handle.appendEntry(.{ .entry_type = .user_message, .content = "second", .timestamp = 2 });
-    try handle.appendEntry(.{ .entry_type = .user_message, .content = "third", .timestamp = 3 });
+    _ = try handle.appendEntry(.{ .entry_type = .user_message, .content = "first", .timestamp = 1 });
+    _ = try handle.appendEntry(.{ .entry_type = .user_message, .content = "second", .timestamp = 2 });
+    _ = try handle.appendEntry(.{ .entry_type = .user_message, .content = "third", .timestamp = 3 });
     handle.close();
 
     const loaded = try loadEntries(session_id, allocator);
