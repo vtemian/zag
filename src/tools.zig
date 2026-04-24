@@ -59,6 +59,19 @@ pub const Registry = struct {
         return self.tools.get(name);
     }
 
+    /// Return a filtered read-only view of this registry. When `names` is
+    /// non-null only those names are visible through `Subset.lookup`; a null
+    /// allowlist inherits the parent registry verbatim. The Subset borrows the
+    /// parent's storage and does not own anything, so it has no `deinit`.
+    ///
+    /// Subagents use this to constrain which tools their agent loop may call
+    /// without copying the tool table. The frontmatter `tools:` field maps
+    /// directly to the `names` argument; omitting the field (null) means
+    /// "inherit everything the parent can call".
+    pub fn subset(self: *const Registry, names: ?[]const []const u8) Subset {
+        return .{ .registry = self, .names = names };
+    }
+
     /// Return an owned slice of all registered tool definitions.
     pub fn definitions(self: *const Registry, allocator: Allocator) ![]const types.ToolDefinition {
         var list: std.ArrayList(types.ToolDefinition) = .empty;
@@ -118,6 +131,43 @@ pub const Registry = struct {
                 break :blk .{ .content = msg, .is_error = true, .owned = true };
             },
         };
+    }
+};
+
+/// A read-only view over a `Registry` that optionally restricts which tool
+/// names are visible. `names == null` inherits every tool in the parent.
+/// Borrows the parent's storage; no `deinit` is required.
+pub const Subset = struct {
+    /// The parent registry whose tools this view exposes.
+    registry: *const Registry,
+    /// Allowlist of tool names; `null` means "inherit all".
+    names: ?[]const []const u8,
+
+    /// Look up a tool by name. Returns `error.ToolNotAllowed` when the name is
+    /// outside the allowlist (or `null` when it is in the allowlist but the
+    /// parent has no such tool). With a null allowlist, behaves like the
+    /// parent's `get`.
+    pub fn lookup(self: Subset, name: []const u8) error{ToolNotAllowed}!?types.Tool {
+        if (self.names) |list| {
+            for (list) |allowed| {
+                if (std.mem.eql(u8, allowed, name)) return self.registry.get(name);
+            }
+            return error.ToolNotAllowed;
+        }
+        return self.registry.get(name);
+    }
+
+    /// Cheap check: would `lookup(name)` be permitted and resolve to a tool?
+    /// Returns false both for names outside the allowlist and for names
+    /// allowed but not registered on the parent.
+    pub fn contains(self: Subset, name: []const u8) bool {
+        if (self.names) |list| {
+            for (list) |allowed| {
+                if (std.mem.eql(u8, allowed, name)) return self.registry.get(name) != null;
+            }
+            return false;
+        }
+        return self.registry.get(name) != null;
     }
 };
 
@@ -320,6 +370,70 @@ test "registry.execute rejects missing required field before dispatch" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(result.owned);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "MissingRequiredField") != null);
+}
+
+test "Subset inherits all when names is null" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(read_tool.tool);
+    try registry.register(write_tool.tool);
+    try registry.register(bash_tool.tool);
+
+    const view = registry.subset(null);
+
+    const read_found = try view.lookup("read");
+    try std.testing.expect(read_found != null);
+    try std.testing.expectEqualStrings("read", read_found.?.definition.name);
+
+    const write_found = try view.lookup("write");
+    try std.testing.expect(write_found != null);
+    try std.testing.expectEqualStrings("write", write_found.?.definition.name);
+
+    const bash_found = try view.lookup("bash");
+    try std.testing.expect(bash_found != null);
+    try std.testing.expectEqualStrings("bash", bash_found.?.definition.name);
+}
+
+test "Subset restricts to allowlist" {
+    const allocator = std.testing.allocator;
+    var registry = try createDefaultRegistry(allocator);
+    defer registry.deinit();
+
+    const allowed = [_][]const u8{ "read", "grep" };
+    const view = registry.subset(&allowed);
+
+    const read_found = try view.lookup("read");
+    try std.testing.expect(read_found != null);
+    try std.testing.expectEqualStrings("read", read_found.?.definition.name);
+
+    try std.testing.expectError(error.ToolNotAllowed, view.lookup("bash"));
+}
+
+test "Subset.contains is accurate" {
+    const allocator = std.testing.allocator;
+    var registry = try createDefaultRegistry(allocator);
+    defer registry.deinit();
+
+    const allowed = [_][]const u8{"read"};
+    const view = registry.subset(&allowed);
+
+    try std.testing.expect(view.contains("read"));
+    try std.testing.expect(!view.contains("bash"));
+    try std.testing.expect(!view.contains("nonexistent_tool"));
+}
+
+test "Subset with null names has contains == true for registered tools" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(read_tool.tool);
+
+    const view = registry.subset(null);
+    try std.testing.expect(view.contains("read"));
+    try std.testing.expect(!view.contains("nonexistent"));
 }
 
 test {
