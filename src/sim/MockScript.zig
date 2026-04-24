@@ -224,6 +224,16 @@ test "nextTurn advances and surfaces NoMoreTurns at the end" {
     try std.testing.expectError(error.NoMoreTurns, script.nextTurn());
 }
 
+test "delay_ms is stripped from emitted chunk JSON" {
+    const src =
+        \\{"turns":[{"chunks":[{"delta":{"content":"x"},"delay_ms":50}]}]}
+    ;
+    const script = try MockScript.loadFromSlice(std.testing.allocator, src);
+    defer script.destroy();
+    try std.testing.expect(std.mem.indexOf(u8, script.turns[0].chunks[0].json, "delay_ms") == null);
+    try std.testing.expectEqual(@as(u32, 50), script.turns[0].chunks[0].delay_ms);
+}
+
 test "reset lets nextTurn start over" {
     const src =
         \\{"turns":[{"chunks":[]}]}
