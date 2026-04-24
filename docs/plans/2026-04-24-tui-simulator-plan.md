@@ -346,6 +346,8 @@ git commit -m "sim: add Spawn.zig fork+exec with PTY controlling-tty setup"
 **Files:**
 - Create: `src/sim/Grid.zig`
 
+Note: Grid is heap-allocated — see reviewer feedback 2026-04-24. `vtStream()` captures a `*Terminal`, so the Grid's Terminal must live at its final storage address before the stream is built. That forces a `create`/`destroy` pair instead of the value-semantics `init`/`deinit` the TDD template would normally use.
+
 **Step 1: Write the failing test**
 
 `src/sim/Grid.zig`:
@@ -357,41 +359,52 @@ const Grid = @This();
 
 alloc: std.mem.Allocator,
 terminal: ghostty_vt.Terminal,
-stream: ghostty_vt.Stream,
+stream: ghostty_vt.TerminalStream,
 
-pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16) !Grid {
-    var terminal: ghostty_vt.Terminal = try .init(alloc, .{ .cols = cols, .rows = rows });
-    errdefer terminal.deinit(alloc);
-    const stream = terminal.vtStream();
-    return .{ .alloc = alloc, .terminal = terminal, .stream = stream };
+pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16) !*Grid {
+    const self = try alloc.create(Grid);
+    errdefer alloc.destroy(self);
+
+    self.* = .{
+        .alloc = alloc,
+        .terminal = try .init(alloc, .{ .cols = cols, .rows = rows }),
+        .stream = undefined,
+    };
+    errdefer self.terminal.deinit(alloc);
+
+    // vtStream's handler captures a `*Terminal`; build it against the
+    // heap-resident Terminal after self.* assignment.
+    self.stream = self.terminal.vtStream();
+    return self;
 }
 
-pub fn deinit(self: *Grid) void {
+pub fn destroy(self: *Grid) void {
     self.stream.deinit();
     self.terminal.deinit(self.alloc);
+    self.alloc.destroy(self);
 }
 
-pub fn feed(self: *Grid, bytes: []const u8) !void {
-    try self.stream.nextSlice(bytes);
+pub fn feed(self: *Grid, bytes: []const u8) void {
+    self.stream.nextSlice(bytes);
 }
 
-pub fn plainText(self: *Grid) ![]u8 {
+pub fn plainText(self: *Grid) ![]const u8 {
     return try self.terminal.plainString(self.alloc);
 }
 
 test "feed plain bytes appears in plain text dump" {
-    var g = try Grid.init(std.testing.allocator, 40, 6);
-    defer g.deinit();
-    try g.feed("hello");
+    const g = try Grid.create(std.testing.allocator, 40, 6);
+    defer g.destroy();
+    g.feed("hello");
     const dump = try g.plainText();
     defer std.testing.allocator.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "hello") != null);
 }
 
 test "feed SGR + text preserves text in plain dump" {
-    var g = try Grid.init(std.testing.allocator, 40, 6);
-    defer g.deinit();
-    try g.feed("\x1b[1;32mbold green\x1b[0m");
+    const g = try Grid.create(std.testing.allocator, 40, 6);
+    defer g.destroy();
+    g.feed("\x1b[1;32mbold green\x1b[0m");
     const dump = try g.plainText();
     defer std.testing.allocator.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "bold green") != null);
@@ -426,6 +439,8 @@ git commit -m "sim: wrap libghostty-vt Terminal as Grid with feed/plainText"
 **Files:**
 - Create: `src/sim/phase1_e2e_test.zig`
 
+Note: Grid is heap-allocated — see reviewer feedback 2026-04-24. Use `Grid.create` / `g.destroy` to match Task 1.5's shipped shape.
+
 **Step 1: Write the test**
 
 `src/sim/phase1_e2e_test.zig`:
@@ -445,8 +460,8 @@ test "cat round-trip: send SGR'd bytes, grid sees the plain text" {
         posix.close(sp.pty.master);
     }
 
-    var g = try Grid.init(std.testing.allocator, 80, 24);
-    defer g.deinit();
+    const g = try Grid.create(std.testing.allocator, 80, 24);
+    defer g.destroy();
 
     _ = try posix.write(sp.pty.master, "\x1b[1mZAG\x1b[0m\n");
 
@@ -459,7 +474,7 @@ test "cat round-trip: send SGR'd bytes, grid sees the plain text" {
         if ((fds[0].revents & posix.POLL.IN) == 0) continue;
         const n = try posix.read(sp.pty.master, &buf);
         if (n == 0) break;
-        try g.feed(buf[0..n]);
+        g.feed(buf[0..n]);
         const dump = try g.plainText();
         defer std.testing.allocator.free(dump);
         if (std.mem.indexOf(u8, dump, "ZAG") != null) return; // pass
@@ -726,6 +741,8 @@ git commit -m "sim: DSL argument parsers (send literals/keysyms/ctrl, durations)
 **Files:**
 - Create: `src/sim/Runner.zig`
 
+Note: Grid is heap-allocated — see reviewer feedback 2026-04-24. The Runner holds `grid: *Grid` and mirrors `Grid.create` / `grid.destroy()` in its own init/deinit.
+
 **Step 1: Minimal Runner**
 
 `src/sim/Runner.zig`:
@@ -747,13 +764,13 @@ pub const Outcome = enum(u8) {
 pub const Runner = struct {
     alloc: std.mem.Allocator,
     child: ?Spawn.Spawned = null,
-    grid: Grid,
+    grid: *Grid,
     env: std.process.EnvMap,
 
     pub fn init(alloc: std.mem.Allocator) !Runner {
         return .{
             .alloc = alloc,
-            .grid = try Grid.init(alloc, 80, 24),
+            .grid = try Grid.create(alloc, 80, 24),
             .env = std.process.EnvMap.init(alloc),
         };
     }
@@ -764,7 +781,7 @@ pub const Runner = struct {
             _ = posix.waitpid(sp.pid, 0);
             posix.close(sp.pty.master);
         }
-        self.grid.deinit();
+        self.grid.destroy();
         self.env.deinit();
     }
 

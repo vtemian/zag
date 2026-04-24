@@ -65,3 +65,13 @@ test "feed SGR + text preserves text in plain dump" {
     defer std.testing.allocator.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "bold green") != null);
 }
+
+test "feed split escape across two calls still parses correctly" {
+    const g = try Grid.create(std.testing.allocator, 40, 6);
+    defer g.destroy();
+    g.feed("\x1b[1;3");
+    g.feed("2mgreen\x1b[0m");
+    const dump = try g.plainText();
+    defer std.testing.allocator.free(dump);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "green") != null);
+}
