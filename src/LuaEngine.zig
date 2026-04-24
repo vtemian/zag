@@ -20,6 +20,7 @@ const llm = @import("llm.zig");
 const Layout = @import("Layout.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
 const subagents_mod = @import("subagents.zig");
+const frontmatter_mod = @import("frontmatter.zig");
 const WindowManager = @import("WindowManager.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
@@ -432,6 +433,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "stat");
         lua.pushFunction(zlua.wrap(zagFsExistsFn));
         lua.setField(-2, "exists");
+        lua.pushFunction(zlua.wrap(zagFsReadFileSyncFn));
+        lua.setField(-2, "read_file_sync");
+        lua.pushFunction(zlua.wrap(zagFsListDirSyncFn));
+        lua.setField(-2, "list_dir_sync");
         lua.setField(-2, "fs"); // zag.fs = fs_table; [zag_table]
 
         // zag.layout; plain namespace table for window-tree inspection
@@ -522,6 +527,12 @@ pub const LuaEngine = struct {
         lua.setField(-2, "_log_err");
         lua.pushFunction(zlua.wrap(zagNotifyFn));
         lua.setField(-2, "notify");
+
+        // zag.parse_frontmatter; narrow YAML parser reused by stdlib
+        // loaders (subagents, skills). Sync helper so Lua modules can
+        // call it during `require` without spinning up a coroutine.
+        lua.pushFunction(zlua.wrap(zagParseFrontmatterFn));
+        lua.setField(-2, "parse_frontmatter");
 
         lua.setGlobal("zag");
     }
@@ -2194,6 +2205,130 @@ pub const LuaEngine = struct {
             return 1;
         };
         co.pushBoolean(true);
+        return 1;
+    }
+
+    /// `zag.fs.read_file_sync(path)`: SYNC file read. Returns the file
+    /// contents as a Lua string, or `nil` on any error (missing file,
+    /// permission denied, OOM). Intended for stdlib loaders that run at
+    /// `require` time outside any coroutine; heavy callers should
+    /// continue to use the async `zag.fs.read`.
+    ///
+    /// Cap at 4 MiB to stop a runaway load from blocking the main
+    /// thread with a multi-megabyte copy. Files larger than the cap
+    /// return nil; the caller logs and moves on.
+    fn zagFsReadFileSyncFn(co: *Lua) i32 {
+        const max_bytes: usize = 4 * 1024 * 1024;
+        const path = co.checkString(1);
+        const engine = getEngineFromState(co);
+
+        const file = std.fs.cwd().openFile(path, .{}) catch {
+            co.pushNil();
+            return 1;
+        };
+        defer file.close();
+
+        const bytes = file.readToEndAlloc(engine.allocator, max_bytes) catch {
+            co.pushNil();
+            return 1;
+        };
+        defer engine.allocator.free(bytes);
+
+        _ = co.pushString(bytes);
+        return 1;
+    }
+
+    /// `zag.fs.list_dir_sync(path)`: SYNC directory listing. Returns a
+    /// Lua array of filename strings (excluding `.` and `..`), or `nil`
+    /// if the directory can't be opened. Subdirectories are listed as
+    /// their own names; the caller filters by extension when needed.
+    fn zagFsListDirSyncFn(co: *Lua) i32 {
+        const path = co.checkString(1);
+
+        var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch {
+            co.pushNil();
+            return 1;
+        };
+        defer dir.close();
+
+        co.newTable();
+        var it = dir.iterate();
+        var idx: i32 = 0;
+        while (true) {
+            const entry = it.next() catch {
+                // Partial listings aren't useful; drop the table and
+                // signal the caller to skip this directory.
+                co.pop(1);
+                co.pushNil();
+                return 1;
+            };
+            const e = entry orelse break;
+            idx += 1;
+            _ = co.pushString(e.name);
+            co.rawSetIndex(-2, idx);
+        }
+        return 1;
+    }
+
+    /// `zag.parse_frontmatter(src)`: parse the YAML frontmatter at the
+    /// start of `src` and return `{ fields = {...}, body = "..." }`.
+    /// `fields` is a Lua table keyed by frontmatter name; scalar values
+    /// map to strings, list values to Lua arrays of strings. `body` is
+    /// the markdown tail (bytes after the closing `---`), empty when
+    /// the document has no frontmatter.
+    ///
+    /// Raises a Lua error on unterminated frontmatter or allocator
+    /// failure; both are caller-fixable and should surface loudly.
+    fn zagParseFrontmatterFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const src = lua.checkString(1);
+
+        var parsed = frontmatter_mod.parse(engine.allocator, src) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(
+                &buf,
+                "zag.parse_frontmatter: {s}",
+                .{@errorName(err)},
+            ) catch "zag.parse_frontmatter: error";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        defer parsed.deinit(engine.allocator);
+
+        // { fields = {...}, body = "..." }
+        lua.newTable();
+
+        lua.newTable();
+        var it = parsed.fields.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const key_z = engine.allocator.dupeZ(u8, key) catch {
+                lua.raiseErrorStr("zag.parse_frontmatter: OOM copying key", .{});
+            };
+            defer engine.allocator.free(key_z);
+
+            switch (entry.value_ptr.*) {
+                .string => |s| {
+                    _ = lua.pushString(s);
+                },
+                .list => |items| {
+                    lua.newTable();
+                    for (items, 0..) |item, i| {
+                        _ = lua.pushString(item);
+                        lua.rawSetIndex(-2, @intCast(i + 1));
+                    }
+                },
+            }
+            lua.setField(-2, key_z);
+        }
+        lua.setField(-2, "fields");
+
+        const body = if (parsed.body_start <= src.len)
+            src[parsed.body_start..]
+        else
+            "";
+        _ = lua.pushString(body);
+        lua.setField(-2, "body");
+
         return 1;
     }
 
@@ -8895,4 +9030,183 @@ test "zag.subagent.register rejects invalid name" {
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "Bad_Name") != null);
 
     try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
+}
+
+test "zag.parse_frontmatter returns fields and body" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\local parsed = zag.parse_frontmatter("---\nname: reviewer\ntools: [read, grep]\n---\nBody text.\n")
+        \\_name = parsed.fields.name
+        \\_body = parsed.body
+        \\_tool_1 = parsed.fields.tools[1]
+        \\_tool_2 = parsed.fields.tools[2]
+    );
+
+    _ = try engine.lua.getGlobal("_name");
+    try std.testing.expectEqualStrings("reviewer", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_body");
+    try std.testing.expectEqualStrings("Body text.\n", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_tool_1");
+    try std.testing.expectEqualStrings("read", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_tool_2");
+    try std.testing.expectEqualStrings("grep", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.fs.read_file_sync and list_dir_sync" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "hello-sync" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.md", .data = "# header\n" });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &rbuf);
+
+    _ = engine.lua.pushString(base);
+    engine.lua.setGlobal("_base");
+
+    try engine.lua.doString(
+        \\local content = zag.fs.read_file_sync(_base .. "/a.txt")
+        \\_content = content
+        \\local names = zag.fs.list_dir_sync(_base)
+        \\table.sort(names)
+        \\_count = #names
+        \\_first = names[1]
+        \\_second = names[2]
+        \\_missing = zag.fs.read_file_sync("/nonexistent/zzz") == nil
+    );
+
+    _ = try engine.lua.getGlobal("_content");
+    try std.testing.expectEqualStrings("hello-sync", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_count");
+    try std.testing.expectEqual(@as(i64, 2), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_first");
+    try std.testing.expectEqualStrings("a.txt", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_second");
+    try std.testing.expectEqualStrings("b.md", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_missing");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.subagents.filesystem loads agents from tmpdir" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const reviewer_md =
+        \\---
+        \\name: reviewer
+        \\description: Review staged diffs.
+        \\model: anthropic/claude-haiku-4-5
+        \\tools: [read, grep]
+        \\---
+        \\You are a reviewer. Read the diff and return findings.
+    ;
+    try tmp.dir.makePath("agents");
+    try tmp.dir.writeFile(.{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
+
+    const scout_md =
+        \\---
+        \\name: scout
+        \\description: Scout the codebase.
+        \\---
+        \\You are a scout.
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "agents/scout.md", .data = scout_md });
+
+    // A sibling file without the right extension must be ignored.
+    try tmp.dir.writeFile(.{ .sub_path = "agents/README", .data = "ignore me" });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath("agents", &rbuf);
+
+    _ = engine.lua.pushString(base);
+    engine.lua.setGlobal("_agents_dir");
+
+    try engine.lua.doString(
+        \\local fs = require("zag.subagents.filesystem")
+        \\fs.load_from(_agents_dir)
+    );
+
+    const registry = engine.subagentRegistry();
+    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
+
+    const reviewer = registry.lookup("reviewer") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Review staged diffs.", reviewer.description);
+    try std.testing.expectEqualStrings(
+        "You are a reviewer. Read the diff and return findings.",
+        reviewer.prompt,
+    );
+    try std.testing.expectEqualStrings("anthropic/claude-haiku-4-5", reviewer.model.?);
+    try std.testing.expectEqual(@as(usize, 2), reviewer.tools.?.len);
+    try std.testing.expectEqualStrings("read", reviewer.tools.?[0]);
+    try std.testing.expectEqualStrings("grep", reviewer.tools.?[1]);
+
+    const scout = registry.lookup("scout") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Scout the codebase.", scout.description);
+    try std.testing.expectEqualStrings("You are a scout.", scout.prompt);
+    try std.testing.expect(scout.model == null);
+    try std.testing.expect(scout.tools == null);
+}
+
+test "zag.subagents.filesystem skips malformed files with a warning" {
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("agents");
+    // Missing `name` field; must be skipped.
+    try tmp.dir.writeFile(.{
+        .sub_path = "agents/broken.md",
+        .data = "---\ndescription: no name\n---\nbody\n",
+    });
+    // Valid; must be loaded even though a sibling was malformed.
+    try tmp.dir.writeFile(.{
+        .sub_path = "agents/good.md",
+        .data = "---\nname: good\ndescription: ok\n---\nhi\n",
+    });
+
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath("agents", &rbuf);
+
+    _ = engine.lua.pushString(base);
+    engine.lua.setGlobal("_agents_dir");
+
+    try engine.lua.doString(
+        \\local fs = require("zag.subagents.filesystem")
+        \\fs.load_from(_agents_dir)
+    );
+
+    const registry = engine.subagentRegistry();
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try std.testing.expect(registry.lookup("good") != null);
 }
