@@ -1374,6 +1374,7 @@ test {
     _ = @import("BufferRegistry.zig");
     _ = @import("Sink.zig");
     _ = @import("sinks/Null.zig");
+    _ = @import("sinks/Collector.zig");
     _ = @import("halfblock.zig");
     _ = @import("png_decode.zig");
     _ = @import("Viewport.zig");
