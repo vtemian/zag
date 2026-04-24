@@ -66,7 +66,12 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking);
-        const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, thinking, req.allocator);
+        // PR 5 will switch this to emit the 2-element system array with
+        // cache_control on the stable half; for now we fold back to the
+        // single-string wire shape so tracing stays byte-identical.
+        const system_joined = try req.joinedSystem(req.allocator);
+        defer req.allocator.free(system_joined);
+        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -92,7 +97,9 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking);
-        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, thinking, req.allocator);
+        const system_joined = try req.joinedSystem(req.allocator);
+        defer req.allocator.free(system_joined);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -1638,4 +1645,38 @@ test "anthropic writeMessage escapes thinking text with special characters" {
     const first = parsed.value.object.get("content").?.array.items[0].object;
     try testing.expectEqualStrings("line1\nline2 \"quoted\" \\ backslash", first.get("thinking").?.string);
     try testing.expectEqualStrings("sig\"with\"quotes", first.get("signature").?.string);
+}
+
+test "Request.joinedSystem matches single-string buildRequestBody byte-for-byte" {
+    // PR 5 will split the Anthropic system field into a 2-element array
+    // with cache_control on the stable half; until then a split Request
+    // must serialize identically to the legacy single-string shape so the
+    // on-wire bytes don't drift during the migration.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const split_req = llm.Request{
+        .system_stable = "You are zag.",
+        .system_volatile = "Today is 2026-04-22.",
+        .messages = &messages,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const joined_from_split = try split_req.joinedSystem(allocator);
+    defer allocator.free(joined_from_split);
+
+    const split_body = try buildRequestBody("claude-sonnet-4-20250514", joined_from_split, &messages, &.{}, null, allocator);
+    defer allocator.free(split_body);
+
+    const single_body = try buildRequestBody(
+        "claude-sonnet-4-20250514",
+        "You are zag.\n\nToday is 2026-04-22.",
+        &messages,
+        &.{},
+        null,
+        allocator,
+    );
+    defer allocator.free(single_body);
+
+    try std.testing.expectEqualStrings(single_body, split_body);
 }

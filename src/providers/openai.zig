@@ -50,7 +50,9 @@ pub const OpenAiSerializer = struct {
     ) !types.LlmResponse {
         const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        const system_joined = try req.joinedSystem(req.allocator);
+        defer req.allocator.free(system_joined);
+        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -75,7 +77,9 @@ pub const OpenAiSerializer = struct {
     ) !types.LlmResponse {
         const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
 
-        const body = try buildStreamingRequestBody(self.model, req.system_prompt, req.messages, req.tool_definitions, req.allocator);
+        const system_joined = try req.joinedSystem(req.allocator);
+        defer req.allocator.free(system_joined);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -989,4 +993,37 @@ test "openai writeMessage emits tool role for tool_result" {
     try std.testing.expectEqualStrings("tool", root.get("role").?.string);
     try std.testing.expectEqualStrings("call_001", root.get("tool_call_id").?.string);
     try std.testing.expectEqualStrings("file contents", root.get("content").?.string);
+}
+
+test "Request.joinedSystem matches single-string openai body byte-for-byte" {
+    // OpenAI Chat Completions only accepts one `role:"system"` message,
+    // so the split-system Request always collapses back to the joined
+    // string. Pin this so split and single-string requests produce the
+    // same bytes on the wire.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const split_req = llm.Request{
+        .system_stable = "stable prefix",
+        .system_volatile = "per-turn suffix",
+        .messages = &messages,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+    const joined = try split_req.joinedSystem(allocator);
+    defer allocator.free(joined);
+
+    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, allocator);
+    defer allocator.free(split_body);
+
+    const single_body = try buildRequestBody(
+        "gpt-4o",
+        "stable prefix\n\nper-turn suffix",
+        &messages,
+        &.{},
+        allocator,
+    );
+    defer allocator.free(single_body);
+
+    try std.testing.expectEqualStrings(single_body, split_body);
 }

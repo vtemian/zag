@@ -177,7 +177,7 @@ fn callLlm(
         .on_event = &streamEventToQueue,
     };
     const stream_req = llm.StreamRequest{
-        .system_prompt = prompt,
+        .system_stable = prompt,
         .messages = messages,
         .tool_definitions = tool_defs,
         .allocator = allocator,
@@ -192,7 +192,7 @@ fn callLlm(
         if (streaming_err == error.Cancelled) return error.Cancelled;
         log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
         const req = llm.Request{
-            .system_prompt = prompt,
+            .system_stable = prompt,
             .messages = messages,
             .tool_definitions = tool_defs,
             .allocator = allocator,
