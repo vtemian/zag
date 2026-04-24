@@ -34,6 +34,8 @@ const CommandRegistry = @import("CommandRegistry.zig");
 const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const trace = @import("Metrics.zig");
+const Sink = @import("Sink.zig").Sink;
+const SinkEvent = @import("Sink.zig").Event;
 
 const log = std.log.scoped(.orchestrator);
 
@@ -295,9 +297,9 @@ fn tick(
     // Drain agent events from every pane. AgentRunner.drainEvents calls
     // dispatchHookRequests first thing, which is the sole owner of hook
     // dispatch at the tick boundary.
-    self.window_manager.drainPane(self.window_manager.root_pane);
-    for (self.window_manager.extra_panes.items) |entry| {
-        self.window_manager.drainPane(entry.pane);
+    self.window_manager.drainPane(&self.window_manager.root_pane);
+    for (self.window_manager.extra_panes.items) |*entry| {
+        self.window_manager.drainPane(&entry.pane);
     }
 
     // Check if any pane has pending visual changes. `buffer.isDirty()`
@@ -587,7 +589,7 @@ fn onUserInputSubmitted(
         }
     }
 
-    try runner.submitInput(working_text, self.allocator);
+    try runner.submitInput(working_text);
 
     if (self.lua_engine) |eng| {
         var payload: Hooks.HookPayload = .{ .user_message_post = .{ .text = working_text } };
@@ -714,7 +716,15 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
-    var runner = AgentRunner.init(allocator, &view, &session_scratch);
+    const TestNullSink = struct {
+        fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+        fn deinitVT(_: *anyopaque) void {}
+        const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+        fn sink() Sink {
+            return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+        }
+    };
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
