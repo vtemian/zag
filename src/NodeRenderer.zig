@@ -472,8 +472,8 @@ test "renderDefault separator" {
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("---", text);
-    // Separator uses status style (dim)
-    try std.testing.expect(lines.items[0].spans[0].style.dim);
+    // Separator uses the status highlight.
+    try std.testing.expect(std.meta.eql(lines.items[0].spans[0].style.fg, theme.highlights.status.fg));
 }
 
 test "renderDefault status" {
@@ -499,7 +499,7 @@ test "renderDefault status" {
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("tokens: 1500 in, 200 out", text);
-    try std.testing.expect(lines.items[0].spans[0].style.dim);
+    try std.testing.expect(std.meta.eql(lines.items[0].spans[0].style.fg, theme.highlights.status.fg));
 }
 
 test "renderDefault custom" {

@@ -244,14 +244,15 @@ borders: Borders,
 
 /// Return the default theme with the standard Zag color palette.
 pub fn defaultTheme() Theme {
-    const fg = Screen.Color{ .rgb = .{ .r = 205, .g = 214, .b = 224 } };
-    const dim = Screen.Color{ .rgb = .{ .r = 110, .g = 118, .b = 129 } };
-    const accent = Screen.Color{ .rgb = .{ .r = 130, .g = 170, .b = 255 } };
-    const success = Screen.Color{ .rgb = .{ .r = 126, .g = 211, .b = 133 } };
-    const warning = Screen.Color{ .rgb = .{ .r = 229, .g = 192, .b = 123 } };
-    const err_color = Screen.Color{ .rgb = .{ .r = 224, .g = 108, .b = 117 } };
-    const info = Screen.Color{ .rgb = .{ .r = 86, .g = 182, .b = 194 } };
-    const code_bg = Screen.Color{ .rgb = .{ .r = 40, .g = 44, .b = 52 } };
+    const fg = Screen.Color{ .rgb = .{ .r = 235, .g = 240, .b = 248 } };
+    const dim = Screen.Color{ .rgb = .{ .r = 92, .g = 99, .b = 112 } };
+    const muted = Screen.Color{ .rgb = .{ .r = 156, .g = 163, .b = 178 } };
+    const accent = Screen.Color{ .rgb = .{ .r = 122, .g = 162, .b = 247 } };
+    const success = Screen.Color{ .rgb = .{ .r = 158, .g = 206, .b = 106 } };
+    const warning = Screen.Color{ .rgb = .{ .r = 224, .g = 175, .b = 104 } };
+    const err_color = Screen.Color{ .rgb = .{ .r = 247, .g = 118, .b = 142 } };
+    const info = Screen.Color{ .rgb = .{ .r = 125, .g = 207, .b = 255 } };
+    const code_bg = Screen.Color{ .rgb = .{ .r = 24, .g = 26, .b = 34 } };
 
     return .{
         .colors = .{
@@ -271,14 +272,14 @@ pub fn defaultTheme() Theme {
             .tool_call = .{ .fg = warning },
             .tool_result = .{ .fg = dim },
             .err = .{ .fg = err_color, .bold = true },
-            .status = .{ .fg = dim, .dim = true },
+            .status = .{ .fg = muted },
             .tab_active = .{ .fg = fg, .bold = true },
             .tab_inactive = .{ .fg = dim },
-            .border = .{ .fg = dim },
+            .border = .{ .fg = muted },
             .border_focused = .{ .fg = accent, .bold = true },
             .title_active = .{ .fg = accent, .bold = true, .inverse = true },
             .title_inactive = .{ .fg = dim },
-            .status_line = .{ .fg = dim, .dim = true },
+            .status_line = .{ .fg = muted },
             .input_prompt = .{ .fg = accent, .bold = true },
             .input_text = .{ .fg = fg },
             .md_heading = .{ .fg = accent, .bold = true },
@@ -360,9 +361,9 @@ test "defaultTheme returns valid base colors" {
     // fg should be the light gray RGB value from the palette
     switch (theme.colors.fg) {
         .rgb => |c| {
-            try std.testing.expectEqual(@as(u8, 205), c.r);
-            try std.testing.expectEqual(@as(u8, 214), c.g);
-            try std.testing.expectEqual(@as(u8, 224), c.b);
+            try std.testing.expectEqual(@as(u8, 235), c.r);
+            try std.testing.expectEqual(@as(u8, 240), c.g);
+            try std.testing.expectEqual(@as(u8, 248), c.b);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -392,9 +393,9 @@ test "CellStyle with null fg inherits default via resolve" {
     // fg should match theme.colors.fg
     switch (resolved.fg) {
         .rgb => |c| {
-            try std.testing.expectEqual(@as(u8, 205), c.r);
-            try std.testing.expectEqual(@as(u8, 214), c.g);
-            try std.testing.expectEqual(@as(u8, 224), c.b);
+            try std.testing.expectEqual(@as(u8, 235), c.r);
+            try std.testing.expectEqual(@as(u8, 240), c.g);
+            try std.testing.expectEqual(@as(u8, 248), c.b);
         },
         else => return error.TestUnexpectedResult,
     }
