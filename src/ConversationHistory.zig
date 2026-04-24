@@ -312,11 +312,12 @@ test "persistEvent chains parent_ids across a turn" {
     // before the history attached, so it's the session's root.
     try std.testing.expect(loaded[0].parent_id == null);
     // Row 1 (user_message) is the first event the history persisted.
-    // ConversationHistory.last_persisted_id is still null here because
-    // session_start went straight through SessionHandle.appendEntry, so
-    // the user_message legitimately has no parent from the history's
-    // point of view. It roots the conversation chain.
-    try std.testing.expect(loaded[1].parent_id == null);
+    // ConversationHistory.last_persisted_id is still null when it runs, so
+    // the on-disk row has no parent_id field. The reader backfills parent
+    // from the previous entry in linear order, so after load row 1 chains
+    // to the session_start row.
+    try std.testing.expect(loaded[1].parent_id != null);
+    try std.testing.expectEqualSlices(u8, &loaded[0].id, &loaded[1].parent_id.?);
     // Row 2 (assistant_text) chains off user_message.
     try std.testing.expect(loaded[2].parent_id != null);
     try std.testing.expectEqualSlices(u8, &loaded[1].id, &loaded[2].parent_id.?);

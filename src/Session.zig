@@ -451,11 +451,37 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
     var line_iter = std.mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
         if (line.len == 0) continue;
-        const entry = parseEntry(line, allocator) catch continue;
+        var entry = parseEntry(line, allocator) catch continue;
+        const previous_id: ?ulid.Ulid = if (entries.items.len > 0)
+            entries.items[entries.items.len - 1].id
+        else
+            null;
+        backfillEntry(&entry, previous_id);
         try entries.append(allocator, entry);
     }
 
     return entries.toOwnedSlice(allocator);
+}
+
+/// Fill in a synthetic ULID for any entry loaded from a pre-migration JSONL
+/// row that never wrote an `id` field. The seed is the entry's own
+/// timestamp so loading the same file twice produces the same synthetic id,
+/// which keeps downstream tools (e.g. `jq -r .id`) stable across runs.
+///
+/// When `parent_id` is missing we chain it to the previous entry's id in
+/// linear load order, matching the implicit parent chain that existed
+/// before the schema gained explicit parents. Synthetic values never get
+/// written back to disk; they live only in the returned slice.
+fn backfillEntry(entry: *Entry, previous_id: ?ulid.Ulid) void {
+    if (isZeroUlid(entry.id)) {
+        const seed: u64 = @bitCast(entry.timestamp);
+        var rng = std.Random.DefaultPrng.init(seed);
+        const ms: u64 = @intCast(@max(entry.timestamp, 0));
+        entry.id = ulid.generateAt(ms, rng.random());
+    }
+    if (entry.parent_id == null) {
+        if (previous_id) |pid| entry.parent_id = pid;
+    }
 }
 
 /// Free strings allocated by parseEntry.
@@ -1292,4 +1318,160 @@ test "recoverSessionFiles reports line count for count reconciliation" {
     const report = try recoverSessionFiles(iter_dir, "sess", allocator);
     try std.testing.expectEqual(@as(u32, 4), report.actual_line_count);
     try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
+}
+
+test "loader synthesizes ids for pre-migration entries" {
+    // Hand-write a JSONL file in the old (id-less) shape and confirm the
+    // reader mints deterministic synthetic ids and a linear parent chain.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try std.fs.cwd().makePath(sessions_dir);
+
+    const session_id = "oldfmt0000000000";
+    var path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
+
+    const old_format =
+        "{\"type\":\"session_start\",\"ts\":100}\n" ++
+        "{\"type\":\"user_message\",\"content\":\"hello\",\"ts\":200}\n" ++
+        "{\"type\":\"assistant_text\",\"content\":\"hi back\",\"ts\":300}\n";
+    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = old_format });
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    for (loaded) |e| try std.testing.expect(!isZeroUlid(e.id));
+
+    // First entry has no parent; the rest chain off the previous row's id.
+    try std.testing.expect(loaded[0].parent_id == null);
+    try std.testing.expect(loaded[1].parent_id != null);
+    try std.testing.expectEqualSlices(u8, &loaded[0].id, &loaded[1].parent_id.?);
+    try std.testing.expect(loaded[2].parent_id != null);
+    try std.testing.expectEqualSlices(u8, &loaded[1].id, &loaded[2].parent_id.?);
+
+    // Synthetic ids must be deterministic across loads of the same bytes.
+    const loaded_again = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded_again) |e| freeEntry(e, allocator);
+        allocator.free(loaded_again);
+    }
+    try std.testing.expectEqual(loaded.len, loaded_again.len);
+    for (loaded, loaded_again) |a, b| {
+        try std.testing.expectEqualSlices(u8, &a.id, &b.id);
+    }
+}
+
+test "loader preserves explicit ids from new-schema entries" {
+    // Rows that already carry an `id` (and `parent_id`) must come back
+    // verbatim; the reader only synthesizes when the field is absent.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try std.fs.cwd().makePath(sessions_dir);
+
+    var prng = std.Random.DefaultPrng.init(0xFEEDBABE);
+    const id_a = ulid.generateAt(1000, prng.random());
+    const id_b = ulid.generateAt(2000, prng.random());
+    const id_c = ulid.generateAt(3000, prng.random());
+
+    var body_buf: [2048]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &body_buf,
+        "{{\"type\":\"session_start\",\"id\":\"{s}\",\"ts\":1000}}\n" ++
+            "{{\"type\":\"user_message\",\"id\":\"{s}\",\"parent_id\":\"{s}\",\"content\":\"q\",\"ts\":2000}}\n" ++
+            "{{\"type\":\"assistant_text\",\"id\":\"{s}\",\"parent_id\":\"{s}\",\"content\":\"a\",\"ts\":3000}}\n",
+        .{ &id_a, &id_b, &id_a, &id_c, &id_b },
+    );
+
+    const session_id = "newfmt0000000000";
+    var path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
+    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = body });
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualSlices(u8, &id_a, &loaded[0].id);
+    try std.testing.expectEqualSlices(u8, &id_b, &loaded[1].id);
+    try std.testing.expectEqualSlices(u8, &id_c, &loaded[2].id);
+
+    // Explicit parent_ids must survive load verbatim.
+    try std.testing.expect(loaded[0].parent_id == null);
+    try std.testing.expectEqualSlices(u8, &id_a, &loaded[1].parent_id.?);
+    try std.testing.expectEqualSlices(u8, &id_b, &loaded[2].parent_id.?);
+}
+
+test "loader handles mixed old+new entries" {
+    // A session upgraded mid-flight has id-less rows before the migration
+    // boundary and id-bearing rows after. Synthetic ids must only mint for
+    // the old rows; explicit parent_ids on new rows must not be rewritten.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try std.fs.cwd().makePath(sessions_dir);
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE42);
+    const explicit_id = ulid.generateAt(5000, prng.random());
+    const unrelated_parent = ulid.generateAt(4000, prng.random());
+
+    var body_buf: [1024]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &body_buf,
+        "{{\"type\":\"user_message\",\"content\":\"old\",\"ts\":100}}\n" ++
+            "{{\"type\":\"assistant_text\",\"id\":\"{s}\",\"parent_id\":\"{s}\",\"content\":\"new\",\"ts\":200}}\n",
+        .{ &explicit_id, &unrelated_parent },
+    );
+
+    const session_id = "mixfmt0000000000";
+    var path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
+    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = body });
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+
+    // First row got a synthetic id; second row kept its explicit id.
+    try std.testing.expect(!isZeroUlid(loaded[0].id));
+    try std.testing.expectEqualSlices(u8, &explicit_id, &loaded[1].id);
+
+    // The explicit parent on the second row was NOT overwritten by the
+    // previous entry's id, even though a linear-chain heuristic would.
+    try std.testing.expect(loaded[1].parent_id != null);
+    try std.testing.expectEqualSlices(u8, &unrelated_parent, &loaded[1].parent_id.?);
+    try std.testing.expect(!std.mem.eql(u8, &loaded[0].id, &loaded[1].parent_id.?));
 }
