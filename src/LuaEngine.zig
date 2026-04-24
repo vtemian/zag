@@ -13,6 +13,7 @@ const Keymap = @import("Keymap.zig");
 const Buffer = @import("Buffer.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const ScratchBuffer = @import("buffers/scratch.zig");
+const GraphicsBuffer = @import("buffers/graphics.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
@@ -478,6 +479,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "current_line");
         lua.pushFunction(zlua.wrap(zagBufferDeleteFn));
         lua.setField(-2, "delete");
+        lua.pushFunction(zlua.wrap(zagBufferSetPngFn));
+        lua.setField(-2, "set_png");
+        lua.pushFunction(zlua.wrap(zagBufferSetFitFn));
+        lua.setField(-2, "set_fit");
         lua.setField(-2, "buffer"); // zag.buffer = buffer_table; [zag_table]
 
         // Private log entrypoints consumed by the Lua-side wrappers in
@@ -2531,17 +2536,24 @@ pub const LuaEngine = struct {
         const kind_str = lua.toString(-1) catch {
             lua.raiseErrorStr("zag.buffer.create: field 'kind' must be a string", .{});
         };
-        // Dup before popping: the Lua string lives in the table slot we
-        // release on pop, and the later string comparison reads through.
-        // `toString` returns a borrowed slice that parseKind copies out
-        // under eql; `kind_str` stays valid until pop.
-        const is_scratch = std.mem.eql(u8, kind_str, "scratch");
+        // Copy-out before popping: the Lua string lives in the table
+        // slot we release on pop, and the downstream branch compares
+        // against it. The enum value carries the decision forward so
+        // we don't keep the borrowed slice alive past the pop.
+        const KindTag = enum { scratch, graphics };
+        const kind_tag: KindTag = if (std.mem.eql(u8, kind_str, "scratch"))
+            .scratch
+        else if (std.mem.eql(u8, kind_str, "graphics"))
+            .graphics
+        else {
+            lua.raiseErrorStr("zag.buffer.create: unknown kind (valid kinds: \"scratch\", \"graphics\")", .{});
+        };
         lua.pop(1);
-        if (!is_scratch) {
-            lua.raiseErrorStr("zag.buffer.create: unknown kind (only \"scratch\" is supported)", .{});
-        }
 
-        var name_buf: []const u8 = "scratch";
+        var name_buf: []const u8 = switch (kind_tag) {
+            .scratch => "scratch",
+            .graphics => "graphics",
+        };
         _ = lua.getField(1, "name");
         if (!lua.isNil(-1)) {
             if (lua.typeOf(-1) != .string) {
@@ -2551,10 +2563,14 @@ pub const LuaEngine = struct {
                 lua.raiseErrorStr("zag.buffer.create: field 'name' must be a string", .{});
             };
         }
-        // Name is copied into the ScratchBuffer's own allocation inside
-        // `createScratch`, so letting the Lua slice go away after this
-        // call is safe.
-        const handle = registry.createScratch(name_buf) catch |err| {
+        // Name is copied into the buffer's own allocation inside the
+        // factory, so letting the Lua slice go away after this call is
+        // safe.
+        const handle_result: anyerror!BufferRegistry.Handle = switch (kind_tag) {
+            .scratch => registry.createScratch(name_buf),
+            .graphics => registry.createGraphics(name_buf),
+        };
+        const handle = handle_result catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.create: {s}", .{@errorName(err)}) catch "zag.buffer.create failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
@@ -2734,6 +2750,60 @@ pub const LuaEngine = struct {
             const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.delete: {s}", .{@errorName(err)}) catch "zag.buffer.delete failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
         };
+        return 0;
+    }
+
+    /// `zag.buffer.set_png(handle, bytes)`: decode PNG bytes and store
+    /// the RGBA image on the graphics buffer referenced by `handle`.
+    /// Lua 5.4 strings are 8-bit clean, so the PNG payload passes
+    /// through unmangled. Scratch handles raise a Lua error instead of
+    /// silently no-oping.
+    fn zagBufferSetPngFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.set_png");
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.buffer.set_png: arg 2 must be a string of PNG bytes", .{});
+        }
+        const bytes = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.buffer.set_png: arg 2 must be a string of PNG bytes", .{});
+        };
+        switch (entry) {
+            .graphics => |gb| {
+                gb.setPng(bytes) catch |err| {
+                    var buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.set_png: {s}", .{@errorName(err)}) catch "zag.buffer.set_png failed";
+                    lua.raiseErrorStr("%s", .{msg.ptr});
+                };
+            },
+            .scratch => lua.raiseErrorStr("zag.buffer.set_png: handle is not a graphics buffer", .{}),
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.set_fit(handle, fit)`: set the graphics buffer's fit
+    /// policy. `fit` is one of `"contain"`, `"fill"`, `"actual"`. Any
+    /// other string raises a Lua error; scratch handles raise a Lua
+    /// error.
+    fn zagBufferSetFitFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.set_fit");
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.buffer.set_fit: arg 2 must be a string", .{});
+        }
+        const fit_str = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.buffer.set_fit: arg 2 must be a string", .{});
+        };
+        const fit: GraphicsBuffer.Fit = if (std.mem.eql(u8, fit_str, "contain"))
+            .contain
+        else if (std.mem.eql(u8, fit_str, "fill"))
+            .fill
+        else if (std.mem.eql(u8, fit_str, "actual"))
+            .actual
+        else {
+            lua.raiseErrorStr("zag.buffer.set_fit: fit must be \"contain\", \"fill\", or \"actual\"", .{});
+        };
+        switch (entry) {
+            .graphics => |gb| gb.setFit(fit),
+            .scratch => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
+        }
         return 0;
     }
 
@@ -8235,7 +8305,7 @@ test "zag.buffer.create rejects unknown kinds" {
     engine.buffer_registry = &buffer_registry;
 
     const result = engine.lua.doString(
-        \\zag.buffer.create { kind = "graphics" }
+        \\zag.buffer.create { kind = "not-a-real-kind" }
     );
     try std.testing.expectError(error.LuaRuntime, result);
     engine.lua.pop(1);
@@ -8339,6 +8409,142 @@ test "zag.buffer.delete releases the slot and later lookups fail" {
     // as a Lua error; the registry layer caught the dangling reference.
     const result = engine.lua.doString(
         \\zag.buffer.line_count(_G.handle)
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+// 1x1 red PNG, 69 bytes. Duplicated from src/png_decode.zig so these
+// tests stay self-contained; the fixture there owns the same bytes
+// for its own decode round-trip coverage.
+const tiny_red_png_fixture = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+    0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+};
+
+test "zag.buffer.create kind=\"graphics\" returns a resolvable graphics handle" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "graphics", name = "diagram" }
+    );
+    _ = try engine.lua.getGlobal("handle");
+    defer engine.lua.pop(1);
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    const entry = try buffer_registry.resolve(handle);
+    try std.testing.expect(entry == .graphics);
+    try std.testing.expectEqualStrings("diagram", entry.graphics.name);
+}
+
+test "zag.buffer.set_png stores decoded image on a graphics handle" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    // Push the PNG bytes as a Lua string global. Lua 5.4 strings are
+    // binary-safe; pushString copies them out of the supplied slice.
+    _ = engine.lua.pushString(&tiny_red_png_fixture);
+    engine.lua.setGlobal("png_bytes");
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "graphics", name = "diagram" }
+        \\zag.buffer.set_png(_G.handle, png_bytes)
+    );
+    _ = try engine.lua.getGlobal("handle");
+    defer engine.lua.pop(1);
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    const entry = try buffer_registry.resolve(handle);
+    try std.testing.expect(entry == .graphics);
+    try std.testing.expect(entry.graphics.image != null);
+    try std.testing.expectEqual(@as(u32, 1), entry.graphics.image.?.width);
+    try std.testing.expectEqual(@as(u32, 1), entry.graphics.image.?.height);
+}
+
+test "zag.buffer.set_png rejects a scratch handle" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(&tiny_red_png_fixture);
+    engine.lua.setGlobal("png_bytes");
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_png(b, png_bytes)
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_fit parses valid strings and rejects invalid ones" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "graphics", name = "diagram" }
+        \\zag.buffer.set_fit(_G.handle, "contain")
+        \\zag.buffer.set_fit(_G.handle, "fill")
+        \\zag.buffer.set_fit(_G.handle, "actual")
+    );
+    _ = try engine.lua.getGlobal("handle");
+    const handle_str = try engine.lua.toString(-1);
+    engine.lua.pop(1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    const entry = try buffer_registry.resolve(handle);
+    try std.testing.expectEqual(GraphicsBuffer.Fit.actual, entry.graphics.fit);
+
+    const result = engine.lua.doString(
+        \\zag.buffer.set_fit(_G.handle, "zoom")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_fit rejects a scratch handle" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_fit(b, "contain")
     );
     try std.testing.expectError(error.LuaRuntime, result);
     engine.lua.pop(1);
