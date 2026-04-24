@@ -27,6 +27,7 @@ const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
+const subagents_mod = @import("subagents.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
 
@@ -87,6 +88,19 @@ node_version_snapshot: u32 = 0,
 /// orchestrator that constructs the registry owns its lifetime.
 /// Null disables the layer (no `<available_skills>` block emitted).
 skills: ?*const skills_mod.SkillRegistry = null,
+
+/// Depth of nested subagent invocations on this runner. Root runners
+/// created by the orchestrator start at 0; the `task` tool sets the
+/// child runner's depth to `parent.task_depth + 1` and refuses to
+/// spawn once the limit is reached. The cap lives on the tool itself
+/// (see `tools/task.zig`); this field is just the counter.
+task_depth: u8 = 0,
+
+/// Backing storage for the `tools.TaskContext` this runner publishes
+/// on its agent thread. Lives here so the pointer stays valid for the
+/// whole life of the thread without a separate allocation. Populated
+/// inside `submit` right before spawning.
+task_ctx: tools.TaskContext = undefined,
 
 /// Create a runner bound to `sink` and `session`. Neither is owned;
 /// the caller guarantees the sink outlives this runner's agent thread.
@@ -157,6 +171,10 @@ pub const SpawnDeps = struct {
     /// Optional skill registry to advertise via the
     /// `builtin.skills_catalog` prompt layer. Null skips the layer.
     skills: ?*const skills_mod.SkillRegistry = null,
+    /// Optional subagent registry consulted by the built-in `task`
+    /// tool. Null disables delegation (the `task` tool surfaces a
+    /// "no TaskContext bound" error when invoked).
+    subagents: ?*const subagents_mod.SubagentRegistry = null,
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -184,6 +202,25 @@ pub fn submit(
     self.lua_engine = deps.lua_engine;
     self.cancel_flag.store(false, .release);
 
+    // Populate the TaskContext the agent thread publishes into the
+    // threadlocal slot so the built-in `task` tool can reach back to
+    // our provider, subagent registry, session handle, and depth
+    // counter. Missing a subagent registry means task delegation is
+    // disabled; the tool surfaces a tool-result error when called.
+    if (deps.subagents) |subs| {
+        self.task_ctx = .{
+            .allocator = deps.allocator,
+            .subagents = subs,
+            .provider = deps.provider,
+            .provider_name = deps.provider_name,
+            .registry = deps.registry,
+            .session_handle = self.session.session_handle,
+            .lua_engine = deps.lua_engine,
+            .task_depth = self.task_depth,
+            .wake_fd = deps.wake_write_fd,
+        };
+    }
+
     self.agent_thread = try std.Thread.spawn(.{}, threadMain, .{
         deps.provider,
         messages,
@@ -195,6 +232,7 @@ pub fn submit(
         deps.provider_name,
         self.pane_handle_packed,
         deps.skills orelse self.skills,
+        if (deps.subagents != null) &self.task_ctx else null,
     });
 }
 
@@ -294,6 +332,7 @@ fn threadMain(
     provider_name: []const u8,
     pane_handle_packed: u32,
     skills: ?*const skills_mod.SkillRegistry,
+    task_ctx: ?*const tools.TaskContext,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -306,6 +345,13 @@ fn threadMain(
     // assignment from their per-thread context.
     tools.current_caller_pane_id = pane_handle_packed;
     defer tools.current_caller_pane_id = null;
+
+    // Publish the task-delegation context when the caller wired one.
+    // Worker threads that run parallel tool calls re-publish this
+    // through `ToolCallContext.task_ctx` for the same reason they
+    // re-publish the Lua queue and caller pane id.
+    tools.task_context = task_ctx;
+    defer tools.task_context = null;
 
     agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills) catch |err| {
         // The message sits in the queue until drained; allocate owned
