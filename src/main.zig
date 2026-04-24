@@ -535,7 +535,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     const instruction = try std.fs.cwd().readFileAlloc(gpa, deps.mode.instruction_file, 1 << 20);
     defer gpa.free(instruction);
 
-    const system_prompt = try agent.buildSystemPrompt(deps.registry, gpa);
+    const system_prompt = try agent.buildSystemPrompt(deps.registry, gpa, deps.runner.skills);
     defer gpa.free(system_prompt);
 
     try deps.runner.submitInput(instruction);
