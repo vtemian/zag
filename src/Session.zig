@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
+const ulid = @import("ulid.zig");
 
 const Session = @This();
 
@@ -70,7 +71,24 @@ pub const Entry = struct {
     is_error: bool = false,
     /// Unix timestamp in milliseconds.
     timestamp: i64 = 0,
+    /// Unique ULID for this event. Zero-initialised in memory; the
+    /// serializer generates a fresh ULID when emitting if this is the
+    /// all-zeros sentinel. Readers populate this from the JSONL line.
+    id: ulid.Ulid = [_]u8{0} ** 26,
+    /// ULID of the parent event in the conversation tree, or null for
+    /// root events (first user message in a session).
+    parent_id: ?ulid.Ulid = null,
 };
+
+/// Return true when `id` is the all-zeros sentinel produced by the
+/// `Entry.id` default. Writers that leave the field unset are detected at
+/// serialize time so the emitter can fabricate a fresh ULID.
+fn isZeroUlid(id: ulid.Ulid) bool {
+    for (id) |b| {
+        if (b != 0) return false;
+    }
+    return true;
+}
 
 /// Session metadata stored in the companion .meta.json file.
 /// Uses fixed-size char arrays to avoid heap allocation.
@@ -329,10 +347,15 @@ pub const SessionHandle = struct {
     /// Allocator for temporary buffers.
     allocator: Allocator,
 
-    /// Append an entry to the JSONL file and update the meta file.
+    /// Append an entry to the JSONL file and update the meta file. The
+    /// serializer fabricates a fresh ULID into the outgoing row when the
+    /// caller leaves `entry.id` as the zero sentinel; Task 3 switches to
+    /// a variant that returns the generated id so callers can chain
+    /// `parent_id` explicitly.
     pub fn appendEntry(self: *SessionHandle, entry: Entry) !void {
         var buf: [8192]u8 = undefined;
-        const json = serializeEntry(entry, &buf) catch |e| {
+        var entry_mut = entry;
+        const json = serializeEntry(&entry_mut, &buf) catch |e| {
             log.err("failed to serialize entry: {}", .{e});
             return e;
         };
@@ -516,13 +539,30 @@ fn generateId(buf: *[32]u8) u8 {
     return 32;
 }
 
-/// Serialize an Entry to a JSON line in a stack buffer.
-fn serializeEntry(entry: Entry, buf: []u8) ![]const u8 {
+/// Serialize an Entry to a JSON line in a stack buffer. Takes a pointer
+/// because the serializer fabricates a fresh ULID into `entry.id` when
+/// the caller left it as the zero sentinel, so the caller can read the
+/// generated id back after the call returns.
+fn serializeEntry(entry: *Entry, buf: []u8) ![]const u8 {
+    if (isZeroUlid(entry.id)) {
+        entry.id = ulid.generate(std.crypto.random);
+    }
+
     var stream = std.io.fixedBufferStream(buf);
     const w = stream.writer();
     try w.writeAll("{\"type\":\"");
     try w.writeAll(entry.entry_type.toSlice());
     try w.writeAll("\"");
+
+    try w.writeAll(",\"id\":\"");
+    try w.writeAll(&entry.id);
+    try w.writeAll("\"");
+
+    if (entry.parent_id) |pid| {
+        try w.writeAll(",\"parent_id\":\"");
+        try w.writeAll(&pid);
+        try w.writeAll("\"");
+    }
 
     if (entry.content.len > 0) {
         try w.writeAll(",\"content\":");
@@ -590,6 +630,22 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         else => @as(i64, 0),
     } else @as(i64, 0);
 
+    // Absent or unparseable `id` leaves the field as the zero sentinel so
+    // a later backfill pass (see Task 4 of the JSONL tree migration) can
+    // assign one deterministically without confusing it for a writer-set
+    // value. Same logic for `parent_id`, except the field stays null.
+    var id: ulid.Ulid = [_]u8{0} ** 26;
+    if (obj.get("id")) |v| switch (v) {
+        .string => |s| id = ulid.parse(s) catch [_]u8{0} ** 26,
+        else => {},
+    };
+
+    var parent_id: ?ulid.Ulid = null;
+    if (obj.get("parent_id")) |v| switch (v) {
+        .string => |s| parent_id = ulid.parse(s) catch null,
+        else => {},
+    };
+
     return Entry{
         .entry_type = entry_type,
         .content = content,
@@ -597,6 +653,8 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         .tool_input = tool_input,
         .is_error = is_error,
         .timestamp = timestamp,
+        .id = id,
+        .parent_id = parent_id,
     };
 }
 
@@ -718,14 +776,14 @@ test "generateId produces 32 hex chars" {
 test "serializeEntry and parseEntry round-trip" {
     const allocator = std.testing.allocator;
 
-    const original = Entry{
+    var original = Entry{
         .entry_type = .user_message,
         .content = "hello world",
         .timestamp = 1234567890,
     };
 
     var buf: [8192]u8 = undefined;
-    const json = try serializeEntry(original, &buf);
+    const json = try serializeEntry(&original, &buf);
 
     const parsed = try parseEntry(json, allocator);
     defer freeEntry(parsed, allocator);
@@ -738,7 +796,7 @@ test "serializeEntry and parseEntry round-trip" {
 test "serializeEntry with tool fields" {
     const allocator = std.testing.allocator;
 
-    const original = Entry{
+    var original = Entry{
         .entry_type = .tool_call,
         .tool_name = "bash",
         .tool_input = "{\"cmd\":\"ls\"}",
@@ -746,7 +804,7 @@ test "serializeEntry with tool fields" {
     };
 
     var buf: [8192]u8 = undefined;
-    const json = try serializeEntry(original, &buf);
+    const json = try serializeEntry(&original, &buf);
 
     const parsed = try parseEntry(json, allocator);
     defer freeEntry(parsed, allocator);
@@ -759,7 +817,7 @@ test "serializeEntry with tool fields" {
 test "serializeEntry with is_error flag" {
     const allocator = std.testing.allocator;
 
-    const original = Entry{
+    var original = Entry{
         .entry_type = .tool_result,
         .content = "command failed",
         .is_error = true,
@@ -767,13 +825,174 @@ test "serializeEntry with is_error flag" {
     };
 
     var buf: [8192]u8 = undefined;
-    const json = try serializeEntry(original, &buf);
+    const json = try serializeEntry(&original, &buf);
 
     const parsed = try parseEntry(json, allocator);
     defer freeEntry(parsed, allocator);
 
     try std.testing.expect(parsed.is_error);
     try std.testing.expectEqualStrings("command failed", parsed.content);
+}
+
+test "serializeEntry auto-generates id when zero" {
+    const allocator = std.testing.allocator;
+
+    var original = Entry{
+        .entry_type = .user_message,
+        .content = "hello",
+        .timestamp = 1,
+    };
+    try std.testing.expect(isZeroUlid(original.id));
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    // The in-memory entry was mutated so the caller can read the fresh id.
+    try std.testing.expect(!isZeroUlid(original.id));
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expect(!isZeroUlid(parsed.id));
+    try std.testing.expectEqualSlices(u8, &original.id, &parsed.id);
+}
+
+test "serializeEntry preserves explicit id" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(0x5EEDED);
+    const explicit_id = ulid.generate(prng.random());
+
+    var original = Entry{
+        .entry_type = .assistant_text,
+        .content = "hi",
+        .timestamp = 7,
+        .id = explicit_id,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    try std.testing.expectEqualSlices(u8, &explicit_id, &original.id);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqualSlices(u8, &explicit_id, &parsed.id);
+}
+
+test "serializeEntry omits parent_id when null" {
+    var original = Entry{
+        .entry_type = .user_message,
+        .content = "root",
+        .timestamp = 1,
+    };
+    try std.testing.expect(original.parent_id == null);
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"parent_id\"") == null);
+}
+
+test "serializeEntry emits parent_id when set" {
+    var prng = std.Random.DefaultPrng.init(0xC0DE);
+    const parent = ulid.generate(prng.random());
+
+    var original = Entry{
+        .entry_type = .assistant_text,
+        .content = "child",
+        .timestamp = 2,
+        .parent_id = parent,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    var needle_buf: [64]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "\"parent_id\":\"{s}\"", .{&parent});
+    try std.testing.expect(std.mem.indexOf(u8, json, needle) != null);
+}
+
+test "parseEntry reads new id and parent_id fields" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(0xABCDEF);
+    const id = ulid.generate(prng.random());
+    const parent = ulid.generate(prng.random());
+
+    var line_buf: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(
+        &line_buf,
+        "{{\"type\":\"assistant_text\",\"id\":\"{s}\",\"parent_id\":\"{s}\",\"content\":\"x\",\"ts\":5}}",
+        .{ &id, &parent },
+    );
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqualSlices(u8, &id, &parsed.id);
+    try std.testing.expect(parsed.parent_id != null);
+    try std.testing.expectEqualSlices(u8, &parent, &parsed.parent_id.?);
+}
+
+test "parseEntry leaves id as zero when field missing" {
+    const allocator = std.testing.allocator;
+
+    const line = "{\"type\":\"user_message\",\"content\":\"hello\",\"ts\":1}";
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expect(isZeroUlid(parsed.id));
+    try std.testing.expect(parsed.parent_id == null);
+}
+
+test "round-trip: append then load reflects generated id" {
+    // Exercise the serialize + parse path end-to-end through a temp file.
+    // Matches the shape of the existing "create, append, and load
+    // round-trip" test: one persistent writer for all rows, then read
+    // back. The point of this test is only to assert the on-disk row
+    // carries a non-zero id, not to probe the SessionHandle meta path.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("rt.jsonl", .{ .truncate = true });
+
+    var entries = [_]Entry{
+        .{ .entry_type = .session_start, .timestamp = 100 },
+        .{ .entry_type = .user_message, .content = "first", .timestamp = 200 },
+    };
+
+    var buf: [8192]u8 = undefined;
+    var write_scratch: [256]u8 = undefined;
+    var fw = file.writer(&write_scratch);
+    for (&entries) |*entry| {
+        const json = try serializeEntry(entry, &buf);
+        try fw.interface.writeAll(json);
+        try fw.interface.writeAll("\n");
+    }
+    try fw.interface.flush();
+    file.close();
+
+    const content = try tmp.dir.readFileAlloc(allocator, "rt.jsonl", 1024 * 1024);
+    defer allocator.free(content);
+
+    var count: usize = 0;
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try parseEntry(line, allocator);
+        defer freeEntry(parsed, allocator);
+        try std.testing.expect(!isZeroUlid(parsed.id));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // Every writer-generated id was written back into the caller's entry
+    // so Task 3 can chain `parent_id` from the prior append's id.
+    for (entries) |e| try std.testing.expect(!isZeroUlid(e.id));
 }
 
 test "EntryType toSlice and fromSlice round-trip" {
@@ -806,7 +1025,7 @@ test "create, append, and load round-trip" {
     const file = try tmp_dir.createFile("test.jsonl", .{ .truncate = true });
 
     // Write entries
-    const entries_to_write = [_]Entry{
+    var entries_to_write = [_]Entry{
         .{ .entry_type = .session_start, .timestamp = 100 },
         .{ .entry_type = .user_message, .content = "hello", .timestamp = 200 },
         .{ .entry_type = .assistant_text, .content = "world", .timestamp = 300 },
@@ -815,7 +1034,7 @@ test "create, append, and load round-trip" {
     var buf: [8192]u8 = undefined;
     var write_scratch: [256]u8 = undefined;
     var fw = file.writer(&write_scratch);
-    for (entries_to_write) |entry| {
+    for (&entries_to_write) |*entry| {
         const json = try serializeEntry(entry, &buf);
         try fw.interface.writeAll(json);
         try fw.interface.writeAll("\n");
