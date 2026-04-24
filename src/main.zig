@@ -682,6 +682,11 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                 break;
             },
             .reset_assistant_text => {},
+            // Task 1.11 will route these into `capture.reasoning_content`.
+            // Until then, drop them so the headless drain stays exhaustive
+            // without perturbing trajectory output.
+            .thinking_delta => |t| gpa.free(t),
+            .thinking_stop => {},
             .hook_request => |req| req.done.set(),
             .lua_tool_request => |req| req.done.set(),
             .layout_request => |req| {

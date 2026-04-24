@@ -325,10 +325,17 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .info => _ = try self.appendNode(null, .status, entry.content),
             .err => _ = try self.appendNode(null, .err, entry.content),
             .session_start, .session_rename => {},
-            // Thinking entries participate in LLM replay via ConversationHistory
-            // but do not yet surface as their own tree node type. Task 1.10
-            // adds a dedicated NodeType.thinking and expands this switch.
-            .thinking, .thinking_redacted => {},
+            .thinking => {
+                const node = try self.appendNode(null, .thinking, entry.content);
+                // Replay has no streaming context; collapse so the
+                // transcript reads cleanly and the user opts into
+                // reasoning content with Ctrl-R.
+                node.collapsed = true;
+            },
+            .thinking_redacted => {
+                const node = try self.appendNode(null, .thinking_redacted, "");
+                node.collapsed = true;
+            },
         }
     }
     // Each appendNode already bumped tree.generation, so isDirty() will
@@ -350,6 +357,13 @@ pub fn clear(self: *ConversationBuffer) void {
 /// Thin wrapper around `appendNode` used by the runner's submit path.
 pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
+}
+
+/// Flip `collapsed` on every `.thinking` / `.thinking_redacted` node in
+/// the tree. Returns the number of nodes touched. Used by the Ctrl-R
+/// keybinding; scoped to the buffer so the state is per-pane.
+pub fn toggleAllThinkingCollapsed(self: *ConversationBuffer) usize {
+    return self.tree.toggleAllThinkingCollapsed();
 }
 
 // -- Draft input --------------------------------------------------------
@@ -503,6 +517,15 @@ pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleRes
             .char => |ch| {
                 if (ch == 'w') {
                     self.deleteWordFromDraft();
+                    return .consumed;
+                }
+                if (ch == 'r') {
+                    // Toggle all thinking blocks in this buffer. The tree
+                    // bumps its own generation on a non-zero touch count,
+                    // which `isDirty()` already picks up. When there are no
+                    // thinking nodes, still consume so the chord doesn't
+                    // leak into the draft.
+                    _ = self.toggleAllThinkingCollapsed();
                     return .consumed;
                 }
             },
@@ -930,6 +953,80 @@ test "loadFromEntries builds node tree from session entries" {
     // tool_result is a child of tool_call
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items[2].children.items.len);
     try std.testing.expectEqual(NodeType.tool_result, cb.tree.root_children.items[2].children.items[0].node_type);
+}
+
+test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "thinking-load");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
+        .{ .entry_type = .thinking, .content = "let me think", .timestamp = 1 },
+        .{ .entry_type = .thinking_redacted, .content = "", .encrypted_data = "ENC", .timestamp = 2 },
+        .{ .entry_type = .assistant_text, .content = "ok", .timestamp = 3 },
+    };
+    try cb.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(@as(usize, 4), cb.tree.root_children.items.len);
+    try std.testing.expectEqual(NodeType.thinking, cb.tree.root_children.items[1].node_type);
+    try std.testing.expect(cb.tree.root_children.items[1].collapsed);
+    try std.testing.expectEqualStrings("let me think", cb.tree.root_children.items[1].content.items);
+    try std.testing.expectEqual(NodeType.thinking_redacted, cb.tree.root_children.items[2].node_type);
+    try std.testing.expect(cb.tree.root_children.items[2].collapsed);
+}
+
+test "Ctrl-R toggles collapsed on every thinking node" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "thinking-toggle");
+    defer cb.deinit();
+
+    const t1 = try cb.appendNode(null, .thinking, "a");
+    t1.collapsed = true;
+    const t2 = try cb.appendNode(null, .thinking, "b");
+    t2.collapsed = true;
+
+    const r = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expect(!t1.collapsed);
+    try std.testing.expect(!t2.collapsed);
+
+    // Second toggle folds them back.
+    _ = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expect(t1.collapsed);
+    try std.testing.expect(t2.collapsed);
+}
+
+test "Ctrl-R is consumed even with no thinking nodes" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "thinking-empty");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hi");
+    const r = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+}
+
+test "getVisibleLines reflects collapsed-to-expanded toggle" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "thinking-render");
+    defer cb.deinit();
+
+    const tnode = try cb.appendNode(null, .thinking, "line1\nline2");
+    tnode.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+
+    var collapsed_lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer collapsed_lines.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), collapsed_lines.items.len);
+
+    _ = cb.toggleAllThinkingCollapsed();
+
+    var expanded_lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer expanded_lines.deinit(allocator);
+    // header + 2 body lines
+    try std.testing.expectEqual(@as(usize, 3), expanded_lines.items.len);
 }
 
 test "draft starts empty" {

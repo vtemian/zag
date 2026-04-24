@@ -27,6 +27,14 @@ pub const NodeType = enum {
     status,
     err,
     separator,
+    /// Extended-thinking block streamed from a reasoning model. Content is
+    /// the human-readable reasoning text; `collapsed` controls whether the
+    /// body is folded to a single header line.
+    thinking,
+    /// Provider-encrypted reasoning block (Anthropic `redacted_thinking`
+    /// or OpenAI Responses `encrypted_content`). No human-readable body;
+    /// renders as a single "redacted" header regardless of `collapsed`.
+    thinking_redacted,
 };
 
 /// A single node in the buffer tree. Owns its content and children.
@@ -253,13 +261,45 @@ pub fn loadFromEntriesFlat(self: *ConversationTree, entries: []const Session.Ent
             // session_start / session_rename are audit entries, not
             // visible tree content.
             .session_start, .session_rename => continue,
-            // Thinking entries round-trip via ConversationHistory for LLM
-            // replay; Task 1.10 will add a dedicated NodeType and surface
-            // them in the tree. For now they are not rendered.
-            .thinking, .thinking_redacted => continue,
+            // Thinking entries become dedicated nodes. The redacted
+            // variant surfaces its ciphertext-length marker from
+            // `encrypted_data` rather than `content`.
+            .thinking => .thinking,
+            .thinking_redacted => .thinking_redacted,
         };
-        _ = try self.appendNode(null, node_type, entry.content);
+        // `.thinking_redacted` has no user-visible content; the renderer
+        // prints a fixed header. We still append an empty node so scroll
+        // positions and replay counts line up with the session.
+        const content: []const u8 = switch (entry.entry_type) {
+            .thinking_redacted => "",
+            else => entry.content,
+        };
+        const node = try self.appendNode(null, node_type, content);
+        // Reloaded thinking nodes default collapsed: no streaming context,
+        // so the user should see the compact header first and opt in with
+        // Ctrl-R. Ciphertext blocks have no expanded view either way.
+        if (entry.entry_type == .thinking or entry.entry_type == .thinking_redacted) {
+            node.collapsed = true;
+        }
     }
+}
+
+/// Toggle `collapsed` on every `.thinking` and `.thinking_redacted` node
+/// in the tree. Bumps each node's `content_version` so the NodeLineCache
+/// invalidates its entries, and pushes each id onto `dirty_nodes` for the
+/// compositor. Returns the number of nodes affected so callers can skip a
+/// redraw when the tree has no thinking blocks.
+pub fn toggleAllThinkingCollapsed(self: *ConversationTree) usize {
+    var touched: usize = 0;
+    for (self.root_children.items) |node| {
+        if (node.node_type != .thinking and node.node_type != .thinking_redacted) continue;
+        node.collapsed = !node.collapsed;
+        node.markDirty();
+        self.dirty_nodes.push(node.id);
+        touched += 1;
+    }
+    if (touched > 0) self.generation +%= 1;
+    return touched;
 }
 
 // -- Tests -----------------------------------------------------------------
@@ -351,6 +391,60 @@ test "clear drops every node and marks the ring overflowed" {
     var out: [DirtyRing.capacity]u32 = undefined;
     const drained = tree.drainDirty(&out);
     try std.testing.expectEqual(true, drained.overflowed);
+}
+
+test "loadFromEntriesFlat surfaces thinking entries as collapsed thinking nodes" {
+    var tree = ConversationTree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .thinking, .content = "let me think...", .timestamp = 0 },
+        .{ .entry_type = .thinking_redacted, .content = "", .encrypted_data = "ENC", .timestamp = 1 },
+    };
+    try tree.loadFromEntriesFlat(&entries);
+
+    try std.testing.expectEqual(@as(usize, 2), tree.root_children.items.len);
+    try std.testing.expectEqual(NodeType.thinking, tree.root_children.items[0].node_type);
+    try std.testing.expect(tree.root_children.items[0].collapsed);
+    try std.testing.expectEqualStrings("let me think...", tree.root_children.items[0].content.items);
+    try std.testing.expectEqual(NodeType.thinking_redacted, tree.root_children.items[1].node_type);
+    try std.testing.expect(tree.root_children.items[1].collapsed);
+}
+
+test "toggleAllThinkingCollapsed flips state and bumps cache version" {
+    var tree = ConversationTree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const t1 = try tree.appendNode(null, .thinking, "a");
+    t1.collapsed = true;
+    const other = try tree.appendNode(null, .assistant_text, "x");
+    const t2 = try tree.appendNode(null, .thinking, "b");
+    t2.collapsed = false;
+
+    const ver_before_t1 = t1.content_version;
+    const ver_before_other = other.content_version;
+    const gen_before = tree.currentGeneration();
+
+    const touched = tree.toggleAllThinkingCollapsed();
+    try std.testing.expectEqual(@as(usize, 2), touched);
+    try std.testing.expect(!t1.collapsed);
+    try std.testing.expect(t2.collapsed);
+    try std.testing.expectEqual(ver_before_t1 +% 1, t1.content_version);
+    // Non-thinking node untouched.
+    try std.testing.expectEqual(ver_before_other, other.content_version);
+    try std.testing.expectEqual(gen_before +% 1, tree.currentGeneration());
+}
+
+test "toggleAllThinkingCollapsed is a no-op when no thinking nodes exist" {
+    var tree = ConversationTree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    _ = try tree.appendNode(null, .user_message, "hi");
+    const gen_before = tree.currentGeneration();
+
+    const touched = tree.toggleAllThinkingCollapsed();
+    try std.testing.expectEqual(@as(usize, 0), touched);
+    try std.testing.expectEqual(gen_before, tree.currentGeneration());
 }
 
 test {

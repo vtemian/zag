@@ -24,6 +24,12 @@ pub const default_backpressure_ms: u32 = 100;
 pub const AgentEvent = union(enum) {
     /// Partial text from the LLM response.
     text_delta: []const u8,
+    /// Partial extended-thinking text. Duped by the agent-side stream
+    /// adapter so the payload outlives the provider's SSE buffer.
+    thinking_delta: []const u8,
+    /// End of a thinking block. Lets the UI collapse the in-progress
+    /// thinking node before the next content block begins.
+    thinking_stop,
     /// A tool call was decided by the LLM.
     tool_start: ToolStartEvent,
     /// Tool execution completed with output.
@@ -83,6 +89,7 @@ pub const AgentEvent = union(enum) {
     pub fn freeOwned(self: AgentEvent, allocator: Allocator) void {
         switch (self) {
             .text_delta => |s| allocator.free(s),
+            .thinking_delta => |s| allocator.free(s),
             .tool_start => |t| {
                 allocator.free(t.name);
                 if (t.call_id) |id| allocator.free(id);
@@ -98,7 +105,7 @@ pub const AgentEvent = union(enum) {
             // the request struct and its payload. Dropping the event from
             // the queue without delivery leaves the waiter blocked, which
             // is a design problem above this layer, not a leak here.
-            .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request => {},
+            .thinking_stop, .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request => {},
         }
     }
 };

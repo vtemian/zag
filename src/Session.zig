@@ -908,7 +908,7 @@ test "serializeEntry with tool fields" {
 test "Entry round-trips thinking through JSONL with signature and provider" {
     const allocator = std.testing.allocator;
 
-    const original = Entry{
+    var original = Entry{
         .entry_type = .thinking,
         .content = "step-by-step reasoning...",
         .signature = "sig_abc123",
@@ -917,7 +917,7 @@ test "Entry round-trips thinking through JSONL with signature and provider" {
     };
 
     var buf: [8192]u8 = undefined;
-    const json = try serializeEntry(original, &buf);
+    const json = try serializeEntry(&original, &buf);
 
     const parsed = try parseEntry(json, allocator);
     defer freeEntry(parsed, allocator);
@@ -933,14 +933,14 @@ test "Entry round-trips thinking through JSONL with signature and provider" {
 test "Entry round-trips thinking_redacted through JSONL with encrypted_data" {
     const allocator = std.testing.allocator;
 
-    const original = Entry{
+    var original = Entry{
         .entry_type = .thinking_redacted,
         .encrypted_data = "ciphertext-blob",
         .timestamp = 777,
     };
 
     var buf: [8192]u8 = undefined;
-    const json = try serializeEntry(original, &buf);
+    const json = try serializeEntry(&original, &buf);
 
     const parsed = try parseEntry(json, allocator);
     defer freeEntry(parsed, allocator);
