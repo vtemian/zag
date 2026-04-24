@@ -159,7 +159,7 @@ fn serializeRequest(
     try writeToolDefinitions(tool_definitions, w);
     try w.writeAll(",");
 
-    try writeMessages(messages, w);
+    try writeMessages(model, messages, w);
 
     try w.writeAll("}");
     return out.toOwnedSlice();
@@ -198,25 +198,38 @@ fn writeToolDefinitions(defs: []const types.ToolDefinition, w: anytype) !void {
     try w.writeAll("]");
 }
 
-fn writeMessages(msgs: []const types.Message, w: anytype) !void {
+fn writeMessages(model: []const u8, msgs: []const types.Message, w: anytype) !void {
     try w.writeAll("\"messages\":[");
     for (msgs, 0..) |msg, i| {
         if (i > 0) try w.writeAll(",");
-        try writeMessage(msg, w);
+        try writeMessage(model, msg, w);
     }
     try w.writeAll("]");
 }
 
-fn writeMessage(msg: types.Message, w: anytype) !void {
+fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
     const role = switch (msg.role) {
         .user => "user",
         .assistant => "assistant",
     };
 
+    // Anthropic rejects thinking/redacted_thinking blocks on models that don't
+    // support extended thinking, so strip them when replaying history to a
+    // pre-thinking Claude. Thinking-capable models require the blocks to be
+    // echoed back verbatim (with their signatures) to preserve reasoning
+    // continuity across turns.
+    const emit_thinking = llm.supportsExtendedThinking(model);
+
     try w.print("{{\"role\":\"{s}\",\"content\":[", .{role});
 
-    for (msg.content, 0..) |block, i| {
-        if (i > 0) try w.writeAll(",");
+    var first = true;
+    for (msg.content) |block| {
+        switch (block) {
+            .thinking, .redacted_thinking => if (!emit_thinking) continue,
+            else => {},
+        }
+        if (!first) try w.writeAll(",");
+        first = false;
         switch (block) {
             .text => |t| {
                 try w.writeAll("{\"type\":\"text\",\"text\":");
@@ -236,7 +249,18 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
                 try std.json.Stringify.value(tr.content, .{}, w);
                 try w.writeAll("}");
             },
-            .thinking, .redacted_thinking => {}, // Task 1.6 replaces with real thinking-block serialization
+            .thinking => |th| {
+                try w.writeAll("{\"type\":\"thinking\",\"thinking\":");
+                try std.json.Stringify.value(th.text, .{}, w);
+                try w.writeAll(",\"signature\":");
+                try std.json.Stringify.value(th.signature orelse "", .{}, w);
+                try w.writeAll("}");
+            },
+            .redacted_thinking => |r| {
+                try w.writeAll("{\"type\":\"redacted_thinking\",\"data\":");
+                try std.json.Stringify.value(r.data, .{}, w);
+                try w.writeAll("}");
+            },
         }
     }
 
@@ -1426,7 +1450,7 @@ test "anthropic writeMessage serializes tool_use content block" {
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -1457,7 +1481,7 @@ test "anthropic writeMessage serializes tool_result with is_error" {
     const msg = types.Message{ .role = .user, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -1466,4 +1490,146 @@ test "anthropic writeMessage serializes tool_result with is_error" {
 
     const block = parsed.value.object.get("content").?.array.items[0].object;
     try testing.expect(block.get("is_error").?.bool);
+}
+
+test "anthropic writeMessage serializes thinking block on thinking-capable model" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "Let me think about this problem.",
+        .signature = "sig-abc-123",
+        .provider = .anthropic,
+    } };
+    content[1] = .{ .text = .{ .text = "Here is the answer." } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const blocks = parsed.value.object.get("content").?.array;
+    try testing.expectEqual(@as(usize, 2), blocks.items.len);
+
+    const first = blocks.items[0].object;
+    try testing.expectEqualStrings("thinking", first.get("type").?.string);
+    try testing.expectEqualStrings("Let me think about this problem.", first.get("thinking").?.string);
+    try testing.expectEqualStrings("sig-abc-123", first.get("signature").?.string);
+
+    const second = blocks.items[1].object;
+    try testing.expectEqualStrings("text", second.get("type").?.string);
+}
+
+test "anthropic writeMessage emits empty signature when thinking has none" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "reasoning",
+        .signature = null,
+        .provider = .anthropic,
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const first = parsed.value.object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("", first.get("signature").?.string);
+}
+
+test "anthropic writeMessage serializes redacted_thinking block" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .redacted_thinking = .{ .data = "opaque-ciphertext-xyz" } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-opus-4-20250514", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const first = parsed.value.object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("redacted_thinking", first.get("type").?.string);
+    try testing.expectEqualStrings("opaque-ciphertext-xyz", first.get("data").?.string);
+}
+
+test "anthropic writeMessage strips thinking blocks on pre-thinking Claude" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 3);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "hidden reasoning",
+        .signature = "sig",
+        .provider = .anthropic,
+    } };
+    content[1] = .{ .redacted_thinking = .{ .data = "cipher" } };
+    content[2] = .{ .text = .{ .text = "visible answer" } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-3-5-sonnet-20241022", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const blocks = parsed.value.object.get("content").?.array;
+    try testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try testing.expectEqualStrings("text", blocks.items[0].object.get("type").?.string);
+    try testing.expectEqualStrings("visible answer", blocks.items[0].object.get("text").?.string);
+}
+
+test "anthropic writeMessage escapes thinking text with special characters" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "line1\nline2 \"quoted\" \\ backslash",
+        .signature = "sig\"with\"quotes",
+        .provider = .anthropic,
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    // Round-trip through JSON parser to confirm escaping is correct.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const first = parsed.value.object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("line1\nline2 \"quoted\" \\ backslash", first.get("thinking").?.string);
+    try testing.expectEqualStrings("sig\"with\"quotes", first.get("signature").?.string);
 }
