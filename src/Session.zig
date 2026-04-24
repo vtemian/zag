@@ -361,7 +361,12 @@ pub const SessionHandle = struct {
         };
 
         var write_scratch: [256]u8 = undefined;
-        var w = self.file.writer(&write_scratch);
+        // std.fs.File.writer defaults to positional mode starting at pos=0,
+        // so every appendEntry would pwrite from byte 0 and clobber prior
+        // rows. writerStreaming uses the file's own cursor, which createFile
+        // leaves at 0 and loadSession advances via seekFromEnd(0), so writes
+        // always land at the current tail.
+        var w = self.file.writerStreaming(&write_scratch);
         w.interface.writeAll(json) catch |e| {
             log.err("failed to write entry: {}", .{e});
             return e;
@@ -1174,6 +1179,56 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
     const loaded = try readMetaFile(meta_path, allocator);
     try std.testing.expectEqualStrings(id, loaded.idSlice());
     try std.testing.expectEqual(@as(u32, 1), loaded.message_count);
+}
+
+fn restoreCwd(abs_path: []const u8) void {
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
+    defer dir.close();
+    dir.setAsCwd() catch {};
+}
+
+test "appendEntry appends without clobbering previous rows" {
+    // Regression test for a positional-writer bug: std.fs.File.writer
+    // defaults to positional mode starting at pos=0, so each appendEntry
+    // was pwrite'ing from byte 0 and overwriting prior rows. Exercise
+    // three appends through the real public API and confirm all three
+    // rows survive a round-trip through loadEntries.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // SessionManager and loadEntries both use std.fs.cwd(); chdir into
+    // the tmp dir so .zag/sessions resolves under it, then restore cwd
+    // on exit.
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("anthropic/claude-sonnet-4-20250514");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    try handle.appendEntry(.{ .entry_type = .user_message, .content = "first", .timestamp = 1 });
+    try handle.appendEntry(.{ .entry_type = .user_message, .content = "second", .timestamp = 2 });
+    try handle.appendEntry(.{ .entry_type = .user_message, .content = "third", .timestamp = 3 });
+    handle.close();
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // createSession writes a session_start entry, then the three user
+    // messages above, so we expect four rows total.
+    try std.testing.expectEqual(@as(usize, 4), loaded.len);
+    try std.testing.expectEqual(EntryType.session_start, loaded[0].entry_type);
+    try std.testing.expectEqualStrings("first", loaded[1].content);
+    try std.testing.expectEqualStrings("second", loaded[2].content);
+    try std.testing.expectEqualStrings("third", loaded[3].content);
 }
 
 test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
