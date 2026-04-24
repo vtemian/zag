@@ -523,6 +523,8 @@ pub const LuaEngine = struct {
         lua.newTable(); // [zag_table, prompt_table]
         lua.pushFunction(zlua.wrap(zagPromptLayerFn));
         lua.setField(-2, "layer");
+        lua.pushFunction(zlua.wrap(zagPromptForModelFn));
+        lua.setField(-2, "for_model");
         lua.setField(-2, "prompt"); // zag.prompt = prompt_table; [zag_table]
 
         // zag.buffer; buffer primitives for Lua plugins. Each binding
@@ -4450,6 +4452,251 @@ pub const LuaEngine = struct {
             return null;
         };
         return try alloc.dupe(u8, out);
+    }
+
+    /// Zig function backing `zag.prompt.for_model(pattern, text_or_fn)`.
+    ///
+    /// Shorthand for a stable-class layer whose render hook checks the
+    /// current `ctx.model_id` against `pattern` before emitting anything.
+    /// Pattern matching is plain substring when `pattern` contains no
+    /// Lua magic characters (detected as the `%` escape), else it is
+    /// routed through `string.match` so full Lua pattern syntax works.
+    ///
+    /// Args:
+    /// - arg 1 (string, required): model-id pattern.
+    /// - arg 2 (string|function, required): either a literal system-prompt
+    ///   snippet or a `function(ctx) -> string|nil` called on a match.
+    ///
+    /// The layer is registered with `priority = 0` (runs before built-in
+    /// identity at 5) and `cache_class = .stable` so matched output lands
+    /// in the cache-friendly prefix. Per-match storage lives in a Lua
+    /// table ref `{pattern, body, has_pct}`; garbage collection anchors
+    /// the `body` function (or string) to the table for us.
+    fn zagPromptForModelFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        // arg 1: pattern string.
+        if (lua.typeOf(1) != .string) {
+            lua.raiseErrorStr("zag.prompt.for_model: arg 1 must be a string pattern", .{});
+        }
+        const pattern_raw = lua.toString(1) catch {
+            lua.raiseErrorStr("zag.prompt.for_model: arg 1 could not be read", .{});
+        };
+        if (pattern_raw.len == 0) {
+            lua.raiseErrorStr("zag.prompt.for_model: pattern must not be empty", .{});
+        }
+
+        // arg 2: string body or function body.
+        const body_type = lua.typeOf(2);
+        if (body_type != .string and body_type != .function) {
+            lua.raiseErrorStr(
+                "zag.prompt.for_model: arg 2 must be a string or function",
+                .{},
+            );
+        }
+
+        // Detect Lua pattern magic. Any `%` means the caller wants
+        // Lua-pattern semantics; otherwise take the cheap substring
+        // path that needs no Lua round-trip per render.
+        const has_pct = std.mem.indexOfScalar(u8, pattern_raw, '%') != null;
+
+        // Build the side-table that holds the captured state. The table
+        // becomes the layer's `lua_ref`; `renderLuaForModelLayer` unpacks
+        // its fields on every render.
+        lua.newTable();
+        _ = lua.pushString(pattern_raw);
+        lua.setField(-2, "pattern");
+        lua.pushBoolean(has_pct);
+        lua.setField(-2, "has_pct");
+        lua.pushValue(2); // duplicate body (string or function) onto top
+        lua.setField(-2, "body");
+
+        const table_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr("zag.prompt.for_model: failed to ref state table", .{});
+        };
+
+        // Synthesize a stable name so diagnostics can tell these apart
+        // from plain `zag.prompt.layer` entries. The dupe is tracked by
+        // `prompt_layer_names` for deinit symmetry with other Lua layers.
+        var name_buf: [512]u8 = undefined;
+        const synth_name = std.fmt.bufPrint(
+            &name_buf,
+            "lua.for_model:{s}",
+            .{pattern_raw},
+        ) catch blk: {
+            // Pattern longer than 512 - name_prefix: fall back to a
+            // fixed label rather than raising. Names do not affect
+            // rendering, only logs.
+            break :blk "lua.for_model:<long-pattern>";
+        };
+        const name_owned = engine.allocator.dupe(u8, synth_name) catch {
+            lua.unref(zlua.registry_index, table_ref);
+            lua.raiseErrorStr("zag.prompt.for_model: out of memory duping name", .{});
+        };
+
+        engine.prompt_layer_names.append(engine.allocator, name_owned) catch {
+            engine.allocator.free(name_owned);
+            lua.unref(zlua.registry_index, table_ref);
+            lua.raiseErrorStr("zag.prompt.for_model: out of memory tracking layer name", .{});
+        };
+
+        engine.prompt_registry.add(engine.allocator, .{
+            .name = name_owned,
+            .priority = 0,
+            .cache_class = .stable,
+            .source = .lua,
+            .render_fn = renderLuaForModelLayer,
+            .lua_ref = table_ref,
+        }) catch |err| {
+            _ = engine.prompt_layer_names.pop();
+            engine.allocator.free(name_owned);
+            lua.unref(zlua.registry_index, table_ref);
+            switch (err) {
+                error.StableFrozen => lua.raiseErrorStr(
+                    "zag.prompt.for_model: cannot register after the first render",
+                    .{},
+                ),
+                error.OutOfMemory => lua.raiseErrorStr(
+                    "zag.prompt.for_model: out of memory appending layer",
+                    .{},
+                ),
+            }
+        };
+
+        return 0;
+    }
+
+    /// Render thunk for layers registered via `zag.prompt.for_model`.
+    /// Unpacks the side-table ref stashed on the layer, evaluates the
+    /// pattern against `ctx.model_id`, and returns the body's text on
+    /// a match. A render-time match (not a registration-time one) keeps
+    /// packs portable across model switches made via `zag.current_model`.
+    fn renderLuaForModelLayer(ctx: *const prompt.LayerContext, alloc: Allocator) anyerror!?[]const u8 {
+        const engine = active_render_engine orelse {
+            log.warn("prompt for_model render: no active engine bound", .{});
+            return null;
+        };
+        const layer = active_render_layer orelse {
+            log.warn("prompt for_model render: no active layer bound", .{});
+            return null;
+        };
+        const table_ref = layer.lua_ref orelse {
+            log.warn("prompt for_model render: layer '{s}' missing lua_ref", .{layer.name});
+            return null;
+        };
+
+        const lua = engine.lua;
+
+        // Fetch the side-table onto the stack once; both pattern and body
+        // are reached via getField on this value.
+        _ = lua.rawGetIndex(zlua.registry_index, table_ref);
+        if (!lua.isTable(-1)) {
+            lua.pop(1);
+            log.warn("prompt for_model '{s}': ref is not a table", .{layer.name});
+            return null;
+        }
+        defer lua.pop(1);
+
+        // pattern (string).
+        _ = lua.getField(-1, "pattern");
+        if (lua.typeOf(-1) != .string) {
+            lua.pop(1);
+            log.warn("prompt for_model '{s}': pattern field missing", .{layer.name});
+            return null;
+        }
+        const pattern = lua.toString(-1) catch {
+            lua.pop(1);
+            log.warn("prompt for_model '{s}': pattern not readable", .{layer.name});
+            return null;
+        };
+        lua.pop(1);
+
+        // has_pct (bool).
+        _ = lua.getField(-1, "has_pct");
+        const has_pct = lua.toBoolean(-1);
+        lua.pop(1);
+
+        // Match against the concrete model_id (not the joined
+        // provider/model_id). Callers pattern on model id because the
+        // provider is carried separately in most packs.
+        const model_id = ctx.model.model_id;
+
+        const matched = if (has_pct)
+            try luaPatternMatch(lua, model_id, pattern)
+        else
+            std.mem.indexOf(u8, model_id, pattern) != null;
+
+        if (!matched) return null;
+
+        // body (string | function). Each arm owns the pop of the value
+        // it pushed onto the stack. `protectedCall` replaces the function
+        // slot with its result, so the function arm pops once for both.
+        _ = lua.getField(-1, "body");
+
+        switch (lua.typeOf(-1)) {
+            .string => {
+                defer lua.pop(1);
+                const text = lua.toString(-1) catch {
+                    log.warn("prompt for_model '{s}': body string not readable", .{layer.name});
+                    return null;
+                };
+                return try alloc.dupe(u8, text);
+            },
+            .function => {
+                pushLayerContextTable(lua, ctx);
+                lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+                    const err_msg = lua.toString(-1) catch "<unprintable>";
+                    log.warn("prompt for_model '{s}' raised: {s}", .{ layer.name, err_msg });
+                    lua.pop(1);
+                    return null;
+                };
+                defer lua.pop(1);
+
+                if (lua.isNil(-1)) return null;
+                if (lua.typeOf(-1) != .string) {
+                    log.warn(
+                        "prompt for_model '{s}' returned non-string (type {s})",
+                        .{ layer.name, @tagName(lua.typeOf(-1)) },
+                    );
+                    return null;
+                }
+                const out = lua.toString(-1) catch {
+                    log.warn("prompt for_model '{s}' return value not readable", .{layer.name});
+                    return null;
+                };
+                return try alloc.dupe(u8, out);
+            },
+            else => {
+                defer lua.pop(1);
+                log.warn(
+                    "prompt for_model '{s}': body has unexpected type {s}",
+                    .{ layer.name, @tagName(lua.typeOf(-1)) },
+                );
+                return null;
+            },
+        }
+    }
+
+    /// Evaluate `string.match(subject, pattern)` and return whether it
+    /// produced at least one non-nil capture. Leaves the stack as it
+    /// found it. Any failure (missing stdlib, match error) is logged
+    /// and treated as "no match" so a bad pattern cannot take down the
+    /// prompt assembly.
+    fn luaPatternMatch(lua: *Lua, subject: []const u8, pattern: []const u8) !bool {
+        const top = lua.getTop();
+        defer lua.setTop(top);
+
+        if (lua.getGlobal("string") catch .nil != .table) return false;
+        _ = lua.getField(-1, "match");
+        if (!lua.isFunction(-1)) return false;
+        _ = lua.pushString(subject);
+        _ = lua.pushString(pattern);
+        lua.protectedCall(.{ .args = 2, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("prompt for_model: string.match error: {s}", .{err_msg});
+            return false;
+        };
+        return !lua.isNil(-1);
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -9662,6 +9909,178 @@ test "zag.prompt.layer engine deinit frees lua refs and names" {
     );
 
     // Built-ins 4 + Lua 3 = 7.
+    try std.testing.expectEqual(@as(usize, 7), engine.prompt_registry.layers.items.len);
+
+    engine.deinit();
+}
+
+test "zag.prompt.for_model substring pattern matches model id" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.for_model("claude", "You are Claude.")
+    );
+
+    var ctx = fakePromptLayerContext();
+    // fakePromptLayerContext model_id is "claude-sonnet-4-5"; matches.
+    {
+        var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+        defer assembled.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, assembled.stable, "You are Claude.") != null);
+    }
+
+    // Swap to a non-Claude model; the layer must stay silent.
+    ctx.model = .{ .provider_name = "openai", .model_id = "gpt-5-codex" };
+    {
+        var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+        defer assembled.deinit();
+        try std.testing.expectEqual(
+            @as(?usize, null),
+            std.mem.indexOf(u8, assembled.stable, "You are Claude."),
+        );
+    }
+}
+
+test "zag.prompt.for_model function body receives ctx on match" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.for_model("gpt-5", function(ctx)
+        \\  return "codex-pack:" .. ctx.model_id
+        \\end)
+    );
+
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "openai", .model_id = "gpt-5-codex" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.stable, "codex-pack:gpt-5-codex") != null);
+}
+
+test "zag.prompt.for_model lua pattern with %% magic engages string.match" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // `%d+` requires Lua-pattern evaluation; a pure substring match
+    // would never fire. A successful match proves the %-branch runs.
+    try engine.lua.doString(
+        \\zag.prompt.for_model("sonnet%-%d+", "MATCH")
+    );
+
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "anthropic", .model_id = "claude-sonnet-4-5" };
+    {
+        var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+        defer assembled.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, assembled.stable, "MATCH") != null);
+    }
+
+    ctx.model = .{ .provider_name = "openai", .model_id = "gpt-5-codex" };
+    {
+        var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+        defer assembled.deinit();
+        try std.testing.expectEqual(
+            @as(?usize, null),
+            std.mem.indexOf(u8, assembled.stable, "MATCH"),
+        );
+    }
+}
+
+test "zag.prompt.for_model lands body in the stable half" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.for_model("claude", "PACK-PREFIX")
+    );
+
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, assembled.stable, "PACK-PREFIX") != null);
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.@"volatile", "PACK-PREFIX"),
+    );
+}
+
+test "zag.prompt.for_model function returning nil contributes nothing" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.for_model("claude", function(_) return nil end)
+    );
+
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    // Built-ins still present; nothing extra in the stable half beyond
+    // the known identity/tool/skills sequence.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "for_model"),
+    );
+}
+
+test "zag.prompt.for_model rejects wrong argument types" {
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Missing body.
+    try engine.lua.doString(
+        \\_ok1, _err1 = pcall(zag.prompt.for_model, "claude")
+    );
+    _ = try engine.lua.getGlobal("_ok1");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    // Non-string pattern.
+    try engine.lua.doString(
+        \\_ok2, _err2 = pcall(zag.prompt.for_model, 42, "x")
+    );
+    _ = try engine.lua.getGlobal("_ok2");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    // Body is neither string nor function.
+    try engine.lua.doString(
+        \\_ok3, _err3 = pcall(zag.prompt.for_model, "claude", 42)
+    );
+    _ = try engine.lua.getGlobal("_ok3");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    // Built-ins only; no partial Lua layer appended.
+    try std.testing.expectEqual(@as(usize, 4), engine.prompt_registry.layers.items.len);
+}
+
+test "zag.prompt.for_model engine deinit frees table refs and names" {
+    // testing.allocator asserts no leaks on deinit; a missing unref
+    // or name free in the for_model path would fail here.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.for_model("claude", "text-body")
+        \\zag.prompt.for_model("gpt-5", function() return "fn-body" end)
+        \\zag.prompt.for_model("%d+", "pattern-body")
+    );
+
+    // Built-ins 4 + for_model 3 = 7.
     try std.testing.expectEqual(@as(usize, 7), engine.prompt_registry.layers.items.len);
 
     engine.deinit();
