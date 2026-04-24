@@ -221,7 +221,18 @@ fn writeInput(messages: []const types.Message, w: anytype) !void {
                     first = false;
                     try writeFunctionCallOutputItem(tr, w);
                 },
-                .thinking, .redacted_thinking => {}, // Task 1.7 wires Responses-API reasoning round-trip
+                .thinking => |t| {
+                    // Responses API reasoning items round-trip between tool
+                    // calls so the model's chain-of-thought stays coherent
+                    // across turns. Only `.openai_responses`-flavored
+                    // thinking blocks are re-sent; Anthropic-shaped thinking
+                    // would break the Codex schema.
+                    if (t.provider != .openai_responses) continue;
+                    if (!first) try w.writeAll(",");
+                    first = false;
+                    try writeReasoningItem(t, w);
+                },
+                .redacted_thinking => {},
             }
         }
     }
@@ -268,21 +279,49 @@ fn writeFunctionCallOutputItem(tr: types.ContentBlock.ToolResultBlock, w: anytyp
     try w.writeAll("}");
 }
 
+/// Emit a `{"type":"reasoning","id":"<rs_id>","summary":[],"encrypted_content":"..."}`
+/// item. Codex rejects the request when `store:false` is set without the
+/// encrypted blob round-tripping, and the `id` lets the server correlate the
+/// replayed item with the original. `summary` is sent empty: pi-mono and
+/// opencode both do this because the server already has the summary it sent
+/// us and doesn't need it echoed.
+fn writeReasoningItem(t: types.ContentBlock.Thinking, w: anytype) !void {
+    try w.writeAll("{\"type\":\"reasoning\"");
+    if (t.id) |id| {
+        try w.writeAll(",\"id\":");
+        try std.json.Stringify.value(id, .{}, w);
+    }
+    try w.writeAll(",\"summary\":[]");
+    if (t.signature) |enc| {
+        try w.writeAll(",\"encrypted_content\":");
+        try std.json.Stringify.value(enc, .{}, w);
+    }
+    try w.writeAll("}");
+}
+
 // -- SSE stream parsing ------------------------------------------------------
 
 /// One accumulating content block during Responses-API streaming.
 /// A `function_call` block aggregates argument bytes from
 /// `response.function_call_arguments.delta` (or the custom-tool variant) into
 /// `content`, keyed by `call_id` so concurrent tool calls in the same turn
-/// don't trample each other's buffers.
+/// don't trample each other's buffers. A `thinking` block aggregates
+/// `response.reasoning_summary_text.delta` (or the raw-text variant) and
+/// stashes the provider-issued `encrypted_content` blob that has to be
+/// round-tripped verbatim on the next request.
 pub const StreamingBlock = struct {
-    kind: enum { text, function_call },
-    /// Text body for text blocks, argument JSON for function_call blocks.
+    kind: enum { text, function_call, thinking },
+    /// Text body for text blocks, argument JSON for function_call blocks,
+    /// reasoning summary text for thinking blocks.
     content: std.ArrayList(u8),
-    /// Responses-API `call_id` for function_call blocks, `""` for text.
+    /// Responses-API `call_id` for function_call blocks, reasoning item id
+    /// (`rs_...`) for thinking blocks, `""` for text.
     call_id: []const u8,
-    /// Tool name for function_call blocks, `""` for text.
+    /// Tool name for function_call blocks, `""` otherwise.
     name: []const u8,
+    /// Opaque `encrypted_content` blob for thinking blocks, `""` otherwise.
+    /// Populated by `response.output_item.done` when the reasoning item closes.
+    encrypted_content: []const u8 = "",
 
     pub fn deinit(self: *StreamingBlock, allocator: Allocator) void {
         self.content.deinit(allocator);
@@ -291,6 +330,10 @@ pub const StreamingBlock = struct {
             .function_call => {
                 allocator.free(self.call_id);
                 allocator.free(self.name);
+            },
+            .thinking => {
+                allocator.free(self.call_id);
+                if (self.encrypted_content.len > 0) allocator.free(self.encrypted_content);
             },
         }
     }
@@ -351,6 +394,20 @@ pub fn dispatchEvent(
         std.mem.eql(u8, event_type, "response.custom_tool_call_input.delta"))
     {
         try handleFunctionCallArgsDelta(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
+        std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
+    {
+        // `reasoning_summary_text.delta` is the normal Codex path; the raw
+        // `reasoning_text.delta` variant appears on GPT-OSS when the summary
+        // layer is disabled. Both feed the same buffer.
+        try handleReasoningDelta(obj, emit);
+    } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.done") or
+        std.mem.eql(u8, event_type, "response.reasoning_summary_part.added") or
+        std.mem.eql(u8, event_type, "response.reasoning_summary_part.done"))
+    {
+        // Delta accumulation already covers the summary content; part
+        // boundaries don't matter for the UI.
+        log.debug("reasoning summary boundary '{s}' noop", .{event_type});
     } else if (std.mem.eql(u8, event_type, "response.completed")) {
         try handleCompleted(obj, emit);
     } else if (std.mem.eql(u8, event_type, "response.failed")) {
@@ -358,7 +415,7 @@ pub fn dispatchEvent(
     } else if (std.mem.eql(u8, event_type, "response.incomplete")) {
         try handleIncomplete(obj, emit);
     } else {
-        // Reasoning deltas, summary parts, unknown future events. Log and skip.
+        // Unknown future events. Log and skip.
         log.debug("ignoring SSE event type '{s}'", .{event_type});
     }
 }
@@ -401,6 +458,11 @@ fn handleOutputItemAdded(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 
     const item_type = item.get("type") orelse return;
     if (item_type != .string) return;
+
+    if (std.mem.eql(u8, item_type.string, "reasoning")) {
+        try handleReasoningItemAdded(item, emit);
+        return;
+    }
     if (!std.mem.eql(u8, item_type.string, "function_call")) return;
 
     const call_id_value = item.get("call_id") orelse return;
@@ -446,6 +508,11 @@ fn handleOutputItemDone(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 
     const item_type = item.get("type") orelse return;
     if (item_type != .string) return;
+
+    if (std.mem.eql(u8, item_type.string, "reasoning")) {
+        try handleReasoningItemDone(item, emit);
+        return;
+    }
     if (!std.mem.eql(u8, item_type.string, "function_call")) return;
 
     // If the server shipped the final arguments in one lump under
@@ -463,6 +530,152 @@ fn handleOutputItemDone(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
             try block.content.appendSlice(emit.allocator, args.string);
         }
     }
+}
+
+/// Handle `response.output_item.added` for a `reasoning` item. Seeds a new
+/// `thinking` StreamingBlock so later `.reasoning_summary_text.delta` events
+/// append to it and the `.done` frame can stash `encrypted_content`.
+fn handleReasoningItemAdded(item: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    // The `id` field is required by the Responses API for the round-trip;
+    // if the server omits it we still accept the item and fall back to an
+    // empty id (the follow-up request will then skip the id field).
+    const id_value = item.get("id");
+    const id_slice: []const u8 = if (id_value) |v|
+        if (v == .string) v.string else ""
+    else
+        "";
+
+    var block: StreamingBlock = .{
+        .kind = .thinking,
+        .content = .empty,
+        .call_id = try emit.allocator.dupe(u8, id_slice),
+        .name = "",
+    };
+    errdefer emit.allocator.free(block.call_id);
+    errdefer block.content.deinit(emit.allocator);
+
+    // Some Responses variants ship the summary content inline on the added
+    // frame; keep it if so. The subsequent delta events will extend it.
+    if (item.get("summary")) |s| {
+        if (s == .array) {
+            for (s.array.items) |part| {
+                if (part != .object) continue;
+                const text_value = part.object.get("text") orelse continue;
+                if (text_value != .string) continue;
+                try block.content.appendSlice(emit.allocator, text_value.string);
+            }
+        }
+    }
+
+    try emit.blocks.append(emit.allocator, block);
+}
+
+/// Handle `response.output_item.done` for a `reasoning` item. Copies the
+/// `encrypted_content` blob onto the matching thinking block so
+/// `parseSseStream` can attach it as the `signature` of the emitted
+/// `.thinking` ContentBlock; emits `thinking_stop` so the UI can flush.
+fn handleReasoningItemDone(item: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const id_value = item.get("id");
+    const id_slice: []const u8 = if (id_value) |v|
+        if (v == .string) v.string else ""
+    else
+        "";
+
+    const block = findThinkingBlock(emit.blocks, id_slice) orelse lastThinkingBlock(emit.blocks) orelse return;
+
+    if (item.get("encrypted_content")) |enc| {
+        if (enc == .string and enc.string.len > 0 and block.encrypted_content.len == 0) {
+            block.encrypted_content = try emit.allocator.dupe(u8, enc.string);
+        }
+    }
+
+    // If the added frame didn't carry the id but the done frame does, adopt
+    // it — it's the canonical identifier for the round-trip.
+    if (id_slice.len > 0 and block.call_id.len == 0) {
+        const owned = try emit.allocator.dupe(u8, id_slice);
+        emit.allocator.free(block.call_id);
+        block.call_id = owned;
+    }
+
+    // If delta events never fired (rare; summary may be empty), pull summary
+    // text from the done frame now so the saved block isn't a blank node.
+    if (block.content.items.len == 0) {
+        if (item.get("summary")) |s| {
+            if (s == .array) {
+                for (s.array.items) |part| {
+                    if (part != .object) continue;
+                    const text_value = part.object.get("text") orelse continue;
+                    if (text_value != .string) continue;
+                    try block.content.appendSlice(emit.allocator, text_value.string);
+                }
+            }
+        }
+    }
+
+    emit.callback.on_event(emit.callback.ctx, .thinking_stop);
+}
+
+fn handleReasoningDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
+    const delta_value = obj.get("delta") orelse return;
+    if (delta_value != .string) return;
+    const delta = delta_value.string;
+
+    // Prefer explicit `item_id` (Responses API's reasoning-delta key), fall
+    // back to the most recent thinking block. Codex emits `item_id`; the
+    // GPT-OSS raw-text path omits it.
+    const key: ?[]const u8 = blk: {
+        if (obj.get("item_id")) |v| {
+            if (v == .string) break :blk v.string;
+        }
+        break :blk null;
+    };
+
+    const block = if (key) |k|
+        findThinkingBlock(emit.blocks, k) orelse lastThinkingBlock(emit.blocks)
+    else
+        lastThinkingBlock(emit.blocks);
+
+    if (block) |b| {
+        try b.content.appendSlice(emit.allocator, delta);
+    } else {
+        // Summary fired before output_item.added landed; seed a block so we
+        // don't drop the content. Unusual but observed on GPT-OSS.
+        var seeded: StreamingBlock = .{
+            .kind = .thinking,
+            .content = .empty,
+            .call_id = try emit.allocator.dupe(u8, if (key) |k| k else ""),
+            .name = "",
+        };
+        errdefer emit.allocator.free(seeded.call_id);
+        errdefer seeded.content.deinit(emit.allocator);
+        try seeded.content.appendSlice(emit.allocator, delta);
+        try emit.blocks.append(emit.allocator, seeded);
+    }
+
+    emit.callback.on_event(emit.callback.ctx, .{ .thinking_delta = .{ .text = delta } });
+}
+
+fn findThinkingBlock(
+    blocks: *std.ArrayList(StreamingBlock),
+    id: []const u8,
+) ?*StreamingBlock {
+    if (id.len == 0) return null;
+    var i: usize = blocks.items.len;
+    while (i > 0) {
+        i -= 1;
+        const b = &blocks.items[i];
+        if (b.kind == .thinking and std.mem.eql(u8, b.call_id, id)) return b;
+    }
+    return null;
+}
+
+fn lastThinkingBlock(blocks: *std.ArrayList(StreamingBlock)) ?*StreamingBlock {
+    var i: usize = blocks.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (blocks.items[i].kind == .thinking) return &blocks.items[i];
+    }
+    return null;
 }
 
 fn handleFunctionCallArgsDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
@@ -659,6 +872,13 @@ pub fn parseSseStream(
         switch (b.kind) {
             .text => try builder.addText(b.content.items, allocator),
             .function_call => try builder.addToolUse(b.call_id, b.name, b.content.items, allocator),
+            .thinking => try builder.addThinkingWithId(
+                b.content.items,
+                if (b.encrypted_content.len > 0) b.encrypted_content else null,
+                if (b.call_id.len > 0) b.call_id else null,
+                .openai_responses,
+                allocator,
+            ),
         }
     }
 
@@ -858,7 +1078,7 @@ test "chatgpt: JSON escapes special characters in text" {
 /// Recorded StreamEvent for assertions. Owns its payload so the test body
 /// survives after the emitter's scratch JSON is freed.
 const RecordedEvent = struct {
-    kind: enum { text_delta, tool_start, info, done, err },
+    kind: enum { text_delta, tool_start, info, done, err, thinking_delta, thinking_stop },
     payload: []const u8,
 
     fn deinit(self: RecordedEvent, alloc: Allocator) void {
@@ -894,8 +1114,14 @@ const EventRecorder = struct {
                 .kind = .done,
                 .payload = self.allocator.dupe(u8, "") catch return,
             },
-            // Anthropic-only variants; chatgpt wire never produces these.
-            .thinking_delta, .thinking_stop => return,
+            .thinking_delta => |t| .{
+                .kind = .thinking_delta,
+                .payload = self.allocator.dupe(u8, t.text) catch return,
+            },
+            .thinking_stop => .{
+                .kind = .thinking_stop,
+                .payload = self.allocator.dupe(u8, "") catch return,
+            },
             .err => |t| .{
                 .kind = .err,
                 .payload = self.allocator.dupe(u8, t) catch return,
@@ -1089,7 +1315,6 @@ test "chatgpt SSE: unknown event types are ignored, not fatal" {
     defer fx.deinit(allocator);
 
     try fx.run(allocator, &.{
-        .{ .event_type = "response.reasoning_summary_text.delta", .data = "{\"delta\":\"thinking...\"}" },
         .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"answer\"}" },
         .{ .event_type = "response.mystery_event_v99", .data = "{\"foo\":1}" },
         .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_4\"}}" },
@@ -1196,6 +1421,248 @@ test "chatgpt SSE: custom_tool_call_input.delta accumulates like function_call" 
 
     try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
     try std.testing.expectEqualStrings("{\"q\":1}", fx.blocks.items[0].content.items);
+}
+
+// -- Reasoning round-trip tests ---------------------------------------------
+
+test "chatgpt SSE: reasoning_summary_text.delta surfaces as thinking_delta" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}",
+        },
+        .{
+            .event_type = "response.reasoning_summary_text.delta",
+            .data = "{\"item_id\":\"rs_1\",\"delta\":\"Let me \"}",
+        },
+        .{
+            .event_type = "response.reasoning_summary_text.delta",
+            .data = "{\"item_id\":\"rs_1\",\"delta\":\"think.\"}",
+        },
+        .{
+            .event_type = "response.output_item.done",
+            .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"ENC_BLOB\",\"summary\":[]}}",
+        },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"Answer.\"}" },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_t1\"}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), fx.blocks.items.len);
+    try std.testing.expectEqual(.thinking, fx.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("rs_1", fx.blocks.items[0].call_id);
+    try std.testing.expectEqualStrings("Let me think.", fx.blocks.items[0].content.items);
+    try std.testing.expectEqualStrings("ENC_BLOB", fx.blocks.items[0].encrypted_content);
+
+    try std.testing.expectEqual(.text, fx.blocks.items[1].kind);
+    try std.testing.expectEqualStrings("Answer.", fx.blocks.items[1].content.items);
+
+    // Callback sequence: two thinking_delta, a thinking_stop, then text_delta, then done.
+    const ev = fx.recorder.events.items;
+    try std.testing.expectEqual(@as(usize, 5), ev.len);
+    try std.testing.expectEqual(.thinking_delta, ev[0].kind);
+    try std.testing.expectEqualStrings("Let me ", ev[0].payload);
+    try std.testing.expectEqual(.thinking_delta, ev[1].kind);
+    try std.testing.expectEqualStrings("think.", ev[1].payload);
+    try std.testing.expectEqual(.thinking_stop, ev[2].kind);
+    try std.testing.expectEqual(.text_delta, ev[3].kind);
+    try std.testing.expectEqual(.done, ev[4].kind);
+}
+
+test "chatgpt SSE: reasoning_text.delta (GPT-OSS variant) lands on thinking block" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_2\"}}",
+        },
+        .{
+            .event_type = "response.reasoning_text.delta",
+            .data = "{\"item_id\":\"rs_2\",\"delta\":\"raw reasoning\"}",
+        },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_t2\"}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqual(.thinking, fx.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("raw reasoning", fx.blocks.items[0].content.items);
+}
+
+test "chatgpt SSE: reasoning item without matching id falls back to last thinking block" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    // Simulate a delta event that arrives without `item_id`; the dispatcher
+    // should still append it to the most recent thinking block.
+    try fx.run(allocator, &.{
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_3\"}}",
+        },
+        .{
+            .event_type = "response.reasoning_summary_text.delta",
+            .data = "{\"delta\":\"fallback\"}",
+        },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_t3\"}}" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fx.blocks.items.len);
+    try std.testing.expectEqualStrings("fallback", fx.blocks.items[0].content.items);
+}
+
+test "chatgpt SSE: thinking StreamingBlock assembles into ContentBlock via ResponseBuilder" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{
+            .event_type = "response.output_item.added",
+            .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_assm\"}}",
+        },
+        .{
+            .event_type = "response.reasoning_summary_text.delta",
+            .data = "{\"item_id\":\"rs_assm\",\"delta\":\"pondering\"}",
+        },
+        .{
+            .event_type = "response.output_item.done",
+            .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_assm\",\"encrypted_content\":\"BLOB42\",\"summary\":[]}}",
+        },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"Done.\"}" },
+        .{ .event_type = "response.completed", .data = "{\"response\":{\"id\":\"r_asm\"}}" },
+    });
+
+    // Mirror parseSseStream's assembly step so we verify ResponseBuilder
+    // attaches the thinking block as `.openai_responses` with id+signature.
+    var builder: llm.ResponseBuilder = .{};
+    errdefer builder.deinit(allocator);
+    for (fx.blocks.items) |*b| {
+        switch (b.kind) {
+            .text => try builder.addText(b.content.items, allocator),
+            .function_call => try builder.addToolUse(b.call_id, b.name, b.content.items, allocator),
+            .thinking => try builder.addThinkingWithId(
+                b.content.items,
+                if (b.encrypted_content.len > 0) b.encrypted_content else null,
+                if (b.call_id.len > 0) b.call_id else null,
+                .openai_responses,
+                allocator,
+            ),
+        }
+    }
+    const response = try builder.finish(fx.stop_reason, 0, 0, 0, 0, allocator);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), response.content.len);
+    switch (response.content[0]) {
+        .thinking => |t| {
+            try std.testing.expectEqualStrings("pondering", t.text);
+            try std.testing.expectEqualStrings("BLOB42", t.signature.?);
+            try std.testing.expectEqualStrings("rs_assm", t.id.?);
+            try std.testing.expectEqual(types.ContentBlock.ThinkingProvider.openai_responses, t.provider);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (response.content[1]) {
+        .text => |t| try std.testing.expectEqualStrings("Done.", t.text),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "chatgpt writeInput serializes openai_responses thinking as reasoning item" {
+    const allocator = std.testing.allocator;
+
+    const content = [_]types.ContentBlock{
+        .{ .thinking = .{
+            .text = "discarded on wire",
+            .signature = "ENC_BLOB_XYZ",
+            .provider = .openai_responses,
+            .id = "rs_round_trip",
+        } },
+        .{ .text = .{ .text = "here is the plan" } },
+    };
+    const messages = [_]types.Message{.{ .role = .assistant, .content = &content }};
+
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const input_items = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), input_items.len);
+
+    const reasoning_item = input_items[0].object;
+    try std.testing.expectEqualStrings("reasoning", reasoning_item.get("type").?.string);
+    try std.testing.expectEqualStrings("rs_round_trip", reasoning_item.get("id").?.string);
+    try std.testing.expectEqualStrings("ENC_BLOB_XYZ", reasoning_item.get("encrypted_content").?.string);
+    try std.testing.expectEqual(@as(usize, 0), reasoning_item.get("summary").?.array.items.len);
+
+    // Summary text on the block is not re-sent on the wire; the server
+    // already emitted it once and doesn't need it echoed.
+    const body_slice = body;
+    try std.testing.expect(std.mem.indexOf(u8, body_slice, "discarded on wire") == null);
+}
+
+test "chatgpt writeInput skips thinking blocks whose provider is not openai_responses" {
+    const allocator = std.testing.allocator;
+
+    // Anthropic-shaped thinking must not leak into a Codex request: the
+    // schema wouldn't accept a bare `thinking` item and there's no
+    // encrypted_content to round-trip.
+    const content = [_]types.ContentBlock{
+        .{ .thinking = .{
+            .text = "claude reasoning",
+            .signature = "anth_sig",
+            .provider = .anthropic,
+        } },
+        .{ .text = .{ .text = "visible answer" } },
+    };
+    const messages = [_]types.Message{.{ .role = .assistant, .content = &content }};
+
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const input_items = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input_items.len);
+    try std.testing.expectEqualStrings("message", input_items[0].object.get("type").?.string);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "anth_sig") == null);
+}
+
+test "chatgpt writeInput omits id and encrypted_content when thinking has neither" {
+    const allocator = std.testing.allocator;
+
+    const content = [_]types.ContentBlock{.{ .thinking = .{
+        .text = "",
+        .signature = null,
+        .provider = .openai_responses,
+        .id = null,
+    } }};
+    const messages = [_]types.Message{.{ .role = .assistant, .content = &content }};
+
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const input_items = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input_items.len);
+    const item = input_items[0].object;
+    try std.testing.expectEqualStrings("reasoning", item.get("type").?.string);
+    try std.testing.expect(item.get("id") == null);
+    try std.testing.expect(item.get("encrypted_content") == null);
+    try std.testing.expectEqual(@as(usize, 0), item.get("summary").?.array.items.len);
 }
 
 // -- End-to-end serializer tests --------------------------------------------
@@ -1327,8 +1794,8 @@ const RecordingCallback = struct {
             .info => |t| .{ .kind = .info, .payload = self.alloc.dupe(u8, t) catch return },
             .done => .{ .kind = .done, .payload = self.alloc.dupe(u8, "") catch return },
             .err => |t| .{ .kind = .err, .payload = self.alloc.dupe(u8, t) catch return },
-            // Anthropic-only variants; chatgpt wire never produces these.
-            .thinking_delta, .thinking_stop => return,
+            .thinking_delta => |t| .{ .kind = .thinking_delta, .payload = self.alloc.dupe(u8, t.text) catch return },
+            .thinking_stop => .{ .kind = .thinking_stop, .payload = self.alloc.dupe(u8, "") catch return },
         };
         self.events.append(self.alloc, tagged) catch {};
     }
