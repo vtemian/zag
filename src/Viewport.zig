@@ -1,10 +1,10 @@
 //! Pane-owned display-state bundle.
 //!
-//! Viewport collects the per-pane view state that used to live on
-//! ConversationBuffer: scroll offset, the dirty flag, the last tree
-//! generation the pane rendered, and a cached layout rect. Bundling
-//! these into one struct lets a Pane own its display state inline
-//! and lets a Buffer remain stateless about presentation. A Buffer
+//! Viewport collects the per-pane view state attached to a
+//! ConversationBuffer through `attachViewport`: scroll offset, the dirty
+//! flag, the last tree generation the pane rendered, and a cached layout
+//! rect. Bundling these into one struct lets a Pane own its display state
+//! inline and lets a Buffer remain stateless about presentation. A Buffer
 //! (e.g., ConversationBuffer) borrows a pointer to this struct and
 //! delegates its display-state vtable methods through it.
 

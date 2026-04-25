@@ -1721,10 +1721,10 @@ test "multiple splits maintain stable viewport pointers" {
     const pane1_attached_vp = wm.extra_panes.items[0].pane.view.?.viewport;
     try std.testing.expectEqual(pane1_storage, pane1_attached_vp);
 
-    // Second split may relocate `extra_panes.items`. Pre-fix this would
-    // dangle the first pane's viewport (it lived inline on Pane); the
-    // heap allocation keeps the first pane's vtable pointer valid and
-    // identical to the captured value.
+    // Second split may relocate `extra_panes.items`. Confirms the heap
+    // allocation keeps the first pane's vtable pointer valid even after
+    // extra_panes' items array reallocates on the second split, so the
+    // captured value still matches what the entry now holds.
     _ = try wm.createSplitPane();
     try std.testing.expectEqual(pane1_storage, wm.extra_panes.items[0].pane.view.?.viewport);
     try std.testing.expectEqual(pane1_storage, pane1_attached_vp);

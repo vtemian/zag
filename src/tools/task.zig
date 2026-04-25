@@ -4,17 +4,22 @@
 //! registered via `zag.subagent.register{...}`; `tools.registerTaskTool`
 //! gates registration on `SubagentRegistry.entries.items.len`.
 //!
-//! v1 simplifications (tracked as TODOs for a follow-up plan item):
+//! v1 simplifications:
 //!
-//!   * The child reuses the parent's `llm.Provider`. The subagent's
-//!     `model` field is honoured as a TODO once per-model provider
-//!     caching lands; for now the child's model matches the parent's.
+//!   * TODO(#4): per-subagent provider override; child currently inherits
+//!     the parent's provider regardless of `subagent.model`. Tracked at
+//!     https://github.com/vtemian/zag/issues/4.
 //!   * The child shares the parent's session handle. `task_start` and
 //!     `task_end` audit rows interleave with the parent's JSONL so a
 //!     single-file replay sees the delegation in order.
-//!   * Metrics captured in `task_end` are limited to the collected text
-//!     size. A richer shape (turn count, token totals) arrives once the
+//!   * TODO(#5): task_end token+turn metrics; metrics captured in
+//!     `task_end` are limited to the collected text size until the
 //!     child's token usage is threaded back through the Collector.
+//!     Tracked at https://github.com/vtemian/zag/issues/5.
+//!   * TODO(#6): forward child streaming events to the parent's sink so
+//!     the UI can render subagent progress live instead of only the
+//!     final tool_result. Tracked at
+//!     https://github.com/vtemian/zag/issues/6.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -60,7 +65,7 @@ fn warnAboutIgnoredModelOnce(registry: *const SubagentRegistry) void {
         "{d} registered subagent(s) declare a `model` frontmatter field, " ++
             "but the v1 task tool ignores it and uses the parent's provider. " ++
             "First example: '{s}'. Track follow-up at " ++
-            "https://github.com/vtemian/zag/issues (per-subagent providers).",
+            "https://github.com/vtemian/zag/issues/4 (per-subagent providers).",
         .{ ignored, first_name orelse "" },
     );
 }
@@ -374,7 +379,7 @@ fn handleChildEvent(
             defer allocator.free(text);
             // Persist as task_message so replay can reconstruct child
             // assistant text inline with the parent's JSONL.
-            child_history.persistEvent(.{
+            child_history.persistEventInternal(.{
                 .entry_type = .task_message,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
@@ -389,7 +394,7 @@ fn handleChildEvent(
         // sees only the final assistant text via the Collector.
         .thinking_delta => |text| {
             defer allocator.free(text);
-            child_history.persistEvent(.{
+            child_history.persistEventInternal(.{
                 .entry_type = .thinking,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
@@ -402,7 +407,7 @@ fn handleChildEvent(
                 if (ev.input_raw) |raw| allocator.free(raw);
                 if (ev.call_id) |id| allocator.free(id);
             }
-            child_history.persistEvent(.{
+            child_history.persistEventInternal(.{
                 .entry_type = .task_tool_use,
                 .tool_name = ev.name,
                 .tool_input = ev.input_raw orelse "",
@@ -414,7 +419,7 @@ fn handleChildEvent(
                 allocator.free(result.content);
                 if (result.call_id) |id| allocator.free(id);
             }
-            child_history.persistEvent(.{
+            child_history.persistEventInternal(.{
                 .entry_type = .task_tool_result,
                 .content = result.content,
                 .is_error = result.is_error,
@@ -428,7 +433,7 @@ fn handleChildEvent(
             // delegation are not silently dropped. Reuse `.err` since
             // there's no `task_err` variant; the parent_id chain places
             // the entry under the delegation scope.
-            child_history.persistEvent(.{
+            child_history.persistEventInternal(.{
                 .entry_type = .err,
                 .content = text,
                 .timestamp = std.time.milliTimestamp(),
@@ -790,18 +795,18 @@ test "child_history pre-seeded with task_start_id chains child events under the 
     child_history.attachSession(&handle);
     child_history.last_persisted_id = task_start_id;
 
-    try child_history.persistEvent(.{
+    try child_history.persistEventInternal(.{
         .entry_type = .task_message,
         .content = "hi",
         .timestamp = 101,
     });
-    try child_history.persistEvent(.{
+    try child_history.persistEventInternal(.{
         .entry_type = .task_tool_use,
         .tool_name = "read",
         .tool_input = "{}",
         .timestamp = 102,
     });
-    try child_history.persistEvent(.{
+    try child_history.persistEventInternal(.{
         .entry_type = .task_tool_result,
         .content = "ok",
         .timestamp = 103,
