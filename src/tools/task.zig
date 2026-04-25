@@ -688,7 +688,7 @@ test "task with stub provider returns collected text" {
     // integration tests in agent.zig; a focused rerun here would
     // duplicate their scaffolding. Skipping keeps the task-tool suite
     // fast while the full happy path is exercised end-to-end by the
-    // Task 9 smoke runs in docs/plans/2026-04-24-skills-and-subagents-plan.md.
+    // Task 9 smoke runs in docs/plans/archive/2026-04-24-skills-and-subagents-plan.md.
     return error.SkipZigTest;
 }
 
