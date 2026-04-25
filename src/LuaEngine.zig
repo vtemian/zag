@@ -12137,6 +12137,82 @@ test "qwen3-coder pack tool gate restricts to read/edit/bash/grep/glob" {
     try std.testing.expectEqualStrings("glob", subset[4]);
 }
 
+test "qwen3-coder dispatch end-to-end installs pack body and overrides via lazy require" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // The dispatcher is auto-loaded by the `zag.prompt` prefix, the
+    // default loop detector by the `zag.loop.*` prefix. The pack file
+    // itself is NOT eager-loaded: it must be pulled in by the
+    // dispatcher's lazy `require()` on first render with a matching
+    // model id. That lazy require is the seam this test exercises.
+    engine.loadBuiltinPlugins();
+
+    // Sanity: before any render fires the dispatcher, the qwen pack's
+    // top-level statements have not run yet, so the gate slot is empty
+    // and trim transforms are absent. The default loop detector is
+    // installed (via `zag.loop.default` auto-load), so the pre-render
+    // `loopDetectHandler` is non-null even before dispatch.
+    try std.testing.expect(engine.loopDetectHandler() != null);
+    try std.testing.expect(engine.toolGateHandler() == null);
+    try std.testing.expect(!engine.toolTransformHandlers().contains("grep"));
+    try std.testing.expect(!engine.toolTransformHandlers().contains("bash"));
+    const default_loop_ref = engine.loopDetectHandler().?;
+
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "ollama", .model_id = "qwen3-coder-30b" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, alloc);
+    defer assembled.deinit();
+
+    // 1. Pack body landed in the stable half. The identity line is
+    // unique to qwen3-coder.lua.
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "running with Qwen3-Coder") != null,
+    );
+
+    // 2. Loop detector handler was swapped by the pack (single global
+    // slot, last-write-wins). The ref id changes when zag.loop.detect
+    // re-registers, which is the observable signal the override fired.
+    try std.testing.expect(engine.loopDetectHandler() != null);
+    try std.testing.expect(engine.loopDetectHandler().? != default_loop_ref);
+
+    // 3. Tool gate now returns the qwen 5-name allowlist. Driving the
+    // gate through `handleToolGateRequest` exercises the same marshal
+    // path that `gateToolDefs` uses at runtime.
+    const tool_names = [_][]const u8{
+        "read", "write", "edit", "bash", "grep",
+        "glob", "fetch", "task",
+    };
+    var gate = agent_events.ToolGateRequest.init(
+        "ollama/qwen3-coder-30b",
+        &tool_names,
+        alloc,
+    );
+    defer gate.freeResult();
+    try engine.handleToolGateRequest(&gate);
+    try std.testing.expect(gate.error_name == null);
+    try std.testing.expect(gate.result != null);
+    const subset = gate.result.?;
+    try std.testing.expectEqual(@as(usize, 5), subset.len);
+    try std.testing.expectEqualStrings("read", subset[0]);
+    try std.testing.expectEqualStrings("edit", subset[1]);
+    try std.testing.expectEqualStrings("bash", subset[2]);
+    try std.testing.expectEqualStrings("grep", subset[3]);
+    try std.testing.expectEqualStrings("glob", subset[4]);
+
+    // 4. Both trim transforms registered as a side effect of the lazy
+    // require. The transform handler map is keyed by tool name; the
+    // rg_trim module registers under "grep" (the harness tool name)
+    // and bash_trim under "bash".
+    try std.testing.expect(engine.toolTransformHandlers().contains("grep"));
+    try std.testing.expect(engine.toolTransformHandlers().contains("bash"));
+}
+
 test "zag.prompt dispatch falls through to default pack for exotic providers" {
     if (sandbox_enabled) return error.SkipZigTest;
 
