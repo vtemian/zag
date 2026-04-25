@@ -22,6 +22,7 @@ const NodeRegistry = @import("NodeRegistry.zig");
 const subagents_mod = @import("subagents.zig");
 const frontmatter_mod = @import("frontmatter.zig");
 const prompt = @import("prompt.zig");
+const Instruction = @import("Instruction.zig");
 const WindowManager = @import("WindowManager.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
@@ -539,6 +540,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagPromptForModelFn));
         lua.setField(-2, "for_model");
         lua.setField(-2, "prompt"); // zag.prompt = prompt_table; [zag_table]
+
+        // zag.context; project-context lookups for prompt layers. The
+        // walk-up logic lives in `Instruction.zig`; this binding hands
+        // back a ready-to-render `{path, content}` table so a Lua layer
+        // can drop in without re-implementing filesystem traversal.
+        lua.newTable(); // [zag_table, context_table]
+        lua.pushFunction(zlua.wrap(zagContextFindUpFn));
+        lua.setField(-2, "find_up");
+        lua.setField(-2, "context"); // zag.context = context_table; [zag_table]
 
         // zag.buffer; buffer primitives for Lua plugins. Each binding
         // resolves a `"b<u32>"` handle string through the live
@@ -4708,6 +4718,130 @@ pub const LuaEngine = struct {
             return false;
         };
         return !lua.isNil(-1);
+    }
+
+    // -- zag.context ----------------------------------------------------------
+
+    /// Hard cap on how many filenames a single `find_up` call may probe.
+    /// The walk runs once per turn through every Lua prompt layer that
+    /// uses it; this guards against a config that accidentally hands in
+    /// hundreds of patterns and turns each render into a stat storm.
+    const find_up_max_names: usize = 16;
+
+    /// Zig function backing `zag.context.find_up(names, opts)`.
+    ///
+    /// Args:
+    /// - arg 1: filename to probe, or array of filenames in priority order.
+    ///   Strings only; numeric or non-string entries trigger a Lua error.
+    /// - arg 2: `{ from = "<absolute cwd>", to = "<absolute worktree>" }`.
+    ///   Both fields required; the walk stops at `to` (inclusive).
+    ///
+    /// Returns either `nil` (no match) or `{ path = "...", content = "..." }`.
+    /// Mirrors `Instruction.findUpWith` so all walk-up file lookups share
+    /// one implementation, including the 64 KiB content cap and the
+    /// silent-skip semantics for unreadable or oversized files.
+    fn zagContextFindUpFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        // Collect names. Accept either a single string or a sequence-style
+        // table of strings. Build a stack-bounded slice we hand to the
+        // Zig walk; everything in `names_buf` borrows Lua-side storage,
+        // valid for the duration of this call.
+        var names_buf: [find_up_max_names][]const u8 = undefined;
+        const names_count = collectFindUpNames(lua, 1, &names_buf);
+
+        // Options table: { from = ..., to = ... }.
+        if (!lua.isTable(2)) {
+            lua.raiseErrorStr("zag.context.find_up: arg 2 must be a table {from=..., to=...}", .{});
+        }
+
+        _ = lua.getField(2, "from");
+        if (lua.typeOf(-1) != .string) {
+            lua.raiseErrorStr("zag.context.find_up: opts.from must be a string", .{});
+        }
+        const from = lua.toString(-1) catch {
+            lua.raiseErrorStr("zag.context.find_up: opts.from could not be read", .{});
+        };
+        lua.pop(1);
+
+        _ = lua.getField(2, "to");
+        if (lua.typeOf(-1) != .string) {
+            lua.raiseErrorStr("zag.context.find_up: opts.to must be a string", .{});
+        }
+        const to = lua.toString(-1) catch {
+            lua.raiseErrorStr("zag.context.find_up: opts.to could not be read", .{});
+        };
+        lua.pop(1);
+
+        const names = names_buf[0..names_count];
+        const result = Instruction.findUpWith(from, to, names, engine.allocator) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(
+                &buf,
+                "zag.context.find_up: walk failed: {s}",
+                .{@errorName(err)},
+            ) catch "zag.context.find_up: walk failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+
+        const found = result orelse {
+            lua.pushNil();
+            return 1;
+        };
+        defer found.deinit(engine.allocator);
+
+        lua.newTable();
+        _ = lua.pushString(found.path);
+        lua.setField(-2, "path");
+        _ = lua.pushString(found.content);
+        lua.setField(-2, "content");
+        return 1;
+    }
+
+    /// Read the names argument for `zag.context.find_up`. Returns the count
+    /// of names written into `out`. Raises a Lua error on bad shape; the
+    /// caller never sees a partial fill.
+    fn collectFindUpNames(lua: *Lua, arg_index: i32, out: *[find_up_max_names][]const u8) usize {
+        const t = lua.typeOf(arg_index);
+        if (t == .string) {
+            const s = lua.toString(arg_index) catch {
+                lua.raiseErrorStr("zag.context.find_up: arg 1 could not be read", .{});
+            };
+            if (s.len == 0) {
+                lua.raiseErrorStr("zag.context.find_up: arg 1 must not be empty", .{});
+            }
+            out[0] = s;
+            return 1;
+        }
+        if (t != .table) {
+            lua.raiseErrorStr("zag.context.find_up: arg 1 must be a string or array of strings", .{});
+        }
+
+        const len_i64 = lua.rawLen(arg_index);
+        const len: usize = @intCast(len_i64);
+        if (len == 0) {
+            lua.raiseErrorStr("zag.context.find_up: arg 1 array must not be empty", .{});
+        }
+        if (len > find_up_max_names) {
+            lua.raiseErrorStr("zag.context.find_up: arg 1 has too many entries", .{});
+        }
+
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            _ = lua.rawGetIndex(arg_index, @intCast(i + 1));
+            if (lua.typeOf(-1) != .string) {
+                lua.raiseErrorStr("zag.context.find_up: arg 1 entries must be strings", .{});
+            }
+            const s = lua.toString(-1) catch {
+                lua.raiseErrorStr("zag.context.find_up: arg 1 entry could not be read", .{});
+            };
+            if (s.len == 0) {
+                lua.raiseErrorStr("zag.context.find_up: arg 1 entries must not be empty", .{});
+            }
+            out[i] = s;
+            lua.pop(1);
+        }
+        return len;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -10179,6 +10313,145 @@ test "zag.layers.env omits git line when is_git_repo is false" {
         @as(?usize, null),
         std.mem.indexOf(u8, assembled.@"volatile", "git: yes"),
     );
+}
+
+test "zag.context.find_up returns nil when no instruction file is present" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    _ = engine.lua.pushString(root);
+    engine.lua.setGlobal("_root");
+
+    try engine.lua.doString(
+        \\_found_is_nil = zag.context.find_up({"AGENTS.md", "CLAUDE.md", "CONTEXT.md"}, {
+        \\  from = _root,
+        \\  to = _root,
+        \\}) == nil
+    );
+
+    _ = try engine.lua.getGlobal("_found_is_nil");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.context.find_up surfaces AGENTS.md content from cwd" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "project guidance" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    _ = engine.lua.pushString(root);
+    engine.lua.setGlobal("_root");
+
+    try engine.lua.doString(
+        \\local f = zag.context.find_up({"AGENTS.md", "CLAUDE.md", "CONTEXT.md"}, {
+        \\  from = _root,
+        \\  to = _root,
+        \\})
+        \\_path = f.path
+        \\_content = f.content
+    );
+
+    _ = try engine.lua.getGlobal("_path");
+    const path = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.endsWith(u8, path, "AGENTS.md"));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_content");
+    try std.testing.expectEqualStrings("project guidance", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.context.find_up accepts a single string and walks up" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "ancestor body" });
+    try tmp.dir.makePath("nested/leaf");
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+    const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
+    defer std.testing.allocator.free(leaf);
+
+    _ = engine.lua.pushString(root);
+    engine.lua.setGlobal("_root");
+    _ = engine.lua.pushString(leaf);
+    engine.lua.setGlobal("_leaf");
+
+    try engine.lua.doString(
+        \\local f = zag.context.find_up("AGENTS.md", { from = _leaf, to = _root })
+        \\_content = f.content
+    );
+
+    _ = try engine.lua.getGlobal("_content");
+    try std.testing.expectEqualStrings("ancestor body", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.layers.agents_md renders nothing when no instruction file exists" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.layers.agents_md')");
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = root;
+    ctx.worktree = root;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.@"volatile", "<instructions"),
+    );
+}
+
+test "zag.layers.agents_md emits AGENTS.md content wrapped in <instructions>" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.layers.agents_md')");
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = root;
+    ctx.worktree = root;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    const tail = assembled.@"volatile";
+    try std.testing.expect(std.mem.indexOf(u8, tail, "<instructions from=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "Use TDD always.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "</instructions>") != null);
 }
 
 test "loadBuiltinPlugins eager-loads zag.layers.* entries" {
