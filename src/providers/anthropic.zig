@@ -66,12 +66,7 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking);
-        // PR 5 will switch this to emit the 2-element system array with
-        // cache_control on the stable half; for now we fold back to the
-        // single-string wire shape so tracing stays byte-identical.
-        const system_joined = try req.joinedSystem(req.allocator);
-        defer req.allocator.free(system_joined);
-        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, thinking, req.allocator);
+        const body = try buildRequestBody(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -97,9 +92,7 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking);
-        const system_joined = try req.joinedSystem(req.allocator);
-        defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, thinking, req.allocator);
+        const body = try buildStreamingRequestBody(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -113,35 +106,40 @@ pub const AnthropicSerializer = struct {
 };
 
 /// Serializes the system prompt, messages, and tool definitions into a JSON
-/// request body suitable for the Anthropic Messages API.
+/// request body suitable for the Anthropic Messages API. The `system_stable`
+/// half is marked with `cache_control: {type: "ephemeral"}` so Anthropic
+/// caches it across turns; `system_volatile` is appended uncached.
 pub fn buildRequestBody(
     model: []const u8,
-    system_prompt: []const u8,
+    system_stable: []const u8,
+    system_volatile: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
     thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, thinking, allocator);
+    return serializeRequest(model, system_stable, system_volatile, messages, tool_definitions, false, default_max_tokens, thinking, allocator);
 }
 
 /// Same as buildRequestBody but with "stream": true.
 pub fn buildStreamingRequestBody(
     model: []const u8,
-    system_prompt: []const u8,
+    system_stable: []const u8,
+    system_volatile: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
     thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, thinking, allocator);
+    return serializeRequest(model, system_stable, system_volatile, messages, tool_definitions, true, default_max_tokens, thinking, allocator);
 }
 
 /// Serializes a full Anthropic Messages API request into JSON.
 /// Caller owns the returned slice.
 fn serializeRequest(
     model: []const u8,
-    system_prompt: []const u8,
+    system_stable: []const u8,
+    system_volatile: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
@@ -160,9 +158,7 @@ fn serializeRequest(
 
     try writeThinking(thinking, w);
 
-    try w.writeAll("\"system\":");
-    try std.json.Stringify.value(system_prompt, .{}, w);
-    try w.writeAll(",");
+    try writeSystem(system_stable, system_volatile, w);
 
     try writeToolDefinitions(tool_definitions, w);
     try w.writeAll(",");
@@ -198,6 +194,36 @@ fn writeThinking(thinking: ?llm.ThinkingConfig, w: anytype) !void {
             try w.print("\"output_config\":{{\"effort\":\"{s}\"}},", .{effort});
         },
     }
+}
+
+/// Emit the `system` field as a JSON array of two text parts. The stable
+/// half carries `cache_control: {type: "ephemeral"}` so Anthropic caches it
+/// across turns; the volatile half is appended uncached. When the stable
+/// half is empty (rare — e.g., a Lua plugin that bypasses the prompt packs
+/// entirely), fall back to a plain string for back-compat: no cache_control,
+/// since there is nothing stable to anchor a cache hit on. When both halves
+/// are empty, emit nothing — the caller still has the trailing comma logic
+/// to think about, so the field is always followed by a comma when present.
+fn writeSystem(stable: []const u8, per_turn: []const u8, w: anytype) !void {
+    if (stable.len == 0 and per_turn.len == 0) return;
+
+    if (stable.len == 0) {
+        try w.writeAll("\"system\":");
+        try std.json.Stringify.value(per_turn, .{}, w);
+        try w.writeAll(",");
+        return;
+    }
+
+    try w.writeAll("\"system\":[");
+    try w.writeAll("{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.value(stable, .{}, w);
+    try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}}");
+    if (per_turn.len > 0) {
+        try w.writeAll(",{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(per_turn, .{}, w);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],");
 }
 
 fn writeToolDefinitions(defs: []const types.ToolDefinition, w: anytype) !void {
@@ -802,7 +828,7 @@ test "buildRequestBody produces valid JSON" {
     };
 
     const model = "claude-sonnet-4-20250514";
-    const body = try buildRequestBody(model, "You are a helper.", &messages, &tool_defs, null, allocator);
+    const body = try buildRequestBody(model, "You are a helper.", "", &messages, &tool_defs, null, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -833,7 +859,7 @@ test "buildRequestBody uses provided model string" {
     };
 
     const model = "claude-opus-4-20250514";
-    const body = try buildRequestBody(model, "system", &messages, &.{}, null, allocator);
+    const body = try buildRequestBody(model, "system", "", &messages, &.{}, null, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -848,7 +874,7 @@ test "buildStreamingRequestBody includes stream:true" {
 
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("claude-sonnet-4-20250514", "system", &messages, &.{}, null, allocator);
+    const body = try buildStreamingRequestBody("claude-sonnet-4-20250514", "system", "", &messages, &.{}, null, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1331,11 +1357,80 @@ test "processSseEvent captures redacted_thinking ciphertext inline" {
     try std.testing.expectEqualStrings("opaque-ciphertext", blocks.items[0].redacted_thinking.data.items);
 }
 
-test "anthropic body places system as top-level field" {
+test "anthropic body emits stable-only system as single-element array with cache_control" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
-    try testing.expect(std.mem.indexOf(u8, body, "\"system\":\"sys\"") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const system = parsed.value.object.get("system").?.array;
+    try testing.expectEqual(@as(usize, 1), system.items.len);
+    const part = system.items[0].object;
+    try testing.expectEqualStrings("text", part.get("type").?.string);
+    try testing.expectEqualStrings("sys", part.get("text").?.string);
+    const cache = part.get("cache_control").?.object;
+    try testing.expectEqualStrings("ephemeral", cache.get("type").?.string);
+}
+
+test "anthropic body emits 2-part system array when both halves are non-empty" {
+    const testing = std.testing;
+    const body = try serializeRequest(
+        "m",
+        "You are zag.",
+        "Today is 2026-04-22.",
+        &.{},
+        &.{},
+        false,
+        128,
+        null,
+        testing.allocator,
+    );
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const system = parsed.value.object.get("system").?.array;
+    try testing.expectEqual(@as(usize, 2), system.items.len);
+
+    const stable = system.items[0].object;
+    try testing.expectEqualStrings("text", stable.get("type").?.string);
+    try testing.expectEqualStrings("You are zag.", stable.get("text").?.string);
+    const cache = stable.get("cache_control").?.object;
+    try testing.expectEqualStrings("ephemeral", cache.get("type").?.string);
+
+    const volatile_part = system.items[1].object;
+    try testing.expectEqualStrings("text", volatile_part.get("type").?.string);
+    try testing.expectEqualStrings("Today is 2026-04-22.", volatile_part.get("text").?.string);
+    // Volatile half MUST NOT carry cache_control — cache anchors only on stable.
+    try testing.expect(volatile_part.get("cache_control") == null);
+}
+
+test "anthropic body falls back to plain string system when only volatile is set" {
+    const testing = std.testing;
+    const body = try serializeRequest("m", "", "ephemeral context", &.{}, &.{}, false, 128, null, testing.allocator);
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    // No stable half means nothing to anchor a cache hit on, so fall back to
+    // the plain-string form. This keeps the wire shape compatible with hand-
+    // rolled Lua plugins that bypass `zag.prompt` entirely.
+    const system = parsed.value.object.get("system").?;
+    try testing.expectEqualStrings("ephemeral context", system.string);
+}
+
+test "anthropic body omits system field entirely when both halves are empty" {
+    const testing = std.testing;
+    const body = try serializeRequest("m", "", "", &.{}, &.{}, false, 128, null, testing.allocator);
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("system") == null);
 }
 
 test "anthropic wraps tool as bare object" {
@@ -1344,7 +1439,7 @@ test "anthropic wraps tool as bare object" {
         .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &tool_defs, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"t\",") != null);
@@ -1354,7 +1449,7 @@ test "anthropic wraps tool as bare object" {
 
 test "anthropic emits empty tools array" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1365,14 +1460,14 @@ test "anthropic emits empty tools array" {
 
 test "streaming flag is included when requested" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, true, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, true, 128, null, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
 }
 
 test "serializeRequest omits thinking when null" {
     const testing = std.testing;
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, null, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
     try testing.expect(std.mem.indexOf(u8, body, "\"output_config\"") == null);
@@ -1381,7 +1476,7 @@ test "serializeRequest omits thinking when null" {
 test "serializeRequest omits thinking when .disabled" {
     const testing = std.testing;
     const cfg: ?llm.ThinkingConfig = .disabled;
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
 }
@@ -1389,7 +1484,7 @@ test "serializeRequest omits thinking when .disabled" {
 test "serializeRequest emits thinking with enabled budget" {
     const testing = std.testing;
     const cfg: ?llm.ThinkingConfig = .{ .enabled = .{ .budget_tokens = 4096 } };
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1404,7 +1499,7 @@ test "serializeRequest emits thinking with enabled budget" {
 test "serializeRequest emits adaptive thinking and sibling output_config" {
     const testing = std.testing;
     const cfg: ?llm.ThinkingConfig = .{ .adaptive = .{ .effort = .medium } };
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1647,36 +1742,31 @@ test "anthropic writeMessage escapes thinking text with special characters" {
     try testing.expectEqualStrings("sig\"with\"quotes", first.get("signature").?.string);
 }
 
-test "Request.joinedSystem matches single-string buildRequestBody byte-for-byte" {
-    // PR 5 will split the Anthropic system field into a 2-element array
-    // with cache_control on the stable half; until then a split Request
-    // must serialize identically to the legacy single-string shape so the
-    // on-wire bytes don't drift during the migration.
+test "buildRequestBody preserves cache_control ordering across stable and volatile halves" {
+    // The stable half MUST come first in the array — Anthropic's prompt
+    // cache requires the cached prefix to be a contiguous head of the
+    // request, so any reordering would silently bust the cache.
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const split_req = llm.Request{
-        .system_stable = "You are zag.",
-        .system_volatile = "Today is 2026-04-22.",
-        .messages = &messages,
-        .tool_definitions = &.{},
-        .allocator = allocator,
-    };
-    const joined_from_split = try split_req.joinedSystem(allocator);
-    defer allocator.free(joined_from_split);
-
-    const split_body = try buildRequestBody("claude-sonnet-4-20250514", joined_from_split, &messages, &.{}, null, allocator);
-    defer allocator.free(split_body);
-
-    const single_body = try buildRequestBody(
+    const body = try buildRequestBody(
         "claude-sonnet-4-20250514",
-        "You are zag.\n\nToday is 2026-04-22.",
+        "stable identity",
+        "per-turn context",
         &messages,
         &.{},
         null,
         allocator,
     );
-    defer allocator.free(single_body);
+    defer allocator.free(body);
 
-    try std.testing.expectEqualStrings(single_body, split_body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const system = parsed.value.object.get("system").?.array;
+    try std.testing.expectEqual(@as(usize, 2), system.items.len);
+    try std.testing.expectEqualStrings("stable identity", system.items[0].object.get("text").?.string);
+    try std.testing.expect(system.items[0].object.get("cache_control") != null);
+    try std.testing.expectEqualStrings("per-turn context", system.items[1].object.get("text").?.string);
+    try std.testing.expect(system.items[1].object.get("cache_control") == null);
 }
