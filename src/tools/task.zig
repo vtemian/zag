@@ -113,14 +113,19 @@ fn runChild(
     // Persist `task_start` with JSON-encoded inputs so replay tooling can
     // reconstruct what was delegated. Failure is logged but non-fatal; the
     // subagent still runs.
-    var start_payload_buf: [2048]u8 = undefined;
-    const start_payload = formatStartPayload(&start_payload_buf, sa.name, prompt) catch "{}";
     if (ctx.session_handle) |sh| {
-        _ = sh.appendEntry(.{
-            .entry_type = .task_start,
-            .content = start_payload,
-            .timestamp = std.time.milliTimestamp(),
-        }) catch |err| log.warn("task_start persist failed: {}", .{err});
+        const start_payload = formatStartPayload(allocator, sa.name, prompt) catch |err| blk: {
+            log.warn("task_start payload format failed: {}", .{err});
+            break :blk null;
+        };
+        if (start_payload) |payload| {
+            defer allocator.free(payload);
+            _ = sh.appendEntry(.{
+                .entry_type = .task_start,
+                .content = payload,
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |err| log.warn("task_start persist failed: {}", .{err});
+        }
     }
 
     // Inject the subagent's system prompt as a prefix on the first user
@@ -336,15 +341,21 @@ fn buildChildRegistry(
     return child;
 }
 
-fn formatStartPayload(buf: []u8, agent_name: []const u8, prompt: []const u8) ![]const u8 {
-    var stream = std.io.fixedBufferStream(buf);
-    const w = stream.writer();
+/// Allocate the `task_start` JSON payload. The previous implementation
+/// formatted into a 2 KiB stack buffer and silently fell back to `"{}"`
+/// on overflow, which collapsed any non-trivial subagent prompt to an
+/// empty audit row. The caller owns the returned slice and must free
+/// it with `allocator`.
+fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    const w = list.writer(allocator);
     try w.writeAll("{\"agent\":");
     try types.writeJsonString(w, agent_name);
     try w.writeAll(",\"prompt\":");
     try types.writeJsonString(w, prompt);
     try w.writeAll("}");
-    return stream.getWritten();
+    return list.toOwnedSlice(allocator);
 }
 
 fn formatUnknownAgent(
@@ -494,6 +505,32 @@ test "task with stub provider returns collected text" {
     // fast while the full happy path is exercised end-to-end by the
     // Task 9 smoke runs in docs/plans/2026-04-24-skills-and-subagents-plan.md.
     return error.SkipZigTest;
+}
+
+test "task_start payload survives prompts longer than 2KB" {
+    const allocator = testing.allocator;
+    var prompt_buf: [4096]u8 = undefined;
+    @memset(&prompt_buf, 'x');
+    const long_prompt = prompt_buf[0..];
+
+    const payload = try formatStartPayload(allocator, "reviewer", long_prompt);
+    defer allocator.free(payload);
+
+    try testing.expect(payload.len > 4000);
+    try testing.expect(std.mem.indexOf(u8, payload, "xxxxxxxxxxxxxxxxxxxxxxxx") != null);
+    try testing.expect(!std.mem.eql(u8, payload, "{}"));
+    try testing.expect(std.mem.indexOf(u8, payload, "\"agent\":\"reviewer\"") != null);
+}
+
+test "task_start payload escapes JSON special characters in prompt" {
+    const allocator = testing.allocator;
+
+    const payload = try formatStartPayload(allocator, "reviewer", "say \"hi\"\nnew\\line");
+    defer allocator.free(payload);
+
+    try testing.expect(std.mem.indexOf(u8, payload, "\\\"hi\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "\\n") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "\\\\line") != null);
 }
 
 test "task without bound context returns tool error" {
