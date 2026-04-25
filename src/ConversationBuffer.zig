@@ -330,6 +330,18 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             // as the parent's tool_result, so replaying them as separate
             // nodes would duplicate content in the buffer view.
             .task_start, .task_end => {},
+            // Inline subagent events. Render them with the same node
+            // types as their top-level counterparts so the user sees
+            // child activity in the transcript on replay. The
+            // `task_start` / `task_end` markers above still bracket the
+            // delegation in the JSONL stream.
+            .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
+            .task_tool_use => {
+                last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+            },
+            .task_tool_result => {
+                _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
+            },
             .thinking => {
                 const node = try self.appendNode(null, .thinking, entry.content);
                 // Replay has no streaming context; collapse so the

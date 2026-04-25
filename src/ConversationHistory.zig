@@ -165,7 +165,13 @@ pub fn rebuildMessages(self: *ConversationHistory, entries: []const Session.Entr
                     .data = duped_data,
                 } });
             },
-            .info, .err, .session_start, .session_rename, .task_start, .task_end => {},
+            // Subagent inline events (task_message / task_tool_use /
+            // task_tool_result) are NOT replayed into the parent's LLM
+            // history. The parent already saw the subagent's final text
+            // as the `task` tool's result, persisted as a regular
+            // tool_result. Replaying child events as parent-visible
+            // assistant content would double-count the delegation.
+            .info, .err, .session_start, .session_rename, .task_start, .task_end, .task_message, .task_tool_use, .task_tool_result => {},
         }
     }
 
