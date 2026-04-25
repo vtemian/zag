@@ -15,10 +15,11 @@ const png_decode = @import("../png_decode.zig");
 const GraphicsBuffer = @This();
 
 /// How the image is mapped into the pane's cell grid. `contain` preserves
-/// aspect ratio and letterboxes; `fill` stretches to fit; `actual` samples
-/// 1:1 against source pixels. Current renderer implements `contain` via
-/// the rasterizer's sampling; other modes reserved for later polish.
-pub const Fit = enum { contain, fill, actual };
+/// aspect ratio and letterboxes the unused axis with theme bg; `fill`
+/// stretches to fit; `actual` aligns 1 cell to 1 source-pixel-pair and
+/// crops anything that doesn't fit. Aliases `halfblock.Fit` so callers
+/// can use either symbol.
+pub const Fit = halfblock.Fit;
 
 allocator: Allocator,
 /// Unique identifier assigned by the BufferRegistry.
@@ -128,7 +129,7 @@ fn bufGetVisibleLines(
     if (cols == 0 or rows == 0) return out;
 
     const bg_pixel = themeBgAsPixel(theme);
-    const raster = try halfblock.rasterize(frame_alloc, image, cols, rows, bg_pixel);
+    const raster = try halfblock.rasterize(frame_alloc, image, cols, rows, bg_pixel, self.fit);
 
     const start = @min(skip, raster.len);
     const end = @min(start + max_lines, raster.len);
@@ -317,6 +318,60 @@ test "buf().getId round-trips the id" {
     defer gb.destroy();
     try std.testing.expectEqual(@as(u32, 99), gb.buf().getId());
     try std.testing.expectEqualStrings("img", gb.buf().getName());
+}
+
+test "setFit(.contain) letterboxes a 1x1 image inside a wide pane" {
+    const gpa = std.testing.allocator;
+    var gb = try GraphicsBuffer.create(gpa, 5, "img");
+    defer gb.destroy();
+
+    try gb.setPng(&tiny_red_png);
+    gb.setFit(.contain);
+    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 4, .height = 1 });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const theme = Theme.defaultTheme();
+    var lines = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
+    defer lines.deinit(arena);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    const spans = lines.items[0].spans;
+    try std.testing.expectEqual(@as(usize, 4), spans.len);
+    // Letterbox columns 0 and 3 are theme bg; image lives at cols 1 and 2.
+    const bg_pixel = themeBgAsPixel(&theme);
+    try std.testing.expectEqual(bg_pixel.r, spans[0].style.fg.?.rgb.r);
+    try std.testing.expectEqual(bg_pixel.r, spans[3].style.fg.?.rgb.r);
+    try std.testing.expectEqual(@as(u8, 255), spans[1].style.fg.?.rgb.r);
+    try std.testing.expectEqual(@as(u8, 255), spans[2].style.fg.?.rgb.r);
+}
+
+test "setFit(.fill) stretches the image across the full pane" {
+    const gpa = std.testing.allocator;
+    var gb = try GraphicsBuffer.create(gpa, 6, "img");
+    defer gb.destroy();
+
+    try gb.setPng(&tiny_red_png);
+    gb.setFit(.fill);
+    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 4, .height = 1 });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const theme = Theme.defaultTheme();
+    var lines = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
+    defer lines.deinit(arena);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    const spans = lines.items[0].spans;
+    try std.testing.expectEqual(@as(usize, 4), spans.len);
+    for (spans) |span| {
+        try std.testing.expectEqual(@as(u8, 255), span.style.fg.?.rgb.r);
+        try std.testing.expectEqual(@as(u8, 255), span.style.bg.?.rgb.r);
+    }
 }
 
 test {
