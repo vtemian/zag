@@ -13,7 +13,7 @@
 # provider, then exits zag via `/quit`. A future regression of the
 # contentLengthStream bug (or any other crash on the streaming-read
 # path) would either re-introduce a SIGABRT before `/quit` lands (the
-# harness writes crash.txt and `wait_exit` reaps the signal — exit 0
+# harness writes crash.txt and `wait_exit` reaps the signal; exit 0
 # still, but crash.txt is the tell), or the agent would never finish
 # the turn and `wait_exit` would time out instead of exiting cleanly.
 

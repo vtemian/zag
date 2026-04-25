@@ -119,7 +119,7 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
 fn printUsage(file: std.fs.File) void {
     const msg =
-        \\zag-sim — terminal scenario driver
+        \\zag-sim: terminal scenario driver
         \\
         \\usage:
         \\  zag-sim run <scenario.zsm> [--artifacts=<dir>] [--mock=<script.json>]
@@ -161,7 +161,7 @@ fn stderrFile() std.fs.File {
 //
 // The scenario-execution path is covered by inline tests in Scenario.zig.
 // These tests pin dispatchRun's arg-parsing behavior without spawning any
-// child process — subprocess lifecycle under Zig's test runner is fraught
+// child process. Subprocess lifecycle under Zig's test runner is fraught
 // (the test binary inherits fds the child inherits the PTY slave etc.), and
 // the actual e2e smoke is done manually via `zig build sim -- run <file>`.
 

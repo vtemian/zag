@@ -10,7 +10,7 @@ const Artifacts = @import("Artifacts.zig");
 const Runner = @import("Runner.zig");
 
 /// Cap individual recorded args at this length. Step args are user-supplied
-/// regex bodies / send literals — usually short, but a runaway scenario should
+/// regex bodies / send literals (usually short), but a runaway scenario should
 /// not blow up the summary file.
 const max_args_bytes: usize = 256;
 
@@ -18,12 +18,12 @@ pub const StepStatus = enum { pass, fail, skipped };
 
 pub const StepRecord = struct {
     line_no: u32,
-    /// `@tagName(verb)` — borrowed, points into the static error/tag table.
+    /// `@tagName(verb)`: borrowed, points into the static error/tag table.
     verb: []const u8,
     /// Owned copy of the raw argument text, truncated to 256 bytes.
     args: []const u8,
     status: StepStatus,
-    /// `@errorName(err)` — borrowed, static.
+    /// `@errorName(err)`: borrowed, static.
     error_name: ?[]const u8 = null,
     duration_ms: u32,
 };
@@ -35,7 +35,7 @@ artifacts: *Artifacts,
 steps: std.ArrayList(StepRecord),
 outcome: Runner.Outcome = .pass,
 failing_step_idx: ?usize = null,
-/// `@errorName` — borrowed, static. Set when a step fails.
+/// `@errorName`: borrowed, static. Set when a step fails.
 failing_error: ?[]const u8 = null,
 /// Optional scenario-file path, embedded in the JSON when set. `runFile`
 /// supplies it; `runSource` leaves it null.
@@ -103,7 +103,7 @@ pub fn flush(self: *Summary) !void {
 fn serialize(self: *Summary, duration_ms: i64) ![]u8 {
     // Hand-roll the JSON. The shape is small and using std.json.Stringify here
     // would force us to construct an intermediate `std.json.Value` tree just
-    // to emit it back out — net more code, more allocs, less clarity.
+    // to emit it back out: net more code, more allocs, less clarity.
     var w: std.ArrayList(u8) = .empty;
     defer w.deinit(self.alloc);
 

@@ -149,7 +149,7 @@ pub fn nextTurn(self: *MockScript) error{NoMoreTurns}!*const Turn {
     const idx = self.turn_index.fetchAdd(1, .acq_rel);
     if (idx >= self.turns.len) {
         // Keep the index bounded so repeated calls after exhaustion don't
-        // eventually wrap a `usize` — a purely defensive saturation.
+        // eventually wrap a `usize` (a purely defensive saturation).
         _ = self.turn_index.store(self.turns.len, .release);
         return error.NoMoreTurns;
     }

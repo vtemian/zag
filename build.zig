@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
     sim_e2e_step.dependOn(&e2e_segfault.step);
 
     // Canary: the harness can drive a clean chat turn end-to-end. If this
-    // fails, the harness is broken — fix it before trusting the segfault
+    // fails, the harness is broken; fix it before trusting the segfault
     // scenario.
     const e2e_canary = b.addRunArtifact(sim_exe);
     e2e_canary.addArgs(&.{

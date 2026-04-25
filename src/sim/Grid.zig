@@ -10,7 +10,7 @@ const Grid = @This();
 /// misinterpreted if the parser were recreated per call).
 ///
 /// The stream's handler holds a raw `*Terminal`, so the Grid itself must
-/// not be copied after init — we allocate it on the heap and return a
+/// not be copied after init. We allocate it on the heap and return a
 /// pointer via `create`.
 alloc: std.mem.Allocator,
 terminal: ghostty_vt.Terminal,
