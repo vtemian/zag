@@ -105,6 +105,11 @@ pub fn runLoopStreaming(
             try marshalPromptAssembly(&layer_ctx, allocator, queue, cancel);
         defer assembled.deinit();
 
+        // Fold queued reminders (next_turn drains, persistent re-fires)
+        // into the most recent top-level user message. No-op when no
+        // engine is wired in, because the queue lives on the engine.
+        if (lua_engine) |engine| try Harness.injectReminders(messages, &engine.reminders, allocator);
+
         const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, tool_defs, allocator, queue, cancel);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);

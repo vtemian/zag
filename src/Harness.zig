@@ -22,6 +22,7 @@
 const std = @import("std");
 const prompt = @import("prompt.zig");
 const types = @import("types.zig");
+const Reminder = @import("Reminder.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -177,6 +178,111 @@ pub fn assembleSystem(
     allocator: Allocator,
 ) !prompt.AssembledPrompt {
     return registry.render(ctx, allocator);
+}
+
+/// Drain the reminder queue and fold the entries into the most recent
+/// top-level user message. A "top-level user message" is a user-role
+/// message whose content is not made up entirely of tool_result blocks
+/// (tool_result messages are within-turn tool loop replies, not turn
+/// boundaries; reminders attach to the human-authored prompt).
+///
+/// When the queue has nothing to drain, or no top-level user message
+/// exists, `messages` is left untouched. Otherwise the relevant message
+/// is rewritten in place using `alloc`:
+///
+/// - If the message contains a single `.text` block, that block's text
+///   is replaced with `<system-reminder>\n<entries>\n</system-reminder>\n\n<original>`.
+///   The previous content slice and its strings are freed.
+/// - If the message has any other shape, a fresh `.text` block carrying
+///   the `<system-reminder>` body is prepended; existing blocks are
+///   moved into a longer slice and the old slice is freed (the block
+///   payload pointers are reused, so per-block strings are not freed).
+///
+/// `alloc` must be the same allocator that owns the message's content
+/// slice and string payloads, because we free them in place. In
+/// production this is the conversation-history allocator threaded
+/// through `runLoopStreaming`.
+///
+/// Persistent entries reappear on every drain; next-turn entries vanish
+/// after this call. See `Reminder.Queue.drainForTurn` for the queue
+/// semantics. The queue's mutex is taken for the duration of the drain
+/// so concurrent Lua pushes are serialized correctly.
+pub fn injectReminders(
+    messages: *std.ArrayList(types.Message),
+    queue: *Reminder.Queue,
+    alloc: Allocator,
+) !void {
+    const drained = try queue.drainForTurn(alloc);
+    defer Reminder.freeDrained(alloc, drained);
+    if (drained.len == 0) return;
+
+    const target = findLastTopLevelUserIndex(messages.items) orelse return;
+    const original = messages.items[target];
+
+    const block = try renderReminderBlock(drained, alloc);
+    defer alloc.free(block);
+
+    if (original.content.len == 1) {
+        switch (original.content[0]) {
+            .text => |t| {
+                const wrapped = try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ block, t.text });
+                errdefer alloc.free(wrapped);
+
+                const new_content = try alloc.alloc(types.ContentBlock, 1);
+                errdefer alloc.free(new_content);
+                new_content[0] = .{ .text = .{ .text = wrapped } };
+
+                original.deinit(alloc);
+                messages.items[target] = .{ .role = .user, .content = new_content };
+                return;
+            },
+            else => {},
+        }
+    }
+
+    // Mixed content (or single non-text block): prepend a new text block.
+    const reminder_text = try alloc.dupe(u8, block);
+    errdefer alloc.free(reminder_text);
+
+    const new_content = try alloc.alloc(types.ContentBlock, original.content.len + 1);
+    errdefer alloc.free(new_content);
+
+    new_content[0] = .{ .text = .{ .text = reminder_text } };
+    @memcpy(new_content[1..], original.content);
+
+    // Free only the outer slice; the per-block strings now live inside
+    // `new_content` and must outlast this call.
+    alloc.free(original.content);
+    messages.items[target] = .{ .role = .user, .content = new_content };
+}
+
+/// Format the drained reminder entries as a single `<system-reminder>`
+/// block. One entry per line, in drain (FIFO) order. The returned slice
+/// is owned by `alloc`.
+fn renderReminderBlock(entries: []const Reminder.Entry, alloc: Allocator) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(alloc);
+
+    try buffer.appendSlice(alloc, "<system-reminder>\n");
+    for (entries, 0..) |entry, i| {
+        if (i != 0) try buffer.append(alloc, '\n');
+        try buffer.appendSlice(alloc, entry.text);
+    }
+    try buffer.appendSlice(alloc, "\n</system-reminder>");
+    return buffer.toOwnedSlice(alloc);
+}
+
+/// Index of the most recent user message whose content is not a bare
+/// tool_result reply. Mirrors `findCurrentTurnStart` but returns null
+/// instead of falling back to position 0, because reminder injection
+/// must skip the call entirely when no human-authored prompt exists.
+fn findLastTopLevelUserIndex(items: []const types.Message) ?usize {
+    var i: usize = items.len;
+    while (i > 0) : (i -= 1) {
+        const msg = items[i - 1];
+        if (msg.role == .user and !isToolResultOnly(msg.content)) return i - 1;
+    }
+    return null;
 }
 
 // -- Tests ------------------------------------------------------------------
@@ -414,4 +520,167 @@ test "assembleSystem renders identity + tool_list into stable and guidelines int
         \\- Prefer editing over rewriting entire files
     ;
     try std.testing.expectEqualStrings(expected, joined);
+}
+
+/// Build a single user message owning a single text block. Caller frees
+/// via `Message.deinit(alloc)`. Used by reminder-injection tests so
+/// teardown can run the same path the agent loop uses.
+fn ownedUserText(alloc: Allocator, text: []const u8) !types.Message {
+    const blocks = try alloc.alloc(types.ContentBlock, 1);
+    errdefer alloc.free(blocks);
+    const duped = try alloc.dupe(u8, text);
+    errdefer alloc.free(duped);
+    blocks[0] = .{ .text = .{ .text = duped } };
+    return .{ .role = .user, .content = blocks };
+}
+
+test "injectReminders wraps a plain text user message" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+
+    try messages.append(alloc, try ownedUserText(alloc, "do the thing"));
+
+    var queue: Reminder.Queue = .{};
+    defer queue.deinit(alloc);
+    try queue.push(alloc, .{ .text = "remember the rules", .scope = .next_turn });
+    try queue.push(alloc, .{ .text = "stay concise", .scope = .next_turn });
+
+    try injectReminders(&messages, &queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), messages.items[0].content.len);
+    const expected =
+        \\<system-reminder>
+        \\remember the rules
+        \\stay concise
+        \\</system-reminder>
+        \\
+        \\do the thing
+    ;
+    try std.testing.expectEqualStrings(expected, messages.items[0].content[0].text.text);
+
+    // next_turn entries are gone after the drain.
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+}
+
+test "injectReminders is a no-op when the queue is empty" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+    try messages.append(alloc, try ownedUserText(alloc, "untouched"));
+
+    var queue: Reminder.Queue = .{};
+    defer queue.deinit(alloc);
+
+    try injectReminders(&messages, &queue, alloc);
+
+    try std.testing.expectEqualStrings("untouched", messages.items[0].content[0].text.text);
+}
+
+test "injectReminders preserves persistent entries across drains" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+    try messages.append(alloc, try ownedUserText(alloc, "first turn"));
+
+    var queue: Reminder.Queue = .{};
+    defer queue.deinit(alloc);
+    try queue.push(alloc, .{ .id = "p", .text = "sticky", .scope = .persistent });
+    try queue.push(alloc, .{ .text = "transient", .scope = .next_turn });
+
+    try injectReminders(&messages, &queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), queue.len());
+    const after_first = messages.items[0].content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, after_first, "sticky") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_first, "transient") != null);
+
+    // Second turn: only the persistent entry should fire.
+    messages.items[0].deinit(alloc);
+    messages.items[0] = try ownedUserText(alloc, "second turn");
+    try injectReminders(&messages, &queue, alloc);
+
+    const after_second = messages.items[0].content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, after_second, "sticky") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_second, "transient") == null);
+    try std.testing.expectEqual(@as(usize, 1), queue.len());
+}
+
+test "injectReminders prepends a text block when the user message has tool_results" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+
+    // A "structured" user message: text + tool_result. This shape doesn't
+    // appear in production today (tool_result messages are pure), but the
+    // plan asks for the prepend path so future shapes work too.
+    const blocks = try alloc.alloc(types.ContentBlock, 2);
+    blocks[0] = .{ .text = .{ .text = try alloc.dupe(u8, "go") } };
+    blocks[1] = .{ .tool_result = .{
+        .tool_use_id = try alloc.dupe(u8, "t1"),
+        .content = try alloc.dupe(u8, "ok"),
+    } };
+    try messages.append(alloc, .{ .role = .user, .content = blocks });
+
+    var queue: Reminder.Queue = .{};
+    defer queue.deinit(alloc);
+    try queue.push(alloc, .{ .text = "heads up", .scope = .next_turn });
+
+    try injectReminders(&messages, &queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items[0].content.len);
+    const expected =
+        \\<system-reminder>
+        \\heads up
+        \\</system-reminder>
+    ;
+    try std.testing.expectEqualStrings(expected, messages.items[0].content[0].text.text);
+    try std.testing.expectEqualStrings("go", messages.items[0].content[1].text.text);
+    try std.testing.expectEqualStrings("t1", messages.items[0].content[2].tool_result.tool_use_id);
+}
+
+test "injectReminders skips messages whose content is tool_result-only" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+
+    // Shape produced by the agent loop after a tool finishes: pure
+    // tool_result reply. Reminders must not attach here; they belong to
+    // the human-authored prompt that started the turn.
+    const tool_blocks = try alloc.alloc(types.ContentBlock, 1);
+    tool_blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try alloc.dupe(u8, "t1"),
+        .content = try alloc.dupe(u8, "ok"),
+    } };
+    try messages.append(alloc, try ownedUserText(alloc, "earlier prompt"));
+    try messages.append(alloc, .{ .role = .user, .content = tool_blocks });
+
+    var queue: Reminder.Queue = .{};
+    defer queue.deinit(alloc);
+    try queue.push(alloc, .{ .text = "nag", .scope = .next_turn });
+
+    try injectReminders(&messages, &queue, alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].content[0].text.text, "nag") != null);
+    try std.testing.expectEqual(@as(usize, 1), messages.items[1].content.len);
+    switch (messages.items[1].content[0]) {
+        .tool_result => {},
+        else => return error.TestUnexpectedResult,
+    }
 }
