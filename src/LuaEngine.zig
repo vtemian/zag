@@ -23,6 +23,7 @@ const subagents_mod = @import("subagents.zig");
 const frontmatter_mod = @import("frontmatter.zig");
 const prompt = @import("prompt.zig");
 const Instruction = @import("Instruction.zig");
+const Reminder = @import("Reminder.zig");
 const WindowManager = @import("WindowManager.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
@@ -138,6 +139,12 @@ pub const LuaEngine = struct {
     /// `deinit` can free every entry without walking the registry's
     /// layers for ownership bookkeeping.
     prompt_layer_names: std.ArrayList([]const u8) = .empty,
+    /// Queue of `<system-reminder>` snippets pushed by Lua plugins via
+    /// `zag.reminder(...)`. The harness drains this at the user-message
+    /// boundary on each turn (Task 7.3); persistent entries survive every
+    /// drain until cleared by id. Lua bindings own the queue's lifetime,
+    /// so the engine's allocator backs every entry copy.
+    reminders: Reminder.Queue = .{},
     /// Default model string set via `zag.set_default_model("prov/id")`.
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
@@ -375,6 +382,7 @@ pub const LuaEngine = struct {
         for (self.prompt_layer_names.items) |name| self.allocator.free(name);
         self.prompt_layer_names.deinit(self.allocator);
         self.prompt_registry.deinit(self.allocator);
+        self.reminders.deinit(self.allocator);
         for (self.hook_dispatcher.registry.hooks.items) |h| {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
@@ -433,6 +441,12 @@ pub const LuaEngine = struct {
         lua.setField(-2, "spawn");
         lua.pushFunction(zlua.wrap(zagDetachFn));
         lua.setField(-2, "detach");
+        lua.pushFunction(zlua.wrap(zagReminderFn));
+        lua.setField(-2, "reminder");
+        lua.pushFunction(zlua.wrap(zagReminderClearFn));
+        lua.setField(-2, "reminder_clear");
+        lua.pushFunction(zlua.wrap(zagReminderListFn));
+        lua.setField(-2, "reminder_list");
 
         // zag.cmd is a callable table so we can hang zag.cmd.spawn et al.
         // off the same name. Stack after this block: [zag_table].
@@ -3388,6 +3402,177 @@ pub const LuaEngine = struct {
         }
         _ = engine.hook_dispatcher.registry.unregister(id);
         return 0;
+    }
+
+    /// Zig function backing `zag.reminder(text, opts?)`.
+    ///
+    /// `text` is the body folded into a `<system-reminder>` block at the
+    /// next user-message boundary. `opts` is an optional table accepting:
+    ///   - `scope`: "next_turn" (default) or "persistent".
+    ///   - `id`:    optional string used by `zag.reminder_clear`.
+    ///   - `once`:  optional boolean (default true); reserved for future
+    ///              once-per-turn dedup, surfaced today so the schema is
+    ///              stable.
+    ///
+    /// The queue dupes both `text` and `id` onto the engine allocator so
+    /// callers may free their inputs immediately.
+    fn zagReminderFn(lua: *Lua) !i32 {
+        return zagReminderFnInner(lua) catch |err| {
+            log.warn("zag.reminder() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagReminderFnInner(lua: *Lua) !i32 {
+        if (lua.typeOf(1) != .string) {
+            log.warn("zag.reminder(): first argument must be a string", .{});
+            return error.LuaError;
+        }
+        const text = lua.toString(1) catch {
+            log.warn("zag.reminder(): first argument must be a string", .{});
+            return error.LuaError;
+        };
+
+        var scope: Reminder.Scope = .next_turn;
+        var id: ?[]const u8 = null;
+        var once: bool = true;
+        var id_pushed = false;
+        defer if (id_pushed) lua.pop(1);
+
+        if (!lua.isNoneOrNil(2)) {
+            if (!lua.isTable(2)) {
+                log.warn("zag.reminder(): second argument must be an options table", .{});
+                return error.LuaError;
+            }
+            const opts_idx = lua.absIndex(2);
+
+            _ = lua.getField(opts_idx, "scope");
+            if (!lua.isNil(-1)) {
+                if (lua.typeOf(-1) != .string) {
+                    lua.pop(1);
+                    log.warn("zag.reminder(): opts.scope must be a string", .{});
+                    return error.LuaError;
+                }
+                const scope_name = lua.toString(-1) catch {
+                    lua.pop(1);
+                    return error.LuaError;
+                };
+                if (std.mem.eql(u8, scope_name, "next_turn")) {
+                    scope = .next_turn;
+                } else if (std.mem.eql(u8, scope_name, "persistent")) {
+                    scope = .persistent;
+                } else {
+                    log.warn("zag.reminder(): opts.scope must be 'next_turn' or 'persistent', got '{s}'", .{scope_name});
+                    lua.pop(1);
+                    return error.LuaError;
+                }
+            }
+            lua.pop(1);
+
+            _ = lua.getField(opts_idx, "once");
+            if (!lua.isNil(-1)) once = lua.toBoolean(-1);
+            lua.pop(1);
+
+            // `id` stays on the stack across the queue push so the
+            // borrowed slice is anchored by Lua until `Queue.push` has
+            // duped it onto the engine allocator. The deferred pop above
+            // releases it on every exit path once we've pushed.
+            _ = lua.getField(opts_idx, "id");
+            id_pushed = true;
+            if (!lua.isNil(-1)) {
+                if (lua.typeOf(-1) != .string) {
+                    log.warn("zag.reminder(): opts.id must be a string", .{});
+                    return error.LuaError;
+                }
+                id = lua.toString(-1) catch return error.LuaError;
+            }
+        }
+
+        const engine = try engineFromRegistry(lua);
+        engine.reminders.push(engine.allocator, .{
+            .id = id,
+            .text = text,
+            .scope = scope,
+            .once = once,
+        }) catch |err| {
+            log.warn("zag.reminder(): queue push failed: {}", .{err});
+            return error.LuaError;
+        };
+        return 0;
+    }
+
+    /// Zig function backing `zag.reminder_clear(id)`.
+    fn zagReminderClearFn(lua: *Lua) !i32 {
+        return zagReminderClearFnInner(lua) catch |err| {
+            log.warn("zag.reminder_clear() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagReminderClearFnInner(lua: *Lua) !i32 {
+        if (lua.typeOf(1) != .string) {
+            log.warn("zag.reminder_clear(): first argument must be a string id", .{});
+            return error.LuaError;
+        }
+        const id = lua.toString(1) catch {
+            log.warn("zag.reminder_clear(): first argument must be a string id", .{});
+            return error.LuaError;
+        };
+        const engine = try engineFromRegistry(lua);
+        engine.reminders.clearById(engine.allocator, id);
+        return 0;
+    }
+
+    /// Zig function backing `zag.reminder_list()`. Returns a Lua array of
+    /// `{ text, scope, id?, once }` tables snapshotting the queue without
+    /// disturbing it. Useful for diagnostics and tests.
+    fn zagReminderListFn(lua: *Lua) !i32 {
+        return zagReminderListFnInner(lua) catch |err| {
+            log.warn("zag.reminder_list() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagReminderListFnInner(lua: *Lua) !i32 {
+        const engine = try engineFromRegistry(lua);
+        const snapshot = engine.reminders.snapshot(engine.allocator) catch |err| {
+            log.warn("zag.reminder_list(): snapshot failed: {}", .{err});
+            return error.LuaError;
+        };
+        defer Reminder.freeDrained(engine.allocator, snapshot);
+
+        lua.newTable();
+        for (snapshot, 0..) |entry, i| {
+            lua.newTable();
+            _ = lua.pushString(entry.text);
+            lua.setField(-2, "text");
+            _ = lua.pushString(switch (entry.scope) {
+                .next_turn => "next_turn",
+                .persistent => "persistent",
+            });
+            lua.setField(-2, "scope");
+            if (entry.id) |entry_id| {
+                _ = lua.pushString(entry_id);
+                lua.setField(-2, "id");
+            }
+            lua.pushBoolean(entry.once);
+            lua.setField(-2, "once");
+            lua.rawSetIndex(-2, @intCast(i + 1));
+        }
+        return 1;
+    }
+
+    /// Resolve the `*LuaEngine` stashed in the Lua registry by
+    /// `storeSelfPointer`. Centralizes the lookup so reminder bindings
+    /// stay symmetrical with the older copy-paste pattern.
+    fn engineFromRegistry(lua: *Lua) !*LuaEngine {
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        defer lua.pop(1);
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        return @ptrCast(@alignCast(@constCast(ptr)));
     }
 
     /// Zig function backing `zag.keymap(...)`. Accepts either the
@@ -10908,4 +11093,126 @@ test "zag.prompt dispatch lets user layer named 'pack' shadow the pack body" {
         if (std.mem.eql(u8, layer.name, "pack")) pack_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), pack_count);
+}
+
+test "zag.reminder pushes a next-turn entry by default" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.reminder("hello there")
+    );
+
+    const snap = try engine.reminders.snapshot(std.testing.allocator);
+    defer Reminder.freeDrained(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("hello there", snap[0].text);
+    try std.testing.expectEqual(Reminder.Scope.next_turn, snap[0].scope);
+    try std.testing.expect(snap[0].id == null);
+    try std.testing.expectEqual(true, snap[0].once);
+}
+
+test "zag.reminder honors persistent scope and id" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.reminder("plan active", { scope = "persistent", id = "plan", once = false })
+    );
+
+    const snap = try engine.reminders.snapshot(std.testing.allocator);
+    defer Reminder.freeDrained(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("plan active", snap[0].text);
+    try std.testing.expectEqual(Reminder.Scope.persistent, snap[0].scope);
+    try std.testing.expectEqualStrings("plan", snap[0].id.?);
+    try std.testing.expectEqual(false, snap[0].once);
+}
+
+test "zag.reminder rejects unknown scope" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.reminder("nope", { scope = "later" })
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expectEqual(@as(usize, 0), engine.reminders.len());
+}
+
+test "zag.reminder rejects non-string text" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.reminder(42)
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expectEqual(@as(usize, 0), engine.reminders.len());
+}
+
+test "zag.reminder_clear removes matching id" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.reminder("keep", { scope = "persistent", id = "keep" })
+        \\zag.reminder("drop", { scope = "persistent", id = "drop" })
+        \\zag.reminder_clear("drop")
+    );
+
+    const snap = try engine.reminders.snapshot(std.testing.allocator);
+    defer Reminder.freeDrained(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("keep", snap[0].text);
+}
+
+test "zag.reminder_list returns a snapshot of pending entries" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.reminder("first")
+        \\zag.reminder("second", { scope = "persistent", id = "p" })
+        \\local snap = zag.reminder_list()
+        \\_G.snap_len = #snap
+        \\_G.first_text = snap[1].text
+        \\_G.first_scope = snap[1].scope
+        \\_G.second_text = snap[2].text
+        \\_G.second_scope = snap[2].scope
+        \\_G.second_id = snap[2].id
+    );
+
+    _ = engine.lua.getGlobal("snap_len") catch {};
+    try std.testing.expectEqual(@as(i64, 2), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("first_text") catch {};
+    try std.testing.expectEqualStrings("first", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("first_scope") catch {};
+    try std.testing.expectEqualStrings("next_turn", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("second_text") catch {};
+    try std.testing.expectEqualStrings("second", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("second_scope") catch {};
+    try std.testing.expectEqualStrings("persistent", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("second_id") catch {};
+    try std.testing.expectEqualStrings("p", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    // Snapshot must not have drained the queue.
+    try std.testing.expectEqual(@as(usize, 2), engine.reminders.len());
 }
