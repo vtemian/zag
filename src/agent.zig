@@ -1654,6 +1654,112 @@ test "jit handler returning nil leaves tool result untouched" {
     }
 }
 
+test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" {
+    // End-to-end PR 8 integration test (HE8.5):
+    //   1. tmpDir contains AGENTS.md and a nested child file.
+    //   2. Engine eager-loads the real `zag.jit.agents_md` module via
+    //      `loadBuiltinPlugins` (no stub handler).
+    //   3. The real `read` tool runs through `executeTools` against the
+    //      child file's absolute path.
+    //   4. The assembled tool_result content carries:
+    //        - the original child-file body,
+    //        - `Instructions from: <path-to-AGENTS.md>`,
+    //        - the AGENTS.md content body.
+    const AgentRunner = @import("AgentRunner.zig");
+    const read_tool = @import("tools/read.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.loadBuiltinPlugins();
+
+    // Verify the eager-load wired up the real AGENTS.md handler before we
+    // proceed; if this regresses, the rest of the test would silently
+    // pass-through and never exercise the integration.
+    try std.testing.expect(engine.jit_context_handlers.contains("read"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The JIT handler probes the file's immediate parent only (see
+    // `src/lua/zag/jit/agents_md.lua` — a true cwd-bounded walk-up
+    // needs the JIT context to carry cwd, which is not yet exposed).
+    // Drop AGENTS.md alongside the child file in `nested/` so the
+    // single-directory probe matches.
+    const agents_body = "# Local conventions\nUse TDD. Keep it terse.";
+    const child_body = "package nested\n";
+    try tmp.dir.makePath("nested");
+    try tmp.dir.writeFile(.{ .sub_path = "nested/AGENTS.md", .data = agents_body });
+    try tmp.dir.writeFile(.{ .sub_path = "nested/file.txt", .data = child_body });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+
+    var child_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const child_path = try std.fmt.bufPrint(&child_buf, "{s}/nested/file.txt", .{root});
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(read_tool.tool);
+
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const tool_input = try std.fmt.bufPrint(&input_buf, "{{\"path\":\"{s}\"}}", .{child_path});
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_jit_e2e", .name = "read", .input_raw = tool_input },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expectEqualStrings("call_jit_e2e", tr.tool_use_id);
+            try std.testing.expect(!tr.is_error);
+
+            // Original read content present.
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "package nested") != null);
+
+            // JIT attachment: header + AGENTS.md path + AGENTS.md body.
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "Instructions from: ") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "AGENTS.md") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "Use TDD. Keep it terse.") != null);
+
+            // Order check: original content precedes the appended instructions.
+            const original_at = std.mem.indexOf(u8, tr.content, "package nested").?;
+            const instructions_at = std.mem.indexOf(u8, tr.content, "Instructions from: ").?;
+            try std.testing.expect(original_at < instructions_at);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "mid-turn user message wraps as a system-reminder interrupt on next iteration" {
     // Verifies the HE7.4 mechanic end-to-end through the seam:
     // 1. The agent loop is mid-turn (`turn_in_progress = true`).
