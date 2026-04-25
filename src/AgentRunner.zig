@@ -49,6 +49,12 @@ allocator: Allocator,
 agent_thread: ?std.Thread = null,
 /// Atomic flag for requesting agent thread cancellation.
 cancel_flag: agent_events.CancelFlag = agent_events.CancelFlag.init(false),
+/// True while the agent loop is between `turn_start` and `turn_end` for a
+/// given iteration. Read from the main thread inside `onUserInputSubmitted`
+/// so a user message arriving during an in-flight turn is diverted into the
+/// reminder queue (wrapped as an interrupt) instead of dangling at the tail
+/// of `messages` for the next iteration to consume bare.
+turn_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 /// Event queue for agent-to-main communication. Initialized when
 /// spawning an agent and torn down on drain completion.
 event_queue: agent_events.EventQueue = undefined,
@@ -234,6 +240,7 @@ pub fn submit(
         self.pane_handle_packed,
         deps.skills orelse self.skills,
         if (deps.subagents != null) &self.task_ctx else null,
+        &self.turn_in_progress,
     });
 }
 
@@ -334,6 +341,7 @@ fn threadMain(
     pane_handle_packed: u32,
     skills: ?*const skills_mod.SkillRegistry,
     task_ctx: ?*const tools.TaskContext,
+    turn_in_progress: *std.atomic.Value(bool),
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -354,7 +362,13 @@ fn threadMain(
     tools.task_context = task_ctx;
     defer tools.task_context = null;
 
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills) catch |err| {
+    // Always reset the mid-turn flag on thread exit. `runLoopStreaming`
+    // clears it inside its iteration, but a mid-iteration error skips
+    // that store; without this defer the next pane submit would see a
+    // stale `true` and divert the first user message.
+    defer turn_in_progress.store(false, .release);
+
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills, turn_in_progress) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
         // queue counter and `.done` is still pushed so the UI returns to
