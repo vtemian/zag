@@ -544,6 +544,17 @@ pub fn dispatchHookRequests(
                 // doesn't park forever.
                 req.done.set();
             },
+            .loop_detect_request => |req| {
+                if (engine) |eng| {
+                    eng.handleLoopDetectRequest(req) catch |err| {
+                        req.error_name = @errorName(err);
+                    };
+                }
+                // Same rationale as `tool_gate_request`: a missing
+                // engine is a clean miss (no detector); always signal
+                // done so the producer doesn't park forever.
+                req.done.set();
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -761,6 +772,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             req.done.set();
         },
         .tool_gate_request => |req| {
+            req.error_name = "drained_without_dispatch";
+            req.done.set();
+        },
+        .loop_detect_request => |req| {
             req.error_name = "drained_without_dispatch";
             req.done.set();
         },
@@ -1413,6 +1428,92 @@ test "tool_gate_request handler error sets error_name" {
     const tool_names = [_][]const u8{"read"};
     var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
     try queue.push(.{ .tool_gate_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name != null);
+    try std.testing.expectEqualStrings("LuaHandlerError", req.error_name.?);
+}
+
+test "loop_detect_request round-trips reminder via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  return { action = "reminder", text = "stop " .. ctx.tool }
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 4, alloc);
+    defer req.freeResult();
+
+    try queue.push(.{ .loop_detect_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    switch (req.result.?) {
+        .reminder => |text| try std.testing.expectEqualStrings("stop bash", text),
+        .abort => return error.TestUnexpectedResult,
+    }
+}
+
+test "loop_detect_request with no handler completes cleanly" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    try queue.push(.{ .loop_detect_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "loop_detect_request with no engine signals done" {
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    try queue.push(.{ .loop_detect_request = &req });
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "loop_detect_request handler error sets error_name" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) error("nope") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer req.freeResult();
+    try queue.push(.{ .loop_detect_request = &req });
     dispatchHookRequests(&queue, &engine, null);
 
     try std.testing.expect(req.done.isSet());

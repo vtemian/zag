@@ -84,6 +84,17 @@ pub fn runLoopStreaming(
     tools.lua_request_queue = queue;
     defer tools.lua_request_queue = null;
 
+    // Loop-detector state: track the most recent (name, input) pair and a
+    // streak counter so `zag.loop.detect` can flag repeated identical
+    // tool calls. Owned here for the duration of the run; `last_input`
+    // is duped so the buffer outlives the per-turn arena that produced
+    // the original raw JSON. Reset to length-zero between mismatches.
+    var last_tool_name: []u8 = &.{};
+    var last_tool_input: []u8 = &.{};
+    defer allocator.free(last_tool_name);
+    defer allocator.free(last_tool_input);
+    var identical_streak: u32 = 0;
+
     var turn_num: u32 = 0;
     while (true) {
         if (cancel.load(.acquire)) return;
@@ -144,6 +155,57 @@ pub fn runLoopStreaming(
         if (tool_calls.len > 0) {
             const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine, tools.current_caller_pane_id);
             try messages.append(allocator, .{ .role = .user, .content = results });
+
+            // Loop detection: compare the just-executed last tool call
+            // with the previous turn's. Bump the streak on a match,
+            // reset to 1 on a mismatch. Then consult the registered
+            // detector (if any). A `reminder` action queues a
+            // `next_turn` reminder for the next iteration's
+            // `injectReminders` pass; an `abort` action breaks the
+            // loop with `error.LoopAborted` so the runner surfaces
+            // the failure cleanly.
+            const last = tool_calls[tool_calls.len - 1];
+            const last_was_error = lastResultIsError(results);
+            const same_name = std.mem.eql(u8, last_tool_name, last.name);
+            const same_input = std.mem.eql(u8, last_tool_input, last.input_raw);
+            if (same_name and same_input) {
+                identical_streak += 1;
+            } else {
+                identical_streak = 1;
+                allocator.free(last_tool_name);
+                last_tool_name = try allocator.dupe(u8, last.name);
+                allocator.free(last_tool_input);
+                last_tool_input = try allocator.dupe(u8, last.input_raw);
+            }
+
+            if (try fireLoopDetect(
+                lua_engine,
+                last_tool_name,
+                last_tool_input,
+                last_was_error,
+                identical_streak,
+                allocator,
+                queue,
+                cancel,
+            )) |action| {
+                switch (action) {
+                    .reminder => |text| {
+                        defer allocator.free(text);
+                        if (lua_engine) |eng| {
+                            eng.reminders.push(eng.allocator, .{
+                                .text = text,
+                                .scope = .next_turn,
+                            }) catch |err| {
+                                log.warn("loop detect reminder push failed: {s}", .{@errorName(err)});
+                            };
+                        }
+                    },
+                    .abort => {
+                        turn_in_progress.store(false, .release);
+                        return error.LoopAborted;
+                    },
+                }
+            }
         }
 
         var turn_end: Hooks.HookPayload = .{ .turn_end = .{
@@ -700,6 +762,67 @@ fn fireToolTransformRequest(
         return null;
     }
     return req.result;
+}
+
+/// Fire `zag.loop.detect` after the most recent tool execution and
+/// block on a main-thread round-trip. Returns the decoded `LoopAction`
+/// (caller owns any heap bytes inside, e.g. `reminder` text) or null
+/// when no handler is registered, the handler returned nil, or the
+/// handler errored. Skips the round-trip entirely when no engine is
+/// present or the detector slot is empty so the no-op fast path stays
+/// cheap.
+fn fireLoopDetect(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    last_tool_name: []const u8,
+    last_tool_input: []const u8,
+    is_error: bool,
+    identical_streak: u32,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !?agent_events.LoopAction {
+    const engine = lua_engine orelse return null;
+    if (engine.loop_detect_handler == null) return null;
+
+    var req = agent_events.LoopDetectRequest.init(
+        last_tool_name,
+        last_tool_input,
+        is_error,
+        identical_streak,
+        allocator,
+    );
+    queue.push(.{ .loop_detect_request = &req }) catch return null;
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                req.freeResult();
+                return error.Cancelled;
+            }
+        }
+    }
+    if (req.error_name) |name| {
+        log.warn("loop detect handler failed: {s}", .{name});
+        req.freeResult();
+        return null;
+    }
+    return req.result;
+}
+
+/// Inspect a freshly built tool-result content slice and report
+/// whether the trailing block reported an error. Used by the loop
+/// detector so a streak of identical-but-erroring calls can be
+/// weighted differently from a streak of success calls. The slice
+/// comes straight from `executeTools` so non-tool_result blocks are
+/// not expected; we tolerate them by returning false rather than
+/// hard-failing on shape drift.
+fn lastResultIsError(results: []const types.ContentBlock) bool {
+    if (results.len == 0) return false;
+    return switch (results[results.len - 1]) {
+        .tool_result => |r| r.is_error,
+        else => false,
+    };
 }
 
 /// Run one tool call's full pipeline: check cancel, fire ToolPre,
@@ -1418,6 +1541,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                     req.done.set();
                 },
                 .tool_gate_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .loop_detect_request => |req| {
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
@@ -2474,4 +2601,250 @@ test "gateToolDefs drops gate names that do not exist in the registry" {
     try std.testing.expect(owned != null);
     try std.testing.expectEqual(@as(usize, 1), visible.len);
     try std.testing.expectEqualStrings("read", visible[0].name);
+}
+
+// -- Loop detector tests ----------------------------------------------------
+//
+// `fireLoopDetect` round-trips the registered handler through the event
+// queue, so each test that exercises a registered handler spawns a Pump
+// thread that calls `AgentRunner.dispatchHookRequests` until the helper
+// returns. The fast-path (no handler / no engine) tests skip the pump
+// because `fireLoopDetect` returns null without touching the queue.
+
+test "fireLoopDetect bypasses round-trip when no handler is registered" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    // No pump thread: a stray push would hang on `done.wait`.
+    const action = try fireLoopDetect(&engine, "bash", "{}", false, 3, alloc, &queue, &cancel);
+    try std.testing.expect(action == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "fireLoopDetect bypasses round-trip when engine is null" {
+    const alloc = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const action = try fireLoopDetect(null, "bash", "{}", false, 3, alloc, &queue, &cancel);
+    try std.testing.expect(action == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "fireLoopDetect returns reminder action from registered handler" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  if ctx.identical_streak >= 3 then
+        \\    return { action = "reminder", text = "stop calling " .. ctx.tool }
+        \\  end
+        \\  return nil
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const action = try fireLoopDetect(&engine, "bash", "{}", false, 3, alloc, &queue, &cancel);
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .reminder => |text| {
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings("stop calling bash", text);
+        },
+        .abort => return error.TestUnexpectedResult,
+    }
+}
+
+test "fireLoopDetect returns abort action from registered handler" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return { action = "abort" } end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const action = try fireLoopDetect(&engine, "bash", "{}", false, 5, alloc, &queue, &cancel);
+    try std.testing.expect(action != null);
+    try std.testing.expectEqual(agent_events.LoopAction.abort, action.?);
+}
+
+test "fireLoopDetect handler error returns null and warns" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) error("blew up") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const action = try fireLoopDetect(&engine, "bash", "{}", false, 3, alloc, &queue, &cancel);
+    try std.testing.expect(action == null);
+}
+
+test "fireLoopDetect nil return returns null" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return nil end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const action = try fireLoopDetect(&engine, "bash", "{}", false, 1, alloc, &queue, &cancel);
+    try std.testing.expect(action == null);
+}
+
+test "lastResultIsError reads is_error off the trailing tool_result" {
+    const ok = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "a", .content = "ok", .is_error = false } },
+    };
+    const fail = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "b", .content = "boom", .is_error = true } },
+    };
+    try std.testing.expect(!lastResultIsError(&ok));
+    try std.testing.expect(lastResultIsError(&fail));
+    try std.testing.expect(!lastResultIsError(&.{}));
+}
+
+test "loop detector reminder action pushes onto engine reminder queue" {
+    // End-to-end: fire the detector twice with identical (name, input)
+    // pairs, simulating two consecutive identical tool calls. The
+    // detector's reminder text should land on the engine's reminder
+    // queue with `next_turn` scope.
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  if ctx.identical_streak >= 2 then
+        \\    return { action = "reminder", text = "stop the loop" }
+        \\  end
+        \\  return nil
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    // Streak of 2 satisfies the threshold.
+    const action = try fireLoopDetect(&engine, "bash", "{\"cmd\":\"ls\"}", false, 2, alloc, &queue, &cancel);
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .reminder => |text| {
+            defer alloc.free(text);
+            try engine.reminders.push(engine.allocator, .{
+                .text = text,
+                .scope = .next_turn,
+            });
+        },
+        .abort => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), engine.reminders.len());
+}
+
+test "identical streak counter increments on identical tool input and resets on different" {
+    // Mirrors the streak-tracking arithmetic in `runLoopStreaming`. We
+    // re-implement the same assignment dance in the test so a future
+    // refactor of the loop body cannot drift the contract without
+    // updating the test.
+    const alloc = std.testing.allocator;
+    var last_name: []u8 = &.{};
+    var last_input: []u8 = &.{};
+    defer alloc.free(last_name);
+    defer alloc.free(last_input);
+    var streak: u32 = 0;
+
+    const Step = struct { name: []const u8, input: []const u8, expected: u32 };
+    const steps = [_]Step{
+        .{ .name = "bash", .input = "{\"cmd\":\"ls\"}", .expected = 1 },
+        .{ .name = "bash", .input = "{\"cmd\":\"ls\"}", .expected = 2 },
+        .{ .name = "bash", .input = "{\"cmd\":\"ls\"}", .expected = 3 },
+        .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = 1 },
+        .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = 2 },
+        .{ .name = "read", .input = "{\"path\":\"b\"}", .expected = 1 },
+    };
+    for (steps) |s| {
+        const same_name = std.mem.eql(u8, last_name, s.name);
+        const same_input = std.mem.eql(u8, last_input, s.input);
+        if (same_name and same_input) {
+            streak += 1;
+        } else {
+            streak = 1;
+            alloc.free(last_name);
+            last_name = try alloc.dupe(u8, s.name);
+            alloc.free(last_input);
+            last_input = try alloc.dupe(u8, s.input);
+        }
+        try std.testing.expectEqual(s.expected, streak);
+    }
 }

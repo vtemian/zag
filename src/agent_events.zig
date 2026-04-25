@@ -83,6 +83,13 @@ pub const AgentEvent = union(enum) {
     /// upcoming turn. Same main-thread marshalling rationale; the
     /// request is caller-owned.
     tool_gate_request: *ToolGateRequest,
+    /// Round-trip: the agent thread asks main to invoke the single global
+    /// loop-detector handler registered via `zag.loop.detect(fn)` after
+    /// each tool execution. The handler returns either a `reminder` to
+    /// push onto the next turn's reminder queue or an `abort` to break
+    /// the agent loop. Same main-thread marshalling rationale; the
+    /// request is caller-owned.
+    loop_detect_request: *LoopDetectRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -144,6 +151,10 @@ pub const AgentEvent = union(enum) {
             // `done`; signal so it proceeds with the full registry rather
             // than wedging the turn.
             .tool_gate_request => |req| req.done.set(),
+            // A dropped loop-detect request leaves the worker parked
+            // awaiting `done`; signal so it proceeds without a reminder
+            // or abort. The detector is advisory, so dropping is safe.
+            .loop_detect_request => |req| req.done.set(),
         }
     }
 };
@@ -577,6 +588,97 @@ pub const ToolGateRequest = struct {
     }
 };
 
+/// Decision a loop-detector handler returns when it spots a stuck
+/// agent. The `reminder` text is owned by `LoopDetectRequest.allocator`
+/// (duped from the Lua return); the waiter releases via
+/// `LoopDetectRequest.freeResult`. `abort` carries no payload; it just
+/// tells the agent loop to bail with `error.LoopAborted`.
+pub const LoopAction = union(enum) {
+    reminder: []const u8,
+    abort,
+};
+
+/// Round-trip request pushed by the agent thread after every tool
+/// execution to consult the single global loop-detector handler
+/// registered via `zag.loop.detect(fn)`. Lua is pinned to the main
+/// thread, so the worker marshals here exactly like the other socket
+/// requests.
+///
+/// The handler receives `{tool = ..., input = ..., is_error = ...,
+/// identical_streak = ...}` and returns either nil (no action), a
+/// table `{action = "reminder", text = "..."}`, or `{action = "abort"}`.
+/// The main thread decodes the table into a `LoopAction` duped into
+/// `req.allocator` and stores it in `result`. The waiter owns the
+/// reminder text (when present) and releases via `freeResult`.
+///
+/// Lifecycle mirrors `JitContextRequest`. A nil handler return, a
+/// missing handler, or a Lua-side error all leave `result = null`
+/// (with `error_name` set on the error path) so the waiter can fall
+/// through to "no intervention this round."
+pub const LoopDetectRequest = struct {
+    /// Most recent tool name. Borrowed from the agent thread's tool
+    /// call slice; main thread reads under `done` and must not retain
+    /// pointers past `done.set()`.
+    last_tool_name: []const u8,
+    /// Raw JSON arguments of the most recent tool call. Same borrow
+    /// rules as `last_tool_name`.
+    last_tool_input: []const u8,
+    /// Whether the most recent tool call reported an error. Surfaced
+    /// as `is_error` on the Lua-side context table so a detector can
+    /// weight error streaks differently.
+    is_error: bool,
+    /// Count of consecutive identical (name + input) tool calls. The
+    /// agent thread bumps this when consecutive calls match and resets
+    /// to 1 otherwise. The detector decides at what threshold to act.
+    identical_streak: u32,
+    /// Allocator used to dupe the reminder text into `result`. Caller
+    /// promises thread-safety.
+    allocator: Allocator,
+    /// Signalled by the main thread when either `result`, `error_name`,
+    /// or neither (handler returned nil / no handler) has been
+    /// finalized.
+    done: std.Thread.ResetEvent = .{},
+    /// Handler return value, decoded into a `LoopAction`. The
+    /// `reminder` arm's text is duped into `allocator`. Null when the
+    /// handler returned nil, when no handler was registered, or when
+    /// the call errored. Owned by the waiter; release via
+    /// `freeResult`.
+    result: ?LoopAction = null,
+    /// `@errorName` of whatever went wrong on the main thread (Lua
+    /// call failure, return value type mismatch, OOM duping the
+    /// reminder text, unknown action string). Borrowed from rodata;
+    /// do not free.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(
+        last_tool_name: []const u8,
+        last_tool_input: []const u8,
+        is_error: bool,
+        identical_streak: u32,
+        allocator: Allocator,
+    ) LoopDetectRequest {
+        return .{
+            .last_tool_name = last_tool_name,
+            .last_tool_input = last_tool_input,
+            .is_error = is_error,
+            .identical_streak = identical_streak,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free any heap allocation owned by `result`, if any. Currently
+    /// only the `reminder` arm carries owned bytes; `abort` is a tag
+    /// with no payload. Safe to call when `result` is null.
+    pub fn freeResult(self: *LoopDetectRequest) void {
+        const action = self.result orelse return;
+        switch (action) {
+            .reminder => |text| self.allocator.free(text),
+            .abort => {},
+        }
+        self.result = null;
+    }
+};
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -963,6 +1065,52 @@ test "ToolGateRequest.freeResult releases duped names" {
     errdefer alloc.free(list[0]);
     list[1] = try alloc.dupe(u8, "bash");
     req.result = list;
+    req.freeResult();
+    try std.testing.expect(req.result == null);
+}
+
+test "push and drain loop_detect_request event" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    defer queue.deinit();
+
+    var req = LoopDetectRequest.init(
+        "bash",
+        "{\"cmd\":\"ls\"}",
+        false,
+        3,
+        std.testing.allocator,
+    );
+
+    try queue.push(.{ .loop_detect_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("bash", buf[0].loop_detect_request.last_tool_name);
+    try std.testing.expectEqual(@as(u32, 3), buf[0].loop_detect_request.identical_streak);
+    try std.testing.expect(!buf[0].loop_detect_request.is_error);
+}
+
+test "freeOwned signals loop_detect_request done" {
+    var req = LoopDetectRequest.init("bash", "{}", false, 1, std.testing.allocator);
+    const ev: AgentEvent = .{ .loop_detect_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+}
+
+test "LoopDetectRequest.freeResult releases reminder text" {
+    const alloc = std.testing.allocator;
+    var req = LoopDetectRequest.init("bash", "{}", false, 5, alloc);
+
+    const text = try alloc.dupe(u8, "stop looping");
+    req.result = .{ .reminder = text };
+    req.freeResult();
+    try std.testing.expect(req.result == null);
+}
+
+test "LoopDetectRequest.freeResult abort variant has no payload" {
+    var req = LoopDetectRequest.init("bash", "{}", false, 5, std.testing.allocator);
+    req.result = .abort;
     req.freeResult();
     try std.testing.expect(req.result == null);
 }

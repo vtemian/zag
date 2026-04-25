@@ -188,6 +188,13 @@ pub const LuaEngine = struct {
     /// unrefed). `null` means "no gate", so the agent uses the full
     /// registry. Released in `deinit`.
     tool_gate_handler: ?i32 = null,
+    /// Single global handler registered via `zag.loop.detect(fn)`. The
+    /// detector runs after each tool execution and returns either a
+    /// reminder to push onto the next turn or an abort decision. Same
+    /// re-registration semantics as `tool_gate_handler`: swap the ref,
+    /// unref the old. `null` means "no detector", so the agent loops
+    /// without intervention. Released in `deinit`.
+    loop_detect_handler: ?i32 = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -475,6 +482,12 @@ pub const LuaEngine = struct {
             self.lua.unref(zlua.registry_index, fn_ref);
             self.tool_gate_handler = null;
         }
+        // Same release dance for the single global loop-detector
+        // handler (set by `zag.loop.detect(fn)`).
+        if (self.loop_detect_handler) |fn_ref| {
+            self.lua.unref(zlua.registry_index, fn_ref);
+            self.loop_detect_handler = null;
+        }
         self.lua.deinit();
     }
 
@@ -695,6 +708,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagToolsGateFn));
         lua.setField(-2, "gate");
         lua.setField(-2, "tools"); // zag.tools = tools_table; [zag_table]
+
+        // zag.loop; namespace for agent-loop sockets. Today only
+        // `detect(fn)` (single global post-tool-result hook). The
+        // detector returns either a reminder to inject on the next
+        // turn or an abort to stop the loop. Stack: [zag_table].
+        lua.newTable(); // [zag_table, loop_table]
+        lua.pushFunction(zlua.wrap(zagLoopDetectFn));
+        lua.setField(-2, "detect");
+        lua.setField(-2, "loop"); // zag.loop = loop_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -5572,6 +5594,152 @@ pub const LuaEngine = struct {
     /// Test-only accessor for the single global tool-gate handler ref.
     pub fn toolGateHandler(self: *const LuaEngine) ?i32 {
         return self.tool_gate_handler;
+    }
+
+    /// Zig function backing `zag.loop.detect(fn)`.
+    ///
+    /// Registers the single global loop-detector handler the harness
+    /// invokes after every tool execution. Re-registering replaces
+    /// the previous function; the old Lua ref is unrefed so memory
+    /// does not bloat across reloads. Pass nil to clear.
+    ///
+    /// Args:
+    /// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
+    fn zagLoopDetectFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        // Allow `zag.loop.detect(nil)` to clear the handler. Anything
+        // else that isn't a function is a programmer error.
+        if (lua.isNil(1)) {
+            if (engine.loop_detect_handler) |old| {
+                lua.unref(zlua.registry_index, old);
+                engine.loop_detect_handler = null;
+            }
+            return 0;
+        }
+        if (!lua.isFunction(1)) {
+            lua.raiseErrorStr(
+                "zag.loop.detect: arg 1 must be a function or nil",
+                .{},
+            );
+        }
+
+        // Push a copy of arg 1 so ref() pops the duplicate and leaves
+        // the original argument frame intact.
+        lua.pushValue(1);
+        const fn_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr(
+                "zag.loop.detect: failed to ref handler",
+                .{},
+            );
+        };
+
+        if (engine.loop_detect_handler) |old| {
+            lua.unref(zlua.registry_index, old);
+        }
+        engine.loop_detect_handler = fn_ref;
+        return 0;
+    }
+
+    /// Run the loop-detector handler on the main thread. Builds a
+    /// Lua-side context table `{tool, input, is_error, identical_streak}`,
+    /// calls the registered function via `protectedCall`, and decodes
+    /// the returned table into a `LoopAction`.
+    ///
+    /// When no handler is registered or the handler returns nil, the
+    /// request returns with `result = null` and `error_name = null` so
+    /// the worker proceeds without intervention. A non-table non-nil
+    /// return surfaces as `error.LoopDetectNotTable`. An unknown action
+    /// string surfaces as `error.LoopDetectUnknownAction`. Caller is
+    /// responsible for `req.done.set()`.
+    pub fn handleLoopDetectRequest(
+        self: *LuaEngine,
+        req: *agent_events.LoopDetectRequest,
+    ) anyerror!void {
+        const fn_ref = self.loop_detect_handler orelse return;
+
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn("loop detect handler: registry slot is not a function", .{});
+            return;
+        }
+
+        // Context table the handler sees. Same shape as the JIT context
+        // and tool-transform handlers (`tool`/`input`/`is_error`) plus a
+        // `last_tool_name` alias and the `identical_streak` counter the
+        // detector uses to decide when to act.
+        lua.newTable();
+        _ = lua.pushString(req.last_tool_name);
+        lua.setField(-2, "tool");
+        _ = lua.pushString(req.last_tool_name);
+        lua.setField(-2, "last_tool_name");
+        _ = lua.pushString(req.last_tool_input);
+        lua.setField(-2, "input");
+        _ = lua.pushString(req.last_tool_input);
+        lua.setField(-2, "last_tool_input");
+        lua.pushBoolean(req.is_error);
+        lua.setField(-2, "is_error");
+        lua.pushInteger(@intCast(req.identical_streak));
+        lua.setField(-2, "identical_streak");
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("loop detect handler raised: {s}", .{err_msg});
+            lua.pop(1);
+            return error.LuaHandlerError;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return;
+        if (lua.typeOf(-1) != .table) {
+            log.warn(
+                "loop detect handler returned non-table (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.LoopDetectNotTable;
+        }
+
+        // Decode `{action = "reminder", text = "..."}` or
+        // `{action = "abort"}`. Anything else is an error.
+        _ = lua.getField(-1, "action");
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .string) {
+            log.warn(
+                "loop detect handler return missing string `action` (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.LoopDetectNotTable;
+        }
+        const action = lua.toString(-1) catch return error.LoopDetectReadFailed;
+
+        if (std.mem.eql(u8, action, "abort")) {
+            req.result = .abort;
+            return;
+        }
+        if (std.mem.eql(u8, action, "reminder")) {
+            _ = lua.getField(-2, "text");
+            defer lua.pop(1);
+            if (lua.typeOf(-1) != .string) {
+                log.warn(
+                    "loop detect reminder return missing string `text` (type {s})",
+                    .{@tagName(lua.typeOf(-1))},
+                );
+                return error.LoopDetectReminderMissingText;
+            }
+            const text = lua.toString(-1) catch return error.LoopDetectReadFailed;
+            const owned = try req.allocator.dupe(u8, text);
+            req.result = .{ .reminder = owned };
+            return;
+        }
+        log.warn("loop detect handler returned unknown action: {s}", .{action});
+        return error.LoopDetectUnknownAction;
+    }
+
+    /// Test-only accessor for the single global loop-detector handler ref.
+    pub fn loopDetectHandler(self: *const LuaEngine) ?i32 {
+        return self.loop_detect_handler;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -12619,4 +12787,197 @@ test "zag.transforms.bash_trim leaves short bash output untouched" {
     try engine.handleToolTransformRequest(&req);
     try std.testing.expect(req.error_name == null);
     try std.testing.expect(req.result == null);
+}
+
+test "zag.loop.detect registers a single global handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expect(engine.loopDetectHandler() == null);
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return nil end)
+    );
+    try std.testing.expect(engine.loopDetectHandler() != null);
+}
+
+test "zag.loop.detect re-registration unrefs old function" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return nil end)
+    );
+    const first = engine.loopDetectHandler().?;
+
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return { action = "abort" } end)
+    );
+    const second = engine.loopDetectHandler().?;
+    try std.testing.expect(first != second);
+}
+
+test "zag.loop.detect(nil) clears the handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return nil end)
+    );
+    try std.testing.expect(engine.loopDetectHandler() != null);
+    try engine.lua.doString("zag.loop.detect(nil)");
+    try std.testing.expect(engine.loopDetectHandler() == null);
+}
+
+test "zag.loop.detect rejects non-function non-nil arg" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString("zag.loop.detect(\"not a function\")");
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expect(engine.loopDetectHandler() == null);
+}
+
+test "handleLoopDetectRequest decodes reminder action" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  if ctx.identical_streak >= 3 then
+        \\    return { action = "reminder", text = "stop looping " .. ctx.tool }
+        \\  end
+        \\  return nil
+        \\end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 3, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    switch (req.result.?) {
+        .reminder => |text| try std.testing.expectEqualStrings("stop looping bash", text),
+        .abort => return error.TestUnexpectedResult,
+    }
+}
+
+test "handleLoopDetectRequest decodes abort action" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return { action = "abort" } end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 5, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqual(agent_events.LoopAction.abort, req.result.?);
+}
+
+test "handleLoopDetectRequest with nil return leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return nil end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleLoopDetectRequest with no handler leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleLoopDetectRequest surfaces Lua handler error via errorName" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) error("nope") end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer req.freeResult();
+    try std.testing.expectError(error.LuaHandlerError, engine.handleLoopDetectRequest(&req));
+    try std.testing.expect(req.result == null);
+}
+
+test "handleLoopDetectRequest rejects unknown action string" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return { action = "explode" } end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer req.freeResult();
+    try std.testing.expectError(error.LoopDetectUnknownAction, engine.handleLoopDetectRequest(&req));
+    try std.testing.expect(req.result == null);
+}
+
+test "handleLoopDetectRequest reminder requires string text field" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx) return { action = "reminder" } end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer req.freeResult();
+    try std.testing.expectError(error.LoopDetectReminderMissingText, engine.handleLoopDetectRequest(&req));
+    try std.testing.expect(req.result == null);
+}
+
+test "handleLoopDetectRequest passes is_error and identical_streak to ctx" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  if ctx.is_error and ctx.identical_streak == 7 then
+        \\    return { action = "abort" }
+        \\  end
+        \\  return nil
+        \\end)
+    );
+
+    var req = agent_events.LoopDetectRequest.init("read", "{\"path\":\"x\"}", true, 7, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqual(agent_events.LoopAction.abort, req.result.?);
 }
