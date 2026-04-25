@@ -3,8 +3,8 @@
 //! A subagent is a delegated execution context: its own system prompt,
 //! optionally its own model, optionally a restricted tool allowlist. The
 //! registry holds the definitions; the `task` tool consults it to dispatch
-//! a call and the agent loop reads its `taskToolSchema` to describe the
-//! available delegates to the LLM.
+//! a call and the agent loop reads its `writeTaskInputSchema` to describe
+//! the available delegates to the LLM.
 //!
 //! Ownership: every string on a `Subagent` is heap-allocated from the
 //! allocator passed to `register`. `deinit` frees all strings, the tool
@@ -113,17 +113,17 @@ pub const SubagentRegistry = struct {
         return null;
     }
 
-    /// Emit the minified JSON Schema for the `task` tool. The `agent`
-    /// property's enum lists every registered name; its description
-    /// enumerates each entry as `"<name>: <description>."` so the LLM can
-    /// tell delegates apart.
+    /// Emit the minified JSON Schema for the `task` tool's `input_schema`
+    /// (the bare parameters object — no `name`/`description`/`parameters`
+    /// wrapper, since providers add their own envelope around it). The
+    /// `agent` property's enum lists every registered name; its
+    /// description enumerates each entry as `"<name>: <description>."`
+    /// so the LLM can tell delegates apart.
     ///
     /// An empty registry still produces valid JSON (empty enum). Callers
     /// decide whether to actually register the tool.
-    pub fn taskToolSchema(self: *const SubagentRegistry, writer: anytype) !void {
-        try writer.writeAll("{\"name\":\"task\",\"description\":\"");
-        try writeJsonEscaped(writer, "Delegate work to a subagent. Returns the subagent's final summary.");
-        try writer.writeAll("\",\"parameters\":{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\",\"enum\":[");
+    pub fn writeTaskInputSchema(self: *const SubagentRegistry, writer: anytype) !void {
+        try writer.writeAll("{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\",\"enum\":[");
         for (self.entries.items, 0..) |entry, i| {
             if (i > 0) try writer.writeAll(",");
             try writer.writeByte('"');
@@ -134,7 +134,16 @@ pub const SubagentRegistry = struct {
         try writeAgentEnumDescription(self, writer);
         try writer.writeAll("},\"prompt\":{\"type\":\"string\",\"description\":\"");
         try writeJsonEscaped(writer, "The task for the subagent.");
-        try writer.writeAll("\"}},\"required\":[\"agent\",\"prompt\"]}}");
+        try writer.writeAll("\"}},\"required\":[\"agent\",\"prompt\"],\"additionalProperties\":false}");
+    }
+
+    /// Allocate and return the minified JSON Schema for the `task` tool's
+    /// `input_schema`. Caller owns the returned slice.
+    pub fn taskInputSchemaJson(self: *const SubagentRegistry, alloc: Allocator) ![]u8 {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(alloc);
+        try self.writeTaskInputSchema(list.writer(alloc));
+        return list.toOwnedSlice(alloc);
     }
 };
 
@@ -324,7 +333,7 @@ test "lookup returns null for unknown" {
     try testing.expect(registry.lookup("bar") == null);
 }
 
-test "taskToolSchema emits enum and per-entry description" {
+test "writeTaskInputSchema emits enum and per-entry description" {
     const alloc = testing.allocator;
 
     var registry: SubagentRegistry = .{};
@@ -343,19 +352,18 @@ test "taskToolSchema emits enum and per-entry description" {
 
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try registry.taskToolSchema(fbs.writer());
+    try registry.writeTaskInputSchema(fbs.writer());
     const out = fbs.getWritten();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
     defer parsed.deinit();
 
-    const root = switch (parsed.value) {
+    const params = switch (parsed.value) {
         .object => |o| o,
         else => return error.TestUnexpectedResult,
     };
-    try testing.expectEqualStrings("task", root.get("name").?.string);
+    try testing.expectEqualStrings("object", params.get("type").?.string);
 
-    const params = root.get("parameters").?.object;
     const props = params.get("properties").?.object;
     const agent = props.get("agent").?.object;
 
@@ -377,9 +385,11 @@ test "taskToolSchema emits enum and per-entry description" {
     try testing.expectEqual(@as(usize, 2), required.len);
     try testing.expectEqualStrings("agent", required[0].string);
     try testing.expectEqualStrings("prompt", required[1].string);
+
+    try testing.expectEqual(false, params.get("additionalProperties").?.bool);
 }
 
-test "taskToolSchema handles empty registry" {
+test "writeTaskInputSchema handles empty registry" {
     const alloc = testing.allocator;
 
     var registry: SubagentRegistry = .{};
@@ -387,15 +397,39 @@ test "taskToolSchema handles empty registry" {
 
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try registry.taskToolSchema(fbs.writer());
+    try registry.writeTaskInputSchema(fbs.writer());
     const out = fbs.getWritten();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
-    const params = root.get("parameters").?.object;
+    const params = parsed.value.object;
     const agent = params.get("properties").?.object.get("agent").?.object;
     const enum_items = agent.get("enum").?.array.items;
     try testing.expectEqual(@as(usize, 0), enum_items.len);
+}
+
+test "taskInputSchemaJson returns owned slice with enum names" {
+    const alloc = testing.allocator;
+
+    var registry: SubagentRegistry = .{};
+    defer registry.deinit(alloc);
+
+    try registry.register(alloc, .{
+        .name = "reviewer",
+        .description = "Reviews diffs.",
+        .prompt = "p",
+    });
+    try registry.register(alloc, .{
+        .name = "planner",
+        .description = "Plans work.",
+        .prompt = "p",
+    });
+
+    const json = try registry.taskInputSchemaJson(alloc);
+    defer alloc.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"reviewer\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"planner\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"enum\"") != null);
 }
