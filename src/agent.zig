@@ -116,7 +116,25 @@ pub fn runLoopStreaming(
         // engine is wired in, because the queue lives on the engine.
         if (lua_engine) |engine| try Harness.injectReminders(messages, &engine.reminders, allocator);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, tool_defs, allocator, queue, cancel);
+        // Fire the tool gate once per turn before `callLlm`. A nil/empty
+        // / errored result falls back to the full registry; a non-empty
+        // allowlist filters the LLM-visible tool list for this turn.
+        // Tool dispatch downstream still uses the unfiltered registry
+        // (there is no Subset wiring in `executeTools`); the gate's
+        // semantic contract is "what the LLM can see," not "what the
+        // process can run." A model that requests a hidden tool falls
+        // through to the registry's existing unknown-tool error path.
+        const turn_tool_defs, const filtered_owned = try gateToolDefs(
+            lua_engine,
+            layer_ctx.model.model_id,
+            tool_defs,
+            allocator,
+            queue,
+            cancel,
+        );
+        defer if (filtered_owned) |d| allocator.free(d);
+
+        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);
 
@@ -201,6 +219,127 @@ fn fireLifecycleHook(
             if (cancel.load(.acquire)) return;
         }
     }
+}
+
+/// Fire `zag.tools.gate` once per turn before `callLlm` and block on
+/// a main-thread round-trip. Returns the duped allowlist (caller owns
+/// outer slice + every interior string; release via the helper on the
+/// `ToolGateRequest` or by walking the slice manually) or null when no
+/// handler is registered, the handler returned nil/empty, or it
+/// errored. Skips the round-trip entirely when no engine is present
+/// or the gate slot is empty so the no-op fast path stays cheap.
+fn fireToolGate(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    model: []const u8,
+    available_tools: []const []const u8,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !?[]const []const u8 {
+    const engine = lua_engine orelse return null;
+    if (engine.tool_gate_handler == null) return null;
+
+    var req = agent_events.ToolGateRequest.init(model, available_tools, allocator);
+    queue.push(.{ .tool_gate_request = &req }) catch return null;
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                req.freeResult();
+                return error.Cancelled;
+            }
+        }
+    }
+    if (req.error_name) |name| {
+        log.warn("tool gate handler failed: {s}", .{name});
+        req.freeResult();
+        return null;
+    }
+    return req.result;
+}
+
+/// Build a filtered `tool_defs` slice keyed by the gate's allowlist.
+/// Preserves the order the gate returned; entries not present in the
+/// full registry are silently dropped (the gate may name a tool that
+/// was hidden by an earlier subset). Caller owns the returned slice
+/// and frees with `allocator.free`.
+fn applyToolGate(
+    full: []const types.ToolDefinition,
+    allowed: []const []const u8,
+    allocator: Allocator,
+) ![]const types.ToolDefinition {
+    var filtered: std.ArrayList(types.ToolDefinition) = .empty;
+    errdefer filtered.deinit(allocator);
+    for (allowed) |name| {
+        for (full) |def| {
+            if (std.mem.eql(u8, def.name, name)) {
+                try filtered.append(allocator, def);
+                break;
+            }
+        }
+    }
+    return filtered.toOwnedSlice(allocator);
+}
+
+/// Run the gate and project the result back to `tool_defs`.
+///
+/// Returns a tuple `{visible, owned}`:
+/// - `visible` is the slice the LLM request sees (either `tool_defs`
+///   verbatim when the gate is absent / no-op, or a freshly allocated
+///   filtered slice).
+/// - `owned` is non-null only when `visible` was allocated here; the
+///   caller frees it after `callLlm` returns. When the gate fell back
+///   (no handler, errored, returned an empty list, or all entries
+///   missed the registry), `owned` is null and `visible` aliases
+///   `tool_defs`.
+///
+/// The "available_tools" array passed to the gate is built and freed
+/// inside this helper so the caller never sees it. Names borrowed
+/// from `tool_defs[i].name` are stable for the lifetime of `tool_defs`,
+/// so we hand them to the gate without duping.
+fn gateToolDefs(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    model_id: []const u8,
+    tool_defs: []const types.ToolDefinition,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !struct { []const types.ToolDefinition, ?[]const types.ToolDefinition } {
+    // Cheap fast-path: if no engine or no gate handler is registered,
+    // skip the allocation entirely. fireToolGate returns null in both
+    // cases, but checking up front avoids the `available_tools` build.
+    if (lua_engine == null or lua_engine.?.tool_gate_handler == null) {
+        return .{ tool_defs, null };
+    }
+
+    const available_tools = try allocator.alloc([]const u8, tool_defs.len);
+    defer allocator.free(available_tools);
+    for (tool_defs, 0..) |def, i| available_tools[i] = def.name;
+
+    const gate_result = (try fireToolGate(
+        lua_engine,
+        model_id,
+        available_tools,
+        allocator,
+        queue,
+        cancel,
+    )) orelse return .{ tool_defs, null };
+    // Always free the duped name list after we've consumed it.
+    defer {
+        for (gate_result) |n| allocator.free(n);
+        allocator.free(gate_result);
+    }
+
+    if (gate_result.len == 0) return .{ tool_defs, null };
+
+    const filtered = applyToolGate(tool_defs, gate_result, allocator) catch
+        return .{ tool_defs, null };
+    if (filtered.len == 0) {
+        allocator.free(filtered);
+        return .{ tool_defs, null };
+    }
+    return .{ filtered, filtered };
 }
 
 /// Per-call state threaded through the streaming callback. Keeps the queue,
@@ -1278,6 +1417,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
+                .tool_gate_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
                 .thinking_stop, .done, .reset_assistant_text => {},
             }
         }
@@ -2141,4 +2284,194 @@ test "mid-turn user message wraps as a system-reminder interrupt on next iterati
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings(expected, second_pass);
+}
+
+// -- Tool gate tests ---------------------------------------------------------
+//
+// `gateToolDefs` round-trips the registered Lua handler through the event
+// queue, so each test spawns a Pump thread that calls
+// `AgentRunner.dispatchHookRequests` until the helper returns.
+
+const GateTestHarness = struct {
+    queue: *agent_events.EventQueue,
+    engine: ?*LuaEngine.LuaEngine,
+    stop: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn pump(q: *agent_events.EventQueue, eng: ?*LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+        const AgentRunnerLocal = @import("AgentRunner.zig");
+        while (!stop_flag.load(.acquire)) {
+            AgentRunnerLocal.dispatchHookRequests(q, eng, null);
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        AgentRunnerLocal.dispatchHookRequests(q, eng, null);
+    }
+};
+
+fn buildGateToolDefs() [3]types.ToolDefinition {
+    return .{
+        .{ .name = "read", .description = "read", .input_schema_json = "{\"type\":\"object\"}" },
+        .{ .name = "write", .description = "write", .input_schema_json = "{\"type\":\"object\"}" },
+        .{ .name = "bash", .description = "bash", .input_schema_json = "{\"type\":\"object\"}" },
+    };
+}
+
+test "gateToolDefs filters tool defs to gate's allowlist" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read", "bash" } end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const defs = buildGateToolDefs();
+    const visible, const owned = try gateToolDefs(&engine, "ollama/qwen3-coder", &defs, alloc, &queue, &cancel);
+    defer if (owned) |d| alloc.free(d);
+
+    try std.testing.expect(owned != null);
+    try std.testing.expectEqual(@as(usize, 2), visible.len);
+    try std.testing.expectEqualStrings("read", visible[0].name);
+    try std.testing.expectEqualStrings("bash", visible[1].name);
+}
+
+test "gateToolDefs falls back to full tool defs when gate returns nil" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return nil end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const defs = buildGateToolDefs();
+    const visible, const owned = try gateToolDefs(&engine, "m", &defs, alloc, &queue, &cancel);
+    defer if (owned) |d| alloc.free(d);
+
+    try std.testing.expect(owned == null);
+    try std.testing.expectEqual(@as(usize, 3), visible.len);
+}
+
+test "gateToolDefs falls back to full tool defs when gate errors" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) error("blew up") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const defs = buildGateToolDefs();
+    const visible, const owned = try gateToolDefs(&engine, "m", &defs, alloc, &queue, &cancel);
+    defer if (owned) |d| alloc.free(d);
+
+    try std.testing.expect(owned == null);
+    try std.testing.expectEqual(@as(usize, 3), visible.len);
+}
+
+test "gateToolDefs bypasses round-trip when no handler is registered" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    // No pump thread: if gateToolDefs incorrectly pushed a request the
+    // test would hang on `done.wait`, so the absence of a dispatcher is
+    // the assertion that the fast-path skips the round-trip entirely.
+
+    const defs = buildGateToolDefs();
+    const visible, const owned = try gateToolDefs(&engine, "m", &defs, alloc, &queue, &cancel);
+    defer if (owned) |d| alloc.free(d);
+
+    try std.testing.expect(owned == null);
+    try std.testing.expectEqual(@as(usize, 3), visible.len);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "gateToolDefs bypasses round-trip when engine is null" {
+    const alloc = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const defs = buildGateToolDefs();
+    const visible, const owned = try gateToolDefs(null, "m", &defs, alloc, &queue, &cancel);
+    defer if (owned) |d| alloc.free(d);
+
+    try std.testing.expect(owned == null);
+    try std.testing.expectEqual(@as(usize, 3), visible.len);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "gateToolDefs drops gate names that do not exist in the registry" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // Gate names "read" (exists) plus "ghost" (does not). The unknown name
+    // is dropped silently so the LLM-visible list stays clean.
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read", "ghost" } end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const defs = buildGateToolDefs();
+    const visible, const owned = try gateToolDefs(&engine, "m", &defs, alloc, &queue, &cancel);
+    defer if (owned) |d| alloc.free(d);
+
+    try std.testing.expect(owned != null);
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqualStrings("read", visible[0].name);
 }

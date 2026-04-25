@@ -532,6 +532,18 @@ pub fn dispatchHookRequests(
                 // engine is a clean miss; always signal done.
                 req.done.set();
             },
+            .tool_gate_request => |req| {
+                if (engine) |eng| {
+                    eng.handleToolGateRequest(req) catch |err| {
+                        req.error_name = @errorName(err);
+                    };
+                }
+                // No engine means no gate can be registered; clean miss
+                // (result stays null) so the worker proceeds with the
+                // full registry. Always signal done so the producer
+                // doesn't park forever.
+                req.done.set();
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -745,6 +757,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             req.done.set();
         },
         .tool_transform_request => |req| {
+            req.error_name = "drained_without_dispatch";
+            req.done.set();
+        },
+        .tool_gate_request => |req| {
             req.error_name = "drained_without_dispatch";
             req.done.set();
         },
@@ -1317,6 +1333,92 @@ test "tool_transform_request with no engine signals done" {
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.result == null);
     try std.testing.expect(req.error_name == null);
+}
+
+test "tool_gate_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read", "bash" } end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const tool_names = [_][]const u8{ "read", "write", "bash" };
+    var req = agent_events.ToolGateRequest.init("ollama/qwen3-coder", &tool_names, alloc);
+    defer req.freeResult();
+
+    try queue.push(.{ .tool_gate_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqual(@as(usize, 2), req.result.?.len);
+    try std.testing.expectEqualStrings("read", req.result.?[0]);
+    try std.testing.expectEqualStrings("bash", req.result.?[1]);
+}
+
+test "tool_gate_request with no handler completes cleanly" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    try queue.push(.{ .tool_gate_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "tool_gate_request with no engine signals done" {
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    try queue.push(.{ .tool_gate_request = &req });
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "tool_gate_request handler error sets error_name" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) error("nope") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    try queue.push(.{ .tool_gate_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name != null);
+    try std.testing.expectEqualStrings("LuaHandlerError", req.error_name.?);
 }
 
 test "prompt_assembly_request with no engine signals error_name" {

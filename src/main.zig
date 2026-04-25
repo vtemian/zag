@@ -748,6 +748,10 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
+                .tool_gate_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
             }
         }
     }

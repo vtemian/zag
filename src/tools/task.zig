@@ -454,6 +454,10 @@ fn handleChildEvent(
             req.error_name = "subagent_unsupported";
             req.done.set();
         },
+        .tool_gate_request => |req| {
+            req.error_name = "subagent_unsupported";
+            req.done.set();
+        },
     }
 }
 
