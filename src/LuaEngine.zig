@@ -10478,6 +10478,95 @@ test "loadBuiltinPlugins eager-loads zag.layers.* entries" {
     try std.testing.expect(found_env);
 }
 
+test "agents_md integration: eager-loaded layer pulls parent AGENTS.md into assembled prompt" {
+    // End-to-end integration for PR 6: real LuaEngine, real eager-load
+    // of `zag.layers.*`, real `renderPromptLayers`. Verifies the full
+    // chain a turn travels: builtin layers seeded -> Lua layers loaded
+    // -> walk-up loader resolves an ancestor AGENTS.md -> assembled
+    // volatile half carries the `<instructions>` block.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Prefer TDD." });
+    try tmp.dir.makePath("nested/leaf");
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+    const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
+    defer std.testing.allocator.free(leaf);
+
+    // Production path: no manual `require`, just the eager-loader.
+    engine.loadBuiltinPlugins();
+
+    var found_layer = false;
+    for (engine.prompt_registry.layers.items) |layer| {
+        if (std.mem.eql(u8, layer.name, "agents_md")) {
+            found_layer = true;
+            try std.testing.expectEqual(prompt.CacheClass.@"volatile", layer.cache_class);
+            try std.testing.expectEqual(@as(i32, 900), layer.priority);
+        }
+    }
+    try std.testing.expect(found_layer);
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = leaf;
+    ctx.worktree = root;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    const tail = assembled.@"volatile";
+    try std.testing.expect(std.mem.indexOf(u8, tail, "<instructions from=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "Prefer TDD.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "</instructions>") != null);
+
+    // Stable half stays free of project-specific instructions; only the
+    // identity / tool_list / guidelines built-ins live there.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "<instructions"),
+    );
+}
+
+test "agents_md integration: assembled prompt omits instructions block when no file is found" {
+    // Negative half of the integration: same eager-loaded layer set, but
+    // the tmp tree has no AGENTS.md / CLAUDE.md / CONTEXT.md anywhere
+    // between cwd and worktree. The agents_md layer must contribute
+    // nothing so the assembled prompt stays clean.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("nested/leaf");
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+    const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
+    defer std.testing.allocator.free(leaf);
+
+    engine.loadBuiltinPlugins();
+
+    var ctx = fakePromptLayerContext();
+    ctx.cwd = leaf;
+    ctx.worktree = root;
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.@"volatile", "<instructions"),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "<instructions"),
+    );
+}
+
 test "zag.parse_frontmatter returns fields and body" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
