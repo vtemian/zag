@@ -631,13 +631,13 @@ fn onUserInputSubmitted(
 
     if (runner.isAgentRunning()) return;
 
-    const spec = llm.parseModelString(self.provider.model_id);
+    const spec = llm.resolveModelSpec(&self.provider.registry, self.provider.model_id);
     try runner.submit(&session.messages, .{
         .allocator = self.allocator,
         .wake_write_fd = self.wake_write_fd,
         .lua_engine = self.lua_engine,
         .provider = self.provider.provider,
-        .provider_name = spec.provider_name,
+        .model_spec = spec,
         .registry = self.registry,
         .subagents = if (self.lua_engine) |eng| eng.subagentRegistry() else null,
     });

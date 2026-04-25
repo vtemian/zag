@@ -231,6 +231,7 @@ fn runChild(
         .lua_engine = ctx.lua_engine,
         .provider = ctx.provider,
         .provider_name = ctx.provider_name,
+        .model_spec = ctx.model_spec,
         .parent_ctx = ctx,
     }});
 
@@ -291,6 +292,10 @@ const ChildArgs = struct {
     lua_engine: ?*@import("../LuaEngine.zig").LuaEngine,
     provider: @import("../llm.zig").Provider,
     provider_name: []const u8,
+    /// Resolved model identity inherited from the parent run so the
+    /// subagent's `runLoopStreaming` drives the per-model prompt pack
+    /// and compact threshold off real values.
+    model_spec: @import("../llm.zig").ModelSpec,
     /// Parent runner's TaskContext, captured at spawn time. The child
     /// thread reads `task_depth`, `subagents`, `session_handle`, and the
     /// rest off this pointer to build its own TaskContext so any nested
@@ -310,6 +315,7 @@ fn buildChildContext(parent_ctx: *const tools.TaskContext, args: ChildArgs) tool
         .subagents = parent_ctx.subagents,
         .provider = args.provider,
         .provider_name = args.provider_name,
+        .model_spec = args.model_spec,
         .registry = args.registry,
         .session_handle = parent_ctx.session_handle,
         .lua_engine = args.lua_engine,
@@ -337,6 +343,18 @@ fn childThreadMain(args: ChildArgs) void {
     // stays unread; pass a stack-allocated cell to satisfy the signature.
     var turn_in_progress = std.atomic.Value(bool).init(false);
 
+    // Subagents inherit the parent's `provider_name` and `model_id` so
+    // their `runLoopStreaming` drives the same per-model prompt pack as
+    // the parent. The compact threshold is intentionally suppressed
+    // here: the strategy socket is a parent-loop concern, and a child
+    // run that hits its model's ceiling surfaces as a normal `MaxTokens`
+    // stop. Building a fresh spec with `context_window = 0` keeps that
+    // contract while keeping the prompt-pack identity intact.
+    const child_model_spec: @import("../llm.zig").ModelSpec = .{
+        .provider_name = args.model_spec.provider_name,
+        .model_id = args.model_spec.model_id,
+        .context_window = 0,
+    };
     agent.runLoopStreaming(
         args.messages,
         args.registry,
@@ -347,10 +365,7 @@ fn childThreadMain(args: ChildArgs) void {
         args.lua_engine,
         null,
         &turn_in_progress,
-        // Subagents inherit no compaction context window: the strategy
-        // socket is a parent-loop concern, and a child run that hits
-        // its model's ceiling surfaces as a normal `MaxTokens` stop.
-        0,
+        child_model_spec,
     ) catch |err| {
         // Surface the failure as a text message so the parent sees it in
         // the collected output rather than a silent empty result.
@@ -600,6 +615,7 @@ test "task returns error for unknown agent" {
         .subagents = &subagent_registry,
         .provider = dummy_provider,
         .provider_name = "test",
+        .model_spec = .{ .provider_name = "test", .model_id = "test" },
         .registry = &parent_registry,
         .session_handle = null,
         .lua_engine = null,
@@ -641,6 +657,7 @@ test "task hits recursion cap at max depth" {
         .subagents = &subagent_registry,
         .provider = dummy_provider,
         .provider_name = "test",
+        .model_spec = .{ .provider_name = "test", .model_id = "test" },
         .registry = &parent_registry,
         .session_handle = null,
         .lua_engine = null,
@@ -725,6 +742,7 @@ test "buildChildContext increments depth and inherits parent state" {
         .subagents = &subagent_registry,
         .provider = dummy_provider,
         .provider_name = "test",
+        .model_spec = .{ .provider_name = "test", .model_id = "test" },
         .registry = &parent_registry,
         .session_handle = null,
         .lua_engine = null,
@@ -741,6 +759,7 @@ test "buildChildContext increments depth and inherits parent state" {
         .lua_engine = null,
         .provider = dummy_provider,
         .provider_name = "test",
+        .model_spec = .{ .provider_name = "test", .model_id = "test" },
         .parent_ctx = &parent,
     };
 
@@ -750,6 +769,7 @@ test "buildChildContext increments depth and inherits parent state" {
     try testing.expectEqual(parent.session_handle, child.session_handle);
     try testing.expect(child.registry == &child_registry);
     try testing.expectEqualStrings("test", child.provider_name);
+    try testing.expectEqualStrings("test", child.model_spec.model_id);
 }
 
 fn restoreCwdForTest(abs_path: []const u8) void {

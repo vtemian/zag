@@ -552,7 +552,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     defer env_snapshot.deinit();
 
     const layer_ctx: prompt.LayerContext = .{
-        .model = llm.parseModelString(deps.model_id),
+        .model = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id),
         .cwd = env_snapshot.cwd,
         .worktree = env_snapshot.worktree,
         .agent_name = "zag",
@@ -577,13 +577,13 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
     const started_at = std.time.milliTimestamp();
     try capture.beginTurn(started_at);
 
-    const spec = llm.parseModelString(deps.model_id);
+    const spec = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id);
     try deps.runner.submit(&deps.session.messages, .{
         .allocator = gpa,
         .wake_write_fd = deps.wake_write_fd,
         .lua_engine = deps.lua_engine,
         .provider = deps.provider.*,
-        .provider_name = spec.provider_name,
+        .model_spec = spec,
         .registry = deps.registry,
         .subagents = if (deps.lua_engine) |eng| eng.subagentRegistry() else null,
     });
