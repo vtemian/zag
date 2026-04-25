@@ -207,6 +207,164 @@ fn kindFromSlice(s: []const u8) ?EntryKind {
     return null;
 }
 
+// -- turn grouping -----------------------------------------------------------
+
+pub const ToolRoundTrip = struct {
+    /// Synthetic id "synth_N" assigned in turn order. Matches the convention
+    /// in `ConversationHistory.rebuildMessages` so a future replay-gen test
+    /// can correlate against zag's own JSONL rebuild path. Owned.
+    id: []const u8,
+    /// Borrowed pointer into the entries slice passed to `groupTurns`.
+    call: *const Entry,
+    /// Borrowed pointer; null if the turn ended before the matching
+    /// tool_result was written (rare; would require mid-turn truncation).
+    result: ?*const Entry = null,
+};
+
+pub const Turn = struct {
+    /// User message that started this turn. Borrowed pointer into entries.
+    /// Null for the implicit initial turn (assistant_text or notes appearing
+    /// before any user_message).
+    user: ?*const Entry,
+    /// Assistant text entries belonging to this turn, in order. Borrowed.
+    assistant_text: []const *const Entry,
+    /// Tool round-trips in this turn (tool_call paired with its tool_result
+    /// by order). Owned slice; each `ToolRoundTrip.id` is owned, `call` and
+    /// `result` are borrowed pointers into the entries slice.
+    tools: []ToolRoundTrip,
+    /// Comment-worthy entries (info/err/session_rename) interleaved in this
+    /// turn. Borrowed pointers; rendered as scenario comments by the emitter.
+    notes: []const *const Entry,
+};
+
+/// Group `entries` into Turns. A new Turn starts on each `user_message`. If
+/// `assistant_text` or a note appears before any user_message, an implicit
+/// turn with `user = null` is created to host them. `info`, `err`, and
+/// `session_rename` attach to the surrounding turn as `notes`. `tool_result`
+/// pairs with the most-recent unmatched `tool_call` in the same turn (by
+/// order; the writer never emits an id field). `session_start` is dropped.
+///
+/// Caller owns the returned slice and each Turn's owned sub-allocations;
+/// release with `freeTurns`.
+pub fn groupTurns(alloc: Allocator, entries: []const Entry) ![]Turn {
+    var turns: std.ArrayList(Turn) = .empty;
+    errdefer {
+        for (turns.items) |t| freeTurnInner(alloc, t);
+        turns.deinit(alloc);
+    }
+
+    var current: ?TurnBuilder = null;
+    errdefer if (current) |*c| c.deinit(alloc);
+
+    var synth_counter: u32 = 0;
+
+    for (entries) |*entry| {
+        switch (entry.kind) {
+            .session_start => continue,
+            .user_message => {
+                if (current) |*c| {
+                    const finished = try c.finish(alloc);
+                    try turns.append(alloc, finished);
+                }
+                current = TurnBuilder.init(entry);
+            },
+            .assistant_text => {
+                if (current == null) current = TurnBuilder.init(null);
+                try current.?.assistant_text.append(alloc, entry);
+            },
+            .tool_call => {
+                if (current == null) current = TurnBuilder.init(null);
+                const id = try std.fmt.allocPrint(alloc, "synth_{d}", .{synth_counter});
+                synth_counter += 1;
+                errdefer alloc.free(id);
+                try current.?.tools.append(alloc, .{ .id = id, .call = entry, .result = null });
+            },
+            .tool_result => {
+                if (current == null) current = TurnBuilder.init(null);
+                // Pair with the most-recent unmatched call in this turn.
+                var matched = false;
+                var i = current.?.tools.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (current.?.tools.items[i].result == null) {
+                        current.?.tools.items[i].result = entry;
+                        matched = true;
+                        break;
+                    }
+                }
+                // Dangling result (turn boundary cut between call and result,
+                // or torn JSONL). Surface it as a note so the emitter can
+                // render it as a comment rather than dropping it silently.
+                if (!matched) try current.?.notes.append(alloc, entry);
+            },
+            .info, .err, .session_rename => {
+                if (current == null) current = TurnBuilder.init(null);
+                try current.?.notes.append(alloc, entry);
+            },
+        }
+    }
+
+    if (current) |*c| {
+        const finished = try c.finish(alloc);
+        try turns.append(alloc, finished);
+        current = null;
+    }
+
+    return turns.toOwnedSlice(alloc);
+}
+
+pub fn freeTurns(alloc: Allocator, turns: []Turn) void {
+    for (turns) |t| freeTurnInner(alloc, t);
+    alloc.free(turns);
+}
+
+const TurnBuilder = struct {
+    user: ?*const Entry,
+    assistant_text: std.ArrayList(*const Entry),
+    tools: std.ArrayList(ToolRoundTrip),
+    notes: std.ArrayList(*const Entry),
+
+    fn init(user: ?*const Entry) TurnBuilder {
+        return .{
+            .user = user,
+            .assistant_text = .empty,
+            .tools = .empty,
+            .notes = .empty,
+        };
+    }
+
+    fn deinit(self: *TurnBuilder, alloc: Allocator) void {
+        for (self.tools.items) |trt| alloc.free(trt.id);
+        self.assistant_text.deinit(alloc);
+        self.tools.deinit(alloc);
+        self.notes.deinit(alloc);
+    }
+
+    fn finish(self: *TurnBuilder, alloc: Allocator) !Turn {
+        const assistant_slice = try self.assistant_text.toOwnedSlice(alloc);
+        errdefer alloc.free(assistant_slice);
+        const tools_slice = try self.tools.toOwnedSlice(alloc);
+        errdefer {
+            for (tools_slice) |trt| alloc.free(trt.id);
+            alloc.free(tools_slice);
+        }
+        const notes_slice = try self.notes.toOwnedSlice(alloc);
+        return .{
+            .user = self.user,
+            .assistant_text = assistant_slice,
+            .tools = tools_slice,
+            .notes = notes_slice,
+        };
+    }
+};
+
+fn freeTurnInner(alloc: Allocator, t: Turn) void {
+    for (t.tools) |trt| alloc.free(trt.id);
+    alloc.free(t.tools);
+    alloc.free(t.assistant_text);
+    alloc.free(t.notes);
+}
+
 // -- tests -------------------------------------------------------------------
 
 test "parseSlice handles every entry kind" {
@@ -261,4 +419,87 @@ test "parseSlice handles empty input" {
     const entries = try parseSlice(std.testing.allocator, "");
     defer freeEntries(std.testing.allocator, entries);
     try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "groupTurns: single user turn with assistant reply" {
+    const src =
+        \\{"type":"session_start","ts":1}
+        \\{"type":"user_message","content":"hi","ts":2}
+        \\{"type":"assistant_text","content":"hello","ts":3}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+    try std.testing.expectEqual(@as(usize, 1), turns.len);
+    try std.testing.expect(turns[0].user != null);
+    try std.testing.expectEqualStrings("hi", turns[0].user.?.content);
+    try std.testing.expectEqual(@as(usize, 1), turns[0].assistant_text.len);
+    try std.testing.expectEqualStrings("hello", turns[0].assistant_text[0].content);
+}
+
+test "groupTurns: tool round-trip pairs by order" {
+    const src =
+        \\{"type":"user_message","content":"do it","ts":1}
+        \\{"type":"tool_call","tool_name":"bash","tool_input":"{\"cmd\":\"ls\"}","ts":2}
+        \\{"type":"tool_result","content":"file1","is_error":false,"ts":3}
+        \\{"type":"assistant_text","content":"done","ts":4}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+    try std.testing.expectEqual(@as(usize, 1), turns.len);
+    try std.testing.expectEqual(@as(usize, 1), turns[0].tools.len);
+    try std.testing.expectEqualStrings("synth_0", turns[0].tools[0].id);
+    try std.testing.expect(turns[0].tools[0].result != null);
+    try std.testing.expectEqualStrings("file1", turns[0].tools[0].result.?.content);
+}
+
+test "groupTurns: synth ids continue across turns" {
+    const src =
+        \\{"type":"user_message","content":"a","ts":1}
+        \\{"type":"tool_call","tool_name":"x","tool_input":"{}","ts":2}
+        \\{"type":"tool_result","content":"r","ts":3}
+        \\{"type":"user_message","content":"b","ts":4}
+        \\{"type":"tool_call","tool_name":"y","tool_input":"{}","ts":5}
+        \\{"type":"tool_result","content":"r2","ts":6}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+    try std.testing.expectEqual(@as(usize, 2), turns.len);
+    try std.testing.expectEqualStrings("synth_0", turns[0].tools[0].id);
+    try std.testing.expectEqualStrings("synth_1", turns[1].tools[0].id);
+}
+
+test "groupTurns: info and err entries become notes on the surrounding turn" {
+    const src =
+        \\{"type":"user_message","content":"hi","ts":1}
+        \\{"type":"info","content":"tok 10/5","ts":2}
+        \\{"type":"assistant_text","content":"ok","ts":3}
+        \\{"type":"err","content":"warn","ts":4}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+    try std.testing.expectEqual(@as(usize, 1), turns.len);
+    try std.testing.expectEqual(@as(usize, 2), turns[0].notes.len);
+    try std.testing.expectEqual(EntryKind.info, turns[0].notes[0].kind);
+    try std.testing.expectEqual(EntryKind.err, turns[0].notes[1].kind);
+}
+
+test "groupTurns: assistant_text without preceding user_message creates user-null turn" {
+    const src =
+        \\{"type":"assistant_text","content":"hello","ts":1}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+    try std.testing.expectEqual(@as(usize, 1), turns.len);
+    try std.testing.expect(turns[0].user == null);
+    try std.testing.expectEqual(@as(usize, 1), turns[0].assistant_text.len);
 }
