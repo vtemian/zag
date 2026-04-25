@@ -129,15 +129,7 @@ pub fn runLoopStreaming(
             queue,
             cancel,
         )) |replacement| {
-            // Free the existing history before installing the
-            // replacement. `messages` owns each `Message`'s content
-            // slice via the agent-thread allocator; the strategy duped
-            // its return through the same allocator so ownership
-            // transfers cleanly.
-            for (messages.items) |m| m.deinit(allocator);
-            messages.clearRetainingCapacity();
-            try messages.appendSlice(allocator, replacement);
-            allocator.free(replacement);
+            try installCompactReplacement(messages, allocator, replacement);
         }
 
         // Mark the turn as in-flight so `EventOrchestrator.onUserInputSubmitted`
@@ -929,6 +921,31 @@ fn fireCompact(
     // `freeResult` is a no-op if the caller drops the request later.
     req.result = null;
     return replacement;
+}
+
+/// Swap `replacement` into `messages` without losing history if the
+/// underlying ArrayList grow fails. Reserving capacity first turns the
+/// later append into an infallible memcpy, so the originals are only
+/// freed once we know the swap will succeed. On OOM the originals stay
+/// untouched and the replacement (each duped Message plus the outer
+/// slice) is freed before the error propagates.
+///
+/// Both `messages` storage and `replacement` (outer slice and each
+/// `Message`'s content) are owned by `allocator`.
+fn installCompactReplacement(
+    messages: *std.ArrayList(types.Message),
+    allocator: Allocator,
+    replacement: []types.Message,
+) !void {
+    messages.ensureTotalCapacity(allocator, replacement.len) catch |err| {
+        for (replacement) |m| m.deinit(allocator);
+        allocator.free(replacement);
+        return err;
+    };
+    for (messages.items) |m| m.deinit(allocator);
+    messages.clearRetainingCapacity();
+    messages.appendSliceAssumeCapacity(replacement);
+    allocator.free(replacement);
 }
 
 /// Inspect a freshly built tool-result content slice and report
@@ -3131,6 +3148,79 @@ test "fireCompact returns null and warns on strategy error" {
 
     const replacement = try fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
+}
+
+// Build a single-block text message owned by `allocator`, suitable for
+// drop-in into `messages` or `replacement` slices in the install tests.
+fn makeTextMessage(allocator: Allocator, role: types.Role, body: []const u8) !types.Message {
+    const text = try allocator.dupe(u8, body);
+    errdefer allocator.free(text);
+    const blocks = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(blocks);
+    blocks[0] = .{ .text = .{ .text = text } };
+    return .{ .role = role, .content = blocks };
+}
+
+test "installCompactReplacement happy path swaps and frees originals" {
+    const alloc = std.testing.allocator;
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+    try messages.append(alloc, try makeTextMessage(alloc, .user, "old-1"));
+    try messages.append(alloc, try makeTextMessage(alloc, .assistant, "old-2"));
+
+    const replacement = try alloc.alloc(types.Message, 1);
+    replacement[0] = try makeTextMessage(alloc, .user, "new-1");
+
+    try installCompactReplacement(&messages, alloc, replacement);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(types.Role.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("new-1", messages.items[0].content[0].text.text);
+}
+
+test "installCompactReplacement OOM keeps originals and frees replacement" {
+    const alloc = std.testing.allocator;
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(alloc);
+        messages.deinit(alloc);
+    }
+    try messages.append(alloc, try makeTextMessage(alloc, .user, "old-1"));
+    try messages.append(alloc, try makeTextMessage(alloc, .assistant, "old-2"));
+
+    // Allocate the replacement under the real allocator. The wrapping
+    // FailingAllocator is wired only into `installCompactReplacement`'s
+    // ArrayList grow attempt, so its fail_index must trip exactly that
+    // call. Each replacement Message and the outer slice are owned by
+    // `alloc`, matching the run-loop's invariant.
+    const replacement = try alloc.alloc(types.Message, 8);
+    replacement[0] = try makeTextMessage(alloc, .user, "new-1");
+    replacement[1] = try makeTextMessage(alloc, .user, "new-2");
+    replacement[2] = try makeTextMessage(alloc, .user, "new-3");
+    replacement[3] = try makeTextMessage(alloc, .user, "new-4");
+    replacement[4] = try makeTextMessage(alloc, .user, "new-5");
+    replacement[5] = try makeTextMessage(alloc, .user, "new-6");
+    replacement[6] = try makeTextMessage(alloc, .user, "new-7");
+    replacement[7] = try makeTextMessage(alloc, .user, "new-8");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const fa = failing.allocator();
+
+    const result = installCompactReplacement(&messages, fa, replacement);
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // Originals untouched: same length, same content.
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("old-1", messages.items[0].content[0].text.text);
+    try std.testing.expectEqualStrings("old-2", messages.items[1].content[0].text.text);
+    // Replacement-side leak detection is enforced by `testing.allocator`
+    // at test teardown; if installCompactReplacement skipped freeing
+    // any duped Message or the outer slice, this test would fail.
 }
 
 test "fireLoopDetect nil return returns null" {
