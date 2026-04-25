@@ -36,6 +36,8 @@ pub const entries = [_]Entry{
     .{ .name = "zag.prompt.anthropic", .code = @embedFile("zag/prompt/anthropic.lua") },
     .{ .name = "zag.prompt.openai-codex", .code = @embedFile("zag/prompt/openai-codex.lua") },
     .{ .name = "zag.prompt.default", .code = @embedFile("zag/prompt/default.lua") },
+    .{ .name = "zag.transforms.rg_trim", .code = @embedFile("zag/transforms/rg_trim.lua") },
+    .{ .name = "zag.transforms.bash_trim", .code = @embedFile("zag/transforms/bash_trim.lua") },
 };
 
 /// Find an entry by its dotted module name. Returns null if not found.
@@ -48,7 +50,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 18), entries.len);
+    try std.testing.expectEqual(@as(usize, 20), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -103,6 +105,18 @@ test "find returns the entry for the default prompt pack" {
     try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.render") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "You are zag, a coding agent harness.") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "running with") == null);
+}
+
+test "find returns the entry for the rg_trim transform" {
+    const e = find("zag.transforms.rg_trim").?;
+    try std.testing.expectEqualStrings("zag.transforms.rg_trim", e.name);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tool.transform_output(\"grep\"") != null);
+}
+
+test "find returns the entry for the bash_trim transform" {
+    const e = find("zag.transforms.bash_trim").?;
+    try std.testing.expectEqualStrings("zag.transforms.bash_trim", e.name);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tool.transform_output(\"bash\"") != null);
 }
 
 test {
