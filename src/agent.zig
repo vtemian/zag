@@ -3818,3 +3818,200 @@ test "fireCompact cancel path waits for handle then frees and returns Cancelled"
     const result = fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
     try std.testing.expectError(error.Cancelled, result);
 }
+
+test "fireJitContextRequest cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  return "appended"
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const tc = types.ContentBlock.ToolUse{
+        .id = "call_jit_cancel",
+        .name = "read",
+        .input_raw = "{}",
+    };
+    const result = fireJitContextRequest(&engine, tc, "tool out", false, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+}
+
+test "fireToolTransformRequest cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool.transform_output("read", function(ctx)
+        \\  return "trimmed"
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const tc = types.ContentBlock.ToolUse{
+        .id = "call_xform_cancel",
+        .name = "read",
+        .input_raw = "{}",
+    };
+    const result = fireToolTransformRequest(&engine, tc, "tool out", false, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+}
+
+// `queue.push` returns `error.QueueFull` on a saturated ring. Each fire
+// helper swallows that with `catch return null;` so a saturated queue
+// surfaces as a quiet null, NOT as a propagated error. These tests pin
+// that contract: the helper returns null, the request struct goes out
+// of scope cleanly, and `testing.allocator` proves nothing leaked.
+test "fireToolGate returns null when queue is at capacity" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read" } end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 1);
+    defer queue.deinit();
+    // Pre-fill the single slot so the helper's push hits QueueFull.
+    try queue.push(.done);
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const tools_seen = [_][]const u8{ "read", "bash" };
+    const result = try fireToolGate(&engine, "ollama/qwen3-coder", &tools_seen, alloc, &queue, &cancel);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), result);
+}
+
+test "fireJitContextRequest returns null when queue is at capacity" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx) return "x" end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 1);
+    defer queue.deinit();
+    try queue.push(.done);
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const tc = types.ContentBlock.ToolUse{
+        .id = "call_jit_full",
+        .name = "read",
+        .input_raw = "{}",
+    };
+    const result = try fireJitContextRequest(&engine, tc, "tool out", false, alloc, &queue, &cancel);
+    try std.testing.expectEqual(@as(?[]u8, null), result);
+}
+
+test "fireToolTransformRequest returns null when queue is at capacity" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool.transform_output("read", function(ctx) return "x" end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 1);
+    defer queue.deinit();
+    try queue.push(.done);
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const tc = types.ContentBlock.ToolUse{
+        .id = "call_xform_full",
+        .name = "read",
+        .input_raw = "{}",
+    };
+    const result = try fireToolTransformRequest(&engine, tc, "tool out", false, alloc, &queue, &cancel);
+    try std.testing.expectEqual(@as(?[]u8, null), result);
+}
+
+test "fireLoopDetect returns null when queue is at capacity" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  return { action = "reminder", text = "stop" }
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 1);
+    defer queue.deinit();
+    try queue.push(.done);
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const result = try fireLoopDetect(&engine, "bash", "{}", false, 5, alloc, &queue, &cancel);
+    try std.testing.expectEqual(@as(?agent_events.LoopAction, null), result);
+}
+
+test "fireCompact returns null when queue is at capacity" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return { { role = "user", content = "kept" } }
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 1);
+    defer queue.deinit();
+    try queue.push(.done);
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+    };
+
+    // 850/1000 = 85% crosses the 80% threshold so the helper actually
+    // attempts the queue push (rather than bypassing on the fast path).
+    const result = try fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
+    try std.testing.expectEqual(@as(?[]types.Message, null), result);
+}
