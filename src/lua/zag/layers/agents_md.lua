@@ -6,10 +6,12 @@
 -- so the layer disappears from the assembled prompt instead of leaving
 -- an empty marker.
 --
--- Priority 900 keeps it in the volatile tail near `env` (priority 10)
--- and the future globals layer at 905. Cache class `volatile` because
--- AGENTS.md edits should land in the very next turn rather than wait
--- for the cache prefix to roll.
+-- Priority 900 lands in the pre_volatile band (see `Bands` in
+-- src/prompt.zig: pack 0..99, context 100..899, pre_volatile 900..999,
+-- volatile 1000+) so it renders right before the volatile tail and
+-- alongside the future globals layer at 905. Cache class `volatile`
+-- because AGENTS.md edits should land in the very next turn rather
+-- than wait for the cache prefix to roll.
 
 zag.prompt.layer({
   name = "agents_md",

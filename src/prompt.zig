@@ -22,6 +22,41 @@ const Allocator = std.mem.Allocator;
 /// change between turns without invalidating the cache.
 pub const CacheClass = enum { stable, @"volatile" };
 
+/// Named priority bands for prompt layers. Plugin authors slot their
+/// layers between built-ins by picking a value inside the matching
+/// band rather than guessing a magic number.
+///
+/// The bands carve `i32` into four contiguous ranges. Lower numbers
+/// run first, so the assembled prompt reads from `pack` at the top
+/// down through `volatile` at the tail:
+///
+/// - `0..=99`    `pack`         identity, model preamble, persona packs.
+/// - `100..=899` `context`      tool catalog, project context, skills, RAG.
+/// - `900..=999` `pre_volatile` boundary band that is technically volatile
+///                              but renders just before the volatile tail
+///                              (e.g. AGENTS.md, guidelines).
+/// - `1000..`    `volatile`     reminders, per-turn injections, anything
+///                              that should land at the very end.
+///
+/// Built-in priorities: identity=5, env=10, skills_catalog=50,
+/// tool_list=100, agents_md=900, guidelines=910.
+pub const Bands = struct {
+    pub const pack_min: i32 = 0;
+    /// Built-in `builtin.identity` registers here.
+    pub const identity: i32 = 5;
+    pub const pack_max: i32 = 99;
+
+    pub const context_min: i32 = 100;
+    /// Suggested default for plugin authors with no priority preference.
+    pub const context_default: i32 = 500;
+    pub const context_max: i32 = 899;
+
+    pub const pre_volatile_min: i32 = 900;
+    pub const pre_volatile_max: i32 = 999;
+
+    pub const volatile_min: i32 = 1000;
+};
+
 /// Where a layer was registered from. `builtin` layers are compiled in;
 /// `lua` layers are wired up through the Lua binding in PR 3.
 pub const Source = enum { builtin, lua };
@@ -63,6 +98,8 @@ pub const Layer = struct {
     /// Stable identifier for diagnostics and override lookup.
     name: []const u8,
     /// Lower runs first. Registration order breaks ties (stable sort).
+    /// See `Bands` for the named ranges that carve `i32` into pack /
+    /// context / pre-volatile / volatile sections.
     priority: i32,
     /// Controls which half of the assembled prompt this layer lands in.
     cache_class: CacheClass,
@@ -368,15 +405,14 @@ fn renderBuiltinSkillsCatalog(ctx: *const LayerContext, alloc: Allocator) anyerr
 /// (prefix), skills catalog (after identity, before tool list), tool
 /// list (middle), guidelines (suffix).
 ///
-/// Priorities are spaced so Lua-registered layers can slot in between
-/// without reshuffling builtins: identity=5, skills_catalog=50,
-/// tool_list=100, guidelines=910. The skills layer is stable so it
-/// joins the cache prefix; skill discovery happens at registry init,
-/// not per turn.
+/// Priorities are picked from the named `Bands` so Lua-registered layers
+/// can slot between builtins without reshuffling. The skills layer is
+/// stable so it joins the cache prefix; skill discovery happens at
+/// registry init, not per turn.
 pub fn registerBuiltinLayers(reg: *Registry, alloc: Allocator) !void {
     try reg.add(alloc, .{
         .name = "builtin.identity",
-        .priority = 5,
+        .priority = Bands.identity,
         .cache_class = .stable,
         .source = .builtin,
         .render_fn = renderBuiltinIdentity,
@@ -390,7 +426,7 @@ pub fn registerBuiltinLayers(reg: *Registry, alloc: Allocator) !void {
     });
     try reg.add(alloc, .{
         .name = "builtin.tool_list",
-        .priority = 100,
+        .priority = Bands.context_min,
         .cache_class = .stable,
         .source = .builtin,
         .render_fn = renderBuiltinToolList,
@@ -867,6 +903,47 @@ test "EnvSnapshot.capture populates cwd, date, and git flag" {
 
     if (snap.is_git_repo) {
         try std.testing.expect(snap.worktree.len > 0);
+    }
+}
+
+test "Bands ranges are contiguous and non-overlapping" {
+    // Adjacent bands abut without gaps or overlaps so any i32 priority
+    // falls into exactly one band.
+    try std.testing.expect(Bands.pack_min < Bands.pack_max);
+    try std.testing.expectEqual(Bands.pack_max + 1, Bands.context_min);
+    try std.testing.expect(Bands.context_min < Bands.context_max);
+    try std.testing.expectEqual(Bands.context_max + 1, Bands.pre_volatile_min);
+    try std.testing.expect(Bands.pre_volatile_min < Bands.pre_volatile_max);
+    try std.testing.expectEqual(Bands.pre_volatile_max + 1, Bands.volatile_min);
+
+    // The named anchors live inside their advertised bands.
+    try std.testing.expect(Bands.identity >= Bands.pack_min);
+    try std.testing.expect(Bands.identity <= Bands.pack_max);
+    try std.testing.expect(Bands.context_default >= Bands.context_min);
+    try std.testing.expect(Bands.context_default <= Bands.context_max);
+}
+
+test "built-in layer priorities fall in the documented bands" {
+    const alloc = std.testing.allocator;
+
+    var reg: Registry = .{};
+    defer reg.deinit(alloc);
+    try registerBuiltinLayers(&reg, alloc);
+
+    for (reg.layers.items) |layer| {
+        if (std.mem.eql(u8, layer.name, "builtin.identity")) {
+            try std.testing.expect(layer.priority >= Bands.pack_min);
+            try std.testing.expect(layer.priority <= Bands.pack_max);
+        } else if (std.mem.eql(u8, layer.name, "builtin.skills_catalog")) {
+            try std.testing.expect(layer.priority >= Bands.pack_min);
+            try std.testing.expect(layer.priority <= Bands.pack_max);
+        } else if (std.mem.eql(u8, layer.name, "builtin.tool_list")) {
+            try std.testing.expect(layer.priority >= Bands.context_min);
+            try std.testing.expect(layer.priority <= Bands.context_max);
+        } else if (std.mem.eql(u8, layer.name, "builtin.guidelines")) {
+            try std.testing.expect(layer.priority >= Bands.pre_volatile_min);
+            try std.testing.expect(layer.priority <= Bands.pre_volatile_max);
+        }
     }
 }
 

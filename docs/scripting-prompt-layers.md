@@ -11,7 +11,7 @@ Full-schema registration. Takes a single table.
 | Field         | Type                         | Required | Default      | Notes                                                                                            |
 | ------------- | ---------------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------ |
 | `name`        | string                       | yes      | -            | Diagnostic label. Must be unique within a run or later registrations shadow it.                  |
-| `priority`    | integer                      | no       | `500`        | Lower runs first. Built-ins: identity=5, env=10, skills=50, tools=100, guidelines=910.           |
+| `priority`    | integer                      | no       | `500`        | Lower runs first. See [Priority bands](#priority-bands) for the named ranges; built-ins: identity=5, env=10, skills=50, tools=100, agents_md=900, guidelines=910. |
 | `cache_class` | `"stable"` \| `"volatile"`   | no       | `"volatile"` | `stable` joins the cacheable prefix; `volatile` sits in the tail. Registering `stable` after the first render raises. |
 | `render`      | `function(ctx) -> string?`   | yes      | -            | Called on every turn. Return a string to emit, or `nil` / `""` to skip.                          |
 
@@ -30,6 +30,21 @@ zag.prompt.layer({
 ```
 
 Stable layers must register before the first turn. Register dynamic or per-turn content as `volatile`.
+
+## Priority bands
+
+`priority` is a plain integer, but the harness carves the `i32` space into four named bands so plugin authors can slot between built-ins without reading source. Pick a value inside the band that matches the layer's role rather than guessing a magic number. Source of truth: `Bands` in `src/prompt.zig`.
+
+| Range          | Band           | What lives here                                                                  |
+| -------------- | -------------- | -------------------------------------------------------------------------------- |
+| `0..=99`       | `pack`         | Identity, model preamble, persona packs. Built-in `identity=5`.                  |
+| `100..=899`    | `context`      | Tool catalog, project context, skills, RAG. Default for plugins: `500`.          |
+| `900..=999`    | `pre_volatile` | Boundary band: technically volatile but renders just before the volatile tail.   |
+| `1000..`       | `volatile`     | Reminders, per-turn injections, anything that should land at the very end.       |
+
+Built-in priorities, for reference: `identity=5`, `env=10`, `skills_catalog=50`, `tool_list=100`, `agents_md=900`, `guidelines=910`.
+
+The bands are advisory: the registry sorts strictly by `priority`, and `cache_class` (not the band) decides whether the layer joins the stable prefix or the volatile tail. The bands exist so a plugin author writing "I want my repo snapshot to land between identity and tools" can pick `priority = 60` without reading multiple Zig files.
 
 ## `zag.prompt.for_model(pattern, body)`
 

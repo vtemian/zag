@@ -6,9 +6,11 @@
 -- is cheap to run every turn.
 --
 -- Priority 10 slots between the identity layer (5) and the skills
--- catalog (50). Cache class `volatile` because the date rolls at UTC
--- midnight; keeping env in the volatile tail avoids invalidating the
--- provider's cache-prefix hash once a day.
+-- catalog (50). See `Bands` in src/prompt.zig for the named ranges
+-- (pack 0..99, context 100..899, pre_volatile 900..999, volatile 1000+).
+-- Cache class `volatile` because the date rolls at UTC midnight;
+-- keeping env in the volatile tail avoids invalidating the provider's
+-- cache-prefix hash once a day.
 
 zag.prompt.layer({
   name = "env",
