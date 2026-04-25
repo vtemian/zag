@@ -122,14 +122,24 @@ pub const Registry = struct {
         return .{ .registry = self, .names = names };
     }
 
-    /// Return an owned slice of all registered tool definitions.
+    /// Return an owned slice of all registered tool definitions, sorted by
+    /// name ascending. Stable order keeps the Anthropic prompt cache prefix
+    /// from busting across process runs: `std.StringHashMap` iteration order
+    /// is unspecified and varies with hash seeds, so the bare iterator would
+    /// reshuffle the system prompt's tool block every restart.
     pub fn definitions(self: *const Registry, allocator: Allocator) ![]const types.ToolDefinition {
         var list: std.ArrayList(types.ToolDefinition) = .empty;
         var it = self.tools.valueIterator();
         while (it.next()) |tool| {
             try list.append(allocator, tool.definition);
         }
-        return list.toOwnedSlice(allocator);
+        const slice = try list.toOwnedSlice(allocator);
+        std.mem.sort(types.ToolDefinition, slice, {}, struct {
+            fn lessThan(_: void, a: types.ToolDefinition, b: types.ToolDefinition) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lessThan);
+        return slice;
     }
 
     /// Execute a tool by name, passing raw JSON input.
@@ -497,6 +507,37 @@ test "Subset with null names has contains == true for registered tools" {
     const view = registry.subset(null);
     try std.testing.expect(view.contains("read"));
     try std.testing.expect(!view.contains("nonexistent"));
+}
+
+test "definitions returns names sorted ascending regardless of insert order" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const make = struct {
+        fn tool(name: []const u8) types.Tool {
+            return .{
+                .definition = .{
+                    .name = name,
+                    .description = "",
+                    .input_schema_json = "{\"type\":\"object\"}",
+                },
+                .execute = testInvalidInputTool,
+            };
+        }
+    }.tool;
+
+    try registry.register(make("zoo"));
+    try registry.register(make("alpha"));
+    try registry.register(make("middle"));
+
+    const defs = try registry.definitions(allocator);
+    defer allocator.free(defs);
+
+    try std.testing.expectEqual(@as(usize, 3), defs.len);
+    try std.testing.expectEqualStrings("alpha", defs[0].name);
+    try std.testing.expectEqualStrings("middle", defs[1].name);
+    try std.testing.expectEqualStrings("zoo", defs[2].name);
 }
 
 test {
