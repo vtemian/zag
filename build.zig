@@ -88,6 +88,15 @@ pub fn build(b: *std.Build) void {
     const sim_test_step = b.step("test-sim", "Run zag-sim unit + non-zag tests");
     sim_test_step.dependOn(&run_sim_tests.step);
 
+    // --- test-sim-e2e -------------------------------------------------------
+    // Runs scenarios that require the real zag binary. Outside `zig build
+    // test`, outside `zig build test-sim`, opt-in only: spawning a real PTY
+    // child from inside the Zig test runner causes hangs that survive across
+    // runs (see Phase 2.7 follow-up), so we drive zag via real `zag-sim`
+    // invocations and let the build system enforce expected exit codes.
+    const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag");
+    sim_e2e_step.dependOn(b.getInstallStep()); // ensures both zag and zag-sim are built
+
     const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
     const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
     script.addArtifactArg(exe);
