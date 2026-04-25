@@ -1460,6 +1460,7 @@ test {
     _ = @import("subagents.zig");
     _ = @import("Harness.zig");
     _ = @import("prompt.zig");
+    _ = @import("Instruction.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
