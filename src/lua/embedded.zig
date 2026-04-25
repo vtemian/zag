@@ -37,6 +37,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.prompt", .code = @embedFile("zag/prompt/init.lua") },
     .{ .name = "zag.prompt.anthropic", .code = @embedFile("zag/prompt/anthropic.lua") },
     .{ .name = "zag.prompt.openai-codex", .code = @embedFile("zag/prompt/openai-codex.lua") },
+    .{ .name = "zag.prompt.qwen3-coder", .code = @embedFile("zag/prompt/qwen3-coder.lua") },
     .{ .name = "zag.prompt.default", .code = @embedFile("zag/prompt/default.lua") },
     .{ .name = "zag.transforms.rg_trim", .code = @embedFile("zag/transforms/rg_trim.lua") },
     .{ .name = "zag.transforms.bash_trim", .code = @embedFile("zag/transforms/bash_trim.lua") },
@@ -52,7 +53,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 22), entries.len);
+    try std.testing.expectEqual(@as(usize, 23), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -96,6 +97,17 @@ test "find returns the entry for the openai-codex prompt pack" {
     try std.testing.expect(std.mem.indexOf(u8, e.code, "running with GPT-5 Codex") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "apply_patch") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "ASCII") != null);
+}
+
+test "find returns the entry for the qwen3-coder prompt pack" {
+    const e = find("zag.prompt.qwen3-coder").?;
+    try std.testing.expectEqualStrings("zag.prompt.qwen3-coder", e.name);
+    // Pack module exposes M.render and the Qwen-tuned identity line.
+    // The "Read before edit" directive is load-bearing for small-model
+    // behavior and distinguishes the pack from the frontier-tuned bodies.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.render") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "running with Qwen3-Coder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "Read before edit") != null);
 }
 
 test "find returns the entry for the default prompt pack" {
