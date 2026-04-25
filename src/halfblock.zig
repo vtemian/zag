@@ -185,10 +185,13 @@ fn sampleBox(img: Image, tx: u32, ty: u32, tw: u32, th: u32, bg: Pixel) Pixel {
     const xb = @max(sx1, sx0 + 1);
     const yb = @max(sy1, sy0 + 1);
 
-    var r_sum: u32 = 0;
-    var g_sum: u32 = 0;
-    var b_sum: u32 = 0;
-    var count: u32 = 0;
+    // u64 accumulators: a single sample fits in u32 (max 255), but at
+    // very large pane sizes the sample box can hold tens of millions of
+    // pixels and overflow a u32 sum.
+    var r_sum: u64 = 0;
+    var g_sum: u64 = 0;
+    var b_sum: u64 = 0;
+    var count: u64 = 0;
     var y: u32 = sy0;
     while (y < yb and y < img.height) : (y += 1) {
         var x: u32 = sx0;

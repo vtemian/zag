@@ -28,7 +28,9 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !Decoded {
     var img = try zigimg.Image.fromMemory(alloc, bytes);
     defer img.deinit(alloc);
 
-    const count: usize = img.width * img.height;
+    // Widen each factor to usize before multiplying so a 4 GiB+ image
+    // (e.g., 65536x65536) doesn't silently wrap a u32 multiply.
+    const count: usize = @as(usize, img.width) * @as(usize, img.height);
     const out = try alloc.alloc(halfblock.Pixel, count);
     errdefer alloc.free(out);
 
