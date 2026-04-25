@@ -532,6 +532,150 @@ fn emitSendLine(
     }
 }
 
+// -- mock script emitter -----------------------------------------------------
+
+/// Write a mock-provider JSON script to `writer` derived from `turns`.
+///
+/// Each turn becomes one mock turn whose chunks emit the assistant_text
+/// concatenated as `{"delta":{"content":"..."}}` plus, if the turn made any
+/// tool_call, a final `{"delta":{"tool_calls":[...]}}` with
+/// `finish_reason="tool_calls"`. Otherwise the terminator is
+/// `{"finish_reason":"stop"}`. Includes a placeholder usage block so
+/// zag's token counter does not stall (see `src/providers/openai.zig:365-383`).
+pub fn emitMockScript(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    turns: []const Turn,
+) !void {
+    try writer.print("{{\"turns\":[", .{});
+    for (turns, 0..) |turn, idx| {
+        if (idx != 0) try writer.print(",", .{});
+        try emitMockTurn(alloc, writer, turn);
+    }
+    try writer.print("]}}", .{});
+}
+
+fn emitMockTurn(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    turn: Turn,
+) !void {
+    try writer.print("{{\"chunks\":[", .{});
+
+    var emitted_chunks: usize = 0;
+
+    if (turn.assistant_text.len > 0) {
+        const concatenated = try concatAssistantText(alloc, turn.assistant_text);
+        defer alloc.free(concatenated);
+        try emitContentChunk(alloc, writer, concatenated);
+        emitted_chunks += 1;
+    }
+
+    if (turn.tools.len > 0) {
+        if (emitted_chunks > 0) try writer.print(",", .{});
+        try emitToolCallsChunk(alloc, writer, turn.tools);
+        emitted_chunks += 1;
+
+        if (emitted_chunks > 0) try writer.print(",", .{});
+        try emitFinishChunk(alloc, writer, "tool_calls");
+    } else {
+        if (emitted_chunks > 0) try writer.print(",", .{});
+        try emitFinishChunk(alloc, writer, "stop");
+    }
+
+    try writer.print("],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":0}}}}", .{});
+}
+
+fn concatAssistantText(
+    alloc: Allocator,
+    items: []const *const Entry,
+) ![]u8 {
+    var total: usize = 0;
+    for (items) |e| total += e.content.len;
+    const buf = try alloc.alloc(u8, total);
+    var cursor: usize = 0;
+    for (items) |e| {
+        @memcpy(buf[cursor..][0..e.content.len], e.content);
+        cursor += e.content.len;
+    }
+    return buf;
+}
+
+fn emitContentChunk(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    content: []const u8,
+) !void {
+    const Wrapper = struct {
+        delta: struct { content: []const u8 },
+    };
+    const json = try std.json.Stringify.valueAlloc(
+        alloc,
+        Wrapper{ .delta = .{ .content = content } },
+        .{},
+    );
+    defer alloc.free(json);
+    try writer.print("{s}", .{json});
+}
+
+fn emitToolCallsChunk(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    tools: []const ToolRoundTrip,
+) !void {
+    const ToolCall = struct {
+        index: u32,
+        id: []const u8,
+        type: []const u8,
+        function: struct {
+            name: []const u8,
+            arguments: []const u8,
+        },
+    };
+    const Wrapper = struct {
+        delta: struct { tool_calls: []const ToolCall },
+    };
+
+    const calls = try alloc.alloc(ToolCall, tools.len);
+    defer alloc.free(calls);
+    for (tools, 0..) |trt, i| {
+        calls[i] = .{
+            .index = @intCast(i),
+            .id = trt.id,
+            .type = "function",
+            .function = .{
+                .name = trt.call.tool_name,
+                .arguments = trt.call.tool_input,
+            },
+        };
+    }
+
+    const json = try std.json.Stringify.valueAlloc(
+        alloc,
+        Wrapper{ .delta = .{ .tool_calls = calls } },
+        .{},
+    );
+    defer alloc.free(json);
+    try writer.print("{s}", .{json});
+}
+
+fn emitFinishChunk(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    reason: []const u8,
+) !void {
+    const Wrapper = struct {
+        finish_reason: []const u8,
+    };
+    const json = try std.json.Stringify.valueAlloc(
+        alloc,
+        Wrapper{ .finish_reason = reason },
+        .{},
+    );
+    defer alloc.free(json);
+    try writer.print("{s}", .{json});
+}
+
 // -- tests -------------------------------------------------------------------
 
 test "parseSlice handles every entry kind" {
@@ -755,4 +899,75 @@ test "emitScenario: implicit turn (no user message) emits comment, no send" {
         search = search[idx + 6 ..];
     }
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "emitMockScript: simple turn becomes content delta + stop" {
+    const src =
+        \\{"type":"user_message","content":"hi","ts":1}
+        \\{"type":"assistant_text","content":"hello world","ts":2}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try emitMockScript(std.testing.allocator, &out.writer, turns);
+    const got = out.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"content\":\"hello world\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"finish_reason\":\"stop\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"usage\":") != null);
+}
+
+test "emitMockScript: turn with tool_call uses tool_calls finish_reason" {
+    const src =
+        \\{"type":"user_message","content":"do","ts":1}
+        \\{"type":"tool_call","tool_name":"bash","tool_input":"{\"cmd\":\"ls\"}","ts":2}
+        \\{"type":"tool_result","content":"file","ts":3}
+        \\{"type":"assistant_text","content":"done","ts":4}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try emitMockScript(std.testing.allocator, &out.writer, turns);
+    const got = out.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"finish_reason\":\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"id\":\"synth_0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"") != null);
+}
+
+test "emitMockScript: round-trips through std.json parse" {
+    const src =
+        \\{"type":"user_message","content":"hi","ts":1}
+        \\{"type":"assistant_text","content":"a","ts":2}
+        \\{"type":"user_message","content":"b","ts":3}
+        \\{"type":"assistant_text","content":"c","ts":4}
+    ;
+    const entries = try parseSlice(std.testing.allocator, src);
+    defer freeEntries(std.testing.allocator, entries);
+    const turns = try groupTurns(std.testing.allocator, entries);
+    defer freeTurns(std.testing.allocator, turns);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try emitMockScript(std.testing.allocator, &out.writer, turns);
+    const got = out.writer.buffered();
+    const Parsed = struct {
+        turns: []const struct {
+            chunks: []const std.json.Value,
+            usage: ?struct {
+                prompt_tokens: ?u32 = null,
+                completion_tokens: ?u32 = null,
+            } = null,
+        },
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, got, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.turns.len);
 }
