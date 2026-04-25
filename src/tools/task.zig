@@ -208,6 +208,7 @@ fn runChild(
     // deinit path.
     const final = collector.final_text.items;
     const owned = try allocator.dupe(u8, final);
+    errdefer allocator.free(owned);
 
     if (ctx.session_handle) |sh| {
         _ = sh.appendEntry(.{
