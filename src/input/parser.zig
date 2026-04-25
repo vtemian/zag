@@ -225,14 +225,14 @@ pub const Parser = struct {
     /// - Returns null when the parser has no pending bytes. Caller should
     ///   block indefinitely (or on other fd activity).
     /// - Returns 0 when pending has a complete non-escape event queued.
-    ///   Caller should not block — drain the queued event(s) on the next
+    ///   Caller should not block; drain the queued event(s) on the next
     ///   pollOnce + nextEvent cycle.
     /// - Returns the remaining escape-timeout (in [0, escape_timeout_ms])
     ///   when pending starts with a bare ESC, so the orchestrator can flush
     ///   it as a lone Escape keypress when the timeout expires.
     pub fn pollTimeoutMs(self: *const Parser, now_ms: i64) ?i32 {
         if (self.pending_len == 0) return null;
-        if (self.pending[0] != 0x1b) return 0; // complete event queued — drain now, don't block
+        if (self.pending[0] != 0x1b) return 0; // complete event queued; drain now, don't block
         const elapsed = now_ms - self.pending_since_ms;
         const remaining = self.escape_timeout_ms - elapsed;
         if (remaining <= 0) return 0;
@@ -242,11 +242,11 @@ pub const Parser = struct {
 
 test "pollTimeoutMs returns 0 when pending has a complete event queued" {
     var p: Parser = .{};
-    // Feed multiple non-escape bytes — each is a complete event.
+    // Feed multiple non-escape bytes; each is a complete event.
     p.feedBytes("hello", 0);
     // Drain the first event so pending still has 4 bytes ('ello').
     _ = p.nextEvent(0);
-    // Now pollTimeoutMs must NOT return null — that would block poll forever
+    // Now pollTimeoutMs must NOT return null. That would block poll forever
     // and starve the queued events. It must return 0 to indicate "drain me
     // immediately, don't wait on the fd."
     try std.testing.expectEqual(@as(?i32, 0), p.pollTimeoutMs(0));

@@ -56,7 +56,7 @@ pub const StreamingResponse = struct {
     /// reads must NOT call back into the reader's stream vtable, because
     /// std.http.contentLengthStream (Zig 0.15.2) accesses
     /// `reader.state.body_remaining_content_length` without checking the
-    /// active union variant — once state has transitioned to `.ready` (which
+    /// active union variant. Once state has transitioned to `.ready` (which
     /// happens automatically when the body is fully drained), calling stream
     /// again panics in safe builds with "access of union field
     /// 'body_remaining_content_length' while field 'ready' is active". The
@@ -256,8 +256,8 @@ pub const StreamingResponse = struct {
     /// Read up to chunk.len bytes from the body reader. Single-shot: calls
     /// the body reader's stream vtable at most once. After observing
     /// EndOfStream, sets body_done and returns 0 on subsequent calls
-    /// without re-entering stdlib (which would panic on contentLengthStream
-    /// — see the comment on body_done).
+    /// without re-entering stdlib (which would panic on contentLengthStream;
+    /// see the comment on body_done).
     fn readChunk(self: *StreamingResponse, chunk: []u8) !usize {
         if (self.body_done) return 0;
         var writer: std.Io.Writer = .fixed(chunk);
