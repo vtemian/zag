@@ -380,6 +380,17 @@ pub const SessionHandle = struct {
     meta: Meta,
     /// Allocator for temporary buffers.
     allocator: Allocator,
+    /// Serializes mutations to `file` and `meta`. The task tool dispatches
+    /// `appendEntry` from the parent's tool-execution thread while the main
+    /// thread persists agent events from the same handle, so concurrent
+    /// `writerStreaming` calls would race on the file cursor and
+    /// `meta.message_count += 1` would be a data race. The mutex must be
+    /// held across the write + meta update sequence in `appendEntry` and
+    /// across the meta update + audit entry sequence in `rename`. Zig's
+    /// stdlib has no recursive mutex, so the file-write body lives in
+    /// `_appendEntryLocked`, which both public entry points call after
+    /// taking the lock once.
+    append_mutex: std.Thread.Mutex = .{},
 
     /// Append an entry to the JSONL file and update the meta file. The
     /// serializer fabricates a fresh ULID into the outgoing row when the
@@ -387,6 +398,15 @@ pub const SessionHandle = struct {
     /// was persisted (either the caller's explicit id or the freshly
     /// generated one) so callers can chain `parent_id` on the next event.
     pub fn appendEntry(self: *SessionHandle, entry: Entry) !ulid.Ulid {
+        self.append_mutex.lock();
+        defer self.append_mutex.unlock();
+        return self._appendEntryLocked(entry);
+    }
+
+    /// Append-and-update body that assumes `append_mutex` is already held.
+    /// Split out so `rename` can write its `session_rename` audit entry
+    /// without re-acquiring the mutex (which would deadlock).
+    fn _appendEntryLocked(self: *SessionHandle, entry: Entry) !ulid.Ulid {
         var buf: [8192]u8 = undefined;
         var entry_mut = entry;
         const json = serializeEntry(&entry_mut, &buf) catch |e| {
@@ -431,6 +451,9 @@ pub const SessionHandle = struct {
 
     /// Rename the session. Updates the meta file.
     pub fn rename(self: *SessionHandle, new_name: []const u8) !void {
+        self.append_mutex.lock();
+        defer self.append_mutex.unlock();
+
         const name_len: u8 = @intCast(@min(new_name.len, self.meta.name.len));
         @memcpy(self.meta.name[0..name_len], new_name[0..name_len]);
         self.meta.name_len = name_len;
@@ -441,7 +464,9 @@ pub const SessionHandle = struct {
         // Also write a session_rename entry. Meta is already on disk at
         // this point; if the audit entry fails we'd silently drift from
         // the audit log, so log the failure rather than swallowing.
-        _ = self.appendEntry(.{
+        // _appendEntryLocked skips re-acquiring append_mutex (we already
+        // hold it) so this nested call cannot deadlock.
+        _ = self._appendEntryLocked(.{
             .entry_type = .session_rename,
             .content = new_name,
             .timestamp = self.meta.updated,
@@ -1651,4 +1676,115 @@ test "loader handles mixed old+new entries" {
     try std.testing.expect(loaded[1].parent_id != null);
     try std.testing.expectEqualSlices(u8, &unrelated_parent, &loaded[1].parent_id.?);
     try std.testing.expect(!std.mem.eql(u8, &loaded[0].id, &loaded[1].parent_id.?));
+}
+
+test "appendEntry serializes concurrent writes from multiple threads" {
+    // Regression test for the missing mutex on SessionHandle. The task
+    // tool dispatches appendEntry from the parent's tool-execution thread
+    // while the main thread persists agent events from the same handle,
+    // so concurrent writerStreaming calls would race on the file cursor
+    // and meta.message_count would be a data race. Spawn N threads and
+    // confirm every write survives, every persisted ULID is non-zero,
+    // and meta.message_count matches the total row count.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("anthropic/claude-sonnet-4-20250514");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    const writes_per_thread: usize = 50;
+    const num_threads: usize = 4;
+    const total: usize = writes_per_thread * num_threads;
+
+    const Worker = struct {
+        h: *SessionHandle,
+        thread_id: usize,
+        per_thread: usize,
+
+        fn run(args: @This()) void {
+            var i: usize = 0;
+            while (i < args.per_thread) : (i += 1) {
+                var content_buf: [64]u8 = undefined;
+                const content = std.fmt.bufPrint(
+                    &content_buf,
+                    "t{d}-i{d}",
+                    .{ args.thread_id, i },
+                ) catch return;
+                _ = args.h.appendEntry(.{
+                    .entry_type = .user_message,
+                    .content = content,
+                    .timestamp = std.time.milliTimestamp(),
+                }) catch return;
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (0..num_threads) |t| {
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{Worker{
+            .h = &handle,
+            .thread_id = t,
+            .per_thread = writes_per_thread,
+        }});
+    }
+    for (threads) |th| th.join();
+
+    // Capture the in-memory count before close so we can compare against
+    // the persisted row count after reload.
+    const meta_count = handle.meta.message_count;
+    handle.close();
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // createSession writes a session_start row, then `total` user messages.
+    try std.testing.expectEqual(total + 1, loaded.len);
+    try std.testing.expectEqual(@as(u32, @intCast(total + 1)), meta_count);
+
+    // Every persisted entry must have a non-zero ULID. A torn line that
+    // somehow round-tripped would either fail to parse (and be skipped by
+    // loadEntries) or produce a synthetic id via backfillEntry, which
+    // already produces non-zero values, so this also catches the more
+    // subtle case where two concurrent writers both stamped the same
+    // explicit id and only one row survived.
+    for (loaded) |e| {
+        try std.testing.expect(!isZeroUlid(e.id));
+    }
+
+    // Confirm every (thread_id, iteration) pair shows up exactly once.
+    // A torn write or a lost increment would leave some content strings
+    // missing from the JSONL even if loaded.len happened to match.
+    var seen = std.AutoHashMap([2]usize, void).init(allocator);
+    defer seen.deinit();
+    var t: usize = 0;
+    while (t < num_threads) : (t += 1) {
+        var i: usize = 0;
+        while (i < writes_per_thread) : (i += 1) {
+            try seen.put(.{ t, i }, {});
+        }
+    }
+    try std.testing.expectEqual(total, seen.count());
+
+    for (loaded[1..]) |e| {
+        // Parse "t<thread>-i<iter>" out of e.content.
+        const dash = std.mem.indexOfScalar(u8, e.content, '-') orelse return error.UnexpectedFormat;
+        const thread_part = e.content[1..dash];
+        const iter_part = e.content[dash + 2 ..];
+        const tid = try std.fmt.parseInt(usize, thread_part, 10);
+        const iid = try std.fmt.parseInt(usize, iter_part, 10);
+        _ = seen.remove(.{ tid, iid });
+    }
+    try std.testing.expectEqual(@as(u32, 0), seen.count());
 }
