@@ -11,82 +11,6 @@ Copy the block for the plan you want, paste into a fresh Claude Code instance st
 
 ---
 
-## 001 — LuaEngine: extract pushJobResultOntoStack
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/001-luaengine-extract-job-result.md and execute it.
-
-This is a pure-dispatch extraction of ~2100 lines from src/LuaEngine.zig into a new src/lua/job_result.zig. Low risk.
-
-Before editing: re-grep for pushJobResultOntoStack and resumeFromJob in LuaEngine.zig and confirm the plan's line ranges still hold. Then follow the Steps section exactly.
-
-Verify with zig build, zig build test, and grep that the symbol appears only in the new file plus its single call site. Commit as "lua: extract pushJobResultOntoStack into lua/job_result.zig".
-```
-
----
-
-## 002 — LuaEngine: extract hook registry
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/002-luaengine-extract-hook-registry.md and execute it.
-
-This is a medium-risk extraction because hook dispatch calls back into the engine to resume tasks. The plan defines a ResumeSink callback interface to cut that coupling — follow it carefully.
-
-Before editing: confirm the line ranges for fireHook, applyHookReturn, enforceHookBudget, and the drain loop still match. Look at src/lua/integration_test.zig for existing hook tests you must keep green.
-
-Execute the Steps in order. After each step, run zig build. Full verification: zig build test plus a manual check that a streaming hook (see examples/ or devlog/ for a known fixture) still fires end-to-end. Commit as "lua: extract hook dispatcher into lua/hook_registry.zig".
-```
-
----
-
-## 003 — LuaEngine: AsyncRuntime wrapper
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/003-luaengine-async-runtime.md and execute it.
-
-Purely structural: wrap the parallel io_pool + completions fields into a single AsyncRuntime struct. Zero behavior change.
-
-Verify: zig build test, and grep confirms no direct use of io_pool or completions outside the new async_runtime.zig. Commit as "lua: wrap pool and completion queue in AsyncRuntime".
-```
-
----
-
-## 004 — llm.zig: extract SSE streaming
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/004-llm-extract-streaming.md and execute it.
-
-Moves StreamingResponse plus nextSseEvent (~280 lines) from src/llm.zig into a new src/llm/streaming.zig. Providers (anthropic, openai) must be updated to reference llm.streaming.StreamingResponse.
-
-Verify: zig build test. Grep for llm.StreamingResponse should return zero; llm.streaming.StreamingResponse should appear in both providers. Commit as "llm: extract SSE streaming state machine into llm/streaming.zig".
-```
-
----
-
-## 005 — llm.zig: extract HTTP helpers
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/005-llm-extract-http-helpers.md and execute it.
-
-Moves httpPostJson, buildHeaders, freeHeaders from src/llm.zig into src/llm/http.zig. Update call sites in both providers.
-
-Verify: zig build test. Commit as "llm: extract HTTP helpers into llm/http.zig".
-```
-
----
-
-## 006 — llm.zig: extract endpoint registry
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/006-llm-extract-endpoint-registry.md and execute it.
-
-Moves Endpoint, builtin_endpoints, isBuiltinEndpointName, and Registry from src/llm.zig into src/llm/registry.zig. Plan uses pub const re-exports in llm.zig so no call-site edits are needed.
-
-Verify: zig build test. Grep confirms Endpoint and Registry definitions live only in the new file. Commit as "llm: extract endpoint registry into llm/registry.zig".
-```
-
----
-
 ## 007 — Input: bracketed paste
 
 ```
@@ -111,20 +35,6 @@ Adds CSI > 3 u / CSI < u enable/disable in Terminal.zig, CSI ... u parsing in in
 Dependency: if plan 009 (input split) has landed, add the KKP parser as a dedicated submodule per the split plan.
 
 Verify: zig build test (including a new test that feeds "\x1b[65;5u" and asserts Ctrl-A event). Manual: test on Ghostty; Ctrl-Shift-A should disambiguate. Commit as "input: add Kitty Keyboard Protocol support".
-```
-
----
-
-## 009 — Input: split input.zig monolith
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/009-input-split-monolith.md and execute it.
-
-Splits src/input.zig (1370 lines) into input.zig (facade) + input/parser.zig + input/core.zig + input/csi.zig + input/mouse.zig. External consumers should not need to change — verify by grep.
-
-Do this BEFORE plans 007 and 008 so paste and KKP slot into the new structure cleanly.
-
-Verify: zig build test, no consumer of input.zig's public API needed edits. Commit as "input: split into parser, core, csi, mouse submodules".
 ```
 
 ---
@@ -225,18 +135,6 @@ Add cache fields to Compositor for last input/draft, guard drawStatusLine and dr
 TDD: unit test that runs composite twice with identical input and asserts drawStatusLine is NOT entered the second time (use a counter or metrics span).
 
 Verify: zig build test, manual keystroke test (prompt redraws each keystroke), visual check under -Dmetrics=true (frame time varies, so redraws continue). Commit as "compositor: skip redundant status and prompt redraws".
-```
-
----
-
-## 018 — Rename ConversationSession to ConversationHistory
-
-```
-Read /Users/whitemonk/projects/ai/zag/plans/018-rename-conversation-session.md and execute it.
-
-Use `git mv src/ConversationSession.zig src/ConversationHistory.zig` to preserve history, then rename the type and every reference (the plan lists them). Single commit.
-
-Verify: zig build test, grep for ConversationSession returns zero. Commit as "types: rename ConversationSession to ConversationHistory".
 ```
 
 ---
