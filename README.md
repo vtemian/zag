@@ -211,7 +211,7 @@ Primitives exposed on the `zag.*` table:
 - `zag.layout.tree/focus/split/close/resize`, `zag.pane.read` — introspect and mutate the window system
 - `zag.log.debug/info/warn/err`, `zag.notify` — structured logging and notifications
 
-See the [plugin authoring guide](docs/plugins/README.md) for event tables, the primitive reference, error conventions, and worked examples (remote policy hooks, git watchers, file watchers).
+Hooks, the primitive reference, error conventions, and worked examples (remote policy hooks, git watchers, file watchers) are documented inline in the source under `src/lua/` and the embedded stdlib at `src/lua/zag/`.
 
 ## Session persistence
 
