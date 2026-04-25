@@ -6497,6 +6497,7 @@ pub const LuaEngine = struct {
     /// and root scope. Must be called after `init()` and before any Lua code
     /// tries to spawn coroutines. Failure rolls back partial state.
     pub fn initAsync(self: *LuaEngine, num_workers: usize, capacity: usize) !void {
+        // Init-once cold path: latched at engine startup before any Lua code runs; double-init is a programmer bug, not a runtime condition.
         std.debug.assert(self.async_runtime == null);
 
         const runtime = try AsyncRuntime.init(self.allocator, num_workers, capacity);
@@ -6604,6 +6605,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
+        // Init-once latch check: dwarfed by the `lua.newThread` + `Scope.init` allocations that follow on the same path, so no measurable hot-path cost.
         std.debug.assert(self.async_runtime != null); // initAsync must have run
 
         const parent = parent_scope orelse self.root_scope.?;

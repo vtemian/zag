@@ -105,6 +105,7 @@ pub const DirtyRing = struct {
     /// the caller. Truncation is not possible: `out` must be at least
     /// `DirtyRing.capacity` long, which is why `drainDirty` enforces it.
     pub fn drain(self: *DirtyRing, out: []u32) DrainResult {
+        // Contract guard: callers always pass a `[capacity]u32`-sized scratch (see Compositor.syncTreeSnapshot), so this is a comptime-statically-true invariant the compiler can fold away.
         std.debug.assert(out.len >= capacity);
         const n = self.len;
         for (self.buf[0..n], 0..) |id, i| out[i] = id;

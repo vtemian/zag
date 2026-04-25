@@ -49,6 +49,7 @@ pub const Scope = struct {
                 }
             }
         }
+        // Deinit-time invariant: children must be torn down before their parent; orphaned children would leak. Cold by definition (one assert per scope lifetime).
         std.debug.assert(self.children.items.len == 0); // orphans = bug
         self.children.deinit(self.alloc);
         self.jobs.deinit(self.alloc);
