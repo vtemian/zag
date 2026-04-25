@@ -77,6 +77,12 @@ pub const AgentEvent = union(enum) {
     /// the returned text REPLACES the tool's output. Same main-thread
     /// marshalling rationale; the request is caller-owned.
     tool_transform_request: *ToolTransformRequest,
+    /// Round-trip: the agent thread asks main to invoke the single global
+    /// gate handler registered via `zag.tools.gate(fn)` before each
+    /// `callLlm`. The handler returns the visible-tool subset for the
+    /// upcoming turn. Same main-thread marshalling rationale; the
+    /// request is caller-owned.
+    tool_gate_request: *ToolGateRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -134,6 +140,10 @@ pub const AgentEvent = union(enum) {
             // transform request leaves the worker awaiting `done`; signal
             // so it proceeds with the original (untransformed) output.
             .tool_transform_request => |req| req.done.set(),
+            // A dropped gate request leaves the worker parked awaiting
+            // `done`; signal so it proceeds with the full registry rather
+            // than wedging the turn.
+            .tool_gate_request => |req| req.done.set(),
         }
     }
 };
@@ -507,6 +517,66 @@ pub const ToolTransformRequest = struct {
     }
 };
 
+/// Round-trip request pushed by the agent thread before each `callLlm`
+/// to consult the single global tool-gate handler registered via
+/// `zag.tools.gate(fn)`. Lua is pinned to the main thread, so the
+/// worker marshals here exactly like the other socket requests.
+///
+/// The handler receives `{model, tools = {names...}}` and returns a
+/// table of allowed tool names (or nil to fall back to the full
+/// registry). The main thread duped the returned strings into
+/// `req.allocator` and stores them in `result`. The waiter owns the
+/// outer slice plus every interior string and frees them via
+/// `freeResult` after consuming.
+pub const ToolGateRequest = struct {
+    /// Current model identifier (e.g. "ollama/qwen3-coder-30b").
+    /// Borrowed; main thread reads under `done` and must not retain
+    /// the slice past `done.set()`.
+    model: []const u8,
+    /// Full registry tool names visible this turn. Borrowed from the
+    /// agent thread's `tool_defs` slice for the lifetime of the
+    /// round-trip; same retention rules as `model`.
+    available_tools: []const []const u8,
+    /// Allocator used to dupe the handler's returned names into
+    /// `result`. Caller promises thread-safety.
+    allocator: Allocator,
+    /// Signalled by the main thread when either `result`, `error_name`,
+    /// or neither (handler returned nil / no handler) has been
+    /// finalized.
+    done: std.Thread.ResetEvent = .{},
+    /// Handler return value, duped into `allocator`. Null when the
+    /// handler returned nil, when no handler was registered, or when
+    /// the call errored. Owned by the waiter; release via
+    /// `freeResult`.
+    result: ?[]const []const u8 = null,
+    /// `@errorName` of whatever went wrong on the main thread (Lua
+    /// call failure, return value type mismatch, OOM duping the
+    /// result). Borrowed from rodata; do not free.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(
+        model: []const u8,
+        available_tools: []const []const u8,
+        allocator: Allocator,
+    ) ToolGateRequest {
+        return .{
+            .model = model,
+            .available_tools = available_tools,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free the duped subset returned by the handler, if any. Frees
+    /// each interior string plus the outer slice. Safe to call when
+    /// `result` is null.
+    pub fn freeResult(self: *ToolGateRequest) void {
+        const list = self.result orelse return;
+        for (list) |name| self.allocator.free(name);
+        self.allocator.free(list);
+        self.result = null;
+    }
+};
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -851,4 +921,48 @@ test "freeOwned signals tool_transform_request done" {
     try std.testing.expect(!req.done.isSet());
     ev.freeOwned(std.testing.allocator);
     try std.testing.expect(req.done.isSet());
+}
+
+test "push and drain tool_gate_request event" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    defer queue.deinit();
+
+    const tools_seen = [_][]const u8{ "read", "bash" };
+    var req = ToolGateRequest.init(
+        "anthropic/claude-sonnet-4",
+        &tools_seen,
+        std.testing.allocator,
+    );
+
+    try queue.push(.{ .tool_gate_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", buf[0].tool_gate_request.model);
+    try std.testing.expectEqual(@as(usize, 2), buf[0].tool_gate_request.available_tools.len);
+    try std.testing.expectEqualStrings("read", buf[0].tool_gate_request.available_tools[0]);
+}
+
+test "freeOwned signals tool_gate_request done" {
+    const tools_seen = [_][]const u8{"read"};
+    var req = ToolGateRequest.init("m", &tools_seen, std.testing.allocator);
+    const ev: AgentEvent = .{ .tool_gate_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+}
+
+test "ToolGateRequest.freeResult releases duped names" {
+    const alloc = std.testing.allocator;
+    const tools_seen = [_][]const u8{"read"};
+    var req = ToolGateRequest.init("m", &tools_seen, alloc);
+
+    var list = try alloc.alloc([]const u8, 2);
+    errdefer alloc.free(list);
+    list[0] = try alloc.dupe(u8, "read");
+    errdefer alloc.free(list[0]);
+    list[1] = try alloc.dupe(u8, "bash");
+    req.result = list;
+    req.freeResult();
+    try std.testing.expect(req.result == null);
 }

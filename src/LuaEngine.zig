@@ -181,6 +181,13 @@ pub const LuaEngine = struct {
     /// loop consumes the return value: transforms REPLACE the tool
     /// output rather than appending under it.
     tool_transform_handlers: std.StringHashMapUnmanaged(JitHandler) = .empty,
+    /// Single global handler registered via `zag.tools.gate(fn)`. The
+    /// gate runs once per turn (before each `callLlm`) and returns the
+    /// allowed-tool subset for that turn. There is no per-name keying:
+    /// re-registering swaps the function (the previous Lua ref is
+    /// unrefed). `null` means "no gate", so the agent uses the full
+    /// registry. Released in `deinit`.
+    tool_gate_handler: ?i32 = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -461,6 +468,13 @@ pub const LuaEngine = struct {
             self.allocator.free(entry.value_ptr.tool_name);
         }
         self.tool_transform_handlers.deinit(self.allocator);
+        // Release the single global tool-gate handler (set by
+        // `zag.tools.gate(fn)`). Null means no handler was ever
+        // registered or it was cleared; either way nothing to unref.
+        if (self.tool_gate_handler) |fn_ref| {
+            self.lua.unref(zlua.registry_index, fn_ref);
+            self.tool_gate_handler = null;
+        }
         self.lua.deinit();
     }
 
@@ -673,6 +687,14 @@ pub const LuaEngine = struct {
         // call it during `require` without spinning up a coroutine.
         lua.pushFunction(zlua.wrap(zagParseFrontmatterFn));
         lua.setField(-2, "parse_frontmatter");
+
+        // zag.tools; namespace for tool-registry sockets. Today only
+        // `gate(fn)` (single global pre-callLlm hook); future tool-
+        // facing sockets hang off the same table. Stack: [zag_table].
+        lua.newTable(); // [zag_table, tools_table]
+        lua.pushFunction(zlua.wrap(zagToolsGateFn));
+        lua.setField(-2, "gate");
+        lua.setField(-2, "tools"); // zag.tools = tools_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -5416,6 +5438,140 @@ pub const LuaEngine = struct {
         self: *LuaEngine,
     ) *std.StringHashMapUnmanaged(JitHandler) {
         return &self.tool_transform_handlers;
+    }
+
+    /// Zig function backing `zag.tools.gate(fn)`.
+    ///
+    /// Registers the single global gate handler the harness invokes
+    /// once per turn (before each `callLlm`). Re-registering replaces
+    /// the previous function; the old Lua ref is unrefed so memory
+    /// does not bloat across reloads. Pass nil to clear.
+    ///
+    /// Args:
+    /// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
+    fn zagToolsGateFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        // Allow `zag.tools.gate(nil)` to clear the handler. Anything
+        // else that isn't a function is a programmer error.
+        if (lua.isNil(1)) {
+            if (engine.tool_gate_handler) |old| {
+                lua.unref(zlua.registry_index, old);
+                engine.tool_gate_handler = null;
+            }
+            return 0;
+        }
+        if (!lua.isFunction(1)) {
+            lua.raiseErrorStr(
+                "zag.tools.gate: arg 1 must be a function or nil",
+                .{},
+            );
+        }
+
+        // Push a copy of arg 1 so ref() pops the duplicate and leaves
+        // the original argument frame intact.
+        lua.pushValue(1);
+        const fn_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr(
+                "zag.tools.gate: failed to ref handler",
+                .{},
+            );
+        };
+
+        if (engine.tool_gate_handler) |old| {
+            lua.unref(zlua.registry_index, old);
+        }
+        engine.tool_gate_handler = fn_ref;
+        return 0;
+    }
+
+    /// Run the tool-gate handler on the main thread. Builds a
+    /// Lua-side context table `{model = ..., tools = {names...}}`,
+    /// calls the registered function via `protectedCall`, and decodes
+    /// the returned table back into an owned `[]const []const u8`
+    /// duped into `req.allocator`.
+    ///
+    /// When no handler is registered or the handler returns nil, the
+    /// request returns with `result = null` and `error_name = null`
+    /// so the worker proceeds with the full registry. A non-table
+    /// non-nil return surfaces as `error.ToolGateNotTable`. Caller is
+    /// responsible for `req.done.set()`.
+    pub fn handleToolGateRequest(
+        self: *LuaEngine,
+        req: *agent_events.ToolGateRequest,
+    ) anyerror!void {
+        const fn_ref = self.tool_gate_handler orelse return;
+
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn("tool gate handler: registry slot is not a function", .{});
+            return;
+        }
+
+        // Context table: { model = string, tools = { name1, name2, ... } }.
+        // Plain sequence so a Lua handler can iterate with ipairs.
+        lua.newTable();
+        _ = lua.pushString(req.model);
+        lua.setField(-2, "model");
+        lua.newTable();
+        for (req.available_tools, 0..) |name, i| {
+            _ = lua.pushString(name);
+            lua.rawSetIndex(-2, @intCast(i + 1));
+        }
+        lua.setField(-2, "tools");
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("tool gate handler raised: {s}", .{err_msg});
+            lua.pop(1);
+            return error.LuaHandlerError;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return;
+        if (lua.typeOf(-1) != .table) {
+            log.warn(
+                "tool gate handler returned non-table (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.ToolGateNotTable;
+        }
+
+        // Walk the returned sequence as 1..N, stopping at the first
+        // hole. `objectLen` is `#t` Lua-side; correct for sequences
+        // (we accept any 1-indexed run of strings).
+        const len = lua.rawLen(-1);
+        if (len == 0) return; // empty table => no subset, fall back
+        var collected: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (collected.items) |s| req.allocator.free(s);
+            collected.deinit(req.allocator);
+        }
+
+        for (0..len) |idx| {
+            _ = lua.rawGetIndex(-1, @intCast(idx + 1));
+            defer lua.pop(1);
+            if (lua.typeOf(-1) != .string) {
+                log.warn(
+                    "tool gate handler entry {d} is non-string (type {s})",
+                    .{ idx + 1, @tagName(lua.typeOf(-1)) },
+                );
+                return error.ToolGateEntryNotString;
+            }
+            const name = lua.toString(-1) catch return error.ToolGateReadFailed;
+            const owned = try req.allocator.dupe(u8, name);
+            errdefer req.allocator.free(owned);
+            try collected.append(req.allocator, owned);
+        }
+
+        req.result = try collected.toOwnedSlice(req.allocator);
+    }
+
+    /// Test-only accessor for the single global tool-gate handler ref.
+    pub fn toolGateHandler(self: *const LuaEngine) ?i32 {
+        return self.tool_gate_handler;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -11895,6 +12051,218 @@ test "zag.tool.transform_output rejects non-function handler" {
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(u32, 0), engine.toolTransformHandlers().count());
+}
+
+test "zag.tools.gate registers a single global handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expect(engine.toolGateHandler() == null);
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read" } end)
+    );
+    try std.testing.expect(engine.toolGateHandler() != null);
+}
+
+test "zag.tools.gate re-registration unrefs old function" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read" } end)
+    );
+    const first = engine.toolGateHandler().?;
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "bash" } end)
+    );
+    const second = engine.toolGateHandler().?;
+    try std.testing.expect(first != second);
+    // testing.allocator + Lua deinit catch a leaked old fn_ref. This
+    // test would fail under the leak detector if the old ref leaked.
+}
+
+test "zag.tools.gate(nil) clears the handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read" } end)
+    );
+    try std.testing.expect(engine.toolGateHandler() != null);
+    try engine.lua.doString(
+        \\zag.tools.gate(nil)
+    );
+    try std.testing.expect(engine.toolGateHandler() == null);
+}
+
+test "zag.tools.gate rejects non-function non-nil arg" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.tools.gate("not a function")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expect(engine.toolGateHandler() == null);
+}
+
+test "handleToolGateRequest returns subset of allowed names" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx)
+        \\  return { "read", "bash" }
+        \\end)
+    );
+
+    const tool_names = [_][]const u8{ "read", "write", "edit", "bash" };
+    var req = agent_events.ToolGateRequest.init(
+        "ollama/qwen3-coder",
+        &tool_names,
+        alloc,
+    );
+    defer req.freeResult();
+
+    try engine.handleToolGateRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    const subset = req.result.?;
+    try std.testing.expectEqual(@as(usize, 2), subset.len);
+    try std.testing.expectEqualStrings("read", subset[0]);
+    try std.testing.expectEqualStrings("bash", subset[1]);
+}
+
+test "handleToolGateRequest receives model and full tool list in ctx" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx)
+        \\  -- Echo the model id and one tool name so the test can read them back.
+        \\  return { ctx.model, ctx.tools[1] }
+        \\end)
+    );
+
+    const tool_names = [_][]const u8{ "read", "bash" };
+    var req = agent_events.ToolGateRequest.init("anthropic/claude-sonnet-4", &tool_names, alloc);
+    defer req.freeResult();
+
+    try engine.handleToolGateRequest(&req);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", req.result.?[0]);
+    try std.testing.expectEqualStrings("read", req.result.?[1]);
+}
+
+test "handleToolGateRequest with no handler leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    try engine.handleToolGateRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleToolGateRequest with nil return leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return nil end)
+    );
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    try engine.handleToolGateRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleToolGateRequest with empty table leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return {} end)
+    );
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    try engine.handleToolGateRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleToolGateRequest surfaces Lua handler error via @errorName" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) error("nope") end)
+    );
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    const result = engine.handleToolGateRequest(&req);
+    try std.testing.expectError(error.LuaHandlerError, result);
+    try std.testing.expect(req.result == null);
+}
+
+test "handleToolGateRequest rejects non-table return" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return "read" end)
+    );
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    const result = engine.handleToolGateRequest(&req);
+    try std.testing.expectError(error.ToolGateNotTable, result);
+    try std.testing.expect(req.result == null);
+}
+
+test "handleToolGateRequest rejects non-string entry" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read", 42 } end)
+    );
+
+    const tool_names = [_][]const u8{"read"};
+    var req = agent_events.ToolGateRequest.init("m", &tool_names, alloc);
+    defer req.freeResult();
+    const result = engine.handleToolGateRequest(&req);
+    try std.testing.expectError(error.ToolGateEntryNotString, result);
 }
 
 test "zag.tool callable form still registers Lua tools" {
