@@ -177,24 +177,41 @@ pub const AgentEvent = union(enum) {
             // Same borrowed-pointer rationale, except: a queued-but-undelivered
             // JIT request still has a worker parked on `done`. Signal it so
             // the worker unblocks and proceeds without the appended context.
-            .jit_context_request => |req| req.done.set(),
+            // Stamp `error_name` so "queue dropped" is distinguishable from
+            // "handler returned nil" at the waiter.
+            .jit_context_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
             // Same parking rationale as `jit_context_request`. A dropped
             // transform request leaves the worker awaiting `done`; signal
             // so it proceeds with the original (untransformed) output.
-            .tool_transform_request => |req| req.done.set(),
+            .tool_transform_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
             // A dropped gate request leaves the worker parked awaiting
             // `done`; signal so it proceeds with the full registry rather
             // than wedging the turn.
-            .tool_gate_request => |req| req.done.set(),
+            .tool_gate_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
             // A dropped loop-detect request leaves the worker parked
             // awaiting `done`; signal so it proceeds without a reminder
             // or abort. The detector is advisory, so dropping is safe.
-            .loop_detect_request => |req| req.done.set(),
+            .loop_detect_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
             // A dropped compact request leaves the worker parked awaiting
             // `done`; signal so it proceeds without compaction. Skipping
             // is safe because compaction is advisory: the worst case is
             // the next turn hits the provider context limit.
-            .compact_request => |req| req.done.set(),
+            .compact_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
         }
     }
 };
@@ -1171,12 +1188,15 @@ test "push and drain jit_context_request event" {
     try std.testing.expect(!buf[0].jit_context_request.is_error);
 }
 
-test "freeOwned signals jit_context_request done" {
+test "freeOwned signals jit_context_request done with error_name" {
     var req = JitContextRequest.init("read", "in", "out", false, std.testing.allocator);
     const ev: AgentEvent = .{ .jit_context_request = &req };
     try std.testing.expect(!req.done.isSet());
+    try std.testing.expect(req.error_name == null);
     ev.freeOwned(std.testing.allocator);
     try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name != null);
+    try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
 }
 
 test "push and drain tool_transform_request event" {

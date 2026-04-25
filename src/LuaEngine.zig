@@ -2895,6 +2895,15 @@ pub const LuaEngine = struct {
         return entry;
     }
 
+    /// Shared rejection arm for `zag.buffer.*` ops that only operate on
+    /// scratch buffers. Graphics buffers expose a different surface (pixel
+    /// data, no row addressing) so calling line/cursor APIs on them is a
+    /// plugin bug worth surfacing as a Lua error rather than silently
+    /// no-oping.
+    fn rejectGraphicsBuffer(lua: *Lua, comptime op_name: []const u8) noreturn {
+        lua.raiseErrorStr(op_name ++ ": not supported on graphics buffers", .{});
+    }
+
     /// `zag.buffer.create{ kind = "scratch", name? = "..." }`: allocate a
     /// new buffer in the live registry and return its handle string.
     /// Only `.scratch` is valid at this point; future kinds add arms to
@@ -3014,7 +3023,7 @@ pub const LuaEngine = struct {
                     lua.raiseErrorStr("%s", .{msg.ptr});
                 };
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.set_lines: not supported on graphics buffers", .{}),
+            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.set_lines"),
         }
         return 0;
     }
@@ -3032,7 +3041,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.get_lines: not supported on graphics buffers", .{}),
+            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.get_lines"),
         }
     }
 
@@ -3044,7 +3053,7 @@ pub const LuaEngine = struct {
                 lua.pushInteger(@intCast(sb.lines.items.len));
                 return 1;
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.line_count: not supported on graphics buffers", .{}),
+            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.line_count"),
         }
     }
 
@@ -3061,7 +3070,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.cursor_row: not supported on graphics buffers", .{}),
+            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.cursor_row"),
         }
     }
 
@@ -3085,7 +3094,7 @@ pub const LuaEngine = struct {
                 sb.cursor_row = if (count == 0) 0 else @min(zero_based, count - 1);
                 sb.dirty = true;
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.set_cursor_row: not supported on graphics buffers", .{}),
+            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.set_cursor_row"),
         }
         return 0;
     }
@@ -3103,7 +3112,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.current_line: not supported on graphics buffers", .{}),
+            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.current_line"),
         }
     }
 
