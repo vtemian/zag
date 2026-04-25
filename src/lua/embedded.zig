@@ -108,6 +108,16 @@ test "find returns the entry for the qwen3-coder prompt pack" {
     try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.render") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "running with Qwen3-Coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "Read before edit") != null);
+    // Overrides are top-level (outside M.render) so they fire once at
+    // module-require time when the dispatcher first picks this pack:
+    // tighter loop threshold, narrowed tool gate, mandatory trim
+    // transforms. Source-level checks here keep the embed manifest
+    // honest; runtime behavior is covered in LuaEngine tests.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.loop.detect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "identical_streak >= 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tools.gate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.transforms.rg_trim") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.transforms.bash_trim") != null);
 }
 
 test "find returns the entry for the default prompt pack" {
