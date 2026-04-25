@@ -142,9 +142,10 @@ node_registry: NodeRegistry,
 /// kinds later). Owns the heap storage for every registered buffer
 /// and destroys it on `deinit`.
 buffer_registry: BufferRegistry,
-/// Slash-command dispatch table. Built-ins are populated during
-/// `init`; Lua plugins append via `zag.command{}`.
-command_registry: CommandRegistry,
+/// Slash-command dispatch table. Borrowed from the Lua engine (or a
+/// test fixture). Built-ins are seeded by `LuaEngine.init`; Lua plugins
+/// append via `zag.command{}`.
+command_registry: *CommandRegistry,
 /// Extra panes created by splits, tracked for cleanup.
 extra_panes: std.ArrayList(PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
@@ -188,6 +189,9 @@ pub const Config = struct {
     session_mgr: *?Session.SessionManager,
     /// Lua plugin engine, or null if Lua init failed (borrowed).
     lua_engine: ?*LuaEngine,
+    /// Slash-command registry. Borrowed; production wires
+    /// `&engine.command_registry`, tests own a fixture instance.
+    command_registry: *CommandRegistry,
     /// Write end of the wake pipe so agent workers can interrupt the main loop.
     wake_write_fd: posix.fd_t,
     /// Skill registry discovered at boot. Threaded into `createSplitPane`
@@ -197,7 +201,7 @@ pub const Config = struct {
 };
 
 pub fn init(cfg: Config) !WindowManager {
-    var wm: WindowManager = .{
+    return .{
         .allocator = cfg.allocator,
         .screen = cfg.screen,
         .layout = cfg.layout,
@@ -207,20 +211,12 @@ pub fn init(cfg: Config) !WindowManager {
         .registry = cfg.registry,
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
+        .command_registry = cfg.command_registry,
         .wake_write_fd = cfg.wake_write_fd,
         .skills = cfg.skills,
         .node_registry = NodeRegistry.init(cfg.allocator),
         .buffer_registry = BufferRegistry.init(cfg.allocator),
-        .command_registry = CommandRegistry.init(cfg.allocator),
     };
-    errdefer wm.command_registry.deinit();
-
-    try wm.command_registry.registerBuiltIn("/quit", .quit);
-    try wm.command_registry.registerBuiltIn("/q", .quit);
-    try wm.command_registry.registerBuiltIn("/perf", .perf);
-    try wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
-
-    return wm;
 }
 
 /// Point the borrowed `Layout` at this manager's `node_registry` so every
@@ -266,9 +262,6 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// by the caller *before* this runs: runners hold buffers read by their
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
-    // Command registry only owns duped key bytes and callback refs; no
-    // pane state touches it, so order is indifferent.
-    self.command_registry.deinit();
     // Free pane-local provider overrides after each runner's thread has
     // been joined but before the runner/view/session objects are
     // destroyed. The agent worker may hold a borrow of the provider for
@@ -1121,15 +1114,10 @@ pub const CommandResult = enum { handled, quit, not_a_command };
 /// Try to handle input as a slash command. Returns .not_a_command if
 /// the input doesn't match any known command.
 pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
-    // Lua plugins register into the engine-owned command registry;
-    // check that first so `zag.command{name="quit"}` shadows the Zig
-    // built-in keyed on the same slash form. The builtin `/model` picker
-    // (zag.builtin.model_picker) lands in the engine registry too.
-    const plugin_hit: ?CommandRegistry.Command = if (self.lua_engine) |engine|
-        engine.command_registry.lookup(command)
-    else
-        null;
-    const cmd = plugin_hit orelse self.command_registry.lookup(command) orelse return .not_a_command;
+    // Single shared registry: built-ins seeded by `LuaEngine.init`, Lua
+    // plugins added later via `zag.command{}` (which shadows a built-in
+    // keyed on the same slash form).
+    const cmd = self.command_registry.lookup(command) orelse return .not_a_command;
     switch (cmd) {
         .built_in => |b| switch (b) {
             .quit => return .quit,
@@ -1527,6 +1515,21 @@ const TestNullSink = struct {
     }
 };
 
+/// Test helper: build a fresh `CommandRegistry` seeded with the same
+/// built-ins `LuaEngine.init` registers in production. Tests build WM
+/// via struct-literal (bypassing `WindowManager.init`), so this reproduces
+/// the engine-side seeding for fixtures that need `handleCommand` to
+/// dispatch `/quit`, `/perf`, etc. Caller owns deinit.
+fn testCommandRegistry(allocator: Allocator) !CommandRegistry {
+    var registry = CommandRegistry.init(allocator);
+    errdefer registry.deinit();
+    try registry.registerBuiltIn("/quit", .quit);
+    try registry.registerBuiltIn("/q", .quit);
+    try registry.registerBuiltIn("/perf", .perf);
+    try registry.registerBuiltIn("/perf-dump", .perf_dump);
+    return registry;
+}
+
 test "formatSplitAnnounce writes the standard announce for id 1" {
     var buf: [64]u8 = undefined;
     const len = formatSplitAnnounce(&buf, 1);
@@ -1644,6 +1647,8 @@ test "extra pane viewport is attached to its buffer" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -1656,7 +1661,7 @@ test "extra pane viewport is attached to its buffer" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -1698,6 +1703,8 @@ test "multiple splits maintain stable viewport pointers" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -1710,7 +1717,7 @@ test "multiple splits maintain stable viewport pointers" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -1751,6 +1758,8 @@ test "WindowManager exposes a NodeRegistry" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -1763,7 +1772,7 @@ test "WindowManager exposes a NodeRegistry" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -1801,6 +1810,8 @@ test "focus by handle updates focused leaf" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -1813,7 +1824,7 @@ test "focus by handle updates focused leaf" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -1856,6 +1867,8 @@ test "focus by handle rejects stale id" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -1868,7 +1881,7 @@ test "focus by handle rejects stale id" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -1902,6 +1915,8 @@ test "splitById creates a new leaf and returns its handle" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -1914,7 +1929,7 @@ test "splitById creates a new leaf and returns its handle" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -1961,6 +1976,8 @@ test "closeById removes a leaf and keeps the sibling" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -1973,7 +1990,7 @@ test "closeById removes a leaf and keeps the sibling" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2015,6 +2032,8 @@ test "closeById rejects the caller's own pane" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -2027,7 +2046,7 @@ test "closeById rejects the caller's own pane" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2070,6 +2089,8 @@ test "resizeById applies ratio to parent split" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2082,7 +2103,7 @@ test "resizeById applies ratio to parent split" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2135,6 +2156,8 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2147,7 +2170,7 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2187,6 +2210,8 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -2199,7 +2224,7 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2243,6 +2268,8 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2255,7 +2282,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2323,6 +2350,8 @@ test "handleLayoutRequest split rejects stale buffer handle" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = undefined,
@@ -2335,7 +2364,7 @@ test "handleLayoutRequest split rejects stale buffer handle" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2389,6 +2418,8 @@ test "describe emits parseable node map" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2401,7 +2432,7 @@ test "describe emits parseable node map" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2450,6 +2481,8 @@ test "executeAction focus_left goes through handle path" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2462,7 +2495,7 @@ test "executeAction focus_left goes through handle path" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2515,6 +2548,8 @@ test "executeAction lua_callback runs the Lua function via the engine" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2527,7 +2562,7 @@ test "executeAction lua_callback runs the Lua function via the engine" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2568,6 +2603,8 @@ test "executeAction lua_callback without an engine is a no-op" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2580,7 +2617,7 @@ test "executeAction lua_callback without an engine is a no-op" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2619,6 +2656,8 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2631,7 +2670,7 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2698,6 +2737,8 @@ test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form wo
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2710,7 +2751,7 @@ test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form wo
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2770,6 +2811,8 @@ test "zag.layout.split rejects a malformed buffer handle string" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2782,7 +2825,7 @@ test "zag.layout.split rejects a malformed buffer handle string" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2830,6 +2873,8 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2842,7 +2887,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -2946,6 +2991,8 @@ test "readPaneById returns rendered text with metadata" {
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
     wm.* = .{
         .allocator = allocator,
         .screen = &screen,
@@ -2958,7 +3005,7 @@ test "readPaneById returns rendered text with metadata" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
@@ -3068,10 +3115,12 @@ const PickerFixture = struct {
     view: ConversationBuffer,
     runner: AgentRunner,
     layout: Layout,
+    command_registry: CommandRegistry,
     wm: WindowManager,
 
     fn deinit(self: *PickerFixture) void {
         self.wm.deinit();
+        self.command_registry.deinit();
         self.layout.deinit();
         self.runner.deinit();
         self.view.deinit();
@@ -3130,6 +3179,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
     f.runner = AgentRunner.init(allocator, TestNullSink.sink(), &f.session);
     f.layout = Layout.init(allocator);
 
+    f.command_registry = try testCommandRegistry(allocator);
     f.wm = .{
         .allocator = allocator,
         .screen = undefined,
@@ -3143,15 +3193,8 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &f.command_registry,
     };
-    // Bypass of `WindowManager.init` skips the built-in registration;
-    // replay it here so `handleCommand` dispatches through the same
-    // table real users hit.
-    try f.wm.command_registry.registerBuiltIn("/quit", .quit);
-    try f.wm.command_registry.registerBuiltIn("/q", .quit);
-    try f.wm.command_registry.registerBuiltIn("/perf", .perf);
-    try f.wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
 }
 
 test "swapProvider rebuilds ProviderResult and updates model_id" {
@@ -3527,12 +3570,8 @@ const ModelPickerPluginFixture = struct {
             .wake_write_fd = 0,
             .node_registry = NodeRegistry.init(allocator),
             .buffer_registry = BufferRegistry.init(allocator),
-            .command_registry = CommandRegistry.init(allocator),
+            .command_registry = &self.engine.command_registry,
         };
-        try self.wm.command_registry.registerBuiltIn("/quit", .quit);
-        try self.wm.command_registry.registerBuiltIn("/q", .quit);
-        try self.wm.command_registry.registerBuiltIn("/perf", .perf);
-        try self.wm.command_registry.registerBuiltIn("/perf-dump", .perf_dump);
 
         try self.wm.attachLayoutRegistry();
         try self.layout.setRoot(self.view.buf());

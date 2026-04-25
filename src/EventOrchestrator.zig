@@ -120,6 +120,11 @@ pub const Config = struct {
     session_mgr: *?Session.SessionManager,
     /// Lua plugin engine, or null if Lua init failed.
     lua_engine: ?*LuaEngine,
+    /// Slash-command registry. Threaded into WindowManager. With Lua up,
+    /// callers point at `&engine.command_registry` so plugin registrations
+    /// land on the same table built-ins live in. Without Lua, callers
+    /// hand in a fallback registry seeded with the same built-ins.
+    command_registry: *CommandRegistry,
     /// Where to write the rendered screen.
     stdout_file: std.fs.File,
     /// Read end of the wake pipe; polled alongside stdin so agent events
@@ -156,6 +161,7 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .registry = cfg.endpoint_registry,
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
+        .command_registry = cfg.command_registry,
         .wake_write_fd = cfg.wake_write_fd,
         .skills = cfg.skills,
     });
@@ -764,6 +770,13 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
 
     var session_mgr: ?Session.SessionManager = null;
 
+    var command_registry = CommandRegistry.init(allocator);
+    defer command_registry.deinit();
+    try command_registry.registerBuiltIn("/quit", .quit);
+    try command_registry.registerBuiltIn("/q", .quit);
+    try command_registry.registerBuiltIn("/perf", .perf);
+    try command_registry.registerBuiltIn("/perf-dump", .perf_dump);
+
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
     wm.* = .{
@@ -775,10 +788,10 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = null,
+        .command_registry = &command_registry,
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
     };
     defer wm.deinit();
 
