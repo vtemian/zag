@@ -12466,3 +12466,157 @@ test "zag.jit.agents_md returns nil when input has no path key" {
     try std.testing.expect(req.result == null);
     try std.testing.expect(req.error_name == null);
 }
+
+test "zag.transforms.rg_trim trims grep output past 200 lines" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.transforms.rg_trim')");
+
+    // Build a 300-line input. The trim keeps the first 200 lines verbatim
+    // and replaces lines 201-300 with a single "... [100 lines elided]"
+    // marker so the agent sees the early hits but not the long tail.
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(alloc);
+    var i: usize = 1;
+    while (i <= 300) : (i += 1) {
+        try output.writer(alloc).print("line {d}\n", .{i});
+    }
+
+    var req = agent_events.ToolTransformRequest.init(
+        "grep",
+        "{}",
+        output.items,
+        false,
+        alloc,
+    );
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    defer alloc.free(req.result.?);
+
+    // First 200 lines kept verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "line 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "line 200\n") != null);
+    // Line 201 onward replaced by the elision marker.
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "line 201") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "... [100 lines elided]") != null);
+}
+
+test "zag.transforms.rg_trim leaves short grep output untouched" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.transforms.rg_trim')");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(alloc);
+    var i: usize = 1;
+    while (i <= 100) : (i += 1) {
+        try output.writer(alloc).print("line {d}\n", .{i});
+    }
+
+    var req = agent_events.ToolTransformRequest.init(
+        "grep",
+        "{}",
+        output.items,
+        false,
+        alloc,
+    );
+    try engine.handleToolTransformRequest(&req);
+    // Handler returns nil for under-cap inputs; the agent reads the
+    // original string and the harness skips the dupe.
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result == null);
+}
+
+test "zag.transforms.rg_trim passes through error output" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.transforms.rg_trim')");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(alloc);
+    var i: usize = 1;
+    while (i <= 300) : (i += 1) {
+        try output.writer(alloc).print("line {d}\n", .{i});
+    }
+
+    var req = agent_events.ToolTransformRequest.init(
+        "grep",
+        "{}",
+        output.items,
+        true,
+        alloc,
+    );
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result == null);
+}
+
+test "zag.transforms.bash_trim trims bash output past 500 lines" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.transforms.bash_trim')");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(alloc);
+    var i: usize = 1;
+    while (i <= 700) : (i += 1) {
+        try output.writer(alloc).print("line {d}\n", .{i});
+    }
+
+    var req = agent_events.ToolTransformRequest.init(
+        "bash",
+        "{}",
+        output.items,
+        false,
+        alloc,
+    );
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    defer alloc.free(req.result.?);
+
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "line 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "line 500\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "line 501") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "... [200 lines elided]") != null);
+}
+
+test "zag.transforms.bash_trim leaves short bash output untouched" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.transforms.bash_trim')");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(alloc);
+    var i: usize = 1;
+    while (i <= 100) : (i += 1) {
+        try output.writer(alloc).print("line {d}\n", .{i});
+    }
+
+    var req = agent_events.ToolTransformRequest.init(
+        "bash",
+        "{}",
+        output.items,
+        false,
+        alloc,
+    );
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result == null);
+}
