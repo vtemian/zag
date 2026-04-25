@@ -111,10 +111,24 @@ pub const BufferSink = struct {
                 const node = self.buffer.appendNode(null, .tool_call, e.name) catch return;
                 self.last_tool_call = node;
                 if (e.call_id) |id| {
-                    const owned = self.alloc.dupe(u8, id) catch return;
-                    self.pending_tool_calls.put(self.alloc, owned, node) catch {
-                        self.alloc.free(owned);
-                    };
+                    const gop = self.pending_tool_calls.getOrPut(self.alloc, id) catch return;
+                    if (gop.found_existing) {
+                        // Duplicate call_id from the LLM. Keep the original key
+                        // (the map already owns it) and overwrite the value with
+                        // the new node. No dupe happened, so nothing to free.
+                        gop.value_ptr.* = node;
+                    } else {
+                        // First sighting; getOrPut inserted a key pointing at the
+                        // event-owned `id` slice, which becomes invalid after this
+                        // handler returns. Replace it with a duped copy we own.
+                        const owned = self.alloc.dupe(u8, id) catch {
+                            // Roll back so the dangling key isn't observed.
+                            _ = self.pending_tool_calls.remove(id);
+                            return;
+                        };
+                        gop.key_ptr.* = owned;
+                        gop.value_ptr.* = node;
+                    }
                 }
             },
             .tool_result => |e| {
@@ -241,6 +255,23 @@ test "BufferSink tool_result falls back to last_tool_call without call_id" {
     const tool = cb.tree.root_children.items[0];
     try std.testing.expectEqual(@as(usize, 1), tool.children.items.len);
     try std.testing.expectEqualStrings("result", tool.children.items[0].content.items);
+}
+
+test "BufferSink handles duplicate call_id without leaking the key" {
+    const alloc = std.testing.allocator;
+    var cb = try ConversationBuffer.init(alloc, 0, "test");
+    defer cb.deinit();
+    var bs = BufferSink.init(alloc, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .tool_use = .{ .name = "first", .call_id = "id-A" } });
+    s.push(.{ .tool_use = .{ .name = "second", .call_id = "id-A" } });
+
+    // Only one map entry should exist; the second tool_use overwrites the
+    // value for the existing key rather than leaking a duplicate dup.
+    try std.testing.expectEqual(@as(u32, 1), bs.pending_tool_calls.count());
+    // testing.allocator catches any leaked dup of "id-A".
 }
 
 test "BufferSink error_event appends an err node" {
