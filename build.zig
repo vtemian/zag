@@ -132,6 +132,36 @@ pub fn build(b: *std.Build) void {
     e2e_canary.step.dependOn(b.getInstallStep());
     sim_e2e_step.dependOn(&e2e_canary.step);
 
+    // Round-trip the replay-gen pipeline: parse a fixture session JSONL,
+    // emit scenario.zsm + mock.json into a stable cache subdir, then run
+    // zag-sim against the kit. Stable path (not b.makeTempPath) so the
+    // dependent run still finds the files when replay-gen is build-cached.
+    // Both invocations must exit 0 or the build fails.
+    const replay_tmp = b.cache_root.join(b.allocator, &.{ "sim-e2e", "replay-roundtrip" }) catch @panic("OOM");
+    const replay_tmp_mkdir = b.addSystemCommand(&.{ "mkdir", "-p", replay_tmp });
+
+    const e2e_replay_gen = b.addRunArtifact(sim_exe);
+    e2e_replay_gen.addArgs(&.{
+        "replay-gen",
+        b.path("src/sim/scenarios/testdata/session_simple.jsonl").getPath(b),
+    });
+    e2e_replay_gen.addArg(b.fmt("--out={s}", .{replay_tmp}));
+    e2e_replay_gen.expectExitCode(0);
+    e2e_replay_gen.step.dependOn(b.getInstallStep());
+    e2e_replay_gen.step.dependOn(&replay_tmp_mkdir.step);
+    sim_e2e_step.dependOn(&e2e_replay_gen.step);
+
+    const e2e_replay_run = b.addRunArtifact(sim_exe);
+    e2e_replay_run.addArgs(&.{
+        "run",
+        b.fmt("{s}/scenario.zsm", .{replay_tmp}),
+    });
+    e2e_replay_run.addArg(b.fmt("--mock={s}/mock.json", .{replay_tmp}));
+    e2e_replay_run.addArg(b.fmt("--artifacts={s}/run-out", .{replay_tmp}));
+    e2e_replay_run.expectExitCode(0);
+    e2e_replay_run.step.dependOn(&e2e_replay_gen.step);
+    sim_e2e_step.dependOn(&e2e_replay_run.step);
+
     const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
     const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
     script.addArtifactArg(exe);

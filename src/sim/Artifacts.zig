@@ -34,9 +34,18 @@ pub fn create(alloc: std.mem.Allocator, override: ?[]const u8) !*Artifacts {
     errdefer alloc.free(run_id);
 
     var minted = false;
+    // The contract on `dir` is "absolute path". When override is relative
+    // (e.g. `--artifacts=relative/dir` from a CLI invocation, or a build
+    // step that hands us a cache-relative path), normalize via realpathAlloc
+    // after creating the dir so downstream callers (executeSnapshot,
+    // tailZagLog) can use createFileAbsolute / openDirAbsolute as the docs
+    // promise.
     const dir = if (override) |o| blk: {
         try std.fs.cwd().makePath(o);
-        break :blk try alloc.dupe(u8, o);
+        if (std.fs.path.isAbsolute(o)) {
+            break :blk try alloc.dupe(u8, o);
+        }
+        break :blk try std.fs.cwd().realpathAlloc(alloc, o);
     } else mint: {
         minted = true;
         const tmp_root = std.posix.getenv("TMPDIR") orelse "/tmp";

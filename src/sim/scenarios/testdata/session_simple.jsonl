@@ -1,0 +1,4 @@
+{"type":"session_start","ts":1700000000000}
+{"type":"user_message","content":"hello","ts":1700000000100}
+{"type":"assistant_text","content":"hi from a replayed session","ts":1700000000200}
+{"type":"info","content":"tokens: in=10 out=5","ts":1700000000201}
