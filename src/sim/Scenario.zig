@@ -77,6 +77,13 @@ fn runSourceImpl(
     // post-run record; losing it because parse failed defeats its purpose.
     defer summary.flush() catch {};
 
+    // Tail zag's own log into artifacts before flushing summary. We need to
+    // do this *before* `r.deinit()` runs (which deletes the mock tempdir and
+    // takes the log with it), but the structure here is `r` declared below
+    // with `defer r.deinit()`. Defer order is LIFO, so a `defer` on the
+    // tailer registered *after* the runner's defer fires *before* it. Done
+    // inline below right after Runner.init.
+
     const steps = Dsl.parse(alloc, src) catch |e| {
         summary.outcome = .harness_error;
         summary.failing_error = @errorName(e);
@@ -89,6 +96,12 @@ fn runSourceImpl(
 
     var r = try Runner.init(alloc);
     defer r.deinit();
+    // Registered after r.init so it fires *before* r.deinit (LIFO defer).
+    // The mock harness's tempdir is the spawned zag's $HOME; tail it now
+    // before deinit yanks the directory.
+    defer {
+        if (r.mock) |h| opts.artifacts.tailZagLog(h.tmp_root) catch {};
+    }
 
     if (opts.mock_script_path) |mock_path| {
         r.attachMock(mock_path) catch |e| {
