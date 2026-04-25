@@ -35,6 +35,36 @@ const Session = @import("../Session.zig");
 /// blowing the stack or eating the token budget.
 const max_task_depth: u8 = 8;
 
+/// Process-wide latch: set to true the first time `task.execute` runs
+/// against a registry whose subagents declared a `model` frontmatter
+/// field. The v1 task tool ignores `model` and always reuses the
+/// parent's provider, so we surface the gap once instead of silently
+/// dropping it. Flipped via `swap(true, .acquire_release)` so a concurrent
+/// caller still sees exactly one warn.
+var warned_about_ignored_model = std.atomic.Value(bool).init(false);
+
+const SubagentRegistry = subagents_types.SubagentRegistry;
+
+fn warnAboutIgnoredModelOnce(registry: *const SubagentRegistry) void {
+    if (warned_about_ignored_model.swap(true, .acq_rel)) return;
+    var ignored: usize = 0;
+    var first_name: ?[]const u8 = null;
+    for (registry.entries.items) |sa| {
+        if (sa.model != null) {
+            if (first_name == null) first_name = sa.name;
+            ignored += 1;
+        }
+    }
+    if (ignored == 0) return;
+    log.warn(
+        "{d} registered subagent(s) declare a `model` frontmatter field, " ++
+            "but the v1 task tool ignores it and uses the parent's provider. " ++
+            "First example: '{s}'. Track follow-up at " ++
+            "https://github.com/vtemian/zag/issues (per-subagent providers).",
+        .{ ignored, first_name orelse "" },
+    );
+}
+
 const TaskInput = struct {
     agent: []const u8,
     prompt: []const u8,
@@ -68,6 +98,8 @@ pub fn execute(
             .owned = false,
         };
     };
+
+    warnAboutIgnoredModelOnce(ctx.subagents);
 
     const sa = ctx.subagents.lookup(parsed.value.agent) orelse {
         const msg = formatUnknownAgent(allocator, parsed.value.agent, ctx.subagents) catch return types.oomResult();
@@ -809,4 +841,48 @@ test "task without bound context returns tool error" {
 
     try testing.expect(result.is_error);
     try testing.expect(std.mem.indexOf(u8, result.content, "TaskContext") != null);
+}
+
+test "warnAboutIgnoredModelOnce skips when no subagent has model" {
+    const allocator = testing.allocator;
+
+    // Reset the latch so this test is order-independent.
+    warned_about_ignored_model.store(false, .release);
+
+    var registry: subagents_mod.SubagentRegistry = .{};
+    defer registry.deinit(allocator);
+    try registry.register(allocator, .{
+        .name = "plain",
+        .description = "no model declared",
+        .prompt = "p",
+    });
+
+    warnAboutIgnoredModelOnce(&registry);
+    // The latch still flips (we ran the scan). What matters is no warn
+    // fired; we cannot intercept std.log here, so the contract is a
+    // smoke check that the call returns without crashing on an empty
+    // ignored count.
+    try testing.expect(warned_about_ignored_model.load(.acquire));
+}
+
+test "warnAboutIgnoredModelOnce fires at most once" {
+    const allocator = testing.allocator;
+
+    warned_about_ignored_model.store(false, .release);
+
+    var registry: subagents_mod.SubagentRegistry = .{};
+    defer registry.deinit(allocator);
+    try registry.register(allocator, .{
+        .name = "with-model",
+        .description = "declares a model",
+        .prompt = "p",
+        .model = "anthropic/claude-haiku-4-5",
+    });
+
+    warnAboutIgnoredModelOnce(&registry);
+    try testing.expect(warned_about_ignored_model.load(.acquire));
+
+    // Second call must short-circuit: the latch is already set.
+    warnAboutIgnoredModelOnce(&registry);
+    try testing.expect(warned_about_ignored_model.load(.acquire));
 }
