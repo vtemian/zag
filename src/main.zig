@@ -1461,6 +1461,7 @@ test {
     _ = @import("Harness.zig");
     _ = @import("prompt.zig");
     _ = @import("Instruction.zig");
+    _ = @import("Reminder.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
