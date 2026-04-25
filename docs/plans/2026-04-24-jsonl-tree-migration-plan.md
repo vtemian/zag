@@ -2,7 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Every JSONL event gets a ULID `id` and a `parent_id`. `tool_uses` stay nested inside their assistant event as an array with local ULIDs; `tool_result.parent_id` points at the assistant event and `tool_result.tool_use_id` names the specific call. This is the schema plan 3 (skills + subagents) depends on for inline subagent persistence.
+**Goal:** Every JSONL event gets a ULID `id` and a `parent_id`. Each event is a flat top-level row: `assistant_text`, `tool_call`, and `tool_result` are siblings under the same user-turn root, chained through `parent_id`. `tool_result` rows still carry `tool_use_id` to name the specific call they answer. This is the schema plan 3 (skills + subagents) depends on for inline subagent persistence.
+
+> **Note (post-implementation):** An earlier draft of this plan described `tool_uses` as nested arrays inside the assistant row with local ULIDs. The shipped implementation flattened that: `tool_call` is its own top-level entry type alongside `tool_result`, and the tree shape comes entirely from `parent_id` chains. The remainder of this document has been rewritten to match what landed.
 
 **Execution order:** Second of three plans.
 
@@ -17,8 +19,8 @@ Today's `Session.zig` writes events as flat JSONL without ids. A reader reconstr
 After this plan:
 
 - **ULID module** (`src/ulid.zig`): 26-char Crockford-base32, 48-bit millisecond timestamp + 80-bit entropy, time-sortable within the same process run.
-- **Event schema** gains `id: [26]u8` and `parent_id: ?[26]u8` on every write path. For `tool_use` blocks nested inside an assistant event, each gets a local ULID inside the `tool_uses` array; the enclosing assistant event carries its own top-level id.
-- **Write paths** updated: `Session.persistUserMessage`, `Session.persistAssistant`, `Session.persistToolResult`, and the streaming-event appenders in `ConversationHistory`.
+- **Event schema** gains `id: [26]u8` and `parent_id: ?[26]u8` on every write path. Every event is one top-level JSONL row. There are no nested arrays of sub-events. `assistant_text`, `tool_call`, and `tool_result` are sibling rows under the same user-turn root; the tree shape lives entirely in the `parent_id` chain.
+- **Write paths** updated: `Session.persistUserMessage`, `Session.persistAssistant`, `Session.persistToolCall`, `Session.persistToolResult`, and the streaming-event appenders in `ConversationHistory`.
 - **Read paths** accept both old (no id / parent_id) and new format during a transition window; unknown fields are skipped. Events without `id` are assigned synthetic ULIDs at read time so downstream code can rely on non-null ids.
 
 **Backwards compatibility**
@@ -90,17 +92,19 @@ id: Ulid,
 parent_id: ?Ulid = null,
 ```
 
-For assistant events that embed `tool_uses`, the nested array entries gain their own local `id` and `input` fields. The `tool_use_id` on `tool_result` already exists; it stays as the reference into the assistant event's `tool_uses[*].id`.
+`tool_call` is its own top-level entry type alongside `tool_result`; both gain `id` and `parent_id` like every other row. The `tool_use_id` field on `tool_result` already exists and stays as the cross-reference back to the matching `tool_call.id`.
 
 **Persistence helpers** gain an overload that takes an explicit parent id:
 
 ```zig
-pub fn persistAssistant(self: *ConversationHistory, text: []const u8, tool_uses: []const ToolUse, parent_id: ?Ulid) !Ulid;
+pub fn persistAssistant(self: *ConversationHistory, text: []const u8, parent_id: ?Ulid) !Ulid;
+pub fn persistToolCall(self: *ConversationHistory, name: []const u8, input: []const u8, parent_id: ?Ulid) !Ulid;
+pub fn persistToolResult(self: *ConversationHistory, tool_use_id: []const u8, content: []const u8, is_error: bool, parent_id: ?Ulid) !Ulid;
 ```
 
 Returning the new ULID lets the caller chain the next event's `parent_id`.
 
-**Tests:** Write a tiny in-memory session, persist user → assistant (with two tool_uses) → tool_result → assistant, read back as JSONL, parse each line, assert every record has non-null `id`, every `parent_id` resolves, and the two `tool_use` local ids are unique within the assistant.
+**Tests:** Write a tiny in-memory session, persist user → assistant_text → tool_call → tool_call → tool_result → tool_result → assistant_text, read back as JSONL, parse each line, assert every record has non-null `id`, every `parent_id` resolves to a previously written row, and the two `tool_call` ids are unique and each match a `tool_result.tool_use_id`.
 
 **Commit:** `session: add ULID id and parent_id to every persisted event`
 
@@ -115,18 +119,19 @@ Returning the new ULID lets the caller chain the next event's `parent_id`.
 
 **Design**
 
-Runner carries `last_persisted_id: ?Ulid` as it loops. On each persist call it passes the previous id as `parent_id` and stores the returned id. Nested tool_uses carry local ids but the assistant event's `id` is what `tool_result.parent_id` points at; `tool_result.tool_use_id` identifies the call within the assistant.
+Runner carries `last_persisted_id: ?Ulid` as it loops. On each persist call it passes the previous id as `parent_id` and stores the returned id. `tool_call` and `tool_result` are their own top-level rows; `tool_result.tool_use_id` cross-references the matching `tool_call.id`.
 
-The specific chain for a single turn:
+The specific chain for a single turn with one tool call:
 
 ```
-user.parent_id       = <previous turn's last assistant id, or null if first>
-assistant.parent_id  = user.id
-tool_result.parent_id = assistant.id, tool_use_id = assistant.tool_uses[k].id
-(next) assistant.parent_id = tool_result.id   // continuation after a tool
+user.parent_id          = <previous turn's last assistant_text id, or null if first>
+assistant_text.parent_id = user.id
+tool_call.parent_id      = assistant_text.id
+tool_result.parent_id    = tool_call.id, tool_use_id = tool_call.id
+(next) assistant_text.parent_id = tool_result.id   // continuation after the tool
 ```
 
-**Tests:** Integration test that runs a stub provider through one user turn with one tool call; assert the id chain is internally consistent.
+**Tests:** Integration test that runs a stub provider through one user turn with one tool call; assert the id chain is internally consistent (every `parent_id` resolves to a previously written row, `tool_result.tool_use_id` matches its `tool_call.id`).
 
 **Commit:** `runner: thread ULID parent_id through turn persistence`
 
