@@ -3238,3 +3238,185 @@ test "identical streak counter increments on identical tool input and resets on 
         try std.testing.expectEqual(s.expected, streak);
     }
 }
+
+test "HE10.5 integration: eager-loaded zag.loop.default fires reminder via fireLoopDetect" {
+    // End-to-end PR 10 integration test for the loop detector.
+    //
+    //   1. `loadBuiltinPlugins` eager-loads `zag.loop.default`, the real
+    //      stdlib detector that flags at the 5-call lenient threshold.
+    //      No stub handler.
+    //   2. `fireLoopDetect` walks the same code path the agent loop runs
+    //      after each tool execution: pushes the request onto the queue,
+    //      blocks on the round-trip, decodes the action.
+    //   3. The pump thread services the queue via the same
+    //      `AgentRunner.dispatchHookRequests` path the production runner
+    //      uses, so this test catches drift in that integration as well.
+    //   4. The reminder text is pushed onto `engine.reminders` and
+    //      asserted against the canonical phrasing emitted by the
+    //      stdlib `default.lua`. If `default.lua` is rewritten, this
+    //      test will catch the contract change.
+    const AgentRunner = @import("AgentRunner.zig");
+    const Reminder = @import("Reminder.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.loadBuiltinPlugins();
+
+    // Eager-load wired up the real detector before we proceed; if this
+    // regresses, the rest of the test would silently report no action.
+    try std.testing.expect(engine.loopDetectHandler() != null);
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    // Streaks 1 through 4: the lenient default stays silent.
+    var streak: u32 = 1;
+    while (streak < 5) : (streak += 1) {
+        const action = try fireLoopDetect(&engine, "bash", "{\"cmd\":\"ls\"}", false, streak, alloc, &queue, &cancel);
+        try std.testing.expect(action == null);
+    }
+
+    // Streak of 5 trips the threshold; the action must carry the
+    // canonical text the stdlib emits.
+    const action = try fireLoopDetect(&engine, "bash", "{\"cmd\":\"ls\"}", false, 5, alloc, &queue, &cancel);
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .reminder => |text| {
+            defer alloc.free(text);
+            try std.testing.expect(std.mem.indexOf(u8, text, "bash") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "5x") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "Try a different approach or stop.") != null);
+
+            // Mirror the agent loop body: a reminder action lands on
+            // the engine's reminder queue with `next_turn` scope so
+            // the next user message picks it up.
+            try engine.reminders.push(engine.allocator, .{
+                .text = text,
+                .scope = .next_turn,
+            });
+        },
+        .abort => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), engine.reminders.len());
+
+    const snap = try engine.reminders.snapshot(engine.allocator);
+    defer Reminder.freeDrained(engine.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expect(std.mem.indexOf(u8, snap[0].text, "Try a different approach or stop.") != null);
+    try std.testing.expectEqual(Reminder.Scope.next_turn, snap[0].scope);
+}
+
+test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompact" {
+    // End-to-end PR 10 integration test for compaction.
+    //
+    //   1. `loadBuiltinPlugins` eager-loads `zag.compact.default`, the
+    //      real stdlib strategy that elides every assistant message
+    //      strictly before the most recent user message.
+    //   2. `fireCompact` is the same entry point the agent loop calls
+    //      at the top of each turn once usage crosses 80%; it pushes a
+    //      `CompactRequest` onto the queue and waits on the result.
+    //   3. The pump thread drains the queue via
+    //      `AgentRunner.dispatchHookRequests`, exercising the marshal
+    //      path end-to-end.
+    //   4. After the round-trip, every old assistant text must be
+    //      replaced with the elision marker while every user message
+    //      survives intact. This locks in the contract between the
+    //      Zig compaction trigger and the stdlib strategy.
+    const AgentRunner = @import("AgentRunner.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.loadBuiltinPlugins();
+
+    try std.testing.expect(engine.compactHandler() != null);
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    // Five-message conversation: two older user/assistant pairs plus a
+    // current user turn. The default strategy keeps every user
+    // message intact and replaces both older assistant bodies with
+    // the elision marker.
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "first ask" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "first answer" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "second ask" } }};
+    var b4 = [_]types.ContentBlock{.{ .text = .{ .text = "second answer" } }};
+    var b5 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+        .{ .role = .assistant, .content = &b2 },
+        .{ .role = .user, .content = &b3 },
+        .{ .role = .assistant, .content = &b4 },
+        .{ .role = .user, .content = &b5 },
+    };
+
+    // 850/1000 = 85% sits above the 80% fire threshold so `fireCompact`
+    // does the round-trip rather than bypassing it.
+    const replacement = try fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement != null);
+    defer {
+        for (replacement.?) |m| m.deinit(alloc);
+        alloc.free(replacement.?);
+    }
+
+    const out = replacement.?;
+    try std.testing.expectEqual(@as(usize, 5), out.len);
+
+    // User messages survive intact at every original position.
+    try std.testing.expectEqual(types.Role.user, out[0].role);
+    try std.testing.expectEqualStrings("first ask", out[0].content[0].text.text);
+    try std.testing.expectEqual(types.Role.user, out[2].role);
+    try std.testing.expectEqualStrings("second ask", out[2].content[0].text.text);
+    try std.testing.expectEqual(types.Role.user, out[4].role);
+    try std.testing.expectEqualStrings("current ask", out[4].content[0].text.text);
+
+    // Both older assistant bodies are gone, replaced by the elision
+    // marker. The original strings must not appear anywhere in the
+    // replacement; otherwise the strategy quietly skipped the elision.
+    try std.testing.expectEqual(types.Role.assistant, out[1].role);
+    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "<elided") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "first answer") == null);
+
+    try std.testing.expectEqual(types.Role.assistant, out[3].role);
+    try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "<elided") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "second answer") == null);
+}
