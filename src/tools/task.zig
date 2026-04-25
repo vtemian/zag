@@ -176,6 +176,7 @@ fn runChild(
         .lua_engine = ctx.lua_engine,
         .provider = ctx.provider,
         .provider_name = ctx.provider_name,
+        .parent_ctx = ctx,
     }});
 
     // Propagate parent cancel to child: while draining we poll the
@@ -230,7 +231,32 @@ const ChildArgs = struct {
     lua_engine: ?*@import("../LuaEngine.zig").LuaEngine,
     provider: @import("../llm.zig").Provider,
     provider_name: []const u8,
+    /// Parent runner's TaskContext, captured at spawn time. The child
+    /// thread reads `task_depth`, `subagents`, `session_handle`, and the
+    /// rest off this pointer to build its own TaskContext so any nested
+    /// `task(...)` invocation from the subagent finds a bound context
+    /// (depth + 1) instead of a null threadlocal.
+    parent_ctx: *const tools.TaskContext,
 };
+
+/// Construct the TaskContext the child thread should publish, given the
+/// parent's context and the spawn-time arguments. Splitting this out of
+/// `childThreadMain` keeps it testable without spinning up a real
+/// provider or agent thread; the test below pins the depth-increment
+/// invariant that makes the recursion cap reachable in production.
+fn buildChildContext(parent_ctx: *const tools.TaskContext, args: ChildArgs) tools.TaskContext {
+    return .{
+        .allocator = args.allocator,
+        .subagents = parent_ctx.subagents,
+        .provider = args.provider,
+        .provider_name = args.provider_name,
+        .registry = args.registry,
+        .session_handle = parent_ctx.session_handle,
+        .lua_engine = args.lua_engine,
+        .task_depth = parent_ctx.task_depth + 1,
+        .wake_fd = args.queue.wake_fd,
+    };
+}
 
 fn childThreadMain(args: ChildArgs) void {
     // Republish the Lua request queue on the child thread so Lua-defined
@@ -238,6 +264,14 @@ fn childThreadMain(args: ChildArgs) void {
     // thread correctly.
     tools.lua_request_queue = args.queue;
     defer tools.lua_request_queue = null;
+
+    // Republish the TaskContext on the child thread. Without this the
+    // threadlocal `tools.task_context` reads null on the child, so any
+    // nested `task(...)` from the subagent fails with the
+    // "no TaskContext bound" error and the recursion cap is dead code.
+    var child_task_ctx = buildChildContext(args.parent_ctx, args);
+    tools.task_context = &child_task_ctx;
+    defer tools.task_context = null;
 
     // Subagents accept no mid-turn user input, so the flag is local and
     // stays unread; pass a stack-allocated cell to satisfy the signature.
@@ -537,6 +571,60 @@ test "task_start payload escapes JSON special characters in prompt" {
     try testing.expect(std.mem.indexOf(u8, payload, "\\\"hi\\\"") != null);
     try testing.expect(std.mem.indexOf(u8, payload, "\\n") != null);
     try testing.expect(std.mem.indexOf(u8, payload, "\\\\line") != null);
+}
+
+test "buildChildContext increments depth and inherits parent state" {
+    const allocator = testing.allocator;
+
+    var subagent_registry: subagents_mod.SubagentRegistry = .{};
+    defer subagent_registry.deinit(allocator);
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+
+    var child_registry = tools.Registry.init(allocator);
+    defer child_registry.deinit();
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 8);
+    defer queue.deinit();
+    queue.wake_fd = null;
+
+    var cancel: agent_events.CancelFlag = agent_events.CancelFlag.init(false);
+
+    var child_messages: std.ArrayList(types.Message) = .empty;
+    defer child_messages.deinit(allocator);
+
+    const dummy_provider: @import("../llm.zig").Provider = undefined;
+    const parent: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = &subagent_registry,
+        .provider = dummy_provider,
+        .provider_name = "test",
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 7,
+        .wake_fd = null,
+    };
+
+    const args: ChildArgs = .{
+        .messages = &child_messages,
+        .registry = &child_registry,
+        .allocator = allocator,
+        .queue = &queue,
+        .cancel = &cancel,
+        .lua_engine = null,
+        .provider = dummy_provider,
+        .provider_name = "test",
+        .parent_ctx = &parent,
+    };
+
+    const child = buildChildContext(&parent, args);
+    try testing.expectEqual(@as(u8, 8), child.task_depth);
+    try testing.expectEqual(parent.subagents, child.subagents);
+    try testing.expectEqual(parent.session_handle, child.session_handle);
+    try testing.expect(child.registry == &child_registry);
+    try testing.expectEqualStrings("test", child.provider_name);
 }
 
 test "task without bound context returns tool error" {
