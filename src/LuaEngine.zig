@@ -10383,3 +10383,167 @@ test "zag.subagents.filesystem skips malformed files with a warning" {
     try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
     try std.testing.expect(registry.lookup("good") != null);
 }
+
+test "zag.prompt.resolve maps known model ids to the right pack module" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Resolve must work without `loadBuiltinPlugins` priming `for_model`
+    // because the dispatcher table is the `require` return value, not a
+    // side effect of layer registration.
+    try engine.lua.doString(
+        \\local d = require("zag.prompt")
+        \\_claude   = d.resolve("claude-sonnet-4-6")
+        \\_codex    = d.resolve("gpt-5-codex")
+        \\_unknown  = d.resolve("groq/llama-3.1-70b")
+    );
+
+    _ = try engine.lua.getGlobal("_claude");
+    try std.testing.expectEqualStrings("zag.prompt.anthropic", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_codex");
+    try std.testing.expectEqualStrings("zag.prompt.openai-codex", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_unknown");
+    try std.testing.expectEqualStrings("zag.prompt.default", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.prompt dispatch routes Claude model id to anthropic pack" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Pulls in the dispatcher (`zag.prompt`) and the env layer. The
+    // pack modules are intentionally lazy-loaded; the dispatcher's
+    // `pack` layer requires them on first match.
+    engine.loadBuiltinPlugins();
+
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "anthropic", .model_id = "claude-sonnet-4-5" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    // Identity line unique to the anthropic pack proves the dispatcher
+    // resolved through `zag.prompt.anthropic` and rendered its body.
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "running with Claude") != null,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "running with GPT-5 Codex"),
+    );
+}
+
+test "zag.prompt dispatch routes Codex model id to openai-codex pack" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    engine.loadBuiltinPlugins();
+
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "openai", .model_id = "gpt-5-codex" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "running with GPT-5 Codex") != null,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "running with Claude"),
+    );
+}
+
+test "zag.prompt dispatch falls through to default pack for exotic providers" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    engine.loadBuiltinPlugins();
+
+    // Groq's llama route matches no provider-specific pattern; the
+    // trailing `.*` entry in `M.PACKS` must catch it and the default
+    // pack must render. The marker phrase only lives in default.lua.
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "groq", .model_id = "llama-3.1-70b" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "Call tools when you need information") != null,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "running with Claude"),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "running with GPT-5 Codex"),
+    );
+}
+
+test "zag.prompt dispatch lets user layer named 'pack' shadow the pack body" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    engine.loadBuiltinPlugins();
+
+    // The dispatcher registers a stable layer literally named `pack`.
+    // A user that wants to take over the model-specific identity for
+    // their config registers their own layer with the same name. The
+    // registry is append-only, so both fire; the user's volatile layer
+    // is what the agent loop ends up appending after the stable prefix,
+    // and the model treats the later text as the operative instruction.
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "pack",
+        \\  priority = 1000,
+        \\  cache_class = "volatile",
+        \\  render = function(_)
+        \\    return "USER-OVERRIDE: ignore the pack identity above."
+        \\  end,
+        \\}
+    );
+
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "anthropic", .model_id = "claude-sonnet-4-5" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    // Pack still renders into the stable half. User layer with the
+    // same name lands in the volatile half and "wins" by virtue of
+    // appearing later in the concatenated system prompt.
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "running with Claude") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.@"volatile", "USER-OVERRIDE") != null,
+    );
+
+    // Two layers share the name `pack` after the user's registration.
+    var pack_count: usize = 0;
+    for (engine.prompt_registry.layers.items) |layer| {
+        if (std.mem.eql(u8, layer.name, "pack")) pack_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), pack_count);
+}
