@@ -1,37 +1,27 @@
-# Reproducer scenario for the segfault Vlad observed on 2026-04-23: a
-# normal chat turn crashed the agent runner during EventQueue.deinit on
-# .done. Drives zag via the mock provider so the reproducer is offline +
-# deterministic.
+# Regression guard for a SIGABRT panic that fired during a normal chat
+# turn through the mock provider. Originally observed on 2026-04-23 as a
+# generic "segfault on .done"; the TUI simulator pinned it to
+# std.http.contentLengthStream (Zig 0.15.2) accessing
+# `reader.state.body_remaining_content_length` after the reader had
+# transitioned to .ready. Real providers (Anthropic, OpenAI, Ollama)
+# stream chunked, so they don't trip the bug; the mock server uses
+# Content-Length, which does. Fixed in src/llm/streaming.zig by
+# switching readLine off readSliceShort and onto Reader.stream with a
+# body_done sticky flag.
 #
-# Status (2026-04-23): committed but NOT yet a working reproducer.
-#
-# What happens today: the canary scenario shows the zag prompt buffer
-# only ever shows the first byte of `send "hello" <Enter>` — `e l l o
-# \r` are written to the PTY master but zag stops reading after `h`.
-# The agent never sends a request, the mock never replies, and `.done`
-# never fires. `wait_exit` times out at the harness's default deadline,
-# so the scenario currently exits 1 (assertion_failed: WaitExitTimeout)
-# instead of 2 (child_crashed).
-#
-# Pacing knobs already tried, none of which help:
-# - `wait_idle 500ms` BEFORE `send` (in case input handler isn't wired)
-# - `wait_idle 200ms` AFTER  `send` (in case Enter races teardown)
-#
-# Likely culprits to investigate:
-# - Pty.zig writes vs zag's input-handler read loop
-# - Spawn.zig pty modes (raw / line discipline)
-# - zag's main-loop reading only on specific fds and missing a wakeup
-#
-# When the input-pacing race is fixed and the scenario actually reaches
-# the .done path:
-# - if the segfault still fires, set `expectExitCode(2)` in build.zig
-# - if it's been silently fixed, set `expectExitCode(0)` and update this
-#   header to a regression-guard note
+# What the scenario does today: drives one chat turn against the mock
+# provider, then exits zag via `/quit`. A future regression of the
+# contentLengthStream bug (or any other crash on the streaming-read
+# path) would either re-introduce a SIGABRT before `/quit` lands (the
+# harness writes crash.txt and `wait_exit` reaps the signal — exit 0
+# still, but crash.txt is the tell), or the agent would never finish
+# the turn and `wait_exit` would time out instead of exiting cleanly.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "hello" <Enter>
-wait_idle 200ms
+wait_idle 5s
+send "/quit" <Enter>
 wait_exit
 snapshot final
