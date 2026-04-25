@@ -11,6 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Hooks = @import("Hooks.zig");
 const prompt = @import("prompt.zig");
+const types = @import("types.zig");
 
 const log = std.log.scoped(.agent_events);
 
@@ -90,6 +91,15 @@ pub const AgentEvent = union(enum) {
     /// the agent loop. Same main-thread marshalling rationale; the
     /// request is caller-owned.
     loop_detect_request: *LoopDetectRequest,
+    /// Round-trip: the agent thread asks main to invoke the single global
+    /// compaction strategy registered via `zag.compact.strategy(fn)` when
+    /// the running token estimate crosses the high-water threshold. The
+    /// handler receives a snapshot of the messages plus token usage and
+    /// returns either nil (skip compaction this turn) or a replacement
+    /// message array that the agent installs in place of the existing
+    /// history. Same main-thread marshalling rationale; the request is
+    /// caller-owned.
+    compact_request: *CompactRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -155,6 +165,11 @@ pub const AgentEvent = union(enum) {
             // awaiting `done`; signal so it proceeds without a reminder
             // or abort. The detector is advisory, so dropping is safe.
             .loop_detect_request => |req| req.done.set(),
+            // A dropped compact request leaves the worker parked awaiting
+            // `done`; signal so it proceeds without compaction. Skipping
+            // is safe because compaction is advisory: the worst case is
+            // the next turn hits the provider context limit.
+            .compact_request => |req| req.done.set(),
         }
     }
 };
@@ -679,6 +694,90 @@ pub const LoopDetectRequest = struct {
     }
 };
 
+/// Round-trip request pushed by the agent thread when the running token
+/// estimate crosses the compaction threshold (default 80% of the model's
+/// context window) so the single global compaction strategy registered
+/// via `zag.compact.strategy(fn)` can rewrite the history. Lua is pinned
+/// to the main thread, so the worker marshals here exactly like the
+/// other socket requests.
+///
+/// Lossy round-trip (v1): the strategy sees a Lua snapshot of each
+/// message as `{role = "user"|"assistant", content = "<concat text>"}`,
+/// where `content` is the concatenation of every `text` block in the
+/// original message. `tool_use`, `tool_result`, `thinking`, and
+/// `redacted_thinking` blocks are dropped from the snapshot. The
+/// strategy returns a sequence of `{role, content}` tables; the main
+/// thread reconstructs each as a `Message{role, .[ {.text = content}]}`.
+/// This is sufficient for "drop oldest tool_result blocks" use cases
+/// (the strategy emits replacement summary text) but does NOT preserve
+/// tool_use/tool_result correlation. Full block fidelity is deferred
+/// until a v2 socket lands.
+///
+/// Lifecycle: the agent builds the request on its stack with the
+/// worker's allocator, pushes the event, parks on `done.wait()`. The
+/// main thread builds the Lua-side message table, calls the registered
+/// function via `protectedCall`, and either decodes the returned table
+/// into `req.result` (success path, allocator-owned messages) or sets
+/// `error_name` (on Lua error). The waiter owns the messages slice plus
+/// every nested ContentBlock allocation and releases via `freeResult`.
+pub const CompactRequest = struct {
+    /// Read-only snapshot of the current conversation history. The main
+    /// thread reads the role + text of each block under `done` and must
+    /// not retain pointers past `done.set()`. The agent thread owns the
+    /// underlying message slice for the lifetime of the round-trip.
+    messages: []const types.Message,
+    /// Estimated tokens consumed by `messages` (the most recent
+    /// `LlmResponse.input_tokens` count is the canonical source). Passed
+    /// to the strategy as part of the context table so a Lua plugin
+    /// can decide how aggressive to be.
+    tokens_used: u32,
+    /// Maximum tokens the active model accepts in a single request.
+    /// Same context table field as `tokens_used`. Zero when the caller
+    /// has no model rate card; the agent loop short-circuits the fire
+    /// in that case so a Lua strategy never sees a zero ceiling.
+    tokens_max: u32,
+    /// Allocator used to dupe the strategy's returned messages into
+    /// `result`. Caller promises thread-safety.
+    allocator: Allocator,
+    /// Signalled by the main thread when either `result`, `error_name`,
+    /// or neither (handler returned nil / no handler) has been
+    /// finalized.
+    done: std.Thread.ResetEvent = .{},
+    /// Replacement messages slice duped into `allocator`. Null when the
+    /// strategy returned nil, when no strategy was registered, or when
+    /// the call errored. Owned by the waiter; release via `freeResult`.
+    result: ?[]types.Message = null,
+    /// `@errorName` of whatever went wrong on the main thread (Lua
+    /// call failure, return value type mismatch, OOM duping the
+    /// replacement messages, malformed entry). Borrowed from rodata;
+    /// do not free.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(
+        messages: []const types.Message,
+        tokens_used: u32,
+        tokens_max: u32,
+        allocator: Allocator,
+    ) CompactRequest {
+        return .{
+            .messages = messages,
+            .tokens_used = tokens_used,
+            .tokens_max = tokens_max,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free the replacement messages slice (and every owned ContentBlock
+    /// inside) duped by the main thread. Safe to call when `result` is
+    /// null.
+    pub fn freeResult(self: *CompactRequest) void {
+        const list = self.result orelse return;
+        for (list) |msg| msg.deinit(self.allocator);
+        self.allocator.free(list);
+        self.result = null;
+    }
+};
+
 // -- Tests -------------------------------------------------------------------
 
 test {
@@ -1111,6 +1210,49 @@ test "LoopDetectRequest.freeResult releases reminder text" {
 test "LoopDetectRequest.freeResult abort variant has no payload" {
     var req = LoopDetectRequest.init("bash", "{}", false, 5, std.testing.allocator);
     req.result = .abort;
+    req.freeResult();
+    try std.testing.expect(req.result == null);
+}
+
+test "push and drain compact_request event" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    defer queue.deinit();
+
+    const empty: []const types.Message = &.{};
+    var req = CompactRequest.init(empty, 100, 200, std.testing.allocator);
+
+    try queue.push(.{ .compact_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u32, 100), buf[0].compact_request.tokens_used);
+    try std.testing.expectEqual(@as(u32, 200), buf[0].compact_request.tokens_max);
+}
+
+test "freeOwned signals compact_request done" {
+    const empty: []const types.Message = &.{};
+    var req = CompactRequest.init(empty, 0, 0, std.testing.allocator);
+    const ev: AgentEvent = .{ .compact_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+}
+
+test "CompactRequest.freeResult releases duped messages" {
+    const alloc = std.testing.allocator;
+    const empty: []const types.Message = &.{};
+    var req = CompactRequest.init(empty, 100, 200, alloc);
+
+    var list = try alloc.alloc(types.Message, 1);
+    errdefer alloc.free(list);
+    const text = try alloc.dupe(u8, "hello");
+    errdefer alloc.free(text);
+    var blocks = try alloc.alloc(types.ContentBlock, 1);
+    errdefer alloc.free(blocks);
+    blocks[0] = .{ .text = .{ .text = text } };
+    list[0] = .{ .role = .user, .content = blocks };
+
+    req.result = list;
     req.freeResult();
     try std.testing.expect(req.result == null);
 }

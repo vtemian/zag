@@ -368,7 +368,13 @@ fn threadMain(
     // stale `true` and divert the first user message.
     defer turn_in_progress.store(false, .release);
 
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills, turn_in_progress) catch |err| {
+    // Compaction context window is plumbed in a follow-up: today the
+    // runner threads zero so `zag.compact.strategy` never fires. The
+    // compaction socket itself (CompactRequest, dispatch arm) lands
+    // first so plugins can register their strategy ahead of the
+    // model-rate-card lookup that will populate this argument.
+    const compact_context_window: u32 = 0;
+    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills, turn_in_progress, compact_context_window) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
         // queue counter and `.done` is still pushed so the UI returns to
@@ -552,6 +558,17 @@ pub fn dispatchHookRequests(
                 }
                 // Same rationale as `tool_gate_request`: a missing
                 // engine is a clean miss (no detector); always signal
+                // done so the producer doesn't park forever.
+                req.done.set();
+            },
+            .compact_request => |req| {
+                if (engine) |eng| {
+                    eng.handleCompactRequest(req) catch |err| {
+                        req.error_name = @errorName(err);
+                    };
+                }
+                // Same rationale as `tool_gate_request`: a missing
+                // engine is a clean miss (no strategy); always signal
                 // done so the producer doesn't park forever.
                 req.done.set();
             },
@@ -776,6 +793,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             req.done.set();
         },
         .loop_detect_request => |req| {
+            req.error_name = "drained_without_dispatch";
+            req.done.set();
+        },
+        .compact_request => |req| {
             req.error_name = "drained_without_dispatch";
             req.done.set();
         },
@@ -1496,6 +1517,94 @@ test "loop_detect_request with no engine signals done" {
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.result == null);
     try std.testing.expect(req.error_name == null);
+}
+
+test "compact_request round-trips a replacement history via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return { { role = "user", content = "compacted" } }
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 850, 1000, alloc);
+    defer req.freeResult();
+
+    try queue.push(.{ .compact_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqual(@as(usize, 1), req.result.?.len);
+    try std.testing.expectEqualStrings("compacted", req.result.?[0].content[0].text.text);
+}
+
+test "compact_request with no handler completes cleanly" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    try queue.push(.{ .compact_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "compact_request with no engine signals done" {
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    try queue.push(.{ .compact_request = &req });
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "compact_request handler error sets error_name" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) error("nope") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    defer req.freeResult();
+    try queue.push(.{ .compact_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name != null);
+    try std.testing.expectEqualStrings("LuaHandlerError", req.error_name.?);
 }
 
 test "loop_detect_request handler error sets error_name" {
