@@ -4736,7 +4736,7 @@ pub const LuaEngine = struct {
             lua.unref(zlua.registry_index, fn_ref);
             switch (err) {
                 error.StableFrozen => lua.raiseErrorStr(
-                    "zag.prompt.layer: cannot register a 'stable' layer after the first render",
+                    "zag.prompt.layer: cannot register a 'stable' layer after the first render. Use cache_class = \"volatile\" instead, or register before the first turn renders.",
                     .{},
                 ),
                 error.OutOfMemory => lua.raiseErrorStr(
@@ -5864,11 +5864,15 @@ pub const LuaEngine = struct {
     /// Decode a single `{role, content}` entry off the top of the stack
     /// into an owned `types.Message`. Caller frees on error via
     /// `Message.deinit` if the call returns successfully but the parent
-    /// loop later fails. Pops the entry on the way out.
+    /// loop later fails. The caller pushes the entry and pops it on the
+    /// success path; the `errdefer` here pops the entry on every error
+    /// path so the outer loop sees a clean stack regardless of where
+    /// decoding fails.
     fn decodeCompactEntry(
         lua: *Lua,
         allocator: Allocator,
     ) !types.Message {
+        errdefer lua.pop(1);
         if (lua.typeOf(-1) != .table) {
             log.warn(
                 "compact strategy entry is not a table (type {s})",
@@ -11189,6 +11193,51 @@ test "zag.prompt.layer rejects bad cache_class" {
     try std.testing.expectEqual(@as(usize, 4), engine.prompt_registry.layers.items.len);
 }
 
+test "zag.prompt.layer rejects a stable layer registered after the first render" {
+    // Pre-existing prompt.zig test covers Zig-side `error.StableFrozen`.
+    // This test proves the same condition propagates through `protectedCall`
+    // as a Lua runtime error so plugin authors see a `pcall`-able failure
+    // instead of an opaque crash.
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.first-stable",
+        \\  priority = 50,
+        \\  cache_class = "stable",
+        \\  render = function() return "FIRST" end,
+        \\}
+    );
+
+    // First render trips the freeze.
+    const ctx = fakePromptLayerContext();
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+    try std.testing.expect(engine.prompt_registry.stable_frozen);
+
+    // Second stable registration must surface as a Lua runtime error.
+    const result = engine.lua.doString(
+        \\zag.prompt.layer{
+        \\  name = "lua.second-stable",
+        \\  priority = 60,
+        \\  cache_class = "stable",
+        \\  render = function() return "SECOND" end,
+        \\}
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+
+    // Error message includes the corrective hint pointing at "volatile".
+    const err_msg = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "volatile") != null);
+    engine.lua.pop(1);
+
+    // No partial registration: built-ins 4 + first stable = 5.
+    try std.testing.expectEqual(@as(usize, 5), engine.prompt_registry.layers.items.len);
+}
+
 test "zag.prompt.layer engine deinit frees lua refs and names" {
     // testing.allocator checks for leaks on deinit; a missing unref or
     // free in the engine teardown path would fail this test. Register
@@ -12531,6 +12580,43 @@ test "handleJitContextRequest passes is_error through to ctx" {
     try std.testing.expectEqualStrings("ERR", req.result.?);
 }
 
+test "handleJitContextRequest rejects handler returning a number" {
+    // A handler that returns a non-string non-nil must surface as
+    // `error.JitContextNotString` so the worker proceeds without
+    // attaching a malformed context blob.
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(_) return 42 end)
+    );
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "x", false, alloc);
+    const result = engine.handleJitContextRequest(&req);
+    try std.testing.expectError(error.JitContextNotString, result);
+    try std.testing.expect(req.result == null);
+}
+
+test "handleJitContextRequest rejects handler returning a table" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(_) return {1,2,3} end)
+    );
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "x", false, alloc);
+    const result = engine.handleJitContextRequest(&req);
+    try std.testing.expectError(error.JitContextNotString, result);
+    try std.testing.expect(req.result == null);
+}
+
 test "zag.context.on_tool_result rejects non-string tool name" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
@@ -12682,6 +12768,44 @@ test "handleToolTransformRequest with nil return leaves result null" {
     try engine.handleToolTransformRequest(&req);
     try std.testing.expect(req.result == null);
     try std.testing.expect(req.error_name == null);
+}
+
+test "handleToolTransformRequest rejects handler returning a number" {
+    // Mirror of the JIT test: non-string non-nil returns from a
+    // transform handler must surface as `error.ToolTransformNotString`
+    // so the worker keeps the original output instead of swapping in
+    // garbage.
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(_) return 42 end)
+    );
+
+    var req = agent_events.ToolTransformRequest.init("bash", "{}", "out", false, alloc);
+    const result = engine.handleToolTransformRequest(&req);
+    try std.testing.expectError(error.ToolTransformNotString, result);
+    try std.testing.expect(req.result == null);
+}
+
+test "handleToolTransformRequest rejects handler returning a table" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(_) return {x=1} end)
+    );
+
+    var req = agent_events.ToolTransformRequest.init("bash", "{}", "out", false, alloc);
+    const result = engine.handleToolTransformRequest(&req);
+    try std.testing.expectError(error.ToolTransformNotString, result);
+    try std.testing.expect(req.result == null);
 }
 
 test "zag.tool.transform_output rejects non-string tool name" {

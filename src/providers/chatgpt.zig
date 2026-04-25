@@ -171,6 +171,7 @@ fn serializeRequest(
     // rejects requests for reasoning models without `reasoning` and
     // (with `store: false`) requires `include` so the encrypted
     // reasoning blob round-trips between tool calls within a turn.
+    // TODO(harness): expose effort/summary/verbosity via zag.provider{} or a per-model config socket — design.md:328
     try w.writeAll(",\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"}");
     try w.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     try w.writeAll(",\"text\":{\"verbosity\":\"medium\"}");

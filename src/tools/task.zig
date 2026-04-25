@@ -461,7 +461,10 @@ fn handleChildEvent(
         // thread doesn't park forever. A full wiring (forwarding them
         // to the parent's engine) is a follow-up.
         .hook_request => |req| req.done.set(),
-        .lua_tool_request => |req| req.done.set(),
+        .lua_tool_request => |req| {
+            req.error_name = "subagent_unsupported";
+            req.done.set();
+        },
         .layout_request => |req| {
             req.is_error = true;
             req.done.set();
