@@ -914,6 +914,8 @@ git commit -m "sim: pumpOnce loop + wait_text / wait_idle executors"
 
 Keep each as its own test-first sub-step. Commit once after all five since they're short. Scenario-level `spawn` at this point takes a program path from env `ZAG_SIM_TARGET` (phase 3 adds the `zag-sim run` orchestration).
 
+Note: plan originally said allocPrintZ, but Zig 0.15.2 ships allocPrintSentinel.
+
 ```zig
 // expect_text: synchronous assertion against the current grid.
 pub fn executeExpectText(self: *Runner, raw: []const u8) !void {
@@ -965,7 +967,7 @@ pub fn executeSpawn(self: *Runner, program: []const u8) !void {
     }
     var it = self.env.iterator();
     while (it.next()) |kv| {
-        const joined = try std.fmt.allocPrintZ(self.alloc, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* });
+        const joined = try std.fmt.allocPrintSentinel(self.alloc, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* }, 0);
         try envp.append(self.alloc, joined.ptr);
     }
     self.child = try Spawn.spawn(&argv, envp.items, 80, 24);
@@ -1084,7 +1086,9 @@ Commit.
 **Files:**
 - Modify: `src/sim/Runner.zig`, `src/sim/Scenario.zig`
 
-Before `executeSpawn`, if a mock script was supplied (`--mock=<path>` CLI flag), start `MockServer`, call `ConfigScaffold`, `self.env.put("ZAG_CONFIG_DIR", tempdir)`, `self.env.put("HOME", tempdir_parent)`. Then `executeSpawn("zig-out/bin/zag")`.
+Before `executeSpawn`, if a mock script was supplied (`--mock=<path>` CLI flag), start `MockServer`, call `ConfigScaffold`, `self.env.put("HOME", tempdir)`. Then `executeSpawn("zig-out/bin/zag")`.
+
+Note: zag has no `ZAG_CONFIG_DIR` / `XDG_CONFIG_HOME` override; path resolution exclusively reads `HOME` (`src/LuaEngine.zig:270-274`). Steer it by pointing `HOME` at the tempdir and scaffolding `<HOME>/.config/zag/config.lua` inside.
 
 Test: scenario that spawns zag with a 1-turn mock (content "test response"), sends one user turn, `wait_text /test response/`. This is the first scenario that actually talks to zag end-to-end. Gated behind a `zig build test-sim-e2e` step that depends on `zig build`.
 
@@ -1161,14 +1165,18 @@ Commit.
 - Create: `src/sim/scenarios/segfault_normal_chat.zsm`
 - Create: `src/sim/scenarios/segfault_normal_chat.mock.json`
 
+Note: Phase 5 manual verification surfaced an input-pacing race. zag's first paint shows "Welcome to zag" (not the modal indicator the plan originally guessed at), and the input handler isn't fully wired up the instant that text appears, so the scenario sits on a `wait_idle` after the welcome banner before driving any keystrokes. A second `wait_idle` after `send "hello" <Enter>` lets the streaming round-trip complete before `/quit` lands, otherwise zag exits before the panic-prone path runs.
+
 Scenario:
 ```
 # Reproduces the segfault Vlad saw on 2026-04-23.
-set env ZAG_LOG_DEBUG=1
-spawn
-wait_text /\[INSERT\]/ 5s
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
 send "hello" <Enter>
-wait_exit 10s
+wait_idle 5s
+send "/quit" <Enter>
+wait_exit
 snapshot final
 ```
 
