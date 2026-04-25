@@ -7,6 +7,7 @@ const Dsl = @import("Dsl.zig");
 const Args = @import("Args.zig");
 const Runner = @import("Runner.zig").Runner;
 const Outcome = @import("Runner.zig").Outcome;
+const Artifacts = @import("Artifacts.zig");
 
 /// Result of driving a scenario to completion (or the first failing step).
 pub const RunResult = struct {
@@ -23,8 +24,10 @@ pub const RunResult = struct {
 
 /// Knobs the scenario driver needs but the `.zsm` source doesn't yet carry.
 pub const RunOptions = struct {
-    /// Directory where `snapshot` steps write their grid dumps. Must exist.
-    artifacts_dir: []const u8,
+    /// Per-run artifacts directory. Owns its filesystem path; the scenario
+    /// driver asks it for sub-paths (`pathFor("foo.grid")`) when writing
+    /// snapshots, summary, log tail, crash report.
+    artifacts: *Artifacts,
     /// Default timeout for `wait_text` / `wait_exit` when the step itself
     /// doesn't specify one. Per-step overrides arrive in a later task.
     wait_default_ms: u32 = 10_000,
@@ -98,7 +101,7 @@ fn executeStep(r: *Runner, step: Dsl.Step, opts: RunOptions) !void {
         },
         .wait_exit => try r.executeWaitExit(opts.wait_default_ms),
         .expect_text => try r.executeExpectText(step.args),
-        .snapshot => try r.executeSnapshot(step.args, opts.artifacts_dir),
+        .snapshot => try r.executeSnapshot(step.args, opts.artifacts),
     }
 }
 
@@ -119,15 +122,17 @@ fn classify(e: anyerror) Outcome {
 
 // --- tests ------------------------------------------------------------------
 
-fn tmpArtifacts(tmp: *std.testing.TmpDir) ![]u8 {
-    return tmp.dir.realpathAlloc(std.testing.allocator, ".");
+fn tmpArtifacts(tmp: *std.testing.TmpDir) !*Artifacts {
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+    return Artifacts.create(std.testing.allocator, path);
 }
 
 test "runSource happy-path script against cat passes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const artifacts_dir = try tmpArtifacts(&tmp);
-    defer std.testing.allocator.free(artifacts_dir);
+    const artifacts = try tmpArtifacts(&tmp);
+    defer artifacts.destroy();
 
     const src =
         \\spawn /bin/cat
@@ -137,7 +142,7 @@ test "runSource happy-path script against cat passes" {
         \\wait_exit
     ;
     const res = try runSource(std.testing.allocator, src, .{
-        .artifacts_dir = artifacts_dir,
+        .artifacts = artifacts,
         .wait_default_ms = 3_000,
     });
     try std.testing.expectEqual(Outcome.pass, res.outcome);
@@ -146,8 +151,8 @@ test "runSource happy-path script against cat passes" {
 test "runSource expect_text mismatch returns assertion_failed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const artifacts_dir = try tmpArtifacts(&tmp);
-    defer std.testing.allocator.free(artifacts_dir);
+    const artifacts = try tmpArtifacts(&tmp);
+    defer artifacts.destroy();
 
     const src =
         \\spawn /bin/cat
@@ -155,7 +160,7 @@ test "runSource expect_text mismatch returns assertion_failed" {
         \\expect_text /xyz/
     ;
     const res = try runSource(std.testing.allocator, src, .{
-        .artifacts_dir = artifacts_dir,
+        .artifacts = artifacts,
         .wait_default_ms = 1_000,
     });
     try std.testing.expectEqual(Outcome.assertion_failed, res.outcome);
@@ -167,12 +172,12 @@ test "runSource expect_text mismatch returns assertion_failed" {
 test "runSource unknown verb returns harness_error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const artifacts_dir = try tmpArtifacts(&tmp);
-    defer std.testing.allocator.free(artifacts_dir);
+    const artifacts = try tmpArtifacts(&tmp);
+    defer artifacts.destroy();
 
     const src = "nope foo\n";
     const res = try runSource(std.testing.allocator, src, .{
-        .artifacts_dir = artifacts_dir,
+        .artifacts = artifacts,
     });
     try std.testing.expectEqual(Outcome.harness_error, res.outcome);
     try std.testing.expect(std.mem.indexOf(u8, res.error_name.?, "UnknownVerb") != null);
