@@ -145,10 +145,35 @@ pub const AgentEvent = union(enum) {
             .info => |s| allocator.free(s),
             .err => |s| allocator.free(s),
             // Hook/Lua round-trips hold borrowed pointers; caller owns
-            // the request struct and its payload. Dropping the event from
-            // the queue without delivery leaves the waiter blocked, which
-            // is a design problem above this layer, not a leak here.
-            .thinking_stop, .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request, .prompt_assembly_request => {},
+            // the request struct and its payload. No bytes to free here.
+            .thinking_stop, .done, .reset_assistant_text => {},
+            // A dropped hook request leaves the firing thread parked
+            // awaiting `done`; signal so it proceeds with `cancelled =
+            // false` (the default) and the hook is treated as a no-op.
+            .hook_request => |req| req.done.set(),
+            // A dropped Lua tool request leaves the worker parked
+            // awaiting `done`; mark it errored so the caller surfaces a
+            // visible failure rather than silently treating the missing
+            // result as success.
+            .lua_tool_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
+            // A dropped layout request leaves the worker parked awaiting
+            // `done`; flag the failure so the waiter sees a non-success
+            // outcome instead of an empty `result_json`.
+            .layout_request => |req| {
+                req.is_error = true;
+                req.done.set();
+            },
+            // A dropped prompt-assembly request leaves the agent thread
+            // parked awaiting `done`; set `error_name` so the waiter
+            // falls through its error path rather than dereferencing a
+            // null `result`.
+            .prompt_assembly_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
             // Same borrowed-pointer rationale, except: a queued-but-undelivered
             // JIT request still has a worker parked on `done`. Signal it so
             // the worker unblocks and proceeds without the appended context.
@@ -936,6 +961,16 @@ test "push and drain hook_request event" {
     );
 }
 
+test "freeOwned signals hook_request done" {
+    var payload: Hooks.HookPayload = .{ .agent_done = {} };
+    var req = Hooks.HookRequest.init(&payload);
+    const ev: AgentEvent = .{ .hook_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(!req.cancelled);
+}
+
 const BackpressureDrainer = struct {
     queue: *EventQueue,
     allocator: Allocator,
@@ -1018,6 +1053,36 @@ test "layout_request can be pushed and peeked" {
     try std.testing.expectEqual(@as(usize, 1), queue.len);
 }
 
+test "freeOwned signals layout_request done with is_error" {
+    var req = LayoutRequest.init(.{ .describe = {} });
+    const ev: AgentEvent = .{ .layout_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    try std.testing.expect(!req.is_error);
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+}
+
+test "freeOwned signals prompt_assembly_request done with error_name" {
+    const ctx: prompt.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    var req = PromptAssemblyRequest.init(&ctx, std.testing.allocator);
+    const ev: AgentEvent = .{ .prompt_assembly_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
+}
+
 test "push and drain prompt_assembly_request event" {
     var queue = try EventQueue.initBounded(std.testing.allocator, 16);
     defer queue.deinit();
@@ -1042,6 +1107,25 @@ test "push and drain prompt_assembly_request event" {
         "test",
         buf[0].prompt_assembly_request.ctx.model.provider_name,
     );
+}
+
+test "freeOwned signals lua_tool_request done with error_name" {
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "hello",
+        .input_raw = "{}",
+        .allocator = std.testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    const ev: AgentEvent = .{ .lua_tool_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
 }
 
 test "push and drain lua_tool_request event" {
