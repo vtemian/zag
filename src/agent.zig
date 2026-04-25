@@ -743,6 +743,14 @@ fn executeToolsSingle(
 /// it to the EventQueue carried by `ctx`. String data is duped because the
 /// source slices point into temporary JSON parser memory that is freed after
 /// the callback returns.
+///
+/// `StreamEvent.done` is intentionally dropped here. It marks the end of one
+/// LLM SSE response, not the end of the agent run; consumers that interpret
+/// `AgentEvent.done` as terminal (the headless drain loop joins the agent
+/// thread on it) would tear down mid-turn whenever a provider that emits a
+/// per-call done (Codex / ChatGPT Responses API) finished its stream while
+/// the agent was still about to dispatch a tool. The terminal `AgentEvent.done`
+/// is pushed by `AgentRunner.threadMain` after `runLoopStreaming` returns.
 fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
     const stream_ctx: *StreamContext = @ptrCast(@alignCast(ctx));
     const alloc = stream_ctx.allocator;
@@ -754,7 +762,7 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         },
         .tool_start => |t| .{ .tool_start = .{ .name = alloc.dupe(u8, t) catch return } },
         .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
-        .done => .done,
+        .done => return,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
         // Thinking is surfaced as its own AgentRunner/ConversationBuffer
         // node. Task 1.11 will also fan this into the trajectory capture.
@@ -774,6 +782,24 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "streamEventToQueue drops StreamEvent.done so it does not signal terminal" {
+    // Pin the contract that per-call SSE termination is not propagated as
+    // an `AgentEvent.done`. Drain loops (notably `runHeadlessWithProvider`)
+    // treat `AgentEvent.done` as "agent is finished, join the worker
+    // thread"; conflating it with a per-LLM-call SSE end deadlocks any
+    // multi-turn flow whose provider emits StreamEvent.done at the close
+    // of each response (Codex / ChatGPT Responses API).
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+
+    var stream_ctx: StreamContext = .{ .queue = &queue, .allocator = allocator };
+    streamEventToQueue(&stream_ctx, .done);
+
+    var buf: [4]agent_events.AgentEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), queue.drain(&buf));
 }
 
 test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt output" {
