@@ -24,6 +24,7 @@ comptime {
     _ = @import("ConfigScaffold.zig");
     _ = @import("Artifacts.zig");
     _ = @import("Summary.zig");
+    _ = @import("Replay.zig");
     _ = @import("phase1_e2e_test.zig");
 }
 
