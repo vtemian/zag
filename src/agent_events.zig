@@ -65,6 +65,12 @@ pub const AgentEvent = union(enum) {
     /// blocks on `request.done` after pushing. The request is
     /// caller-owned; the queue holds a borrowed pointer.
     prompt_assembly_request: *PromptAssemblyRequest,
+    /// Round-trip: the agent thread asks main to invoke the Lua handler
+    /// registered via `zag.context.on_tool_result(name, fn)` for a just
+    /// completed tool call. Returned text (if any) is appended under the
+    /// tool result content. Same main-thread marshalling rationale as
+    /// `prompt_assembly_request`. The request is caller-owned.
+    jit_context_request: *JitContextRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -114,6 +120,10 @@ pub const AgentEvent = union(enum) {
             // the queue without delivery leaves the waiter blocked, which
             // is a design problem above this layer, not a leak here.
             .thinking_stop, .done, .reset_assistant_text, .hook_request, .lua_tool_request, .layout_request, .prompt_assembly_request => {},
+            // Same borrowed-pointer rationale, except: a queued-but-undelivered
+            // JIT request still has a worker parked on `done`. Signal it so
+            // the worker unblocks and proceeds without the appended context.
+            .jit_context_request => |req| req.done.set(),
         }
     }
 };
@@ -367,6 +377,64 @@ pub const PromptAssemblyRequest = struct {
 
     pub fn init(ctx: *const prompt.LayerContext, allocator: Allocator) PromptAssemblyRequest {
         return .{ .ctx = ctx, .allocator = allocator };
+    }
+};
+
+/// Round-trip request pushed by the agent thread when a tool call has
+/// just completed and a Lua handler is registered via
+/// `zag.context.on_tool_result(tool_name, fn)`. Lua is pinned to the
+/// main thread, so the worker marshals here exactly like
+/// `PromptAssemblyRequest`.
+///
+/// Lifecycle: agent builds the request on its stack with the worker's
+/// allocator, pushes the event, parks on `done.wait()`. The main thread
+/// looks up the handler, builds a Lua-side context table from
+/// `tool_name/input/output/is_error`, calls the function via
+/// `protectedCall`, and either dupes the returned string into
+/// `req.allocator` (success path) or sets `error_name` (on Lua error).
+/// The waiter owns `result` and frees it after consuming.
+pub const JitContextRequest = struct {
+    /// Registered tool name. Used as the lookup key in
+    /// `LuaEngine.jit_context_handlers`.
+    tool_name: []const u8,
+    /// Raw JSON the agent passed to the tool. Borrowed from the worker's
+    /// turn arena; the main thread reads it under `done` and must not
+    /// retain pointers past `done.set()`.
+    input: []const u8,
+    /// Tool output text (post-execution). Same borrow rules as `input`.
+    output: []const u8,
+    /// Whether the tool reported an error. Surfaced as `is_error` on the
+    /// Lua-side context table.
+    is_error: bool,
+    /// Allocator used to dupe the handler's returned string into
+    /// `result`. Caller promises thread-safety.
+    allocator: Allocator,
+    /// Signalled by the main thread when either `result`, `error_name`,
+    /// or neither (handler returned nil) has been finalized.
+    done: std.Thread.ResetEvent = .{},
+    /// Handler return value, duped into `allocator`. Null when the
+    /// handler returned nil, when no handler was registered, or when
+    /// the call errored. Owned by the waiter.
+    result: ?[]u8 = null,
+    /// `@errorName` of whatever went wrong on the main thread (Lua call
+    /// failure, return value type mismatch, OOM duping the result).
+    /// Borrowed from rodata; do not free.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(
+        tool_name: []const u8,
+        input: []const u8,
+        output: []const u8,
+        is_error: bool,
+        allocator: Allocator,
+    ) JitContextRequest {
+        return .{
+            .tool_name = tool_name,
+            .input = input,
+            .output = output,
+            .is_error = is_error,
+            .allocator = allocator,
+        };
     }
 };
 
@@ -656,4 +724,33 @@ test "push and drain lua_tool_request event" {
     const n = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqualStrings("hello", buf[0].lua_tool_request.tool_name);
+}
+
+test "push and drain jit_context_request event" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    defer queue.deinit();
+
+    var req = JitContextRequest.init(
+        "read",
+        "{\"path\":\"/tmp/x\"}",
+        "ok",
+        false,
+        std.testing.allocator,
+    );
+
+    try queue.push(.{ .jit_context_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("read", buf[0].jit_context_request.tool_name);
+    try std.testing.expectEqualStrings("ok", buf[0].jit_context_request.output);
+    try std.testing.expect(!buf[0].jit_context_request.is_error);
+}
+
+test "freeOwned signals jit_context_request done" {
+    var req = JitContextRequest.init("read", "in", "out", false, std.testing.allocator);
+    const ev: AgentEvent = .{ .jit_context_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
 }
