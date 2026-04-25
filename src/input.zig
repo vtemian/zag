@@ -908,10 +908,12 @@ test "Parser.pollTimeoutMs: null when no pending bytes" {
     try std.testing.expect(p.pollTimeoutMs(0) == null);
 }
 
-test "Parser.pollTimeoutMs: null when pending head is not ESC" {
+test "Parser.pollTimeoutMs: 0 when pending head is not ESC" {
     var p: Parser = .{};
     p.feedBytes(&.{'A'}, 0);
-    try std.testing.expect(p.pollTimeoutMs(0) == null);
+    // A queued non-escape byte is a complete event; the orchestrator
+    // must drain it on the next tick instead of blocking on poll.
+    try std.testing.expectEqual(@as(?i32, 0), p.pollTimeoutMs(0));
 }
 
 test "Parser.pollTimeoutMs: returns remaining ms when ESC is pending" {
