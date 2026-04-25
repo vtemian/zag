@@ -29,7 +29,7 @@ const default_agent_name = "zag";
 /// supplies; the contract is "match what your provider/registry resolved
 /// at boot." Tests that only exercise the assembly path use this so they
 /// don't have to fabricate a registry.
-pub const UNKNOWN_MODEL: llm.ModelSpec = .{
+const UNKNOWN_MODEL: llm.ModelSpec = .{
     .provider_name = "unknown",
     .model_id = "unknown",
 };

@@ -66,8 +66,7 @@ pub const TaskContext = struct {
     /// Resolved model identity (`provider_name`, `model_id`,
     /// `context_window`) for the child run. The task tool hands this to
     /// `runLoopStreaming` so subagents drive the same `zag.prompt.init`
-    /// dispatcher and `zag.compact.strategy` threshold as the parent
-    /// instead of running with the placeholder `UNKNOWN_MODEL`.
+    /// dispatcher and `zag.compact.strategy` threshold as the parent.
     model_spec: llm.ModelSpec,
     /// Parent's tool registry. The task tool builds a `Subset` view
     /// against the subagent's allowlist and passes that down.
