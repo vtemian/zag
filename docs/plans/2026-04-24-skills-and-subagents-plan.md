@@ -12,7 +12,17 @@
 
 **Source design:** `docs/plans/2026-04-24-skills-and-subagents-design.md`.
 
-**Tech Stack:** Zig 0.15 std, `ziglua` (for subagent Lua registration), existing YAML parsing helpers or a narrow custom frontmatter parser, existing `ToolRegistry` and `AgentRunner` infrastructure (post-plan 1), ULID module from plan 2.
+**Prerequisites (in addition to plans 1 and 2):** Task 3 wires the skills catalog through the prompt-layer registry that landed in parallel with this work. The catalog ships as a `builtin.skills_catalog` layer in `src/prompt.zig`, not as direct string concatenation inside `AgentRunner`. The relevant commits:
+
+- `60a81c8 prompt: scaffold Layer registry with AssembledPrompt`
+- `9ad34c7 prompt: built-in identity, tool list, and guidelines layers`
+- `0a33e95 harness: add assembleSystem and defaultRegistry`
+- `7c571e8 agent: route system prompt through Harness layer registry`
+- `6d6e95f prompt: register skills catalog as a built-in layer`
+
+Without these in place, Task 3 has nowhere to slot the skills catalog. The earlier draft of this plan said to splice the catalog directly into `AgentRunner`'s system-prompt assembly; the prompt-layer system replaced that approach.
+
+**Tech Stack:** Zig 0.15 std, `ziglua` (for subagent Lua registration), existing YAML parsing helpers or a narrow custom frontmatter parser, existing `ToolRegistry` and `AgentRunner` infrastructure (post-plan 1), ULID module from plan 2, prompt-layer registry in `src/prompt.zig`.
 
 **Non-scope**
 
@@ -120,15 +130,18 @@ Catalog format:
 ## Task 3: Wire skills catalog into the system prompt
 
 **Files:**
-- Modify: `/Users/whitemonk/projects/ai/zag/src/AgentRunner.zig` (or wherever the system prompt is assembled)
+- Modify: `/Users/whitemonk/projects/ai/zag/src/prompt.zig` (register the `builtin.skills_catalog` layer)
+- Modify: `/Users/whitemonk/projects/ai/zag/src/Harness.zig` (thread the `SkillRegistry` into the layer context, if not already piped through)
 
 **Design**
 
-At Runner init, the caller passes the `SkillRegistry` (or nil). System-prompt assembly appends `<available_skills>...` to the existing base prompt when the registry has entries. Skill bodies are NOT preloaded; the LLM reads them via the existing `read` tool against the absolute path from the catalog.
+The system prompt is assembled by the prompt-layer registry, not by `AgentRunner` directly (see the Prerequisites section above). Skills ship as a `builtin.skills_catalog` layer with a stable priority slot (50, between `identity` at 5 and `tool_list` higher up). The layer's render function reads the `SkillRegistry` from its `LayerContext`; when the registry is null or empty, the layer renders nothing and contributes no text to the assembled prompt.
 
-**Tests:** Integration test constructs a Runner with a two-skill registry, asserts the outgoing request to a stub provider contains `<available_skills>` with both entries.
+At runner construction time, the caller attaches the `SkillRegistry` (or nil) to the harness so the layer context can see it. Skill bodies are NOT preloaded; the LLM reads them via the existing `read` tool against the absolute path from the catalog.
 
-**Commit:** `agent: inject skills catalog into system prompt`
+**Tests:** Inline tests in `src/prompt.zig` cover the three states of the layer: null registry returns null, empty registry returns null, populated registry renders an `<available_skills>` block. An additional integration test constructs a runner with a two-skill registry and asserts the outgoing request to a stub provider contains `<available_skills>` with both entries.
+
+**Commit:** `prompt: register skills catalog as a built-in layer`
 
 ---
 
