@@ -458,6 +458,10 @@ fn handleChildEvent(
             req.error_name = "subagent_unsupported";
             req.done.set();
         },
+        .loop_detect_request => |req| {
+            req.error_name = "subagent_unsupported";
+            req.done.set();
+        },
     }
 }
 
