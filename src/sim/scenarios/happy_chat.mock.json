@@ -1,0 +1,11 @@
+{
+  "turns": [
+    {
+      "chunks": [
+        {"delta": {"content": "hi there"}},
+        {"finish_reason": "stop"}
+      ],
+      "usage": {"prompt_tokens": 10, "completion_tokens": 3}
+    }
+  ]
+}

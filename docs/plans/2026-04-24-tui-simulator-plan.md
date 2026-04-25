@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
-**Goal:** Ship a PTY-based test harness (`zag-sim`) that drives zag through its real stdin/stdout, interprets output through libghostty-vt, and reproduces TUI bugs deterministically, culminating in a reproducer for the current segfault-on-normal-chat-turn bug.
+**Goal:** Ship a PTY-based test harness (`zag-sim`) that drives zag through its real stdin/stdout, interprets output through libghostty-vt, and reproduces TUI bugs deterministically. The capstone is a reproducer for the current segfault-on-normal-chat-turn bug.
 
 **Architecture:** New `src/sim/` subtree, new `zig build sim` binary, new Zig dep on `ghostty` (module `ghostty-vt`). Subprocess model with openpty + libc-linked `openpty(3)` so zag's raw-mode path stays unchanged. A sidecar HTTP server on localhost serves OpenAI-SSE mock responses; zag is pointed at it via a throwaway `config.lua` in a temp dir (no new wire format inside zag). Scenarios are plain-text `.zsm` files with a tiny verb-per-line DSL. Replay-gen converts session JSONLs into scenario + mock-script pairs.
 
@@ -346,6 +346,8 @@ git commit -m "sim: add Spawn.zig fork+exec with PTY controlling-tty setup"
 **Files:**
 - Create: `src/sim/Grid.zig`
 
+Note: Grid is heap-allocated (see reviewer feedback 2026-04-24). `vtStream()` captures a `*Terminal`, so the Grid's Terminal must live at its final storage address before the stream is built. That forces a `create`/`destroy` pair instead of the value-semantics `init`/`deinit` the TDD template would normally use.
+
 **Step 1: Write the failing test**
 
 `src/sim/Grid.zig`:
@@ -357,41 +359,52 @@ const Grid = @This();
 
 alloc: std.mem.Allocator,
 terminal: ghostty_vt.Terminal,
-stream: ghostty_vt.Stream,
+stream: ghostty_vt.TerminalStream,
 
-pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16) !Grid {
-    var terminal: ghostty_vt.Terminal = try .init(alloc, .{ .cols = cols, .rows = rows });
-    errdefer terminal.deinit(alloc);
-    const stream = terminal.vtStream();
-    return .{ .alloc = alloc, .terminal = terminal, .stream = stream };
+pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16) !*Grid {
+    const self = try alloc.create(Grid);
+    errdefer alloc.destroy(self);
+
+    self.* = .{
+        .alloc = alloc,
+        .terminal = try .init(alloc, .{ .cols = cols, .rows = rows }),
+        .stream = undefined,
+    };
+    errdefer self.terminal.deinit(alloc);
+
+    // vtStream's handler captures a `*Terminal`; build it against the
+    // heap-resident Terminal after self.* assignment.
+    self.stream = self.terminal.vtStream();
+    return self;
 }
 
-pub fn deinit(self: *Grid) void {
+pub fn destroy(self: *Grid) void {
     self.stream.deinit();
     self.terminal.deinit(self.alloc);
+    self.alloc.destroy(self);
 }
 
-pub fn feed(self: *Grid, bytes: []const u8) !void {
-    try self.stream.nextSlice(bytes);
+pub fn feed(self: *Grid, bytes: []const u8) void {
+    self.stream.nextSlice(bytes);
 }
 
-pub fn plainText(self: *Grid) ![]u8 {
+pub fn plainText(self: *Grid) ![]const u8 {
     return try self.terminal.plainString(self.alloc);
 }
 
 test "feed plain bytes appears in plain text dump" {
-    var g = try Grid.init(std.testing.allocator, 40, 6);
-    defer g.deinit();
-    try g.feed("hello");
+    const g = try Grid.create(std.testing.allocator, 40, 6);
+    defer g.destroy();
+    g.feed("hello");
     const dump = try g.plainText();
     defer std.testing.allocator.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "hello") != null);
 }
 
 test "feed SGR + text preserves text in plain dump" {
-    var g = try Grid.init(std.testing.allocator, 40, 6);
-    defer g.deinit();
-    try g.feed("\x1b[1;32mbold green\x1b[0m");
+    const g = try Grid.create(std.testing.allocator, 40, 6);
+    defer g.destroy();
+    g.feed("\x1b[1;32mbold green\x1b[0m");
     const dump = try g.plainText();
     defer std.testing.allocator.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "bold green") != null);
@@ -426,6 +439,8 @@ git commit -m "sim: wrap libghostty-vt Terminal as Grid with feed/plainText"
 **Files:**
 - Create: `src/sim/phase1_e2e_test.zig`
 
+Note: Grid is heap-allocated (see reviewer feedback 2026-04-24). Use `Grid.create` / `g.destroy` to match Task 1.5's shipped shape.
+
 **Step 1: Write the test**
 
 `src/sim/phase1_e2e_test.zig`:
@@ -445,8 +460,8 @@ test "cat round-trip: send SGR'd bytes, grid sees the plain text" {
         posix.close(sp.pty.master);
     }
 
-    var g = try Grid.init(std.testing.allocator, 80, 24);
-    defer g.deinit();
+    const g = try Grid.create(std.testing.allocator, 80, 24);
+    defer g.destroy();
 
     _ = try posix.write(sp.pty.master, "\x1b[1mZAG\x1b[0m\n");
 
@@ -459,7 +474,7 @@ test "cat round-trip: send SGR'd bytes, grid sees the plain text" {
         if ((fds[0].revents & posix.POLL.IN) == 0) continue;
         const n = try posix.read(sp.pty.master, &buf);
         if (n == 0) break;
-        try g.feed(buf[0..n]);
+        g.feed(buf[0..n]);
         const dump = try g.plainText();
         defer std.testing.allocator.free(dump);
         if (std.mem.indexOf(u8, dump, "ZAG") != null) return; // pass
@@ -489,7 +504,7 @@ Expected: 5 tests pass.
 
 ```bash
 git add src/sim/phase1_e2e_test.zig src/sim/main.zig
-git commit -m "sim: phase 1 e2e, cat round-trip through libghostty-vt"
+git commit -m "sim: phase 1 e2e: cat round-trip through libghostty-vt"
 ```
 
 Phase 1 complete.
@@ -726,6 +741,8 @@ git commit -m "sim: DSL argument parsers (send literals/keysyms/ctrl, durations)
 **Files:**
 - Create: `src/sim/Runner.zig`
 
+Note: Grid is heap-allocated (see reviewer feedback 2026-04-24). The Runner holds `grid: *Grid` and mirrors `Grid.create` / `grid.destroy()` in its own init/deinit.
+
 **Step 1: Minimal Runner**
 
 `src/sim/Runner.zig`:
@@ -747,13 +764,13 @@ pub const Outcome = enum(u8) {
 pub const Runner = struct {
     alloc: std.mem.Allocator,
     child: ?Spawn.Spawned = null,
-    grid: Grid,
+    grid: *Grid,
     env: std.process.EnvMap,
 
     pub fn init(alloc: std.mem.Allocator) !Runner {
         return .{
             .alloc = alloc,
-            .grid = try Grid.init(alloc, 80, 24),
+            .grid = try Grid.create(alloc, 80, 24),
             .env = std.process.EnvMap.init(alloc),
         };
     }
@@ -764,7 +781,7 @@ pub const Runner = struct {
             _ = posix.waitpid(sp.pid, 0);
             posix.close(sp.pty.master);
         }
-        self.grid.deinit();
+        self.grid.destroy();
         self.env.deinit();
     }
 
@@ -897,6 +914,8 @@ git commit -m "sim: pumpOnce loop + wait_text / wait_idle executors"
 
 Keep each as its own test-first sub-step. Commit once after all five since they're short. Scenario-level `spawn` at this point takes a program path from env `ZAG_SIM_TARGET` (phase 3 adds the `zag-sim run` orchestration).
 
+Note: plan originally said allocPrintZ, but Zig 0.15.2 ships allocPrintSentinel.
+
 ```zig
 // expect_text: synchronous assertion against the current grid.
 pub fn executeExpectText(self: *Runner, raw: []const u8) !void {
@@ -948,7 +967,7 @@ pub fn executeSpawn(self: *Runner, program: []const u8) !void {
     }
     var it = self.env.iterator();
     while (it.next()) |kv| {
-        const joined = try std.fmt.allocPrintZ(self.alloc, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* });
+        const joined = try std.fmt.allocPrintSentinel(self.alloc, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* }, 0);
         try envp.append(self.alloc, joined.ptr);
     }
     self.child = try Spawn.spawn(&argv, envp.items, 80, 24);
@@ -973,7 +992,7 @@ Commit.
 
 ```bash
 git add src/sim/Scenario.zig src/sim/main.zig
-git commit -m "sim: Scenario driver, parse + execute + outcome mapping"
+git commit -m "sim: Scenario driver: parse + execute + outcome mapping"
 ```
 
 ### Task 2.7: `zag-sim run <scenario>` CLI
@@ -1067,7 +1086,9 @@ Commit.
 **Files:**
 - Modify: `src/sim/Runner.zig`, `src/sim/Scenario.zig`
 
-Before `executeSpawn`, if a mock script was supplied (`--mock=<path>` CLI flag), start `MockServer`, call `ConfigScaffold`, `self.env.put("ZAG_CONFIG_DIR", tempdir)`, `self.env.put("HOME", tempdir_parent)`. Then `executeSpawn("zig-out/bin/zag")`.
+Before `executeSpawn`, if a mock script was supplied (`--mock=<path>` CLI flag), start `MockServer`, call `ConfigScaffold`, `self.env.put("HOME", tempdir)`. Then `executeSpawn("zig-out/bin/zag")`.
+
+Note: zag has no `ZAG_CONFIG_DIR` / `XDG_CONFIG_HOME` override; path resolution exclusively reads `HOME` (`src/LuaEngine.zig:270-274`). Steer it by pointing `HOME` at the tempdir and scaffolding `<HOME>/.config/zag/config.lua` inside.
 
 Test: scenario that spawns zag with a 1-turn mock (content "test response"), sends one user turn, `wait_text /test response/`. This is the first scenario that actually talks to zag end-to-end. Gated behind a `zig build test-sim-e2e` step that depends on `zig build`.
 
@@ -1144,14 +1165,18 @@ Commit.
 - Create: `src/sim/scenarios/segfault_normal_chat.zsm`
 - Create: `src/sim/scenarios/segfault_normal_chat.mock.json`
 
+Note: Phase 5 manual verification surfaced an input-pacing race. zag's first paint shows "Welcome to zag" (not the modal indicator the plan originally guessed at), and the input handler isn't fully wired up the instant that text appears, so the scenario sits on a `wait_idle` after the welcome banner before driving any keystrokes. A second `wait_idle` after `send "hello" <Enter>` lets the streaming round-trip complete before `/quit` lands, otherwise zag exits before the panic-prone path runs.
+
 Scenario:
 ```
 # Reproduces the segfault Vlad saw on 2026-04-23.
-set env ZAG_LOG_DEBUG=1
-spawn
-wait_text /\[INSERT\]/ 5s
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
 send "hello" <Enter>
-wait_exit 10s
+wait_idle 5s
+send "/quit" <Enter>
+wait_exit
 snapshot final
 ```
 
@@ -1181,7 +1206,7 @@ test "e2e: segfault-normal-chat reproduces the crash" {
 ```
 
 Run: `zig build test-sim-e2e`
-Expected (at plan-write time): FAIL because child_crashed matches (i.e. the test passes, confirming the bug is reproduced). If the bug has been fixed in the meantime, the test FAILS with `expected child_crashed got pass`, also a load-bearing signal. Document which happened.
+Expected (at plan-write time): FAIL because child_crashed matches (i.e. the test passes, confirming the bug is reproduced). If the bug has been fixed in the meantime, the test FAILS with `expected child_crashed got pass`, which is also a load-bearing signal. Document which happened.
 
 Commit.
 

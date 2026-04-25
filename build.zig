@@ -56,6 +56,112 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zag");
     run_step.dependOn(&run_cmd.step);
 
+    // --- zag-sim ------------------------------------------------------------
+    const sim_mod = b.createModule(.{
+        .root_source_file = b.path("src/sim/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sim_mod.addImport("build_options", build_options.createModule());
+    if (b.lazyDependency("ghostty", .{})) |dep| {
+        sim_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    }
+    sim_mod.link_libc = true;
+    if (target.result.os.tag == .linux) {
+        sim_mod.linkSystemLibrary("util", .{});
+    }
+
+    const sim_exe = b.addExecutable(.{
+        .name = "zag-sim",
+        .root_module = sim_mod,
+    });
+    b.installArtifact(sim_exe);
+
+    const sim_run_cmd = b.addRunArtifact(sim_exe);
+    sim_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| sim_run_cmd.addArgs(args);
+    const sim_run_step = b.step("sim", "Run zag-sim");
+    sim_run_step.dependOn(&sim_run_cmd.step);
+
+    const sim_tests = b.addTest(.{ .root_module = sim_mod });
+    const run_sim_tests = b.addRunArtifact(sim_tests);
+    const sim_test_step = b.step("test-sim", "Run zag-sim unit + non-zag tests");
+    sim_test_step.dependOn(&run_sim_tests.step);
+
+    // --- test-sim-e2e -------------------------------------------------------
+    // Runs scenarios that require the real zag binary. Outside `zig build
+    // test`, outside `zig build test-sim`, opt-in only: spawning a real PTY
+    // child from inside the Zig test runner causes hangs that survive across
+    // runs (see Phase 2.7 follow-up), so we drive zag via real `zag-sim`
+    // invocations and let the build system enforce expected exit codes.
+    const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag");
+    sim_e2e_step.dependOn(b.getInstallStep()); // ensures both zag and zag-sim are built
+
+    // Regression guard for the contentLengthStream panic discovered via
+    // the TUI simulator on 2026-04-23 and fixed in src/llm/streaming.zig.
+    // Drives a chat turn through the mock provider, then `/quit`s zag.
+    // A regression that re-introduces a crash on the streaming-read path
+    // would write a crash.txt to the artifacts dir; a regression that
+    // hangs the agent would make `wait_exit` time out and exit 1.
+    const e2e_segfault = b.addRunArtifact(sim_exe);
+    e2e_segfault.addArgs(&.{
+        "run",
+        b.path("src/sim/scenarios/segfault_normal_chat.zsm").getPath(b),
+    });
+    e2e_segfault.addArg(b.fmt(
+        "--mock={s}",
+        .{b.path("src/sim/scenarios/segfault_normal_chat.mock.json").getPath(b)},
+    ));
+    e2e_segfault.expectExitCode(0);
+    e2e_segfault.step.dependOn(b.getInstallStep());
+    sim_e2e_step.dependOn(&e2e_segfault.step);
+
+    // Canary: the harness can drive a clean chat turn end-to-end. If this
+    // fails, the harness is broken; fix it before trusting the segfault
+    // scenario.
+    const e2e_canary = b.addRunArtifact(sim_exe);
+    e2e_canary.addArgs(&.{
+        "run",
+        b.path("src/sim/scenarios/happy_chat.zsm").getPath(b),
+    });
+    e2e_canary.addArg(b.fmt(
+        "--mock={s}",
+        .{b.path("src/sim/scenarios/happy_chat.mock.json").getPath(b)},
+    ));
+    e2e_canary.expectExitCode(0);
+    e2e_canary.step.dependOn(b.getInstallStep());
+    sim_e2e_step.dependOn(&e2e_canary.step);
+
+    // Round-trip the replay-gen pipeline: parse a fixture session JSONL,
+    // emit scenario.zsm + mock.json into a stable cache subdir, then run
+    // zag-sim against the kit. Stable path (not b.makeTempPath) so the
+    // dependent run still finds the files when replay-gen is build-cached.
+    // Both invocations must exit 0 or the build fails.
+    const replay_tmp = b.cache_root.join(b.allocator, &.{ "sim-e2e", "replay-roundtrip" }) catch @panic("OOM");
+    const replay_tmp_mkdir = b.addSystemCommand(&.{ "mkdir", "-p", replay_tmp });
+
+    const e2e_replay_gen = b.addRunArtifact(sim_exe);
+    e2e_replay_gen.addArgs(&.{
+        "replay-gen",
+        b.path("src/sim/scenarios/testdata/session_simple.jsonl").getPath(b),
+    });
+    e2e_replay_gen.addArg(b.fmt("--out={s}", .{replay_tmp}));
+    e2e_replay_gen.expectExitCode(0);
+    e2e_replay_gen.step.dependOn(b.getInstallStep());
+    e2e_replay_gen.step.dependOn(&replay_tmp_mkdir.step);
+    sim_e2e_step.dependOn(&e2e_replay_gen.step);
+
+    const e2e_replay_run = b.addRunArtifact(sim_exe);
+    e2e_replay_run.addArgs(&.{
+        "run",
+        b.fmt("{s}/scenario.zsm", .{replay_tmp}),
+    });
+    e2e_replay_run.addArg(b.fmt("--mock={s}/mock.json", .{replay_tmp}));
+    e2e_replay_run.addArg(b.fmt("--artifacts={s}/run-out", .{replay_tmp}));
+    e2e_replay_run.expectExitCode(0);
+    e2e_replay_run.step.dependOn(&e2e_replay_gen.step);
+    sim_e2e_step.dependOn(&e2e_replay_run.step);
+
     const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
     const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
     script.addArtifactArg(exe);

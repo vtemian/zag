@@ -1,0 +1,27 @@
+# Regression guard for a SIGABRT panic that fired during a normal chat
+# turn through the mock provider. Originally observed on 2026-04-23 as a
+# generic "segfault on .done"; the TUI simulator pinned it to
+# std.http.contentLengthStream (Zig 0.15.2) accessing
+# `reader.state.body_remaining_content_length` after the reader had
+# transitioned to .ready. Real providers (Anthropic, OpenAI, Ollama)
+# stream chunked, so they don't trip the bug; the mock server uses
+# Content-Length, which does. Fixed in src/llm/streaming.zig by
+# switching readLine off readSliceShort and onto Reader.stream with a
+# body_done sticky flag.
+#
+# What the scenario does today: drives one chat turn against the mock
+# provider, then exits zag via `/quit`. A future regression of the
+# contentLengthStream bug (or any other crash on the streaming-read
+# path) would either re-introduce a SIGABRT before `/quit` lands (the
+# harness writes crash.txt and `wait_exit` reaps the signal; exit 0
+# still, but crash.txt is the tell), or the agent would never finish
+# the turn and `wait_exit` would time out instead of exiting cleanly.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "hello" <Enter>
+wait_idle 5s
+send "/quit" <Enter>
+wait_exit
+snapshot final
