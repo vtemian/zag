@@ -619,123 +619,129 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
         // so breaking out of this loop on `.done` or `.err` would orphan any
         // events that follow in the same `drain_buf` slice. Free the tail
         // explicitly in those arms before breaking.
-        for (drain_buf[0..count], 0..) |ev, idx| switch (ev) {
-            .text_delta => |t| {
-                defer gpa.free(t);
-                capture.addTextDelta(t) catch |err| {
-                    log.warn("capture dropped text delta: {s}", .{@errorName(err)});
-                };
-            },
-            .tool_start => |s| {
-                defer {
-                    gpa.free(s.name);
-                    if (s.call_id) |id| gpa.free(id);
-                    if (s.input_raw) |raw| gpa.free(raw);
-                }
-                const args_json = s.input_raw orelse "{}";
-                const tool_id = if (s.call_id) |id| id else blk: {
-                    synth_counter += 1;
-                    var buf: [16]u8 = undefined;
-                    const synth = std.fmt.bufPrint(&buf, "t{d}", .{synth_counter}) catch "t?";
-                    const owned = gpa.dupe(u8, synth) catch {
-                        break :blk "t?";
+        for (drain_buf[0..count], 0..) |ev, idx| {
+            // Persist to JSONL before the trajectory capture takes over.
+            // `persistAgentEvent` borrows the event payload; the per-arm
+            // `defer free` chains below stay correct.
+            deps.runner.persistAgentEvent(ev);
+            switch (ev) {
+                .text_delta => |t| {
+                    defer gpa.free(t);
+                    capture.addTextDelta(t) catch |err| {
+                        log.warn("capture dropped text delta: {s}", .{@errorName(err)});
                     };
-                    pending_synth.append(gpa, owned) catch {
-                        gpa.free(owned);
-                        break :blk "t?";
+                },
+                .tool_start => |s| {
+                    defer {
+                        gpa.free(s.name);
+                        if (s.call_id) |id| gpa.free(id);
+                        if (s.input_raw) |raw| gpa.free(raw);
+                    }
+                    const args_json = s.input_raw orelse "{}";
+                    const tool_id = if (s.call_id) |id| id else blk: {
+                        synth_counter += 1;
+                        var buf: [16]u8 = undefined;
+                        const synth = std.fmt.bufPrint(&buf, "t{d}", .{synth_counter}) catch "t?";
+                        const owned = gpa.dupe(u8, synth) catch {
+                            break :blk "t?";
+                        };
+                        pending_synth.append(gpa, owned) catch {
+                            gpa.free(owned);
+                            break :blk "t?";
+                        };
+                        break :blk owned;
                     };
-                    break :blk owned;
-                };
-                capture.addToolCall(tool_id, s.name, args_json) catch |err| {
-                    log.warn("capture dropped tool call: {s}", .{@errorName(err)});
-                };
-            },
-            .tool_result => |r| {
-                defer {
-                    gpa.free(r.content);
-                    if (r.call_id) |id| gpa.free(id);
-                }
-                // FIFO-match null-id results against the oldest outstanding
-                // synthetic id. Parallel calls without provider ids collapse
-                // to best-effort correlation. `Capture.addToolResult` dupes
-                // the id string into its arena, so we free the synth owner
-                // after the call returns.
-                var synth_owned: ?[]const u8 = null;
-                defer if (synth_owned) |id| gpa.free(id);
-                const tool_id = if (r.call_id) |id| id else blk: {
-                    if (pending_synth.items.len == 0) break :blk "";
-                    const id = pending_synth.orderedRemove(0);
-                    synth_owned = id;
-                    break :blk id;
-                };
-                capture.addToolResult(tool_id, r.content, r.is_error) catch |err| {
-                    log.warn("capture dropped tool result: {s}", .{@errorName(err)});
-                };
-            },
-            .info => |text| {
-                defer gpa.free(text);
-                if (parseTokenInfo(text)) |u| {
-                    pending_usage = .{
-                        .input_tokens = u.input,
-                        .output_tokens = u.output,
-                        .cache_creation_tokens = u.cache_creation,
-                        .cache_read_tokens = u.cache_read,
+                    capture.addToolCall(tool_id, s.name, args_json) catch |err| {
+                        log.warn("capture dropped tool call: {s}", .{@errorName(err)});
                     };
-                }
-            },
-            .done => {
-                const metrics: Trajectory.TurnMetrics = if (pending_usage) |u| .{
-                    .prompt_tokens = u.input_tokens,
-                    .completion_tokens = u.output_tokens,
-                    .cached_tokens = if (u.cache_read_tokens > 0) u.cache_read_tokens else null,
-                    .cost_usd = llm.cost.estimateCost(deps.endpoint_registry, deps.model_id, u),
-                } else .{};
-                capture.endTurn(metrics) catch |err| {
-                    log.warn("capture endTurn failed: {s}", .{@errorName(err)});
-                };
-                for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
-                if (deps.runner.agent_thread) |t| t.join();
-                deps.runner.agent_thread = null;
-                deps.runner.event_queue.deinit();
-                deps.runner.queue_active = false;
-                done = true;
-                break;
-            },
-            .err => |text| {
-                agent_err = gpa.dupe(u8, text) catch null;
-                gpa.free(text);
-                for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
-                capture.endTurn(.{}) catch {};
-                if (deps.runner.agent_thread) |t| t.join();
-                deps.runner.agent_thread = null;
-                deps.runner.event_queue.deinit();
-                deps.runner.queue_active = false;
-                done = true;
-                break;
-            },
-            .reset_assistant_text => {},
-            .thinking_delta => |t| {
-                defer gpa.free(t);
-                capture.addThinkingDelta(t) catch |err| {
-                    log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
-                };
-            },
-            .thinking_stop => {
-                capture.addThinkingStop() catch |err| {
-                    log.warn("capture dropped thinking stop: {s}", .{@errorName(err)});
-                };
-            },
-            .hook_request => |req| req.done.set(),
-            .lua_tool_request => |req| req.done.set(),
-            .layout_request => |req| {
-                req.is_error = true;
-                req.done.set();
-            },
-            .prompt_assembly_request => |req| {
-                req.error_name = "drained_without_dispatch";
-                req.done.set();
-            },
-        };
+                },
+                .tool_result => |r| {
+                    defer {
+                        gpa.free(r.content);
+                        if (r.call_id) |id| gpa.free(id);
+                    }
+                    // FIFO-match null-id results against the oldest outstanding
+                    // synthetic id. Parallel calls without provider ids collapse
+                    // to best-effort correlation. `Capture.addToolResult` dupes
+                    // the id string into its arena, so we free the synth owner
+                    // after the call returns.
+                    var synth_owned: ?[]const u8 = null;
+                    defer if (synth_owned) |id| gpa.free(id);
+                    const tool_id = if (r.call_id) |id| id else blk: {
+                        if (pending_synth.items.len == 0) break :blk "";
+                        const id = pending_synth.orderedRemove(0);
+                        synth_owned = id;
+                        break :blk id;
+                    };
+                    capture.addToolResult(tool_id, r.content, r.is_error) catch |err| {
+                        log.warn("capture dropped tool result: {s}", .{@errorName(err)});
+                    };
+                },
+                .info => |text| {
+                    defer gpa.free(text);
+                    if (parseTokenInfo(text)) |u| {
+                        pending_usage = .{
+                            .input_tokens = u.input,
+                            .output_tokens = u.output,
+                            .cache_creation_tokens = u.cache_creation,
+                            .cache_read_tokens = u.cache_read,
+                        };
+                    }
+                },
+                .done => {
+                    const metrics: Trajectory.TurnMetrics = if (pending_usage) |u| .{
+                        .prompt_tokens = u.input_tokens,
+                        .completion_tokens = u.output_tokens,
+                        .cached_tokens = if (u.cache_read_tokens > 0) u.cache_read_tokens else null,
+                        .cost_usd = llm.cost.estimateCost(deps.endpoint_registry, deps.model_id, u),
+                    } else .{};
+                    capture.endTurn(metrics) catch |err| {
+                        log.warn("capture endTurn failed: {s}", .{@errorName(err)});
+                    };
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
+                    if (deps.runner.agent_thread) |t| t.join();
+                    deps.runner.agent_thread = null;
+                    deps.runner.event_queue.deinit();
+                    deps.runner.queue_active = false;
+                    done = true;
+                    break;
+                },
+                .err => |text| {
+                    agent_err = gpa.dupe(u8, text) catch null;
+                    gpa.free(text);
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
+                    capture.endTurn(.{}) catch {};
+                    if (deps.runner.agent_thread) |t| t.join();
+                    deps.runner.agent_thread = null;
+                    deps.runner.event_queue.deinit();
+                    deps.runner.queue_active = false;
+                    done = true;
+                    break;
+                },
+                .reset_assistant_text => {},
+                .thinking_delta => |t| {
+                    defer gpa.free(t);
+                    capture.addThinkingDelta(t) catch |err| {
+                        log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
+                    };
+                },
+                .thinking_stop => {
+                    capture.addThinkingStop() catch |err| {
+                        log.warn("capture dropped thinking stop: {s}", .{@errorName(err)});
+                    };
+                },
+                .hook_request => |req| req.done.set(),
+                .lua_tool_request => |req| req.done.set(),
+                .layout_request => |req| {
+                    req.is_error = true;
+                    req.done.set();
+                },
+                .prompt_assembly_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+            }
+        }
     }
 
     const traj = try capture.build(gpa, .{
