@@ -352,6 +352,9 @@ fn fireToolGate(
             break;
         } else |_| {
             if (cancel.load(.acquire)) {
+                // Main may still be inside handleX(req) writing to req.result.
+                // Wait for it to signal done before touching req.result.
+                req.done.wait();
                 req.freeResult();
                 return error.Cancelled;
             }
@@ -748,6 +751,9 @@ fn fireJitContextRequest(
             break;
         } else |_| {
             if (cancel.load(.acquire)) {
+                // Main may still be inside handleX(req) writing to req.result.
+                // Wait for it to signal done before touching req.result.
+                req.done.wait();
                 if (req.result) |attached| allocator.free(attached);
                 return error.Cancelled;
             }
@@ -795,6 +801,9 @@ fn fireToolTransformRequest(
             break;
         } else |_| {
             if (cancel.load(.acquire)) {
+                // Main may still be inside handleX(req) writing to req.result.
+                // Wait for it to signal done before touching req.result.
+                req.done.wait();
                 if (req.result) |replacement| allocator.free(replacement);
                 return error.Cancelled;
             }
@@ -841,6 +850,9 @@ fn fireLoopDetect(
             break;
         } else |_| {
             if (cancel.load(.acquire)) {
+                // Main may still be inside handleX(req) writing to req.result.
+                // Wait for it to signal done before touching req.result.
+                req.done.wait();
                 req.freeResult();
                 return error.Cancelled;
             }
@@ -899,6 +911,9 @@ fn fireCompact(
             break;
         } else |_| {
             if (cancel.load(.acquire)) {
+                // Main may still be inside handleX(req) writing to req.result.
+                // Wait for it to signal done before touching req.result.
+                req.done.wait();
                 req.freeResult();
                 return error.Cancelled;
             }
@@ -3419,4 +3434,144 @@ test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompac
     try std.testing.expectEqual(types.Role.assistant, out[3].role);
     try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "<elided") != null);
     try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "second answer") == null);
+}
+
+// -- Cancel-path UAF regression tests --------------------------------------
+//
+// Each `fireX` helper must, on cancel observed mid-round-trip, wait for the
+// main thread to finish writing `req.result` BEFORE freeing it. The worker
+// would otherwise free a struct the main thread is still scribbling into
+// (the request lives on the worker's stack). These tests exercise the
+// cancel branch deterministically by:
+//   1. Pre-setting `cancel = true` so the worker enters the timed-wait
+//      loop already cancelled.
+//   2. Starting the pump only AFTER the worker's first 50ms `timedWait`
+//      times out, guaranteeing the cancel branch fires and the worker
+//      parks on `req.done.wait()`.
+//   3. The pump then drains the queue, the main side signals `done`, the
+//      worker frees and returns `error.Cancelled`.
+//
+// `testing.allocator` proves no leak on the cancel path. The race itself
+// is hard to deterministically reproduce without a thread sanitizer; we
+// only assert the code path runs to completion without crashing.
+
+const CancelPathHarness = struct {
+    fn delayedPump(
+        q: *agent_events.EventQueue,
+        eng: *LuaEngine.LuaEngine,
+        stop_flag: *std.atomic.Value(bool),
+        start_delay_ns: u64,
+    ) void {
+        const AgentRunnerLocal = @import("AgentRunner.zig");
+        std.Thread.sleep(start_delay_ns);
+        while (!stop_flag.load(.acquire)) {
+            AgentRunnerLocal.dispatchHookRequests(q, eng, null);
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        AgentRunnerLocal.dispatchHookRequests(q, eng, null);
+    }
+};
+
+test "fireToolGate cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tools.gate(function(ctx) return { "read" } end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    // Pump waits 150ms before draining so the worker's first 50ms
+    // timedWait times out and the cancel branch fires.
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const tools_seen = [_][]const u8{ "read", "bash" };
+    const result = fireToolGate(&engine, "ollama/qwen3-coder", &tools_seen, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+}
+
+test "fireLoopDetect cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.loop.detect(function(ctx)
+        \\  return { action = "reminder", text = "stop" }
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const result = fireLoopDetect(&engine, "bash", "{}", false, 5, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+}
+
+test "fireCompact cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return { { role = "user", content = "kept" } }
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+    };
+
+    // 850/1000 = 85% crosses the 80% threshold so `fireCompact` does the
+    // round-trip rather than bypassing it on the no-op fast path.
+    const result = fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
 }
