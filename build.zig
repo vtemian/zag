@@ -97,6 +97,45 @@ pub fn build(b: *std.Build) void {
     const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag");
     sim_e2e_step.dependOn(b.getInstallStep()); // ensures both zag and zag-sim are built
 
+    // Reproducer: a normal chat turn used to crash the agent runner during
+    // EventQueue.deinit on .done. As of 2026-04-23 the scenario can't
+    // actually reach .done because of an input-pacing race in the harness
+    // (only the first byte of `send "hello" <Enter>` lands), so it times
+    // out at `wait_exit` and exits 1 (assertion_failed). The exit code is
+    // pinned at 1 today so a green CI doesn't lie about the reproducer
+    // status. See `src/sim/scenarios/segfault_normal_chat.zsm` for the
+    // full diagnosis and the bump path: when input pacing is fixed, flip
+    // this to 2 (still crashes) or 0 (silently fixed) depending on what
+    // the run actually does.
+    const e2e_segfault = b.addRunArtifact(sim_exe);
+    e2e_segfault.addArgs(&.{
+        "run",
+        b.path("src/sim/scenarios/segfault_normal_chat.zsm").getPath(b),
+    });
+    e2e_segfault.addArg(b.fmt(
+        "--mock={s}",
+        .{b.path("src/sim/scenarios/segfault_normal_chat.mock.json").getPath(b)},
+    ));
+    e2e_segfault.expectExitCode(1);
+    e2e_segfault.step.dependOn(b.getInstallStep());
+    sim_e2e_step.dependOn(&e2e_segfault.step);
+
+    // Canary: the harness can drive a clean chat turn end-to-end. If this
+    // fails, the harness is broken — fix it before trusting the segfault
+    // scenario.
+    const e2e_canary = b.addRunArtifact(sim_exe);
+    e2e_canary.addArgs(&.{
+        "run",
+        b.path("src/sim/scenarios/happy_chat.zsm").getPath(b),
+    });
+    e2e_canary.addArg(b.fmt(
+        "--mock={s}",
+        .{b.path("src/sim/scenarios/happy_chat.mock.json").getPath(b)},
+    ));
+    e2e_canary.expectExitCode(0);
+    e2e_canary.step.dependOn(b.getInstallStep());
+    sim_e2e_step.dependOn(&e2e_canary.step);
+
     const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
     const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
     script.addArtifactArg(exe);
