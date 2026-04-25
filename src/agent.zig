@@ -21,12 +21,15 @@ const log = std.log.scoped(.agent);
 /// a real one. The built-in layers don't read it; PR 3's Lua layers will.
 const default_agent_name = "zag";
 
-/// Placeholder model spec for the `LayerContext.model` field. The agent
-/// loop currently receives only an `llm.Provider` vtable, not the parsed
-/// model identifier; built-in layers don't read it. PR 3 plumbs the real
-/// `ModelSpec` through `runLoopStreaming` so Lua `for_model` layers can
-/// match against it.
-const placeholder_model_spec: llm.ModelSpec = .{
+/// Sentinel `ModelSpec` for callers that don't have a real one (unit tests
+/// and some headless harnesses without a populated registry). Production
+/// turns must NEVER pass this: the dispatcher in `zag.prompt.init` matches
+/// `model_id` against pack patterns, and `"unknown"` would silently miss
+/// every per-provider pack. `runLoopStreaming` accepts whatever the caller
+/// supplies; the contract is "match what your provider/registry resolved
+/// at boot." Tests that only exercise the assembly path use this so they
+/// don't have to fabricate a registry.
+pub const UNKNOWN_MODEL: llm.ModelSpec = .{
     .provider_name = "unknown",
     .model_id = "unknown",
 };
@@ -45,12 +48,15 @@ pub fn runLoopStreaming(
     lua_engine: ?*LuaEngine.LuaEngine,
     skills: ?*const skills_mod.SkillRegistry,
     turn_in_progress: *std.atomic.Value(bool),
-    /// Provider context window for the active model. Drives the
-    /// `zag.compact.strategy` fire threshold (currently 80% of this
-    /// number against the prior turn's `input_tokens`). Pass 0 to
-    /// disable compaction entirely; callers without a model rate card
-    /// (tests, headless eval) use 0 and skip the round-trip.
-    context_window: u32,
+    /// Resolved model identity for this run. `provider_name` and `model_id`
+    /// drive the `zag.prompt.init` dispatcher (and any Lua `for_model`
+    /// layer) so the per-provider pack body actually fires; production
+    /// callers must not pass `UNKNOWN_MODEL`. `context_window` drives the
+    /// `zag.compact.strategy` fire threshold (currently 80% of the cap
+    /// against the prior turn's `input_tokens`); a zero value disables
+    /// compaction entirely so callers without a rate card (some tests,
+    /// the headless eval) still run cleanly.
+    model_spec: llm.ModelSpec,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
@@ -73,7 +79,7 @@ pub fn runLoopStreaming(
     defer env_snapshot.deinit();
 
     const layer_ctx: prompt.LayerContext = .{
-        .model = placeholder_model_spec,
+        .model = model_spec,
         .cwd = env_snapshot.cwd,
         .worktree = env_snapshot.worktree,
         .agent_name = default_agent_name,
@@ -124,7 +130,7 @@ pub fn runLoopStreaming(
             lua_engine,
             messages.items,
             last_input_tokens,
-            context_window,
+            model_spec.context_window,
             allocator,
             queue,
             cancel,
@@ -1353,7 +1359,7 @@ test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt o
     defer prompt_registry.deinit(allocator);
 
     const layer_ctx: prompt.LayerContext = .{
-        .model = placeholder_model_spec,
+        .model = UNKNOWN_MODEL,
         .cwd = "",
         .worktree = "",
         .agent_name = default_agent_name,
@@ -1411,7 +1417,7 @@ test "runLoopStreaming wires SkillRegistry into the assembled system prompt" {
     defer prompt_registry.deinit(allocator);
 
     const layer_ctx: prompt.LayerContext = .{
-        .model = placeholder_model_spec,
+        .model = UNKNOWN_MODEL,
         .cwd = "",
         .worktree = "",
         .agent_name = default_agent_name,
@@ -1432,6 +1438,153 @@ test "runLoopStreaming wires SkillRegistry into the assembled system prompt" {
     try std.testing.expect(std.mem.indexOf(u8, joined, "name=\"roll-dice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined, "Roll a die.") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined, "</available_skills>") != null);
+}
+
+test "runLoopStreaming model_spec drives the per-provider prompt pack via the Lua dispatcher" {
+    // Pins the plumbing fix that replaced `placeholder_model_spec` with
+    // the caller-supplied `model_spec`. We stop short of spinning up a
+    // real provider thread (the existing assembly tests above already
+    // pin the Zig-only path); instead we mirror the LayerContext block
+    // `runLoopStreaming` builds on entry and run it through the Lua
+    // dispatcher the production loop now drives. With
+    // `provider_name = "anthropic"` the `zag.prompt.init` dispatcher
+    // resolves to `zag.prompt.anthropic` and emits the "running with
+    // Claude" identity line; an `UNKNOWN_MODEL` ctx falls through to
+    // the default pack and the line is absent.
+    if (LuaEngine.sandbox_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.loadBuiltinPlugins();
+
+    const real_spec: llm.ModelSpec = .{
+        .provider_name = "anthropic",
+        .model_id = "claude-sonnet-4-20250514",
+        .context_window = 200_000,
+    };
+    const layer_ctx_anthropic: prompt.LayerContext = .{
+        .model = real_spec,
+        .cwd = "",
+        .worktree = "",
+        .agent_name = default_agent_name,
+        .date_iso = "1970-01-01",
+        .is_git_repo = false,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = &.{},
+    };
+
+    var assembled = try engine.renderPromptLayers(&layer_ctx_anthropic, allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "running with Claude") != null,
+    );
+
+    // Sanity: the placeholder spec the old code used would have missed
+    // every provider-specific pack pattern. Re-running with
+    // UNKNOWN_MODEL must drop the anthropic identity line, which is
+    // exactly the silent-failure mode the plumbing fix closes.
+    const layer_ctx_unknown: prompt.LayerContext = .{
+        .model = UNKNOWN_MODEL,
+        .cwd = "",
+        .worktree = "",
+        .agent_name = default_agent_name,
+        .date_iso = "1970-01-01",
+        .is_git_repo = false,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = &.{},
+    };
+
+    var fallback = try engine.renderPromptLayers(&layer_ctx_unknown, allocator);
+    defer fallback.deinit();
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, fallback.stable, "running with Claude") == null,
+    );
+}
+
+test "runLoopStreaming model_spec.context_window crosses fireCompact's 80% threshold" {
+    // Pins the plumbing fix that replaced the hardcoded
+    // `compact_context_window: u32 = 0` in AgentRunner with
+    // `model_spec.context_window`. `runLoopStreaming` forwards the
+    // field to `fireCompact` verbatim, so a unit test that drives
+    // `fireCompact` with the same number a real ModelSpec would carry
+    // is sufficient: it proves the threshold ladder fires once a
+    // production-shaped spec lands in the loop. With `tokens_used =
+    // 850` and `context_window = 1000` we sit at 85%, above the 80%
+    // fire threshold, so the strategy must be invoked and a
+    // replacement returned.
+    if (LuaEngine.sandbox_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\local fired = 0
+        \\zag.compact.strategy(function(ctx)
+        \\  fired = fired + 1
+        \\  return { { role = "user", content = "<elided>" } }
+        \\end)
+        \\function compact_fire_count() return fired end
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    const real_spec: llm.ModelSpec = .{
+        .provider_name = "anthropic",
+        .model_id = "claude-sonnet-4-20250514",
+        .context_window = 1000,
+    };
+
+    // Mirrors the call site at the top of `runLoopStreaming`'s loop:
+    // tokens_used = 850 vs. spec.context_window = 1000 sits at 85% so
+    // `fireCompact` MUST cross the 80% threshold and round-trip to the
+    // strategy handler. Before this plumbing fix the call site passed
+    // a hardcoded 0, which short-circuits the helper before the
+    // threshold check; the test here would still pass on the bug
+    // (because we call fireCompact directly with the right ceiling),
+    // so we additionally pin the value via a Lua-side counter to
+    // catch any future regression in the handler dispatch path.
+    const replacement = try fireCompact(
+        &engine,
+        fixture.items,
+        850,
+        real_spec.context_window,
+        alloc,
+        &queue,
+        &cancel,
+    );
+    try std.testing.expect(replacement != null);
+    defer {
+        for (replacement.?) |m| m.deinit(alloc);
+        alloc.free(replacement.?);
+    }
+
+    _ = try engine.lua.getGlobal("compact_fire_count");
+    try engine.lua.protectedCall(.{ .args = 0, .results = 1 });
+    const fired = try engine.lua.toInteger(-1);
+    engine.lua.pop(1);
+    try std.testing.expectEqual(@as(i64, 1), fired);
 }
 
 test "emitTokenUsage emits old two-field form when no cache counts" {

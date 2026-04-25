@@ -169,10 +169,15 @@ pub const SpawnDeps = struct {
     lua_engine: ?*LuaEngine,
     /// Provider used by the agent loop for LLM calls.
     provider: llm.Provider,
-    /// Provider name (e.g. "openai-oauth") extracted from the model
-    /// string. Surfaced in `NotLoggedIn` / `LoginExpired` error hints so
-    /// the user sees `zag --login=<provider>` with the real name.
-    provider_name: []const u8,
+    /// Resolved model identity for this run. The caller resolves
+    /// (`provider_name`, `model_id`, `context_window`) at boot from the
+    /// endpoint registry's rate card so the agent loop can drive the
+    /// `zag.prompt.init` per-model dispatcher and the
+    /// `zag.compact.strategy` fire threshold off real values.
+    /// `model_spec.provider_name` is also surfaced in `NotLoggedIn` /
+    /// `LoginExpired` error hints so the user sees `zag --login=<provider>`
+    /// with the real name.
+    model_spec: llm.ModelSpec,
     /// Tool registry dispatched from the agent loop.
     registry: *const tools.Registry,
     /// Optional skill registry to advertise via the
@@ -219,7 +224,8 @@ pub fn submit(
             .allocator = deps.allocator,
             .subagents = subs,
             .provider = deps.provider,
-            .provider_name = deps.provider_name,
+            .provider_name = deps.model_spec.provider_name,
+            .model_spec = deps.model_spec,
             .registry = deps.registry,
             .session_handle = self.session.session_handle,
             .lua_engine = deps.lua_engine,
@@ -236,7 +242,7 @@ pub fn submit(
         &self.event_queue,
         &self.cancel_flag,
         deps.lua_engine,
-        deps.provider_name,
+        deps.model_spec,
         self.pane_handle_packed,
         deps.skills orelse self.skills,
         if (deps.subagents != null) &self.task_ctx else null,
@@ -337,7 +343,7 @@ fn threadMain(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine,
-    provider_name: []const u8,
+    model_spec: llm.ModelSpec,
     pane_handle_packed: u32,
     skills: ?*const skills_mod.SkillRegistry,
     task_ctx: ?*const tools.TaskContext,
@@ -368,18 +374,23 @@ fn threadMain(
     // stale `true` and divert the first user message.
     defer turn_in_progress.store(false, .release);
 
-    // Compaction context window is plumbed in a follow-up: today the
-    // runner threads zero so `zag.compact.strategy` never fires. The
-    // compaction socket itself (CompactRequest, dispatch arm) lands
-    // first so plugins can register their strategy ahead of the
-    // model-rate-card lookup that will populate this argument.
-    const compact_context_window: u32 = 0;
-    agent.runLoopStreaming(messages, registry, provider, allocator, queue, cancel, lua_engine, skills, turn_in_progress, compact_context_window) catch |err| {
+    agent.runLoopStreaming(
+        messages,
+        registry,
+        provider,
+        allocator,
+        queue,
+        cancel,
+        lua_engine,
+        skills,
+        turn_in_progress,
+        model_spec,
+    ) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
         // queue counter and `.done` is still pushed so the UI returns to
         // idle rather than getting stuck.
-        const message = formatAgentErrorMessage(err, provider_name, allocator) catch {
+        const message = formatAgentErrorMessage(err, model_spec.provider_name, allocator) catch {
             _ = queue.dropped.fetchAdd(1, .monotonic);
             queue.tryPush(allocator, .done);
             return;

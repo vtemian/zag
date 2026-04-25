@@ -289,15 +289,27 @@ pub const Provider = struct {
     }
 };
 
-/// Parsed model string components.
+/// Parsed model string components plus the per-model context window
+/// pulled from the endpoint registry's rate card. Populated by
+/// `parseModelString` (no registry lookup, `context_window = 0`) or
+/// `resolveModelSpec` (with the registry, populating `context_window`
+/// when the rate card carries one).
 pub const ModelSpec = struct {
     /// Provider name (e.g., "anthropic", "openai").
     provider_name: []const u8,
     /// Model identifier within the provider (e.g., "claude-sonnet-4-20250514").
     model_id: []const u8,
+    /// Maximum input tokens this model accepts in one request, copied from
+    /// `Endpoint.models[i].context_window` when the registry knows about
+    /// the model. Zero means "no rate card" — the agent loop's compaction
+    /// fire helper short-circuits on a zero ceiling so unknown models
+    /// don't trigger spurious compactions.
+    context_window: u32 = 0,
 };
 
 /// Parse a "provider/model" string. If no slash is present, defaults to "anthropic".
+/// Leaves `context_window = 0`; pair with `resolveModelSpec` for a
+/// rate-card-aware spec when a registry is available.
 pub fn parseModelString(model: []const u8) ModelSpec {
     if (std.mem.indexOfScalar(u8, model, '/')) |slash| {
         return .{
@@ -309,6 +321,30 @@ pub fn parseModelString(model: []const u8) ModelSpec {
         .provider_name = "anthropic",
         .model_id = model,
     };
+}
+
+/// Parse `model_string` and look up the model's context window in the
+/// endpoint registry. Returns the parsed spec with `context_window`
+/// populated when the registry knows about the provider AND the model id
+/// appears in its `models` rate card; falls back to zero otherwise so
+/// callers without a populated registry get the same behaviour as
+/// `parseModelString`. The `provider_name` and `model_id` slices alias
+/// `model_string`; the caller must keep that buffer alive for the
+/// lifetime of the returned spec.
+pub fn resolveModelSpec(
+    registry_opt: ?*const Registry,
+    model_string: []const u8,
+) ModelSpec {
+    var spec = parseModelString(model_string);
+    const registry = registry_opt orelse return spec;
+    const endpoint = registry.find(spec.provider_name) orelse return spec;
+    for (endpoint.models) |rate| {
+        if (std.mem.eql(u8, rate.id, spec.model_id)) {
+            spec.context_window = rate.context_window;
+            return spec;
+        }
+    }
+    return spec;
 }
 
 /// Result of creating a provider. Owns all resources needed for LLM calls.

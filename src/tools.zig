@@ -58,8 +58,17 @@ pub const TaskContext = struct {
     /// LLM provider to share with the child. v1 ignores the subagent's
     /// own `model` field and always reuses this provider.
     provider: llm.Provider,
-    /// Provider name for child `formatAgentErrorMessage` calls.
+    /// Provider name for child `formatAgentErrorMessage` calls. Mirrors
+    /// `model_spec.provider_name`; kept as a separate field because the
+    /// task tool reaches for it on every error path and the duplication
+    /// keeps that path allocation-free.
     provider_name: []const u8,
+    /// Resolved model identity (`provider_name`, `model_id`,
+    /// `context_window`) for the child run. The task tool hands this to
+    /// `runLoopStreaming` so subagents drive the same `zag.prompt.init`
+    /// dispatcher and `zag.compact.strategy` threshold as the parent
+    /// instead of running with the placeholder `UNKNOWN_MODEL`.
+    model_spec: llm.ModelSpec,
     /// Parent's tool registry. The task tool builds a `Subset` view
     /// against the subagent's allowlist and passes that down.
     registry: *const Registry,
