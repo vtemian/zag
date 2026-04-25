@@ -318,13 +318,21 @@ pub const LuaEngine = struct {
         };
     }
 
-    /// Require every embedded `zag.builtin.*` and `zag.layers.*` module
-    /// so the side effects (slash command registrations, keymap bindings,
-    /// prompt layer registrations) land in the engine's registries. Must
-    /// be called before `loadUserConfig` so a user's overrides win via
-    /// the command registry's last-write-wins semantics and so that
-    /// stable-class prompt layers register before the user's config has
-    /// a chance to trigger the first render.
+    /// Require every embedded `zag.builtin.*`, `zag.layers.*`, and the
+    /// `zag.prompt` dispatcher so the side effects (slash command
+    /// registrations, keymap bindings, prompt layer registrations) land
+    /// in the engine's registries. Must be called before `loadUserConfig`
+    /// so a user's overrides win via the command registry's last-write-wins
+    /// semantics and so that stable-class prompt layers register before
+    /// the user's config has a chance to trigger the first render.
+    ///
+    /// `zag.prompt` (without a sub-segment) is the dispatcher itself;
+    /// requiring it installs the catch-all `for_model(".*", ...)` that
+    /// routes to a pack module on first render. The per-pack files
+    /// (`zag.prompt.anthropic`, `zag.prompt.openai-codex`,
+    /// `zag.prompt.default`) are deliberately *not* eager-loaded: the
+    /// dispatcher pulls them in lazily via `require()` so a pack only
+    /// registers when its model selects it.
     ///
     /// Failures are logged and swallowed; a broken builtin must never
     /// block engine startup.
@@ -333,7 +341,8 @@ pub const LuaEngine = struct {
         for (embedded.entries) |entry| {
             const is_builtin = std.mem.startsWith(u8, entry.name, "zag.builtin.");
             const is_layer = std.mem.startsWith(u8, entry.name, "zag.layers.");
-            if (!is_builtin and !is_layer) continue;
+            const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
+            if (!is_builtin and !is_layer and !is_prompt_dispatcher) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
