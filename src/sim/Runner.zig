@@ -50,6 +50,13 @@ pub const Runner = struct {
     env: std.process.EnvMap,
     /// Optional mock-provider harness. Set by `attachMock`, freed by `deinit`.
     mock: ?*MockHarness = null,
+    /// Raw waitpid status from the most recent reap. `null` until the child
+    /// is reaped (either via wait_exit or by `deinit`'s SIGKILL fallback).
+    child_status: ?u32 = null,
+    /// `deinit` sends SIGKILL when the child is still alive at teardown. We
+    /// only want to treat a non-zero exit as a crash when *we* didn't send
+    /// the killing signal — so the crash-report path checks this flag.
+    was_killed_by_harness: bool = false,
 
     pub fn init(alloc: std.mem.Allocator) !Runner {
         return .{
@@ -61,9 +68,12 @@ pub const Runner = struct {
 
     pub fn deinit(self: *Runner) void {
         if (self.child) |sp| {
+            self.was_killed_by_harness = true;
             _ = posix.kill(sp.pid, posix.SIG.KILL) catch {};
-            _ = posix.waitpid(sp.pid, 0);
+            const r = posix.waitpid(sp.pid, 0);
+            self.child_status = r.status;
             posix.close(sp.pty.master);
+            self.child = null;
         }
         self.grid.destroy();
         self.env.deinit();
@@ -72,6 +82,18 @@ pub const Runner = struct {
             self.alloc.destroy(h);
             self.mock = null;
         }
+    }
+
+    /// Reap the child if it's already exited, populating `child_status`.
+    /// Must be called from `executeWaitExit` after `pumpOnce` reports
+    /// `.exited`; otherwise `deinit`'s SIGKILL path runs and the status
+    /// mismatches the actual cause of death.
+    fn reapExitedChild(self: *Runner) void {
+        const sp = self.child orelse return;
+        const r = posix.waitpid(sp.pid, 0);
+        self.child_status = r.status;
+        posix.close(sp.pty.master);
+        self.child = null;
     }
 
     /// Load the mock script at `script_path`, spin up an in-process HTTP mock
@@ -164,7 +186,10 @@ pub const Runner = struct {
         while (true) {
             const remaining = @max(@as(i64, 0), deadline_ms - std.time.milliTimestamp());
             const status = try self.pumpOnce(@intCast(@min(remaining, 250)));
-            if (status == .exited) return error.ChildExitedDuringWait;
+            if (status == .exited) {
+                self.reapExitedChild();
+                return error.ChildExitedDuringWait;
+            }
             const dump = try self.grid.plainText();
             defer self.alloc.free(dump);
             if (std.mem.indexOf(u8, dump, pattern) != null) return;
@@ -175,7 +200,10 @@ pub const Runner = struct {
     pub fn executeWaitIdle(self: *Runner, idle_ms: u32) !void {
         while (true) {
             const status = try self.pumpOnce(@intCast(idle_ms));
-            if (status == .exited) return error.ChildExitedDuringWait;
+            if (status == .exited) {
+                self.reapExitedChild();
+                return error.ChildExitedDuringWait;
+            }
             if (status == .idle) return;
             // data arrived — re-arm
         }
@@ -206,8 +234,46 @@ pub const Runner = struct {
             const remaining = @max(@as(i64, 0), deadline - std.time.milliTimestamp());
             if (remaining == 0) return error.WaitExitTimeout;
             const status = try self.pumpOnce(@intCast(@min(remaining, 250)));
-            if (status == .exited) return;
+            if (status == .exited) {
+                self.reapExitedChild();
+                return;
+            }
         }
+    }
+
+    /// If the child exited with non-zero status (signal we didn't send, or
+    /// non-zero exit code), write a `crash.txt` to `artifacts.dir`. No-op
+    /// when the child is still alive, exited cleanly, or was killed by
+    /// `deinit` (we sent the signal — not a crash).
+    pub fn writeCrashReportIfBad(self: *Runner, artifacts: *Artifacts) !void {
+        const status = self.child_status orelse return;
+
+        const desc: CrashDescription = describeStatus(status, self.was_killed_by_harness) orelse return;
+
+        const grid_dump = try self.grid.plainText();
+        defer self.alloc.free(grid_dump);
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.alloc);
+        try body.appendSlice(self.alloc, "zag-sim crash report\n====================\nexit_status: ");
+        try body.appendSlice(self.alloc, desc.text);
+        try body.appendSlice(self.alloc, "\nfinal_grid:\n");
+        try body.appendSlice(self.alloc, grid_dump);
+        try body.appendSlice(self.alloc, "\nlast log lines:\n");
+        if (self.mock) |h| {
+            const log_path_opt = readNewestLog(self.alloc, h.tmp_root) catch null;
+            if (log_path_opt) |log_bytes| {
+                defer self.alloc.free(log_bytes);
+                const tail = sliceLastLinesPub(log_bytes, crash_log_tail_lines);
+                try body.appendSlice(self.alloc, tail);
+            }
+        }
+
+        const out_path = try artifacts.pathFor("crash.txt");
+        defer self.alloc.free(out_path);
+        const file = try std.fs.createFileAbsolute(out_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(body.items);
     }
 
     pub fn executeSetEnv(self: *Runner, raw: []const u8) !void {
@@ -239,6 +305,95 @@ pub const Runner = struct {
         return raw;
     }
 };
+
+/// Crash report includes a tail of zag's debug log; cap the line count
+/// so the file stays skim-able even when the child died after thousands
+/// of log lines.
+const crash_log_tail_lines: usize = 40;
+
+const CrashDescription = struct { text: []const u8 };
+
+/// Render a `WaitPidResult.status` as a human-readable string, or return
+/// `null` when the exit doesn't qualify as a crash. Owned by the static
+/// `signal_table`, so the returned slice doesn't need freeing.
+fn describeStatus(status: u32, was_killed_by_harness: bool) ?CrashDescription {
+    if (posix.W.IFEXITED(status)) {
+        const code = posix.W.EXITSTATUS(status);
+        if (code == 0) return null;
+        // Buffer is module-static; we never free it.
+        return .{ .text = formatExit(code) };
+    }
+    if (posix.W.IFSIGNALED(status)) {
+        const sig = posix.W.TERMSIG(status);
+        // Don't flag the SIGKILL we sent ourselves as a crash.
+        if (was_killed_by_harness and sig == posix.SIG.KILL) return null;
+        return .{ .text = formatSignal(sig) };
+    }
+    return null;
+}
+
+// Per-process scratch for the human-readable status text. Not thread-safe,
+// but Runner is single-threaded by construction.
+var status_scratch: [64]u8 = undefined;
+
+fn formatExit(code: u8) []const u8 {
+    return std.fmt.bufPrint(&status_scratch, "exit {d}", .{code}) catch "exit ?";
+}
+
+fn formatSignal(sig: u32) []const u8 {
+    return std.fmt.bufPrint(&status_scratch, "signal {d}", .{sig}) catch "signal ?";
+}
+
+/// Read the most-recent `*.log` under `<home>/.zag/logs/`. Returns null
+/// when no logs exist or the dir is missing. Caller owns the returned
+/// bytes.
+fn readNewestLog(alloc: std.mem.Allocator, home: []const u8) !?[]u8 {
+    const logs_dir = try std.fs.path.join(alloc, &.{ home, ".zag", "logs" });
+    defer alloc.free(logs_dir);
+
+    var dir = std.fs.openDirAbsolute(logs_dir, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    var newest_path: ?[]u8 = null;
+    errdefer if (newest_path) |p| alloc.free(p);
+    var newest_mtime: i128 = std.math.minInt(i128);
+
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
+        const stat = dir.statFile(entry.name) catch continue;
+        if (stat.mtime <= newest_mtime) continue;
+        const full = try std.fs.path.join(alloc, &.{ logs_dir, entry.name });
+        if (newest_path) |old| alloc.free(old);
+        newest_path = full;
+        newest_mtime = stat.mtime;
+    }
+
+    const path = newest_path orelse return null;
+    defer alloc.free(path);
+    return try std.fs.cwd().readFileAlloc(alloc, path, 8 * 1024 * 1024);
+}
+
+/// Same byte-walk-from-end logic as Artifacts.sliceLastLines. Duplicated
+/// here so Runner doesn't need a dep on Artifacts internals; it's eight
+/// lines and the alternative is exposing more surface from Artifacts.
+fn sliceLastLinesPub(bytes: []const u8, max_lines: usize) []const u8 {
+    if (bytes.len == 0) return bytes;
+    var seen: usize = 0;
+    var i: usize = bytes.len;
+    while (i > 0) {
+        i -= 1;
+        if (bytes[i] != '\n') continue;
+        if (i == bytes.len - 1) continue;
+        seen += 1;
+        if (seen == max_lines) return bytes[i + 1 ..];
+    }
+    return bytes;
+}
 
 /// Mint a fresh `<TMPDIR>/zag-sim-<pid>-<ts>` directory. Caller owns the
 /// returned path and is responsible for `deleteTree`-ing it.
@@ -312,6 +467,49 @@ test "executeSnapshot writes grid dump to artifacts dir" {
     const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "shot1.grid", 64 * 1024);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "snapshot body") != null);
+}
+
+test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
+    defer artifacts.destroy();
+
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    const argv = [_][*:0]const u8{ "/bin/sh", "-c", "exit 42" };
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try r.executeWaitExit(2000);
+
+    try r.writeCrashReportIfBad(artifacts);
+    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "crash.txt", 64 * 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "exit 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "zag-sim crash report") != null);
+}
+
+test "writeCrashReportIfBad is a noop on clean exit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
+    defer artifacts.destroy();
+
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    const argv = [_][*:0]const u8{"/usr/bin/true"};
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try r.executeWaitExit(2000);
+
+    try r.writeCrashReportIfBad(artifacts);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("crash.txt", .{}));
 }
 
 test "executeWaitExit returns when child exits" {

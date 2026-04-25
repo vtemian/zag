@@ -96,10 +96,11 @@ fn runSourceImpl(
 
     var r = try Runner.init(alloc);
     defer r.deinit();
-    // Registered after r.init so it fires *before* r.deinit (LIFO defer).
-    // The mock harness's tempdir is the spawned zag's $HOME; tail it now
-    // before deinit yanks the directory.
+    // Registered after r.init so they fire *before* r.deinit (LIFO defer).
+    // The mock harness's tempdir is the spawned zag's $HOME; tail the log
+    // and emit the crash report before deinit yanks the directory.
     defer {
+        r.writeCrashReportIfBad(opts.artifacts) catch {};
         if (r.mock) |h| opts.artifacts.tailZagLog(h.tmp_root) catch {};
     }
 
