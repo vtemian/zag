@@ -562,9 +562,11 @@ fn formatUnknownAgent(
 }
 
 /// JSON schema and metadata sent to the LLM. The `agent` enum is built
-/// by `SubagentRegistry.taskToolSchema` at emit time; the schema here
-/// is deliberately permissive (string + string) because the registry's
-/// emit path is the source of truth for what subagent names exist.
+/// by `SubagentRegistry.taskInputSchemaJson` and patched onto this
+/// definition by `tools.registerTaskTool` before any provider serializes
+/// the tool list. The fallback schema below is deliberately permissive
+/// (string + string) for the unusual case where a caller registers the
+/// raw `task_tool.tool` without going through `registerTaskTool`.
 pub const definition = types.ToolDefinition{
     .name = "task",
     .description = "Delegate a sub-problem to a named subagent. Returns the subagent's final summary as the tool result.",
