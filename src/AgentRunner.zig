@@ -522,6 +522,16 @@ pub fn dispatchHookRequests(
                 // the producer doesn't park forever.
                 req.done.set();
             },
+            .tool_transform_request => |req| {
+                if (engine) |eng| {
+                    eng.handleToolTransformRequest(req) catch |err| {
+                        req.error_name = @errorName(err);
+                    };
+                }
+                // Same rationale as `jit_context_request`: a missing
+                // engine is a clean miss; always signal done.
+                req.done.set();
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -731,6 +741,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             req.done.set();
         },
         .jit_context_request => |req| {
+            req.error_name = "drained_without_dispatch";
+            req.done.set();
+        },
+        .tool_transform_request => |req| {
             req.error_name = "drained_without_dispatch";
             req.done.set();
         },
@@ -1256,6 +1270,53 @@ test "jit_context_request handler error sets error_name" {
     try std.testing.expect(req.result == null);
     try std.testing.expect(req.error_name != null);
     try std.testing.expectEqualStrings("LuaHandlerError", req.error_name.?);
+}
+
+test "tool_transform_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx)
+        \\  return "transformed: " .. ctx.output
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.ToolTransformRequest.init(
+        "bash",
+        "{\"cmd\":\"ls\"}",
+        "raw output",
+        false,
+        alloc,
+    );
+
+    try queue.push(.{ .tool_transform_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    defer alloc.free(req.result.?);
+    try std.testing.expectEqualStrings("transformed: raw output", req.result.?);
+}
+
+test "tool_transform_request with no engine signals done" {
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.ToolTransformRequest.init("bash", "{}", "x", false, alloc);
+    try queue.push(.{ .tool_transform_request = &req });
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
 }
 
 test "prompt_assembly_request with no engine signals error_name" {
