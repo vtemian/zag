@@ -12031,6 +12031,112 @@ test "zag.prompt dispatch routes Qwen3-Coder model id to qwen3-coder pack" {
     );
 }
 
+test "qwen3-coder pack require installs loop, gate, and trim transforms globally" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Pull in the default loop detector first so we can prove the pack
+    // overrides it. The pack file is intentionally NOT auto-loaded by
+    // `loadBuiltinPlugins` (per-pack files are lazy); requiring it
+    // directly mirrors the dispatcher's first-match behavior and is
+    // what registers the overrides.
+    try engine.lua.doString("require('zag.loop.default')");
+    try std.testing.expect(engine.loopDetectHandler() != null);
+    try std.testing.expect(engine.toolGateHandler() == null);
+    try std.testing.expect(!engine.toolTransformHandlers().contains("grep"));
+    try std.testing.expect(!engine.toolTransformHandlers().contains("bash"));
+
+    try engine.lua.doString("require('zag.prompt.qwen3-coder')");
+
+    // Loop detector handler swapped (single global slot, last-write-wins).
+    // We can't compare refs directly without snapshotting, but the next
+    // test exercises the threshold-2 behavior to confirm the swap.
+    try std.testing.expect(engine.loopDetectHandler() != null);
+    // Tool gate slot now populated by the pack.
+    try std.testing.expect(engine.toolGateHandler() != null);
+    // Both trim transforms registered.
+    try std.testing.expect(engine.toolTransformHandlers().contains("grep"));
+    try std.testing.expect(engine.toolTransformHandlers().contains("bash"));
+}
+
+test "qwen3-coder pack loop detector flags at 2 identical calls" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.prompt.qwen3-coder')");
+
+    // identical_streak == 1: below the qwen threshold, no action.
+    var below = agent_events.LoopDetectRequest.init("bash", "{}", false, 1, alloc);
+    defer below.freeResult();
+    try engine.handleLoopDetectRequest(&below);
+    try std.testing.expect(below.error_name == null);
+    try std.testing.expect(below.result == null);
+
+    // identical_streak == 2: hits the qwen threshold (vs default's 5),
+    // returns a reminder. Reminder text mentions tool name and count
+    // so plugin authors get actionable diagnostic copy.
+    var at = agent_events.LoopDetectRequest.init("bash", "{}", false, 2, alloc);
+    defer at.freeResult();
+    try engine.handleLoopDetectRequest(&at);
+    try std.testing.expect(at.error_name == null);
+    try std.testing.expect(at.result != null);
+    switch (at.result.?) {
+        .reminder => |text| {
+            try std.testing.expect(std.mem.indexOf(u8, text, "bash") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "2x") != null);
+        },
+        .abort => return error.TestUnexpectedAbort,
+    }
+}
+
+test "qwen3-coder pack tool gate restricts to read/edit/bash/grep/glob" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.prompt.qwen3-coder')");
+
+    // The gate returns its own fixed allowlist; the available-tools
+    // list passed in is informational (handlers can read `ctx.tools`
+    // but the qwen pack does not). We populate it with the agent's
+    // realistic set so the test exercises the marshal path the same
+    // way `gateToolDefs` will at runtime; intersection with the
+    // registered tool registry happens upstream in `agent.zig`.
+    const tool_names = [_][]const u8{
+        "read", "write", "edit", "bash", "grep",
+        "glob", "fetch", "task",
+    };
+    var req = agent_events.ToolGateRequest.init(
+        "ollama/qwen3-coder-30b",
+        &tool_names,
+        alloc,
+    );
+    defer req.freeResult();
+
+    try engine.handleToolGateRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+
+    const subset = req.result.?;
+    try std.testing.expectEqual(@as(usize, 5), subset.len);
+    try std.testing.expectEqualStrings("read", subset[0]);
+    try std.testing.expectEqualStrings("edit", subset[1]);
+    try std.testing.expectEqualStrings("bash", subset[2]);
+    try std.testing.expectEqualStrings("grep", subset[3]);
+    try std.testing.expectEqualStrings("glob", subset[4]);
+}
+
 test "zag.prompt dispatch falls through to default pack for exotic providers" {
     if (sandbox_enabled) return error.SkipZigTest;
 
