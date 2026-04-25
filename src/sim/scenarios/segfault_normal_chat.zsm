@@ -1,0 +1,9 @@
+# Reproduces the segfault Vlad observed on 2026-04-23: a normal chat turn
+# crashes the agent runner during EventQueue.deinit on .done. Drives zag
+# via the mock provider so the reproducer is offline + deterministic.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+send "hello" <Enter>
+wait_exit
+snapshot final
