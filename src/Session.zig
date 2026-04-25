@@ -130,6 +130,11 @@ pub const Entry = struct {
     /// Ciphertext for `.thinking_redacted` entries. Echoed back verbatim
     /// on later turns. Null on every other entry type.
     encrypted_data: ?[]const u8 = null,
+    /// Provider-issued tool-use identifier (e.g. Anthropic's `toolu_...`)
+    /// that pairs a `tool_call` with its matching `tool_result`. Null on
+    /// non-tool entries and on tool entries persisted before this field
+    /// existed; replay logic treats null as "fall back to linear pairing".
+    tool_use_id: ?[]const u8 = null,
 };
 
 /// Return true when `id` is the all-zeros sentinel produced by the
@@ -569,6 +574,7 @@ pub fn freeEntry(entry: Entry, allocator: Allocator) void {
     if (entry.signature) |s| allocator.free(s);
     if (entry.thinking_provider) |tp| allocator.free(tp);
     if (entry.encrypted_data) |ed| allocator.free(ed);
+    if (entry.tool_use_id) |id| allocator.free(id);
 }
 
 /// Outcome of a session's crash-recovery pass. `actual_line_count` is the
@@ -711,6 +717,11 @@ fn serializeEntry(entry: *Entry, buf: []u8) ![]const u8 {
         try writeJsonString(w, ed);
     }
 
+    if (entry.tool_use_id) |id| {
+        try w.writeAll(",\"tool_use_id\":");
+        try writeJsonString(w, id);
+    }
+
     try w.print(",\"ts\":{d}", .{entry.timestamp});
     try w.writeAll("}");
 
@@ -789,6 +800,11 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         else => null,
     } else null;
 
+    const tool_use_id = if (obj.get("tool_use_id")) |v| switch (v) {
+        .string => |s| try allocator.dupe(u8, s),
+        else => null,
+    } else null;
+
     return Entry{
         .entry_type = entry_type,
         .content = content,
@@ -801,6 +817,7 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         .signature = signature,
         .thinking_provider = thinking_provider,
         .encrypted_data = encrypted_data,
+        .tool_use_id = tool_use_id,
     };
 }
 
@@ -1870,4 +1887,71 @@ test "appendEntry serializes concurrent writes from multiple threads" {
         _ = seen.remove(.{ tid, iid });
     }
     try std.testing.expectEqual(@as(u32, 0), seen.count());
+}
+
+test "tool_call and tool_result round-trip tool_use_id and tool_input via loadEntries" {
+    // Replay correctness for parallel tool calls / retries / subagents
+    // depends on every tool_result row carrying the API-issued
+    // tool_use_id of its matching tool_call. A user -> assistant ->
+    // tool_call(id=X, input={"q":"hi"}) -> tool_result(tool_use_id=X)
+    // chain must round-trip through the JSONL persistence layer with
+    // the cross-reference intact.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("anthropic/claude-sonnet-4-20250514");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    const tool_use_id = "toolu_01ABCDE";
+    const tool_input = "{\"q\":\"hi\"}";
+
+    _ = try handle.appendEntry(.{ .entry_type = .user_message, .content = "hi", .timestamp = 1 });
+    _ = try handle.appendEntry(.{ .entry_type = .assistant_text, .content = "let me check", .timestamp = 2 });
+    _ = try handle.appendEntry(.{
+        .entry_type = .tool_call,
+        .tool_name = "ask",
+        .tool_input = tool_input,
+        .tool_use_id = tool_use_id,
+        .timestamp = 3,
+    });
+    _ = try handle.appendEntry(.{
+        .entry_type = .tool_result,
+        .content = "hello",
+        .tool_use_id = tool_use_id,
+        .timestamp = 4,
+    });
+    handle.close();
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // session_start + user + assistant + tool_call + tool_result = 5
+    try std.testing.expectEqual(@as(usize, 5), loaded.len);
+
+    const call_entry = loaded[3];
+    try std.testing.expectEqual(EntryType.tool_call, call_entry.entry_type);
+    try std.testing.expectEqualStrings("ask", call_entry.tool_name);
+    try std.testing.expectEqualStrings(tool_input, call_entry.tool_input);
+    try std.testing.expect(call_entry.tool_use_id != null);
+    try std.testing.expectEqualStrings(tool_use_id, call_entry.tool_use_id.?);
+
+    const result_entry = loaded[4];
+    try std.testing.expectEqual(EntryType.tool_result, result_entry.entry_type);
+    try std.testing.expect(result_entry.tool_use_id != null);
+    try std.testing.expectEqualStrings(tool_use_id, result_entry.tool_use_id.?);
+
+    // The cross-reference is the whole point: tool_result -> tool_call.
+    try std.testing.expectEqualStrings(call_entry.tool_use_id.?, result_entry.tool_use_id.?);
 }
