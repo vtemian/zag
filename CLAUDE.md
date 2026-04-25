@@ -32,7 +32,7 @@ require("zag.providers.openai")
 zag.set_default_model("openai/gpt-4o")
 ```
 
-The stdlib lives inside the binary under `zag.providers.*`: `anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `ollama`. Drop a file at `~/.config/zag/lua/zag/providers/<name>.lua` to override a stdlib entry. Declare a brand-new provider by writing its own module and `require()`ing it — `zag.provider{...}` takes the full endpoint schema (url, wire, auth, headers, default_model, models). The first-run wizard scaffolds `openai-oauth/gpt-5-codex` when you pick the recommended entry.
+The stdlib lives inside the binary under `zag.providers.*`: `anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `ollama`. Drop a file at `~/.config/zag/lua/zag/providers/<name>.lua` to override a stdlib entry. Declare a brand-new provider by writing its own module and `require()`ing it. `zag.provider{...}` takes the full endpoint schema (url, wire, auth, headers, default_model, models). The first-run wizard scaffolds `openai-oauth/gpt-5.2` when you pick the recommended entry.
 
 `auth.json` holds provider API keys and OAuth tokens. Written by `zag auth login`; do not hand-edit. Ollama is keyless. Schema for reference only:
 
@@ -139,33 +139,129 @@ Plugin modules load from `~/.config/zag/lua/?.lua` via `require()`.
 ## Architecture
 ```
 src/
-  main.zig          entry point, TUI event loop
-  agent.zig         agent loop (LLM call, tool execution, repeat)
-  llm.zig           provider interface, endpoint registry, model string parser
-  tools.zig         tool registry and dispatch
-  tools/
-    read.zig        read file contents
-    write.zig       create/overwrite files
-    edit.zig        exact text replacement
-    bash.zig        shell command execution
+  main.zig                  entry point, TUI event loop
+  agent.zig                 agent loop (LLM call, tool execution, repeat)
+  agent_events.zig          typed event payloads emitted by the agent loop
+  AgentRunner.zig           per-pane agent lifecycle: thread, queue, cancel, event drain
+  EventOrchestrator.zig     fan-in of runner events into the UI thread
+  Harness.zig               headless eval harness (single-shot, trajectory capture)
+  Trajectory.zig            ATIF-v1.2 trajectory writer for headless runs
+  Hooks.zig                 typed hook dispatch surface for Lua plugins
+  Reminder.zig              interrupt-time reminder queue (mid-turn user input)
+  Instruction.zig           instruction file loader (system prompt overrides)
+  prompt.zig                system prompt assembly and slot ordering
+  Keymap.zig                modal keymap registry (vim-style chords)
+  CommandRegistry.zig       slash-command registry
+  Sink.zig                  event sink interface (transcript, collector, null)
+  skills.zig                skill discovery (CLAUDE.md / agent skills)
+  subagents.zig             subagent spawn/wait/cancel
+  frontmatter.zig           YAML frontmatter parser
+  json_schema.zig           JSON Schema subset for tool input validation
+  ulid.zig                  ULID generator for session and event ids
+  png_decode.zig            PNG decoder for inline image attachments
+  halfblock.zig             half-block image renderer (terminal pixel art)
+  width.zig                 grapheme-cluster width classification
+  file_log.zig              structured file logger (debug traces)
+  oauth.zig                 OAuth flow (PKCE, token refresh, account_id claim)
+  auth.zig                  auth.json read/write, provider credential lookup
+  auth_wizard.zig           first-run interactive provider/model picker
+  types.zig                 Message, ContentBlock, ToolCall, ToolResult
+
+  llm.zig                   provider interface, endpoint registry, model string parser
+  llm/
+    cost.zig                per-token pricing and usage rollup
+    error_detail.zig        provider error normalization
+    http.zig                HTTP client wrapper with retry and timeout
+    registry.zig            provider/endpoint lookup
+    streaming.zig           SSE / streaming chunk parser
+
   providers/
-    anthropic.zig   Anthropic Messages API serializer
-    openai.zig      OpenAI Chat Completions serializer
-  types.zig         Message, ContentBlock, ToolCall, ToolResult
-  AgentRunner.zig   per-pane agent lifecycle: thread, queue, cancel, event drain
-  Session.zig       JSONL session persistence and management
-  LuaEngine.zig     Lua plugin engine (config loading, tool bridging)
-  Buffer.zig        runtime-polymorphic buffer interface (ptr+vtable)
-  ConversationBuffer.zig  conversation buffer (node tree, session, messages)
-  MarkdownParser.zig line-by-line markdown to StyledLine converter
-  NodeRenderer.zig  type-specific node rendering for ConversationBuffer
-  Layout.zig        binary tree window system (splits, focus)
-  Theme.zig         design system (colors, highlights, spacing, borders)
-  Metrics.zig       span-based performance tracing (compile-time toggle)
-  Compositor.zig    merges buffer content into screen grid
-  Screen.zig        cell grid with dirty-rectangle ANSI renderer
-  Terminal.zig      raw mode, alternate screen, input handling
-  input.zig         keyboard and mouse event parsing
+    anthropic.zig           Anthropic Messages API wire serializer
+    openai.zig              OpenAI Chat Completions wire serializer
+    chatgpt.zig             ChatGPT (Codex) Responses API wire serializer
+
+  tools.zig                 tool registry and dispatch
+  tools/
+    read.zig                read file contents
+    write.zig               create/overwrite files
+    edit.zig                exact text replacement
+    bash.zig                shell command execution (with seatbelt on macOS)
+    layout.zig              window-system mutation tool
+    task.zig                spawn subagent task tool
+
+  Session.zig               JSONL session persistence and management
+  ConversationBuffer.zig    conversation buffer (node tree, session, messages)
+  ConversationHistory.zig   linear history view over the conversation tree
+  ConversationTree.zig      branching node tree (forks, retries, edits)
+  NodeRegistry.zig          conversation node id allocator
+  NodeRenderer.zig          type-specific node rendering for ConversationBuffer
+  NodeLineCache.zig         per-node styled-line cache keyed by content version
+  MarkdownParser.zig        line-by-line markdown to StyledLine converter
+
+  Buffer.zig                runtime-polymorphic buffer interface (ptr+vtable)
+  BufferRegistry.zig        buffer id allocator and lookup
+  buffers/
+    graphics.zig            graphics buffer (image / pixel surface)
+    scratch.zig             scratch buffer (free-form text)
+
+  sinks/
+    BufferSink.zig          sink that writes events into a ConversationBuffer
+    Collector.zig           in-memory sink for tests and headless runs
+    Null.zig                discarding sink
+
+  Layout.zig                binary tree window system (splits, focus)
+  WindowManager.zig         window lifecycle and focus policy
+  Viewport.zig              scroll and visible-region state per buffer
+  Theme.zig                 design system (colors, highlights, spacing, borders)
+  Compositor.zig            merges buffer content into screen grid
+  Screen.zig                cell grid with dirty-rectangle ANSI renderer
+  Terminal.zig              raw mode, alternate screen, input handling
+  Metrics.zig               span-based performance tracing (compile-time toggle)
+
+  input.zig                 input facade re-exporting parser surface
+  input/
+    core.zig                key and mouse event types
+    csi.zig                 CSI escape sequence decoder
+    mouse.zig               mouse event parser (SGR / x10)
+    parser.zig              top-level input byte stream parser
+
+  LuaEngine.zig              Lua plugin engine (config loading, tool bridging)
+  lua/
+    mod.zig                  package facade for the Lua subsystem
+    embedded.zig             embedded stdlib bundle (zag.* modules)
+    AsyncRuntime.zig         coroutine-aware task scheduler (main-thread pinned)
+    Job.zig                  in-flight async job state
+    job_result.zig           job result encoding for Lua return values
+    LuaCompletionQueue.zig   completion handoff from worker pool to main thread
+    LuaIoPool.zig            worker pool for blocking I/O primitives
+    Scope.zig                lexical scope for plugin-owned resources
+    hook_registry.zig        Lua-side hook registration surface
+    lua_json.zig             Lua value to/from JSON
+    integration_test.zig     end-to-end Lua runtime tests
+    spike_test.zig           targeted Lua runtime regression tests
+    primitives/
+      cmd.zig                zag.cmd subprocess primitive
+      cmd_handle.zig         live subprocess handle (lines, kill, wait)
+      fs.zig                 zag.fs filesystem primitives
+      http.zig               zag.http one-shot request primitive
+      http_stream.zig        zag.http.stream chunked-body primitive
+
+  sim/                       TUI simulator: scripted mock-server runs
+    main.zig                 zag-sim entry point
+    Args.zig                 CLI argument parser
+    Artifacts.zig            run output layout (logs, transcripts, replays)
+    ConfigScaffold.zig       generated config.lua / auth.json for sim runs
+    Dsl.zig                  scenario DSL parser (zsm files)
+    Grid.zig                 PTY grid snapshot diffing
+    MockScript.zig           recorded provider responses
+    MockServer.zig            local HTTP server replaying mock scripts
+    Pty.zig                  PTY spawn and IO
+    Replay.zig               replay-gen subcommand (record real run to scenario)
+    Runner.zig               scenario executor
+    Scenario.zig             parsed scenario representation
+    Spawn.zig                zag binary launcher under PTY
+    Summary.zig              pass/fail summary writer
+    phase1_e2e_test.zig      end-to-end smoke test
 ```
 
 ## Commit messages

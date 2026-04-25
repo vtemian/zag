@@ -174,7 +174,7 @@ require("zag.transforms.bash_trim")
 
 ## Example
 
-A runnable example that injects a repo snapshot layer and a model-specific preamble lives at [`plugins/examples/prompt-layers.lua`](plugins/examples/prompt-layers.lua).
+The embedded stdlib under `src/lua/zag/layers/` and `src/lua/zag/transforms/` provides ready-made layer and transform implementations to copy from.
 
 ## Pipeline order
 
