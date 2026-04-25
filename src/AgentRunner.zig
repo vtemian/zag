@@ -510,6 +510,18 @@ pub fn dispatchHookRequests(
                 }
                 req.done.set();
             },
+            .jit_context_request => |req| {
+                if (engine) |eng| {
+                    eng.handleJitContextRequest(req) catch |err| {
+                        req.error_name = @errorName(err);
+                    };
+                }
+                // No engine means no handlers can be registered; treat
+                // as a clean miss (result stays null) so the worker
+                // proceeds without an attachment. Always signal done so
+                // the producer doesn't park forever.
+                req.done.set();
+            },
             else => {
                 queue.buffer[write] = ev;
                 write = (write + 1) % cap;
@@ -715,6 +727,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             req.done.set();
         },
         .prompt_assembly_request => |req| {
+            req.error_name = "drained_without_dispatch";
+            req.done.set();
+        },
+        .jit_context_request => |req| {
             req.error_name = "drained_without_dispatch";
             req.done.set();
         },
@@ -1151,6 +1167,95 @@ test "prompt_assembly_request round-trips via main thread" {
     try std.testing.expect(
         std.mem.indexOf(u8, assembled.@"volatile", "ROUND-TRIP-PROBE cwd=/tmp/zag-dispatch") != null,
     );
+}
+
+test "jit_context_request round-trips via main thread" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  return "Instructions for " .. ctx.tool .. ": " .. ctx.input
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.JitContextRequest.init(
+        "read",
+        "/tmp/foo",
+        "file body",
+        false,
+        alloc,
+    );
+
+    try queue.push(.{ .jit_context_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    defer alloc.free(req.result.?);
+    try std.testing.expectEqualStrings("Instructions for read: /tmp/foo", req.result.?);
+}
+
+test "jit_context_request with no handler completes cleanly" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.JitContextRequest.init("write", "{}", "x", false, alloc);
+    try queue.push(.{ .jit_context_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "jit_context_request with no engine signals done" {
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "x", false, alloc);
+    try queue.push(.{ .jit_context_request = &req });
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "jit_context_request handler error sets error_name" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("bash", function(ctx) error("blew up") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req = agent_events.JitContextRequest.init("bash", "{}", "x", false, alloc);
+    try queue.push(.{ .jit_context_request = &req });
+    dispatchHookRequests(&queue, &engine, null);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name != null);
+    try std.testing.expectEqualStrings("LuaHandlerError", req.error_name.?);
 }
 
 test "prompt_assembly_request with no engine signals error_name" {

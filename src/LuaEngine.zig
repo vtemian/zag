@@ -25,6 +25,7 @@ const prompt = @import("prompt.zig");
 const Instruction = @import("Instruction.zig");
 const Reminder = @import("Reminder.zig");
 const WindowManager = @import("WindowManager.zig");
+const agent_events = @import("agent_events.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -166,8 +167,28 @@ pub const LuaEngine = struct {
     buffer_registry: ?*BufferRegistry = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
     tasks: std.AutoHashMap(i32, *Task),
+    /// Handlers registered via `zag.context.on_tool_result(name, fn)`.
+    /// Keyed by tool name (the engine owns the key bytes; see `JitHandler`).
+    /// Walked by `AgentRunner.dispatchHookRequests` when a
+    /// `jit_context_request` arrives so the JIT context layer can attach
+    /// `Instructions from: ...` content under a fresh tool result.
+    /// Re-registering an existing tool name unrefs the old function and
+    /// reuses the owned key, so memory does not bloat across reloads.
+    jit_context_handlers: std.StringHashMapUnmanaged(JitHandler) = .empty,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
+
+    /// Per-tool-name JIT context handler. The map key aliases
+    /// `tool_name` so insert/remove operates on a single owned slice
+    /// per registration.
+    pub const JitHandler = struct {
+        /// Owned tool-name copy. Same bytes referenced by the
+        /// `StringHashMap` key; freed on unregister/deinit.
+        tool_name: []u8,
+        /// Lua registry ref to the handler function. Released via
+        /// `lua.unref(zlua.registry_index, fn_ref)`.
+        fn_ref: i32,
+    };
 
     pub const Task = struct {
         co: *Lua,
@@ -412,6 +433,17 @@ pub const LuaEngine = struct {
             }
         }
         self.command_registry.deinit();
+        // Release every JIT context handler registered via
+        // `zag.context.on_tool_result(name, fn)`. Keys are owned by the
+        // entry's `tool_name` slice (the map borrows the bytes), so we
+        // free that single slice per entry; the StringHashMap itself
+        // releases its bucket storage in `deinit`.
+        var jit_iter = self.jit_context_handlers.iterator();
+        while (jit_iter.next()) |entry| {
+            self.lua.unref(zlua.registry_index, entry.value_ptr.fn_ref);
+            self.allocator.free(entry.value_ptr.tool_name);
+        }
+        self.jit_context_handlers.deinit(self.allocator);
         self.lua.deinit();
     }
 
@@ -562,6 +594,8 @@ pub const LuaEngine = struct {
         lua.newTable(); // [zag_table, context_table]
         lua.pushFunction(zlua.wrap(zagContextFindUpFn));
         lua.setField(-2, "find_up");
+        lua.pushFunction(zlua.wrap(zagContextOnToolResultFn));
+        lua.setField(-2, "on_tool_result");
         lua.setField(-2, "context"); // zag.context = context_table; [zag_table]
 
         // zag.buffer; buffer primitives for Lua plugins. Each binding
@@ -5029,6 +5063,165 @@ pub const LuaEngine = struct {
         return len;
     }
 
+    /// Zig function backing `zag.context.on_tool_result(tool_name, fn)`.
+    ///
+    /// Registers a Lua handler that the harness invokes after every
+    /// completed call to the tool with the matching name. The handler
+    /// runs on the main thread (Lua is pinned there); the agent worker
+    /// marshals through a `jit_context_request` event so the handler can
+    /// see the tool's input/output and return a string to attach under
+    /// the result.
+    ///
+    /// Args:
+    /// - arg 1 (string, required, non-empty): tool name to match.
+    /// - arg 2 (function, required): handler `fn(ctx) -> string|nil`.
+    ///
+    /// Re-registering an existing tool name unrefs the previous function
+    /// before stashing the new one; the owned name slice is reused so the
+    /// hashmap key stays stable.
+    fn zagContextOnToolResultFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        if (lua.typeOf(1) != .string) {
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: arg 1 must be a string tool name",
+                .{},
+            );
+        }
+        const tool_name = lua.toString(1) catch {
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: arg 1 could not be read",
+                .{},
+            );
+        };
+        if (tool_name.len == 0) {
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: arg 1 must not be empty",
+                .{},
+            );
+        }
+
+        if (!lua.isFunction(2)) {
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: arg 2 must be a function",
+                .{},
+            );
+        }
+
+        // ref() pops the value at top-of-stack. Push a copy of arg 2 so
+        // the original argument frame stays well-formed.
+        lua.pushValue(2);
+        const fn_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: failed to ref handler",
+                .{},
+            );
+        };
+        errdefer lua.unref(zlua.registry_index, fn_ref);
+
+        // Re-registration: unref the old fn but keep the existing owned
+        // name slice (the map key aliases it, so freeing would dangle the
+        // bucket key). Just swap the value in place.
+        if (engine.jit_context_handlers.getPtr(tool_name)) |existing| {
+            lua.unref(zlua.registry_index, existing.fn_ref);
+            existing.fn_ref = fn_ref;
+            return 0;
+        }
+
+        const owned_name = engine.allocator.dupe(u8, tool_name) catch {
+            lua.unref(zlua.registry_index, fn_ref);
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: out of memory duping tool name",
+                .{},
+            );
+        };
+        errdefer engine.allocator.free(owned_name);
+
+        engine.jit_context_handlers.put(engine.allocator, owned_name, .{
+            .tool_name = owned_name,
+            .fn_ref = fn_ref,
+        }) catch {
+            lua.unref(zlua.registry_index, fn_ref);
+            engine.allocator.free(owned_name);
+            lua.raiseErrorStr(
+                "zag.context.on_tool_result: out of memory inserting handler",
+                .{},
+            );
+        };
+
+        return 0;
+    }
+
+    /// Run the JIT context handler for `req.tool_name` on the main thread.
+    /// Builds a Lua-side context table, calls the registered function via
+    /// `protectedCall`, and dupes the returned string into `req.allocator`
+    /// (success path). When no handler is registered the request returns
+    /// with `result = null` and `error_name = null` so the worker proceeds
+    /// without an attachment. Lua-side errors set `error_name` and leave
+    /// `result` null. Caller is responsible for `req.done.set()`.
+    pub fn handleJitContextRequest(
+        self: *LuaEngine,
+        req: *agent_events.JitContextRequest,
+    ) anyerror!void {
+        const handler = self.jit_context_handlers.get(req.tool_name) orelse return;
+
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, handler.fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn(
+                "jit context handler for '{s}': registry slot is not a function",
+                .{req.tool_name},
+            );
+            return;
+        }
+
+        // Build the context table the handler sees. Strings are copied
+        // into Lua-managed memory by `pushString`, so the borrowed
+        // `req.input/output` slices do not need to outlive this call.
+        lua.newTable();
+        _ = lua.pushString(req.tool_name);
+        lua.setField(-2, "tool");
+        _ = lua.pushString(req.input);
+        lua.setField(-2, "input");
+        _ = lua.pushString(req.output);
+        lua.setField(-2, "output");
+        lua.pushBoolean(req.is_error);
+        lua.setField(-2, "is_error");
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn(
+                "jit context handler for '{s}' raised: {s}",
+                .{ req.tool_name, err_msg },
+            );
+            lua.pop(1);
+            return error.LuaHandlerError;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return;
+        if (lua.typeOf(-1) != .string) {
+            log.warn(
+                "jit context handler for '{s}' returned non-string (type {s})",
+                .{ req.tool_name, @tagName(lua.typeOf(-1)) },
+            );
+            return error.JitContextNotString;
+        }
+        const out = lua.toString(-1) catch return error.JitContextReadFailed;
+        req.result = try req.allocator.dupe(u8, out);
+    }
+
+    /// Test-only accessor for the JIT context handler map. Stays public
+    /// behind `pub` so inline tests in this file and round-trip tests in
+    /// `AgentRunner` can assert handler-count growth without exposing the
+    /// raw field through the public API surface.
+    pub fn jitContextHandlers(
+        self: *LuaEngine,
+    ) *std.StringHashMapUnmanaged(JitHandler) {
+        return &self.jit_context_handlers;
+    }
+
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
     /// per layer so the thunk can cheaply identify which registry entry
     /// it is servicing without carrying user-data on the Layer type.
@@ -6345,7 +6538,6 @@ test "fireHook invokes Lua callback for matching event" {
 }
 
 test "end-to-end: config file to registry execution" {
-    const agent_events = @import("agent_events.zig");
     const AgentRunner = @import("AgentRunner.zig");
 
     var engine = try LuaEngine.init(std.testing.allocator);
@@ -11215,4 +11407,143 @@ test "zag.reminder_list returns a snapshot of pending entries" {
 
     // Snapshot must not have drained the queue.
     try std.testing.expectEqual(@as(usize, 2), engine.reminders.len());
+}
+
+test "zag.context.on_tool_result registers a handler keyed by tool name" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  return "stub for: " .. ctx.input
+        \\end)
+    );
+    try std.testing.expectEqual(@as(u32, 1), engine.jitContextHandlers().count());
+    try std.testing.expect(engine.jit_context_handlers.contains("read"));
+}
+
+test "zag.context.on_tool_result re-registration unrefs old function" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx) return "v1" end)
+    );
+    const first_ref = engine.jit_context_handlers.get("read").?.fn_ref;
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx) return "v2" end)
+    );
+    try std.testing.expectEqual(@as(u32, 1), engine.jitContextHandlers().count());
+    const second_ref = engine.jit_context_handlers.get("read").?.fn_ref;
+    try std.testing.expect(first_ref != second_ref);
+    // testing.allocator + Lua deinit catch a leaked old fn_ref. This test
+    // body would fail under the leak detector if the old ref was kept.
+}
+
+test "handleJitContextRequest invokes registered handler and dupes result" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  return "ok " .. ctx.tool .. " in=" .. ctx.input .. " out=" .. ctx.output
+        \\end)
+    );
+
+    var req = agent_events.JitContextRequest.init(
+        "read",
+        "{\"path\":\"/tmp/x\"}",
+        "file body",
+        false,
+        alloc,
+    );
+    try engine.handleJitContextRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    defer alloc.free(req.result.?);
+    try std.testing.expectEqualStrings(
+        "ok read in={\"path\":\"/tmp/x\"} out=file body",
+        req.result.?,
+    );
+}
+
+test "handleJitContextRequest with unknown tool name leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var req = agent_events.JitContextRequest.init("write", "{}", "nope", false, alloc);
+    try engine.handleJitContextRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleJitContextRequest surfaces Lua handler error via @errorName" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("bash", function(ctx)
+        \\  error("boom")
+        \\end)
+    );
+
+    var req = agent_events.JitContextRequest.init("bash", "{}", "", false, alloc);
+    const result = engine.handleJitContextRequest(&req);
+    try std.testing.expectError(error.LuaHandlerError, result);
+    try std.testing.expect(req.result == null);
+}
+
+test "handleJitContextRequest passes is_error through to ctx" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  if ctx.is_error then return "ERR" else return "OK" end
+        \\end)
+    );
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "x", true, alloc);
+    try engine.handleJitContextRequest(&req);
+    defer if (req.result) |s| alloc.free(s);
+    try std.testing.expectEqualStrings("ERR", req.result.?);
+}
+
+test "zag.context.on_tool_result rejects non-string tool name" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.context.on_tool_result(42, function() end)
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expectEqual(@as(u32, 0), engine.jitContextHandlers().count());
+}
+
+test "zag.context.on_tool_result rejects non-function handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.context.on_tool_result("read", "not a function")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expectEqual(@as(u32, 0), engine.jitContextHandlers().count());
 }
