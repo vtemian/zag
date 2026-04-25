@@ -11998,6 +11998,39 @@ test "zag.prompt dispatch routes Codex model id to openai-codex pack" {
     );
 }
 
+test "zag.prompt dispatch routes Qwen3-Coder model id to qwen3-coder pack" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    engine.loadBuiltinPlugins();
+
+    // Ollama is the canonical Qwen3-Coder host; the dispatcher pattern
+    // matches the bare model id, so the `ollama/` provider prefix in the
+    // route is incidental. Identity line uniquely belongs to the qwen
+    // pack and proves the dispatcher resolved through it rather than
+    // falling through to the generic default.
+    var ctx = fakePromptLayerContext();
+    ctx.model = .{ .provider_name = "ollama", .model_id = "qwen3-coder-30b" };
+
+    var assembled = try engine.renderPromptLayers(&ctx, std.testing.allocator);
+    defer assembled.deinit();
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, assembled.stable, "running with Qwen3-Coder") != null,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "running with Claude"),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, assembled.stable, "running with GPT-5 Codex"),
+    );
+}
+
 test "zag.prompt dispatch falls through to default pack for exotic providers" {
     if (sandbox_enabled) return error.SkipZigTest;
 
