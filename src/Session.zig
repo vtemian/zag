@@ -406,7 +406,7 @@ pub const SessionHandle = struct {
     /// held across the write + meta update sequence in `appendEntry` and
     /// across the meta update + audit entry sequence in `rename`. Zig's
     /// stdlib has no recursive mutex, so the file-write body lives in
-    /// `_appendEntryLocked`, which both public entry points call after
+    /// `appendEntryLocked`, which both public entry points call after
     /// taking the lock once.
     append_mutex: std.Thread.Mutex = .{},
 
@@ -418,13 +418,13 @@ pub const SessionHandle = struct {
     pub fn appendEntry(self: *SessionHandle, entry: Entry) !ulid.Ulid {
         self.append_mutex.lock();
         defer self.append_mutex.unlock();
-        return self._appendEntryLocked(entry);
+        return self.appendEntryLocked(entry);
     }
 
     /// Append-and-update body that assumes `append_mutex` is already held.
     /// Split out so `rename` can write its `session_rename` audit entry
     /// without re-acquiring the mutex (which would deadlock).
-    fn _appendEntryLocked(self: *SessionHandle, entry: Entry) !ulid.Ulid {
+    fn appendEntryLocked(self: *SessionHandle, entry: Entry) !ulid.Ulid {
         var buf: [8192]u8 = undefined;
         var entry_mut = entry;
         const json = serializeEntry(&entry_mut, &buf) catch |e| {
@@ -482,9 +482,9 @@ pub const SessionHandle = struct {
         // Also write a session_rename entry. Meta is already on disk at
         // this point; if the audit entry fails we'd silently drift from
         // the audit log, so log the failure rather than swallowing.
-        // _appendEntryLocked skips re-acquiring append_mutex (we already
+        // appendEntryLocked skips re-acquiring append_mutex (we already
         // hold it) so this nested call cannot deadlock.
-        _ = self._appendEntryLocked(.{
+        _ = self.appendEntryLocked(.{
             .entry_type = .session_rename,
             .content = new_name,
             .timestamp = self.meta.updated,

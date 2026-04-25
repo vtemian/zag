@@ -1,11 +1,12 @@
 //! BufferSink: the UI-backed Sink implementation.
 //!
-//! Wraps a borrowed `*ConversationBuffer` and owns the node-correlation
-//! state that used to live on `AgentRunner`: the in-progress assistant
-//! node, the `call_id -> *Node` map for tool results, and the
-//! last-seen tool_call fallback. Moving this state into the sink
-//! removes the dangling-*Node hazard on pane / provider swaps, because
-//! the runner no longer holds buffer-relative node pointers.
+//! BufferSink owns the call_id correlation map and current_assistant_node
+//! so AgentRunner stays free of node-pointer state. It wraps a borrowed
+//! `*ConversationBuffer` and tracks the in-progress assistant node, the
+//! `call_id -> *Node` map for tool results, and the last-seen tool_call
+//! fallback. Keeping this state inside the sink removes the dangling-*Node
+//! hazard on pane / provider swaps, because the runner does not hold
+//! buffer-relative node pointers.
 //!
 //! Thread-safety: single-threaded; the owner guarantees no concurrent
 //! push. The owner is the pane's main-thread drain loop: pushes happen

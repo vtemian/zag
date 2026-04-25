@@ -72,7 +72,7 @@ fn warnAboutIgnoredAllowedToolsOnce(registry: *const SkillRegistry) void {
         "{d} registered skill(s) declare an `allowed-tools` frontmatter field, " ++
             "but the v1 tool dispatcher does not enforce it. " ++
             "First example: '{s}'. Track follow-up at " ++
-            "https://github.com/vtemian/zag/issues (per-skill tool gating).",
+            "https://github.com/vtemian/zag/issues/7 (per-skill tool gating).",
         .{ ignored, first_name orelse "" },
     );
 }

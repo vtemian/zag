@@ -1,7 +1,7 @@
 //! ConversationHistory: LLM conversation history and session persistence.
 //!
 //! Owns the message list sent to the LLM API and the optional session
-//! handle used to persist events as JSONL. Tree state lives elsewhere
+//! handle for persisting events as JSONL. Tree state lives elsewhere
 //! (see ConversationBuffer); this type has no notion of rendering.
 
 const std = @import("std");
@@ -56,13 +56,27 @@ pub fn appendUserMessage(self: *ConversationHistory, text: []const u8) !void {
 }
 
 /// Persist an event to the session JSONL file, if a session is attached.
-/// Propagates errors so callers can decide whether to log and flip the
-/// `persist_failed` flag or abort the operation.
+/// Swallows errors after logging them and flipping `persist_failed`;
+/// production callers all want the same swallow-and-flag behaviour, so
+/// centralising it here removes the repeated boilerplate at every call
+/// site. Tests or callers that need the underlying error should call
+/// `persistEventInternal` directly.
 ///
 /// Auto-threads `parent_id` from `last_persisted_id` when the caller
 /// hasn't set one explicitly, and records the persisted id so the next
 /// event in the turn can chain off of it.
-pub fn persistEvent(self: *ConversationHistory, entry: Session.Entry) !void {
+pub fn persistEvent(self: *ConversationHistory, entry: Session.Entry) void {
+    self.persistEventInternal(entry) catch |err| {
+        log.err("session persist failed: {}", .{err});
+        self.persist_failed = true;
+    };
+}
+
+/// Error-propagating variant of `persistEvent`. Used by tests that assert
+/// on the failure mode and by callers (e.g. the task tool's child-event
+/// pump) that want to log a more specific message instead of flipping
+/// `persist_failed`.
+pub fn persistEventInternal(self: *ConversationHistory, entry: Session.Entry) !void {
     const sh = self.session_handle orelse return;
     var entry_with_parent = entry;
     if (entry_with_parent.parent_id == null) {
@@ -73,18 +87,15 @@ pub fn persistEvent(self: *ConversationHistory, entry: Session.Entry) !void {
 }
 
 /// Persist a user_message entry with the current timestamp. Convenience
-/// wrapper around `persistEvent` for the submit path. Errors are logged
-/// and flip `persist_failed`; the caller continues since we have already
-/// accepted the message into the conversation history.
+/// wrapper around `persistEvent` for the submit path; the caller continues
+/// even on persist failure since we have already accepted the message
+/// into the conversation history.
 pub fn persistUserMessage(self: *ConversationHistory, text: []const u8) void {
     self.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
         .timestamp = std.time.milliTimestamp(),
-    }) catch |err| {
-        log.err("session persist failed: {}", .{err});
-        self.persist_failed = true;
-    };
+    });
 }
 
 /// Reconstruct the LLM message history from loaded entries.
@@ -275,13 +286,14 @@ test "persistEvent propagates errors from a closed file handle" {
     defer s.deinit();
     s.attachSession(&handle);
 
-    const result = s.persistEvent(.{
+    const result = s.persistEventInternal(.{
         .entry_type = .user_message,
         .content = "hello",
         .timestamp = 0,
     });
     // The exact error kind depends on the platform write syscall; we just
-    // require that persistEvent surfaced something rather than swallowed it.
+    // require that persistEventInternal surfaced something rather than
+    // swallowed it.
     try std.testing.expect(std.meta.isError(result));
 }
 
@@ -290,7 +302,7 @@ test "persistEvent is a no-op when no session is attached" {
     var s = ConversationHistory.init(allocator);
     defer s.deinit();
 
-    try s.persistEvent(.{
+    try s.persistEventInternal(.{
         .entry_type = .user_message,
         .content = "hello",
         .timestamp = 0,
@@ -330,9 +342,9 @@ test "persistEvent chains parent_ids across a turn" {
 
     // Persist three events; each should auto-thread parent_id from the
     // prior event (or from the session_start row written by createSession).
-    try history.persistEvent(.{ .entry_type = .user_message, .content = "hi", .timestamp = 1 });
-    try history.persistEvent(.{ .entry_type = .assistant_text, .content = "hello", .timestamp = 2 });
-    try history.persistEvent(.{ .entry_type = .tool_call, .tool_name = "read", .tool_input = "{}", .timestamp = 3 });
+    try history.persistEventInternal(.{ .entry_type = .user_message, .content = "hi", .timestamp = 1 });
+    try history.persistEventInternal(.{ .entry_type = .assistant_text, .content = "hello", .timestamp = 2 });
+    try history.persistEventInternal(.{ .entry_type = .tool_call, .tool_name = "read", .tool_input = "{}", .timestamp = 3 });
     handle.close();
 
     const loaded = try Session.loadEntries(session_id, allocator);

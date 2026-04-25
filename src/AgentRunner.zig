@@ -637,10 +637,7 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
                 .entry_type = .assistant_text,
                 .content = text,
                 .timestamp = ts,
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
+            });
         },
         .thinking_delta => |text| {
             // Persist per-delta so a crash mid-stream still preserves
@@ -652,20 +649,14 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
                 .content = text,
                 .thinking_provider = "anthropic",
                 .timestamp = ts,
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
+            });
         },
         .tool_start => |ev| {
             self.session.persistEvent(.{
                 .entry_type = .tool_call,
                 .tool_name = ev.name,
                 .timestamp = ts,
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
+            });
         },
         .tool_result => |result| {
             self.session.persistEvent(.{
@@ -673,20 +664,14 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
                 .content = result.content,
                 .is_error = result.is_error,
                 .timestamp = ts,
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
+            });
         },
         .err => |text| {
             self.session.persistEvent(.{
                 .entry_type = .err,
                 .content = text,
                 .timestamp = ts,
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
+            });
         },
         else => {},
     }
