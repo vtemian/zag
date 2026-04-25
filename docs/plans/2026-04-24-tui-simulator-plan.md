@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
-**Goal:** Ship a PTY-based test harness (`zag-sim`) that drives zag through its real stdin/stdout, interprets output through libghostty-vt, and reproduces TUI bugs deterministically — culminating in a reproducer for the current segfault-on-normal-chat-turn bug.
+**Goal:** Ship a PTY-based test harness (`zag-sim`) that drives zag through its real stdin/stdout, interprets output through libghostty-vt, and reproduces TUI bugs deterministically. The capstone is a reproducer for the current segfault-on-normal-chat-turn bug.
 
 **Architecture:** New `src/sim/` subtree, new `zig build sim` binary, new Zig dep on `ghostty` (module `ghostty-vt`). Subprocess model with openpty + libc-linked `openpty(3)` so zag's raw-mode path stays unchanged. A sidecar HTTP server on localhost serves OpenAI-SSE mock responses; zag is pointed at it via a throwaway `config.lua` in a temp dir (no new wire format inside zag). Scenarios are plain-text `.zsm` files with a tiny verb-per-line DSL. Replay-gen converts session JSONLs into scenario + mock-script pairs.
 
@@ -10,7 +10,7 @@
 
 **Design reference:** `docs/plans/2026-04-24-tui-simulator-design.md`.
 
-**Invariant preserved across every task:** `zig build test` green. The existing `zag` binary is never modified (phase 5 flagship reproducer fails the first time it runs, on purpose — that's how we know the harness is real).
+**Invariant preserved across every task:** `zig build test` green. The existing `zag` binary is never modified (phase 5 flagship reproducer fails the first time it runs, on purpose; that's how we know the harness is real).
 
 ---
 
@@ -20,11 +20,11 @@
 - Read the design doc end-to-end before starting phase 1.
 - macOS or Linux host. No Windows path attempted.
 - Zig 0.15.2+.
-- For phase 5 only: zag's current segfault-on-normal-chat bug still reproducing interactively (if it has already been fixed, phase 5 becomes a different scenario — see task 5.3).
+- For phase 5 only: zag's current segfault-on-normal-chat bug still reproducing interactively (if it has already been fixed, phase 5 becomes a different scenario; see task 5.3).
 
 ---
 
-## Phase 1 — Scaffolding + PTY round-trip
+## Phase 1: Scaffolding + PTY round-trip
 
 Ships the build skeleton, the libghostty-vt dependency, and a PTY round-trip against `/bin/cat`. No DSL, no mock server yet. At the end of phase 1, `zig build test-sim` spawns cat, sends bytes, and asserts they come back through the grid.
 
@@ -40,7 +40,7 @@ Run:
 zig fetch --save=ghostty https://github.com/ghostty-org/ghostty/archive/48ccec182a932c2ec04c344d45a5fc553861cb13.tar.gz
 ```
 
-If that commit is stale at implementation time, use the then-current main HEAD (ghostty explicitly documents the API as unstable — pin an exact commit, not a tag).
+If that commit is stale at implementation time, use the then-current main HEAD (ghostty explicitly documents the API as unstable; pin an exact commit, not a tag).
 
 **Step 2: Verify the entry**
 
@@ -121,7 +121,7 @@ sim_test_step.dependOn(&run_sim_tests.step);
 Run: `zig build sim -- hello`
 Expected: binary builds, prints `zag-sim\n`, exits 0.
 
-Run: `zig build test` (existing step — make sure it still passes).
+Run: `zig build test` (existing step; make sure it still passes).
 Expected: unchanged pass.
 
 **Step 4: Commit**
@@ -192,7 +192,7 @@ test "open returns positive fds" {
 
 **Step 2: Surface the test to the runner**
 
-Modify `src/sim/main.zig` — add at top:
+Modify `src/sim/main.zig`. Add at top:
 ```zig
 comptime {
     _ = @import("Pty.zig");
@@ -346,7 +346,7 @@ git commit -m "sim: add Spawn.zig fork+exec with PTY controlling-tty setup"
 **Files:**
 - Create: `src/sim/Grid.zig`
 
-Note: Grid is heap-allocated — see reviewer feedback 2026-04-24. `vtStream()` captures a `*Terminal`, so the Grid's Terminal must live at its final storage address before the stream is built. That forces a `create`/`destroy` pair instead of the value-semantics `init`/`deinit` the TDD template would normally use.
+Note: Grid is heap-allocated (see reviewer feedback 2026-04-24). `vtStream()` captures a `*Terminal`, so the Grid's Terminal must live at its final storage address before the stream is built. That forces a `create`/`destroy` pair instead of the value-semantics `init`/`deinit` the TDD template would normally use.
 
 **Step 1: Write the failing test**
 
@@ -434,12 +434,12 @@ git add src/sim/Grid.zig src/sim/main.zig
 git commit -m "sim: wrap libghostty-vt Terminal as Grid with feed/plainText"
 ```
 
-### Task 1.6: End-to-end phase 1 — cat round-trip through grid
+### Task 1.6: End-to-end phase 1: cat round-trip through grid
 
 **Files:**
 - Create: `src/sim/phase1_e2e_test.zig`
 
-Note: Grid is heap-allocated — see reviewer feedback 2026-04-24. Use `Grid.create` / `g.destroy` to match Task 1.5's shipped shape.
+Note: Grid is heap-allocated (see reviewer feedback 2026-04-24). Use `Grid.create` / `g.destroy` to match Task 1.5's shipped shape.
 
 **Step 1: Write the test**
 
@@ -504,14 +504,14 @@ Expected: 5 tests pass.
 
 ```bash
 git add src/sim/phase1_e2e_test.zig src/sim/main.zig
-git commit -m "sim: phase 1 e2e — cat round-trip through libghostty-vt"
+git commit -m "sim: phase 1 e2e: cat round-trip through libghostty-vt"
 ```
 
 Phase 1 complete.
 
 ---
 
-## Phase 2 — DSL parser + scenario runner
+## Phase 2: DSL parser + scenario runner
 
 Ships the `.zsm` format and a runner that executes scenarios against any PTY child. Still no mock server; scenarios target `/bin/cat` or `/bin/sh` for tests.
 
@@ -741,7 +741,7 @@ git commit -m "sim: DSL argument parsers (send literals/keysyms/ctrl, durations)
 **Files:**
 - Create: `src/sim/Runner.zig`
 
-Note: Grid is heap-allocated — see reviewer feedback 2026-04-24. The Runner holds `grid: *Grid` and mirrors `Grid.create` / `grid.destroy()` in its own init/deinit.
+Note: Grid is heap-allocated (see reviewer feedback 2026-04-24). The Runner holds `grid: *Grid` and mirrors `Grid.create` / `grid.destroy()` in its own init/deinit.
 
 **Step 1: Minimal Runner**
 
@@ -870,7 +870,7 @@ pub fn executeWaitIdle(self: *Runner, idle_ms: u32) !void {
         const status = try self.pumpOnce(@intCast(idle_ms));
         if (status == .exited) return error.ChildExitedDuringWait;
         if (status == .idle) return;
-        // data arrived — re-arm
+        // data arrived. Re-arm.
     }
 }
 
@@ -915,7 +915,7 @@ git commit -m "sim: pumpOnce loop + wait_text / wait_idle executors"
 Keep each as its own test-first sub-step. Commit once after all five since they're short. Scenario-level `spawn` at this point takes a program path from env `ZAG_SIM_TARGET` (phase 3 adds the `zag-sim run` orchestration).
 
 ```zig
-// expect_text — synchronous assertion against the current grid.
+// expect_text: synchronous assertion against the current grid.
 pub fn executeExpectText(self: *Runner, raw: []const u8) !void {
     const pattern = stripRegexDelims(raw);
     const dump = try self.grid.plainText();
@@ -923,7 +923,7 @@ pub fn executeExpectText(self: *Runner, raw: []const u8) !void {
     if (std.mem.indexOf(u8, dump, pattern) == null) return error.ExpectTextNotFound;
 }
 
-// snapshot — dump grid to artifacts_dir/<label>.grid
+// snapshot: dump grid to artifacts_dir/<label>.grid
 pub fn executeSnapshot(self: *Runner, label: []const u8, artifacts_dir: []const u8) !void {
     const dump = try self.grid.plainText();
     defer self.alloc.free(dump);
@@ -934,7 +934,7 @@ pub fn executeSnapshot(self: *Runner, label: []const u8, artifacts_dir: []const 
     try file.writeAll(dump);
 }
 
-// wait_exit — pump until child exits.
+// wait_exit: pump until child exits.
 pub fn executeWaitExit(self: *Runner, deadline_ms: u32) !void {
     const deadline = std.time.milliTimestamp() + deadline_ms;
     while (true) {
@@ -945,13 +945,13 @@ pub fn executeWaitExit(self: *Runner, deadline_ms: u32) !void {
     }
 }
 
-// set env — record in self.env for the next spawn.
+// set env: record in self.env for the next spawn.
 pub fn executeSetEnv(self: *Runner, raw: []const u8) !void {
     const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.MissingEquals;
     try self.env.put(raw[0..eq], raw[eq + 1 ..]);
 }
 
-// spawn — fork child using current env + path from the scenario.
+// spawn: fork child using current env + path from the scenario.
 pub fn executeSpawn(self: *Runner, program: []const u8) !void {
     if (self.child != null) return error.AlreadySpawned;
     // Build argv/envp null-terminated.
@@ -990,7 +990,7 @@ Commit.
 
 ```bash
 git add src/sim/Scenario.zig src/sim/main.zig
-git commit -m "sim: Scenario driver — parse + execute + outcome mapping"
+git commit -m "sim: Scenario driver: parse + execute + outcome mapping"
 ```
 
 ### Task 2.7: `zag-sim run <scenario>` CLI
@@ -1013,7 +1013,7 @@ Phase 2 complete.
 
 ---
 
-## Phase 3 — Mock HTTP server + config scaffolding
+## Phase 3: Mock HTTP server + config scaffolding
 
 Ships a sidecar HTTP server inside `zag-sim` that speaks OpenAI-SSE, plus a temp-directory `config.lua` scaffolder so zag points at it.
 
@@ -1099,7 +1099,7 @@ Phase 3 complete.
 
 ---
 
-## Phase 4 — Artifacts
+## Phase 4: Artifacts
 
 ### Task 4.1: Artifacts dir helper
 
@@ -1135,7 +1135,7 @@ Phase 4 complete.
 
 ---
 
-## Phase 5 — Segfault reproducer (flagship e2e)
+## Phase 5: Segfault reproducer (flagship e2e)
 
 ### Task 5.1: `test-sim-e2e` build step
 
@@ -1198,7 +1198,7 @@ test "e2e: segfault-normal-chat reproduces the crash" {
 ```
 
 Run: `zig build test-sim-e2e`
-Expected (at plan-write time): FAIL because child_crashed matches — i.e. the test passes, confirming the bug is reproduced. If the bug has been fixed in the meantime, the test FAILS with `expected child_crashed got pass` — also a load-bearing signal. Document which happened.
+Expected (at plan-write time): FAIL because child_crashed matches (i.e. the test passes, confirming the bug is reproduced). If the bug has been fixed in the meantime, the test FAILS with `expected child_crashed got pass`, which is also a load-bearing signal. Document which happened.
 
 Commit.
 
@@ -1206,7 +1206,7 @@ Commit.
 
 ---
 
-## Phase 6 — Replay-gen
+## Phase 6: Replay-gen
 
 ### Task 6.1: JSONL parser
 
@@ -1221,7 +1221,7 @@ Commit.
 
 ### Task 6.2: Turn boundary detection
 
-Group entries into Turns. A Turn starts at a `user_message` (or the session start) and ends at the next `user_message` or EOF. Within a turn: `assistant_text` entries concatenate into a `content` body; `tool_call` entries become pending tool invocations; `tool_result` entries pair with the most-recent pending tool_call by ORDER (there is no id in the JSONL — `src/Session.zig:578-582`).
+Group entries into Turns. A Turn starts at a `user_message` (or the session start) and ends at the next `user_message` or EOF. Within a turn: `assistant_text` entries concatenate into a `content` body; `tool_call` entries become pending tool invocations; `tool_result` entries pair with the most-recent pending tool_call by ORDER (there is no id in the JSONL; `src/Session.zig:578-582`).
 
 Tests: fixture with 2 turns + one tool round-trip parses into the expected shape.
 
@@ -1255,7 +1255,7 @@ Commit.
 
 `zag-sim replay-gen <session.jsonl> --out <dir>` writes `scenario.zsm` + `mock.json` into `<dir>`. Support `--include-partial` for incomplete trailing turns.
 
-Tests: end-to-end — real JSONL from `testdata/` produces valid files that `zag-sim run` can execute.
+Tests: end-to-end. Real JSONL from `testdata/` produces valid files that `zag-sim run` can execute.
 
 Commit.
 

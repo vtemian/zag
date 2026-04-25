@@ -119,7 +119,7 @@ fn runSourceImpl(
         const t0 = std.time.milliTimestamp();
         if (executeStep(&r, step, opts)) |_| {
             const dur: i64 = std.time.milliTimestamp() - t0;
-            // Comments aren't worth recording — they parse to verb=.comment
+            // Comments aren't worth recording. They parse to verb=.comment
             // with no behaviour. Skip them to keep summary.json focused on
             // executable steps.
             if (step.verb != .comment) {
@@ -176,7 +176,7 @@ fn executeStep(r: *Runner, step: Dsl.Step, opts: RunOptions) !void {
 }
 
 /// Map a runtime error to an `Outcome`. Anything not explicitly listed falls
-/// into `harness_error` — that includes parse errors, spawn failures, and
+/// into `harness_error`. That includes parse errors, spawn failures, and
 /// fd/read problems, which all signal the harness itself couldn't run the
 /// scenario as written.
 fn classify(e: anyerror) Outcome {

@@ -2,7 +2,7 @@
 //!
 //! A scenario writes a handful of files: `summary.json`, the optional
 //! `<label>.grid` snapshots, a tail of zag's own log, and a crash report on
-//! abnormal exit. `Artifacts` resolves where those land — either an explicit
+//! abnormal exit. `Artifacts` resolves where those land: either an explicit
 //! `--artifacts=<dir>` from the CLI or a freshly minted `$TMPDIR/zag-sim-<run_id>/`
 //! and exposes a tiny path-builder so callers don't reimplement `{s}/{s}` joins.
 
@@ -24,7 +24,7 @@ start_ms: i64,
 
 /// Create or reuse an artifacts dir.
 ///
-/// When `override` is set, `makePath` it and use it verbatim — `minted=false`
+/// When `override` is set, `makePath` it and use it verbatim. `minted=false`
 /// signals the harness should not delete it on cleanup. When `override` is
 /// null, mint `$TMPDIR/zag-sim-<run_id>/` (fallback `/tmp`).
 pub fn create(alloc: std.mem.Allocator, override: ?[]const u8) !*Artifacts {
@@ -108,7 +108,7 @@ pub fn tailZagLog(self: *Artifacts, home: []const u8) !void {
 const tail_log_max_lines: usize = 200;
 
 /// Hard read cap for log files. 8 MiB covers anything realistic; oversized
-/// logs get truncated to the last 8 MiB by the read, which is fine — the
+/// logs get truncated to the last 8 MiB by the read, which is fine. The
 /// tailer only ever cares about the last N lines.
 const max_log_read_bytes: usize = 8 * 1024 * 1024;
 
@@ -142,7 +142,7 @@ fn sliceLastLines(bytes: []const u8, max_lines: usize) []const u8 {
     while (i > 0) {
         i -= 1;
         if (bytes[i] != '\n') continue;
-        // Don't count a trailing newline at the very end — we want to keep
+        // Don't count a trailing newline at the very end. We want to keep
         // the last line intact, not start counting from the empty tail.
         if (i == bytes.len - 1) continue;
         seen += 1;

@@ -95,7 +95,7 @@ test "writeMockConfigAt writes to an explicit absolute path" {
 
     const explicit = try std.fmt.allocPrint(std.testing.allocator, "{s}/sub/cfg.lua", .{tmp_path});
     defer std.testing.allocator.free(explicit);
-    // Parent doesn't exist — function should make it.
+    // Parent doesn't exist. Function should make it.
     try writeMockConfigAt(std.testing.allocator, explicit, 8080);
 
     const config_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, explicit, 64 * 1024);

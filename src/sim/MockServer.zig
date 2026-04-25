@@ -10,7 +10,7 @@
 //! spawns the accept thread before returning. `shutdown` flips the atomic
 //! flag and kicks the blocking `accept()` with a self-connection so the
 //! thread exits within a few ms. `deinit` frees the heap slot. Callers own
-//! the returned pointer — always `shutdown()` before `deinit()`.
+//! the returned pointer; always `shutdown()` before `deinit()`.
 
 const std = @import("std");
 
@@ -68,7 +68,7 @@ pub fn start(alloc: std.mem.Allocator) !*MockServer {
 
 /// Same as `start`, but every subsequent POST to `/v1/chat/completions`
 /// pulls the next turn from `script` and replays it as SSE. The script
-/// is borrowed — callers retain ownership and must outlive the server.
+/// is borrowed; callers retain ownership and must outlive the server.
 pub fn startWithScript(alloc: std.mem.Allocator, script: *MockScript) !*MockServer {
     const self = try start(alloc);
     self.script = script;
@@ -167,7 +167,7 @@ fn respondToRequest(self: *MockServer, request: *std.http.Server.Request) !void 
 
     // TODO(phase 4): switch to a streaming response so `delay_ms` takes
     // effect between chunk flushes. For now we coalesce the whole SSE
-    // body in memory — the scripts are a few KB and tests only care
+    // body in memory. The scripts are a few KB and tests only care
     // about ordering, not wall-clock arrival times.
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(self.alloc);

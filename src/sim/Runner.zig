@@ -20,7 +20,7 @@ pub const Outcome = enum(u8) {
 /// the loaded script it replays, and a throwaway config root that zag reads.
 /// Heap-owned so `Runner.deinit` can tear everything down in the right order
 /// (server first: shutdown → deinit, then script, then filesystem scratch).
-/// Zag has no `ZAG_CONFIG_DIR` / `XDG_CONFIG_HOME` override — it always reads
+/// Zag has no `ZAG_CONFIG_DIR` / `XDG_CONFIG_HOME` override; it always reads
 /// `$HOME/.config/zag/config.lua` (see `src/LuaEngine.zig:270-274`). We steer
 /// it by pointing `HOME` at our tempdir and scaffolding the config inside.
 pub const MockHarness = struct {
@@ -28,7 +28,7 @@ pub const MockHarness = struct {
     script: *MockScript,
     /// Temp root used as the spawned zag's `$HOME`. Absolute path, owned.
     tmp_root: []u8,
-    /// `<tmp_root>/.config/zag` — where `config.lua` was scaffolded.
+    /// `<tmp_root>/.config/zag`: where `config.lua` was scaffolded.
     config_dir: []u8,
 
     pub fn deinit(self: *MockHarness, alloc: std.mem.Allocator) void {
@@ -55,7 +55,7 @@ pub const Runner = struct {
     child_status: ?u32 = null,
     /// `deinit` sends SIGKILL when the child is still alive at teardown. We
     /// only want to treat a non-zero exit as a crash when *we* didn't send
-    /// the killing signal — so the crash-report path checks this flag.
+    /// the killing signal. The crash-report path checks this flag.
     was_killed_by_harness: bool = false,
 
     pub fn init(alloc: std.mem.Allocator) !Runner {
@@ -205,7 +205,7 @@ pub const Runner = struct {
                 return error.ChildExitedDuringWait;
             }
             if (status == .idle) return;
-            // data arrived — re-arm
+            // data arrived. Re-arm.
         }
     }
 
@@ -244,7 +244,7 @@ pub const Runner = struct {
     /// If the child exited with non-zero status (signal we didn't send, or
     /// non-zero exit code), write a `crash.txt` to `artifacts.dir`. No-op
     /// when the child is still alive, exited cleanly, or was killed by
-    /// `deinit` (we sent the signal — not a crash).
+    /// `deinit` (we sent the signal, not a crash).
     pub fn writeCrashReportIfBad(self: *Runner, artifacts: *Artifacts) !void {
         const status = self.child_status orelse return;
 
