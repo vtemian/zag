@@ -94,6 +94,12 @@ pub const PaneEntry = struct {
     /// the runner is freed first (no more sink.push), then the sink
     /// releases its correlation map, then the buffer it borrowed.
     sink_storage: ?*BufferSink = null,
+    /// Heap-allocated Viewport this pane's ConversationBuffer attached to.
+    /// Stored on the PaneEntry rather than inline on `Pane` so its address
+    /// stays stable when `extra_panes` reallocates: the buffer's vtable
+    /// holds a borrowed pointer to this Viewport and would otherwise
+    /// dangle after a second split moved the items buffer.
+    viewport_storage: ?*Viewport = null,
 };
 
 /// Heap allocator for runtime allocations.
@@ -288,6 +294,10 @@ pub fn deinit(self: *WindowManager) void {
             v.deinit();
             self.allocator.destroy(v);
         }
+        // The view's vtable borrowed this Viewport. Free it after
+        // `v.deinit()` so no late vtable call dereferences a freed
+        // pointer.
+        if (entry.viewport_storage) |vp| self.allocator.destroy(vp);
         if (entry.pane.session) |s| {
             s.deinit();
             self.allocator.destroy(s);
@@ -965,17 +975,31 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
 
     const pane: Pane = .{ .buffer = cb.buf(), .view = cb, .session = cs, .runner = runner };
 
+    // Heap-allocate the Viewport so the buffer's borrowed pointer survives
+    // any subsequent `extra_panes.append` that relocates the items buffer.
+    // The PaneEntry's `viewport_storage` slot carries ownership; deinit
+    // frees it after the view is torn down.
+    const viewport = try self.allocator.create(Viewport);
+    errdefer self.allocator.destroy(viewport);
+    viewport.* = .{};
+
     // Register the entry before attaching the session handle so any
     // subsequent `paneFromBuffer` call already sees this pane. The
-    // sink_storage slot carries ownership of the heap BufferSink.
-    try self.extra_panes.append(self.allocator, .{ .pane = pane, .sink_storage = bs });
+    // sink_storage and viewport_storage slots carry ownership of the
+    // heap BufferSink and Viewport respectively.
+    try self.extra_panes.append(self.allocator, .{
+        .pane = pane,
+        .sink_storage = bs,
+        .viewport_storage = viewport,
+    });
 
-    // The Pane now lives at its final address inside `extra_panes`, so
-    // resolve the stable entry and wire the buffer's display-state
-    // delegation through the pane-owned Viewport.
+    // Resolve the stable entry and wire the buffer's display-state
+    // delegation through the heap-allocated Viewport. The viewport
+    // address is independent of `extra_panes` storage, so future
+    // splits cannot dangle this pointer.
     const entry = &self.extra_panes.items[self.extra_panes.items.len - 1];
     if (entry.pane.view) |v| {
-        v.attachViewport(&entry.pane.viewport);
+        v.attachViewport(entry.viewport_storage.?);
     }
 
     const sh = self.attachSession(pane);
@@ -1614,13 +1638,68 @@ test "extra pane viewport is attached to its buffer" {
     const entry = &wm.extra_panes.items[wm.extra_panes.items.len - 1];
     const cb = entry.pane.view.?;
 
-    // The buffer now routes display-state through the pane-owned Viewport.
-    try std.testing.expectEqual(&entry.pane.viewport, cb.viewport.?);
+    // The buffer now routes display-state through the heap-allocated
+    // Viewport that the PaneEntry owns via `viewport_storage`.
+    try std.testing.expectEqual(entry.viewport_storage.?, cb.viewport.?);
 
     // Flipping scroll on the pane's Viewport must reflect through the
     // Buffer vtable, proving the attach actually wired the delegation.
-    entry.pane.viewport.setScrollOffset(7);
+    entry.viewport_storage.?.setScrollOffset(7);
     try std.testing.expectEqual(@as(u32, 7), entry.pane.buffer.getScrollOffset());
+}
+
+test "multiple splits maintain stable viewport pointers" {
+    const allocator = std.testing.allocator;
+
+    // Same minimal harness as `extra pane viewport is attached to its
+    // buffer`: Layout is created but not driven; createSplitPane is
+    // invoked directly, so Screen/Compositor stay undefined and
+    // session_mgr points at a null optional to skip persistence.
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    // First split: capture the heap viewport pointer the buffer attached
+    // to and the storage slot the PaneEntry owns. They must match.
+    _ = try wm.createSplitPane();
+    const pane1_storage = wm.extra_panes.items[0].viewport_storage;
+    const pane1_attached_vp = wm.extra_panes.items[0].pane.view.?.viewport;
+    try std.testing.expectEqual(pane1_storage, pane1_attached_vp);
+
+    // Second split may relocate `extra_panes.items`. Pre-fix this would
+    // dangle the first pane's viewport (it lived inline on Pane); the
+    // heap allocation keeps the first pane's vtable pointer valid and
+    // identical to the captured value.
+    _ = try wm.createSplitPane();
+    try std.testing.expectEqual(pane1_storage, wm.extra_panes.items[0].pane.view.?.viewport);
+    try std.testing.expectEqual(pane1_storage, pane1_attached_vp);
 }
 
 test "WindowManager exposes a NodeRegistry" {
