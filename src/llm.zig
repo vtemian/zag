@@ -243,6 +243,10 @@ pub const Serializer = enum {
 /// Runtime-polymorphic LLM provider interface.
 /// Uses the ptr + vtable pattern (same as std.mem.Allocator).
 /// Each provider implements call() for its specific API format.
+///
+/// Provider impls must be thread-safe; see VTable comments. The task
+/// tool relies on this when a child agent on a separate thread shares
+/// the parent's provider.
 pub const Provider = struct {
     /// Type-erased pointer to the concrete provider struct.
     ptr: *anyopaque,
@@ -251,6 +255,12 @@ pub const Provider = struct {
 
     pub const VTable = struct {
         /// Send a conversation and return the parsed response.
+        ///
+        /// Thread-safe: each call allocates its own http.Client and
+        /// resolves credentials per-request, so no mutable state is
+        /// shared. Multiple threads may invoke concurrently. Any
+        /// future change that introduces a shared connection pool or
+        /// token cache must preserve this invariant.
         call: *const fn (
             ptr: *anyopaque,
             req: *const Request,
@@ -259,6 +269,8 @@ pub const Provider = struct {
         /// Streaming variant: invokes `req.callback.on_event` for each
         /// SSE event. Assembles and returns the final LlmResponse when
         /// the stream ends or is cancelled.
+        ///
+        /// Thread-safe: see `call`.
         call_streaming: *const fn (
             ptr: *anyopaque,
             req: *const StreamRequest,
