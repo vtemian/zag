@@ -323,6 +323,15 @@ pub const LuaEngine = struct {
             log.warn("failed to load lua combinators: {}", .{err});
         };
 
+        var command_registry = CommandRegistry.init(allocator);
+        errdefer command_registry.deinit();
+        // Seed the Zig-baked slash commands. Tests share this seeding via
+        // `WindowManager.testCommandRegistry`; production calls land here.
+        try command_registry.registerBuiltIn("/quit", .quit);
+        try command_registry.registerBuiltIn("/q", .quit);
+        try command_registry.registerBuiltIn("/perf", .perf);
+        try command_registry.registerBuiltIn("/perf-dump", .perf_dump);
+
         return LuaEngine{
             .lua = lua,
             .allocator = allocator,
@@ -330,7 +339,7 @@ pub const LuaEngine = struct {
             .hook_dispatcher = hook_registry_mod.HookDispatcher.init(allocator),
             .providers_registry = providers_registry,
             .keymap_registry = keymap_registry,
-            .command_registry = CommandRegistry.init(allocator),
+            .command_registry = command_registry,
             .tasks = std.AutoHashMap(i32, *Task).init(allocator),
             .prompt_registry = prompt_registry_value,
         };
@@ -7706,12 +7715,9 @@ test "zag.command{} shadow wins over a built-in keyed on the same slash" {
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    // The engine's command_registry is empty by default; simulate what
-    // WindowManager does at init by dropping a built-in entry in the
-    // *engine* registry directly. The dispatch preference rule in the
-    // window manager checks the engine registry first, so this models
-    // the shadow lookup order.
-    try engine.command_registry.registerBuiltIn("/quit", .quit);
+    // `LuaEngine.init` already seeds `/quit`. The Lua callback below
+    // registers a same-named entry, which the registry treats as a
+    // replacement; this test asserts that the callback variant wins.
     try engine.lua.doString(
         \\_G.shadow_fired = false
         \\zag.command {

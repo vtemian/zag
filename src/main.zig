@@ -1271,6 +1271,22 @@ pub fn main() !void {
         null;
     defer if (fallback_registry) |*r| r.deinit();
     const registry_ptr: *const llm.Registry = if (lua_engine) |*eng| &eng.providers_registry else &fallback_registry.?;
+
+    // Same engine-less fallback for the slash-command registry that the
+    // window manager borrows. With Lua up, the engine owns the registry
+    // and `LuaEngine.init` seeds built-ins; without Lua, we hand the
+    // manager an empty registry seeded inline so degraded-mode dispatch
+    // still has a stable pointer.
+    var fallback_command_registry: ?@import("CommandRegistry.zig") = if (lua_engine == null) blk: {
+        var r = @import("CommandRegistry.zig").init(allocator);
+        try r.registerBuiltIn("/quit", .quit);
+        try r.registerBuiltIn("/q", .quit);
+        try r.registerBuiltIn("/perf", .perf);
+        try r.registerBuiltIn("/perf-dump", .perf_dump);
+        break :blk r;
+    } else null;
+    defer if (fallback_command_registry) |*r| r.deinit();
+    const command_registry_ptr = if (lua_engine) |*eng| &eng.command_registry else &fallback_command_registry.?;
     var provider = llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
         if (err != error.MissingCredential) return err;
 
@@ -1408,6 +1424,7 @@ pub fn main() !void {
         .endpoint_registry = registry_ptr,
         .session_mgr = &session_mgr,
         .lua_engine = if (lua_engine) |*eng| eng else null,
+        .command_registry = command_registry_ptr,
         .stdout_file = stdout_file,
         .wake_read_fd = wake_read,
         .wake_write_fd = wake_write,
