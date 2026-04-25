@@ -40,6 +40,18 @@ pub const EntryType = enum {
     /// subagent's final assistant text as returned to the parent as the
     /// `task` tool result.
     task_end,
+    /// Child agent's assistant_text event during a task delegation.
+    /// `parent_id` chains off the parent's `task_start` ULID so replay
+    /// tooling can attribute the message to its delegation scope.
+    task_message,
+    /// Child agent's tool_call event during a task delegation.
+    /// `tool_name` and `tool_input` mirror the regular `tool_call` shape;
+    /// `parent_id` threads through the child's chain anchored at
+    /// `task_start`.
+    task_tool_use,
+    /// Child agent's tool_result event during a task delegation.
+    /// `content` and `is_error` mirror the regular `tool_result` shape.
+    task_tool_result,
 
     pub fn toSlice(self: EntryType) []const u8 {
         return switch (self) {
@@ -55,6 +67,9 @@ pub const EntryType = enum {
             .thinking_redacted => "thinking_redacted",
             .task_start => "task_start",
             .task_end => "task_end",
+            .task_message => "task_message",
+            .task_tool_use => "task_tool_use",
+            .task_tool_result => "task_tool_result",
         };
     }
 
@@ -72,6 +87,9 @@ pub const EntryType = enum {
             .{ "thinking_redacted", EntryType.thinking_redacted },
             .{ "task_start", EntryType.task_start },
             .{ "task_end", EntryType.task_end },
+            .{ "task_message", EntryType.task_message },
+            .{ "task_tool_use", EntryType.task_tool_use },
+            .{ "task_tool_result", EntryType.task_tool_result },
         };
         inline for (map) |pair| {
             if (std.mem.eql(u8, s, pair[0])) return pair[1];
@@ -1192,6 +1210,7 @@ test "EntryType toSlice and fromSlice round-trip" {
         .tool_call,         .tool_result,    .info,
         .err,               .session_rename, .thinking,
         .thinking_redacted, .task_start,     .task_end,
+        .task_message,      .task_tool_use,  .task_tool_result,
     };
     for (types_to_test) |t| {
         const s = t.toSlice();
@@ -1242,6 +1261,70 @@ test "task_end round-trips through JSONL" {
     try std.testing.expectEqual(EntryType.task_end, parsed.entry_type);
     try std.testing.expectEqualStrings("reviewer says: looks good", parsed.content);
     try std.testing.expectEqual(@as(i64, 222), parsed.timestamp);
+}
+
+test "task_message round-trips through JSONL" {
+    const allocator = std.testing.allocator;
+
+    var original = Entry{
+        .entry_type = .task_message,
+        .content = "child agent says hello",
+        .timestamp = 333,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.task_message, parsed.entry_type);
+    try std.testing.expectEqualStrings("child agent says hello", parsed.content);
+    try std.testing.expectEqual(@as(i64, 333), parsed.timestamp);
+}
+
+test "task_tool_use round-trips through JSONL" {
+    const allocator = std.testing.allocator;
+
+    var original = Entry{
+        .entry_type = .task_tool_use,
+        .tool_name = "read",
+        .tool_input = "{\"path\":\"foo.txt\"}",
+        .timestamp = 444,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.task_tool_use, parsed.entry_type);
+    try std.testing.expectEqualStrings("read", parsed.tool_name);
+    try std.testing.expectEqualStrings("{\"path\":\"foo.txt\"}", parsed.tool_input);
+    try std.testing.expectEqual(@as(i64, 444), parsed.timestamp);
+}
+
+test "task_tool_result round-trips through JSONL" {
+    const allocator = std.testing.allocator;
+
+    var original = Entry{
+        .entry_type = .task_tool_result,
+        .content = "ok",
+        .is_error = false,
+        .timestamp = 555,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntry(&original, &buf);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.task_tool_result, parsed.entry_type);
+    try std.testing.expectEqualStrings("ok", parsed.content);
+    try std.testing.expect(!parsed.is_error);
+    try std.testing.expectEqual(@as(i64, 555), parsed.timestamp);
 }
 
 test "create, append, and load round-trip" {

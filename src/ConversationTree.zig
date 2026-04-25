@@ -264,6 +264,12 @@ pub fn loadFromEntriesFlat(self: *ConversationTree, entries: []const Session.Ent
             // parent's tool_result already carries the subagent's
             // output, so rendering task markers as nodes would duplicate.
             .session_start, .session_rename, .task_start, .task_end => continue,
+            // Inline subagent events render the same as top-level
+            // counterparts; the task_start/task_end markers above still
+            // bracket the delegation in the JSONL stream.
+            .task_message => .assistant_text,
+            .task_tool_use => .tool_call,
+            .task_tool_result => .tool_result,
             // Thinking entries become dedicated nodes. The redacted
             // variant surfaces its ciphertext-length marker from
             // `encrypted_data` rather than `content`.

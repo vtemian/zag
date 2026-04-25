@@ -27,6 +27,8 @@ const Sink = @import("../Sink.zig").Sink;
 const SinkEvent = @import("../Sink.zig").Event;
 const Collector = @import("../sinks/Collector.zig").Collector;
 const subagents_types = @import("../subagents.zig");
+const ConversationHistory = @import("../ConversationHistory.zig");
+const Session = @import("../Session.zig");
 
 /// Maximum nested `task` invocations on a single runner. Picked to
 /// match the plan's recursion cap; keeps runaway delegation loops from
@@ -112,7 +114,10 @@ fn runChild(
 
     // Persist `task_start` with JSON-encoded inputs so replay tooling can
     // reconstruct what was delegated. Failure is logged but non-fatal; the
-    // subagent still runs.
+    // subagent still runs. Capture the persisted id so the child's history
+    // can chain its first event off it and so `task_end` can name it as
+    // its parent for symmetric open/close querying.
+    var task_start_id: ?@import("../ulid.zig").Ulid = null;
     if (ctx.session_handle) |sh| {
         const start_payload = formatStartPayload(allocator, sa.name, prompt) catch |err| blk: {
             log.warn("task_start payload format failed: {}", .{err});
@@ -120,13 +125,26 @@ fn runChild(
         };
         if (start_payload) |payload| {
             defer allocator.free(payload);
-            _ = sh.appendEntry(.{
+            task_start_id = sh.appendEntry(.{
                 .entry_type = .task_start,
                 .content = payload,
                 .timestamp = std.time.milliTimestamp(),
-            }) catch |err| log.warn("task_start persist failed: {}", .{err});
+            }) catch |err| outer: {
+                log.warn("task_start persist failed: {}", .{err});
+                break :outer null;
+            };
         }
     }
+
+    // The child shares the parent's session_handle (single-file replay)
+    // but maintains its own `last_persisted_id` chain so child events
+    // thread together independently of the parent's chain. Pre-seed the
+    // chain with the `task_start` ULID so the first child event auto-
+    // threads its `parent_id` back to the delegation scope.
+    var child_history = ConversationHistory.init(allocator);
+    defer child_history.deinit();
+    if (ctx.session_handle) |sh| child_history.attachSession(sh);
+    child_history.last_persisted_id = task_start_id;
 
     // Inject the subagent's system prompt as a prefix on the first user
     // turn. TODO: thread the prompt through the Harness layer registry as
@@ -193,7 +211,7 @@ fn runChild(
             continue;
         }
         for (buf[0..n]) |event| {
-            handleChildEvent(event, &collector, allocator);
+            handleChildEvent(event, &collector, &child_history, allocator);
             if (event == .done) saw_done = true;
         }
     }
@@ -201,7 +219,7 @@ fn runChild(
 
     // Drain anything queued after .done (unlikely, but defensive).
     const tail_n = child_queue.drain(&buf);
-    for (buf[0..tail_n]) |event| handleChildEvent(event, &collector, allocator);
+    for (buf[0..tail_n]) |event| handleChildEvent(event, &collector, &child_history, allocator);
 
     // Take ownership of the collected text. The Collector's ArrayList is
     // heap-allocated with `allocator`, so we can hand the slice straight
@@ -212,10 +230,15 @@ fn runChild(
     errdefer allocator.free(owned);
 
     if (ctx.session_handle) |sh| {
+        // Chain task_end to task_start so the open/close pair is a
+        // sibling block in the parent_id tree. If the empty-child case
+        // hit and task_start was never persisted (`null`), leave
+        // parent_id unset; the entry still lands in JSONL order.
         _ = sh.appendEntry(.{
             .entry_type = .task_end,
             .content = owned,
             .timestamp = std.time.milliTimestamp(),
+            .parent_id = task_start_id,
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }
 
@@ -306,34 +329,75 @@ fn childThreadMain(args: ChildArgs) void {
 fn handleChildEvent(
     event: agent_events.AgentEvent,
     collector: *Collector,
+    child_history: *ConversationHistory,
     allocator: Allocator,
 ) void {
     const sink = collector.sink();
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
+            // Persist as task_message so replay can reconstruct child
+            // assistant text inline with the parent's JSONL.
+            child_history.persistEvent(.{
+                .entry_type = .task_message,
+                .content = text,
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |err| log.warn("task_message persist failed: {}", .{err});
             sink.push(.{ .assistant_delta = .{ .text = text } });
         },
         .reset_assistant_text => sink.push(.assistant_reset),
         .done => sink.push(.run_end),
-        // The child's thinking, tool_use, tool_result, info, err events
-        // aren't surfaced to the parent's sink in v1; the parent sees
-        // only the final assistant text. Free any owned bytes so the
-        // queue doesn't leak. TODO: forward child events into the
-        // parent's sink so the TUI can render subagent activity live.
-        .thinking_delta => |text| allocator.free(text),
+        // The child's thinking is recorded inline so replay can show
+        // subagent reasoning under the delegation scope. Other events
+        // (info, hook round-trips) are still discarded in v1; the parent
+        // sees only the final assistant text via the Collector.
+        .thinking_delta => |text| {
+            defer allocator.free(text);
+            child_history.persistEvent(.{
+                .entry_type = .thinking,
+                .content = text,
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |err| log.warn("child thinking persist failed: {}", .{err});
+        },
         .thinking_stop => {},
         .tool_start => |ev| {
-            allocator.free(ev.name);
-            if (ev.input_raw) |raw| allocator.free(raw);
-            if (ev.call_id) |id| allocator.free(id);
+            defer {
+                allocator.free(ev.name);
+                if (ev.input_raw) |raw| allocator.free(raw);
+                if (ev.call_id) |id| allocator.free(id);
+            }
+            child_history.persistEvent(.{
+                .entry_type = .task_tool_use,
+                .tool_name = ev.name,
+                .tool_input = ev.input_raw orelse "",
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |err| log.warn("task_tool_use persist failed: {}", .{err});
         },
         .tool_result => |result| {
-            allocator.free(result.content);
-            if (result.call_id) |id| allocator.free(id);
+            defer {
+                allocator.free(result.content);
+                if (result.call_id) |id| allocator.free(id);
+            }
+            child_history.persistEvent(.{
+                .entry_type = .task_tool_result,
+                .content = result.content,
+                .is_error = result.is_error,
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |err| log.warn("task_tool_result persist failed: {}", .{err});
         },
         .info => |text| allocator.free(text),
-        .err => |text| allocator.free(text),
+        .err => |text| {
+            defer allocator.free(text);
+            // Surface child errors in the audit log so failures inside a
+            // delegation are not silently dropped. Reuse `.err` since
+            // there's no `task_err` variant; the parent_id chain places
+            // the entry under the delegation scope.
+            child_history.persistEvent(.{
+                .entry_type = .err,
+                .content = text,
+                .timestamp = std.time.milliTimestamp(),
+            }) catch |suberr| log.warn("child err persist failed: {}", .{suberr});
+        },
         // Hook / Lua-tool / layout requests would normally be serviced
         // by the main thread's drain loop. They can still arrive on the
         // child's queue if the subagent fires a hook or a Lua tool; in
@@ -629,6 +693,105 @@ test "buildChildContext increments depth and inherits parent state" {
     try testing.expectEqual(parent.session_handle, child.session_handle);
     try testing.expect(child.registry == &child_registry);
     try testing.expectEqualStrings("test", child.provider_name);
+}
+
+fn restoreCwdForTest(abs_path: []const u8) void {
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
+    defer dir.close();
+    dir.setAsCwd() catch {};
+}
+
+test "child_history pre-seeded with task_start_id chains child events under the delegation" {
+    // This is the small-piece sanity check that the design's parent_id
+    // chain works the way Step 2 of Task 15 promises: a fresh child
+    // ConversationHistory whose `last_persisted_id` is set to the
+    // task_start ULID will auto-thread its first persisted event off
+    // task_start, and subsequent events off each other. The full
+    // happy-path through `runChild` (provider stub + agent thread) is
+    // covered by the manual smoke run from Task 14 / 15.
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwdForTest(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("anthropic/claude-sonnet-4-20250514");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    // Parent persists task_start directly (mirroring runChild).
+    const task_start_id = try handle.appendEntry(.{
+        .entry_type = .task_start,
+        .content = "{\"agent\":\"reviewer\",\"prompt\":\"go\"}",
+        .timestamp = 100,
+    });
+
+    // Child history shares the same handle but maintains its own chain
+    // pre-seeded with the task_start ULID.
+    var child_history = ConversationHistory.init(allocator);
+    defer child_history.deinit();
+    child_history.attachSession(&handle);
+    child_history.last_persisted_id = task_start_id;
+
+    try child_history.persistEvent(.{
+        .entry_type = .task_message,
+        .content = "hi",
+        .timestamp = 101,
+    });
+    try child_history.persistEvent(.{
+        .entry_type = .task_tool_use,
+        .tool_name = "read",
+        .tool_input = "{}",
+        .timestamp = 102,
+    });
+    try child_history.persistEvent(.{
+        .entry_type = .task_tool_result,
+        .content = "ok",
+        .timestamp = 103,
+    });
+
+    // Parent writes task_end with explicit parent_id back to task_start.
+    _ = try handle.appendEntry(.{
+        .entry_type = .task_end,
+        .content = "done",
+        .timestamp = 104,
+        .parent_id = task_start_id,
+    });
+    handle.close();
+
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // session_start, task_start, task_message, task_tool_use,
+    // task_tool_result, task_end.
+    try testing.expectEqual(@as(usize, 6), loaded.len);
+    try testing.expectEqual(Session.EntryType.task_start, loaded[1].entry_type);
+    try testing.expectEqual(Session.EntryType.task_message, loaded[2].entry_type);
+    try testing.expectEqual(Session.EntryType.task_tool_use, loaded[3].entry_type);
+    try testing.expectEqual(Session.EntryType.task_tool_result, loaded[4].entry_type);
+    try testing.expectEqual(Session.EntryType.task_end, loaded[5].entry_type);
+
+    // task_message chains off task_start (the pre-seeded id).
+    try testing.expect(loaded[2].parent_id != null);
+    try testing.expectEqualSlices(u8, &loaded[1].id, &loaded[2].parent_id.?);
+    // task_tool_use chains off task_message.
+    try testing.expect(loaded[3].parent_id != null);
+    try testing.expectEqualSlices(u8, &loaded[2].id, &loaded[3].parent_id.?);
+    // task_tool_result chains off task_tool_use.
+    try testing.expect(loaded[4].parent_id != null);
+    try testing.expectEqualSlices(u8, &loaded[3].id, &loaded[4].parent_id.?);
+    // task_end chains explicitly back to task_start, NOT to the last
+    // child event, so open/close form a sibling pair.
+    try testing.expect(loaded[5].parent_id != null);
+    try testing.expectEqualSlices(u8, &loaded[1].id, &loaded[5].parent_id.?);
 }
 
 test "task without bound context returns tool error" {
