@@ -342,6 +342,10 @@ fn childThreadMain(args: ChildArgs) void {
         args.lua_engine,
         null,
         &turn_in_progress,
+        // Subagents inherit no compaction context window: the strategy
+        // socket is a parent-loop concern, and a child run that hits
+        // its model's ceiling surfaces as a normal `MaxTokens` stop.
+        0,
     ) catch |err| {
         // Surface the failure as a text message so the parent sees it in
         // the collected output rather than a silent empty result.
@@ -459,6 +463,10 @@ fn handleChildEvent(
             req.done.set();
         },
         .loop_detect_request => |req| {
+            req.error_name = "subagent_unsupported";
+            req.done.set();
+        },
+        .compact_request => |req| {
             req.error_name = "subagent_unsupported";
             req.done.set();
         },

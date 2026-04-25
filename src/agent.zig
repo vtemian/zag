@@ -45,6 +45,12 @@ pub fn runLoopStreaming(
     lua_engine: ?*LuaEngine.LuaEngine,
     skills: ?*const skills_mod.SkillRegistry,
     turn_in_progress: *std.atomic.Value(bool),
+    /// Provider context window for the active model. Drives the
+    /// `zag.compact.strategy` fire threshold (currently 80% of this
+    /// number against the prior turn's `input_tokens`). Pass 0 to
+    /// disable compaction entirely; callers without a model rate card
+    /// (tests, headless eval) use 0 and skip the round-trip.
+    context_window: u32,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
@@ -95,10 +101,44 @@ pub fn runLoopStreaming(
     defer allocator.free(last_tool_input);
     var identical_streak: u32 = 0;
 
+    // Token estimate from the prior turn's response. Drives the
+    // compaction fire at the top of each iteration; zero on the first
+    // turn so compaction never runs against an empty conversation.
+    var last_input_tokens: u32 = 0;
+
     var turn_num: u32 = 0;
     while (true) {
         if (cancel.load(.acquire)) return;
         turn_num += 1;
+
+        // Fire `zag.compact.strategy` before assembling the next
+        // request. The strategy may rewrite the message history (e.g.
+        // drop oldest tool_result blocks) so the upcoming `callLlm`
+        // request stays under the model's context window. Skipped on
+        // the first turn (no token estimate yet), when no engine is
+        // wired in, when the strategy slot is empty, when the caller
+        // didn't supply a context window, or when usage is below the
+        // 80% high-water mark. See `fireCompact` for the full no-op
+        // ladder.
+        if (try fireCompact(
+            lua_engine,
+            messages.items,
+            last_input_tokens,
+            context_window,
+            allocator,
+            queue,
+            cancel,
+        )) |replacement| {
+            // Free the existing history before installing the
+            // replacement. `messages` owns each `Message`'s content
+            // slice via the agent-thread allocator; the strategy duped
+            // its return through the same allocator so ownership
+            // transfers cleanly.
+            for (messages.items) |m| m.deinit(allocator);
+            messages.clearRetainingCapacity();
+            try messages.appendSlice(allocator, replacement);
+            allocator.free(replacement);
+        }
 
         // Mark the turn as in-flight so `EventOrchestrator.onUserInputSubmitted`
         // diverts an interrupt-time user message into the reminder queue.
@@ -148,6 +188,10 @@ pub fn runLoopStreaming(
         const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);
+        // Snapshot the latest input token count so the next iteration's
+        // compaction fire has a fresh estimate to compare against the
+        // configured context window.
+        last_input_tokens = response.input_tokens;
 
         const tool_calls = try collectToolCalls(response.content, allocator);
         defer allocator.free(tool_calls);
@@ -808,6 +852,68 @@ fn fireLoopDetect(
         return null;
     }
     return req.result;
+}
+
+/// Fire `zag.compact.strategy` at the top of the next iteration when
+/// the running token estimate crosses the 80% high-water mark of the
+/// model's context window. Returns the replacement message slice
+/// (caller owns the outer slice plus every nested ContentBlock
+/// allocation, all duped through `allocator`) or null when the
+/// strategy declines to compact.
+///
+/// No-op fast path: skips the round-trip entirely when no engine is
+/// wired in, the strategy slot is empty, the caller didn't supply a
+/// context window, or the prior turn's input token count is below
+/// `tokens_max * 0.80`. The threshold lives here (not on the Lua side)
+/// because the agent owns the canonical token estimate and a bad
+/// threshold should not be a Lua plugin's problem to override.
+///
+/// Lossy round-trip: the strategy receives a Lua snapshot of each
+/// message as `{role, content}` where `content` is the concatenation
+/// of every `text` block in the original message. tool_use,
+/// tool_result, thinking, and redacted_thinking blocks are dropped
+/// from the snapshot. The returned messages are reconstructed as
+/// single-block text messages. See `CompactRequest` in
+/// `agent_events.zig` for the full contract and v2 follow-up.
+fn fireCompact(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    messages: []const types.Message,
+    tokens_used: u32,
+    tokens_max: u32,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !?[]types.Message {
+    const engine = lua_engine orelse return null;
+    if (engine.compact_handler == null) return null;
+    if (tokens_max == 0) return null;
+    // Threshold: 80% of the model's context window. Held here so a
+    // misbehaving plugin can't hide the trigger point from the harness.
+    const threshold = (@as(u64, tokens_max) * 4) / 5;
+    if (tokens_used < threshold) return null;
+
+    var req = agent_events.CompactRequest.init(messages, tokens_used, tokens_max, allocator);
+    queue.push(.{ .compact_request = &req }) catch return null;
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                req.freeResult();
+                return error.Cancelled;
+            }
+        }
+    }
+    if (req.error_name) |name| {
+        log.warn("compact strategy handler failed: {s}", .{name});
+        req.freeResult();
+        return null;
+    }
+    const replacement = req.result orelse return null;
+    // Transfer ownership to the caller. Clear the request slot so
+    // `freeResult` is a no-op if the caller drops the request later.
+    req.result = null;
+    return replacement;
 }
 
 /// Inspect a freshly built tool-result content slice and report
@@ -1545,6 +1651,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                     req.done.set();
                 },
                 .loop_detect_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .compact_request => |req| {
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
@@ -2726,6 +2836,286 @@ test "fireLoopDetect handler error returns null and warns" {
 
     const action = try fireLoopDetect(&engine, "bash", "{}", false, 3, alloc, &queue, &cancel);
     try std.testing.expect(action == null);
+}
+
+// -- Compaction strategy tests ---------------------------------------------
+//
+// Same fixtures as the loop-detector tests above: each test that exercises
+// a registered handler spawns a `GateTestHarness.pump` thread that calls
+// `AgentRunner.dispatchHookRequests` until the helper returns. The
+// no-handler / no-engine / threshold-not-crossed paths skip the pump
+// because `fireCompact` returns null without touching the queue.
+
+/// Build a 3-message conversation containing a tool_result block. The
+/// "drop oldest tool_result" strategy below replaces this with a
+/// shorter slice, so the test asserts the shape change.
+fn buildCompactFixture(allocator: Allocator) !std.ArrayList(types.Message) {
+    var list: std.ArrayList(types.Message) = .empty;
+    errdefer {
+        for (list.items) |m| m.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    // user "first ask"
+    {
+        const text = try allocator.dupe(u8, "first ask");
+        errdefer allocator.free(text);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        errdefer allocator.free(blocks);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try list.append(allocator, .{ .role = .user, .content = blocks });
+    }
+    // assistant: text + tool_use (the tool_use is dropped from the
+    // Lua snapshot but lives in the real history).
+    {
+        const text = try allocator.dupe(u8, "running tool");
+        errdefer allocator.free(text);
+        const tu_id = try allocator.dupe(u8, "t1");
+        errdefer allocator.free(tu_id);
+        const tu_name = try allocator.dupe(u8, "bash");
+        errdefer allocator.free(tu_name);
+        const tu_input = try allocator.dupe(u8, "{}");
+        errdefer allocator.free(tu_input);
+        const blocks = try allocator.alloc(types.ContentBlock, 2);
+        errdefer allocator.free(blocks);
+        blocks[0] = .{ .text = .{ .text = text } };
+        blocks[1] = .{ .tool_use = .{ .id = tu_id, .name = tu_name, .input_raw = tu_input } };
+        try list.append(allocator, .{ .role = .assistant, .content = blocks });
+    }
+    // user (tool_result)
+    {
+        const tu_id = try allocator.dupe(u8, "t1");
+        errdefer allocator.free(tu_id);
+        const content = try allocator.dupe(u8, "really long tool output");
+        errdefer allocator.free(content);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        errdefer allocator.free(blocks);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = tu_id, .content = content } };
+        try list.append(allocator, .{ .role = .user, .content = blocks });
+    }
+    return list;
+}
+
+test "fireCompact bypasses round-trip when engine is null" {
+    const alloc = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    const replacement = try fireCompact(null, fixture.items, 1000, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "fireCompact bypasses round-trip when no handler is registered" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    // No pump thread: a stray push would hang on `done.wait`.
+    const replacement = try fireCompact(&engine, fixture.items, 1000, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "fireCompact bypasses round-trip when tokens_max is zero" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return {} end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    // tokens_max = 0 means "no model rate card", so even with a registered
+    // strategy `fireCompact` skips the round-trip.
+    const replacement = try fireCompact(&engine, fixture.items, 1000, 0, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "fireCompact bypasses round-trip when usage is below 80%" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return {} end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    // 79% of 1000 = 790; threshold is 800 (80%). No fire.
+    const replacement = try fireCompact(&engine, fixture.items, 790, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.len);
+}
+
+test "fireCompact returns shrunk history when strategy drops the oldest tool_result" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // The strategy walks the Lua snapshot and keeps every message
+    // whose role/content is anything other than the elided
+    // tool_result text. Since the snapshot drops tool_use blocks
+    // entirely, the assistant message (which had a tool_use under a
+    // text block) survives via its text. The tool_result message in
+    // our fixture is a single-block user message; the strategy
+    // recognises it by content and drops it.
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  local out = {}
+        \\  for _, m in ipairs(ctx.messages) do
+        \\    if m.role ~= "user" or m.content ~= "" then
+        \\      -- skip the tool_result-only message (its text snapshot
+        \\      -- is the tool output we want elided).
+        \\      if not (m.role == "user" and m.content == "really long tool output") then
+        \\        table.insert(out, { role = m.role, content = m.content })
+        \\      end
+        \\    end
+        \\  end
+        \\  table.insert(out, { role = "user", content = "<elided tool output>" })
+        \\  return out
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    const original_len = fixture.items.len;
+    const replacement = try fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement != null);
+    defer {
+        for (replacement.?) |m| m.deinit(alloc);
+        alloc.free(replacement.?);
+    }
+
+    // We started with 3 messages; the strategy dropped the tool_result
+    // message and appended an elision marker so the replacement is
+    // 1 + (original_len - 1) = original_len, but the dropped content
+    // is gone. Assert the trailing message is the elision marker.
+    try std.testing.expectEqual(original_len, replacement.?.len);
+    const tail = replacement.?[replacement.?.len - 1];
+    try std.testing.expectEqual(types.Role.user, tail.role);
+    try std.testing.expectEqual(@as(usize, 1), tail.content.len);
+    try std.testing.expectEqualStrings("<elided tool output>", tail.content[0].text.text);
+}
+
+test "fireCompact returns null when strategy returns nil" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return nil end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    const replacement = try fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
+}
+
+test "fireCompact returns null and warns on strategy error" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) error("blew up") end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, GateTestHarness.pump, .{ &queue, @as(?*LuaEngine.LuaEngine, &engine), &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var fixture = try buildCompactFixture(alloc);
+    defer {
+        for (fixture.items) |m| m.deinit(alloc);
+        fixture.deinit(alloc);
+    }
+
+    const replacement = try fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
 }
 
 test "fireLoopDetect nil return returns null" {

@@ -195,6 +195,16 @@ pub const LuaEngine = struct {
     /// unref the old. `null` means "no detector", so the agent loops
     /// without intervention. Released in `deinit`.
     loop_detect_handler: ?i32 = null,
+    /// Single global handler registered via `zag.compact.strategy(fn)`.
+    /// The strategy runs at the top of each agent iteration when the
+    /// running token estimate crosses the high-water threshold and
+    /// returns either a replacement message array (which the agent
+    /// installs in place of the existing history) or nil (skip
+    /// compaction this turn). Same re-registration semantics as
+    /// `tool_gate_handler`: swap the ref, unref the old. `null` means
+    /// "no strategy", so the agent never compacts. Released in
+    /// `deinit`.
+    compact_handler: ?i32 = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -490,6 +500,12 @@ pub const LuaEngine = struct {
             self.lua.unref(zlua.registry_index, fn_ref);
             self.loop_detect_handler = null;
         }
+        // Same release dance for the single global compaction strategy
+        // handler (set by `zag.compact.strategy(fn)`).
+        if (self.compact_handler) |fn_ref| {
+            self.lua.unref(zlua.registry_index, fn_ref);
+            self.compact_handler = null;
+        }
         self.lua.deinit();
     }
 
@@ -719,6 +735,16 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagLoopDetectFn));
         lua.setField(-2, "detect");
         lua.setField(-2, "loop"); // zag.loop = loop_table; [zag_table]
+
+        // zag.compact; namespace for context-compaction sockets. Today
+        // only `strategy(fn)` (single global pre-callLlm hook fired at
+        // the high-water threshold). The strategy returns a replacement
+        // message array (installed in place of the existing history) or
+        // nil (skip this turn). Stack: [zag_table].
+        lua.newTable(); // [zag_table, compact_table]
+        lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
+        lua.setField(-2, "strategy");
+        lua.setField(-2, "compact"); // zag.compact = compact_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -5742,6 +5768,238 @@ pub const LuaEngine = struct {
     /// Test-only accessor for the single global loop-detector handler ref.
     pub fn loopDetectHandler(self: *const LuaEngine) ?i32 {
         return self.loop_detect_handler;
+    }
+
+    /// Zig function backing `zag.compact.strategy(fn)`.
+    ///
+    /// Registers the single global compaction-strategy handler the
+    /// harness invokes when the running token estimate crosses the
+    /// high-water threshold. Re-registering replaces the previous
+    /// function; the old Lua ref is unrefed so memory does not bloat
+    /// across reloads. Pass nil to clear.
+    ///
+    /// Args:
+    /// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
+    fn zagCompactStrategyFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        // Allow `zag.compact.strategy(nil)` to clear the handler.
+        // Anything else that isn't a function is a programmer error.
+        if (lua.isNil(1)) {
+            if (engine.compact_handler) |old| {
+                lua.unref(zlua.registry_index, old);
+                engine.compact_handler = null;
+            }
+            return 0;
+        }
+        if (!lua.isFunction(1)) {
+            lua.raiseErrorStr(
+                "zag.compact.strategy: arg 1 must be a function or nil",
+                .{},
+            );
+        }
+
+        // Push a copy of arg 1 so ref() pops the duplicate and leaves
+        // the original argument frame intact.
+        lua.pushValue(1);
+        const fn_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr(
+                "zag.compact.strategy: failed to ref handler",
+                .{},
+            );
+        };
+
+        if (engine.compact_handler) |old| {
+            lua.unref(zlua.registry_index, old);
+        }
+        engine.compact_handler = fn_ref;
+        return 0;
+    }
+
+    /// Push a Lua-side message snapshot onto the stack for the compact
+    /// strategy handler. The snapshot is a sequence (1..N) of
+    /// `{role = "user"|"assistant", content = "<concat text>"}` tables
+    /// where `content` is the concatenation of every `.text` block in
+    /// the original message. Non-text blocks (tool_use, tool_result,
+    /// thinking, redacted_thinking) are dropped from the snapshot.
+    /// Lossy by design: the strategy decides what stays and emits
+    /// replacement summary text rather than mutating block-shaped
+    /// history. Returns void; the table is left on top of the stack.
+    fn pushCompactMessageSnapshot(
+        lua: *Lua,
+        messages: []const types.Message,
+        scratch: Allocator,
+    ) !void {
+        lua.newTable();
+        for (messages, 0..) |msg, idx| {
+            // Per-message subtable. `role` is a fixed string; `content`
+            // is the concatenation of every text block in this message.
+            lua.newTable();
+
+            const role_str: []const u8 = switch (msg.role) {
+                .user => "user",
+                .assistant => "assistant",
+            };
+            _ = lua.pushString(role_str);
+            lua.setField(-2, "role");
+
+            var concat: std.ArrayList(u8) = .empty;
+            defer concat.deinit(scratch);
+            for (msg.content) |block| {
+                switch (block) {
+                    .text => |t| try concat.appendSlice(scratch, t.text),
+                    else => {},
+                }
+            }
+            _ = lua.pushString(concat.items);
+            lua.setField(-2, "content");
+
+            // Lua sequences are 1-indexed.
+            lua.rawSetIndex(-2, @intCast(idx + 1));
+        }
+    }
+
+    /// Decode a single `{role, content}` entry off the top of the stack
+    /// into an owned `types.Message`. Caller frees on error via
+    /// `Message.deinit` if the call returns successfully but the parent
+    /// loop later fails. Pops the entry on the way out.
+    fn decodeCompactEntry(
+        lua: *Lua,
+        allocator: Allocator,
+    ) !types.Message {
+        if (lua.typeOf(-1) != .table) {
+            log.warn(
+                "compact strategy entry is not a table (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.CompactEntryNotTable;
+        }
+
+        _ = lua.getField(-1, "role");
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .string) {
+            log.warn(
+                "compact strategy entry missing string `role` (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.CompactEntryMissingRole;
+        }
+        const role_str = lua.toString(-1) catch return error.CompactEntryReadFailed;
+        const role: types.Role = if (std.mem.eql(u8, role_str, "user"))
+            .user
+        else if (std.mem.eql(u8, role_str, "assistant"))
+            .assistant
+        else {
+            log.warn("compact strategy entry has unknown role: {s}", .{role_str});
+            return error.CompactEntryUnknownRole;
+        };
+
+        _ = lua.getField(-2, "content");
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .string) {
+            log.warn(
+                "compact strategy entry missing string `content` (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.CompactEntryMissingContent;
+        }
+        const content_str = lua.toString(-1) catch return error.CompactEntryReadFailed;
+
+        const owned_text = try allocator.dupe(u8, content_str);
+        errdefer allocator.free(owned_text);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        errdefer allocator.free(blocks);
+        blocks[0] = .{ .text = .{ .text = owned_text } };
+        return .{ .role = role, .content = blocks };
+    }
+
+    /// Run the compaction strategy on the main thread. Builds a
+    /// Lua-side context table `{tokens_used, tokens_max, messages}`,
+    /// calls the registered function via `protectedCall`, and decodes
+    /// the returned table into a duped `[]Message`.
+    ///
+    /// When no handler is registered or the handler returns nil, the
+    /// request returns with `result = null` and `error_name = null` so
+    /// the worker proceeds without compaction. A non-table non-nil
+    /// return surfaces as `error.CompactNotTable`. Caller is responsible
+    /// for `req.done.set()`.
+    pub fn handleCompactRequest(
+        self: *LuaEngine,
+        req: *agent_events.CompactRequest,
+    ) anyerror!void {
+        const fn_ref = self.compact_handler orelse return;
+
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn("compact strategy handler: registry slot is not a function", .{});
+            return;
+        }
+
+        // Context table the strategy sees: token usage scalars plus a
+        // sequence of `{role, content}` message tables. The text
+        // concatenation lives on the engine's allocator for the
+        // duration of the call; `pushString` dupes into Lua's string
+        // table so the scratch allocations are safe to drop on return.
+        lua.newTable();
+        lua.pushInteger(@intCast(req.tokens_used));
+        lua.setField(-2, "tokens_used");
+        lua.pushInteger(@intCast(req.tokens_max));
+        lua.setField(-2, "tokens_max");
+
+        try pushCompactMessageSnapshot(lua, req.messages, self.allocator);
+        lua.setField(-2, "messages");
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("compact strategy handler raised: {s}", .{err_msg});
+            lua.pop(1);
+            return error.LuaHandlerError;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return;
+        if (lua.typeOf(-1) != .table) {
+            log.warn(
+                "compact strategy handler returned non-table (type {s})",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return error.CompactNotTable;
+        }
+
+        const len = lua.rawLen(-1);
+        if (len == 0) {
+            // Empty replacement is a valid "drop everything" request,
+            // but we route it through the standard allocator so the
+            // caller's `freeResult` path stays uniform.
+            const empty = try req.allocator.alloc(types.Message, 0);
+            req.result = empty;
+            return;
+        }
+
+        var collected: std.ArrayList(types.Message) = .empty;
+        errdefer {
+            for (collected.items) |m| m.deinit(req.allocator);
+            collected.deinit(req.allocator);
+        }
+
+        for (0..len) |idx| {
+            _ = lua.rawGetIndex(-1, @intCast(idx + 1));
+            // decodeCompactEntry pops its own entry off the stack
+            // so the outer loop sees a clean top after each iteration.
+            const msg = try decodeCompactEntry(lua, req.allocator);
+            errdefer msg.deinit(req.allocator);
+            try collected.append(req.allocator, msg);
+            lua.pop(1);
+        }
+
+        req.result = try collected.toOwnedSlice(req.allocator);
+    }
+
+    /// Test-only accessor for the single global compact strategy handler ref.
+    pub fn compactHandler(self: *const LuaEngine) ?i32 {
+        return self.compact_handler;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -13034,6 +13292,217 @@ test "zag.loop.default emits reminder at the 5-call threshold" {
         },
         .abort => return error.TestUnexpectedResult,
     }
+}
+
+// -- Compaction strategy tests ---------------------------------------------
+
+test "zag.compact.strategy registers a single global handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expect(engine.compactHandler() == null);
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return nil end)
+    );
+    try std.testing.expect(engine.compactHandler() != null);
+}
+
+test "zag.compact.strategy re-registration unrefs old function" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return nil end)
+    );
+    const first = engine.compactHandler().?;
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return {} end)
+    );
+    const second = engine.compactHandler().?;
+    try std.testing.expect(first != second);
+}
+
+test "zag.compact.strategy(nil) clears the handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return nil end)
+    );
+    try std.testing.expect(engine.compactHandler() != null);
+    try engine.lua.doString("zag.compact.strategy(nil)");
+    try std.testing.expect(engine.compactHandler() == null);
+}
+
+test "zag.compact.strategy rejects non-function non-nil arg" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString("zag.compact.strategy(\"not a function\")");
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expect(engine.compactHandler() == null);
+}
+
+test "handleCompactRequest with no handler leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleCompactRequest returns null when strategy returns nil" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return nil end)
+    );
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleCompactRequest decodes returned messages" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return {
+        \\    { role = "user", content = "summary" },
+        \\    { role = "assistant", content = "ack" },
+        \\  }
+        \\end)
+    );
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 1000, 1000, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqual(@as(usize, 2), req.result.?.len);
+    try std.testing.expectEqual(types.Role.user, req.result.?[0].role);
+    try std.testing.expectEqualStrings("summary", req.result.?[0].content[0].text.text);
+    try std.testing.expectEqual(types.Role.assistant, req.result.?[1].role);
+    try std.testing.expectEqualStrings("ack", req.result.?[1].content[0].text.text);
+}
+
+test "handleCompactRequest passes tokens_used and tokens_max to ctx" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  if ctx.tokens_used == 850 and ctx.tokens_max == 1000 then
+        \\    return { { role = "user", content = "ok" } }
+        \\  end
+        \\  return nil
+        \\end)
+    );
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 850, 1000, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqualStrings("ok", req.result.?[0].content[0].text.text);
+}
+
+test "handleCompactRequest snapshots messages as concatenated text" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // Echo the first message's content back so we can assert on the
+    // concatenation. Two text blocks should join end-to-end; non-text
+    // blocks should drop entirely.
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return { { role = "user", content = ctx.messages[1].content } }
+        \\end)
+    );
+
+    var blocks_buf = [_]types.ContentBlock{
+        .{ .text = .{ .text = "first " } },
+        .{ .tool_use = .{ .id = "t1", .name = "bash", .input_raw = "{}" } },
+        .{ .text = .{ .text = "second" } },
+    };
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &blocks_buf },
+    };
+    var req = agent_events.CompactRequest.init(&messages, 0, 1, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.result != null);
+    try std.testing.expectEqualStrings("first second", req.result.?[0].content[0].text.text);
+}
+
+test "handleCompactRequest surfaces Lua handler error via errorName" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) error("nope") end)
+    );
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    defer req.freeResult();
+    try std.testing.expectError(error.LuaHandlerError, engine.handleCompactRequest(&req));
+    try std.testing.expect(req.result == null);
+}
+
+test "handleCompactRequest rejects malformed entry" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) return { { content = "missing role" } } end)
+    );
+
+    const empty: []const types.Message = &.{};
+    var req = agent_events.CompactRequest.init(empty, 100, 200, alloc);
+    defer req.freeResult();
+    try std.testing.expectError(error.CompactEntryMissingRole, engine.handleCompactRequest(&req));
+    try std.testing.expect(req.result == null);
+}
+
+test "zag.compact.strategy is not auto-loaded by builtin plugins" {
+    // PR 10 ships only the socket; the default strategy is task 10.4.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expect(engine.compactHandler() == null);
+    engine.loadBuiltinPlugins();
+    try std.testing.expect(engine.compactHandler() == null);
 }
 
 test "zag.loop.default treats a streak reset as a non-event" {
