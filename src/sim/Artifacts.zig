@@ -69,6 +69,88 @@ pub fn pathFor(self: *Artifacts, sub: []const u8) ![]u8 {
     return std.fs.path.join(self.alloc, &.{ self.dir, sub });
 }
 
+/// Tail up to `tail_log_max_lines` from the most-recent `*.log` under
+/// `<home>/.zag/logs/` into `<self.dir>/zag.log`. Best-effort: returns
+/// success when the logs directory is missing (zag never logged), and
+/// silently skips empty log files.
+pub fn tailZagLog(self: *Artifacts, home: []const u8) !void {
+    const logs_dir = try std.fs.path.join(self.alloc, &.{ home, ".zag", "logs" });
+    defer self.alloc.free(logs_dir);
+
+    var dir = std.fs.openDirAbsolute(logs_dir, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return,
+        else => return e,
+    };
+    defer dir.close();
+
+    const newest = try findNewestLog(self.alloc, dir, logs_dir);
+    const log_path = newest orelse return;
+    defer self.alloc.free(log_path);
+
+    const bytes = std.fs.cwd().readFileAlloc(self.alloc, log_path, max_log_read_bytes) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
+    defer self.alloc.free(bytes);
+
+    const tail = sliceLastLines(bytes, tail_log_max_lines);
+    const out_path = try self.pathFor("zag.log");
+    defer self.alloc.free(out_path);
+
+    const file = try std.fs.createFileAbsolute(out_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(tail);
+}
+
+/// Cap the line count we tail. The artifacts dir is meant to be skim-able;
+/// 200 lines is enough to spot the failure window and not so many that
+/// users drown in startup noise.
+const tail_log_max_lines: usize = 200;
+
+/// Hard read cap for log files. 8 MiB covers anything realistic; oversized
+/// logs get truncated to the last 8 MiB by the read, which is fine — the
+/// tailer only ever cares about the last N lines.
+const max_log_read_bytes: usize = 8 * 1024 * 1024;
+
+fn findNewestLog(alloc: std.mem.Allocator, dir: std.fs.Dir, dir_path: []const u8) !?[]u8 {
+    var it = dir.iterate();
+    var newest_path: ?[]u8 = null;
+    errdefer if (newest_path) |p| alloc.free(p);
+    var newest_mtime: i128 = std.math.minInt(i128);
+
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
+        const stat = dir.statFile(entry.name) catch continue;
+        if (stat.mtime <= newest_mtime) continue;
+
+        const full = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+        if (newest_path) |old| alloc.free(old);
+        newest_path = full;
+        newest_mtime = stat.mtime;
+    }
+    return newest_path;
+}
+
+fn sliceLastLines(bytes: []const u8, max_lines: usize) []const u8 {
+    if (bytes.len == 0) return bytes;
+    // Walk backwards counting newlines. Stop one past the (max_lines)th
+    // newline-from-the-end so the returned slice begins right after that
+    // newline.
+    var seen: usize = 0;
+    var i: usize = bytes.len;
+    while (i > 0) {
+        i -= 1;
+        if (bytes[i] != '\n') continue;
+        // Don't count a trailing newline at the very end — we want to keep
+        // the last line intact, not start counting from the empty tail.
+        if (i == bytes.len - 1) continue;
+        seen += 1;
+        if (seen == max_lines) return bytes[i + 1 ..];
+    }
+    return bytes;
+}
+
 // --- tests ------------------------------------------------------------------
 
 test "create with override uses the given dir" {
@@ -97,6 +179,71 @@ test "create without override mints a tempdir" {
     // The directory must exist on disk.
     var d = try std.fs.openDirAbsolute(a.dir, .{});
     d.close();
+}
+
+test "tailZagLog copies last N lines of newest .log" {
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+
+    try home_tmp.dir.makePath(".zag/logs");
+    var logs_dir = try home_tmp.dir.openDir(".zag/logs", .{});
+    defer logs_dir.close();
+
+    // Build 500 numbered lines so we can prove we got the last 200.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(std.testing.allocator);
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const line = try std.fmt.bufPrint(&buf, "line-{d}\n", .{i});
+        try src.appendSlice(std.testing.allocator, line);
+    }
+    try logs_dir.writeFile(.{ .sub_path = "abc.log", .data = src.items });
+
+    var artifacts_tmp = std.testing.tmpDir(.{});
+    defer artifacts_tmp.cleanup();
+    const art_path = try artifacts_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(art_path);
+
+    const artifacts = try create(std.testing.allocator, art_path);
+    defer artifacts.destroy();
+
+    const home_path = try home_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(home_path);
+
+    try artifacts.tailZagLog(home_path);
+
+    const tailed = try artifacts_tmp.dir.readFileAlloc(std.testing.allocator, "zag.log", 64 * 1024);
+    defer std.testing.allocator.free(tailed);
+
+    // Count newlines: tail file should contain exactly 200 lines.
+    var newlines: usize = 0;
+    for (tailed) |c| if (c == '\n') {
+        newlines += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 200), newlines);
+    // First line of the tail should be line-300 (500 - 200).
+    try std.testing.expect(std.mem.startsWith(u8, tailed, "line-300\n"));
+    try std.testing.expect(std.mem.endsWith(u8, tailed, "line-499\n"));
+}
+
+test "tailZagLog is a noop when logs dir is missing" {
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home_path = try home_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(home_path);
+
+    var artifacts_tmp = std.testing.tmpDir(.{});
+    defer artifacts_tmp.cleanup();
+    const art_path = try artifacts_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(art_path);
+
+    const artifacts = try create(std.testing.allocator, art_path);
+    defer artifacts.destroy();
+
+    try artifacts.tailZagLog(home_path);
+    // No zag.log should have been created.
+    try std.testing.expectError(error.FileNotFound, artifacts_tmp.dir.openFile("zag.log", .{}));
 }
 
 test "pathFor joins dir and sub" {
