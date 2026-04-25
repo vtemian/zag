@@ -531,6 +531,7 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
     }
 
     var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var line_index: usize = 0;
     while (line_iter.next()) |line| {
         if (line.len == 0) continue;
         var entry = parseEntry(line, allocator) catch continue;
@@ -538,25 +539,33 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
             entries.items[entries.items.len - 1].id
         else
             null;
-        backfillEntry(&entry, previous_id);
+        backfillEntry(&entry, previous_id, line_index);
         try entries.append(allocator, entry);
+        line_index += 1;
     }
 
     return entries.toOwnedSlice(allocator);
 }
 
 /// Fill in a synthetic ULID for any entry loaded from a pre-migration JSONL
-/// row that never wrote an `id` field. The seed is the entry's own
-/// timestamp so loading the same file twice produces the same synthetic id,
-/// which keeps downstream tools (e.g. `jq -r .id`) stable across runs.
+/// row that never wrote an `id` field. The seed mixes the entry's own
+/// timestamp with its line index in the file so two rows persisted in the
+/// same millisecond receive distinct synthetic ids. Loading the same file
+/// twice still produces the same synthetic id for each row, which keeps
+/// downstream tools (e.g. `jq -r .id`) stable across runs.
 ///
 /// When `parent_id` is missing we chain it to the previous entry's id in
 /// linear load order, matching the implicit parent chain that existed
 /// before the schema gained explicit parents. Synthetic values never get
 /// written back to disk; they live only in the returned slice.
-fn backfillEntry(entry: *Entry, previous_id: ?ulid.Ulid) void {
+fn backfillEntry(entry: *Entry, previous_id: ?ulid.Ulid, line_index: usize) void {
     if (isZeroUlid(entry.id)) {
-        const seed: u64 = @bitCast(entry.timestamp);
+        const ts_seed: u64 = @bitCast(entry.timestamp);
+        // Hash-mix line index into the seed: an XOR alone collides for
+        // pathological line/timestamp combinations, while wrapping
+        // multiplication by a large odd constant scrambles the bit
+        // pattern enough to keep adjacent line indexes far apart.
+        const seed: u64 = ts_seed ^ (@as(u64, line_index) *% 0x9E3779B97F4A7C15);
         var rng = std.Random.DefaultPrng.init(seed);
         const ms: u64 = @intCast(@max(entry.timestamp, 0));
         entry.id = ulid.generateAt(ms, rng.random());
@@ -1954,4 +1963,44 @@ test "tool_call and tool_result round-trip tool_use_id and tool_input via loadEn
 
     // The cross-reference is the whole point: tool_result -> tool_call.
     try std.testing.expectEqualStrings(call_entry.tool_use_id.?, result_entry.tool_use_id.?);
+}
+
+test "backfillEntry mixes line index into seed to avoid same-ms collisions" {
+    // Two old-format rows persisted in the same millisecond would seed
+    // the synthetic-ULID PRNG identically, producing identical ids and
+    // breaking parent_id chains and any downstream id-keyed lookup.
+    // Mixing the line index into the seed makes synthetic ids collision
+    // free for any pair of rows in the same file.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try std.fs.cwd().makePath(sessions_dir);
+
+    const session_id = "samems0000000000";
+    var path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
+
+    // Two id-less rows with the same timestamp.
+    const same_ms_body =
+        "{\"type\":\"user_message\",\"content\":\"a\",\"ts\":1000}\n" ++
+        "{\"type\":\"user_message\",\"content\":\"b\",\"ts\":1000}\n";
+    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = same_ms_body });
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expect(!isZeroUlid(loaded[0].id));
+    try std.testing.expect(!isZeroUlid(loaded[1].id));
+    try std.testing.expect(!std.mem.eql(u8, &loaded[0].id, &loaded[1].id));
 }
