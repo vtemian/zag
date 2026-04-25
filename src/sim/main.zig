@@ -9,6 +9,7 @@
 const std = @import("std");
 const Scenario = @import("Scenario.zig");
 const Runner = @import("Runner.zig");
+const Artifacts = @import("Artifacts.zig");
 
 comptime {
     _ = @import("Pty.zig");
@@ -21,6 +22,7 @@ comptime {
     _ = @import("MockServer.zig");
     _ = @import("MockScript.zig");
     _ = @import("ConfigScaffold.zig");
+    _ = @import("Artifacts.zig");
     _ = @import("phase1_e2e_test.zig");
 }
 
@@ -89,22 +91,14 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return exit_harness_error;
     };
 
-    // Resolve artifacts dir: honor --artifacts if provided, else mint a
-    // per-run tmpdir under $TMPDIR (fallback /tmp). Phase 4 owns cleanup.
-    var artifacts_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const artifacts_dir = if (artifacts_override) |d| blk: {
-        std.fs.cwd().makePath(d) catch |e| {
-            reportFmt("zag-sim run: cannot create artifacts dir '{s}': {s}\n", .{ d, @errorName(e) });
-            return exit_harness_error;
-        };
-        break :blk d;
-    } else defaultArtifactsDir(&artifacts_buf) catch |e| {
-        reportFmt("zag-sim run: cannot create default artifacts dir: {s}\n", .{@errorName(e)});
+    const artifacts = Artifacts.create(alloc, artifacts_override) catch |e| {
+        reportFmt("zag-sim run: cannot create artifacts dir: {s}\n", .{@errorName(e)});
         return exit_harness_error;
     };
+    defer artifacts.destroy();
 
     const result = Scenario.runFile(alloc, path, .{
-        .artifacts_dir = artifacts_dir,
+        .artifacts = artifacts,
         .mock_script_path = mock_script_path,
     }) catch |e| {
         reportFmt("zag-sim run: {s}: {s}\n", .{ path, @errorName(e) });
@@ -120,17 +114,6 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     };
     _ = stdoutFile().write(line) catch {};
     return code;
-}
-
-/// Mint a unique directory under `$TMPDIR` (fallback `/tmp`) and return a
-/// slice into `buf`. The directory is created; cleanup is a phase-4 concern.
-fn defaultArtifactsDir(buf: []u8) ![]const u8 {
-    const tmp_root = std.posix.getenv("TMPDIR") orelse "/tmp";
-    const pid: i32 = @intCast(std.c.getpid());
-    const ts = std.time.milliTimestamp();
-    const path = try std.fmt.bufPrint(buf, "{s}/zag-sim-{d}-{d}", .{ tmp_root, pid, ts });
-    try std.fs.cwd().makePath(path);
-    return path;
 }
 
 fn printUsage(file: std.fs.File) void {

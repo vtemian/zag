@@ -7,6 +7,7 @@ const Args = @import("Args.zig");
 const MockServer = @import("MockServer.zig");
 const MockScript = @import("MockScript.zig");
 const ConfigScaffold = @import("ConfigScaffold.zig");
+const Artifacts = @import("Artifacts.zig");
 
 pub const Outcome = enum(u8) {
     pass = 0,
@@ -187,10 +188,12 @@ pub const Runner = struct {
         if (std.mem.indexOf(u8, dump, pattern) == null) return error.ExpectTextNotFound;
     }
 
-    pub fn executeSnapshot(self: *Runner, label: []const u8, artifacts_dir: []const u8) !void {
+    pub fn executeSnapshot(self: *Runner, label: []const u8, artifacts: *Artifacts) !void {
         const dump = try self.grid.plainText();
         defer self.alloc.free(dump);
-        const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}.grid", .{ artifacts_dir, label });
+        const sub = try std.fmt.allocPrint(self.alloc, "{s}.grid", .{label});
+        defer self.alloc.free(sub);
+        const path = try artifacts.pathFor(sub);
         defer self.alloc.free(path);
         const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
         defer file.close();
@@ -292,16 +295,19 @@ test "executeExpectText fails when pattern absent and passes when present" {
     try std.testing.expectError(error.ExpectTextNotFound, r.executeExpectText("/xyz/"));
 }
 
-test "executeSnapshot writes grid dump to artifacts_dir" {
+test "executeSnapshot writes grid dump to artifacts dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
 
+    const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
+    defer artifacts.destroy();
+
     var r = try Runner.init(std.testing.allocator);
     defer r.deinit();
     r.grid.feed("snapshot body");
-    try r.executeSnapshot("shot1", dir_path);
+    try r.executeSnapshot("shot1", artifacts);
 
     const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "shot1.grid", 64 * 1024);
     defer std.testing.allocator.free(contents);
