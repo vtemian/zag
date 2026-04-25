@@ -1776,6 +1776,9 @@ test "drainPane snaps the heap viewport on extra panes" {
 
     var session_mgr: ?Session.SessionManager = null;
 
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
     wm.* = .{
@@ -1790,7 +1793,7 @@ test "drainPane snaps the heap viewport on extra panes" {
         .wake_write_fd = 0,
         .node_registry = NodeRegistry.init(allocator),
         .buffer_registry = BufferRegistry.init(allocator),
-        .command_registry = CommandRegistry.init(allocator),
+        .command_registry = &command_registry,
     };
     defer wm.deinit();
 
