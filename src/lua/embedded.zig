@@ -32,6 +32,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.layers.env", .code = @embedFile("zag/layers/env.lua") },
     .{ .name = "zag.layers.agents_md", .code = @embedFile("zag/layers/agents_md.lua") },
     .{ .name = "zag.jit.agents_md", .code = @embedFile("zag/jit/agents_md.lua") },
+    .{ .name = "zag.loop.default", .code = @embedFile("zag/loop/default.lua") },
     .{ .name = "zag.prompt", .code = @embedFile("zag/prompt/init.lua") },
     .{ .name = "zag.prompt.anthropic", .code = @embedFile("zag/prompt/anthropic.lua") },
     .{ .name = "zag.prompt.openai-codex", .code = @embedFile("zag/prompt/openai-codex.lua") },
@@ -50,7 +51,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 20), entries.len);
+    try std.testing.expectEqual(@as(usize, 21), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -117,6 +118,15 @@ test "find returns the entry for the bash_trim transform" {
     const e = find("zag.transforms.bash_trim").?;
     try std.testing.expectEqualStrings("zag.transforms.bash_trim", e.name);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tool.transform_output(\"bash\"") != null);
+}
+
+test "find returns the entry for the default loop detector" {
+    const e = find("zag.loop.default").?;
+    try std.testing.expectEqualStrings("zag.loop.default", e.name);
+    // Default detector calls `zag.loop.detect` and flags at the lenient
+    // 5-identical-call threshold.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.loop.detect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "identical_streak >= 5") != null);
 }
 
 test {
