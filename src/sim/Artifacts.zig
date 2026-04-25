@@ -74,23 +74,8 @@ pub fn pathFor(self: *Artifacts, sub: []const u8) ![]u8 {
 /// success when the logs directory is missing (zag never logged), and
 /// silently skips empty log files.
 pub fn tailZagLog(self: *Artifacts, home: []const u8) !void {
-    const logs_dir = try std.fs.path.join(self.alloc, &.{ home, ".zag", "logs" });
-    defer self.alloc.free(logs_dir);
-
-    var dir = std.fs.openDirAbsolute(logs_dir, .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound, error.NotDir => return,
-        else => return e,
-    };
-    defer dir.close();
-
-    const newest = try findNewestLog(self.alloc, dir, logs_dir);
-    const log_path = newest orelse return;
-    defer self.alloc.free(log_path);
-
-    const bytes = std.fs.cwd().readFileAlloc(self.alloc, log_path, max_log_read_bytes) catch |e| switch (e) {
-        error.FileNotFound => return,
-        else => return e,
-    };
+    const bytes_opt = try readNewestLog(self.alloc, home);
+    const bytes = bytes_opt orelse return;
     defer self.alloc.free(bytes);
 
     const tail = sliceLastLines(bytes, tail_log_max_lines);
@@ -100,6 +85,29 @@ pub fn tailZagLog(self: *Artifacts, home: []const u8) !void {
     const file = try std.fs.createFileAbsolute(out_path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(tail);
+}
+
+/// Read the most-recent `*.log` under `<home>/.zag/logs/`. Returns null
+/// when no logs exist or the dir is missing. Caller owns the returned
+/// bytes. Truncates at `max_log_read_bytes` from the end.
+pub fn readNewestLog(alloc: std.mem.Allocator, home: []const u8) !?[]u8 {
+    const logs_dir = try std.fs.path.join(alloc, &.{ home, ".zag", "logs" });
+    defer alloc.free(logs_dir);
+
+    var dir = std.fs.openDirAbsolute(logs_dir, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    defer dir.close();
+
+    const newest = try findNewestLog(alloc, dir, logs_dir);
+    const log_path = newest orelse return null;
+    defer alloc.free(log_path);
+
+    return std.fs.cwd().readFileAlloc(alloc, log_path, max_log_read_bytes) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => e,
+    };
 }
 
 /// Cap the line count we tail. The artifacts dir is meant to be skim-able;
@@ -132,7 +140,7 @@ fn findNewestLog(alloc: std.mem.Allocator, dir: std.fs.Dir, dir_path: []const u8
     return newest_path;
 }
 
-fn sliceLastLines(bytes: []const u8, max_lines: usize) []const u8 {
+pub fn sliceLastLines(bytes: []const u8, max_lines: usize) []const u8 {
     if (bytes.len == 0) return bytes;
     // Walk backwards counting newlines. Stop one past the (max_lines)th
     // newline-from-the-end so the returned slice begins right after that

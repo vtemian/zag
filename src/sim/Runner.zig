@@ -261,10 +261,10 @@ pub const Runner = struct {
         try body.appendSlice(self.alloc, grid_dump);
         try body.appendSlice(self.alloc, "\nlast log lines:\n");
         if (self.mock) |h| {
-            const log_path_opt = readNewestLog(self.alloc, h.tmp_root) catch null;
-            if (log_path_opt) |log_bytes| {
+            const log_bytes_opt = Artifacts.readNewestLog(self.alloc, h.tmp_root) catch null;
+            if (log_bytes_opt) |log_bytes| {
                 defer self.alloc.free(log_bytes);
-                const tail = sliceLastLinesPub(log_bytes, crash_log_tail_lines);
+                const tail = Artifacts.sliceLastLines(log_bytes, crash_log_tail_lines);
                 try body.appendSlice(self.alloc, tail);
             }
         }
@@ -342,57 +342,6 @@ fn formatExit(code: u8) []const u8 {
 
 fn formatSignal(sig: u32) []const u8 {
     return std.fmt.bufPrint(&status_scratch, "signal {d}", .{sig}) catch "signal ?";
-}
-
-/// Read the most-recent `*.log` under `<home>/.zag/logs/`. Returns null
-/// when no logs exist or the dir is missing. Caller owns the returned
-/// bytes.
-fn readNewestLog(alloc: std.mem.Allocator, home: []const u8) !?[]u8 {
-    const logs_dir = try std.fs.path.join(alloc, &.{ home, ".zag", "logs" });
-    defer alloc.free(logs_dir);
-
-    var dir = std.fs.openDirAbsolute(logs_dir, .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound, error.NotDir => return null,
-        else => return e,
-    };
-    defer dir.close();
-
-    var it = dir.iterate();
-    var newest_path: ?[]u8 = null;
-    errdefer if (newest_path) |p| alloc.free(p);
-    var newest_mtime: i128 = std.math.minInt(i128);
-
-    while (try it.next()) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
-        const stat = dir.statFile(entry.name) catch continue;
-        if (stat.mtime <= newest_mtime) continue;
-        const full = try std.fs.path.join(alloc, &.{ logs_dir, entry.name });
-        if (newest_path) |old| alloc.free(old);
-        newest_path = full;
-        newest_mtime = stat.mtime;
-    }
-
-    const path = newest_path orelse return null;
-    defer alloc.free(path);
-    return try std.fs.cwd().readFileAlloc(alloc, path, 8 * 1024 * 1024);
-}
-
-/// Same byte-walk-from-end logic as Artifacts.sliceLastLines. Duplicated
-/// here so Runner doesn't need a dep on Artifacts internals; it's eight
-/// lines and the alternative is exposing more surface from Artifacts.
-fn sliceLastLinesPub(bytes: []const u8, max_lines: usize) []const u8 {
-    if (bytes.len == 0) return bytes;
-    var seen: usize = 0;
-    var i: usize = bytes.len;
-    while (i > 0) {
-        i -= 1;
-        if (bytes[i] != '\n') continue;
-        if (i == bytes.len - 1) continue;
-        seen += 1;
-        if (seen == max_lines) return bytes[i + 1 ..];
-    }
-    return bytes;
 }
 
 /// Mint a fresh `<TMPDIR>/zag-sim-<pid>-<ts>` directory. Caller owns the
