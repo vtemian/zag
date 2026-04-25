@@ -469,6 +469,53 @@ fn firePostHook(
     };
 }
 
+/// Fire `zag.context.on_tool_result` for one tool call and block on a
+/// main-thread round-trip. Mirrors `firePostHook`'s cancel-poll cadence.
+/// Returns the duped attachment string (caller owns) or null when no
+/// handler is registered, the handler returned nil, or the handler
+/// errored. Skips the round-trip entirely when no handler is registered
+/// for `tc.name` so the no-op fast path stays cheap.
+fn fireJitContextRequest(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    tc: types.ContentBlock.ToolUse,
+    output: []const u8,
+    is_error: bool,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !?[]u8 {
+    const engine = lua_engine orelse return null;
+    if (engine.jit_context_handlers.count() == 0) return null;
+    if (!engine.jit_context_handlers.contains(tc.name)) return null;
+
+    var req = agent_events.JitContextRequest.init(
+        tc.name,
+        tc.input_raw,
+        output,
+        is_error,
+        allocator,
+    );
+    // Queue-full means the main loop is saturated; skip the round-trip
+    // rather than parking on `done` that nobody will signal.
+    queue.push(.{ .jit_context_request = &req }) catch return null;
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                if (req.result) |attached| allocator.free(attached);
+                return error.Cancelled;
+            }
+        }
+    }
+    if (req.error_name) |name| {
+        log.warn("jit context handler '{s}' failed: {s}", .{ tc.name, name });
+        if (req.result) |attached| allocator.free(attached);
+        return null;
+    }
+    return req.result;
+}
+
 /// Run one tool call's full pipeline: check cancel, fire ToolPre,
 /// push tool_start, execute the tool (or synthesize a veto result),
 /// push tool_result. Tool execution errors are captured as error
@@ -561,6 +608,22 @@ fn runToolStep(
                 final = .{ .content = rewrite, .is_error = final.is_error, .owned = true };
             }
             if (post.is_error_rewrite) |b| final.is_error = b;
+
+            // JIT context attachment: a registered Lua handler can return
+            // a string to append under the tool result (e.g. AGENTS.md
+            // walked up from the read path). The combined buffer replaces
+            // `final.content` so both the conversation history and the
+            // queued tool_result event carry the augmented text.
+            if (try fireJitContextRequest(lua_engine, tc, final.content, final.is_error, allocator, queue, cancel)) |attached| {
+                defer allocator.free(attached);
+                const combined = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n\n{s}",
+                    .{ final.content, attached },
+                );
+                if (final.owned) allocator.free(final.content);
+                final = .{ .content = combined, .is_error = final.is_error, .owned = true };
+            }
 
             const result_content = try allocator.dupe(u8, final.content);
             errdefer allocator.free(result_content);
@@ -1397,6 +1460,195 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
             try std.testing.expectEqualStrings("call_2", tr.tool_use_id);
             try std.testing.expect(!tr.is_error);
             try std.testing.expectEqualStrings("REDACTED", tr.content);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "jit context handler appends content to tool result" {
+    const AgentRunner = @import("AgentRunner.zig");
+    const read_tool = @import("tools/read.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(result)
+        \\  return "Instructions: foo"
+        \\end)
+    );
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(read_tool.tool);
+
+    const tmp = "zag-jit-attach-e2e.txt";
+    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "hello jit" });
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_jit", .name = "read", .input_raw = "{\"path\":\"zag-jit-attach-e2e.txt\"}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expectEqualStrings("call_jit", tr.tool_use_id);
+            try std.testing.expect(!tr.is_error);
+            try std.testing.expect(std.mem.endsWith(u8, tr.content, "\n\nInstructions: foo"));
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "hello jit") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "no jit handler registered leaves tool result untouched" {
+    const AgentRunner = @import("AgentRunner.zig");
+    const read_tool = @import("tools/read.zig");
+    const alloc = std.testing.allocator;
+
+    // Engine with no jit handler registered. The fast path in
+    // fireJitContextRequest should skip the round-trip entirely.
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(read_tool.tool);
+
+    const tmp = "zag-jit-noop-e2e.txt";
+    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "untouched" });
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_noop", .name = "read", .input_raw = "{\"path\":\"zag-jit-noop-e2e.txt\"}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "untouched") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "Instructions:") == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "jit handler returning nil leaves tool result untouched" {
+    const AgentRunner = @import("AgentRunner.zig");
+    const read_tool = @import("tools/read.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // Handler registered but returns nil for every call.
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(result)
+        \\  return nil
+        \\end)
+    );
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(read_tool.tool);
+
+    const tmp = "zag-jit-nil-e2e.txt";
+    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "passthrough" });
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_nil", .name = "read", .input_raw = "{\"path\":\"zag-jit-nil-e2e.txt\"}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "passthrough") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "\n\n") == null);
         },
         else => return error.TestUnexpectedResult,
     }
