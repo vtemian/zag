@@ -51,6 +51,32 @@ pub const Skill = struct {
     }
 };
 
+/// Process-wide latch: set the first time `catalog` runs against a
+/// registry whose skills declare `allowed-tools` frontmatter. The field
+/// is parsed and stored, but the v1 dispatcher does not enforce it; we
+/// surface the gap once instead of pretending the constraint is live.
+var warned_about_ignored_allowed_tools = std.atomic.Value(bool).init(false);
+
+fn warnAboutIgnoredAllowedToolsOnce(registry: *const SkillRegistry) void {
+    if (warned_about_ignored_allowed_tools.swap(true, .acq_rel)) return;
+    var ignored: usize = 0;
+    var first_name: ?[]const u8 = null;
+    for (registry.skills.items) |skill| {
+        if (skill.allowed_tools != null) {
+            if (first_name == null) first_name = skill.name;
+            ignored += 1;
+        }
+    }
+    if (ignored == 0) return;
+    log.warn(
+        "{d} registered skill(s) declare an `allowed-tools` frontmatter field, " ++
+            "but the v1 tool dispatcher does not enforce it. " ++
+            "First example: '{s}'. Track follow-up at " ++
+            "https://github.com/vtemian/zag/issues (per-skill tool gating).",
+        .{ ignored, first_name orelse "" },
+    );
+}
+
 pub const SkillRegistry = struct {
     skills: std.ArrayListUnmanaged(Skill) = .empty,
 
@@ -87,6 +113,8 @@ pub const SkillRegistry = struct {
     /// the output unconditionally.
     pub fn catalog(self: *const SkillRegistry, writer: anytype) !void {
         if (self.skills.items.len == 0) return;
+
+        warnAboutIgnoredAllowedToolsOnce(self);
 
         try writer.writeAll("<available_skills>\n");
         for (self.skills.items) |skill| {
@@ -454,4 +482,48 @@ test "catalog is empty when no skills" {
     var fbs = std.io.fixedBufferStream(&buf);
     try registry.catalog(fbs.writer());
     try testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+}
+
+test "warnAboutIgnoredAllowedToolsOnce skips when no skill declares allowed-tools" {
+    const alloc = testing.allocator;
+
+    warned_about_ignored_allowed_tools.store(false, .release);
+
+    var registry: SkillRegistry = .{};
+    defer registry.deinit(alloc);
+
+    const name = try alloc.dupe(u8, "plain");
+    const desc = try alloc.dupe(u8, "no allow-list");
+    const path = try alloc.dupe(u8, "/abs/SKILL.md");
+    try registry.skills.append(alloc, .{ .name = name, .description = desc, .path = path });
+
+    warnAboutIgnoredAllowedToolsOnce(&registry);
+    try testing.expect(warned_about_ignored_allowed_tools.load(.acquire));
+}
+
+test "warnAboutIgnoredAllowedToolsOnce fires at most once" {
+    const alloc = testing.allocator;
+
+    warned_about_ignored_allowed_tools.store(false, .release);
+
+    var registry: SkillRegistry = .{};
+    defer registry.deinit(alloc);
+
+    const name = try alloc.dupe(u8, "gated");
+    const desc = try alloc.dupe(u8, "declares allow-list");
+    const path = try alloc.dupe(u8, "/abs/SKILL.md");
+    const allow = try alloc.dupe(u8, "read, grep");
+    try registry.skills.append(alloc, .{
+        .name = name,
+        .description = desc,
+        .path = path,
+        .allowed_tools = allow,
+    });
+
+    warnAboutIgnoredAllowedToolsOnce(&registry);
+    try testing.expect(warned_about_ignored_allowed_tools.load(.acquire));
+
+    // Latch is set; second call must short-circuit.
+    warnAboutIgnoredAllowedToolsOnce(&registry);
+    try testing.expect(warned_about_ignored_allowed_tools.load(.acquire));
 }
