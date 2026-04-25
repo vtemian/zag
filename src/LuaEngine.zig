@@ -11917,9 +11917,11 @@ test "zag.prompt.resolve maps known model ids to the right pack module" {
     // side effect of layer registration.
     try engine.lua.doString(
         \\local d = require("zag.prompt")
-        \\_claude   = d.resolve("claude-sonnet-4-6")
-        \\_codex    = d.resolve("gpt-5-codex")
-        \\_unknown  = d.resolve("groq/llama-3.1-70b")
+        \\_claude       = d.resolve("claude-sonnet-4-6")
+        \\_codex        = d.resolve("gpt-5-codex")
+        \\_qwen_short   = d.resolve("qwen3-coder-30b")
+        \\_qwen_instruct = d.resolve("ollama/qwen3-coder-30b-instruct")
+        \\_unknown      = d.resolve("groq/llama-3.1-70b")
     );
 
     _ = try engine.lua.getGlobal("_claude");
@@ -11928,6 +11930,14 @@ test "zag.prompt.resolve maps known model ids to the right pack module" {
 
     _ = try engine.lua.getGlobal("_codex");
     try std.testing.expectEqualStrings("zag.prompt.openai-codex", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_qwen_short");
+    try std.testing.expectEqualStrings("zag.prompt.qwen3-coder", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("_qwen_instruct");
+    try std.testing.expectEqualStrings("zag.prompt.qwen3-coder", try engine.lua.toString(-1));
     engine.lua.pop(1);
 
     _ = try engine.lua.getGlobal("_unknown");

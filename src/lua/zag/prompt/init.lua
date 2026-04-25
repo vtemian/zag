@@ -23,6 +23,7 @@ M.PACKS = {
   { pattern = "anthropic",     module = "zag.prompt.anthropic" },
   { pattern = "claude",        module = "zag.prompt.anthropic" },
   { pattern = "gpt%-5%-codex", module = "zag.prompt.openai-codex" },
+  { pattern = "qwen3%-coder",  module = "zag.prompt.qwen3-coder" },
   { pattern = ".*",            module = "zag.prompt.default" },
 }
 
