@@ -97,16 +97,12 @@ pub fn build(b: *std.Build) void {
     const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag");
     sim_e2e_step.dependOn(b.getInstallStep()); // ensures both zag and zag-sim are built
 
-    // Reproducer: a normal chat turn used to crash the agent runner during
-    // EventQueue.deinit on .done. As of 2026-04-23 the scenario can't
-    // actually reach .done because of an input-pacing race in the harness
-    // (only the first byte of `send "hello" <Enter>` lands), so it times
-    // out at `wait_exit` and exits 1 (assertion_failed). The exit code is
-    // pinned at 1 today so a green CI doesn't lie about the reproducer
-    // status. See `src/sim/scenarios/segfault_normal_chat.zsm` for the
-    // full diagnosis and the bump path: when input pacing is fixed, flip
-    // this to 2 (still crashes) or 0 (silently fixed) depending on what
-    // the run actually does.
+    // Regression guard for the contentLengthStream panic discovered via
+    // the TUI simulator on 2026-04-23 and fixed in src/llm/streaming.zig.
+    // Drives a chat turn through the mock provider, then `/quit`s zag.
+    // A regression that re-introduces a crash on the streaming-read path
+    // would write a crash.txt to the artifacts dir; a regression that
+    // hangs the agent would make `wait_exit` time out and exit 1.
     const e2e_segfault = b.addRunArtifact(sim_exe);
     e2e_segfault.addArgs(&.{
         "run",
@@ -116,7 +112,7 @@ pub fn build(b: *std.Build) void {
         "--mock={s}",
         .{b.path("src/sim/scenarios/segfault_normal_chat.mock.json").getPath(b)},
     ));
-    e2e_segfault.expectExitCode(1);
+    e2e_segfault.expectExitCode(0);
     e2e_segfault.step.dependOn(b.getInstallStep());
     sim_e2e_step.dependOn(&e2e_segfault.step);
 

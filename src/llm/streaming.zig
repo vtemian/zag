@@ -52,6 +52,18 @@ pub const StreamingResponse = struct {
     /// pointer into this buffer, which is why the struct must be pinned.
     transfer_buf: [8192]u8,
 
+    /// True after the body reader has reported EndOfStream once. Subsequent
+    /// reads must NOT call back into the reader's stream vtable, because
+    /// std.http.contentLengthStream (Zig 0.15.2) accesses
+    /// `reader.state.body_remaining_content_length` without checking the
+    /// active union variant — once state has transitioned to `.ready` (which
+    /// happens automatically when the body is fully drained), calling stream
+    /// again panics in safe builds with "access of union field
+    /// 'body_remaining_content_length' while field 'ready' is active". The
+    /// chunkedStream sibling handles `.ready` correctly; contentLengthStream
+    /// does not. File upstream when you have a minute.
+    body_done: bool = false,
+
     /// Accumulates partial lines across network reads.
     pending_line: std.ArrayList(u8),
     /// Leftover bytes after a newline that belong to subsequent lines.
@@ -78,6 +90,7 @@ pub const StreamingResponse = struct {
             .pending_line = .empty,
             .remainder = .empty,
             .allocator = allocator,
+            .body_done = false,
         };
         errdefer self.client.deinit();
 
@@ -213,8 +226,7 @@ pub const StreamingResponse = struct {
                 if (flag.load(.acquire)) return error.Cancelled;
             }
             var chunk: [4096]u8 = undefined;
-            const n = self.body_reader.readSliceShort(&chunk) catch
-                return error.ApiError;
+            const n = self.readChunk(&chunk) catch return error.ApiError;
             if (n == 0) {
                 // End of stream.
                 if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
@@ -239,6 +251,25 @@ pub const StreamingResponse = struct {
             // No newline yet; accumulate and keep reading.
             try self.appendToPendingLine(received);
         }
+    }
+
+    /// Read up to chunk.len bytes from the body reader. Single-shot: calls
+    /// the body reader's stream vtable at most once. After observing
+    /// EndOfStream, sets body_done and returns 0 on subsequent calls
+    /// without re-entering stdlib (which would panic on contentLengthStream
+    /// — see the comment on body_done).
+    fn readChunk(self: *StreamingResponse, chunk: []u8) !usize {
+        if (self.body_done) return 0;
+        var writer: std.Io.Writer = .fixed(chunk);
+        const n = self.body_reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+            error.EndOfStream => {
+                self.body_done = true;
+                return 0;
+            },
+            error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
+            error.ReadFailed => return error.ApiError,
+        };
+        return n;
     }
 
     /// Append bytes to `pending_line` with a hard cap. Returns SseLineTooLong
