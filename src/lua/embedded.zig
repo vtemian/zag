@@ -31,6 +31,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.subagents.filesystem", .code = @embedFile("zag/subagents/filesystem.lua") },
     .{ .name = "zag.layers.env", .code = @embedFile("zag/layers/env.lua") },
     .{ .name = "zag.prompt", .code = @embedFile("zag/prompt/init.lua") },
+    .{ .name = "zag.prompt.anthropic", .code = @embedFile("zag/prompt/anthropic.lua") },
 };
 
 /// Find an entry by its dotted module name. Returns null if not found.
@@ -43,7 +44,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 13), entries.len);
+    try std.testing.expectEqual(@as(usize, 14), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -68,6 +69,14 @@ test "find returns the entry for the prompt dispatcher" {
     try std.testing.expectEqualStrings("zag.prompt", e.name);
     // Dispatcher installs a catch-all via `zag.prompt.for_model`.
     try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.prompt.for_model") != null);
+}
+
+test "find returns the entry for the anthropic prompt pack" {
+    const e = find("zag.prompt.anthropic").?;
+    try std.testing.expectEqualStrings("zag.prompt.anthropic", e.name);
+    // Pack module exposes M.render and the Claude identity line.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.render") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "running with Claude") != null);
 }
 
 test {
