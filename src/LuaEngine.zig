@@ -11650,6 +11650,54 @@ test "zag.jit.agents_md dedups within a turn" {
     try std.testing.expect(req_b.result == null);
 }
 
+test "zag.jit.agents_md re-attaches across turn boundaries" {
+    // Same parent dir read twice in two different turns: dedup must NOT
+    // span turns, so the TurnEnd hook clears `seen_this_turn` and the
+    // second turn's read sees the instructions again.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD." });
+    try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.jit.agents_md')");
+
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input_a = try std.fmt.bufPrint(&input_buf, "{{\"path\": \"{s}/a.go\"}}", .{root});
+    var req_a = agent_events.JitContextRequest.init("read", input_a, "package a", false, alloc);
+    try engine.handleJitContextRequest(&req_a);
+    defer if (req_a.result) |s| alloc.free(s);
+    try std.testing.expect(req_a.result != null);
+
+    // Fire TurnEnd: the JIT layer's hook callback runs on the main
+    // thread and clears `seen_this_turn`.
+    var turn_end: Hooks.HookPayload = .{ .turn_end = .{
+        .turn_num = 1,
+        .stop_reason = "end_turn",
+        .input_tokens = 0,
+        .output_tokens = 0,
+    } };
+    _ = try engine.fireHook(&turn_end);
+
+    var input_buf2: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input_b = try std.fmt.bufPrint(&input_buf2, "{{\"path\": \"{s}/b.go\"}}", .{root});
+    var req_b = agent_events.JitContextRequest.init("read", input_b, "package b", false, alloc);
+    try engine.handleJitContextRequest(&req_b);
+    defer if (req_b.result) |s| alloc.free(s);
+
+    // New turn => dedup table is empty => AGENTS.md re-attaches.
+    try std.testing.expect(req_b.result != null);
+    try std.testing.expect(std.mem.indexOf(u8, req_b.result.?, "AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req_b.result.?, "Use TDD.") != null);
+}
+
 test "zag.jit.agents_md skips when ctx.is_error is true" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);

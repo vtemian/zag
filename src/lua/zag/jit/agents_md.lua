@@ -15,13 +15,18 @@
 --
 -- Per-turn dedup: `seen_this_turn` keeps the same instruction file from
 -- being attached twice in the same turn when the agent reads several
--- files under the same parent. Task 8.4 will hook turn_end to clear it.
+-- files under the same parent. The TurnEnd hook below clears the table
+-- at the boundary so the next turn starts fresh.
 --
 -- Path extraction is a Lua pattern rather than a JSON parser because
 -- the read tool's input schema is fixed at `{"path": "..."}`. When a
 -- real JSON binding lands in Lua we can swap it in place.
 
 local seen_this_turn = {}
+
+zag.hook("TurnEnd", function()
+  seen_this_turn = {}
+end)
 
 local function extract_path(input)
   if type(input) ~= "string" then return nil end
