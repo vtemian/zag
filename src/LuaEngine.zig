@@ -368,10 +368,11 @@ pub const LuaEngine = struct {
     }
 
     /// Require every embedded `zag.builtin.*`, `zag.layers.*`,
-    /// `zag.jit.*`, and the `zag.prompt` dispatcher so the side effects
-    /// (slash command registrations, keymap bindings, prompt layer
-    /// registrations, JIT context handlers) land in the engine's
-    /// registries. Must be called before `loadUserConfig` so a user's
+    /// `zag.jit.*`, `zag.loop.*`, and the `zag.prompt` dispatcher so the
+    /// side effects (slash command registrations, keymap bindings,
+    /// prompt layer registrations, JIT context handlers, loop detector
+    /// handlers) land in the engine's registries. Must be called before
+    /// `loadUserConfig` so a user's
     /// overrides win via the command registry's last-write-wins
     /// semantics and so that stable-class prompt layers register before
     /// the user's config has a chance to trigger the first render.
@@ -392,8 +393,9 @@ pub const LuaEngine = struct {
             const is_builtin = std.mem.startsWith(u8, entry.name, "zag.builtin.");
             const is_layer = std.mem.startsWith(u8, entry.name, "zag.layers.");
             const is_jit = std.mem.startsWith(u8, entry.name, "zag.jit.");
+            const is_loop = std.mem.startsWith(u8, entry.name, "zag.loop.");
             const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
-            if (!is_builtin and !is_layer and !is_jit and !is_prompt_dispatcher) continue;
+            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_prompt_dispatcher) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -12980,4 +12982,80 @@ test "handleLoopDetectRequest passes is_error and identical_streak to ctx" {
     try engine.handleLoopDetectRequest(&req);
     try std.testing.expect(req.result != null);
     try std.testing.expectEqual(agent_events.LoopAction.abort, req.result.?);
+}
+
+test "loadBuiltinPlugins eager-loads zag.loop.* entries" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expect(engine.loopDetectHandler() == null);
+    engine.loadBuiltinPlugins();
+    // The default detector module registers exactly one global handler.
+    try std.testing.expect(engine.loopDetectHandler() != null);
+}
+
+test "zag.loop.default does not act before the 5-call threshold" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.loop.default')");
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{\"cmd\":\"ls\"}", false, 4, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "zag.loop.default emits reminder at the 5-call threshold" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.loop.default')");
+
+    var req = agent_events.LoopDetectRequest.init("bash", "{\"cmd\":\"ls\"}", false, 5, alloc);
+    defer req.freeResult();
+    try engine.handleLoopDetectRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    switch (req.result.?) {
+        .reminder => |text| {
+            // The default text names the offending tool and the streak
+            // count so the agent sees the same diagnostic the user would.
+            try std.testing.expect(std.mem.indexOf(u8, text, "bash") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "5x") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "Try a different approach or stop.") != null);
+        },
+        .abort => return error.TestUnexpectedResult,
+    }
+}
+
+test "zag.loop.default treats a streak reset as a non-event" {
+    // The agent owns streak accounting: a different tool input collapses
+    // identical_streak back to 1. The default detector must stay silent
+    // for that follow-up call even when the prior streak had already
+    // tripped the threshold.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.loop.default')");
+
+    var tripped = agent_events.LoopDetectRequest.init("bash", "{\"cmd\":\"ls\"}", false, 5, alloc);
+    defer tripped.freeResult();
+    try engine.handleLoopDetectRequest(&tripped);
+    try std.testing.expect(tripped.result != null);
+
+    var reset = agent_events.LoopDetectRequest.init("bash", "{\"cmd\":\"pwd\"}", false, 1, alloc);
+    defer reset.freeResult();
+    try engine.handleLoopDetectRequest(&reset);
+    try std.testing.expect(reset.result == null);
+    try std.testing.expect(reset.error_name == null);
 }
