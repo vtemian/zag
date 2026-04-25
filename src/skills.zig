@@ -170,6 +170,14 @@ fn loadSkill(
             log.warn("{s}: unterminated frontmatter", .{md_path});
             return error.Skipped;
         },
+        error.UnterminatedQuotedScalar => {
+            log.warn("{s}: unterminated quoted scalar in frontmatter", .{md_path});
+            return error.Skipped;
+        },
+        error.UnterminatedInlineList => {
+            log.warn("{s}: unterminated inline list in frontmatter", .{md_path});
+            return error.Skipped;
+        },
     };
     defer fm.deinit(alloc);
 

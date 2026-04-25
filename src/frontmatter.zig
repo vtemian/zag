@@ -35,6 +35,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+const log = std.log.scoped(.frontmatter);
+
 pub const Value = union(enum) {
     /// Heap-allocated, owned by the Frontmatter's allocator.
     string: []const u8,
@@ -67,6 +69,8 @@ pub const Frontmatter = struct {
 
 pub const ParseError = error{
     UnterminatedFrontmatter,
+    UnterminatedQuotedScalar,
+    UnterminatedInlineList,
 } || Allocator.Error;
 
 /// Parse YAML frontmatter from the start of `src`.
@@ -117,7 +121,7 @@ pub fn parse(alloc: Allocator, src: []const u8) ParseError!Frontmatter {
 
         if (after_colon.len == 0) {
             // Block list candidate: peek ahead for `- item` lines.
-            const list_result = try parseBlockList(alloc, src, next);
+            const list_result = try parseBlockList(alloc, src, next, key);
             if (list_result.items) |items| {
                 try putField(alloc, &result, key, .{ .list = items });
                 cursor = list_result.next_cursor;
@@ -180,6 +184,13 @@ fn isBlankOrComment(line: []const u8) bool {
     return false;
 }
 
+fn isNonSpaceWhitespace(c: u8) bool {
+    return switch (c) {
+        '\t', 0x0B, 0x0C => true,
+        else => false,
+    };
+}
+
 fn putField(
     alloc: Allocator,
     fm: *Frontmatter,
@@ -207,10 +218,8 @@ fn putField(
 
 fn parseScalar(alloc: Allocator, raw: []const u8) ![]const u8 {
     if (raw.len >= 2 and raw[0] == '"') {
-        const end = std.mem.lastIndexOfScalar(u8, raw, '"') orelse raw.len;
-        if (end > 0) {
-            return unescapeDoubleQuoted(alloc, raw[1..end]);
-        }
+        const end = findClosingDoubleQuote(raw) orelse return error.UnterminatedQuotedScalar;
+        return unescapeDoubleQuoted(alloc, raw[1..end]);
     }
     if (raw.len >= 2 and raw[0] == '\'') {
         const end = std.mem.lastIndexOfScalar(u8, raw, '\'') orelse raw.len;
@@ -219,6 +228,21 @@ fn parseScalar(alloc: Allocator, raw: []const u8) ![]const u8 {
         }
     }
     return alloc.dupe(u8, raw);
+}
+
+/// Forward-scan for the first unescaped `"` after the opening quote at index 0.
+/// Skips `\"` escape pairs so a quoted scalar with embedded `\"` does not
+/// terminate early. Returns the index of the closing quote, or null if none.
+fn findClosingDoubleQuote(raw: []const u8) ?usize {
+    var i: usize = 1;
+    while (i < raw.len) : (i += 1) {
+        if (raw[i] == '\\' and i + 1 < raw.len) {
+            i += 1;
+            continue;
+        }
+        if (raw[i] == '"') return i;
+    }
+    return null;
 }
 
 fn unescapeDoubleQuoted(alloc: Allocator, raw: []const u8) ![]const u8 {
@@ -256,9 +280,11 @@ fn unescapeDoubleQuoted(alloc: Allocator, raw: []const u8) ![]const u8 {
 }
 
 fn parseInlineList(alloc: Allocator, raw: []const u8) ![]const []const u8 {
-    // raw starts with '['. Find the matching ']'.
-    const close = std.mem.lastIndexOfScalar(u8, raw, ']') orelse raw.len;
-    const inner = if (close > 0) raw[1..close] else raw[1..];
+    // raw starts with '['. Find the matching ']' via forward scan; missing
+    // close bracket is a hard error so callers do not silently accept
+    // garbage past the end of the list.
+    const close = std.mem.indexOfScalarPos(u8, raw, 1, ']') orelse return error.UnterminatedInlineList;
+    const inner = raw[1..close];
 
     var items: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -283,7 +309,7 @@ const BlockListResult = struct {
     next_cursor: usize,
 };
 
-fn parseBlockList(alloc: Allocator, src: []const u8, start: usize) !BlockListResult {
+fn parseBlockList(alloc: Allocator, src: []const u8, start: usize, field: []const u8) !BlockListResult {
     var items: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (items.items) |s| alloc.free(s);
@@ -306,7 +332,22 @@ fn parseBlockList(alloc: Allocator, src: []const u8, start: usize) !BlockListRes
         // Count leading spaces (0 to 4) then require `- `.
         var indent: usize = 0;
         while (indent < line.len and line[indent] == ' ' and indent < 4) : (indent += 1) {}
-        if (indent >= line.len or line[indent] != '-') break;
+        if (indent >= line.len or line[indent] != '-') {
+            // A leading ASCII whitespace byte that is not a regular space
+            // (most commonly a tab) silently broke the indent count and
+            // would terminate the list with zero items. Surface this so
+            // misindented YAML does not vanish without explanation. A
+            // non-whitespace prefix is just the next field; treat it as a
+            // normal terminator.
+            if (items.items.len == 0 and indent < line.len and isNonSpaceWhitespace(line[indent])) {
+                const preview_len = @min(line.len, 80);
+                log.warn(
+                    "block list for field '{s}' terminated by non-space whitespace (likely tab); line: {s}",
+                    .{ field, line[0..preview_len] },
+                );
+            }
+            break;
+        }
         if (indent + 1 >= line.len) break;
         // Accept "- item" or "-item"; spec wants "- item" but be permissive.
         var item_start = indent + 1;
@@ -430,4 +471,30 @@ test "parse empty value yields empty string" {
 
     const other = fm.fields.get("other") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("x", other.string);
+}
+
+test "parse unterminated quoted scalar errors" {
+    const src = "---\ndescription: \"foo\n---\nbody";
+    try testing.expectError(error.UnterminatedQuotedScalar, parse(testing.allocator, src));
+}
+
+test "parse unterminated inline list errors" {
+    const src = "---\ntools: [a, b\n---\nbody";
+    try testing.expectError(error.UnterminatedInlineList, parse(testing.allocator, src));
+}
+
+test "parse tab-indented block list does not silently produce empty list" {
+    // Tab-indented item terminates the block list at the tab. We can't
+    // intercept the warn log from inside zig test, so assert the parse
+    // succeeds and the field collapses to an empty scalar (today's behavior,
+    // now accompanied by a warn log line).
+    const src = "---\ntools:\n\t- read\n---\nbody";
+    var fm = try parse(testing.allocator, src);
+    defer fm.deinit(testing.allocator);
+
+    const tools = fm.fields.get("tools") orelse return error.TestUnexpectedResult;
+    switch (tools) {
+        .string => |s| try testing.expectEqualStrings("", s),
+        .list => return error.TestExpectedStringGotList,
+    }
 }
