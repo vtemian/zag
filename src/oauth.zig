@@ -34,6 +34,7 @@ pub fn generatePkce(alloc: Allocator) !PkceCodes {
     const verifier_buf = try alloc.alloc(u8, enc.calcSize(raw.len));
     errdefer alloc.free(verifier_buf);
     const verifier = enc.encode(verifier_buf, &raw);
+    // Cold one-shot at OAuth login start: pin the encoder's returned slice to its backing buffer so the `errdefer alloc.free(verifier_buf)` above is provably the right pointer to free.
     std.debug.assert(verifier.ptr == verifier_buf.ptr and verifier.len == verifier_buf.len);
 
     var digest: [32]u8 = undefined;
@@ -42,6 +43,7 @@ pub fn generatePkce(alloc: Allocator) !PkceCodes {
     const challenge_buf = try alloc.alloc(u8, enc.calcSize(digest.len));
     errdefer alloc.free(challenge_buf);
     const challenge = enc.encode(challenge_buf, &digest);
+    // Cold one-shot at OAuth login start: same alias-pinning rationale as the verifier assert above; runs once per `zag auth login`.
     std.debug.assert(challenge.ptr == challenge_buf.ptr and challenge.len == challenge_buf.len);
 
     return .{ .verifier = verifier_buf, .challenge = challenge_buf };

@@ -449,6 +449,7 @@ pub fn getDraft(self: *const ConversationBuffer) []const u8 {
 /// Caller's buffer must be at least `MAX_DRAFT` bytes.
 pub fn consumeDraft(self: *ConversationBuffer, dest: []u8) []const u8 {
     const n = self.draft_len;
+    // Cold submit path: caller hands us a `MAX_DRAFT`-sized scratch and `draft_len <= MAX_DRAFT` by construction, so this is a comptime-bounded contract check, not a per-frame branch.
     std.debug.assert(dest.len >= n);
     @memcpy(dest[0..n], self.draft[0..n]);
     self.draft_len = 0;
