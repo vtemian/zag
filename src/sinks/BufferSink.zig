@@ -56,6 +56,24 @@ pub const BufferSink = struct {
         self.pending_tool_calls.deinit(self.alloc);
     }
 
+    /// Drop every cross-event correlation: the live assistant/thinking
+    /// nodes, the in-flight tool_call -> *Node map, and the
+    /// last-tool fallback. Frees the duped keys but keeps the map's
+    /// buckets so the next turn reuses the same allocation.
+    ///
+    /// Called from `.run_end` (every turn) and from
+    /// `WindowManager.swapProviderOnPanePtr` after the runner has been
+    /// shut down (every model swap), so cancelled-mid-turn tool calls
+    /// don't leave orphan entries that outlive the pane.
+    pub fn resetCorrelation(self: *BufferSink) void {
+        self.current_assistant_node = null;
+        self.current_thinking_node = null;
+        var it = self.pending_tool_calls.iterator();
+        while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.pending_tool_calls.clearRetainingCapacity();
+        self.last_tool_call = null;
+    }
+
     fn push(ptr: *anyopaque, event: Event) void {
         const self: *BufferSink = @ptrCast(@alignCast(ptr));
         switch (event) {
@@ -144,8 +162,12 @@ pub const BufferSink = struct {
                 _ = self.buffer.appendNode(parent, .tool_result, e.content) catch return;
             },
             .run_end => {
-                self.current_assistant_node = null;
-                self.current_thinking_node = null;
+                // Clear the full correlation state, not just the live
+                // assistant/thinking nodes. A turn cancelled mid-tool
+                // leaves entries in `pending_tool_calls` that no
+                // tool_result will ever drain; without this they sit
+                // around until pane teardown.
+                self.resetCorrelation();
             },
             .error_event => |e| {
                 self.current_thinking_node = null;
@@ -272,6 +294,36 @@ test "BufferSink handles duplicate call_id without leaking the key" {
     // value for the existing key rather than leaking a duplicate dup.
     try std.testing.expectEqual(@as(u32, 1), bs.pending_tool_calls.count());
     // testing.allocator catches any leaked dup of "id-A".
+}
+
+test "BufferSink clears pending_tool_calls on run_end" {
+    const alloc = std.testing.allocator;
+    var cb = try ConversationBuffer.init(alloc, 0, "test");
+    defer cb.deinit();
+    var bs = BufferSink.init(alloc, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .tool_use = .{ .name = "t1", .call_id = "id-A" } });
+    s.push(.{ .tool_use = .{ .name = "t2", .call_id = "id-B" } });
+    try std.testing.expectEqual(@as(u32, 2), bs.pending_tool_calls.count());
+
+    s.push(.run_end);
+    try std.testing.expectEqual(@as(u32, 0), bs.pending_tool_calls.count());
+    // testing.allocator catches any leaked keys.
+}
+
+test "BufferSink resetCorrelation can be called externally" {
+    const alloc = std.testing.allocator;
+    var cb = try ConversationBuffer.init(alloc, 0, "test");
+    defer cb.deinit();
+    var bs = BufferSink.init(alloc, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .tool_use = .{ .name = "t1", .call_id = "id-A" } });
+    bs.resetCorrelation();
+    try std.testing.expectEqual(@as(u32, 0), bs.pending_tool_calls.count());
 }
 
 test "BufferSink error_event appends an err node" {

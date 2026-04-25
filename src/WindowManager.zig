@@ -1238,6 +1238,20 @@ fn swapProviderOnPanePtr(
         runner.shutdown();
     }
 
+    // Drop any half-drained tool-correlation state on the pane's sink
+    // before the new provider's first turn. A cancelled-mid-tool swap
+    // would otherwise leave `pending_tool_calls` entries that no
+    // future tool_result drains; they leak the duped call_id keys
+    // until pane teardown. Only PaneEntry-backed panes carry a
+    // reachable BufferSink; the root pane's sink lives on main.zig's
+    // stack and will reset itself on its next `run_end`.
+    for (self.extra_panes.items) |*entry| {
+        if (&entry.pane == pane) {
+            if (entry.sink_storage) |bs| bs.resetCorrelation();
+            break;
+        }
+    }
+
     // Step 2: build the new provider BEFORE touching the old, so a
     // failure leaves the old provider live. Auth still comes from
     // `self.provider.auth_path`: the shared default always carries a
