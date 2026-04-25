@@ -8,6 +8,7 @@ const Args = @import("Args.zig");
 const Runner = @import("Runner.zig").Runner;
 const Outcome = @import("Runner.zig").Outcome;
 const Artifacts = @import("Artifacts.zig");
+const Summary = @import("Summary.zig");
 
 /// Result of driving a scenario to completion (or the first failing step).
 pub const RunResult = struct {
@@ -50,7 +51,7 @@ pub fn runFile(
 ) !RunResult {
     const src = try std.fs.cwd().readFileAlloc(alloc, path, max_scenario_bytes);
     defer alloc.free(src);
-    return runSource(alloc, src, opts);
+    return runSourceImpl(alloc, src, opts, path);
 }
 
 /// Parse `src` and execute the resulting steps sequentially. Returns on the
@@ -60,9 +61,29 @@ pub fn runSource(
     src: []const u8,
     opts: RunOptions,
 ) !RunResult {
-    const steps = Dsl.parse(alloc, src) catch |e| return RunResult{
-        .outcome = .harness_error,
-        .error_name = @errorName(e),
+    return runSourceImpl(alloc, src, opts, null);
+}
+
+fn runSourceImpl(
+    alloc: std.mem.Allocator,
+    src: []const u8,
+    opts: RunOptions,
+    scenario_path: ?[]const u8,
+) !RunResult {
+    var summary = Summary.init(alloc, opts.artifacts);
+    defer summary.deinit();
+    summary.scenario_path = scenario_path;
+    // Always flush, even on early-return paths. The summary is the canonical
+    // post-run record; losing it because parse failed defeats its purpose.
+    defer summary.flush() catch {};
+
+    const steps = Dsl.parse(alloc, src) catch |e| {
+        summary.outcome = .harness_error;
+        summary.failing_error = @errorName(e);
+        return RunResult{
+            .outcome = .harness_error,
+            .error_name = @errorName(e),
+        };
     };
     defer alloc.free(steps);
 
@@ -70,19 +91,54 @@ pub fn runSource(
     defer r.deinit();
 
     if (opts.mock_script_path) |mock_path| {
-        r.attachMock(mock_path) catch |e| return RunResult{
-            .outcome = .harness_error,
-            .error_name = @errorName(e),
+        r.attachMock(mock_path) catch |e| {
+            summary.outcome = .harness_error;
+            summary.failing_error = @errorName(e);
+            return RunResult{
+                .outcome = .harness_error,
+                .error_name = @errorName(e),
+            };
         };
     }
 
-    for (steps) |step| {
-        executeStep(&r, step, opts) catch |e| return RunResult{
-            .outcome = classify(e),
-            .failing_step_line = step.line_no,
-            .failing_step_verb = step.verb,
-            .error_name = @errorName(e),
-        };
+    for (steps, 0..) |step, idx| {
+        const t0 = std.time.milliTimestamp();
+        if (executeStep(&r, step, opts)) |_| {
+            const dur: i64 = std.time.milliTimestamp() - t0;
+            // Comments aren't worth recording — they parse to verb=.comment
+            // with no behaviour. Skip them to keep summary.json focused on
+            // executable steps.
+            if (step.verb != .comment) {
+                summary.recordStep(
+                    step.line_no,
+                    @tagName(step.verb),
+                    step.args,
+                    .pass,
+                    null,
+                    @intCast(@max(@as(i64, 0), dur)),
+                ) catch {};
+            }
+        } else |e| {
+            const dur: i64 = std.time.milliTimestamp() - t0;
+            const outcome = classify(e);
+            summary.recordStep(
+                step.line_no,
+                @tagName(step.verb),
+                step.args,
+                .fail,
+                @errorName(e),
+                @intCast(@max(@as(i64, 0), dur)),
+            ) catch {};
+            summary.outcome = outcome;
+            summary.failing_step_idx = idx;
+            summary.failing_error = @errorName(e);
+            return RunResult{
+                .outcome = outcome,
+                .failing_step_line = step.line_no,
+                .failing_step_verb = step.verb,
+                .error_name = @errorName(e),
+            };
+        }
     }
 
     return .{ .outcome = .pass };
