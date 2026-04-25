@@ -4,7 +4,7 @@
 
 **Goal:** Replace the current "first run crashes with a stack trace" experience with an interactive onboarding flow for first-time strangers. On first run with no credentials, zag drops into a wizard that asks which provider, paste the key (or launch OAuth), writes `auth.json` on the user's behalf (0600, atomic), scaffolds `config.lua` with a matching `set_default_model`, and proceeds into the TUI. Expose the same wizard as `zag auth login <provider>` / `zag auth list` / `zag auth remove <provider>` subcommands so users never hand-edit `auth.json`.
 
-**Architecture:** Six phases. (1) Harden `src/auth.zig::saveAuthFile` to the tmpfile + fsync + rename pattern used by `Session.zig:631-648`, and add a symmetric `setApiKey` / `removeEntry` test surface. (2) New `src/auth_wizard.zig` — pure over `std.Io.Reader` / `std.Io.Writer` so it tests without a TTY; contains `promptChoice`, `promptSecret` (toggles ECHO via termios when `isatty`), `scaffoldConfigLua`, and `runWizard`. (3) Extend `StartupMode` in `src/main.zig` with an `auth` variant carrying `login/list/remove` sub-variants; extend `parseStartupArgs` with hand-rolled `zag auth ...` parsing. (4) In `main.zig`, insert a detection branch: when `llm.createProviderFromEnv` returns `error.MissingCredential` (currently `main.zig:157`), invoke the wizard, then retry provider creation. (5) Wire the `zag auth ...` subcommands to bypass TUI init entirely. (6) OAuth hook: leave a `ProviderOptions.oauth_flow_fn` slot in the wizard that's null in this plan and becomes `oauth.runLoginFlow` when `wip/chatgpt-oauth` merges to main (no hard dependency).
+**Architecture:** Six phases. (1) Harden `src/auth.zig::saveAuthFile` to the tmpfile + fsync + rename pattern used by `Session.zig:631-648`, and add a symmetric `setApiKey` / `removeEntry` test surface. (2) New `src/auth_wizard.zig`: pure over `std.Io.Reader` / `std.Io.Writer` so it tests without a TTY; contains `promptChoice`, `promptSecret` (toggles ECHO via termios when `isatty`), `scaffoldConfigLua`, and `runWizard`. (3) Extend `StartupMode` in `src/main.zig` with an `auth` variant carrying `login/list/remove` sub-variants; extend `parseStartupArgs` with hand-rolled `zag auth ...` parsing. (4) In `main.zig`, insert a detection branch: when `llm.createProviderFromEnv` returns `error.MissingCredential` (currently `main.zig:157`), invoke the wizard, then retry provider creation. (5) Wire the `zag auth ...` subcommands to bypass TUI init entirely. (6) OAuth hook: leave a `ProviderOptions.oauth_flow_fn` slot in the wizard that's null in this plan and becomes `oauth.runLoginFlow` when `wip/chatgpt-oauth` merges to main (no hard dependency).
 
 **Tech Stack:** Zig 0.15+, `std.posix` for termios (`tcgetattr` / `tcsetattr` / `isatty`), `std.fs.Dir.rename` for atomic rename, `std.Io` abstractions for testable I/O, existing ziglua bindings for config scaffolding (`zag.provider`, `zag.set_default_model`).
 
@@ -20,11 +20,11 @@
 
 **In scope**
 
-- `src/auth.zig` — harden `saveAuthFile` to tmpfile + fsync + rename (currently non-atomic; truncates the final path at line 163). Add `removeEntry(name)` as the symmetric counterpart to `setApiKey`. Keep schema read-compatible with the OAuth plan's future `"type": "oauth"` entries (loader already rejects them with `error.UnknownCredentialType`; no change needed for v1 write path).
-- `src/auth_wizard.zig` (new) — `Wizard` struct with `Reader`/`Writer`/`is_tty: bool` fields; public entry `runWizard(alloc, deps)` returning the picked provider name so `main.zig` can retry provider creation. Paste-only flow for v1; OAuth gated on a null-by-default callback.
-- `src/main.zig` — extend `StartupMode` with `.auth_login`, `.auth_list`, `.auth_remove` variants; extend `parseStartupArgs` with `zag auth ...` grammar; in `main()`, after `createProviderFromEnv` fails with `MissingCredential`, invoke the wizard, scaffold `config.lua` if absent, retry once, only then exit on repeated failure; dispatch `auth` subcommands before TUI init.
-- `src/file_log.zig` usage — wizard output writes to stdout, not the file logger, so first-run prompts are visible even when the logger path is unset.
-- `CLAUDE.md` / `README.md` — replace the "create `auth.json` by hand" section with the new onboarding description.
+- `src/auth.zig`: harden `saveAuthFile` to tmpfile + fsync + rename (currently non-atomic; truncates the final path at line 163). Add `removeEntry(name)` as the symmetric counterpart to `setApiKey`. Keep schema read-compatible with the OAuth plan's future `"type": "oauth"` entries (loader already rejects them with `error.UnknownCredentialType`; no change needed for v1 write path).
+- `src/auth_wizard.zig` (new): `Wizard` struct with `Reader`/`Writer`/`is_tty: bool` fields; public entry `runWizard(alloc, deps)` returning the picked provider name so `main.zig` can retry provider creation. Paste-only flow for v1; OAuth gated on a null-by-default callback.
+- `src/main.zig`: extend `StartupMode` with `.auth_login`, `.auth_list`, `.auth_remove` variants; extend `parseStartupArgs` with `zag auth ...` grammar; in `main()`, after `createProviderFromEnv` fails with `MissingCredential`, invoke the wizard, scaffold `config.lua` if absent, retry once, only then exit on repeated failure; dispatch `auth` subcommands before TUI init.
+- `src/file_log.zig` usage: wizard output writes to stdout, not the file logger, so first-run prompts are visible even when the logger path is unset.
+- `CLAUDE.md` / `README.md`: replace the "create `auth.json` by hand" section with the new onboarding description.
 - Inline tests for the wizard (stdin/stdout fakes) and the atomic-write hardening.
 - An integration smoke test: `zag auth login openai` against a fixture stdin, assert `auth.json` is written with `0o600` and the expected shape.
 
@@ -52,27 +52,27 @@
 | Site | Role |
 |---|---|
 | `:28-32` | `StartupMode` union: `new_session`, `resume_session`, `resume_last` |
-| `:35-48` | `parseStartupArgs` — hand-rolled `std.process.argsWithAllocator` loop; recognizes `--session=<id>` and `--last` only |
+| `:35-48` | `parseStartupArgs`: hand-rolled `std.process.argsWithAllocator` loop; recognizes `--session=<id>` and `--last` only |
 | `:145` | `LuaEngine.init` |
 | `:152` | `eng.loadUserConfig()` |
 | `:155` | `default_model` resolved from `eng.default_model` |
 | `:156` | `llm.createProviderFromEnv(default_model, allocator)` |
-| `:157-169` | `error.MissingCredential` path — prints "zag: no credentials for provider '<name>' in ~/.config/zag/auth.json", returns |
-| `:183` | `parseStartupArgs` *actually* called (after provider creation — note the ordering quirk) |
-| `:224` | `Terminal.init()` — raw mode entered, `ECHO` + `ICANON` cleared |
+| `:157-169` | `error.MissingCredential` path: prints "zag: no credentials for provider '<name>' in ~/.config/zag/auth.json", returns |
+| `:183` | `parseStartupArgs` *actually* called (after provider creation, note the ordering quirk) |
+| `:224` | `Terminal.init()`: raw mode entered, `ECHO` + `ICANON` cleared |
 
 **Ordering quirk:** `parseStartupArgs` currently runs at `:183`, *after* provider creation. For the wizard plan we reorder: `parseStartupArgs` must run first so `auth` subcommands can bypass Lua + provider init entirely. This is a small but required change to `main.zig` task ordering.
 
-### `src/auth.zig` — current state
+### `src/auth.zig`: current state
 
 Public API (all confirmed by research agent):
 
 - `AuthFile.init(alloc) → AuthFile` (`:40`)
 - `AuthFile.deinit(*AuthFile)` (`:48`)
-- `AuthFile.setApiKey(*AuthFile, name, key) → !void` (`:60`) — dupes both, replaces existing, frees old credential
-- `AuthFile.getApiKey(*AuthFile, name) → !?[]const u8` (`:79`) — returns borrowed bytes or null; errors if entry is non-api_key type
-- `loadAuthFile(alloc, path) → !AuthFile` (`:101`) — missing file yields empty AuthFile; `error.MalformedAuthJson` / `error.UnknownCredentialType` on bad input
-- `saveAuthFile(path, file) → !void` (`:155`) — **non-atomic today**: `createFile(.{ .mode = 0o600, .truncate = true })` directly on `path`, then buffered writer + flush. Crash mid-write leaves a zero-length or partially-written file.
+- `AuthFile.setApiKey(*AuthFile, name, key) → !void` (`:60`): dupes both, replaces existing, frees old credential
+- `AuthFile.getApiKey(*AuthFile, name) → !?[]const u8` (`:79`): returns borrowed bytes or null; errors if entry is non-api_key type
+- `loadAuthFile(alloc, path) → !AuthFile` (`:101`): missing file yields empty AuthFile; `error.MalformedAuthJson` / `error.UnknownCredentialType` on bad input
+- `saveAuthFile(path, file) → !void` (`:155`): **non-atomic today**: `createFile(.{ .mode = 0o600, .truncate = true })` directly on `path`, then buffered writer + flush. Crash mid-write leaves a zero-length or partially-written file.
 
 Error set for the loader (from the agent report): `error.FileNotFound` (caught), `error.MalformedAuthJson` (`:109,:115,:126,:129-132,:136-140`), `error.UnknownCredentialType` (`:146`).
 
@@ -84,7 +84,7 @@ Schema:
 }
 ```
 
-OAuth plan extends this with `"type": "oauth"` and `id_token / access_token / refresh_token / account_id / last_refresh` fields — the v1 wizard only writes `api_key` entries, but the loader already tolerates the shape.
+OAuth plan extends this with `"type": "oauth"` and `id_token / access_token / refresh_token / account_id / last_refresh` fields. The v1 wizard only writes `api_key` entries, but the loader already tolerates the shape.
 
 ### Atomic-write reference (`src/Session.zig:631-648`)
 
@@ -104,7 +104,7 @@ const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path});
 try cwd.rename(tmp_path, path);
 ```
 
-**Delta for `auth.json`:** set `.mode = 0o600` on `createFile` (the existing `saveAuthFile` at `:163` already does this — preserve it), then fsync, then rename. The `rename` preserves the mode from the tmpfile.
+**Delta for `auth.json`:** set `.mode = 0o600` on `createFile` (the existing `saveAuthFile` at `:163` already does this; preserve it), then fsync, then rename. The `rename` preserves the mode from the tmpfile.
 
 **Test for atomicity:** the Session test at `:922-959` validates tolerance of a stale `.tmp` file from a previous crash. Mirror that shape.
 
@@ -112,7 +112,7 @@ try cwd.rename(tmp_path, path);
 
 - Raw mode entered at `:63-88` via `tcgetattr` → flag clear → `tcsetattr`. Flags cleared: `ICANON`, `ECHO` (`:80-81`), `ISIG`, `IEXTEN`, plus I/O post-processing.
 - Raw mode restored at `:161-181` via `tcsetattr` with the saved original termios.
-- Wizard runs *before* `Terminal.init()` (`main.zig:224`) — stdin is still in cooked, line-buffered, echoing mode.
+- Wizard runs *before* `Terminal.init()` (`main.zig:224`): stdin is still in cooked, line-buffered, echoing mode.
 
 **No-echo read recipe (darwin, Zig 0.15):**
 
@@ -130,14 +130,14 @@ try std.posix.tcsetattr(stdin_fd, .NOW, echo_off);
 
 TTY detection: `std.posix.isatty(std.posix.STDIN_FILENO)` returns `true` for a real terminal. In non-TTY mode, the wizard refuses (see Out of scope).
 
-**No existing no-echo code** in the codebase — this is new ground. Put the termios toggle inside `auth_wizard.zig::readSecretLine` and keep it narrow.
+**No existing no-echo code** in the codebase. This is new ground. Put the termios toggle inside `auth_wizard.zig::readSecretLine` and keep it narrow.
 
 ### LuaEngine + config scaffolding (`src/LuaEngine.zig`)
 
-- Config path: `$HOME/.config/zag/config.lua` — no fallback. Resolved at `:228-239`. Missing `$HOME` yields early return; missing file is a silent no-op via `error.LuaFile` catch at `:244`.
-- `zag.provider { name = "<string>" }` — table arg required, `name` field required, string-only, non-empty (`:2446-2464`). Duped into allocator; prior values freed.
-- `zag.set_default_model("<prov/id>")` — single positional string arg; non-string rejected (`:2404-2410`). Duped, prior value freed.
-- `engine.default_model: ?[]const u8` (`:98-104`) — read by `createProviderFromLuaConfig` at `src/llm.zig:265`. No caching; scaffolding `config.lua` and calling `loadUserConfig` again in the same process is safe.
+- Config path: `$HOME/.config/zag/config.lua`: no fallback. Resolved at `:228-239`. Missing `$HOME` yields early return; missing file is a silent no-op via `error.LuaFile` catch at `:244`.
+- `zag.provider { name = "<string>" }`: table arg required, `name` field required, string-only, non-empty (`:2446-2464`). Duped into allocator; prior values freed.
+- `zag.set_default_model("<prov/id>")`: single positional string arg; non-string rejected (`:2404-2410`). Duped, prior value freed.
+- `engine.default_model: ?[]const u8` (`:98-104`): read by `createProviderFromLuaConfig` at `src/llm.zig:265`. No caching; scaffolding `config.lua` and calling `loadUserConfig` again in the same process is safe.
 
 ### OAuth + headless plans (dependency status)
 
@@ -148,7 +148,7 @@ Both plans live in unmerged branches:
 | ChatGPT OAuth | `wip/chatgpt-oauth` | implemented, not on main |
 | Headless entry | `wip/headless-entry` | implemented, not on main |
 
-**Implication for this plan:** do not depend on `src/oauth.zig` or `src/Trajectory.zig` symbols that aren't in main. Leave a null-by-default extension point in the wizard's provider table for OAuth; the wiring is a one-line follow-up once `wip/chatgpt-oauth` lands. Ditto for headless mode — the wizard plan ships independently of headless-entry.
+**Implication for this plan:** do not depend on `src/oauth.zig` or `src/Trajectory.zig` symbols that aren't in main. Leave a null-by-default extension point in the wizard's provider table for OAuth; the wiring is a one-line follow-up once `wip/chatgpt-oauth` lands. Ditto for headless mode: the wizard plan ships independently of headless-entry.
 
 Per the OAuth research agent: `oauth.runLoginFlow(alloc, LoginOptions)` is the single entry point we'd eventually call for a ChatGPT provider choice. Signature is stable per that plan. No further design needed here.
 
@@ -160,19 +160,19 @@ Per the OAuth research agent: `oauth.runLoginFlow(alloc, LoginOptions)` is the s
 Today: Lua init (`:145`) → `loadUserConfig` (`:152`) → `createProviderFromEnv` (`:156`) → `parseStartupArgs` (`:183`). The plan moves `parseStartupArgs` to the very top so `zag auth ...` subcommands short-circuit. The first-run wizard (when `createProviderFromEnv` fails with `MissingCredential`) runs *after* Lua is already up, so it can scaffold `config.lua`, call `eng.loadUserConfig()` again, and retry `createProviderFromEnv` in-process.
 
 **2. Idempotency and safety around `config.lua`.**
-The wizard only scaffolds when `config.lua` is absent. When present, the wizard trusts it — writes only `auth.json`, leaves the user's Lua untouched. Failure mode to watch: user has `config.lua` with `set_default_model("anthropic/...")` but only gets an OpenAI key via the wizard. The retry still fails with `MissingCredential`. Solution: after a successful `zag auth login <provider>`, print a clear note — "Your config.lua sets the default model to 'anthropic/…', which you don't have credentials for. Edit `~/.config/zag/config.lua` to point at an '<provider>/…' model." No automatic rewrite.
+The wizard only scaffolds when `config.lua` is absent. When present, the wizard trusts it: writes only `auth.json`, leaves the user's Lua untouched. Failure mode to watch: user has `config.lua` with `set_default_model("anthropic/...")` but only gets an OpenAI key via the wizard. The retry still fails with `MissingCredential`. Solution: after a successful `zag auth login <provider>`, print a clear note: "Your config.lua sets the default model to 'anthropic/…', which you don't have credentials for. Edit `~/.config/zag/config.lua` to point at an '<provider>/…' model." No automatic rewrite.
 
 **3. Key echo on terminal paste.**
-`promptSecret` disables `ECHO` via termios. There's still a tiny window between printing the prompt and clearing ECHO where a fast typist could type — mitigate by clearing ECHO *before* printing the prompt. Also: macOS Terminal.app clipboard paste may not respect `ECHO` being off (the paste goes through as a burst of characters, which the kernel still buffers without echo; verified behavior). Enter commits the line; user sees "✓" after.
+`promptSecret` disables `ECHO` via termios. There's still a tiny window between printing the prompt and clearing ECHO where a fast typist could type; mitigate by clearing ECHO *before* printing the prompt. Also: macOS Terminal.app clipboard paste may not respect `ECHO` being off (the paste goes through as a burst of characters, which the kernel still buffers without echo; verified behavior). Enter commits the line; user sees "✓" after.
 
 **4. Stale `.tmp` files.**
 Copying the `Session.zig:631-648` pattern inherits its handling. Before writing, the wizard unlinks any existing `auth.json.tmp` if present. This is belt-and-suspenders on top of `rename` being atomic.
 
 **5. Partial wizard abort.**
-If the user Ctrl-Cs mid-paste, nothing has been written yet (secret is in a `std.ArrayList(u8)`, not on disk). If they Ctrl-C between `setApiKey` in memory and `saveAuthFile`, we've lost nothing — in-memory state vanishes. If they Ctrl-C *during* `saveAuthFile`, the tmpfile pattern guarantees the final `auth.json` is either the old bytes or the new bytes, never a partial mix.
+If the user Ctrl-Cs mid-paste, nothing has been written yet (secret is in a `std.ArrayList(u8)`, not on disk). If they Ctrl-C between `setApiKey` in memory and `saveAuthFile`, we've lost nothing; in-memory state vanishes. If they Ctrl-C *during* `saveAuthFile`, the tmpfile pattern guarantees the final `auth.json` is either the old bytes or the new bytes, never a partial mix.
 
 **6. Scripted / non-TTY usage.**
-V1 refuses with an actionable error when `isatty(stdin) == false`. This is a deliberate cliff — users who want scripted setup will (a) populate `auth.json` by hand on first install and (b) follow a future `zag auth login --stdin` plan. Rationale: a silently-accepting wizard under a pipe is a surprise vector (e.g., CI runs pick up an unexpected credential). Fail loud, add the scripted path when someone actually needs it.
+V1 refuses with an actionable error when `isatty(stdin) == false`. This is a deliberate cliff: users who want scripted setup will (a) populate `auth.json` by hand on first install and (b) follow a future `zag auth login --stdin` plan. Rationale: a silently-accepting wizard under a pipe is a surprise vector (e.g., CI runs pick up an unexpected credential). Fail loud, add the scripted path when someone actually needs it.
 
 **7. Default model coupling.**
 Wizard writes `zag.set_default_model("<provider>/<model>")` matching the user's choice. Hard-code a reasonable model per provider in `auth_wizard.zig::PROVIDER_DEFAULTS`:
@@ -187,7 +187,7 @@ Wizard writes `zag.set_default_model("<provider>/<model>")` matching the user's 
 These can drift over time; living in one table keeps the drift local. Users can override by editing `config.lua` after the fact.
 
 **8. Subcommand grammar.**
-`zag auth login <provider>` / `zag auth list` / `zag auth remove <provider>`. Reject unknown `auth <subcommand>` with a one-line help message. Don't add `zag auth add` as an alias for `login` — one name per thing.
+`zag auth login <provider>` / `zag auth list` / `zag auth remove <provider>`. Reject unknown `auth <subcommand>` with a one-line help message. Don't add `zag auth add` as an alias for `login`: one name per thing.
 
 ---
 
@@ -241,7 +241,7 @@ Everything above `main()` is testable with fake `Reader`/`Writer`.
 
 Every task follows TDD: write the failing test, then the minimal code, then refactor. Every task ends with `zig fmt --check .` + `zig build test` + commit. Commit message prefix: `auth:` for wizard/auth.zig work, `main:` for `main.zig` wiring, `docs:` for README/CLAUDE.md updates.
 
-### Task 1 — `auth.zig` atomic save
+### Task 1: `auth.zig` atomic save
 
 **Goal:** Replace the non-atomic `createFile(.truncate = true)` in `saveAuthFile` with tmpfile + fsync + rename, mirroring `Session.zig:631-648`. Preserve `0o600` mode.
 
@@ -250,13 +250,13 @@ Every task follows TDD: write the failing test, then the minimal code, then refa
 **TDD:**
 1. Add test "saveAuthFile is atomic under simulated crash". Write a fixture `auth.json` with one entry, simulate a crash by creating a `auth.json.tmp` with garbage bytes, then call `saveAuthFile` with a new entry. Assert: final `auth.json` matches the new entry, and `auth.json.tmp` is gone.
 2. Add test "saveAuthFile preserves 0o600". After save, stat the file and assert mode is `0o600`.
-3. Run tests — both fail (current code doesn't use tmpfile path).
+3. Run tests; both fail (current code doesn't use tmpfile path).
 4. Refactor `saveAuthFile` to write `path.tmp` first with `.mode = 0o600 / .truncate = true`, flush, `sync()`, then `rename(path.tmp, path)`. Unlink any stale `path.tmp` before writing.
-5. Add `removeEntry(self: *AuthFile, name: []const u8) void` — find-and-erase the entry, free owned bytes. One test: "removeEntry deletes existing and is a no-op for missing".
+5. Add `removeEntry(self: *AuthFile, name: []const u8) void`: find-and-erase the entry, free owned bytes. One test: "removeEntry deletes existing and is a no-op for missing".
 
 **Verify:** `zig build test` green. Commit: `auth: atomic tmpfile+rename save, add removeEntry`.
 
-### Task 2 — `auth_wizard.zig` skeleton + `promptChoice`
+### Task 2: `auth_wizard.zig` skeleton + `promptChoice`
 
 **Goal:** Land the new module with the struct, the choice prompt, and fake-I/O tests. No termios code yet.
 
@@ -272,7 +272,7 @@ Every task follows TDD: write the failing test, then the minimal code, then refa
 
 **Verify:** `zig build test` green, all 4 new tests pass. Commit: `auth: wizard skeleton + promptChoice with fake-I/O tests`.
 
-### Task 3 — `promptSecret` + termios toggle
+### Task 3: `promptSecret` + termios toggle
 
 **Goal:** No-echo line read gated by `is_tty`.
 
@@ -282,22 +282,22 @@ Every task follows TDD: write the failing test, then the minimal code, then refa
 1. Test "promptSecret reads line and strips newline" with `is_tty = false` (no termios dance). Feed `"sk-abc-123\n"`, assert returns `"sk-abc-123"`.
 2. Test "promptSecret rejects empty input". Feed `"\n"`, assert `error.EmptyInput`.
 3. Test "promptSecret rejects input longer than max". Feed a 16KB string, assert `error.KeyTooLong` (cap is 8KB).
-4. Implement `promptSecret(deps) ![]u8` — returns owned slice. If `is_tty`, wrap the read in `tcgetattr` / clear `lflag.ECHO` / `tcsetattr(.NOW)` / `defer tcsetattr(.NOW, original)`.
+4. Implement `promptSecret(deps) ![]u8`: returns owned slice. If `is_tty`, wrap the read in `tcgetattr` / clear `lflag.ECHO` / `tcsetattr(.NOW)` / `defer tcsetattr(.NOW, original)`.
 5. Manual smoke: `zig build run` with `forced_provider = openai` in a debug build, paste a fake key, confirm no echo.
 
 **Verify:** `zig build test` green. Commit: `auth: promptSecret with termios ECHO toggle`.
 
-### Task 4 — `scaffoldConfigLua`
+### Task 4: `scaffoldConfigLua`
 
 **Goal:** Write a user-editable `config.lua` with the chosen provider uncommented and a matching `set_default_model`. Skip if the file exists.
 
-**Touches:** `src/auth_wizard.zig`. Optional: `src/auth.zig` if a shared dirpath helper makes sense — probably not, keep it local.
+**Touches:** `src/auth_wizard.zig`. Optional: `src/auth.zig` if a shared dirpath helper makes sense; probably not, keep it local.
 
 **TDD:**
 1. Test "scaffoldConfigLua writes expected contents". Call with `provider = "openai"` and a `tmpDir` path, read the file, assert it matches the fixture string.
 2. Test "scaffoldConfigLua is a no-op when file exists". Pre-create a `config.lua` with content `"-- user content"`, call scaffold, assert the file still contains `"-- user content"`.
 3. Test "scaffoldConfigLua creates parent directories". Point at a path where `.config/zag` doesn't exist yet, assert the dir is created and the file written.
-4. Implement the scaffold — lookup `PROVIDER_DEFAULTS[provider]` for the model id; template is small (see fixture). Use `std.fs.Dir.makePath` then `createFile(.{ .exclusive = true, .mode = 0o644 })`. On `error.PathAlreadyExists`, return without writing.
+4. Implement the scaffold: lookup `PROVIDER_DEFAULTS[provider]` for the model id; template is small (see fixture). Use `std.fs.Dir.makePath` then `createFile(.{ .exclusive = true, .mode = 0o644 })`. On `error.PathAlreadyExists`, return without writing.
 
 Fixture string (exact):
 
@@ -317,7 +317,7 @@ zag.set_default_model("openai/gpt-4o")
 
 **Verify:** `zig build test` green. Commit: `auth: scaffoldConfigLua with tmpl + existence guard`.
 
-### Task 5 — `runWizard` orchestrator
+### Task 5: `runWizard` orchestrator
 
 **Goal:** Wire the pieces into the top-level first-run flow.
 
@@ -333,12 +333,12 @@ zag.set_default_model("openai/gpt-4o")
 3. Test "runWizard refuses when `is_tty = false` and `scaffold_config = true` (first-run via pipe)". Assert `error.NonInteractiveFirstRun`.
 4. Test "runWizard appends to existing `auth.json` without clobbering other providers". Pre-seed `auth.json` with anthropic entry, pick openai, assert both present.
 5. Implement. Sequence: enumerate providers → `promptChoice` (unless forced) → `promptSecret` → `loadAuthFile` (or empty) → `setApiKey` → `saveAuthFile` → `scaffoldConfigLua` (if opted in and absent) → return result.
-6. Add `printAuthList(deps)` — load, list each entry as `<name>  <type>  <masked-key>` (last 4 chars visible). One test.
-7. Add `removeAuth(deps, name)` — load, `removeEntry`, save. If the entry was absent, print a message and return normally (not an error). Two tests.
+6. Add `printAuthList(deps)`: load, list each entry as `<name>  <type>  <masked-key>` (last 4 chars visible). One test.
+7. Add `removeAuth(deps, name)`: load, `removeEntry`, save. If the entry was absent, print a message and return normally (not an error). Two tests.
 
 **Verify:** `zig build test` green. Commit: `auth: runWizard orchestrator + list/remove helpers`.
 
-### Task 6 — `main.zig` wiring
+### Task 6: `main.zig` wiring
 
 **Goal:** Dispatch `zag auth ...` subcommands before TUI init, and invoke the wizard on `MissingCredential`.
 
@@ -356,7 +356,7 @@ Integration tests for `main()` wiring are hard without spawning the binary. Inst
 
 **Implementation:**
 
-1. Reorder: move `parseStartupArgs` call to the very top of `main()`, after `gpa` init and before `LuaEngine.init`. Currently it's at `:183` after provider setup — move it.
+1. Reorder: move `parseStartupArgs` call to the very top of `main()`, after `gpa` init and before `LuaEngine.init`. Currently it's at `:183` after provider setup; move it.
 2. Extend `StartupMode`:
    ```zig
    const StartupMode = union(enum) {
@@ -382,11 +382,11 @@ Integration tests for `main()` wiring are hard without spawning the binary. Inst
 5. In the existing `createProviderFromEnv` error branch (`:156-170`), on `error.MissingCredential`:
    - If `is_tty == false`: print the current stderr message and return (same as today).
    - Else: call `runWizard` with `scaffold_config = (config.lua absent)`, reload `eng.loadUserConfig()`, retry `createProviderFromEnv` once. If still fails, print a message ("config.lua's default model is X, you added credentials for Y; edit config.lua") and return.
-6. Lifetime: the returned `WizardResult.provider_name` is owned — free it after the retry succeeds.
+6. Lifetime: the returned `WizardResult.provider_name` is owned; free it after the retry succeeds.
 
 **Verify:** `zig build test` green. Manual smoke above passes. Commit: `main: dispatch zag auth subcommands + first-run wizard on MissingCredential`.
 
-### Task 7 — Docs
+### Task 7: Docs
 
 **Goal:** Replace the "create `auth.json` by hand" section in the README with the new onboarding flow.
 
@@ -398,7 +398,7 @@ Integration tests for `main()` wiring are hard without spawning the binary. Inst
 
 **Verify:** `zig fmt --check .` (no-op for markdown but run anyway). Commit: `docs: describe onboarding wizard and auth subcommands`.
 
-### Task 8 — Polish / OAuth hook stub
+### Task 8: Polish / OAuth hook stub
 
 **Goal:** Leave the seam for the OAuth branch to merge cleanly later.
 
@@ -441,11 +441,11 @@ All unit and integration tests run under `testing.allocator` so leaks fail the t
 
 ## Verification steps (end-of-plan)
 
-1. `zig fmt --check .` — clean
-2. `zig build test` — all green
-3. `zig build` — no warnings
+1. `zig fmt --check .`: clean
+2. `zig build test`: all green
+3. `zig build`: no warnings
 4. Manual smoke (above)
-5. `grep -rE "edit.*auth\.json|chmod 0600" README.md CLAUDE.md` — zero hits (old hand-editing instructions gone)
+5. `grep -rE "edit.*auth\.json|chmod 0600" README.md CLAUDE.md`: zero hits (old hand-editing instructions gone)
 6. A fresh install simulation: `rm -rf ~/.config/zag && zig build run` produces the wizard, not a stack trace
 
 ---

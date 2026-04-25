@@ -153,56 +153,56 @@ Target: under 400 LOC each, largely tests.
 
 Each commit compiles and `zig build test` is green. No commit contains a provider rewrite plus test changes plus a new module plus a removal; every commit is one narrow step.
 
-### Commit 1 — `llm/conversation: scaffold module with writeToolDefinitions`
+### Commit 1: `llm/conversation: scaffold module with writeToolDefinitions`
 - Create `src/llm/conversation.zig` with `Dialect` enum and a single `writeToolDefinitions(dialect, defs, w)` function that switches and inlines the current bodies from each provider.
 - Add a `pub const conversation = @import("llm/conversation.zig");` re-export through `llm.zig` (following existing `http`/`streaming`/`registry` pattern).
 - Copy (not move) both providers' tool-definition tests into the new module, parametrized by dialect.
 - Do NOT touch provider files yet. Tests assert shared module reproduces byte-for-byte the current output.
 
-### Commit 2 — `providers: route writeToolDefinitions through conversation module`
+### Commit 2: `providers: route writeToolDefinitions through conversation module`
 - Delete the local `writeToolDefinitions` in both providers.
 - Call `conversation.writeToolDefinitions(.anthropic, ...)` / `(.openai, ...)` from `serializeRequest`.
 - Existing per-provider tests that targeted the local helper migrate to import from `conversation` or get deleted as duplicates of Commit 1's parametrized tests.
 
-### Commit 3 — `llm/conversation: add writeMessage with dialect switch`
+### Commit 3: `llm/conversation: add writeMessage with dialect switch`
 - Move both providers' `writeMessage` bodies into `conversation.writeMessage(dialect, msg, w)` as a top-level `switch (dialect)` with the two current bodies inlined into arms.
 - Move the matching `writeMessage` tests (anthropic text/tool_use/tool_result, openai text/tool_use/tool_result/interleaved/concat). Keep them dialect-parametrized.
 - Providers keep their local wrappers but call through.
 
-### Commit 4 — `providers: remove local writeMessage, writeMessages; move to conversation.writeMessages`
+### Commit 4: `providers: remove local writeMessage, writeMessages; move to conversation.writeMessages`
 - Add `conversation.writeMessages(dialect, system, msgs, w)`: for `.anthropic` writes `"messages":[...]`; for `.openai` injects leading system message.
 - Delete both providers' `writeMessage` / `writeMessages` / `writeMessagesWithSystem`.
 - `serializeRequest` in each provider becomes: prelude + `conversation.writeMessages` + `conversation.writeToolDefinitions` (with OpenAI's conditional `tool_definitions.len > 0` guard preserved) + epilogue.
 
-### Commit 5 — `llm/conversation: promote serializeRequest to shared entry point`
+### Commit 5: `llm/conversation: promote serializeRequest to shared entry point`
 - Add `pub fn serializeRequest(opts: RequestOptions, allocator: Allocator) ![]const u8` that owns the writer lifecycle and calls the above helpers. The per-dialect split over streaming-flag payload (`"stream":true,` vs `"stream":true,"stream_options":{"include_usage":true},`) is a `switch` at the top.
 - Delete the local `serializeRequest` / `buildRequestBody` / `buildStreamingRequestBody` in both providers; replace call sites in `callImpl*` trampolines with a single `conversation.serializeRequest(...)`.
 - Move the `serializeRequest` tests (system placement, tool wrapping, streaming flag) into `conversation.zig` parametrized by dialect.
 
-### Commit 6 — `llm/conversation: add parseResponse with per-dialect parseUsage and mapStopReason`
+### Commit 6: `llm/conversation: add parseResponse with per-dialect parseUsage and mapStopReason`
 - Introduce `parseResponse(dialect, body, allocator)` that dispatches. Per-dialect private helpers: `parseUsageAnthropic`, `parseUsageOpenAi`, `mapStopReasonAnthropic`, `mapStopReasonOpenAi`.
 - Both providers' `parseResponse` becomes a one-line wrapper (kept briefly for call sites in `callImpl`).
 - Move the full parseResponse test matrix (text-only, tool_use, malformed JSON, missing usage, cache tokens, unknown stop_reason, interleaved text+tool_calls).
 
-### Commit 7 — `providers: inline parseResponse call through conversation module`
+### Commit 7: `providers: inline parseResponse call through conversation module`
 - Remove the one-line wrappers; `callImpl` calls `conversation.parseResponse(.anthropic, ...)` directly.
 - Re-verify: `zig build test` and `zig build run` (smoke: a manual echo prompt against each provider if auth is configured).
 
-### Commit 8 — `llm/event_parser: extract Anthropic SSE assembly`
+### Commit 8: `llm/event_parser: extract Anthropic SSE assembly`
 - Create `src/llm/event_parser.zig`. Move `StreamingBlock`, `processSseEvent`, and the Anthropic half of `parseSseStream` into it. Anthropic provider's `parseSseStream` becomes a call to `event_parser.parseSseStream(.anthropic, ...)`.
 - Move all processSseEvent/parseSseStream tests (anthropic text_delta, tool_use start, cache_tokens, message_delta, ping skip, input_json_delta).
 
-### Commit 9 — `llm/event_parser: absorb OpenAI SSE assembly`
+### Commit 9: `llm/event_parser: absorb OpenAI SSE assembly`
 - Move `StreamingToolCall` and OpenAI's `parseSseStream` body into `event_parser.zig` as the `.openai` arm of the shared `parseSseStream(dialect, ...)`.
 - OpenAI provider's `parseSseStream` deleted; call site routes through shared entry point.
 - Move the OpenAI streaming test (`parseSseStream captures usage and cached_tokens from final chunk`).
 
-### Commit 10 — `providers: shrink files; re-verify LOC budget`
+### Commit 10: `providers: shrink files; re-verify LOC budget`
 - Both provider files should now be: struct + vtable + `provider()` + `callImpl*` + any provider-specific smoke tests that didn't belong in the shared modules.
 - Run `wc -l src/providers/*.zig` to confirm < 400 each; if over, identify the leftover and decide whether it's genuinely provider-specific or was missed.
 - Run `zig fmt --check .` and `zig build test`.
 
-### Commit 11 — `docs: update architecture comment in CLAUDE.md`
+### Commit 11: `docs: update architecture comment in CLAUDE.md`
 - Add `llm/conversation.zig` and `llm/event_parser.zig` to the tree diagram in project CLAUDE.md. One-line descriptions.
 
 ## 6. What stays per-provider (on purpose)

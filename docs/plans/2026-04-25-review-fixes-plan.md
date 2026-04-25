@@ -262,7 +262,7 @@ Then `handleAgentEvent` calls `self.persistAgentEvent(event, allocator)` first, 
 
 **Diff.** In `runHeadlessWithProvider`'s drain loop (around `:605-742`), inside the per-event switch, call `deps.runner.persistAgentEvent(event, gpa)` BEFORE the trajectory capture switch. Closes the gap where headless trajectory captures the assistant text but JSONL doesn't.
 
-**Test:** Headless smoke (manual) — after fix, the newest `.zag/sessions/*.jsonl` should have at minimum `session_start + user_message + assistant_text` rows.
+**Test:** Headless smoke (manual). After fix, the newest `.zag/sessions/*.jsonl` should have at minimum `session_start + user_message + assistant_text` rows.
 
 **Commit:** `main: headless mode persists assistant turn through persistAgentEvent`
 
@@ -418,7 +418,7 @@ Open these issues on `vtemian/zag`:
 - **#6 (proposed): Forward child streaming events to parent's sink.** Current child events drain into Collector, no UI exposure. Depends on multi-sink fan-out (which depends on visual-mode #1).
 - **#7 (proposed): Enforce skills allowed-tools frontmatter.** Currently parsed but never checked at tool dispatch.
 
-This task is a no-code commit — it's just file the issues. Reference each issue from the corresponding TODO in the codebase.
+This task is a no-code commit; it's just file the issues. Reference each issue from the corresponding TODO in the codebase.
 
 **Commit:** `docs: file GitHub issues for v1 simplifications and reference from code TODOs`
 

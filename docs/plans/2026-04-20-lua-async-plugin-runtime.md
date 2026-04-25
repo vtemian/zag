@@ -93,18 +93,18 @@ pub const Task = struct {
 ### Error tags (exhaustive list)
 
 Stable string tags returned as `err` on failure:
-- `"cancelled"` — cooperative cancel (user interrupt, parent cancel, timeout, race loser)
-- `"timeout"` — per-call deadline exceeded
-- `"connect_failed"` — HTTP TCP/TLS connect failed
-- `"tls_error"` — TLS handshake failure
-- `"http_error"` — HTTP status non-2xx OR framing error (carries suffix `"http_error: 404"`)
-- `"invalid_uri"` — URL parse failed
-- `"spawn_failed"` — `std.process.Child.spawn` failed
-- `"killed"` — subprocess terminated by signal
-- `"io_error"` — generic filesystem/network error with suffix
-- `"not_found"` — path doesn't exist (fs)
-- `"permission_denied"` — fs permission
-- `"budget_exceeded"` — hook exceeded wall-clock budget
+- `"cancelled"`: cooperative cancel (user interrupt, parent cancel, timeout, race loser)
+- `"timeout"`: per-call deadline exceeded
+- `"connect_failed"`: HTTP TCP/TLS connect failed
+- `"tls_error"`: TLS handshake failure
+- `"http_error"`: HTTP status non-2xx OR framing error (carries suffix `"http_error: 404"`)
+- `"invalid_uri"`: URL parse failed
+- `"spawn_failed"`: `std.process.Child.spawn` failed
+- `"killed"`: subprocess terminated by signal
+- `"io_error"`: generic filesystem/network error with suffix
+- `"not_found"`: path doesn't exist (fs)
+- `"permission_denied"`: fs permission
+- `"budget_exceeded"`: hook exceeded wall-clock budget
 
 ### Wake pipe reuse
 
@@ -116,16 +116,16 @@ Add completion drain in `EventOrchestrator.tick()` at `src/EventOrchestrator.zig
 
 ### Existing code we stop needing
 
-- 50ms polling in `agent.zig:128-134` (`fireLifecycleHook`), `agent.zig:285-307` (`firePreHook`), `agent.zig:330-350` (`firePostHook`). Replaced by coroutine yield/resume — agent thread still uses `HookRequest` + `ResetEvent` round-trip (unchanged), but main thread's hook execution becomes a coroutine driven by the scheduler.
+- 50ms polling in `agent.zig:128-134` (`fireLifecycleHook`), `agent.zig:285-307` (`firePreHook`), `agent.zig:330-350` (`firePostHook`). Replaced by coroutine yield/resume: agent thread still uses `HookRequest` + `ResetEvent` round-trip (unchanged), but main thread's hook execution becomes a coroutine driven by the scheduler.
 - `LuaEngine.activate()` / `deactivate()` vestigial stubs at `LuaEngine.zig:968-975`. Delete.
 
 ### zlua gotchas to remember while implementing
 
-1. **Cannot yield across `Lua.call` or `Lua.protectedCall`** on Lua 5.4 — raises "attempt to yield across a C-call boundary". All coroutine entry points must use `resumeThread`, not `protectedCall`.
-2. **`Lua.yield` is `noreturn`** — longjmps. Any `errdefer` in the Zig C-closure after yield never runs. Stash ownership in the `Job` struct BEFORE yielding.
+1. **Cannot yield across `Lua.call` or `Lua.protectedCall`** on Lua 5.4: raises "attempt to yield across a C-call boundary". All coroutine entry points must use `resumeThread`, not `protectedCall`.
+2. **`Lua.yield` is `noreturn`**: longjmps. Any `errdefer` in the Zig C-closure after yield never runs. Stash ownership in the `Job` struct BEFORE yielding.
 3. **`newThread` returns a `*Lua` pinned on the parent stack**. Must immediately `ref(registry_index)` to pin across GC.
-4. **Registry ref of nil errors** — `lua.ref()` returns `error.LuaError` if TOS is nil. Check `isFunction` first when receiving user callbacks.
-5. **Sandbox strips `debug`** — no `debug.traceback` for coroutine error reports. Grab zlua's `traceback` helper or capture trace before sandbox applies.
+4. **Registry ref of nil errors**: `lua.ref()` returns `error.LuaError` if TOS is nil. Check `isFunction` first when receiving user callbacks.
+5. **Sandbox strips `debug`**: no `debug.traceback` for coroutine error reports. Grab zlua's `traceback` helper or capture trace before sandbox applies.
 
 ---
 
@@ -194,7 +194,7 @@ test "spike: create coroutine, resume, it yields, resume again, it finishes" {
 
 **Step 2: Wire into build**
 
-Modify: `src/lua/mod.zig` (create if missing) — add `_ = @import("spike_test.zig");` in a test block.
+Modify: `src/lua/mod.zig` (create if missing); add `_ = @import("spike_test.zig");` in a test block.
 
 **Step 3: Run test**
 
@@ -344,7 +344,7 @@ git commit -m "lua: spike error propagation from coroutine body"
 
 ## Phase 1: Scope type (structured concurrency)
 
-Build the scope/cancel-token primitive that will later anchor every coroutine. No coroutines yet — just the type and its tests.
+Build the scope/cancel-token primitive that will later anchor every coroutine. No coroutines yet, just the type and its tests.
 
 ### Task 1.1: Create empty Scope module with types
 
@@ -436,7 +436,7 @@ test "Scope.isCancelled defaults to false" {
 
 **Step 2: Add to build module root**
 
-Modify: `src/lua/mod.zig` — add `pub const Scope = @import("Scope.zig").Scope;` and `test { _ = @import("Scope.zig"); }`.
+Modify: `src/lua/mod.zig`: add `pub const Scope = @import("Scope.zig").Scope;` and `test { _ = @import("Scope.zig"); }`.
 
 **Step 3: Run**
 
@@ -553,7 +553,7 @@ test "Scope.cancel cascades from root to all descendants" {
 }
 ```
 
-**Step 2: Run — should already pass from Task 1.2**
+**Step 2: Run ,  should already pass from Task 1.2**
 
 ```bash
 zig build test 2>&1 | grep -A3 "cascades"
@@ -617,7 +617,7 @@ test "Job.abort calls aborter" {
 
 **Step 2: Wire Scope to use Job**
 
-Modify `src/lua/Scope.zig` — replace `jobs: std.ArrayList(*anyopaque)` with `jobs: std.ArrayList(*Job)`, add import:
+Modify `src/lua/Scope.zig`: replace `jobs: std.ArrayList(*anyopaque)` with `jobs: std.ArrayList(*Job)`, add import:
 
 ```zig
 const Job = @import("Job.zig").Job;
@@ -752,7 +752,7 @@ for (children_snap) |c| {
 }
 ```
 
-And `isCancelled` — the parent walk is only needed for unshielded scopes:
+And `isCancelled`: the parent walk is only needed for unshielded scopes:
 
 ```zig
 pub fn isCancelled(self: *Scope) bool {
@@ -1137,7 +1137,7 @@ test "Pool submit routes job to worker and posts to completion queue" {
 }
 ```
 
-**Step 2: Run — should pass (worker loop already routes to completions)**
+**Step 2: Run ,  should pass (worker loop already routes to completions)**
 
 ```bash
 zig build test 2>&1 | grep -A3 "routes job"
@@ -1259,7 +1259,7 @@ git commit -m "lua: wire async runtime (pool, completions, scope) into LuaEngine
 
 **Step 1: Expose a setter on EventOrchestrator**
 
-Modify `EventOrchestrator.zig` — add after init:
+Modify `EventOrchestrator.zig`: add after init:
 
 ```zig
 pub fn wakeWriteFd(self: *EventOrchestrator) std.posix.fd_t {
@@ -1364,7 +1364,7 @@ fn drainLuaCompletions(eng: *LuaEngine) void {
 }
 ```
 
-Stub `LuaEngine.resumeFromJob` — actual resume comes in Phase 4:
+Stub `LuaEngine.resumeFromJob`: actual resume comes in Phase 4:
 
 ```zig
 pub fn resumeFromJob(self: *LuaEngine, job: *@import("lua/Job.zig").Job) !void {
@@ -1391,7 +1391,7 @@ git commit -m "lua: add async completion drain step to EventOrchestrator.tick"
 
 ---
 
-## Phase 4: First primitive — `zag.sleep`
+## Phase 4: First primitive: `zag.sleep`
 
 End-to-end proof: Lua calls `zag.sleep(100)` inside a coroutine, worker sleeps, completion resumes.
 
@@ -1460,7 +1460,7 @@ pub const Job = struct {
 };
 ```
 
-**Step 2: Run — existing tests should still compile**
+**Step 2: Run ,  existing tests should still compile**
 
 ```bash
 zig build 2>&1 | head -20
@@ -2331,7 +2331,7 @@ cmd_exec: struct {
 
 **Step 2: Worker dispatch**
 
-In `LuaIoPool.zig` `executeJob`, add case (heavy lift — template is `src/tools/bash.zig:26-78,94-129`). Write it as its own function `executeCmdExec(alloc, job)` in a new file:
+In `LuaIoPool.zig` `executeJob`, add case (heavy lift; template is `src/tools/bash.zig:26-78,94-129`). Write it as its own function `executeCmdExec(alloc, job)` in a new file:
 
 **Files:**
 - Create: `src/lua/primitives/cmd.zig`
@@ -2790,11 +2790,11 @@ git commit -m "lua: zag.cmd supports stdin, env, and timeout"
 **Step 1: Design the handle**
 
 `zag.cmd.spawn(argv, opts)` returns a `CmdHandle` userdata supporting:
-- `handle:lines()` — coroutine-yielding iterator over stdout lines
-- `handle:write(data)` — write to stdin (yields)
-- `handle:close_stdin()` — close stdin
-- `handle:wait()` — yield until process exits; returns `(code, err)`
-- `handle:kill(signal)` — send signal (sync, no yield)
+- `handle:lines()`: coroutine-yielding iterator over stdout lines
+- `handle:write(data)`: write to stdin (yields)
+- `handle:close_stdin()`: close stdin
+- `handle:wait()`: yield until process exits; returns `(code, err)`
+- `handle:kill(signal)`: send signal (sync, no yield)
 
 Implementation: the Child process runs in a dedicated helper thread (not pool) for its lifetime. Lines/writes/waits go through jobs to the pool, which signals the helper via its own queue.
 
@@ -2810,7 +2810,7 @@ This is substantial. Break into subtasks:
 
 **Step 2-6: each subtask mirrors the TDD pattern**
 
-(Abbreviated for the plan — standard pattern: design struct, write test, implement, verify, commit. Each a distinct commit.)
+(Abbreviated for the plan; standard pattern: design struct, write test, implement, verify, commit. Each a distinct commit.)
 
 ### Task 6.5: `zag.cmd.kill(pid, sig)` sync primitive
 
@@ -2872,7 +2872,7 @@ HTTP mirrors the `zag.cmd` shape: GET/POST yield and return `{ status, headers, 
 
 ## Phase 8: `zag.fs.*`
 
-Simpler than HTTP/cmd — each primitive is a single blocking call.
+Simpler than HTTP/cmd: each primitive is a single blocking call.
 
 ### Task 8.1: `zag.fs.read`
 
@@ -2988,14 +2988,14 @@ pub fn fireHookAsync(self: *LuaEngine, payload: *Hooks.HookPayload) !void {
 }
 ```
 
-**Step 3:** Replace callers of `fireHook` — note they're mostly agent-thread round-trips. Agent thread still pushes `HookRequest` via event queue; main thread's `dispatchHookRequests` drains and calls `fireHookAsync`. But `HookRequest.done` is signaled only when the hook completes — for async hooks, that means when its coroutine finishes, not when it starts. Update `dispatchHookRequests` to register agent-thread `ResetEvent` as a joiner of the spawned coroutine.
+**Step 3:** Replace callers of `fireHook`: note they're mostly agent-thread round-trips. Agent thread still pushes `HookRequest` via event queue; main thread's `dispatchHookRequests` drains and calls `fireHookAsync`. But `HookRequest.done` is signaled only when the hook completes (for async hooks, that means when its coroutine finishes, not when it starts). Update `dispatchHookRequests` to register agent-thread `ResetEvent` as a joiner of the spawned coroutine.
 
 This is the heavy lift of the phase. Subtask breakdown:
 - Task 10.1a: fireHookAsync basic path (no veto/rewrite yet)
 - Task 10.1b: Hook coroutine return table → pending_cancel/rewrite captured
 - Task 10.1c: HookRequest.done signaled when hook coroutine retires
-- Task 10.1d: Agent thread still polls cancel every 50ms (agent.zig:128-134 stays for now — that's agent-side logic; hook-side is now coroutine-driven)
-- Task 10.1e: Delete the polling in agent.zig — replaced by bare `req.done.wait()` because hook completion is now reliable
+- Task 10.1d: Agent thread still polls cancel every 50ms (agent.zig:128-134 stays for now: that's agent-side logic; hook-side is now coroutine-driven)
+- Task 10.1e: Delete the polling in agent.zig: replaced by bare `req.done.wait()` because hook completion is now reliable
 
 **Step 4-6:** Implement, test, commit each subtask.
 
@@ -3090,21 +3090,21 @@ This is the heavy lift of the phase. Subtask breakdown:
 
 **Step 1-2:** Cover: overview, install path (`~/.config/zag/config.lua`, `~/.config/zag/lua/`), hook events table, keymap registration, error convention, cancellation semantics, examples. Commit.
 
-### Task 14.2: Example — policy hook
+### Task 14.2: Example: policy hook
 
 **Files:**
 - Create: `docs/plugins/examples/policy-hook.lua`
 
 **Step 1-2:** Demonstrates `zag.http.get` inside a `ToolPre` hook to check a policy server. Commit.
 
-### Task 14.3: Example — git status keymap
+### Task 14.3: Example: git status keymap
 
 **Files:**
 - Create: `docs/plugins/examples/git-status.lua`
 
 **Step 1-2:** Uses `zag.cmd` to run `git status --short`, shows via `zag.notify`. Commit.
 
-### Task 14.4: Example — file watcher hook
+### Task 14.4: Example: file watcher hook
 
 **Files:**
 - Create: `docs/plugins/examples/file-watcher.lua`
@@ -3127,7 +3127,7 @@ This is the heavy lift of the phase. Subtask breakdown:
 - Every `Job` is owned by the scheduler from `submit` → `resumeFromJob`. After resume, the scheduler frees it.
 - `Job.err_detail` and per-kind result strings are owned by the job; freed by `resumeFromJob` AFTER pushing onto the coroutine stack (Lua copies strings on push, so this is safe).
 - Arena pattern for `zag.cmd`: argv strings copied into an arena stored on the Task; arena freed after resume.
-- Testing allocator must not report leaks. Run with `zig build test` — any leak is a bug.
+- Testing allocator must not report leaks. Run with `zig build test`: any leak is a bug.
 
 ### Thread safety
 
@@ -3152,7 +3152,7 @@ After EVERY task, run:
 zig build test
 ```
 
-No existing test should break. If one does, it's a regression — fix before moving on.
+No existing test should break. If one does, it's a regression: fix before moving on.
 
 ### Verification checkpoints
 
@@ -3166,12 +3166,12 @@ After phase 10 (hook migration): Existing hook tests still green. Add integratio
 
 ### Follow-up work (not in this plan)
 
-- File watchers (`fsevents`/`inotify`) as a `zag.watch` primitive — deferred to next RFC.
-- TCP/UDP sockets — deferred; no current user need.
-- Out-of-process plugins — not planned; in-process is sufficient for Zag's domain.
-- `zag.ui.*` surface (panes, buffers) — deferred; separate RFC.
-- Stream cancellation mid-body for `zag.http.stream` — edge cases around partial-receive handling.
-- Memory limit on per-plugin Lua allocator — defer until a real offender appears.
+- File watchers (`fsevents`/`inotify`) as a `zag.watch` primitive: deferred to next RFC.
+- TCP/UDP sockets: deferred; no current user need.
+- Out-of-process plugins: not planned; in-process is sufficient for Zag's domain.
+- `zag.ui.*` surface (panes, buffers): deferred; separate RFC.
+- Stream cancellation mid-body for `zag.http.stream`: edge cases around partial-receive handling.
+- Memory limit on per-plugin Lua allocator: defer until a real offender appears.
 
 ### What we explicitly DO NOT do
 

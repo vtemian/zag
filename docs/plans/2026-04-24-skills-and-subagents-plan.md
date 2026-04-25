@@ -6,8 +6,8 @@
 
 **Execution order:** Third of three plans.
 
-1. `2026-04-24-buffer-pane-runner-decoupling-plan.md` — prerequisite.
-2. `2026-04-24-jsonl-tree-migration-plan.md` — prerequisite.
+1. `2026-04-24-buffer-pane-runner-decoupling-plan.md` (prerequisite).
+2. `2026-04-24-jsonl-tree-migration-plan.md` (prerequisite).
 3. **[this plan] Skills + subagents**
 
 **Source design:** `docs/plans/2026-04-24-skills-and-subagents-design.md`.
@@ -69,7 +69,7 @@ pub fn parse(alloc: Allocator, src: []const u8) !Frontmatter;
 
 Narrow YAML subset: `---\n<key>: <scalar-or-list>\n---\n<body>`. Scalars can be plain or quoted; lists can be inline (`[a, b, c]`) or block (`- a\n- b\n`). Unknown keys accepted; parser is permissive (warn-only) on unknown types.
 
-**Tests:** Five cases minimum — minimal skill frontmatter, quoted strings with special chars, inline list, block list, unknown field accepted as string.
+**Tests:** Five cases minimum: minimal skill frontmatter, quoted strings with special chars, inline list, block list, unknown field accepted as string.
 
 **Commit:** `frontmatter: add narrow YAML frontmatter parser`
 
@@ -211,7 +211,7 @@ Binding validates the table, copies strings into allocator-owned memory via the 
 
 **Design**
 
-Pure Lua module users opt into via `require("zag.subagents.filesystem")`. Walks `.zag/agents/`, `.agents/agents/`, `~/.config/zag/agents/` for `*.md` files; for each file, parses YAML frontmatter (call into the Zig frontmatter parser via a Lua binding, OR reimplement a tiny parser in Lua — prefer the Zig binding via `zag.parse_frontmatter(body)` which we expose in this task) and calls `zag.subagent.register` for each entry.
+Pure Lua module users opt into via `require("zag.subagents.filesystem")`. Walks `.zag/agents/`, `.agents/agents/`, `~/.config/zag/agents/` for `*.md` files; for each file, parses YAML frontmatter (call into the Zig frontmatter parser via a Lua binding, OR reimplement a tiny parser in Lua; prefer the Zig binding via `zag.parse_frontmatter(body)` which we expose in this task) and calls `zag.subagent.register` for each entry.
 
 Expose one new Lua helper: `zag.parse_frontmatter(src) -> { fields = {...}, body = "..." }`.
 
@@ -252,7 +252,7 @@ Returns a read-only view backed by the same tool implementations; `lookup` refus
 
 Execution:
 
-1. `SubagentRegistry.lookup(args.agent)` — `error.UnknownSubagent` on miss.
+1. `SubagentRegistry.lookup(args.agent)`: `error.UnknownSubagent` on miss.
 2. Parent Runner's `task_depth >= 8` → `error.MaxRecursionDepth`.
 3. Build a child `AgentRunner`:
    - Fresh `ConversationHistory` (empty; no attached session file, writes route to parent's file via wrapper).

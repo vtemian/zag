@@ -8,9 +8,9 @@
 
 **Execution order:** Second of three plans.
 
-1. `2026-04-24-buffer-pane-runner-decoupling-plan.md` — prerequisite.
+1. `2026-04-24-buffer-pane-runner-decoupling-plan.md` (prerequisite).
 2. **[this plan] JSONL tree migration**
-3. `2026-04-24-skills-and-subagents-plan.md` — builds on both.
+3. `2026-04-24-skills-and-subagents-plan.md` (builds on both).
 
 **Architecture**
 

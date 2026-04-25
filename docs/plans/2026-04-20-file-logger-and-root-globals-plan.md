@@ -12,7 +12,7 @@
 - Log rotation (file grows unbounded for now; YAGNI, instance lifetimes are short).
 - Lua config for the log path (would require boot-ordering gymnastics; env var is sufficient "configurable").
 - Routing per-pane diagnostics to individual files (no consumer).
-- Touching the `.zag/sessions/` JSONL format — this is a separate log.
+- Touching the `.zag/sessions/` JSONL format; this is a separate log.
 
 ---
 
@@ -46,11 +46,11 @@ A self-contained logger module. Owns the file handle, mutex, and the `std.Option
 
 Write the full file. Public surface:
 
-- `pub fn initWithPath(path: []const u8) !void` — open the file (O_APPEND | O_CREAT | O_WRONLY), store handle. Idempotent re-init closes the previous handle first.
-- `pub fn init(alloc: Allocator) !void` — resolves path via `resolvePath` and calls `initWithPath`. If no path is resolvable, the module stays disabled (logger becomes a silent no-op). Never returns an error the caller must handle beyond "init failed, continuing without logs" — init returns `!void` but callers should downgrade failure to a warning.
-- `pub fn deinit() void` — close handle, clear state. Idempotent.
-- `pub fn handler(level, scope, format, args)` — `std.Options.logFn`-compatible. Formats `YYYY-MM-DDTHH:MM:SS.mmmZ [scope] level: message\n` into a stack scratch buffer, acquires the mutex, writes, releases. Silent no-op if not initialized.
-- `pub fn resolvePath(alloc: Allocator) !?[]const u8` — returns `$ZAG_LOG_FILE` if set (duped), else `$HOME/.zag/logs/<uuid>.log` (duped, creates `$HOME/.zag/logs/` if missing). Returns `null` if `$HOME` is unset and no env override exists. Caller owns the returned slice.
+- `pub fn initWithPath(path: []const u8) !void`: open the file (O_APPEND | O_CREAT | O_WRONLY), store handle. Idempotent re-init closes the previous handle first.
+- `pub fn init(alloc: Allocator) !void`: resolves path via `resolvePath` and calls `initWithPath`. If no path is resolvable, the module stays disabled (logger becomes a silent no-op). Never returns an error the caller must handle beyond "init failed, continuing without logs"; init returns `!void` but callers should downgrade failure to a warning.
+- `pub fn deinit() void`: close handle, clear state. Idempotent.
+- `pub fn handler(level, scope, format, args)`: `std.Options.logFn`-compatible. Formats `YYYY-MM-DDTHH:MM:SS.mmmZ [scope] level: message\n` into a stack scratch buffer, acquires the mutex, writes, releases. Silent no-op if not initialized.
+- `pub fn resolvePath(alloc: Allocator) !?[]const u8`: returns `$ZAG_LOG_FILE` if set (duped), else `$HOME/.zag/logs/<uuid>.log` (duped, creates `$HOME/.zag/logs/` if missing). Returns `null` if `$HOME` is unset and no env override exists. Caller owns the returned slice.
 
 Full initial file body:
 
@@ -312,7 +312,7 @@ Run: `zig build`
 Expected: Build succeeds.
 
 Run: `rm -f ~/.zag/logs/*.log 2>/dev/null; zig build run -- --help 2>&1 | head -5`
-(The binary will fail at provider init without an API key — that's fine. It just needs to reach the first log call.)
+(The binary will fail at provider init without an API key, that's fine. It just needs to reach the first log call.)
 
 Run: `ls ~/.zag/logs/`
 Expected: Exactly one new `.log` file created by this invocation.
@@ -325,7 +325,7 @@ Run: `rm ~/.zag/logs/*.log` (cleanup).
 **Step 5: Run tests**
 
 Run: `zig build test`
-Expected: Pass. The `appendOutputText creates a status node` test at main.zig:375 still references `root_buffer` as a module global — that's fixed in Task 3. For Task 2, it should still compile and pass because the module globals are untouched.
+Expected: Pass. The `appendOutputText creates a status node` test at main.zig:375 still references `root_buffer` as a module global; that's fixed in Task 3. For Task 2, it should still compile and pass because the module globals are untouched.
 
 **Step 6: Commit**
 
@@ -498,8 +498,8 @@ Expected after the refactor: only LOCAL occurrences inside `main()` remain (arou
 Run: `rm -f ~/.zag/logs/*.log; zig build run -- --help 2>&1 | head -20`
 (Again, will fail at provider init without API key; that's fine.)
 
-Run: `ls ~/.zag/logs/` — expect exactly one file.
-Run: `cat ~/.zag/logs/*.log | head -20` — expect plain-text log lines, no conversation content.
+Run: `ls ~/.zag/logs/`. Expect exactly one file.
+Run: `cat ~/.zag/logs/*.log | head -20`. Expect plain-text log lines, no conversation content.
 
 Run: `rm ~/.zag/logs/*.log` (cleanup).
 
@@ -552,8 +552,8 @@ Expected: At least `file_log.init`, `file_log.deinit`, and `file_log.handler` re
 
 Run: `rm -f ~/.zag/logs/*.log; ZAG_LOG_FILE=/tmp/zag-smoke.log zig build run -- --help 2>&1 | head -5`
 
-Run: `ls ~/.zag/logs/` — expect EMPTY directory (env var override wins).
-Run: `cat /tmp/zag-smoke.log` — expect log lines in the override path.
+Run: `ls ~/.zag/logs/`. Expect EMPTY directory (env var override wins).
+Run: `cat /tmp/zag-smoke.log`. Expect log lines in the override path.
 Run: `rm /tmp/zag-smoke.log` (cleanup).
 
 **Step 6: Branch diff review**
@@ -568,7 +568,7 @@ Expected: `src/file_log.zig` created, `src/main.zig` significantly slimmed (net 
 
 Summarise the change to Vlad:
 - Log output now lands in `~/.zag/logs/<uuid>.log` by default, `$ZAG_LOG_FILE` overrides.
-- `root_buffer`/`root_session`/`root_runner` are no longer module-level — Phase 4 collapse is complete.
+- `root_buffer`/`root_session`/`root_runner` are no longer module-level; Phase 4 collapse is complete.
 - Original leak (scratch agents polluting session buffer) is fixed at the root: logs don't hit any conversation buffer.
 
 ---
@@ -581,7 +581,7 @@ Summarise the change to Vlad:
 ## Reminders for the executor
 - Do NOT introduce Lua-configurable log paths in this plan. Env var only.
 - Do NOT add log rotation. Single file per instance; YAGNI.
-- The `in_handler` threadlocal guard in `file_log.zig` mirrors the old `in_log_handler`. Keep it — an allocator panic inside the logger path would be ugly without it.
+- The `in_handler` threadlocal guard in `file_log.zig` mirrors the old `in_log_handler`. Keep it; an allocator panic inside the logger path would be ugly without it.
 - If Zig 0.15's `std.posix.open` flags differ from what's shown (e.g., `.CREAT` vs `.CREATE`), use the actual stdlib names. Intent: `O_WRONLY | O_APPEND | O_CREAT | 0644`.
 - Manual smoke tests all require `rm ~/.zag/logs/*.log` cleanup BEFORE to isolate; don't skip.
 - If `std.time.epoch` formatting breaks the build (API drift), simplify the prefix format to `{millis_since_epoch} [{scope}] {level}:` and leave human-readable ISO formatting for a follow-up.

@@ -7,8 +7,8 @@
 **Execution order:** First of three plans.
 
 1. **[this plan] Buffer + Pane + Runner decoupling**
-2. `2026-04-24-jsonl-tree-migration-plan.md` — ULID + parent_id event schema.
-3. `2026-04-24-skills-and-subagents-plan.md` — builds on both.
+2. `2026-04-24-jsonl-tree-migration-plan.md` (ULID + parent_id event schema).
+3. `2026-04-24-skills-and-subagents-plan.md` (builds on both).
 
 ---
 
@@ -30,7 +30,7 @@ After the refactor:
 
 - `AgentRunner.view` is replaced by `AgentRunner.sink: Sink`.
 - Every `view.*` write becomes a `self.sink.push(.<variant>)` call.
-- `session` persistence stays as direct calls on `*ConversationHistory` (the runner still owns persistence; the Sink does not route persistence — it's a display-only abstraction).
+- `session` persistence stays as direct calls on `*ConversationHistory` (the runner still owns persistence; the Sink does not route persistence, it's a display-only abstraction).
 - `current_assistant_node: ?*Node` and `pending_tool_calls: StringHashMap(*Node)` stay but become `BufferSink`-internal state. The runner no longer tracks node pointers; it tracks `call_id` strings in its correlation map and passes them through `tool_use` / `tool_result` events. The Sink decides how to materialise nodes. This kills the dangling-*Node hazard on provider swap.
 - Scroll reset (lines 475–477 in AgentRunner) stays as a direct mutation against whatever display channel the Pane exposes; it is not a content event and does not go through the Sink.
 
@@ -172,7 +172,7 @@ test {
 
 **Step 1: failing test**
 
-Before writing the file, verify `zig build` fails because `Sink.zig` isn't imported. Add a tiny import in `src/main.zig` (top of file, with other imports) that references `@import("Sink.zig")` — this alone will fail until Task 1 lands.
+Before writing the file, verify `zig build` fails because `Sink.zig` isn't imported. Add a tiny import in `src/main.zig` (top of file, with other imports) that references `@import("Sink.zig")`; this alone will fail until Task 1 lands.
 
 Actually simpler: create the file, then add one inline test that constructs a trivial counting Sink:
 
@@ -375,7 +375,7 @@ test "setScrollOffset marks dirty only when value changes" {
 }
 ```
 
-The four "dirty" tests should continue to assert via the Buffer vtable (`cb.buf().isDirty()`, etc.) — the point is that the vtable still works, just backed by Viewport now.
+The four "dirty" tests should continue to assert via the Buffer vtable (`cb.buf().isDirty()`, etc.). The point is that the vtable still works, just backed by Viewport now.
 
 **Step 2: implementation**
 
@@ -460,9 +460,9 @@ This test will fail until Task 5 is complete (the struct field doesn't exist yet
 
 Add the field to Pane. Update `createSplitPane` to do the post-append attach dance. Update main.zig to attach after `EventOrchestrator.init`.
 
-Update `WindowManager.deinit` (lines 253-274): no new free is needed — Viewport is inline, not heap.
+Update `WindowManager.deinit` (lines 253-274): no new free is needed; Viewport is inline, not heap.
 
-Update `createSplitPane` (lines 906-946): also check for the existing `createSplitPane` scratch path (`doSplitWithBuffer`, lines 855-885) — it constructs a Pane with `view: null`. Those panes still need `viewport: Viewport = .{}` default, but no buffer-attach (no ConversationBuffer to attach to).
+Update `createSplitPane` (lines 906-946): also check for the existing `createSplitPane` scratch path (`doSplitWithBuffer`, lines 855-885); it constructs a Pane with `view: null`. Those panes still need `viewport: Viewport = .{}` default, but no buffer-attach (no ConversationBuffer to attach to).
 
 **Verification**
 
@@ -749,7 +749,7 @@ Five tests in AgentRunner.zig need rewrites (per the audit):
 - "resetCurrentAssistantText removes..." (line 642): becomes "handleAgentEvent .reset_assistant_text pushes assistant_reset to sink".
 - "resetCurrentAssistantText is a no-op..." (664): deleted or merged into above.
 - "text_delta after reset..." (681): verify sequence of Sink events in a MockSink.
-- "handleAgentEvent correlates..." (706): now tests that tool_use and tool_result are emitted with matching call_id; correlation is BufferSink's concern, not runner's — so this test moves to BufferSink's file (already covered by Task 6 tests).
+- "handleAgentEvent correlates..." (706): now tests that tool_use and tool_result are emitted with matching call_id; correlation is BufferSink's concern, not runner's, so this test moves to BufferSink's file (already covered by Task 6 tests).
 - "submitInput records..." (895): verify `run_start` pushed + session.messages appended + persistUserMessage called.
 
 MockSink helper for tests (add at the top of the test section in AgentRunner.zig):
@@ -851,7 +851,7 @@ for (self.extra_panes.items) |entry| {
 }
 ```
 
-Note: BufferSink deinit must run before the buffer's deinit (BufferSink borrows the buffer pointer). The order above is correct — runner first (no more events pushed), then sink (frees correlation map), then view (buffer).
+Note: BufferSink deinit must run before the buffer's deinit (BufferSink borrows the buffer pointer). The order above is correct: runner first (no more events pushed), then sink (frees correlation map), then view (buffer).
 
 For the **root pane in main.zig**, use the same post-init attach pattern as extras. The Pane value is passed by value into `EventOrchestrator.init`, which copies it into `orchestrator.window_manager.root_pane`. After init returns, that location is stable for the rest of the program, and we attach the viewport pointer from there. The root BufferSink lives on main's stack because its lifetime matches main's defer chain; that's the only asymmetry between root and extras, and it's deliberate (extras outlive main.zig's stack frame on their own ArrayList, root doesn't).
 
@@ -976,7 +976,7 @@ jq '.steps[] | select(.role == "assistant") | .text' /tmp/zag_decouple_traj.json
 
 Baseline `zig build test` test count (captured at Task 0) must be preserved or improved.
 
-**Commit:** none (gate commit is implicit — plan 2 begins only when all of the above pass).
+**Commit:** none (gate commit is implicit; plan 2 begins only when all of the above pass).
 
 ---
 
