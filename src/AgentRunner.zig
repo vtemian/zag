@@ -663,9 +663,17 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
             });
         },
         .tool_start => |ev| {
+            // Pair tool_call rows with their tool_result via the
+            // provider-issued call id; otherwise parallel tool calls,
+            // retries, and subagent dispatches cannot be replayed
+            // unambiguously from the JSONL log. The raw input JSON is
+            // persisted so replay can rebuild the exact tool_use block
+            // the model emitted instead of fabricating "{}".
             self.session.persistEvent(.{
                 .entry_type = .tool_call,
                 .tool_name = ev.name,
+                .tool_input = if (ev.input_raw) |raw| raw else "",
+                .tool_use_id = ev.call_id,
                 .timestamp = ts,
             });
         },
@@ -674,6 +682,7 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
                 .entry_type = .tool_result,
                 .content = result.content,
                 .is_error = result.is_error,
+                .tool_use_id = result.call_id,
                 .timestamp = ts,
             });
         },
