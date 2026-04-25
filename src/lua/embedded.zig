@@ -33,6 +33,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.prompt", .code = @embedFile("zag/prompt/init.lua") },
     .{ .name = "zag.prompt.anthropic", .code = @embedFile("zag/prompt/anthropic.lua") },
     .{ .name = "zag.prompt.openai-codex", .code = @embedFile("zag/prompt/openai-codex.lua") },
+    .{ .name = "zag.prompt.default", .code = @embedFile("zag/prompt/default.lua") },
 };
 
 /// Find an entry by its dotted module name. Returns null if not found.
@@ -45,7 +46,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 15), entries.len);
+    try std.testing.expectEqual(@as(usize, 16), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -89,6 +90,17 @@ test "find returns the entry for the openai-codex prompt pack" {
     try std.testing.expect(std.mem.indexOf(u8, e.code, "running with GPT-5 Codex") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "apply_patch") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "ASCII") != null);
+}
+
+test "find returns the entry for the default prompt pack" {
+    const e = find("zag.prompt.default").?;
+    try std.testing.expectEqualStrings("zag.prompt.default", e.name);
+    // Pack module exposes M.render and the provider-agnostic identity
+    // line (no "running with <vendor>" tail; the fallback never claims
+    // a specific model family).
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.render") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "You are zag, a coding agent harness.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "running with") == null);
 }
 
 test {
