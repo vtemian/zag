@@ -134,13 +134,13 @@ test "find returns the entry for the default prompt pack" {
 test "find returns the entry for the rg_trim transform" {
     const e = find("zag.transforms.rg_trim").?;
     try std.testing.expectEqualStrings("zag.transforms.rg_trim", e.name);
-    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tool.transform_output(\"grep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tools.transform_output(\"grep\"") != null);
 }
 
 test "find returns the entry for the bash_trim transform" {
     const e = find("zag.transforms.bash_trim").?;
     try std.testing.expectEqualStrings("zag.transforms.bash_trim", e.name);
-    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tool.transform_output(\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.tools.transform_output(\"bash\"") != null);
 }
 
 test "find returns the entry for the default loop detector" {

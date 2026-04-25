@@ -113,7 +113,7 @@ zag.context.on_tool_result("read", function(ctx)
 end)
 ```
 
-## `zag.tool.transform_output(tool_name, fn)`
+## `zag.tools.transform_output(tool_name, fn)`
 
 Per-tool socket that runs at the same lifecycle point as `on_tool_result`, but the return value **replaces** `ctx.output` instead of appending. Use it to trim, redact, or reshape what the model sees.
 
@@ -125,7 +125,7 @@ Per-tool socket that runs at the same lifecycle point as `on_tool_result`, but t
 Re-registration replaces the previous function (last write wins). One handler per tool, so chaining transforms means composing them inside a single Lua function. Handler errors are caught and logged; on failure the original output flows through.
 
 ```lua
-zag.tool.transform_output("bash", function(ctx)
+zag.tools.transform_output("bash", function(ctx)
   if ctx.is_error then return nil end
   if #ctx.output > 4000 then
     return ctx.output:sub(1, 4000) .. "\n... [truncated]"
@@ -192,11 +192,11 @@ Each turn of the agent loop runs the same fixed sequence. Sockets fire at exactl
    b. The tool's `execute` runs.
    c. `runToolStep` post-hook (`Hooks.tool_post`) for output rewrites.
    d. `fireJitContextRequest`: the matching `zag.context.on_tool_result` handler runs and its return value is **appended** under the tool result with a blank-line separator.
-   e. `fireToolTransformRequest`: the matching `zag.tool.transform_output` handler runs and its return value **replaces** the (post-JIT) tool output.
+   e. `fireToolTransformRequest`: the matching `zag.tools.transform_output` handler runs and its return value **replaces** the (post-JIT) tool output.
 9. `fireLoopDetect`: the harness compares the just-executed last tool call against the previous turn's, bumps `identical_streak` on a match, and consults the registered detector. A `reminder` action pushes onto the `Reminder.Queue` with `next_turn` scope. An `abort` action raises `error.LoopAborted` and ends the loop cleanly.
 10. `fireLifecycleHook(turn_end)`: Lua `turn_end` lifecycle hooks fire with `stop_reason`, `input_tokens`, and `output_tokens`. `turn_in_progress` clears immediately after.
 
 Two load-bearing rules fall out of this order:
 
-- **JIT context runs before tool output transform.** A `zag.tool.transform_output` handler sees the post-JIT content as its `ctx.output`. If you want the transform to operate on the model's raw tool result, register the same logic on both sockets, or move the trim into `zag.context.on_tool_result` instead.
+- **JIT context runs before tool output transform.** A `zag.tools.transform_output` handler sees the post-JIT content as its `ctx.output`. If you want the transform to operate on the model's raw tool result, register the same logic on both sockets, or move the trim into `zag.context.on_tool_result` instead.
 - **Loop-detector reminders surface at the next user-message boundary.** When `zag.loop.detect` returns a `reminder` action, the text lands in `Reminder.Queue` with `next_turn` scope and is folded in by step 5 of the **next** iteration, not appended to the current iteration's next tool call. A persistent reminder fires every turn until cleared; a `next_turn` reminder fires once and drops.

@@ -1,7 +1,7 @@
 //! Reminder queue: short text snippets that get folded into the next
 //! user-message boundary as `<system-reminder>` blocks.
 //!
-//! Lua plugins push entries via `zag.reminder(text, opts)`; the harness
+//! Lua plugins push entries via `zag.reminders.push(text, opts)`; the harness
 //! drains the queue when it builds the next turn's request. Entries with
 //! `scope = .next_turn` are removed on drain; `scope = .persistent`
 //! survive across drains so they keep firing on every turn until cleared

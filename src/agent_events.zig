@@ -73,7 +73,7 @@ pub const AgentEvent = union(enum) {
     /// `prompt_assembly_request`. The request is caller-owned.
     jit_context_request: *JitContextRequest,
     /// Round-trip: the agent thread asks main to invoke the Lua handler
-    /// registered via `zag.tool.transform_output(name, fn)` for a just
+    /// registered via `zag.tools.transform_output(name, fn)` for a just
     /// completed tool call. Unlike `jit_context_request` (which appends),
     /// the returned text REPLACES the tool's output. Same main-thread
     /// marshalling rationale; the request is caller-owned.
@@ -511,7 +511,7 @@ pub const JitContextRequest = struct {
 
 /// Round-trip request pushed by the agent thread when a tool call has
 /// just completed and a Lua handler is registered via
-/// `zag.tool.transform_output(tool_name, fn)`. Lua is pinned to the main
+/// `zag.tools.transform_output(tool_name, fn)`. Lua is pinned to the main
 /// thread, so the worker marshals here exactly like `JitContextRequest`.
 ///
 /// The semantic difference from `JitContextRequest`: the handler's
