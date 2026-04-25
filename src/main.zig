@@ -26,6 +26,7 @@ const agent = @import("agent.zig");
 const agent_events = @import("agent_events.zig");
 const Harness = @import("Harness.zig");
 const prompt = @import("prompt.zig");
+const skills_mod = @import("skills.zig");
 const types = @import("types.zig");
 const auth_wizard = @import("auth_wizard.zig");
 const oauth = @import("oauth.zig");
@@ -825,6 +826,23 @@ pub fn runHeadless(mode: HeadlessMode, gpa: std.mem.Allocator) !void {
     const auth_path = try std.fmt.allocPrint(gpa, "{s}/.config/zag/auth.json", .{home_dir});
     defer gpa.free(auth_path);
 
+    // Discover skills before the agent loop assembles its system prompt:
+    // SKILL.md frontmatter anywhere under `<project>/.zag/skills`,
+    // `<project>/.agents/skills`, or `~/.config/zag/skills` becomes an
+    // entry in the `<available_skills>` block. A discovery failure is
+    // non-fatal; the layer just stays empty.
+    const skills_config_home = try std.fmt.allocPrint(gpa, "{s}/.config/zag", .{home_dir});
+    defer gpa.free(skills_config_home);
+    const skills_project_root = std.fs.cwd().realpathAlloc(gpa, ".") catch null;
+    defer if (skills_project_root) |p| gpa.free(p);
+
+    var skills_registry = skills_mod.SkillRegistry.discover(gpa, skills_config_home, skills_project_root) catch |err| blk: {
+        log.warn("skills discovery failed: {}", .{err});
+        break :blk skills_mod.SkillRegistry{};
+    };
+    defer skills_registry.deinit(gpa);
+    root_runner.skills = &skills_registry;
+
     const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
     // If the Lua engine failed to boot, fall back to an empty registry.
     // `createProviderFromLuaConfig` will surface UnknownProvider, which the
@@ -1328,6 +1346,29 @@ pub fn main() !void {
 
     try postStartupBanner(&root_buffer, resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
+    // Discover skills before the orchestrator brings up split panes:
+    // SKILL.md frontmatter under `<project>/.zag/skills`,
+    // `<project>/.agents/skills`, or `~/.config/zag/skills` becomes an
+    // entry in the `<available_skills>` block injected into every
+    // pane's system prompt. A discovery failure is non-fatal; the
+    // layer just stays empty for this session.
+    const skills_home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => try allocator.dupe(u8, "."),
+        else => return err,
+    };
+    defer allocator.free(skills_home_dir);
+    const skills_config_home = try std.fmt.allocPrint(allocator, "{s}/.config/zag", .{skills_home_dir});
+    defer allocator.free(skills_config_home);
+    const skills_project_root = std.fs.cwd().realpathAlloc(allocator, ".") catch null;
+    defer if (skills_project_root) |p| allocator.free(p);
+
+    var skills_registry = skills_mod.SkillRegistry.discover(allocator, skills_config_home, skills_project_root) catch |err| blk: {
+        log.warn("skills discovery failed: {}", .{err});
+        break :blk skills_mod.SkillRegistry{};
+    };
+    defer skills_registry.deinit(allocator);
+    root_runner.skills = &skills_registry;
+
     // -- Hand off to the orchestrator ----------------------------------------
     var orchestrator = try EventOrchestrator.init(.{
         .allocator = allocator,
@@ -1344,6 +1385,7 @@ pub fn main() !void {
         .stdout_file = stdout_file,
         .wake_read_fd = wake_read,
         .wake_write_fd = wake_write,
+        .skills = &skills_registry,
     });
     defer orchestrator.deinit();
 

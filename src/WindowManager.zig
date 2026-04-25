@@ -34,6 +34,7 @@ const BufferRegistry = @import("BufferRegistry.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const agent_events = @import("agent_events.zig");
 const auth_wizard = @import("auth_wizard.zig");
+const skills_mod = @import("skills.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const input = @import("input.zig");
@@ -127,6 +128,11 @@ lua_engine: ?*LuaEngine,
 /// Write end of the wake pipe. Threaded into every buffer's event_queue
 /// so agent workers can wake the main loop from arbitrary threads.
 wake_write_fd: posix.fd_t,
+/// Filesystem-discovered skill registry advertised to every pane's
+/// agent loop via the `builtin.skills_catalog` prompt layer. Borrowed
+/// from main; outlives the manager. Null leaves the layer dormant
+/// (no `<available_skills>` block emitted).
+skills: ?*const skills_mod.SkillRegistry = null,
 
 /// Stable IDs for layout nodes. Populated by `Layout` via its
 /// `registry` back-pointer once `attachLayoutRegistry` wires them
@@ -184,6 +190,10 @@ pub const Config = struct {
     lua_engine: ?*LuaEngine,
     /// Write end of the wake pipe so agent workers can interrupt the main loop.
     wake_write_fd: posix.fd_t,
+    /// Skill registry discovered at boot. Threaded into `createSplitPane`
+    /// so every new pane's runner advertises the same catalog as the root.
+    /// Null disables the prompt layer.
+    skills: ?*const skills_mod.SkillRegistry = null,
 };
 
 pub fn init(cfg: Config) !WindowManager {
@@ -198,6 +208,7 @@ pub fn init(cfg: Config) !WindowManager {
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
+        .skills = cfg.skills,
         .node_registry = NodeRegistry.init(cfg.allocator),
         .buffer_registry = BufferRegistry.init(cfg.allocator),
         .command_registry = CommandRegistry.init(cfg.allocator),
@@ -969,6 +980,9 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     runner.wake_fd = self.wake_write_fd;
     runner.lua_engine = self.lua_engine;
     runner.window_manager = self;
+    // Propagate the boot-time skill registry so split panes share the
+    // same `<available_skills>` catalog as root.
+    runner.skills = self.skills;
 
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;

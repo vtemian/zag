@@ -33,6 +33,7 @@ const BufferRegistry = @import("BufferRegistry.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
+const skills_mod = @import("skills.zig");
 const trace = @import("Metrics.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
@@ -127,6 +128,10 @@ pub const Config = struct {
     /// Write end of the wake pipe, wired into every pane's event queue so
     /// agent workers can wake the main loop from arbitrary threads.
     wake_write_fd: posix.fd_t,
+    /// Boot-time skill registry. Forwarded into the WindowManager so
+    /// `createSplitPane` can attach the same registry to every new pane's
+    /// runner. Null leaves the prompt layer dormant.
+    skills: ?*const skills_mod.SkillRegistry = null,
 };
 
 pub fn init(cfg: Config) !EventOrchestrator {
@@ -152,6 +157,7 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .session_mgr = cfg.session_mgr,
         .lua_engine = cfg.lua_engine,
         .wake_write_fd = cfg.wake_write_fd,
+        .skills = cfg.skills,
     });
     errdefer self.window_manager.deinit();
     return self;
