@@ -84,14 +84,28 @@ pub fn freeSystemPaths(paths: []const []const u8, alloc: Allocator) void {
 /// of `cwd` (after normalization); otherwise the walk halts at filesystem
 /// root and returns `null`.
 pub fn findUp(cwd: []const u8, worktree: []const u8, alloc: Allocator) !?Found {
+    return findUpWith(cwd, worktree, &FILE_NAMES, alloc);
+}
+
+/// Same as `findUp`, but probes a caller-supplied list of basenames in
+/// priority order. Used by the Lua `zag.context.find_up` binding so plugins
+/// can pull instruction-style files (or any other walk-up sentinel) without
+/// re-implementing the walk in Lua.
+pub fn findUpWith(
+    cwd: []const u8,
+    worktree: []const u8,
+    names: []const []const u8,
+    alloc: Allocator,
+) !?Found {
     if (cwd.len == 0 or worktree.len == 0) return null;
     if (!std.fs.path.isAbsolute(cwd) or !std.fs.path.isAbsolute(worktree)) return null;
+    if (names.len == 0) return null;
 
     const worktree_norm = trimTrailingSep(worktree);
 
     var current = trimTrailingSep(cwd);
     while (true) {
-        if (try probeDir(current, alloc)) |found| return found;
+        if (try probeDir(current, names, alloc)) |found| return found;
 
         if (std.mem.eql(u8, current, worktree_norm)) break;
 
@@ -109,8 +123,8 @@ fn trimTrailingSep(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-fn probeDir(dir_abs: []const u8, alloc: Allocator) !?Found {
-    for (FILE_NAMES) |name| {
+fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?Found {
+    for (names) |name| {
         const path = try std.fs.path.join(alloc, &.{ dir_abs, name });
         errdefer alloc.free(path);
 
@@ -350,4 +364,35 @@ test "findUp rejects relative paths" {
     try testing.expect(r1 == null);
     const r2 = try findUp("/abs/cwd", "relative/wt", testing.allocator);
     try testing.expect(r2 == null);
+}
+
+test "findUpWith honours caller-supplied basenames" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "MARK.md", "marker body");
+    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(root);
+
+    // The default FILE_NAMES list misses MARK.md, so the standard
+    // findUp returns nothing; findUpWith with the right list finds it.
+    const default_result = try findUp(root, root, testing.allocator);
+    try testing.expect(default_result == null);
+
+    const names = [_][]const u8{"MARK.md"};
+    const result = (try findUpWith(root, root, &names, testing.allocator)).?;
+    defer result.deinit(testing.allocator);
+    try testing.expect(std.mem.endsWith(u8, result.path, "MARK.md"));
+    try testing.expectEqualStrings("marker body", result.content);
+}
+
+test "findUpWith returns null for empty names list" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "AGENTS.md", "ignored");
+    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(root);
+
+    const empty: []const []const u8 = &.{};
+    const result = try findUpWith(root, root, empty, testing.allocator);
+    try testing.expect(result == null);
 }
