@@ -44,6 +44,11 @@ const EventOrchestrator = @This();
 /// Action returned from event handling to the main loop.
 const Action = enum { none, quit, redraw };
 
+/// Reminder body pushed when a user message arrives mid-turn. `injectReminders`
+/// wraps it as `<system-reminder>\n<this>\n</system-reminder>\n\n<user text>`,
+/// which produces the interrupt envelope the model recognises.
+const mid_turn_interrupt_prefix = "The user interrupted with the following message. Acknowledge before continuing:";
+
 /// Re-exported from WindowManager: result of handling a slash command.
 const CommandResult = WindowManager.CommandResult;
 
@@ -586,6 +591,23 @@ fn onUserInputSubmitted(
         if (payload.user_message_pre.text_rewrite) |rewritten| {
             working_text = rewritten;
             text_rewrite_owned = rewritten;
+        }
+    }
+
+    // When the user types Enter while a turn is mid-flight, the bare
+    // message arriving at the tail of `messages` doesn't carry any
+    // signal that it interrupted in-progress work. Push a `next_turn`
+    // reminder so HE7.3's `injectReminders` wraps the message with a
+    // `<system-reminder>` interrupt prefix on the next iteration. We
+    // push *before* `submitInput` so the reminder is queued by the time
+    // the agent's next iteration starts; pushing after would race a
+    // worker thread that already woke on the appended message.
+    if (runner.turn_in_progress.load(.acquire)) {
+        if (self.lua_engine) |eng| {
+            eng.reminders.push(eng.allocator, .{
+                .text = mid_turn_interrupt_prefix,
+                .scope = .next_turn,
+            }) catch |err| log.warn("mid-turn reminder push failed: {}", .{err});
         }
     }
 

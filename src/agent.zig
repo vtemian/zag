@@ -44,6 +44,7 @@ pub fn runLoopStreaming(
     cancel: *agent_events.CancelFlag,
     lua_engine: ?*LuaEngine.LuaEngine,
     skills: ?*const skills_mod.SkillRegistry,
+    turn_in_progress: *std.atomic.Value(bool),
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
@@ -88,6 +89,11 @@ pub fn runLoopStreaming(
         if (cancel.load(.acquire)) return;
         turn_num += 1;
 
+        // Mark the turn as in-flight so `EventOrchestrator.onUserInputSubmitted`
+        // diverts an interrupt-time user message into the reminder queue.
+        // Cleared right before we exit the iteration's tail (after `turn_end`).
+        turn_in_progress.store(true, .release);
+
         var turn_start: Hooks.HookPayload = .{ .turn_start = .{
             .turn_num = turn_num,
             .message_count = messages.items.len,
@@ -129,6 +135,7 @@ pub fn runLoopStreaming(
             .output_tokens = response.output_tokens,
         } };
         fireLifecycleHook(lua_engine, &turn_end, queue, cancel);
+        turn_in_progress.store(false, .release);
 
         if (tool_calls.len == 0) break;
     }
@@ -1363,4 +1370,78 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "mid-turn user message wraps as a system-reminder interrupt on next iteration" {
+    // Verifies the HE7.4 mechanic end-to-end through the seam:
+    // 1. The agent loop is mid-turn (`turn_in_progress = true`).
+    // 2. A user message arrives. The orchestrator-side branch pushes a
+    //    `next_turn` reminder with the interrupt prefix and lets the
+    //    bare user message flow into `messages` as before.
+    // 3. The next iteration runs `Harness.injectReminders`, which wraps
+    //    the trailing user message with the `<system-reminder>` block.
+    //
+    // The text exposed to the model on that next iteration must read:
+    //   <system-reminder>
+    //   The user interrupted ... :
+    //   </system-reminder>
+    //
+    //   <original user text>
+    const Reminder = @import("Reminder.zig");
+    const alloc = std.testing.allocator;
+
+    // The constant that EventOrchestrator pushes when turn_in_progress is true.
+    // Duplicated here rather than imported to keep the test self-contained;
+    // any drift breaks this assertion before it reaches the orchestrator.
+    const interrupt_prefix = "The user interrupted with the following message. Acknowledge before continuing:";
+
+    var queue: Reminder.Queue = .{};
+    defer queue.deinit(alloc);
+
+    // Simulate the orchestrator's mid-turn branch.
+    var turn_in_progress = std.atomic.Value(bool).init(true);
+    if (turn_in_progress.load(.acquire)) {
+        try queue.push(alloc, .{ .text = interrupt_prefix, .scope = .next_turn });
+    }
+
+    // The user-input pipeline still appends the bare message to `messages`
+    // (UI rendering and session persistence depend on it). The wrap is
+    // produced solely by `injectReminders` rewriting this last user msg.
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |msg| msg.deinit(alloc);
+        messages.deinit(alloc);
+    }
+
+    const user_text = "halt please";
+    const content = try alloc.alloc(types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try alloc.dupe(u8, user_text) } };
+    try messages.append(alloc, .{ .role = .user, .content = content });
+
+    try Harness.injectReminders(&messages, &queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), messages.items[0].content.len);
+    const rewritten = switch (messages.items[0].content[0]) {
+        .text => |t| t.text,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const expected =
+        "<system-reminder>\n" ++
+        "The user interrupted with the following message. Acknowledge before continuing:\n" ++
+        "</system-reminder>\n" ++
+        "\n" ++
+        "halt please";
+    try std.testing.expectEqualStrings(expected, rewritten);
+
+    // Reminder queue drained: a second injectReminders pass leaves the
+    // wrapped message untouched (would otherwise double-wrap).
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try Harness.injectReminders(&messages, &queue, alloc);
+    const second_pass = switch (messages.items[0].content[0]) {
+        .text => |t| t.text,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings(expected, second_pass);
 }

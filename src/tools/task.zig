@@ -239,6 +239,10 @@ fn childThreadMain(args: ChildArgs) void {
     tools.lua_request_queue = args.queue;
     defer tools.lua_request_queue = null;
 
+    // Subagents accept no mid-turn user input, so the flag is local and
+    // stays unread; pass a stack-allocated cell to satisfy the signature.
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+
     agent.runLoopStreaming(
         args.messages,
         args.registry,
@@ -248,6 +252,7 @@ fn childThreadMain(args: ChildArgs) void {
         args.cancel,
         args.lua_engine,
         null,
+        &turn_in_progress,
     ) catch |err| {
         // Surface the failure as a text message so the parent sees it in
         // the collected output rather than a silent empty result.
