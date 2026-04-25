@@ -10,6 +10,7 @@ const std = @import("std");
 const Scenario = @import("Scenario.zig");
 const Runner = @import("Runner.zig");
 const Artifacts = @import("Artifacts.zig");
+const Replay = @import("Replay.zig");
 
 comptime {
     _ = @import("Pty.zig");
@@ -52,6 +53,9 @@ pub fn main() !u8 {
     }
     if (std.mem.eql(u8, subcmd, "run")) {
         return dispatchRun(alloc, argv[2..]);
+    }
+    if (std.mem.eql(u8, subcmd, "replay-gen")) {
+        return dispatchReplayGen(alloc, argv[2..]);
     }
 
     writeLine(stderrFile(), "zag-sim: unknown subcommand");
@@ -118,12 +122,152 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return code;
 }
 
+/// Parse `replay-gen` flags and emit a reproducer kit (scenario + mock script)
+/// derived from a zag session JSONL. Drops the trailing turn when it has no
+/// assistant output (mid-turn truncation) unless `--include-partial` keeps it
+/// for crash repros. Any failure before both files are on disk maps to
+/// `harness_error` and is reported to stderr.
+fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
+    var session_path: ?[]const u8 = null;
+    var out_dir: ?[]const u8 = null;
+    var include_partial: bool = false;
+
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--out=")) {
+            out_dir = arg["--out=".len..];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--include-partial")) {
+            include_partial = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
+            reportFmt("zag-sim replay-gen: unknown flag '{s}'\n", .{arg});
+            return exit_harness_error;
+        }
+        if (session_path != null) {
+            writeLine(stderrFile(), "zag-sim replay-gen: too many positional arguments");
+            return exit_harness_error;
+        }
+        session_path = arg;
+    }
+
+    const path = session_path orelse {
+        writeLine(stderrFile(), "zag-sim replay-gen: missing session.jsonl path");
+        printUsage(stderrFile());
+        return exit_harness_error;
+    };
+    const dir = out_dir orelse {
+        writeLine(stderrFile(), "zag-sim replay-gen: missing --out=<dir>");
+        printUsage(stderrFile());
+        return exit_harness_error;
+    };
+
+    std.fs.cwd().makePath(dir) catch |e| {
+        reportFmt("zag-sim replay-gen: cannot create out dir '{s}': {s}\n", .{ dir, @errorName(e) });
+        return exit_harness_error;
+    };
+
+    const entries = Replay.parseFile(alloc, path) catch |e| {
+        reportFmt("zag-sim replay-gen: parse '{s}' failed: {s}\n", .{ path, @errorName(e) });
+        return exit_harness_error;
+    };
+    defer Replay.freeEntries(alloc, entries);
+
+    var turns = Replay.groupTurns(alloc, entries) catch |e| {
+        reportFmt("zag-sim replay-gen: groupTurns failed: {s}\n", .{@errorName(e)});
+        return exit_harness_error;
+    };
+    defer Replay.freeTurns(alloc, turns);
+
+    // Drop a trailing turn that has no assistant response: mid-stream tear,
+    // not something we want to drive zag through. Keep it under
+    // --include-partial so crash repros can record the prompt that triggered
+    // the cut. The kept slice is a fresh allocation: free the dropped Turn's
+    // sub-allocations explicitly, free the original outer slice container,
+    // and reassign so the deferred `freeTurns` operates on the new slice.
+    if (!include_partial and turns.len > 0) {
+        const last = turns[turns.len - 1];
+        const incomplete = last.assistant_text.len == 0 and
+            last.tools.len == 0 and
+            last.notes.len == 0;
+        if (incomplete) {
+            const kept = alloc.alloc(Replay.Turn, turns.len - 1) catch |e| {
+                reportFmt("zag-sim replay-gen: trim alloc failed: {s}\n", .{@errorName(e)});
+                return exit_harness_error;
+            };
+            @memcpy(kept, turns[0 .. turns.len - 1]);
+            Replay.freeTurn(alloc, last);
+            alloc.free(turns);
+            turns = kept;
+        }
+    }
+
+    const scenario_path = std.fs.path.join(alloc, &.{ dir, "scenario.zsm" }) catch |e| {
+        reportFmt("zag-sim replay-gen: path join failed: {s}\n", .{@errorName(e)});
+        return exit_harness_error;
+    };
+    defer alloc.free(scenario_path);
+    writeScenario(alloc, scenario_path, turns, .{
+        .source_path = path,
+        .include_partial = include_partial,
+    }) catch |e| {
+        reportFmt("zag-sim replay-gen: write scenario '{s}' failed: {s}\n", .{ scenario_path, @errorName(e) });
+        return exit_harness_error;
+    };
+
+    const mock_path = std.fs.path.join(alloc, &.{ dir, "mock.json" }) catch |e| {
+        reportFmt("zag-sim replay-gen: path join failed: {s}\n", .{@errorName(e)});
+        return exit_harness_error;
+    };
+    defer alloc.free(mock_path);
+    writeMockScript(alloc, mock_path, turns) catch |e| {
+        reportFmt("zag-sim replay-gen: write mock '{s}' failed: {s}\n", .{ mock_path, @errorName(e) });
+        return exit_harness_error;
+    };
+
+    var scratch: [1024]u8 = undefined;
+    const summary = std.fmt.bufPrint(&scratch, "replay-gen wrote {s} and {s} ({d} turns)\n", .{
+        scenario_path, mock_path, turns.len,
+    }) catch "replay-gen: ok\n";
+    _ = stdoutFile().write(summary) catch {};
+    return 0;
+}
+
+fn writeScenario(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    turns: []const Replay.Turn,
+    opts: Replay.EmitOptions,
+) !void {
+    const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer f.close();
+    var fw_buf: [4096]u8 = undefined;
+    var fw = f.writer(&fw_buf);
+    try Replay.emitScenario(alloc, &fw.interface, turns, opts);
+    try fw.interface.flush();
+}
+
+fn writeMockScript(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    turns: []const Replay.Turn,
+) !void {
+    const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer f.close();
+    var fw_buf: [4096]u8 = undefined;
+    var fw = f.writer(&fw_buf);
+    try Replay.emitMockScript(alloc, &fw.interface, turns);
+    try fw.interface.flush();
+}
+
 fn printUsage(file: std.fs.File) void {
     const msg =
         \\zag-sim: terminal scenario driver
         \\
         \\usage:
         \\  zag-sim run <scenario.zsm> [--artifacts=<dir>] [--mock=<script.json>]
+        \\  zag-sim replay-gen <session.jsonl> --out=<dir> [--include-partial]
         \\  zag-sim --help | -h
         \\
         \\exit codes:
@@ -187,3 +331,35 @@ test "dispatchRun on a missing scenario file returns harness_error" {
     const code = try dispatchRun(std.testing.allocator, argv_storage[0..]);
     try std.testing.expectEqual(@intFromEnum(Runner.Outcome.harness_error), code);
 }
+
+test "dispatchReplayGen with no args returns harness_error" {
+    var argv_storage: [0][:0]u8 = .{};
+    const code = try dispatchReplayGen(std.testing.allocator, argv_storage[0..]);
+    try std.testing.expectEqual(@intFromEnum(Runner.Outcome.harness_error), code);
+}
+
+test "dispatchReplayGen without --out returns harness_error" {
+    const path = try std.testing.allocator.dupeZ(u8, "/tmp/zag-sim-no-such-session.jsonl");
+    defer std.testing.allocator.free(path);
+    var argv_storage = [_][:0]u8{path};
+    const code = try dispatchReplayGen(std.testing.allocator, argv_storage[0..]);
+    try std.testing.expectEqual(@intFromEnum(Runner.Outcome.harness_error), code);
+}
+
+test "dispatchReplayGen on a missing session file returns harness_error" {
+    const path = try std.testing.allocator.dupeZ(u8, "/tmp/zag-sim-no-such-session.jsonl");
+    defer std.testing.allocator.free(path);
+    const out_flag = try std.testing.allocator.dupeZ(u8, "--out=/tmp/zag-sim-replay-test-out");
+    defer std.testing.allocator.free(out_flag);
+    var argv_storage = [_][:0]u8{ path, out_flag };
+    const code = try dispatchReplayGen(std.testing.allocator, argv_storage[0..]);
+    try std.testing.expectEqual(@intFromEnum(Runner.Outcome.harness_error), code);
+}
+
+// Note: end-to-end tests that invoke `dispatchReplayGen` against a real
+// session file hang under the Zig test runner because the success path
+// writes a summary line to stdout, and the test runner's captured pipe
+// can wedge. Phase-2.7 had the same lesson with `dispatchRun`. The full
+// pipeline (parse + group + emit + write files + run zag against the
+// kit) is covered by the build-step round-trip in `test-sim-e2e`
+// (see Task 6.6).

@@ -318,6 +318,14 @@ pub fn freeTurns(alloc: Allocator, turns: []Turn) void {
     alloc.free(turns);
 }
 
+/// Free a single Turn's owned allocations (synth ids and the inner slices).
+/// Borrowed pointers into the source `Entry` slice are not touched. Use this
+/// when you have surgically removed a Turn from a `[]Turn` and need to
+/// release its sub-allocations without freeing the surrounding slice.
+pub fn freeTurn(alloc: Allocator, t: Turn) void {
+    freeTurnInner(alloc, t);
+}
+
 const TurnBuilder = struct {
     user: ?*const Entry,
     assistant_text: std.ArrayList(*const Entry),
