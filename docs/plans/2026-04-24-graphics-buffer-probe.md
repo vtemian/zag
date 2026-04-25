@@ -31,13 +31,13 @@ Scope is intentionally narrow: one Buffer kind, one rendering path (half-block),
 
 ## Out of scope (explicitly)
 
-- Kitty graphics protocol — Milestone 2.
-- iTerm2 inline image protocol — Milestone 2.
-- Sixel — not doing it. Ghostty/Kitty don't support it; half-block covers everything else.
-- In-place image updates, image-ID pools — Milestone 2.
-- PNG caching keyed by source hash — add only if the render loop shows cost.
-- Mermaid (Puppeteer cold-start 3-6s) — add only after d2 works and caching design is settled.
-- tmux passthrough detection — moot for half-block.
+- Kitty graphics protocol: Milestone 2.
+- iTerm2 inline image protocol: Milestone 2.
+- Sixel: not doing it. Ghostty/Kitty don't support it; half-block covers everything else.
+- In-place image updates, image-ID pools: Milestone 2.
+- PNG caching keyed by source hash: add only if the render loop shows cost.
+- Mermaid (Puppeteer cold-start 3-6s): add only after d2 works and caching design is settled.
+- tmux passthrough detection: moot for half-block.
 - Mouse interaction in graphics panes (click-to-zoom, drag-to-pan).
 - Streaming/animated content.
 
@@ -504,7 +504,7 @@ const vtable = Buffer.VTable{
 Port the rest of the vtable shims (all 12 methods) by copying scratch's pattern and adapting:
 - `getVisibleLines`: empty list if `image == null` or cols/rows == 0; otherwise run `halfblock.rasterize` against the stored RGBA with theme bg composite.
 - `onResize`: update `last_render_cols`/`last_render_rows`, bump `dirty` on change.
-- `handleKey`: return `.passthrough` for everything — graphics panes don't consume input.
+- `handleKey`: return `.passthrough` for everything; graphics panes don't consume input.
 - `onFocus`, `onMouse`: no-ops.
 - `isDirty`/`clearDirty`: flip the bool.
 - `lineCount`: 0 (scroll math doesn't apply).
@@ -598,8 +598,8 @@ git commit -m "BufferRegistry: add .graphics entry variant"
 `zag.buffer.create{kind = "scratch", ...}` already dispatches via a kind string. Extend the dispatch to accept `"graphics"` and route to `BufferRegistry.createGraphics`.
 
 Add two new bindings:
-- `zag.buffer.set_png(handle, bytes)` — dispatches on Entry.graphics, calls `GraphicsBuffer.setPng`. Errors on scratch handles with a Lua error.
-- `zag.buffer.set_fit(handle, fit_string)` — same shape; `fit_string` parses to `GraphicsBuffer.Fit` (`"contain"` / `"fill"` / `"actual"`).
+- `zag.buffer.set_png(handle, bytes)`: dispatches on Entry.graphics, calls `GraphicsBuffer.setPng`. Errors on scratch handles with a Lua error.
+- `zag.buffer.set_fit(handle, fit_string)`: same shape; `fit_string` parses to `GraphicsBuffer.Fit` (`"contain"` / `"fill"` / `"actual"`).
 
 **Step 1: Extend the `zagBufferCreateFn` kind switch.**
 
@@ -855,7 +855,7 @@ Expected: agent calls `render_diagram({engine="graphviz", source="digraph { clie
 
 **Step 7: Try closing the diagram pane.**
 
-`<C-w>q` on the diagram pane. Verify the GraphicsBuffer is destroyed (no leak — memory instrumentation optional, testing.allocator leak check in Task 4 already proved this).
+`<C-w>q` on the diagram pane. Verify the GraphicsBuffer is destroyed (no leak; memory instrumentation optional, testing.allocator leak check in Task 4 already proved this).
 
 **Step 8: Commit a note.**
 
@@ -906,9 +906,9 @@ Deferred indefinitely: Mermaid engine (Puppeteer tax), image caching by source h
 
 After the plan is saved, two execution options:
 
-**1. Subagent-Driven (this session)** — I dispatch a fresh subagent per task, review between tasks, fast iteration. Best if you want to watch the shape emerge.
+**1. Subagent-Driven (this session).** I dispatch a fresh subagent per task, review between tasks, fast iteration. Best if you want to watch the shape emerge.
 
-**2. Parallel Session (separate)** — New session with `superpowers:executing-plans`, batch execution with checkpoints. Best for unattended execution.
+**2. Parallel Session (separate).** New session with `superpowers:executing-plans`, batch execution with checkpoints. Best for unattended execution.
 
 Either way, work in a worktree: `git worktree add .worktrees/graphics-buffer-probe -b graphics-buffer-probe` before starting, so main stays clean.
 

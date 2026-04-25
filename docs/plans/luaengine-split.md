@@ -226,7 +226,7 @@ No cycles. The one edge that would have made a cycle (scheduler needing hook-ret
 
 Each step must compile and `zig build test` green. Commit after each.
 
-**Step 1 — extract tool_registry** (smallest blast radius).
+**Step 1, extract tool_registry** (smallest blast radius).
 
 - Create `src/lua/tool_registry.zig` with `LuaTool`, `ToolRegistry`.
 - Move `executeTool`, `findTool`, `registerTools`, `zagToolFnInner` internals.
@@ -236,7 +236,7 @@ Each step must compile and `zig build test` green. Commit after each.
 - Move tool-specific tests (lines 3282-3439) to the new file.
 - Commit: `lua/tool_registry: extract tool registration + marshalling`.
 
-**Step 2 — extract hook_dispatcher glue**.
+**Step 2, extract hook_dispatcher glue**.
 
 - Create `src/lua/hook_dispatcher.zig` with `HookGlue`.
 - Move `setHookBudgetMs`, `fireHook`, the four `sink*` functions.
@@ -245,7 +245,7 @@ Each step must compile and `zig build test` green. Commit after each.
 - Move fireHook/veto/rewrite tests (lines 3540-3747, plus budget tests 5732-end) to the new file.
 - Commit: `lua/hook_dispatcher: extract ResumeSink glue`.
 
-**Step 3 — extract task_scheduler** (biggest move).
+**Step 3, extract task_scheduler** (biggest move).
 
 - Create `src/lua/task_scheduler.zig` with `Scheduler`, `Task`, `TaskHandle`.
 - Move `tasks`, `async_runtime`, `root_scope` fields into `Scheduler`.
@@ -255,7 +255,7 @@ Each step must compile and `zig build test` green. Commit after each.
 - Move coroutine/scheduler tests (lines 3125-3252, 3893-4258, hook-body sleep test) to the new file.
 - Commit: `lua/task_scheduler: extract coroutine scheduler`.
 
-**Step 4 — tidy LuaEngine** (mechanical).
+**Step 4, tidy LuaEngine** (mechanical).
 
 - Delete any now-orphaned imports; re-run `zig fmt`.
 - Confirm file < 600 LOC with `wc -l`.
@@ -281,7 +281,7 @@ Each commit is revertable in isolation. If Step 3 turns out wrong we can back ou
 
 ## Decisions to confirm with Vlad before execution
 
-1. Module naming — `task_scheduler.zig` (snake_case, matches `hook_registry.zig` / `job_result.zig`) or `TaskScheduler.zig` (PascalCase, Ghostty-style because the file's primary export is one struct)? I lean PascalCase per CLAUDE.md.
+1. Module naming. `task_scheduler.zig` (snake_case, matches `hook_registry.zig` / `job_result.zig`) or `TaskScheduler.zig` (PascalCase, Ghostty-style because the file's primary export is one struct)? I lean PascalCase per CLAUDE.md.
 2. `hook_dispatcher.zig` collides conceptually with `hook_registry.HookDispatcher`. Rename the new wrapper `HookGlue` (used in the doc above) or something less cheeky? Alternatively fold the glue into `hook_registry.zig` directly and skip the new file.
-3. Keep `Scope.zig` where it is (`src/lua/Scope.zig`). It is already a leaf with its own owner (scheduler uses it, primitives reference `Job.scope`). Move only if the scheduler ends up the sole consumer — confirm after Step 3 lands.
+3. Keep `Scope.zig` where it is (`src/lua/Scope.zig`). It is already a leaf with its own owner (scheduler uses it, primitives reference `Job.scope`). Move only if the scheduler ends up the sole consumer; confirm after Step 3 lands.
 4. Ship the C-closures split as a follow-up, not part of this plan. Agreed?

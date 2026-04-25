@@ -4,7 +4,7 @@
 
 **Goal:** Add `zag --headless --instruction-file=<path> --trajectory-out=<path>` so harbor-framework can drive zag as a `BaseInstalledAgent` for Terminal-Bench 2.0 evaluations, emitting validator-clean ATIF-v1.2 trajectory JSON.
 
-**Architecture:** Five sequential phases. (1) Fix provider usage plumbing so metrics are honest — OpenAI streaming currently drops usage, cache tokens are never captured. (2) Add `src/Trajectory.zig` with ATIF-v1.2 Zig structs, a `Capture` that accumulates events during a run, and a `build()` that emits validator-clean JSON. (3) Add `src/pricing.zig` with per-model USD rates so `total_cost_usd` is meaningful. (4) Extend `StartupMode` + `parseStartupArgs` + a `runHeadless()` that reuses subsystem init up to the TUI line and replaces `EventOrchestrator.run()` with a headless drain loop. (5) Wire a `zig build validate-trajectory` target that runs the binary against a canned prompt and pipes output through harbor's Python validator. Docs last.
+**Architecture:** Five sequential phases. (1) Fix provider usage plumbing so metrics are honest. OpenAI streaming currently drops usage, cache tokens are never captured. (2) Add `src/Trajectory.zig` with ATIF-v1.2 Zig structs, a `Capture` that accumulates events during a run, and a `build()` that emits validator-clean JSON. (3) Add `src/pricing.zig` with per-model USD rates so `total_cost_usd` is meaningful. (4) Extend `StartupMode` + `parseStartupArgs` + a `runHeadless()` that reuses subsystem init up to the TUI line and replaces `EventOrchestrator.run()` with a headless drain loop. (5) Wire a `zig build validate-trajectory` target that runs the binary against a canned prompt and pipes output through harbor's Python validator. Docs last.
 
 **Tech Stack:** Zig 0.15+, ziglua, `std.json` for ATIF serialization, existing `AgentRunner` drain loop, harbor's `trajectory_validator` CLI (Python 3.12+) as an optional CI gate.
 
@@ -17,20 +17,20 @@
 ## Scope
 
 **In scope**
-- `src/types.zig` — add `cache_creation_tokens` and `cache_read_tokens` to `LlmResponse`.
-- `src/providers/anthropic.zig` — parse cache tokens in both streaming and non-streaming paths.
-- `src/providers/openai.zig` — enable `stream_options.include_usage`, parse final-chunk usage and cached tokens.
-- `src/pricing.zig` — new; per-model USD rates, `estimateCost(model, usage) -> f64`.
-- `src/Trajectory.zig` — new; ATIF-v1.2 structs, `Capture`, `build()`, JSON emit.
-- `src/main.zig` — add `--headless`, `--instruction-file=`, `--trajectory-out=`, `--no-session` flags; `runHeadless()` function; branch in `main()` before TUI init.
-- `build.zig` — add `validate-trajectory` step and `-Dheadless-test=true` option for the integration test.
-- `CLAUDE.md`, `README.md` — document the headless flags and harbor usage.
+- `src/types.zig`: add `cache_creation_tokens` and `cache_read_tokens` to `LlmResponse`.
+- `src/providers/anthropic.zig`: parse cache tokens in both streaming and non-streaming paths.
+- `src/providers/openai.zig`: enable `stream_options.include_usage`, parse final-chunk usage and cached tokens.
+- `src/pricing.zig`: new; per-model USD rates, `estimateCost(model, usage) -> f64`.
+- `src/Trajectory.zig`: new; ATIF-v1.2 structs, `Capture`, `build()`, JSON emit.
+- `src/main.zig`: add `--headless`, `--instruction-file=`, `--trajectory-out=`, `--no-session` flags; `runHeadless()` function; branch in `main()` before TUI init.
+- `build.zig`: add `validate-trajectory` step and `-Dheadless-test=true` option for the integration test.
+- `CLAUDE.md`, `README.md`: document the headless flags and harbor usage.
 
 **Out of scope**
-- The harbor Python adapter (`ZagAgent(BaseInstalledAgent)`) — separate follow-up in a harbor fork or adapter repo.
+- The harbor Python adapter (`ZagAgent(BaseInstalledAgent)`): separate follow-up in a harbor fork or adapter repo.
 - Multi-turn headless mode. V1 is single-shot: one instruction in, one trajectory out.
 - ATIF-v1.6 `ContentPart` (text/image). V1.2 is text-only.
-- OAuth providers in the pricing table (`openai-oauth`) — add later when OAuth lands.
+- OAuth providers in the pricing table (`openai-oauth`): add later when OAuth lands.
 - Streaming trajectory output. V1 writes once, at the end.
 - Cost-free providers (Ollama). Emit `total_cost_usd: null` when model has no pricing entry.
 
@@ -72,21 +72,21 @@ metrics:           Metrics | null             (agent-only)
 extra:             dict | null
 ```
 
-`ToolCall`: `{ tool_call_id: string, function_name: string, arguments: object }` — `arguments` is a JSON **object**, not a string.
+`ToolCall`: `{ tool_call_id: string, function_name: string, arguments: object }`: `arguments` is a JSON **object**, not a string.
 
-`Observation`: `{ results: list[ObservationResult] }` — required field.
+`Observation`: `{ results: list[ObservationResult] }`: required field.
 
-`ObservationResult`: `{ source_call_id: string | null, content: string | null }` — `source_call_id` must match a `tool_call_id` in the **same** step's `tool_calls`.
+`ObservationResult`: `{ source_call_id: string | null, content: string | null }`: `source_call_id` must match a `tool_call_id` in the **same** step's `tool_calls`.
 
-`FinalMetrics`: `{ total_prompt_tokens, total_completion_tokens, total_cached_tokens, total_cost_usd, total_steps }` — all nullable. Note: `total_cached_tokens` is a **subset** of `total_prompt_tokens`, not additional.
+`FinalMetrics`: `{ total_prompt_tokens, total_completion_tokens, total_cached_tokens, total_cost_usd, total_steps }`: all nullable. Note: `total_cached_tokens` is a **subset** of `total_prompt_tokens`, not additional.
 
-`Agent`: `{ name, version, model_name?, tool_definitions?, extra? }` — name and version are required strings.
+`Agent`: `{ name, version, model_name?, tool_definitions?, extra? }`: name and version are required strings.
 
 ### Validator behavior
 
-- `python -m harbor.utils.trajectory_validator <path>` — loads via `Trajectory(**data)`, strict Pydantic, `extra: forbid` everywhere.
+- `python -m harbor.utils.trajectory_validator <path>`: loads via `Trajectory(**data)`, strict Pydantic, `extra: forbid` everywhere.
 - Cross-field: tool result `source_call_id` must reference a `tool_call_id` in the **same** step; `step_id` must be sequential dense 1..N.
-- Serialize with `exclude_none=True` equivalent — don't emit `"field": null`.
+- Serialize with `exclude_none=True` equivalent: don't emit `"field": null`.
 
 ### Harbor installed-agent contract (from earlier research)
 
@@ -98,7 +98,7 @@ extra:             dict | null
 
 ## Zag integration points (current state)
 
-### Endpoint registry — `src/llm.zig:138-148`
+### Endpoint registry: `src/llm.zig:138-148`
 
 ```zig
 pub const Endpoint = struct {
@@ -110,7 +110,7 @@ pub const Endpoint = struct {
 };
 ```
 
-### Provider factory — `src/llm.zig:430`
+### Provider factory: `src/llm.zig:430`
 
 ```zig
 pub fn createProviderFromLuaConfig(
@@ -122,7 +122,7 @@ pub fn createProviderFromLuaConfig(
 
 Hardcoded fallback: `"anthropic/claude-sonnet-4-20250514"` at `src/llm.zig:435` and `src/main.zig:170`.
 
-### `LlmResponse` — `src/types.zig:162-177`
+### `LlmResponse`: `src/types.zig:162-177`
 
 ```zig
 pub const LlmResponse = struct {
@@ -134,11 +134,11 @@ pub const LlmResponse = struct {
 };
 ```
 
-### Anthropic usage capture — `src/providers/anthropic.zig:217-223` (non-stream), `:277-278, :340-343, :405-408` (stream)
+### Anthropic usage capture: `src/providers/anthropic.zig:217-223` (non-stream), `:277-278, :340-343, :405-408` (stream)
 
 Captures `input_tokens` and `output_tokens` in both modes. **Drops cache fields.**
 
-### OpenAI usage capture — `src/providers/openai.zig:279-282` (non-stream), `:433` (stream)
+### OpenAI usage capture: `src/providers/openai.zig:279-282` (non-stream), `:433` (stream)
 
 Non-stream works. Stream hardcodes `0, 0`:
 
@@ -146,7 +146,7 @@ Non-stream works. Stream hardcodes `0, 0`:
 return builder.finish(stop_reason, 0, 0, allocator);
 ```
 
-### CLI parsing — `src/main.zig:34-48`
+### CLI parsing: `src/main.zig:34-48`
 
 ```zig
 const StartupMode = union(enum) {
@@ -158,7 +158,7 @@ const StartupMode = union(enum) {
 fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode { ... }
 ```
 
-### Main init order — `src/main.zig`
+### Main init order: `src/main.zig`
 
 - `:99-104` allocator + metrics
 - `:106-111` file logger
@@ -176,7 +176,7 @@ fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode { ... }
 
 **Headless branches between :232 and :234.** Lua, provider, registry, session all already live.
 
-### AgentRunner event drain — `src/AgentRunner.zig:258, :318`
+### AgentRunner event drain: `src/AgentRunner.zig:258, :318`
 
 ```zig
 pub fn dispatchHookRequests(queue: *agent_events.EventQueue, engine: ?*LuaEngine) void { ... }
@@ -195,7 +195,7 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) bool {
 }
 ```
 
-### `ConversationSession` — `src/ConversationSession.zig:18`
+### `ConversationSession`: `src/ConversationSession.zig:18`
 
 ```zig
 messages: std.ArrayList(types.Message) = .empty,
@@ -203,7 +203,7 @@ messages: std.ArrayList(types.Message) = .empty,
 
 Direct field access. No getter needed.
 
-### `agent_events.AgentEvent` — `src/agent_events.zig:15-59`
+### `agent_events.AgentEvent`: `src/agent_events.zig:15-59`
 
 ```zig
 pub const AgentEvent = union(enum) {
@@ -416,7 +416,7 @@ if (msg_obj.get("usage")) |usage| {
 }
 ```
 
-Thread `cache_creation_tokens` and `cache_read_tokens` local variables through to the `builder.finish(...)` call at `:340-343` / `:405-408` (adjust `finish()` signature if it doesn't already accept them; if it doesn't, extend its signature to take all four token counts — covered next).
+Thread `cache_creation_tokens` and `cache_read_tokens` local variables through to the `builder.finish(...)` call at `:340-343` / `:405-408` (adjust `finish()` signature if it doesn't already accept them; if it doesn't, extend its signature to take all four token counts, covered next).
 
 **Step 4: Run the test and watch it pass**
 
@@ -434,7 +434,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ### Task 4: Extend `builder.finish()` (both providers) to carry all four token counts
 
 **Files:**
-- Modify: `src/providers/anthropic.zig` (builder definition), `src/providers/openai.zig` (builder definition) — and their call sites.
+- Modify: `src/providers/anthropic.zig` (builder definition), `src/providers/openai.zig` (builder definition), and their call sites.
 
 **Note:** If both providers share a response-building helper, extend it in one place. If each defines its own, extend both.
 
@@ -456,9 +456,9 @@ test "builder.finish populates all four token counts" {
 }
 ```
 
-**Step 2-3: Extend `finish()` signature to accept `cache_creation_tokens: u32, cache_read_tokens: u32`.** Update every call site. Existing call sites that don't know cache counts pass `0, 0` — that's honest (they didn't capture them).
+**Step 2-3: Extend `finish()` signature to accept `cache_creation_tokens: u32, cache_read_tokens: u32`.** Update every call site. Existing call sites that don't know cache counts pass `0, 0`: that's honest (they didn't capture them).
 
-**Step 4: Run `zig build test` — all existing provider tests must still pass.**
+**Step 4: Run `zig build test`: all existing provider tests must still pass.**
 
 **Step 5: Commit**
 
@@ -498,7 +498,7 @@ test "OpenAI streaming request includes stream_options.include_usage=true" {
 
 **Step 2: Run the test, watch it fail.**
 
-**Step 3: Implement** — add the `stream_options` field to the serialized JSON request body. Example diff near the stream-serializer:
+**Step 3: Implement.** add the `stream_options` field to the serialized JSON request body. Example diff near the stream-serializer:
 
 ```zig
 try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
@@ -529,7 +529,7 @@ test "OpenAI SSE stream captures usage from final chunk" {
 
 **Step 5: Run, watch it fail.**
 
-**Step 6: Implement** — in the stream event loop, before the `[DONE]` break, look for `usage` on any chunk and capture:
+**Step 6: Implement.** in the stream event loop, before the `[DONE]` break, look for `usage` on any chunk and capture:
 
 ```zig
 if (root.get("usage")) |usage| {
@@ -542,7 +542,7 @@ if (root.get("usage")) |usage| {
 }
 ```
 
-Then at `:433` replace `builder.finish(stop_reason, 0, 0, allocator)` with `builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator)` (OpenAI doesn't report cache-creation separately — it's implicit in prompt_tokens).
+Then at `:433` replace `builder.finish(stop_reason, 0, 0, allocator)` with `builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator)` (OpenAI doesn't report cache-creation separately; it's implicit in prompt_tokens).
 
 **Step 7: Run, watch it pass.**
 
@@ -583,7 +583,7 @@ test "OpenAI non-stream parse captures cached_tokens" {
 
 **Step 2: Run, watch it fail.**
 
-**Step 3: Implement** — extend the existing usage block at `:279-282` to read the nested `prompt_tokens_details.cached_tokens`.
+**Step 3: Implement.** extend the existing usage block at `:279-282` to read the nested `prompt_tokens_details.cached_tokens`.
 
 **Step 4: Run, watch it pass.**
 
@@ -727,7 +727,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Create `src/Trajectory.zig` — ATIF-v1.2 Zig types
+### Task 8: Create `src/Trajectory.zig`: ATIF-v1.2 Zig types
 
 **Files:**
 - Create: `src/Trajectory.zig`
@@ -1053,7 +1053,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 11: `Capture.build()` — translate to `Trajectory`
+### Task 11: `Capture.build()`: translate to `Trajectory`
 
 **Files:**
 - Modify: `src/Trajectory.zig`
@@ -1170,7 +1170,7 @@ test "build aggregates per-turn metrics into final_metrics" {
 
 **Step 2: Run, watch it fail.**
 
-**Step 3: Implement** — walk `self.turns`, sum nullable fields (null if all turns are null, otherwise sum of non-null). `total_steps` = step count in final trajectory.
+**Step 3: Implement.** walk `self.turns`, sum nullable fields (null if all turns are null, otherwise sum of non-null). `total_steps` = step count in final trajectory.
 
 **Step 4: Run, watch it pass.**
 
@@ -1316,7 +1316,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 14: `runHeadless()` — subsystem init without TUI
+### Task 14: `runHeadless()`: subsystem init without TUI
 
 **Files:**
 - Modify: `src/main.zig`
@@ -1653,4 +1653,4 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ## Rollback
 
-Phase 1 changes are independently revertable per task. Phase 2+3 files are additive (`src/Trajectory.zig`, `src/pricing.zig`). Phase 4 CLI branch is a single `if` at the top of `main()` — delete it and TUI-only zag is restored. No schema or on-disk format changes except the new trajectory file, which is opt-in per invocation.
+Phase 1 changes are independently revertable per task. Phase 2+3 files are additive (`src/Trajectory.zig`, `src/pricing.zig`). Phase 4 CLI branch is a single `if` at the top of `main()`: delete it and TUI-only zag is restored. No schema or on-disk format changes except the new trajectory file, which is opt-in per invocation.

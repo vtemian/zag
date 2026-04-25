@@ -24,9 +24,9 @@ The Day-∞ model does not ship Day 1. It exists to calibrate the *primitives* s
 
 ### Three-layer architecture
 
-1. **Zig primitives** — pipeline slots exposed to Lua: layer registry, reminder queue, JIT context resolver, tool-output transform, tool gate, loop detector, compaction strategy.
-2. **Lua stdlib** — opinionated defaults shipped in the binary via `@embedFile`, loaded through existing `require("zag.*")` resolution. Per-model prompt packs, env layer, `AGENTS.md` loader, default loop detector, default compaction.
-3. **User config / community packs** — same `require` path, overrideable file-by-file under `~/.config/zag/lua/zag/`.
+1. **Zig primitives.** Pipeline slots exposed to Lua: layer registry, reminder queue, JIT context resolver, tool-output transform, tool gate, loop detector, compaction strategy.
+2. **Lua stdlib.** Opinionated defaults shipped in the binary via `@embedFile`, loaded through existing `require("zag.*")` resolution. Per-model prompt packs, env layer, `AGENTS.md` loader, default loop detector, default compaction.
+3. **User config / community packs.** Same `require` path, overrideable file-by-file under `~/.config/zag/lua/zag/`.
 
 This matches the existing provider pattern: `require("zag.providers.anthropic")` is stdlib; users drop their own to override. Generalize to prompts, layers, JIT, loop, compact.
 
@@ -34,8 +34,8 @@ This matches the existing provider pattern: `require("zag.providers.anthropic")`
 
 Anthropic extended thinking and prompt caching both key off *system-message boundaries*. The assembled system is modeled as two strings, not one:
 
-- **`stable`** — identity + model-family pack. Written once per session. Changing it invalidates every cached turn downstream. **Plugins cannot append to stable after first turn render.** Enforced at the Lua binding layer.
-- **`volatile`** — env block, `AGENTS.md`, skills, per-turn overrides, reminders. Changes freely per turn.
+- **`stable`**: identity + model-family pack. Written once per session. Changing it invalidates every cached turn downstream. **Plugins cannot append to stable after first turn render.** Enforced at the Lua binding layer.
+- **`volatile`**: env block, `AGENTS.md`, skills, per-turn overrides, reminders. Changes freely per turn.
 
 On Anthropic, the provider emits two system blocks with `cache_control: {type: "ephemeral"}` on `stable`. On OpenAI, it concatenates `stable + "\n" + volatile` (their cache is prefix-based, order-stable).
 
@@ -62,7 +62,7 @@ pub const ContentBlock = union(enum) {
 
 pub const Thinking = struct {
     text: []const u8,
-    /// Anthropic: opaque signature — must round-trip verbatim within a turn.
+    /// Anthropic: opaque signature; must round-trip verbatim within a turn.
     /// OpenAI Responses: the `reasoning.encrypted_content` blob lands here.
     signature: ?[]const u8,
     provider: enum { anthropic, openai_responses, openai_chat, none },
@@ -187,7 +187,7 @@ pub const Registry = struct {
 
 `render` sets `stable_frozen = true` after first call. Subsequent `add` with `cache_class = .stable` returns `error.StableFrozen`. The Lua binding surfaces this as a Lua error with a clear message.
 
-New `src/Harness.zig` (PascalCase — single struct-typed owner):
+New `src/Harness.zig` (PascalCase, single struct-typed owner):
 
 ```zig
 pub const Harness = struct {
@@ -253,7 +253,7 @@ end)
 
 zag.loop.detect(function(ctx)
   if ctx.identical_streak >= 3 then
-    return { action = "reminder", text = "You called the same tool 3x — try a different approach." }
+    return { action = "reminder", text = "You called the same tool 3x; try a different approach." }
   end
 end)
 
@@ -310,7 +310,7 @@ Users override any module by dropping the same path under `~/.config/zag/lua/`. 
 
 Reasoning: stacking works for frontier models, hurts small models, and inflates the cache-invalidating volatile section on all models. If a user wants stacking, they can `require()` the parent from the child.
 
-**JIT walk on read.** When the `read` tool returns, walk up from the read path looking for `AGENTS.md`. Attach the content under the tool result with `Instructions from: <path>\n<content>`. Dedup per message ID — the same file is only attached once per turn, not once per read of that file.
+**JIT walk on read.** When the `read` tool returns, walk up from the read path looking for `AGENTS.md`. Attach the content under the tool result with `Instructions from: <path>\n<content>`. Dedup per message ID; the same file is only attached once per turn, not once per read of that file.
 
 ## Out of scope for v1
 
@@ -324,7 +324,7 @@ Reasoning: stacking works for frontier models, hurts small models, and inflates 
 
 - **Stable-frozen enforcement is the critical invariant.** Every time `stable` mutates mid-session, every downstream turn cache-misses. Users will try to write plugins that append to stable "just once more." Return a Lua error loudly with guidance to use `volatile` instead.
 - **Thinking round-trip vs. cross-turn strip is easy to confuse.** Within-turn: preserve verbatim, including signatures and redacted blocks. Cross-turn: drop. Session log: keep forever. Three different operations on the same data.
-- **OpenAI Responses `reasoning.encrypted_content` is provider-specific.** The `signature` field on `Thinking` is a union semantically — Anthropic signature vs. OpenAI encrypted blob. Keep them distinct in wire serialization; the struct layout is just a convenience.
+- **OpenAI Responses `reasoning.encrypted_content` is provider-specific.** The `signature` field on `Thinking` is a union semantically: Anthropic signature vs. OpenAI encrypted blob. Keep them distinct in wire serialization; the struct layout is just a convenience.
 - **Reasoning effort as a first-class knob.** Hardcoded `effort:medium` in `providers/chatgpt.zig:163` ships as a regression risk; it needs to come from the model/agent config, surfaced through `zag.provider{...}` with sensible defaults.
 - **Parallel tool calls fight reasoning models.** Opus-thinking degrades materially with parallel fan-out. Tool gate should support disabling parallelism as part of its context. Not a v1 API concern but worth noting in the gate design.
 - **Layer ordering is load-bearing.** Priority numbers in the stdlib must be stable across versions. Reserve bands: `0-99` identity/pack, `100-899` context, `900-999` pre-volatile, `1000+` volatile. Document.
@@ -333,37 +333,37 @@ Reasoning: stacking works for frontier models, hurts small models, and inflates 
 
 Each PR ships user-visible value and unblocks the next.
 
-**PR 1 — thinking content plumbing** (P0; unblocks reasoning-first launch).
+**PR 1: thinking content plumbing** (P0; unblocks reasoning-first launch).
 Thinking + RedactedThinking in `types.zig`. Anthropic extended thinking serialize + deserialize with signature preservation. Codex: stop dropping reasoning deltas; emit as `thinking_delta` events. ConversationBuffer renders thinking as a collapsed block with Ctrl-R toggle. `stripThinkingAcrossTurns` runs before every LLM send. Tests: round-trip thinking through a turn with tool calls; verify prior-turn stripping does not leak into send payload.
 
-**PR 2 — prompt layer registry (Zig-only default).**
+**PR 2: prompt layer registry (Zig-only default).**
 `src/prompt.zig` with Registry, AssembledPrompt, stable-frozen enforcement. Builtin env layer as a placeholder. `agent.zig` calls `harness.assembleSystem` instead of `buildSystemPrompt`. Backward compat: tool snippets stay hardcoded for one PR.
 
-**PR 3 — Lua prompt layer API.**
+**PR 3: Lua prompt layer API.**
 Bind `zag.prompt.layer` via LuaEngine. Rewrite the env layer as `lua/zag/layers/env.lua` to dogfood.
 
-**PR 4 — per-model prompt packs.**
+**PR 4: per-model prompt packs.**
 `zag.prompt.for_model` + `prompt/init.lua` dispatch. Ship three packs: `anthropic.lua`, `openai-codex.lua`, `default.lua`. Packs are lifted and tuned from opencode's `anthropic.txt` / `codex.txt` with attribution.
 
-**PR 5 — Anthropic two-part cache.**
+**PR 5: Anthropic two-part cache.**
 Provider sends `system_stable` with `cache_control: ephemeral`, `system_volatile` without. Test: `usage.cache_read_input_tokens` across repeated turns confirms cache hit.
 
-**PR 6 — AGENTS.md first-hit loader.**
+**PR 6: AGENTS.md first-hit loader.**
 `src/Instruction.zig` (PascalCase) with `systemPaths()` + walk-up. Registered as a default Lua layer. Globals at `~/.claude/CLAUDE.md`, `~/.config/zag/AGENTS.md`.
 
-**PR 7 — reminder queue.**
+**PR 7: reminder queue.**
 `src/Reminder.zig`, `zag.reminder` Lua API, `<system-reminder>` wrapping, injection at user-message boundary. First concrete use: mid-loop user-message wrap.
 
-**PR 8 — JIT context on tool results.**
+**PR 8: JIT context on tool results.**
 `zag.context.on_tool_result` API. Default `lua/zag/jit/agents_md.lua`: walk up from read paths, dedup per-message.
 
-**PR 9 — tool output transform + tool gate sockets.**
+**PR 9: tool output transform + tool gate sockets.**
 APIs land as no-ops on frontier. Example Lua: trim `rg` output past 200 lines.
 
-**PR 10 — loop detector + compaction sockets.**
+**PR 10: loop detector + compaction sockets.**
 Lenient default detector (5 identical streak). Token-threshold default compaction (summarize tool results older than N turns when >80% window).
 
-**PR 11 — first small-model pack (Qwen3-Coder).**
+**PR 11: first small-model pack (Qwen3-Coder).**
 `lua/zag/prompt/qwen3-coder.lua`. Override loop detector threshold to 2. Gate to `read/edit/bash/grep/glob`. Aggressive tool-output transforms on `bash` and `grep`. Benchmark harness: Terminal-Bench or harbor runs on local Qwen vs. Cline + LM Studio baseline. The "almost as good as Claude" claim gets tested here.
 
 ## Open questions
@@ -379,4 +379,4 @@ Lenient default detector (5 identical streak). Token-threshold default compactio
 - Opencode's layered system assembly, two-part cache discipline, JIT `Instruction.resolve`, per-model prompt files, and `<system-reminder>` pattern.
 - Pi-mono's conditional-guidelines-by-tool-set and slash-command template loader.
 - Neovim's `vim.*` stdlib-on-top-of-primitives shape.
-- Aider's per-model settings files — a reminder that per-model tuning earns its keep.
+- Aider's per-model settings files: a reminder that per-model tuning earns its keep.

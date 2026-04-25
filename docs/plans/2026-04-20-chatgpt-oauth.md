@@ -94,7 +94,7 @@ state=<32-byte-base64url>
 originator=codex_cli_rs
 ```
 
-**Encoding**: every value is percent-encoded via `urlencoding::encode` (spaces as `%20`, not `+`). Keys are joined with `&` after `{issuer}/oauth/authorize?`. `originator` is **unconditional** (was flagged as "optional" in the original plan; that was wrong — Codex always sends it).
+**Encoding**: every value is percent-encoded via `urlencoding::encode` (spaces as `%20`, not `+`). Keys are joined with `&` after `{issuer}/oauth/authorize?`. `originator` is **unconditional** (was flagged as "optional" in the original plan; that was wrong: Codex always sends it).
 
 Zag uses `originator=zag_cli` so third-party telemetry is distinguishable, though server-side this likely alters routing (Codex's `is_first_party_originator` at `codex-rs/login/src/auth/default_client.rs:120-125` whitelists `codex_cli_rs` and a few variants; everything else is "third-party"). If this causes issues we fall back to `codex_cli_rs`.
 
@@ -122,7 +122,7 @@ Zag uses `originator=zag_cli` so third-party telemetry is distinguishable, thoug
 `codex-rs/login/src/auth/manager.rs:742-760, 840-852`.
 
 - **Method**: POST to same `{issuer}/oauth/token`
-- **Content-Type**: `application/json` — **switches to JSON for refresh**
+- **Content-Type**: `application/json` (**switches to JSON for refresh**)
 - **Body**:
   ```json
   {
@@ -138,7 +138,7 @@ Zag uses `originator=zag_cli` so third-party telemetry is distinguishable, thoug
 
 ### JWT claims we extract
 
-From `id_token` (decoded without signature verification — these tokens are trust-on-first-write locally):
+From `id_token` (decoded without signature verification; these tokens are trust-on-first-write locally):
 
 | Claim path | Use |
 |---|---|
@@ -163,7 +163,7 @@ Content-Type: application/json
 Accept: text/event-stream           # streaming only
 ```
 
-`Accept: text/event-stream` is set on the streaming path (`codex-rs/codex-api/src/endpoint/responses.rs:134-138`). **`OpenAI-Beta: responses=v1` does NOT exist on Codex's HTTP path** — only on the websocket variant, and with a different value (`responses_websockets=2026-02-06`). Do not send it.
+`Accept: text/event-stream` is set on the streaming path (`codex-rs/codex-api/src/endpoint/responses.rs:134-138`). **`OpenAI-Beta: responses=v1` does NOT exist on Codex's HTTP path**, only on the websocket variant, and with a different value (`responses_websockets=2026-02-06`). Do not send it.
 
 ### Responses API request body shape
 
@@ -331,7 +331,7 @@ All tasks follow TDD. Zig tests live inline in the module under test. Commit aft
 
 ---
 
-### Task 1: Endpoint registry — add `.oauth_chatgpt` variant and `openai-oauth` entry
+### Task 1: Endpoint registry, add `.oauth_chatgpt` variant and `openai-oauth` entry
 
 **Why first:** the Lua binding `zag.provider { name = "openai-oauth" }` already validates names against `isBuiltinEndpointName`. Until the endpoint is registered, no config.lua can enable it. Landing this first means every other test we write can flip the engine into "oauth provider requested" mode simply by loading a config.lua that names the provider.
 
@@ -400,7 +400,7 @@ Expected: two compile errors. `Auth.oauth_chatgpt` undefined; `Serializer.chatgp
    },
    ```
 
-**Step 4: Run tests — both green.** `buildHeaders` and the provider factory will still fail to compile because they don't know `.oauth_chatgpt` and `.chatgpt`; that's expected. We fix them in Task 11 and 12. For now, the registry compiles standalone via file-scoped `zig test`.
+**Step 4: Run tests, both green.** `buildHeaders` and the provider factory will still fail to compile because they don't know `.oauth_chatgpt` and `.chatgpt`; that's expected. We fix them in Task 11 and 12. For now, the registry compiles standalone via file-scoped `zig test`.
 
 Actually, `zig build test` compiles everything. Verify by running:
 
@@ -725,7 +725,7 @@ fn writeParam(w: *std.io.Writer, key: []const u8, value: []const u8) !void {
 
 **Files:** Modify `src/oauth.zig`.
 
-JWTs on this flow are `<header_b64>.<payload_b64>.<signature>`; we only care about `payload_b64`, base64url-decoded, JSON-parsed. We never verify the signature — these tokens are trust-on-first-write locally.
+JWTs on this flow are `<header_b64>.<payload_b64>.<signature>`; we only care about `payload_b64`, base64url-decoded, JSON-parsed. We never verify the signature; these tokens are trust-on-first-write locally.
 
 **Step 1: Failing tests**
 
@@ -1268,7 +1268,7 @@ fn isInvalidGrant(body: []const u8) bool {
 
 ---
 
-### Task 8: auth.zig — extend Credential union with OAuth variant
+### Task 8: auth.zig, extend Credential union with OAuth variant
 
 **Files:**
 - Modify: `/Users/whitemonk/projects/ai/zag/src/auth.zig`
@@ -1507,7 +1507,7 @@ Note: do NOT delete the `.lock` sidecar. Leaving it in place is fine; it's tiny 
 
 ---
 
-### Task 10: `resolveCredential` — the unified credential entry point
+### Task 10: `resolveCredential`, the unified credential entry point
 
 **Files:**
 - Modify: `src/auth.zig`
@@ -1806,7 +1806,7 @@ fn runLoginFlowWithCodes(
     defer alloc.free(account_id);
 
     // 9) Persist.
-    const last_refresh = try formatIsoNow(alloc); // from auth.zig — re-export or duplicate
+    const last_refresh = try formatIsoNow(alloc); // from auth.zig (re-export or duplicate)
     defer alloc.free(last_refresh);
     try @import("auth.zig").upsertOAuth(alloc, opts.auth_path, opts.provider_name, .{
         .id_token      = tokens.id_token,
@@ -1978,7 +1978,7 @@ Update all call sites (grep `buildHeaders`): pass `auth_path` instead of `api_ke
 
 ---
 
-### Task 13: Responses API — request body serializer
+### Task 13: Responses API request body serializer
 
 **Files:** Create `/Users/whitemonk/projects/ai/zag/src/providers/chatgpt.zig`.
 
@@ -2046,19 +2046,19 @@ Convert `types.Message` + `types.ContentBlock` arrays into `InputItem` variants.
 
 ---
 
-### Task 14: Responses API — SSE stream parser
+### Task 14: Responses API SSE stream parser
 
 **Files:** Modify `src/providers/chatgpt.zig`.
 
 Handle the events from the "Responses API SSE events" table above. Write the parser as a dispatch function `dispatchEvent(evt: SseEvent, emit: StreamEmitter) !void` that switches on `evt.event_type` and extracts the needed fields from `evt.data` (JSON).
 
-**Step 1: Failing tests** — feed fixture SSE streams into the parser, assert the emitted `StreamEvent` sequence. Three fixtures:
+**Step 1: Failing tests.** Feed fixture SSE streams into the parser, assert the emitted `StreamEvent` sequence. Three fixtures:
 
 1. Plain text response: `response.created` → 3× `response.output_text.delta` → `response.completed`.
 2. Tool call: `response.created` → `response.output_item.added` (function_call) → N× `response.function_call_arguments.delta` → `response.output_item.done` → `response.completed`.
 3. Error: `response.created` → `response.failed` with `error.code = "context_length_exceeded"`.
 
-**Step 3: Implement** — reuse `llm.StreamingResponse`'s `readLine` / `nextSseEvent` for the line framing, dispatch on `event_type`, parse `data` via `std.json.parseFromSlice`, emit `types.StreamEvent` variants via the existing callback pattern from `src/providers/openai.zig`.
+**Step 3: Implement.** Reuse `llm.StreamingResponse`'s `readLine` / `nextSseEvent` for the line framing, dispatch on `event_type`, parse `data` via `std.json.parseFromSlice`, emit `types.StreamEvent` variants via the existing callback pattern from `src/providers/openai.zig`.
 
 **Step 5:** commit `providers/chatgpt: Responses API SSE stream parser`.
 
@@ -2068,7 +2068,7 @@ Handle the events from the "Responses API SSE events" table above. Write the par
 
 **Files:** Modify `src/llm.zig`.
 
-Add the `.chatgpt` arm to the serializer switch at `src/llm.zig:457-484`, mirroring the `.openai` arm. No api_key stored on the serializer — it calls `buildHeaders(endpoint, auth_path, alloc)` per request.
+Add the `.chatgpt` arm to the serializer switch at `src/llm.zig:457-484`, mirroring the `.openai` arm. No api_key stored on the serializer; it calls `buildHeaders(endpoint, auth_path, alloc)` per request.
 
 **Step 5:** commit `llm: route openai-oauth through ChatgptSerializer`.
 
@@ -2100,7 +2100,7 @@ switch (mode) {
 }
 ```
 
-Validate `provider` against `llm.isBuiltinEndpointName` AND `endpoint.auth == .oauth_chatgpt` — reject non-OAuth providers with a clear error. In v1 that means only `openai-oauth` is accepted.
+Validate `provider` against `llm.isBuiltinEndpointName` AND `endpoint.auth == .oauth_chatgpt`; reject non-OAuth providers with a clear error. In v1 that means only `openai-oauth` is accepted.
 
 **Step 5:** commit `main: add --login=<provider> CLI flag`.
 
@@ -2134,4 +2134,4 @@ Commit: none; this runs before merge.
 
 ## Rollback
 
-Each task commits independently. If the approach goes sideways after Task 11 (callback server), tasks 1–10 stand alone as auth primitives plus endpoint registration — they provide value for API-key paths even without OAuth. If Task 13 (Responses serializer) lands but the backend breaks, comment out `zag.provider { name = "openai-oauth" }` in `config.lua` — API-key paths remain unaffected.
+Each task commits independently. If the approach goes sideways after Task 11 (callback server), tasks 1–10 stand alone as auth primitives plus endpoint registration; they provide value for API-key paths even without OAuth. If Task 13 (Responses serializer) lands but the backend breaks, comment out `zag.provider { name = "openai-oauth" }` in `config.lua`; API-key paths remain unaffected.

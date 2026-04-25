@@ -180,7 +180,7 @@ entry gets a per-enum-value description from the subagent's
 When the parent's LLM emits `task(agent, prompt)`, `src/tools/task.zig`
 executes synchronously on the parent's runner thread:
 
-1. **Resolve.** `SubagentRegistry.lookup(agent)` — return
+1. **Resolve.** `SubagentRegistry.lookup(agent)`. Return
    `error.UnknownSubagent` on miss, with the list of registered names
    in the error message.
 2. **Depth check.** Parent's Runner carries `task_depth: u8`. If
@@ -190,7 +190,7 @@ executes synchronously on the parent's runner thread:
    `Collector` sink. System prompt = `subagent.prompt`. Model:
    resolve `subagent.model orelse parent.provider.model` (cache
    shared `ProviderResult`s across same-model invocations). Tools:
-   `ToolRegistry.subset(subagent.tools orelse parent.tools)` — a
+   `ToolRegistry.subset(subagent.tools orelse parent.tools)`, a
    read-only view that refuses lookups outside the allowlist.
 4. **Persistence wiring.** Child's session handle is a thin wrapper
    that writes to the parent's JSONL with `type` values prefixed
@@ -208,7 +208,7 @@ executes synchronously on the parent's runner thread:
 
 The parent's turn blocks for the duration. UI shows the parent pane's
 normal "tool running" indicator. No pane split, no visual of child
-work — that's [#1](https://github.com/vtemian/zag/issues/1).
+work; that's [#1](https://github.com/vtemian/zag/issues/1).
 
 ### The `Collector` sink
 

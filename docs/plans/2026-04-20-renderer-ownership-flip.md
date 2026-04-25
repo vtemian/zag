@@ -2,7 +2,7 @@
 
 **Author:** Vlad + Bot
 **Date:** 2026-04-20
-**Issue:** #5 in the top-10 review — "Renderer dupes span text twice on every frame"
+**Issue:** #5 in the top-10 review, "Renderer dupes span text twice on every frame"
 **Status:** Plan
 
 ## Goal
@@ -18,26 +18,26 @@ frames, small bounded allocations only during cache-miss re-render.
 ## Scope
 
 **In scope**
-- `src/MarkdownParser.zig` — stop duping span text
-- `src/NodeRenderer.zig` — stop duping span text, intern static prefixes
-- `src/Theme.zig` — change `StyledLine.deinit` / `freeStyledLines` semantics; revise
+- `src/MarkdownParser.zig`: stop duping span text
+- `src/NodeRenderer.zig`: stop duping span text, intern static prefixes
+- `src/Theme.zig`: change `StyledLine.deinit` / `freeStyledLines` semantics; revise
   `singleSpanLine` / `emptyStyledLine`
-- `src/ConversationBuffer.zig` — cache stores slices into `node.content.items`,
+- `src/ConversationBuffer.zig`: cache stores slices into `node.content.items`,
   `cloneStyledLine` deletes, cache-hit path returns slices directly
-- `src/Compositor.zig` — add per-frame arena, thread `frame_alloc` into render path,
+- `src/Compositor.zig`: add per-frame arena, thread `frame_alloc` into render path,
   delete the `defer freeStyledLines`
 - All inline tests in the above files
 
 **Out of scope**
 - Any change to `Node.content` storage (it's correct)
 - Any change to `Screen` cell grid, ANSI diff, or `Terminal`
-- Any change to compositor chrome (frames, titles, status line — they write directly
+- Any change to compositor chrome (frames, titles, status line; they write directly
   to `Screen` cells and don't go through `StyledSpan`)
-- Event system, agent loop, Lua, providers — unrelated
+- Event system, agent loop, Lua, providers (unrelated)
 
 ## Current state (verified)
 
-### Producers — sites that `allocator.dupe(u8, ...)` span text
+### Producers, sites that `allocator.dupe(u8, ...)` span text
 
 From the render-pipeline inventory:
 
@@ -59,9 +59,9 @@ From the render-pipeline inventory:
 The `line` param threaded through `MarkdownParser` is ultimately
 `node.content.items` (`NodeRenderer.renderDefault`'s `splitAndAppend` → `MarkdownParser.parseLines`).
 
-### Consumers — sites that free span text
+### Consumers, sites that free span text
 
-- Production: `Compositor.zig:201` (`defer Theme.freeStyledLines(&lines, self.allocator)`) — **only** production freer.
+- Production: `Compositor.zig:201` (`defer Theme.freeStyledLines(&lines, self.allocator)`); **only** production freer.
 - Cache teardown: `Node.clearCache` at `ConversationBuffer.zig:69-75`, called from
   `Node.deinit:59` and `collectVisibleLines:253`.
 - `cloneStyledLine` errdefer at `ConversationBuffer.zig:196`.
@@ -73,7 +73,7 @@ The `line` param threaded through `MarkdownParser` is ultimately
 - `Node.content` is `std.ArrayList(u8)` (unmanaged). `appendSlice` **can realloc**, invalidating
   any slice into `content.items`.
 - `content_version: u32` is bumped **only** by `appendToNode → markDirty` (`ConversationBuffer.zig:78-80, 320`).
-  Realloc and version bump are co-located — a realloc without a version bump cannot happen.
+  Realloc and version bump are co-located; a realloc without a version bump cannot happen.
 - `clearCache` is **not** called from `appendToNode`. Stale cache persists until the next
   cache-miss render frees it.
 - Rendering and content mutation run on the same thread (main) and are strictly serial:
@@ -84,13 +84,13 @@ The `line` param threaded through `MarkdownParser` is ultimately
 ### Test coverage
 
 - 19 MarkdownParser tests: all use `defer freeStyledLines`. Content asserted via
-  `expectEqualStrings` against string literals — no identity or ownership checks.
+  `expectEqualStrings` against string literals (no identity or ownership checks).
 - 12 NodeRenderer tests: same shape.
 - 6 ConversationBuffer `getVisibleLines` tests (`:509, :552, :596, :624, :649, :673`):
   exercise cache hit, cache miss after mutation, `clear`-induced invalidation.
 - 14 Compositor integration tests (`:558` through `:1096`): go through the full
   `composite → getVisibleLines → freeStyledLines` path.
-- All tests use `std.testing.allocator`, which auto-detects leaks — any leak introduced
+- All tests use `std.testing.allocator`, which auto-detects leaks; any leak introduced
   mid-refactor surfaces as a test failure.
 
 ## Design
@@ -109,12 +109,12 @@ realloc becomes dangling.
 The guarantee: `appendToNode` always bumps `content_version`. The cache-hit path checks
 `cached_version == node.content_version` **before** dereferencing any span. On mismatch,
 the cache is discarded via `clearCache` (which under the new contract does **not** free
-span text — see below), and the renderer re-parses against the current `content.items`,
+span text, see below), and the renderer re-parses against the current `content.items`,
 producing fresh slices.
 
 Between mutation and next render, the cache holds dangling slices but they are never
 dereferenced. `clearCache` frees only the spans arrays and the outer `StyledLine` slice,
-not the text — so discarding dangling pointers is safe.
+not the text, so discarding dangling pointers is safe.
 
 ### Per-frame arena
 
@@ -124,13 +124,13 @@ Add a `std.heap.ArenaAllocator` to `Compositor`. Reset at the top of `composite(
 - Output `ArrayList(StyledLine)` backing array: arena.
 - Per-frame `StyledLine.spans` arrays that don't come from the cache: arena.
 - Cache-owned `StyledLine` / `spans` arrays: still heap (long-lived).
-- `StyledSpan.text`: always a slice — into `node.content.items`, into the cache's
+- `StyledSpan.text`: always a slice into `node.content.items`, into the cache's
   spans (which themselves slice into content.items), or into static strings.
 
 ### Cache model (chosen: "cache stores slices into content.items")
 
 On cache miss:
-1. `clearCache` — frees the old spans arrays, does NOT touch span.text.
+1. `clearCache`: frees the old spans arrays, does NOT touch span.text.
 2. Render fresh: produce `StyledLine`s whose spans hold slices into `node.content.items`.
 3. Allocate the spans arrays and the outer `cached_lines` slice on the heap (long-lived,
    owned by the Node).
@@ -175,7 +175,7 @@ TDD, each step keeps tests green before moving on.
 Before touching production code, add one test in each critical area:
 
 - `MarkdownParser.zig`: a test that renders, asserts a span's `text.ptr` equals a pointer
-  into the input `line` slice. This is the regression pin — it must FAIL before the flip
+  into the input `line` slice. This is the regression pin: it must FAIL before the flip
   and PASS after.
 - `ConversationBuffer.zig`: a test that renders, appends to node (forcing potential
   realloc), renders again, asserts content matches. This is the cache-invalidation pin.
@@ -207,19 +207,19 @@ pub fn freeStyledLines(lines: *std.ArrayList(StyledLine), allocator: std.mem.All
 }
 ```
 
-This is a semantic change, not a signature change — callers don't need to update.
+This is a semantic change, not a signature change; callers don't need to update.
 But producers currently dupe span text, and those dupes are now leaks. So this step
 **must** ship together with Step 2.
 
 ### Step 2: migrate all producers to slice, not dupe
 
-Do these in order — each file's tests must pass before moving on.
+Do these in order: each file's tests must pass before moving on.
 
 **2a. `NodeRenderer.zig`: intern prefixes, use static slices**
 
 - Add the `Prefixes` const block (see Design).
 - `twoSpanLine`: take text1 and text2 as `[]const u8` and use them directly. Remove both
-  `dupe` calls at `:116, :118`. Still allocate `spans` array (it's owned — on arena for
+  `dupe` calls at `:116, :118`. Still allocate `spans` array (it's owned: on arena for
   output, on heap for cache).
 - `splitAndAppendIndented`: replace `alloc+memset` at `:169` with
   `Prefixes.indent_pad_max[0..indent_count]`. Remove the `dupe` at `:172`; use `segment`
@@ -232,7 +232,7 @@ Do these in order — each file's tests must pass before moving on.
 
 - `singleSpanLine(alloc, text, style)`: do NOT dupe `text`. Caller is responsible for
   `text` having adequate lifetime (frame arena, static string, or cache-owned).
-- `emptyStyledLine(alloc)`: unchanged — no text to dupe.
+- `emptyStyledLine(alloc)`: unchanged. No text to dupe.
 
 **2c. `MarkdownParser.zig`: remove all 6 dupes**
 
@@ -272,7 +272,7 @@ between "dupe removed" and "deinit still frees" surfaces immediately.
 
 Commit after each of 2a, 2b, 2c, 2d.
 
-### Step 3: bifurcate the allocator — arena for output, heap for cache
+### Step 3: bifurcate the allocator (arena for output, heap for cache)
 
 Today, `getVisibleLines` takes a single `allocator` and uses it for everything. In the
 new design, the **output list** lives on the frame arena, but **cache entries** must
@@ -306,7 +306,7 @@ Commit: `renderer: split frame allocator from cache allocator`.
 ### Step 4: add the per-frame arena to Compositor
 
 - Add `frame_arena: std.heap.ArenaAllocator` to `Compositor` struct.
-- Initialize in Compositor construction (today at `main.zig:283-287` — inline struct
+- Initialize in Compositor construction (today at `main.zig:283-287`: inline struct
   literal becomes a proper `init`/`deinit` pair).
 - `deinit` to release the arena.
 - At the top of `composite()`: `_ = self.frame_arena.reset(.retain_capacity)`.
@@ -330,7 +330,7 @@ Three test-file touchups needed:
   `getVisibleLines` calls change to the two-allocator signature. Use
   `std.testing.allocator` for both args (same allocator; in tests the distinction
   doesn't matter).
-- `Compositor.zig` tests: no signature changes needed — they call `composite`, not
+- `Compositor.zig` tests: no signature changes needed; they call `composite`, not
   `getVisibleLines` directly. Verify they still pass.
 - Add a test in `ConversationBuffer.zig` that renders a node, appends content
   (forcing the realloc path), renders again, asserts correctness. This is the
@@ -369,7 +369,7 @@ Commit: `test: update getVisibleLines callers for split allocator signature`.
    own span text. They'd leak under the new `deinit` semantics.
    Mitigation: document the new contract in `NodeRenderer.zig`'s module doc comment.
    The existing test at `:548` (`custom override replaces default renderer`) uses
-   `alloc.dupe` inside the custom renderer — this test will leak and must be updated
+   `alloc.dupe` inside the custom renderer; this test will leak and must be updated
    to use a static string or the caller-provided content slice.
 
 5. **Split allocator API is a slight complexity bump.** Two allocators, two lifetimes.
@@ -378,7 +378,7 @@ Commit: `test: update getVisibleLines callers for split allocator signature`.
 
 6. **Performance regression on repeated cache misses.** If something (e.g. frequent
    `content_version` bumps) forces cache rebuilds every frame, we lose the cache
-   benefit. But this is already true in current code — the current cache has the
+   benefit. But this is already true in current code: the current cache has the
    same invalidation semantics, and we verified (`appendToNode` is the sole
    invalidator).
 
@@ -389,7 +389,7 @@ After each step:
 - `zig build` and `zig build test` run clean.
 - Test output pristine. No unexpected `log.err` lines. The testing allocator does
   not report leaks.
-- `git diff` reviewed against plan — each file touched appears in the step's scope.
+- `git diff` reviewed against plan: each file touched appears in the step's scope.
 
 Final verification:
 
@@ -407,7 +407,7 @@ Not part of this plan, but surfaced during analysis:
 - Move `StyledSpan` from `Theme.zig` to its own module if more borrowing patterns
   emerge (e.g. borrowing from a terminal PTY buffer once `TerminalBuffer` exists).
 - Thread the frame arena into the Compositor chrome code paths (titles, borders)
-  for consistency — today they don't allocate, so not urgent.
+  for consistency. Today they don't allocate, so not urgent.
 
 ## Commit plan (summary)
 

@@ -1,4 +1,4 @@
-# Harness Engineering Implementation Plan — Foundation (PRs 1–7)
+# Harness Engineering Implementation Plan: Foundation (PRs 1–7)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
@@ -30,8 +30,8 @@ Context-gathering turned up four points where the design doc was inaccurate abou
 ## Prerequisites
 
 - `zig build` green on `main`.
-- `src/Hooks.zig` behavior understood — PR 3 and PR 7 reuse the request/reply thread-bridge (`queue.push(.{ .hook_request = &req }); req.done.wait();` pattern).
-- `src/lua/embedded.zig` entries array understood — PRs 3/4/6 add rows to it.
+- `src/Hooks.zig` behavior understood: PR 3 and PR 7 reuse the request/reply thread-bridge (`queue.push(.{ .hook_request = &req }); req.done.wait();` pattern).
+- `src/lua/embedded.zig` entries array understood: PRs 3/4/6 add rows to it.
 - A test Anthropic API key on `claude-sonnet-4-6` and a ChatGPT subscription OAuth (for `gpt-5-codex`) to sanity-check PRs 1 and 5. Unit tests use golden JSON; live checks are manual.
 
 ---
@@ -42,8 +42,8 @@ Each PR is a single atomic ship unit with user-visible value and unblocks the ne
 
 | PR | Scope | P | Depends |
 |----|-------|---|---------|
-| 1  | Reasoning content plumbing (Anthropic + OpenAI) | P0 | — |
-| 2  | Zig-only prompt layer registry + `AssembledPrompt` | P0 | — |
+| 1  | Reasoning content plumbing (Anthropic + OpenAI) | P0 | n/a |
+| 2  | Zig-only prompt layer registry + `AssembledPrompt` | P0 | n/a |
 | 3  | Lua bindings for layers; rewrite env layer in Lua | P1 | 2 |
 | 4  | Per-model prompt packs (anthropic / openai-codex / default) | P1 | 3 |
 | 5  | Anthropic 2-part system + `cache_control` | P1 | 2, 4 |
@@ -54,13 +54,13 @@ PRs 1 and 2 are independent and can land in either order. PR 3 needs 2. PR 5 nee
 
 ---
 
-## PR 1 — Reasoning content plumbing
+## PR 1: Reasoning content plumbing
 
 **Goal:** Anthropic extended thinking and OpenAI Responses reasoning round-trip correctly end-to-end. The UI renders a collapsible thinking block toggled by `Ctrl-R`. Session replay preserves thinking forever; send path strips across turns.
 
 **Why first:** This is a P0 correctness bug on frontier reasoning models today. Opus-thinking and Sonnet-thinking produce silent pauses in the UI; Codex drops every `response.reasoning_summary_text.delta`.
 
-### Task 1.1 — Add `Thinking` and `RedactedThinking` variants to `ContentBlock`
+### Task 1.1: Add `Thinking` and `RedactedThinking` variants to `ContentBlock`
 
 **Files:**
 - Modify: `src/types.zig`
@@ -85,7 +85,7 @@ test "Thinking and RedactedThinking variants compile and freeOwned handles them"
 }
 ```
 
-**Step 2, run:** `zig build test 2>&1 | head -30` — expect `error: no member 'thinking' in 'ContentBlock'`.
+**Step 2, run:** `zig build test 2>&1 | head -30`: expect `error: no member 'thinking' in 'ContentBlock'`.
 
 **Step 3, extend `ContentBlock`:**
 
@@ -127,27 +127,27 @@ Extend `freeOwned` (`/Users/whitemonk/projects/ai/zag/src/types.zig` 45–57) wi
 .redacted_thinking => |r| alloc.free(r.data),
 ```
 
-**Step 4, run:** `zig build test` — must be green.
+**Step 4, run:** `zig build test`: must be green.
 
 **Acceptance:** tests pass; no existing `switch (block)` sites become non-exhaustive without explicit allowance (search for `switch (block)` and `switch (content)` in the codebase).
 
-### Task 1.2 — Make every `switch (ContentBlock)` exhaustive for the new variants
+### Task 1.2: Make every `switch (ContentBlock)` exhaustive for the new variants
 
 **Files:**
 - Modify: every file that switches on `ContentBlock`. Grep first: `rg 'switch \(.*\.\*' -t zig src/` and follow up with `rg 'ContentBlock' -t zig src/`.
 
 **Step 1, the expected hit list** (from the subagent report):
-- `src/providers/anthropic.zig` `writeMessage` (175–195) — needs `thinking` and `redacted_thinking` branches.
-- `src/providers/chatgpt.zig` `writeInput` (203–227) — needs both branches.
+- `src/providers/anthropic.zig` `writeMessage` (175–195): needs `thinking` and `redacted_thinking` branches.
+- `src/providers/chatgpt.zig` `writeInput` (203–227): needs both branches.
 - `src/providers/openai.zig` `writeMessage` (if it has a `ContentBlock` switch).
-- `src/ConversationHistory.zig` `rebuildMessages` (75–137) — handled in Task 1.9 flow.
+- `src/ConversationHistory.zig` `rebuildMessages` (75–137): handled in Task 1.9 flow.
 - `src/Trajectory.zig` if it walks content blocks.
 
 **Step 2, for each file: add `.thinking => {}, .redacted_thinking => {}` stubs** (silent drop; Tasks 1.3–1.7 replace the stubs with real serialization). Run `zig build` after each file to catch what you missed.
 
 **Acceptance:** `zig build` green. No behavior change yet.
 
-### Task 1.3 — Anthropic SSE: parse `thinking_delta` and `signature_delta`
+### Task 1.3: Anthropic SSE: parse `thinking_delta` and `signature_delta`
 
 **Files:**
 - Modify: `src/providers/anthropic.zig` (`processSseEvent` 341–437, `StreamingBlock` 263–277)
@@ -172,38 +172,38 @@ test "processSseEvent records signature_delta as signature replacement" { /* ...
 
 **Step 2, extend `StreamingBlock`** (263–277) with `.thinking: struct { text: ArrayList(u8), signature: ?ArrayList(u8) }` and `.redacted_thinking: struct { data: ArrayList(u8) }`.
 
-**Step 3, add event branches to `processSseEvent`** before the implicit else (currently silent drop at end of function — see the current structure at 379–420):
+**Step 3, add event branches to `processSseEvent`** before the implicit else (currently silent drop at end of function: see the current structure at 379–420):
 
 - `content_block_start` with `content_block.type == "thinking"` → push `StreamingBlock.thinking` with empty buffers.
 - `content_block_start` with `content_block.type == "redacted_thinking"` → push `StreamingBlock.redacted_thinking`; copy `content_block.data` into buffer immediately (single non-delta field).
-- `content_block_delta` with `delta.type == "thinking_delta"` → append `delta.thinking` to the last block's text buffer. **Do not** emit a `text_delta` callback — thinking is routed through a separate stream event (see Task 1.4). Emit a new `StreamEvent.thinking_delta` instead.
+- `content_block_delta` with `delta.type == "thinking_delta"` → append `delta.thinking` to the last block's text buffer. **Do not** emit a `text_delta` callback; thinking is routed through a separate stream event (see Task 1.4). Emit a new `StreamEvent.thinking_delta` instead.
 - `content_block_delta` with `delta.type == "signature_delta"` → **replace** (not append) the last block's signature buffer with `delta.signature`. No callback (signature is opaque; UI doesn't render it).
 
-**Step 4, finalize in stream assembly** (324–329) — when building `LlmResponse.content`, emit `ContentBlock.thinking` / `ContentBlock.redacted_thinking` from `StreamingBlock.thinking` / `.redacted_thinking`. `provider` tag = `.anthropic`.
+**Step 4, finalize in stream assembly** (324–329). When building `LlmResponse.content`, emit `ContentBlock.thinking` / `ContentBlock.redacted_thinking` from `StreamingBlock.thinking` / `.redacted_thinking`. `provider` tag = `.anthropic`.
 
 **Acceptance:** golden test: a recorded SSE stream from `claude-sonnet-4-6` with `thinking: {enabled, 1024}` produces a `LlmResponse` whose first content block is `.thinking` with non-empty `text` and `signature` fields.
 
-### Task 1.4 — Add `StreamEvent.thinking_delta` and `thinking_stop`
+### Task 1.4: Add `StreamEvent.thinking_delta` and `thinking_stop`
 
 **Files:**
 - Modify: `src/llm.zig` (95–106 `StreamEvent`)
 - Modify: every site that switches on `StreamEvent`. Grep: `rg 'StreamEvent' -t zig src/`.
 - Modify: `src/AgentRunner.zig` `handleStreamEvent` (or wherever the callback routes to `AgentEvent`).
-- Modify: `src/agent_events.zig` — add `thinking_delta: []const u8` and `thinking_stop` to `AgentEvent`. Extend `freeOwned` (79–102).
+- Modify: `src/agent_events.zig`: add `thinking_delta: []const u8` and `thinking_stop` to `AgentEvent`. Extend `freeOwned` (79–102).
 
 **Step 1, failing test:** add an event-recorder test in `chatgpt.zig` or `anthropic.zig` that asserts a recorded thinking SSE stream produces at least one `.thinking_delta` and exactly one `.thinking_stop` on the callback.
 
 **Step 2, wire the callback:** the streaming callback in `callLlm` already bridges to `AgentEvent`. Add a new bridge arm for `.thinking_delta` → `AgentEvent{ .thinking_delta = text_copy }`, and `.thinking_stop` → `AgentEvent.thinking_stop`.
 
-**Step 3, backpressure/ownership:** `thinking_delta` carries a borrowed slice (SSE buffer lifetime); follow the same pattern as `text_delta` in `agent.zig`'s `streamEventToQueue` — `dupe` into a buffer owned by the `AgentEvent`, freed in `freeOwned`.
+**Step 3, backpressure/ownership:** `thinking_delta` carries a borrowed slice (SSE buffer lifetime); follow the same pattern as `text_delta` in `agent.zig`'s `streamEventToQueue`: `dupe` into a buffer owned by the `AgentEvent`, freed in `freeOwned`.
 
 **Acceptance:** running the Anthropic golden SSE test at the agent layer emits the expected `.thinking_delta` sequence followed by `.thinking_stop` into the `EventQueue`.
 
-### Task 1.5 — Anthropic request: send `thinking` parameter
+### Task 1.5: Anthropic request: send `thinking` parameter
 
 **Files:**
-- Modify: `src/llm.zig` — extend `Request` and `StreamRequest` (124–152) with an optional `thinking: ?ThinkingConfig = null`.
-- Modify: `src/providers/anthropic.zig` `serializeRequest` (114–142) — emit `thinking` when set.
+- Modify: `src/llm.zig`: extend `Request` and `StreamRequest` (124–152) with an optional `thinking: ?ThinkingConfig = null`.
+- Modify: `src/providers/anthropic.zig` `serializeRequest` (114–142): emit `thinking` when set.
 
 **Step 1, add the config struct to `llm.zig`:**
 
@@ -235,7 +235,7 @@ test "serializeRequest omits thinking field when null" { /* ... */ }
 
 **Acceptance:** live smoke test against `claude-sonnet-4-6` returns a response whose first content block is `.thinking`.
 
-### Task 1.6 — Anthropic request: serialize thinking blocks in assistant content
+### Task 1.6: Anthropic request: serialize thinking blocks in assistant content
 
 **Files:**
 - Modify: `src/providers/anthropic.zig` `writeMessage` (165–198)
@@ -261,13 +261,13 @@ test "serializeRequest omits thinking field when null" { /* ... */ }
 },
 ```
 
-(Adjust leading-comma logic to match existing per-block emission — the existing code already handles first-vs-rest commas.)
+(Adjust leading-comma logic to match existing per-block emission; the existing code already handles first-vs-rest commas.)
 
 **Step 3, hard-rule enforcement:** when the agent appends an assistant `Message` after a streamed response (`/Users/whitemonk/projects/ai/zag/src/agent.zig` 90), the full `response.content` must be stored verbatim. Verify with a test that a tool-call follow-up request in the same turn re-sends the thinking blocks byte-for-byte.
 
 **Acceptance:** live: one tool call round-trip on `claude-sonnet-4-6` with thinking enabled completes without a `400 invalid_request_error` about signatures or missing thinking blocks.
 
-### Task 1.7 — OpenAI Codex: stop dropping reasoning deltas, round-trip reasoning items
+### Task 1.7: OpenAI Codex: stop dropping reasoning deltas, round-trip reasoning items
 
 **Files:**
 - Modify: `src/providers/chatgpt.zig`
@@ -291,7 +291,7 @@ test "writeInput serializes .thinking variants as reasoning items with encrypted
 | `response.reasoning_text.delta` | Same as summary delta (GPT-OSS path; unlikely on Codex) |
 | `response.output_item.done` with `item.type=="reasoning"` | Copy `item.encrypted_content` into the current block's `signature` buffer; callback `.thinking_stop` |
 
-**Step 3, `writeInput` serialization** (203–227) — replace the `.thinking` stub with Codex reasoning-item shape:
+**Step 3, `writeInput` serialization** (203–227). Replace the `.thinking` stub with Codex reasoning-item shape:
 
 ```zig
 .thinking => |t| {
@@ -309,22 +309,22 @@ test "writeInput serializes .thinking variants as reasoning items with encrypted
 },
 ```
 
-**Step 4, `ContentBlock.Thinking` gains an optional `id: ?[]const u8`** — Anthropic thinking blocks don't have ids, Responses reasoning items do. Update `freeOwned`, Anthropic parse (leave `id = null`), Codex parse (set `id` from `output_item.done`). Add to Task 1.1's test.
+**Step 4, `ContentBlock.Thinking` gains an optional `id: ?[]const u8`.** Anthropic thinking blocks don't have ids, Responses reasoning items do. Update `freeOwned`, Anthropic parse (leave `id = null`), Codex parse (set `id` from `output_item.done`). Add to Task 1.1's test.
 
 **Step 5, make `effort` / `summary` / `verbosity` configurable:**
 
-Replace the hardcoded strings at `chatgpt.zig:163–165` with fields on `StreamRequest` (shared with Anthropic in spirit — same `ThinkingConfig` from Task 1.5 drives `effort`). Add `verbosity: ?Verbosity = null` on `StreamRequest` (used only for GPT-5 family; error on o-series). Default Codex path: `thinking = .enabled{ budget_tokens=0 }` maps to `reasoning:{effort:medium, summary:auto}` for Codex (`budget_tokens` is ignored on Codex).
+Replace the hardcoded strings at `chatgpt.zig:163–165` with fields on `StreamRequest` (shared with Anthropic in spirit; same `ThinkingConfig` from Task 1.5 drives `effort`). Add `verbosity: ?Verbosity = null` on `StreamRequest` (used only for GPT-5 family; error on o-series). Default Codex path: `thinking = .enabled{ budget_tokens=0 }` maps to `reasoning:{effort:medium, summary:auto}` for Codex (`budget_tokens` is ignored on Codex).
 
 **Acceptance:** live against `gpt-5-codex` via ChatGPT OAuth, a tool-call round-trip produces `.thinking_delta` events followed by `.thinking_stop`; the follow-up request body contains a `reasoning` item with `encrypted_content` preserved verbatim.
 
-### Task 1.8 — `stripThinkingAcrossTurns` utility
+### Task 1.8: `stripThinkingAcrossTurns` utility
 
 **Files:**
 - Create: `src/prompt.zig` with a free-function shell (the Registry lives in PR 2; for PR 1 it's a utility module).
 
-Actually — to keep PR 1 self-contained, put this function in `src/types.zig` temporarily and move it in PR 2. Or: create a skeleton `src/Harness.zig` now with only this method. Decision: skeleton `src/Harness.zig`, because PR 2 adds more methods and it's cleaner.
+Actually, to keep PR 1 self-contained, put this function in `src/types.zig` temporarily and move it in PR 2. Or: create a skeleton `src/Harness.zig` now with only this method. Decision: skeleton `src/Harness.zig`, because PR 2 adds more methods and it's cleaner.
 
-- Create: `src/Harness.zig` — minimal struct with only `stripThinkingAcrossTurns`.
+- Create: `src/Harness.zig`: minimal struct with only `stripThinkingAcrossTurns`.
 
 **Step 1, failing test:**
 
@@ -368,13 +368,13 @@ fn filterBlocks(blocks: []types.ContentBlock, arena: Allocator) ![]types.Content
 }
 ```
 
-**Step 3, wire into `agent.zig`** — call `harness.stripThinkingAcrossTurns(messages.items, &arena.allocator())` inside the `while` loop before `callLlm` (before line 89). Use a per-turn arena so the filtered slices don't leak.
+**Step 3, wire into `agent.zig`.** call `harness.stripThinkingAcrossTurns(messages.items, &arena.allocator())` inside the `while` loop before `callLlm` (before line 89). Use a per-turn arena so the filtered slices don't leak.
 
-**Critical:** strip runs **before** the LLM call but **after** the tool-result append. The assistant message **currently** being built (the one from this turn's first `callLlm`) must **not** be stripped — it's inside the current turn. The boundary logic at Step 2 enforces this.
+**Critical:** strip runs **before** the LLM call but **after** the tool-result append. The assistant message **currently** being built (the one from this turn's first `callLlm`) must **not** be stripped; it's inside the current turn. The boundary logic at Step 2 enforces this.
 
 **Acceptance:** with Anthropic thinking enabled, five consecutive turns with tool calls succeed without `400 invalid_request_error`; cross-turn thinking does not appear in request payloads (inspect with a request-logger).
 
-### Task 1.9 — Session JSONL: add `thinking` entry type
+### Task 1.9: Session JSONL: add `thinking` entry type
 
 **Files:**
 - Modify: `src/Session.zig` (`EntryType` 17–37, `Entry` 59–73, `serializeEntry` 519–550, `parseEntry` 556–600)
@@ -415,11 +415,11 @@ test "rebuildMessages tolerates thinking lines in old format with missing signat
 
 **Step 6, persist on the runner side:** `AgentRunner.handleAgentEvent` (499–625) gains arms for `.thinking_delta` and `.thinking_stop`. Delta appends to a `current_thinking_node` (same pattern as `current_assistant_node`); stop writes the final JSONL entry and clears the node. **Important:** `tool_start` must also clear `current_thinking_node` exactly like it clears `current_assistant_node` at 532–533.
 
-**Migration story:** old sessions don't have `thinking` lines — `rebuildMessages` sees none, produces no thinking blocks, still valid. New sessions in old binaries: `parseEntry` fails on unknown `type` and `loadEntries` skips the line (`Session.zig` 424–425). That's **not forward-compatible for old binaries reading new files**; acceptable since nobody downgrades zag mid-session. Document in the PR description.
+**Migration story:** old sessions don't have `thinking` lines; `rebuildMessages` sees none, produces no thinking blocks, still valid. New sessions in old binaries: `parseEntry` fails on unknown `type` and `loadEntries` skips the line (`Session.zig` 424–425). That's **not forward-compatible for old binaries reading new files**; acceptable since nobody downgrades zag mid-session. Document in the PR description.
 
 **Acceptance:** new session with thinking models round-trips through save → close → reopen → scroll-back and shows thinking blocks in the UI.
 
-### Task 1.10 — ConversationBuffer: thinking node + `Ctrl-R` toggle
+### Task 1.10: ConversationBuffer: thinking node + `Ctrl-R` toggle
 
 **Files:**
 - Modify: `src/ConversationTree.zig` `NodeType` (20–30)
@@ -443,23 +443,23 @@ test "rebuildMessages tolerates thinking lines in old format with missing signat
 - `.thinking_stop` → set `current_thinking_node.collapsed = true` (default UX: collapse once the block is complete, so the user can focus on the assistant's visible reply); clear the pointer.
 - `.tool_start` → clear `current_thinking_node` **in addition** to `current_assistant_node` (AgentRunner 532–533).
 
-**Step 5, `loadFromEntries`** (310–325) — append `.thinking` / `.thinking_redacted` entries as root nodes, default collapsed on load (no streaming context).
+**Step 5, `loadFromEntries`** (310–325). Append `.thinking` / `.thinking_redacted` entries as root nodes, default collapsed on load (no streaming context).
 
 **Step 6, Ctrl-R toggle.** Two options:
 - (a) Add `Keymap.Action.toggle_thinking` that runs in WindowManager before the buffer sees the key. Toggles every `.thinking` node's `collapsed` within the focused pane.
 - (b) Intercept `Ctrl-R` directly in `ConversationBuffer.handleKey` when modifiers.ctrl and ch == 'r'. Per-buffer, scoped.
 
-Pick (b) — matches the buffer-local nature of the state. Add the binding with an insert-mode guard so it doesn't swallow Ctrl-R in command-line search-history if that ever lands.
+Pick (b): matches the buffer-local nature of the state. Add the binding with an insert-mode guard so it doesn't swallow Ctrl-R in command-line search-history if that ever lands.
 
 **Step 7, `Node.collapsed` already hides children** (`ConversationBuffer.zig` 227–231); since thinking has no children, override `collectVisibleLines` for `.thinking` to ask the renderer for the collapsed-vs-expanded line count directly.
 
 **Acceptance:** manual: run against Claude with thinking enabled; thinking streams live, collapses at `thinking_stop`, `Ctrl-R` toggles collapse on any thinking block under the cursor; cursor navigation works across thinking nodes.
 
-### Task 1.11 — Trajectory: populate `reasoning_content`
+### Task 1.11: Trajectory: populate `reasoning_content`
 
 **Files:**
 - Modify: `src/Trajectory.zig` `Capture` (318–386), `build` (504–511)
-- Modify: `src/main.zig` headless drain (589–641) — forward `.thinking_delta` / `.thinking_stop` to `capture`
+- Modify: `src/main.zig` headless drain (589–641): forward `.thinking_delta` / `.thinking_stop` to `capture`
 
 **Step 1, failing test:** run a mock headless session with thinking events → ATIF output's `Step.reasoning_content` is non-null and contains concatenated thinking text.
 
@@ -467,11 +467,11 @@ Pick (b) — matches the buffer-local nature of the state. Add the binding with 
 
 **Step 3, main drain:** route `.thinking_delta` and `.thinking_stop` into the capture. Do not emit them as ATIF text.
 
-**Acceptance:** harbor `trajectory_validator` accepts the produced ATIF (verify against `src/harbor/models/trajectories/` — ref `/Users/whitemonk/projects/ai/zag/src/Trajectory.zig` 1–7).
+**Acceptance:** harbor `trajectory_validator` accepts the produced ATIF (verify against `src/harbor/models/trajectories/`: ref `/Users/whitemonk/projects/ai/zag/src/Trajectory.zig` 1–7).
 
-### Task 1.12 — End-to-end live smoke
+### Task 1.12: End-to-end live smoke
 
-Not a code task — a checklist. After PR 1 lands:
+Not a code task: a checklist. After PR 1 lands:
 
 - `claude-sonnet-4-6` + `thinking:{enabled, 4096}` → one tool call → full response. Inspect JSONL: thinking entry, text entry, tool_call, tool_result, text. Close and reopen session: buffer shows the thinking block collapsed by default.
 - `claude-opus-4-7` + `thinking:{adaptive}` + `output_config:{effort:medium}` → same flow. Confirms adaptive path works.
@@ -480,11 +480,11 @@ Not a code task — a checklist. After PR 1 lands:
 
 ---
 
-## PR 2 — Prompt layer registry (Zig-only)
+## PR 2: Prompt layer registry (Zig-only)
 
 **Goal:** Replace the static `buildSystemPrompt(registry)` path with `harness.assembleSystem(&ctx)` returning `AssembledPrompt{stable, volatile}`. No Lua yet; all layers are registered from Zig. Backward-compat: the identity + tool-list + existing suffix collapse into exactly two built-in layers.
 
-### Task 2.1 — Scaffold `src/prompt.zig`
+### Task 2.1: Scaffold `src/prompt.zig`
 
 **Files:**
 - Create: `src/prompt.zig`
@@ -549,10 +549,10 @@ try self.layers.append(alloc, layer);
 
 **Acceptance:** tests pass; `rg 'Registry.add' src/` finds only tests so far.
 
-### Task 2.2 — Built-in layers for identity + tool list + guidelines
+### Task 2.2: Built-in layers for identity + tool list + guidelines
 
 **Files:**
-- Modify: `src/prompt.zig` — add `registerBuiltinLayers(reg, alloc)`
+- Modify: `src/prompt.zig`: add `registerBuiltinLayers(reg, alloc)`
 
 **Step 1, three layers replace today's `buildSystemPrompt`:**
 
@@ -570,7 +570,7 @@ Rationale for `guidelines` being `volatile`: we want to phase out guideline text
 
 **Acceptance:** unit tests pass.
 
-### Task 2.3 — `src/Harness.zig` with `assembleSystem` + `stripThinkingAcrossTurns`
+### Task 2.3: `src/Harness.zig` with `assembleSystem` + `stripThinkingAcrossTurns`
 
 **Files:**
 - Modify: `src/Harness.zig` (expand the skeleton from PR 1 Task 1.8)
@@ -602,12 +602,12 @@ pub const Harness = struct {
 
 **Step 2, integration test:** call `assembleSystem` with a fake context; assert the joined output (stable + "\n\n" + volatile) equals what `buildSystemPrompt` produces today.
 
-### Task 2.4 — `StreamRequest` + `Request` accept split system
+### Task 2.4: `StreamRequest` + `Request` accept split system
 
 **Files:**
-- Modify: `src/llm.zig` — widen `Request` (124–135) and `StreamRequest` (140–152) to carry `system_stable: []const u8` and `system_volatile: []const u8`. For backward compat during the transition, **keep** `system_prompt: []const u8` as a convenience computed field: `pub fn systemPrompt(self: *const Request, arena: Allocator) ![]u8` that joins `stable + "\n\n" + volatile`.
+- Modify: `src/llm.zig`: widen `Request` (124–135) and `StreamRequest` (140–152) to carry `system_stable: []const u8` and `system_volatile: []const u8`. For backward compat during the transition, **keep** `system_prompt: []const u8` as a convenience computed field: `pub fn systemPrompt(self: *const Request, arena: Allocator) ![]u8` that joins `stable + "\n\n" + volatile`.
 
-Actually — cleaner: remove `system_prompt` and make providers join internally. All providers except Anthropic (PR 5) concatenate. PR 5 changes Anthropic to emit an array.
+Actually, cleaner: remove `system_prompt` and make providers join internally. All providers except Anthropic (PR 5) concatenate. PR 5 changes Anthropic to emit an array.
 
 **Step 1, the change:**
 
@@ -623,14 +623,14 @@ pub const Request = struct {
 ```
 
 **Step 2, every call site:**
-- `agent.zig` `callLlm` (161–168) — plumbs both slices through.
-- `providers/anthropic.zig` `serializeRequest` (127–134) — temporarily joins with "\n\n" into the single-string system field. PR 5 replaces with array.
-- `providers/openai.zig` `serializeRequest` (153–163) — joins into the system message.
-- `providers/chatgpt.zig` `serializeRequest` (143–146) — joins into `instructions`.
+- `agent.zig` `callLlm` (161–168): plumbs both slices through.
+- `providers/anthropic.zig` `serializeRequest` (127–134): temporarily joins with "\n\n" into the single-string system field. PR 5 replaces with array.
+- `providers/openai.zig` `serializeRequest` (153–163): joins into the system message.
+- `providers/chatgpt.zig` `serializeRequest` (143–146): joins into `instructions`.
 
 **Step 3, provider tests:** for each provider, test that requests with identical joined system_stable+system_volatile produce the same JSON byte-for-byte as requests with just `system_prompt = joined` (the old API).
 
-### Task 2.5 — Replace `buildSystemPrompt` call site in `agent.zig`
+### Task 2.5: Replace `buildSystemPrompt` call site in `agent.zig`
 
 **Files:**
 - Modify: `src/agent.zig`
@@ -674,25 +674,25 @@ const response = try callLlm(provider, .{
 });
 ```
 
-**Step 2, delete `buildSystemPrompt`** (`/Users/whitemonk/projects/ai/zag/src/agent.zig` 33–50) — its responsibilities now live in the three built-in layers. Delete `system_prompt_prefix` and `system_prompt_suffix` constants (16–30).
+**Step 2, delete `buildSystemPrompt`** (`/Users/whitemonk/projects/ai/zag/src/agent.zig` 33–50). Its responsibilities now live in the three built-in layers. Delete `system_prompt_prefix` and `system_prompt_suffix` constants (16–30).
 
 **Step 3, owner plumbing:** the agent thread receives a `*Harness` via the `threadMain` spawn arguments (same way it receives `*LuaEngine`). `AgentRunner.submit` threads it through.
 
 **Step 4, `LayerContext` population:** compute `cwd`, `worktree`, `date_iso`, `is_git_repo`, `platform` once at `runLoopStreaming` entry (they don't change per-iteration). `tools` uses the already-allocated `tool_defs`.
 
-**Acceptance:** `zig build test` green; a smoke run produces identical behavior to before (no observable change — same system prompt, two layers now).
+**Acceptance:** `zig build test` green; a smoke run produces identical behavior to before (no observable change; same system prompt, two layers now).
 
 ---
 
-## PR 3 — Lua bindings for prompt layers
+## PR 3: Lua bindings for prompt layers
 
 **Goal:** Lua plugins can call `zag.prompt.layer(name, {priority, cache}, fn)` and `zag.prompt.for_model(pattern, text_or_fn)`. The `env` layer gets rewritten as embedded Lua to dogfood the API.
 
-### Task 3.1 — Bind `zag.prompt.layer` in `LuaEngine`
+### Task 3.1: Bind `zag.prompt.layer` in `LuaEngine`
 
 **Files:**
-- Modify: `src/LuaEngine.zig` — register `zag.prompt` sub-table with `layer` and `for_model` functions in `injectZagGlobal` (`/Users/whitemonk/projects/ai/zag/src/LuaEngine.zig` 348–497).
-- Modify: `src/LuaEngine.zig` — add `prompt_registry: *prompt.Registry` as a field (the registry now lives alongside other registries in `LuaEngine`; `Harness.init` takes a `*prompt.Registry` and forwards). Actually — cleaner: keep the registry on `Harness`, pass `*Harness` to `LuaEngine` via `engine.harness` pointer, and access from bindings.
+- Modify: `src/LuaEngine.zig`: register `zag.prompt` sub-table with `layer` and `for_model` functions in `injectZagGlobal` (`/Users/whitemonk/projects/ai/zag/src/LuaEngine.zig` 348–497).
+- Modify: `src/LuaEngine.zig`: add `prompt_registry: *prompt.Registry` as a field (the registry now lives alongside other registries in `LuaEngine`; `Harness.init` takes a `*prompt.Registry` and forwards). Actually, cleaner: keep the registry on `Harness`, pass `*Harness` to `LuaEngine` via `engine.harness` pointer, and access from bindings.
 
 Decision: `LuaEngine` gets a `harness: ?*Harness` field set by `AgentRunner.submit` or at app init. Bindings look it up.
 
@@ -756,9 +756,9 @@ fn renderLuaLayer(ctx: *const prompt.LayerContext, alloc: Allocator) !?[]const u
 }
 ```
 
-**Step 4, `LayerContext` extension:** add `engine: *LuaEngine` and `current_layer: *const Layer` — set per-layer by `Registry.render`.
+**Step 4, `LayerContext` extension:** add `engine: *LuaEngine` and `current_layer: *const Layer`: set per-layer by `Registry.render`.
 
-**Step 5, main-thread enforcement.** `assembleSystem` runs **before `callLlm`** inside the agent loop, which means it runs **on the agent thread**. Problem: Lua layers need the main thread. Solution: `assembleSystem` round-trips through the existing `hook_request` pattern — `Hooks.EventKind` gains a `prompt_render` event, and `AgentRunner.dispatchHookRequests` gains an arm that calls `engine.harness.renderLayersOnMainThread(ctx)`.
+**Step 5, main-thread enforcement.** `assembleSystem` runs **before `callLlm`** inside the agent loop, which means it runs **on the agent thread**. Problem: Lua layers need the main thread. Solution: `assembleSystem` round-trips through the existing `hook_request` pattern: `Hooks.EventKind` gains a `prompt_render` event, and `AgentRunner.dispatchHookRequests` gains an arm that calls `engine.harness.renderLayersOnMainThread(ctx)`.
 
 Alternative: `assembleSystem` becomes async, and the agent thread pushes a new event type `.prompt_assembly_request` with a `ResetEvent`. Same pattern as `lua_tool_request` (`/Users/whitemonk/projects/ai/zag/src/AgentRunner.zig` 421–433).
 
@@ -768,7 +768,7 @@ Pick alternative. Cleaner separation than overloading the hook path.
 
 **Acceptance:** live test with a Lua plugin registering one volatile layer that returns `"Hello from Lua"` → the next LLM call's system prompt contains that string.
 
-### Task 3.2 — Bind `zag.prompt.for_model`
+### Task 3.2: Bind `zag.prompt.for_model`
 
 **Files:**
 - Modify: `src/LuaEngine.zig`
@@ -784,13 +784,13 @@ Internally: registers with `cache_class = .stable, priority = 0, render_fn = mat
 
 **Acceptance:** test that a pattern `"claude"` matches `claude-sonnet-4-6` but not `gpt-5-codex`.
 
-### Task 3.3 — Rewrite env layer as Lua, remove Zig env layer if any
+### Task 3.3: Rewrite env layer as Lua, remove Zig env layer if any
 
 **Files:**
 - Create: `src/lua/zag/layers/env.lua`
-- Modify: `src/lua/embedded.zig` — add entry
-- Modify: `src/prompt.zig` — remove any Zig-side env layer registration (nothing to remove yet; this task installs the env layer for the first time)
-- Modify: `src/LuaEngine.zig` `loadBuiltinPlugins` — add `"zag.layers.env"` to the eager-load list
+- Modify: `src/lua/embedded.zig`: add entry
+- Modify: `src/prompt.zig`: remove any Zig-side env layer registration (nothing to remove yet; this task installs the env layer for the first time)
+- Modify: `src/LuaEngine.zig` `loadBuiltinPlugins`: add `"zag.layers.env"` to the eager-load list
 
 **Step 1, failing integration test:** a fresh session's system prompt contains the current date in ISO format.
 
@@ -820,24 +820,24 @@ end)
 .{ .name = "zag.layers.env", .code = @embedFile("zag/layers/env.lua") },
 ```
 
-**Step 4, eager-load** in `loadBuiltinPlugins` (LuaEngine 292–304) — add `"zag.layers.env"` to the iteration set. Or rely on `require` from a top-level `zag.layers` init file in Task 4.
+**Step 4, eager-load** in `loadBuiltinPlugins` (LuaEngine 292–304). Add `"zag.layers.env"` to the iteration set. Or rely on `require` from a top-level `zag.layers` init file in Task 4.
 
 **Acceptance:** live: a turn's request body has the date and cwd in the system prompt; removing `src/lua/zag/layers/env.lua` and rebuilding removes those lines.
 
-### Task 3.4 — Documentation + examples
+### Task 3.4: Documentation + examples
 
 **Files:**
-- Modify: `docs/scripting.md` (if it exists; else create a new `docs/scripting-prompt-layers.md`) — document `zag.prompt.layer`, `zag.prompt.for_model`, and the `LayerContext` fields available to Lua.
+- Modify: `docs/scripting.md` (if it exists; else create a new `docs/scripting-prompt-layers.md`): document `zag.prompt.layer`, `zag.prompt.for_model`, and the `LayerContext` fields available to Lua.
 
 **Acceptance:** doc review.
 
 ---
 
-## PR 4 — Per-model prompt packs
+## PR 4: Per-model prompt packs
 
 **Goal:** Ship three embedded Lua packs (`anthropic`, `openai-codex`, `default`) lifted and tuned from opencode. Dispatch based on model ID pattern.
 
-### Task 4.1 — Dispatch module `zag.prompt.init`
+### Task 4.1: Dispatch module `zag.prompt.init`
 
 **Files:**
 - Create: `src/lua/zag/prompt/init.lua`
@@ -872,12 +872,12 @@ end)
 return M
 ```
 
-### Task 4.2 — `zag.prompt.anthropic`
+### Task 4.2: `zag.prompt.anthropic`
 
 **Files:**
 - Create: `src/lua/zag/prompt/anthropic.lua`
 
-Base text: lift from `opencode/packages/opencode/src/session/prompt/anthropic.txt` (`~/projects/ai/opencode/...` in the user's filesystem; consult for content, *not* verbatim — rewrite in Zag's voice). Attribution comment at top:
+Base text: lift from `opencode/packages/opencode/src/session/prompt/anthropic.txt` (`~/projects/ai/opencode/...` in the user's filesystem; consult for content, *not* verbatim; rewrite in Zag's voice). Attribution comment at top:
 
 ```lua
 -- Adapted from opencode's anthropic.txt (MIT).
@@ -888,9 +888,9 @@ Structure:
 - Identity: "You are zag, a coding agent harness. You are running with Claude."
 - Output style: concise, direct, markdown for code, no excessive preamble.
 - Tool-use guidelines specific to Claude (parallel tool calls fine except with extended thinking).
-- Reasoning-awareness: "When you're thinking, make it count — no stalling."
+- Reasoning-awareness: "When you're thinking, make it count, no stalling."
 
-### Task 4.3 — `zag.prompt.openai-codex`
+### Task 4.3: `zag.prompt.openai-codex`
 
 **Files:**
 - Create: `src/lua/zag/prompt/openai-codex.lua`
@@ -901,14 +901,14 @@ Adapted from `opencode/packages/opencode/src/session/prompt/codex.txt`. Emphasiz
 - Short, functional tone.
 - No chain-of-thought in visible output (Codex thinks separately).
 
-### Task 4.4 — `zag.prompt.default`
+### Task 4.4: `zag.prompt.default`
 
 **Files:**
 - Create: `src/lua/zag/prompt/default.lua`
 
 Conservative baseline. Essentially today's `system_prompt_prefix` reformed for the new context. Used for Ollama, Groq, unknown providers.
 
-### Task 4.5 — Tests
+### Task 4.5: Tests
 
 - Unit: `pick("claude-sonnet-4-6")` returns `zag.prompt.anthropic`; `pick("gpt-5-codex")` returns `zag.prompt.openai-codex`.
 - Integration: running against each provider uses the right pack. Check by asserting a marker string only that pack contains.
@@ -917,11 +917,11 @@ Conservative baseline. Essentially today's `system_prompt_prefix` reformed for t
 
 ---
 
-## PR 5 — Anthropic 2-part system + `cache_control`
+## PR 5: Anthropic 2-part system + `cache_control`
 
 **Goal:** On Anthropic, emit system as a JSON array with two items; mark the first (stable) with `cache_control: {type: "ephemeral"}`. Verify cache hits across turns via `usage.cache_read_input_tokens`.
 
-### Task 5.1 — Anthropic serializer emits system array
+### Task 5.1: Anthropic serializer emits system array
 
 **Files:**
 - Modify: `src/providers/anthropic.zig` `serializeRequest` (127–134)
@@ -960,17 +960,17 @@ try w.writeAll("]");
 
 **Acceptance:** golden JSON snapshot test.
 
-### Task 5.2 — Expose cache hit metrics in `LlmResponse`
+### Task 5.2: Expose cache hit metrics in `LlmResponse`
 
 Already exposed per the Anthropic subagent's report (`cache_creation_input_tokens` / `cache_read_input_tokens` in `parseResponse` at 223–228). Verify they populate when the array form is used; if not, fix.
 
-### Task 5.3 — Live verification
+### Task 5.3: Live verification
 
 Not code: run three consecutive turns against `claude-sonnet-4-6` with identical system_stable and varying system_volatile. Assert via `UsageStats` display that `cache_read_input_tokens > 0` on turn 2 and turn 3.
 
 Also verify cache invalidation on purpose: change a character in a stable layer (e.g., edit a pack), run: `cache_read_input_tokens == 0` on the first turn after.
 
-### Task 5.4 — Stable-frozen enforcement test
+### Task 5.4: Stable-frozen enforcement test
 
 With PR 2's `stable_frozen`, verify that a Lua layer trying to add a stable layer on turn 2 gets a clear error (not a silent cache bust). Surface as `error.StableFrozen` from Zig, translated to `"zag.prompt.layer: stable layers cannot be registered after the first turn; use cache=\"volatile\""` in Lua.
 
@@ -978,14 +978,14 @@ With PR 2's `stable_frozen`, verify that a Lua layer trying to add a stable laye
 
 ---
 
-## PR 6 — `AGENTS.md` first-hit loader
+## PR 6: `AGENTS.md` first-hit loader
 
 **Goal:** On every turn, walk up from cwd to worktree looking for `AGENTS.md`, then `CLAUDE.md`, then `CONTEXT.md`. Stop at first match. Attach global files from `~/.claude/CLAUDE.md` and `~/.config/zag/AGENTS.md` separately. First-hit policy, not stacked.
 
-### Task 6.1 — `src/Instruction.zig`
+### Task 6.1: `src/Instruction.zig`
 
 **Files:**
-- Create: `src/Instruction.zig` (PascalCase — struct-typed)
+- Create: `src/Instruction.zig` (PascalCase, struct-typed)
 
 **Step 1, failing tests:** `systemPaths(home)` returns the two global paths; `findUp(from, to)` finds `AGENTS.md` in the right directory.
 
@@ -1008,12 +1008,12 @@ pub const Instruction = struct {
 };
 ```
 
-### Task 6.2 — `agents_md` Lua layer
+### Task 6.2: `agents_md` Lua layer
 
 **Files:**
 - Create: `src/lua/zag/layers/agents_md.lua`
 - Modify: `src/lua/embedded.zig`
-- Modify: `src/LuaEngine.zig` — bind `zag.context.find_up(pattern, {from, to})` and `zag.context.ancestors(cwd, root)` via `Instruction` helpers.
+- Modify: `src/LuaEngine.zig`: bind `zag.context.find_up(pattern, {from, to})` and `zag.context.ancestors(cwd, root)` via `Instruction` helpers.
 
 ```lua
 zag.prompt.layer("agents_md", { priority = 900, cache = "volatile" }, function(ctx)
@@ -1028,19 +1028,19 @@ end)
 
 Globals layer at priority 905, picking up `~/.claude/CLAUDE.md` and `~/.config/zag/AGENTS.md`.
 
-### Task 6.3 — Integration test
+### Task 6.3: Integration test
 
 Create a tempdir with `AGENTS.md` in a parent; run a turn; assert the system prompt contains the file's content.
 
-**Acceptance:** tests pass; inspect a real session against `~/projects/ai/zag` — the project's `CLAUDE.md` gets picked up.
+**Acceptance:** tests pass; inspect a real session against `~/projects/ai/zag`: the project's `CLAUDE.md` gets picked up.
 
 ---
 
-## PR 7 — Reminder queue
+## PR 7: Reminder queue
 
 **Goal:** Lua plugins can queue `<system-reminder>`-wrapped text that gets injected at the next user-message boundary. Also wraps mid-loop user messages (when the user interrupts and sends text while the agent is mid-turn).
 
-### Task 7.1 — `src/Reminder.zig`
+### Task 7.1: `src/Reminder.zig`
 
 **Files:**
 - Create: `src/Reminder.zig`
@@ -1070,7 +1070,7 @@ pub const Queue = struct {
 
 **Step 2, tests:** push 3, drain → get all 3, persistent ones stay for next drain.
 
-### Task 7.2 — `zag.reminder` Lua bindings
+### Task 7.2: `zag.reminder` Lua bindings
 
 **Files:**
 - Modify: `src/LuaEngine.zig`
@@ -1080,13 +1080,13 @@ zag.reminder("You have a pending plan", { scope = "persistent", id = "plan-activ
 zag.reminder_clear("plan-active")
 ```
 
-Bind via the same pattern as `zag.hook` — persist a `[]const u8` in the queue (dupe into engine allocator).
+Bind via the same pattern as `zag.hook`: persist a `[]const u8` in the queue (dupe into engine allocator).
 
-### Task 7.3 — Injection at user-message boundary
+### Task 7.3: Injection at user-message boundary
 
 **Files:**
-- Modify: `src/Harness.zig` — add `injectReminders(messages, alloc)`
-- Modify: `src/agent.zig` — call `harness.injectReminders` inside the `while` loop before `stripThinkingAcrossTurns`
+- Modify: `src/Harness.zig`: add `injectReminders(messages, alloc)`
+- Modify: `src/agent.zig`: call `harness.injectReminders` inside the `while` loop before `stripThinkingAcrossTurns`
 
 **Step 1, semantics:**
 
@@ -1104,7 +1104,7 @@ Bind via the same pattern as `zag.hook` — persist a `[]const u8` in the queue 
 
 **Step 2, failing test:** push two reminders, append a user message, run `injectReminders` → the user message's text starts with a `<system-reminder>` block containing both.
 
-### Task 7.4 — Mid-loop user-message wrap
+### Task 7.4: Mid-loop user-message wrap
 
 **Files:**
 - Modify: `src/agent.zig`
@@ -1117,7 +1117,7 @@ Detection: check whether a user message arrived *during* the current turn (track
 
 **Step 2, wire into `AgentRunner`.** When `Hooks.EventKind.user_message_post` fires mid-turn (check `turn_in_progress` flag), don't push to the agent's user-message channel directly; instead, push a `Reminder.Entry` with `scope = .next_turn, text = wrapped` and let `injectReminders` handle it.
 
-**Acceptance:** manual test — start a long-running agent turn, send a second message, verify the agent acknowledges the interrupt.
+**Acceptance:** manual test. Start a long-running agent turn, send a second message, verify the agent acknowledges the interrupt.
 
 ---
 
@@ -1146,7 +1146,7 @@ Request-body snapshots per provider for a fixed `(LayerContext, messages)` input
 After each PR lands:
 1. `zag run` against the zag repo; verify no regression in normal usage.
 2. `zag headless "list files"`; verify ATIF output is well-formed.
-3. Session replay — close and reopen a session that used thinking; verify scrollback.
+3. Session replay: close and reopen a session that used thinking; verify scrollback.
 
 ---
 
@@ -1158,7 +1158,7 @@ Lua runs on the main thread only. The agent thread invokes Lua via the event-que
 
 ### Allocator hygiene
 
-Every assembled prompt uses a per-turn arena that's destroyed when `AssembledPrompt.deinit` runs (end of turn). Lua-returned strings are `dupe`d into that arena immediately — never held past the Lua call that returned them. Reminder queue entries are duped into engine allocator and freed by `drainForTurn` (one-shot) or on engine shutdown (persistent).
+Every assembled prompt uses a per-turn arena that's destroyed when `AssembledPrompt.deinit` runs (end of turn). Lua-returned strings are `dupe`d into that arena immediately, never held past the Lua call that returned them. Reminder queue entries are duped into engine allocator and freed by `drainForTurn` (one-shot) or on engine shutdown (persistent).
 
 ### Error handling
 
@@ -1169,7 +1169,7 @@ Every assembled prompt uses a per-turn arena that's destroyed when `AssembledPro
 
 ### Backward compatibility
 
-- Session JSONL: new `thinking` entry types. Old binaries reading new files skip those lines (they become text-only replays — degraded, not broken).
+- Session JSONL: new `thinking` entry types. Old binaries reading new files skip those lines (they become text-only replays, degraded but not broken).
 - Config: no new required config. Everything works with defaults.
 - Lua API: purely additive. Existing plugins unaffected.
 
@@ -1183,7 +1183,7 @@ Every assembled prompt uses a per-turn arena that's destroyed when `AssembledPro
 
 ## Out of scope for this plan (follow-up plan)
 
-The following PRs from the design doc get a separate plan document — `docs/plans/2026-05-??-harness-engineering-plan-2.md` — after Foundation lands:
+The following PRs from the design doc get a separate plan document, `docs/plans/2026-05-??-harness-engineering-plan-2.md`, after Foundation lands:
 
 - **PR 8: JIT context on tool results** (`zag.context.on_tool_result("read", ...)`). Walk-up from the read path, dedup per-message, attach under the tool result. Requires the tool-execution lifecycle socket.
 - **PR 9: Tool-output transform + tool gate.** `zag.tool.transform_output(pattern, fn)` and `zag.tools.gate(fn)`. Post-tool-result rewriting for small models; per-turn visible tool subset.
@@ -1204,8 +1204,8 @@ These are deferred because:
 3. **`signature_delta` is replacement, not append.** Anthropic sends it once, immediately before `content_block_stop`. Appending double-bytes the signature and corrupts the opaque blob. Server rejects next request with `"Invalid signature in thinking block"`.
 4. **Adaptive vs enabled thinking modes differ across models.** Opus 4.7 rejects `enabled`; Sonnet 4.6 accepts both. Packs must pick correctly; PR 4 Task 4.2 handles this.
 5. **`store:false` + `include:["reasoning.encrypted_content"]` is mandatory on ChatGPT backend.** Already the Codex path's default. Keep it; removing either flag breaks reasoning.
-6. **Mid-loop user message wrap is subtle.** If the user sends "cancel" mid-turn, we don't want to wrap that in a reminder — we want to cancel. The implementation must distinguish between cancel signals (which hit `cancel_flag`) and regular messages (which queue).
-7. **Tool output transform runs per-tool inside `runToolStep` (after execute, before message-append) — NOT after join.** Cross-tool aggregation is out of scope for PR 9 and will need post-join hooks if we ever need it.
+6. **Mid-loop user message wrap is subtle.** If the user sends "cancel" mid-turn, we don't want to wrap that in a reminder; we want to cancel. The implementation must distinguish between cancel signals (which hit `cancel_flag`) and regular messages (which queue).
+7. **Tool output transform runs per-tool inside `runToolStep` (after execute, before message-append), NOT after join.** Cross-tool aggregation is out of scope for PR 9 and will need post-join hooks if we ever need it.
 8. **Buffer rendering is flat root nodes, not nested assistant containers.** Thinking is a sibling node, not a child. Ctrl-R toggles the nearest `.thinking` root node under the cursor, not "the current assistant message's thinking."
 9. **`AgentRunner.persistEvent` currently drops `tool_input` from `.tool_call` events** (`ConversationHistory.zig` 110 defaults to `"{}"`). Reminder / compaction logic that depends on knowing past tool arguments via JSONL replay will hit this. Either fix the persist path in a prep task, or document the limitation.
 
@@ -1225,13 +1225,13 @@ Ship cadence: 1 PR/week is realistic for PRs 1–2 (larger); PRs 3–7 are small
 
 ---
 
-## Appendix A — File surface summary
+## Appendix A: File surface summary
 
 **New files:**
-- `src/prompt.zig` — Layer, Registry, AssembledPrompt, LayerContext
-- `src/Harness.zig` — primitives owner, main-thread glue
-- `src/Instruction.zig` — AGENTS.md walk-up
-- `src/Reminder.zig` — queue + injection helpers
+- `src/prompt.zig`: Layer, Registry, AssembledPrompt, LayerContext
+- `src/Harness.zig`: primitives owner, main-thread glue
+- `src/Instruction.zig`: AGENTS.md walk-up
+- `src/Reminder.zig`: queue + injection helpers
 - `src/lua/zag/prompt/init.lua`
 - `src/lua/zag/prompt/anthropic.lua`
 - `src/lua/zag/prompt/openai-codex.lua`
@@ -1240,23 +1240,23 @@ Ship cadence: 1 PR/week is realistic for PRs 1–2 (larger); PRs 3–7 are small
 - `src/lua/zag/layers/agents_md.lua`
 
 **Modified files:**
-- `src/types.zig` — `Thinking` / `RedactedThinking` variants
-- `src/agent.zig` — loop restructured to call `harness.assembleSystem` per turn
-- `src/agent_events.zig` — `thinking_delta` / `thinking_stop` / `prompt_assembly_request`
-- `src/llm.zig` — `Request` / `StreamRequest` split system; `StreamEvent.thinking_delta`; `ThinkingConfig`
-- `src/providers/anthropic.zig` — thinking serialization, SSE events, 2-part system
-- `src/providers/chatgpt.zig` — reasoning deltas surfaced, encrypted_content captured + round-tripped, effort configurable
-- `src/providers/openai.zig` — stub `.thinking` arm in writeMessage (no-op; it's not a thinking path)
-- `src/AgentRunner.zig` — new event types, thinking node wiring
-- `src/ConversationTree.zig` — `NodeType.thinking`
-- `src/ConversationBuffer.zig` — thinking rendering, Ctrl-R, `loadFromEntries`
-- `src/NodeRenderer.zig` — thinking render dispatch
-- `src/Session.zig` — thinking EntryTypes
-- `src/ConversationHistory.zig` — thinking rebuild
-- `src/Trajectory.zig` — reasoning_content population
-- `src/LuaEngine.zig` — `zag.prompt.*`, `zag.reminder`, `zag.reminder_clear`, `zag.context.*` bindings
-- `src/lua/embedded.zig` — new module entries
-- `src/Hooks.zig` — potentially new `EventKind.prompt_assembly` (or routed through `agent_events`)
+- `src/types.zig`: `Thinking` / `RedactedThinking` variants
+- `src/agent.zig`: loop restructured to call `harness.assembleSystem` per turn
+- `src/agent_events.zig`: `thinking_delta` / `thinking_stop` / `prompt_assembly_request`
+- `src/llm.zig`: `Request` / `StreamRequest` split system; `StreamEvent.thinking_delta`; `ThinkingConfig`
+- `src/providers/anthropic.zig`: thinking serialization, SSE events, 2-part system
+- `src/providers/chatgpt.zig`: reasoning deltas surfaced, encrypted_content captured + round-tripped, effort configurable
+- `src/providers/openai.zig`: stub `.thinking` arm in writeMessage (no-op; it's not a thinking path)
+- `src/AgentRunner.zig`: new event types, thinking node wiring
+- `src/ConversationTree.zig`: `NodeType.thinking`
+- `src/ConversationBuffer.zig`: thinking rendering, Ctrl-R, `loadFromEntries`
+- `src/NodeRenderer.zig`: thinking render dispatch
+- `src/Session.zig`: thinking EntryTypes
+- `src/ConversationHistory.zig`: thinking rebuild
+- `src/Trajectory.zig`: reasoning_content population
+- `src/LuaEngine.zig`: `zag.prompt.*`, `zag.reminder`, `zag.reminder_clear`, `zag.context.*` bindings
+- `src/lua/embedded.zig`: new module entries
+- `src/Hooks.zig`: potentially new `EventKind.prompt_assembly` (or routed through `agent_events`)
 
 **Deleted:**
 - `src/agent.zig:16–30` (`system_prompt_prefix`, `system_prompt_suffix`)
@@ -1264,7 +1264,7 @@ Ship cadence: 1 PR/week is realistic for PRs 1–2 (larger); PRs 3–7 are small
 
 ---
 
-## Appendix B — Reference pointers to subagent research
+## Appendix B: Reference pointers to subagent research
 
 The implementation decisions above were informed by seven context-gathering subagents. Raw research output is in the chat transcript for this session. Key artifacts:
 
