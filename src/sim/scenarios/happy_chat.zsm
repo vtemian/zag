@@ -1,0 +1,13 @@
+# Canary scenario: a clean chat turn should pass exit 0. If this fails,
+# the harness is broken; investigate before trusting the segfault scenario.
+#
+# Pacing notes (Phase 5 manual verification):
+# - The 500ms idle BEFORE `send` lets zag's input handler fully wire up;
+#   without it, send races startup and only the first byte lands.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "hello" <Enter>
+wait_idle 5s
+snapshot final
