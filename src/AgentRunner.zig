@@ -557,11 +557,85 @@ pub fn drainEvents(self: *AgentRunner, allocator: Allocator) DrainResult {
     return result;
 }
 
+/// Persist an agent event to the borrowed session. Idempotent for
+/// events that don't carry persistable content (info, hooks, layout
+/// requests, done, reset, thinking_stop). Called by `handleAgentEvent`
+/// on the interactive path and directly by the headless drain loop,
+/// which doesn't go through `handleAgentEvent`.
+///
+/// The event payload is borrowed; this function does NOT free any
+/// owned strings on the event. `handleAgentEvent` keeps the existing
+/// per-arm `defer allocator.free(...)` lifetime; the headless loop
+/// owns the bytes for the duration of its switch arm.
+pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void {
+    const ts = std.time.milliTimestamp();
+    switch (event) {
+        .text_delta => |text| {
+            self.session.persistEvent(.{
+                .entry_type = .assistant_text,
+                .content = text,
+                .timestamp = ts,
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
+        },
+        .thinking_delta => |text| {
+            // Persist per-delta so a crash mid-stream still preserves
+            // reasoning text. The history-rebuild path concatenates
+            // consecutive thinking entries on replay, same as
+            // assistant_text.
+            self.session.persistEvent(.{
+                .entry_type = .thinking,
+                .content = text,
+                .thinking_provider = "anthropic",
+                .timestamp = ts,
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
+        },
+        .tool_start => |ev| {
+            self.session.persistEvent(.{
+                .entry_type = .tool_call,
+                .tool_name = ev.name,
+                .timestamp = ts,
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
+        },
+        .tool_result => |result| {
+            self.session.persistEvent(.{
+                .entry_type = .tool_result,
+                .content = result.content,
+                .is_error = result.is_error,
+                .timestamp = ts,
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
+        },
+        .err => |text| {
+            self.session.persistEvent(.{
+                .entry_type = .err,
+                .content = text,
+                .timestamp = ts,
+            }) catch |err| {
+                log.err("session persist failed: {}", .{err});
+                self.session.persist_failed = true;
+            };
+        },
+        else => {},
+    }
+}
+
 /// Process a single agent event: translate content into sink events
 /// and persist to session. Fires post-hooks into the Lua engine when
 /// one is attached. The sink owns all node-correlation state; the
 /// runner just forwards the event payload.
 pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allocator: Allocator) void {
+    self.persistAgentEvent(event);
     switch (event) {
         .text_delta => |text| {
             defer allocator.free(text);
@@ -574,31 +648,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 };
             }
             self.sink.push(.{ .assistant_delta = .{ .text = text } });
-            self.session.persistEvent(.{
-                .entry_type = .assistant_text,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
         },
         .thinking_delta => |text| {
             defer allocator.free(text);
             self.sink.push(.{ .thinking_delta = .{ .text = text } });
-            // Persist per-delta so a crash mid-stream still preserves
-            // reasoning text. The history-rebuild path concatenates
-            // consecutive thinking entries on replay, same as
-            // assistant_text.
-            self.session.persistEvent(.{
-                .entry_type = .thinking,
-                .content = text,
-                .thinking_provider = "anthropic",
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
         },
         .thinking_stop => {
             self.sink.push(.thinking_stop);
@@ -612,14 +665,6 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 .call_id = ev.call_id,
                 .input_raw = ev.input_raw,
             } });
-            self.session.persistEvent(.{
-                .entry_type = .tool_call,
-                .tool_name = ev.name,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
         },
         .tool_result => |result| {
             defer allocator.free(result.content);
@@ -629,15 +674,6 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 .is_error = result.is_error,
                 .call_id = result.call_id,
             } });
-            self.session.persistEvent(.{
-                .entry_type = .tool_result,
-                .content = result.content,
-                .is_error = result.is_error,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
         },
         .info => |text| {
             defer allocator.free(text);
@@ -667,14 +703,6 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 };
             }
             self.sink.push(.{ .error_event = .{ .text = text } });
-            self.session.persistEvent(.{
-                .entry_type = .err,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| {
-                log.err("session persist failed: {}", .{err});
-                self.session.persist_failed = true;
-            };
         },
         // These round-trip events are normally consumed by
         // `dispatchHookRequests` before the drain sees them. If one slips
@@ -772,6 +800,31 @@ const NullSink = struct {
         return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
     }
 };
+
+test "persistAgentEvent is a no-op without an attached session handle" {
+    // Mirrors the ConversationHistory.persistEvent contract: with
+    // session_handle == null, persistAgentEvent should be a no-op for
+    // every event variant and leave persist_failed false. The headless
+    // drain loop (Task 11) and handleAgentEvent both rely on this so a
+    // pane created without a session file doesn't trip persist failures.
+    const allocator = std.testing.allocator;
+    var scb = ConversationHistory.init(allocator);
+    defer scb.deinit();
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
+    defer runner.deinit();
+
+    runner.persistAgentEvent(.{ .text_delta = "hello" });
+    runner.persistAgentEvent(.{ .thinking_delta = "thinking" });
+    runner.persistAgentEvent(.{ .tool_start = .{ .name = "bash" } });
+    runner.persistAgentEvent(.{ .tool_result = .{ .content = "ok", .is_error = false } });
+    runner.persistAgentEvent(.{ .err = "boom" });
+    runner.persistAgentEvent(.reset_assistant_text);
+    runner.persistAgentEvent(.thinking_stop);
+    runner.persistAgentEvent(.done);
+
+    try std.testing.expect(scb.session_handle == null);
+    try std.testing.expect(!scb.persist_failed);
+}
 
 test "handleAgentEvent .reset_assistant_text pushes assistant_reset" {
     const allocator = std.testing.allocator;
