@@ -4,7 +4,7 @@
 
 **Goal:** Build the four post-foundation PRs that take Zag from "frontier-model harness" to "small-model viable." JIT context on tool results, tool output transforms + tool gate, loop detector + compaction sockets, and the first concrete small-model pack (Qwen3-Coder).
 
-**Architecture:** Every new API in this plan is a **socket**: a Lua-registerable hook the harness consults at a specific lifecycle point. Sockets are no-ops by default on frontier models. Each socket gets a Zig-side dispatch path that routes through the existing main-thread marshalling pattern (mirrors `PromptAssemblyRequest` from PR 3). The socket handlers attach via `zag.context.on_tool_result`, `zag.tool.transform_output`, `zag.tools.gate`, `zag.loop.detect`, `zag.compact.strategy`. The Qwen3-Coder pack composes those primitives.
+**Architecture:** Every new API in this plan is a **socket**: a Lua-registerable hook the harness consults at a specific lifecycle point. Sockets are no-ops by default on frontier models. Each socket gets a Zig-side dispatch path that routes through the existing main-thread marshalling pattern (mirrors `PromptAssemblyRequest` from PR 3). The socket handlers attach via `zag.context.on_tool_result`, `zag.tools.transform_output`, `zag.tools.gate`, `zag.loop.detect`, `zag.compact.strategy`. The Qwen3-Coder pack composes those primitives.
 
 **Tech stack:** Zig 0.15, ziglua, the foundation already shipped: `prompt.Registry`, `Reminder.Queue`, `Instruction.findUp`, `PromptAssemblyRequest` event pattern, `Sink` vtable, `BufferSink`, `Hooks`.
 
@@ -269,15 +269,15 @@ End-to-end: spawn an engine, drop AGENTS.md in tmpDir, register the default jit 
 
 ## PR 9: Tool output transform + tool gate
 
-**Goal:** Two sockets that don't intervene by default but let plugins reshape what tools see and emit. `zag.tool.transform_output(name, fn)` rewrites the tool result text after execution. `zag.tools.gate(fn)` returns the visible tool subset per turn.
+**Goal:** Two sockets that don't intervene by default but let plugins reshape what tools see and emit. `zag.tools.transform_output(name, fn)` rewrites the tool result text after execution. `zag.tools.gate(fn)` returns the visible tool subset per turn.
 
 **Why:** Small models choke on large tool outputs (`rg` of a big repo) and on deep tool menus. Transforms trim noise; gates narrow the menu per turn.
 
-### Task 9.1: `zag.tool.transform_output` socket
+### Task 9.1: `zag.tools.transform_output` socket
 
 **Files:**
 - Create: AgentEvent variant `ToolTransformRequest` in `src/agent_events.zig`.
-- Modify: `src/LuaEngine.zig` add `zag.tool.transform_output(name, fn)` binding + handler registry.
+- Modify: `src/LuaEngine.zig` add `zag.tools.transform_output(name, fn)` binding + handler registry.
 - Modify: `src/agent.zig` fire the transform after tool execution, before the result is pushed.
 
 Mirrors PR 8 Task 8.1 + 8.2 structure exactly. Same dispatch pattern, same allocator hygiene. Diff: the result REPLACES tool_output (not appends).
@@ -317,7 +317,7 @@ Tests:
 
 ### Task 9.4: Documentation
 
-Extend `docs/scripting-prompt-layers.md` with sections for `zag.tool.transform_output`, `zag.tools.gate`, and the opt-in transform stdlib. One example per socket.
+Extend `docs/scripting-prompt-layers.md` with sections for `zag.tools.transform_output`, `zag.tools.gate`, and the opt-in transform stdlib. One example per socket.
 
 ---
 

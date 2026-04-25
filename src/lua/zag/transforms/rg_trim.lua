@@ -1,7 +1,7 @@
 -- Trim grep tool output past 200 lines.
 --
 -- Opt-in: `require("zag.transforms.rg_trim")` registers a
--- `zag.tool.transform_output("grep", ...)` handler that keeps the first
+-- `zag.tools.transform_output("grep", ...)` handler that keeps the first
 -- 200 lines of the result and replaces everything after with a single
 -- `... [N lines elided]` marker. Successful results only; error output
 -- passes through untouched so the agent still sees the failure.
@@ -34,7 +34,7 @@ local function head(s, max)
   return s:sub(1, cursor - 1), elided
 end
 
-zag.tool.transform_output("grep", function(ctx)
+zag.tools.transform_output("grep", function(ctx)
   if ctx.is_error then return nil end
   if type(ctx.output) ~= "string" then return nil end
 

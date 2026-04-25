@@ -141,7 +141,7 @@ pub const LuaEngine = struct {
     /// layers for ownership bookkeeping.
     prompt_layer_names: std.ArrayList([]const u8) = .empty,
     /// Queue of `<system-reminder>` snippets pushed by Lua plugins via
-    /// `zag.reminder(...)`. The harness drains this at the user-message
+    /// `zag.reminders.push(...)`. The harness drains this at the user-message
     /// boundary on each turn (Task 7.3); persistent entries survive every
     /// drain until cleared by id. Lua bindings own the queue's lifetime,
     /// so the engine's allocator backs every entry copy.
@@ -175,7 +175,7 @@ pub const LuaEngine = struct {
     /// Re-registering an existing tool name unrefs the old function and
     /// reuses the owned key, so memory does not bloat across reloads.
     jit_context_handlers: std.StringHashMapUnmanaged(JitHandler) = .empty,
-    /// Handlers registered via `zag.tool.transform_output(name, fn)`.
+    /// Handlers registered via `zag.tools.transform_output(name, fn)`.
     /// Same lifecycle and re-registration semantics as
     /// `jit_context_handlers`; the difference is purely how the agent
     /// loop consumes the return value: transforms REPLACE the tool
@@ -481,7 +481,7 @@ pub const LuaEngine = struct {
         }
         self.jit_context_handlers.deinit(self.allocator);
         // Same release dance for transform handlers registered via
-        // `zag.tool.transform_output`. Both maps share `JitHandler` so
+        // `zag.tools.transform_output`. Both maps share `JitHandler` so
         // the cleanup is identical.
         var transform_iter = self.tool_transform_handlers.iterator();
         while (transform_iter.next()) |entry| {
@@ -516,13 +516,11 @@ pub const LuaEngine = struct {
     fn injectZagGlobal(lua: *Lua) void {
         lua.newTable();
         // zag.tool is a callable table: `zag.tool{...}` registers a
-        // Lua-defined tool (the historical entry point), and
-        // `zag.tool.transform_output(name, fn)` hangs the post-execution
-        // output rewriter off the same namespace. Stack after this
+        // Lua-defined tool. Collection-of-tools sockets like
+        // `transform_output` and `gate` live under `zag.tools` so all
+        // tool-registry hooks share one namespace. Stack after this
         // block: [zag_table].
         lua.newTable(); // [zag_table, tool_table]
-        lua.pushFunction(zlua.wrap(zagToolTransformOutputFn));
-        lua.setField(-2, "transform_output");
         lua.newTable(); // [zag_table, tool_table, mt]
         lua.pushFunction(zlua.wrap(zagToolCallFn));
         lua.setField(-2, "__call"); // mt.__call = zagToolCallFn
@@ -548,12 +546,17 @@ pub const LuaEngine = struct {
         lua.setField(-2, "spawn");
         lua.pushFunction(zlua.wrap(zagDetachFn));
         lua.setField(-2, "detach");
+        // zag.reminders; namespace for the reminder queue. `push(text, opts)`
+        // enqueues an entry, `clear(id)` drops a pending entry, `list()`
+        // snapshots the queue. Stack: [zag_table].
+        lua.newTable(); // [zag_table, reminders_table]
         lua.pushFunction(zlua.wrap(zagReminderFn));
-        lua.setField(-2, "reminder");
+        lua.setField(-2, "push");
         lua.pushFunction(zlua.wrap(zagReminderClearFn));
-        lua.setField(-2, "reminder_clear");
+        lua.setField(-2, "clear");
         lua.pushFunction(zlua.wrap(zagReminderListFn));
-        lua.setField(-2, "reminder_list");
+        lua.setField(-2, "list");
+        lua.setField(-2, "reminders"); // zag.reminders = reminders_table; [zag_table]
 
         // zag.cmd is a callable table so we can hang zag.cmd.spawn et al.
         // off the same name. Stack after this block: [zag_table].
@@ -721,12 +724,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagParseFrontmatterFn));
         lua.setField(-2, "parse_frontmatter");
 
-        // zag.tools; namespace for tool-registry sockets. Today only
-        // `gate(fn)` (single global pre-callLlm hook); future tool-
+        // zag.tools; namespace for tool-registry sockets. `gate(fn)` is a
+        // single global pre-callLlm hook; `transform_output(name, fn)`
+        // hangs a per-tool post-execution output rewriter. Future tool-
         // facing sockets hang off the same table. Stack: [zag_table].
         lua.newTable(); // [zag_table, tools_table]
         lua.pushFunction(zlua.wrap(zagToolsGateFn));
         lua.setField(-2, "gate");
+        lua.pushFunction(zlua.wrap(zagToolTransformOutputFn));
+        lua.setField(-2, "transform_output");
         lua.setField(-2, "tools"); // zag.tools = tools_table; [zag_table]
 
         // zag.loop; namespace for agent-loop sockets. Today only
@@ -3551,12 +3557,12 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// Zig function backing `zag.reminder(text, opts?)`.
+    /// Zig function backing `zag.reminders.push(text, opts?)`.
     ///
     /// `text` is the body folded into a `<system-reminder>` block at the
     /// next user-message boundary. `opts` is an optional table accepting:
     ///   - `scope`: "next_turn" (default) or "persistent".
-    ///   - `id`:    optional string used by `zag.reminder_clear`.
+    ///   - `id`:    optional string used by `zag.reminders.clear`.
     ///   - `once`:  optional boolean (default true); reserved for future
     ///              once-per-turn dedup, surfaced today so the schema is
     ///              stable.
@@ -3565,18 +3571,18 @@ pub const LuaEngine = struct {
     /// callers may free their inputs immediately.
     fn zagReminderFn(lua: *Lua) !i32 {
         return zagReminderFnInner(lua) catch |err| {
-            log.warn("zag.reminder() failed: {}", .{err});
+            log.warn("zag.reminders.push() failed: {}", .{err});
             return err;
         };
     }
 
     fn zagReminderFnInner(lua: *Lua) !i32 {
         if (lua.typeOf(1) != .string) {
-            log.warn("zag.reminder(): first argument must be a string", .{});
+            log.warn("zag.reminders.push(): first argument must be a string", .{});
             return error.LuaError;
         }
         const text = lua.toString(1) catch {
-            log.warn("zag.reminder(): first argument must be a string", .{});
+            log.warn("zag.reminders.push(): first argument must be a string", .{});
             return error.LuaError;
         };
 
@@ -3588,7 +3594,7 @@ pub const LuaEngine = struct {
 
         if (!lua.isNoneOrNil(2)) {
             if (!lua.isTable(2)) {
-                log.warn("zag.reminder(): second argument must be an options table", .{});
+                log.warn("zag.reminders.push(): second argument must be an options table", .{});
                 return error.LuaError;
             }
             const opts_idx = lua.absIndex(2);
@@ -3597,7 +3603,7 @@ pub const LuaEngine = struct {
             if (!lua.isNil(-1)) {
                 if (lua.typeOf(-1) != .string) {
                     lua.pop(1);
-                    log.warn("zag.reminder(): opts.scope must be a string", .{});
+                    log.warn("zag.reminders.push(): opts.scope must be a string", .{});
                     return error.LuaError;
                 }
                 const scope_name = lua.toString(-1) catch {
@@ -3609,7 +3615,7 @@ pub const LuaEngine = struct {
                 } else if (std.mem.eql(u8, scope_name, "persistent")) {
                     scope = .persistent;
                 } else {
-                    log.warn("zag.reminder(): opts.scope must be 'next_turn' or 'persistent', got '{s}'", .{scope_name});
+                    log.warn("zag.reminders.push(): opts.scope must be 'next_turn' or 'persistent', got '{s}'", .{scope_name});
                     lua.pop(1);
                     return error.LuaError;
                 }
@@ -3628,7 +3634,7 @@ pub const LuaEngine = struct {
             id_pushed = true;
             if (!lua.isNil(-1)) {
                 if (lua.typeOf(-1) != .string) {
-                    log.warn("zag.reminder(): opts.id must be a string", .{});
+                    log.warn("zag.reminders.push(): opts.id must be a string", .{});
                     return error.LuaError;
                 }
                 id = lua.toString(-1) catch return error.LuaError;
@@ -3642,27 +3648,27 @@ pub const LuaEngine = struct {
             .scope = scope,
             .once = once,
         }) catch |err| {
-            log.warn("zag.reminder(): queue push failed: {}", .{err});
+            log.warn("zag.reminders.push(): queue push failed: {}", .{err});
             return error.LuaError;
         };
         return 0;
     }
 
-    /// Zig function backing `zag.reminder_clear(id)`.
+    /// Zig function backing `zag.reminders.clear(id)`.
     fn zagReminderClearFn(lua: *Lua) !i32 {
         return zagReminderClearFnInner(lua) catch |err| {
-            log.warn("zag.reminder_clear() failed: {}", .{err});
+            log.warn("zag.reminders.clear() failed: {}", .{err});
             return err;
         };
     }
 
     fn zagReminderClearFnInner(lua: *Lua) !i32 {
         if (lua.typeOf(1) != .string) {
-            log.warn("zag.reminder_clear(): first argument must be a string id", .{});
+            log.warn("zag.reminders.clear(): first argument must be a string id", .{});
             return error.LuaError;
         }
         const id = lua.toString(1) catch {
-            log.warn("zag.reminder_clear(): first argument must be a string id", .{});
+            log.warn("zag.reminders.clear(): first argument must be a string id", .{});
             return error.LuaError;
         };
         const engine = try engineFromRegistry(lua);
@@ -3670,12 +3676,12 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// Zig function backing `zag.reminder_list()`. Returns a Lua array of
+    /// Zig function backing `zag.reminders.list()`. Returns a Lua array of
     /// `{ text, scope, id?, once }` tables snapshotting the queue without
     /// disturbing it. Useful for diagnostics and tests.
     fn zagReminderListFn(lua: *Lua) !i32 {
         return zagReminderListFnInner(lua) catch |err| {
-            log.warn("zag.reminder_list() failed: {}", .{err});
+            log.warn("zag.reminders.list() failed: {}", .{err});
             return err;
         };
     }
@@ -3683,7 +3689,7 @@ pub const LuaEngine = struct {
     fn zagReminderListFnInner(lua: *Lua) !i32 {
         const engine = try engineFromRegistry(lua);
         const snapshot = engine.reminders.snapshot(engine.allocator) catch |err| {
-            log.warn("zag.reminder_list(): snapshot failed: {}", .{err});
+            log.warn("zag.reminders.list(): snapshot failed: {}", .{err});
             return error.LuaError;
         };
         defer Reminder.freeDrained(engine.allocator, snapshot);
@@ -5335,7 +5341,7 @@ pub const LuaEngine = struct {
         return &self.jit_context_handlers;
     }
 
-    /// Zig function backing `zag.tool.transform_output(tool_name, fn)`.
+    /// Zig function backing `zag.tools.transform_output(tool_name, fn)`.
     ///
     /// Registers a Lua handler that the harness invokes after every
     /// completed call to the tool with the matching name. Same lifecycle
@@ -5354,26 +5360,26 @@ pub const LuaEngine = struct {
 
         if (lua.typeOf(1) != .string) {
             lua.raiseErrorStr(
-                "zag.tool.transform_output: arg 1 must be a string tool name",
+                "zag.tools.transform_output: arg 1 must be a string tool name",
                 .{},
             );
         }
         const tool_name = lua.toString(1) catch {
             lua.raiseErrorStr(
-                "zag.tool.transform_output: arg 1 could not be read",
+                "zag.tools.transform_output: arg 1 could not be read",
                 .{},
             );
         };
         if (tool_name.len == 0) {
             lua.raiseErrorStr(
-                "zag.tool.transform_output: arg 1 must not be empty",
+                "zag.tools.transform_output: arg 1 must not be empty",
                 .{},
             );
         }
 
         if (!lua.isFunction(2)) {
             lua.raiseErrorStr(
-                "zag.tool.transform_output: arg 2 must be a function",
+                "zag.tools.transform_output: arg 2 must be a function",
                 .{},
             );
         }
@@ -5383,7 +5389,7 @@ pub const LuaEngine = struct {
         lua.pushValue(2);
         const fn_ref = lua.ref(zlua.registry_index) catch {
             lua.raiseErrorStr(
-                "zag.tool.transform_output: failed to ref handler",
+                "zag.tools.transform_output: failed to ref handler",
                 .{},
             );
         };
@@ -5401,7 +5407,7 @@ pub const LuaEngine = struct {
         const owned_name = engine.allocator.dupe(u8, tool_name) catch {
             lua.unref(zlua.registry_index, fn_ref);
             lua.raiseErrorStr(
-                "zag.tool.transform_output: out of memory duping tool name",
+                "zag.tools.transform_output: out of memory duping tool name",
                 .{},
             );
         };
@@ -5414,7 +5420,7 @@ pub const LuaEngine = struct {
             lua.unref(zlua.registry_index, fn_ref);
             engine.allocator.free(owned_name);
             lua.raiseErrorStr(
-                "zag.tool.transform_output: out of memory inserting handler",
+                "zag.tools.transform_output: out of memory inserting handler",
                 .{},
             );
         };
@@ -12345,13 +12351,13 @@ test "zag.prompt dispatch lets user layer named 'pack' shadow the pack body" {
     try std.testing.expectEqual(@as(usize, 2), pack_count);
 }
 
-test "zag.reminder pushes a next-turn entry by default" {
+test "zag.reminders.push pushes a next-turn entry by default" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.reminder("hello there")
+        \\zag.reminders.push("hello there")
     );
 
     const snap = try engine.reminders.snapshot(std.testing.allocator);
@@ -12363,13 +12369,13 @@ test "zag.reminder pushes a next-turn entry by default" {
     try std.testing.expectEqual(true, snap[0].once);
 }
 
-test "zag.reminder honors persistent scope and id" {
+test "zag.reminders.push honors persistent scope and id" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.reminder("plan active", { scope = "persistent", id = "plan", once = false })
+        \\zag.reminders.push("plan active", { scope = "persistent", id = "plan", once = false })
     );
 
     const snap = try engine.reminders.snapshot(std.testing.allocator);
@@ -12381,39 +12387,39 @@ test "zag.reminder honors persistent scope and id" {
     try std.testing.expectEqual(false, snap[0].once);
 }
 
-test "zag.reminder rejects unknown scope" {
+test "zag.reminders.push rejects unknown scope" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     const result = engine.lua.doString(
-        \\zag.reminder("nope", { scope = "later" })
+        \\zag.reminders.push("nope", { scope = "later" })
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(usize, 0), engine.reminders.len());
 }
 
-test "zag.reminder rejects non-string text" {
+test "zag.reminders.push rejects non-string text" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     const result = engine.lua.doString(
-        \\zag.reminder(42)
+        \\zag.reminders.push(42)
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(usize, 0), engine.reminders.len());
 }
 
-test "zag.reminder_clear removes matching id" {
+test "zag.reminders.clear removes matching id" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.reminder("keep", { scope = "persistent", id = "keep" })
-        \\zag.reminder("drop", { scope = "persistent", id = "drop" })
-        \\zag.reminder_clear("drop")
+        \\zag.reminders.push("keep", { scope = "persistent", id = "keep" })
+        \\zag.reminders.push("drop", { scope = "persistent", id = "drop" })
+        \\zag.reminders.clear("drop")
     );
 
     const snap = try engine.reminders.snapshot(std.testing.allocator);
@@ -12422,15 +12428,15 @@ test "zag.reminder_clear removes matching id" {
     try std.testing.expectEqualStrings("keep", snap[0].text);
 }
 
-test "zag.reminder_list returns a snapshot of pending entries" {
+test "zag.reminders.list returns a snapshot of pending entries" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.reminder("first")
-        \\zag.reminder("second", { scope = "persistent", id = "p" })
-        \\local snap = zag.reminder_list()
+        \\zag.reminders.push("first")
+        \\zag.reminders.push("second", { scope = "persistent", id = "p" })
+        \\local snap = zag.reminders.list()
         \\_G.snap_len = #snap
         \\_G.first_text = snap[1].text
         \\_G.first_scope = snap[1].scope
@@ -12643,14 +12649,14 @@ test "zag.context.on_tool_result rejects non-function handler" {
     try std.testing.expectEqual(@as(u32, 0), engine.jitContextHandlers().count());
 }
 
-test "zag.tool.transform_output registers a handler keyed by tool name" {
+test "zag.tools.transform_output registers a handler keyed by tool name" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx)
+        \\zag.tools.transform_output("bash", function(ctx)
         \\  return "trimmed: " .. ctx.output
         \\end)
     );
@@ -12658,19 +12664,19 @@ test "zag.tool.transform_output registers a handler keyed by tool name" {
     try std.testing.expect(engine.tool_transform_handlers.contains("bash"));
 }
 
-test "zag.tool.transform_output re-registration unrefs old function" {
+test "zag.tools.transform_output re-registration unrefs old function" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx) return "v1" end)
+        \\zag.tools.transform_output("bash", function(ctx) return "v1" end)
     );
     const first_ref = engine.tool_transform_handlers.get("bash").?.fn_ref;
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx) return "v2" end)
+        \\zag.tools.transform_output("bash", function(ctx) return "v2" end)
     );
     try std.testing.expectEqual(@as(u32, 1), engine.toolTransformHandlers().count());
     const second_ref = engine.tool_transform_handlers.get("bash").?.fn_ref;
@@ -12686,7 +12692,7 @@ test "handleToolTransformRequest invokes registered handler and dupes result" {
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx)
+        \\zag.tools.transform_output("bash", function(ctx)
         \\  return "ok " .. ctx.tool .. " in=" .. ctx.input .. " out=" .. ctx.output
         \\end)
     );
@@ -12727,7 +12733,7 @@ test "handleToolTransformRequest surfaces Lua handler error via @errorName" {
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx) error("blew up") end)
+        \\zag.tools.transform_output("bash", function(ctx) error("blew up") end)
     );
 
     var req = agent_events.ToolTransformRequest.init("bash", "{}", "out", false, alloc);
@@ -12743,7 +12749,7 @@ test "handleToolTransformRequest passes is_error through to ctx" {
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx)
+        \\zag.tools.transform_output("bash", function(ctx)
         \\  if ctx.is_error then return "STAYS-ERR" else return "STAYS-OK" end
         \\end)
     );
@@ -12761,7 +12767,7 @@ test "handleToolTransformRequest with nil return leaves result null" {
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx) return nil end)
+        \\zag.tools.transform_output("bash", function(ctx) return nil end)
     );
 
     var req = agent_events.ToolTransformRequest.init("bash", "{}", "x", false, alloc);
@@ -12782,7 +12788,7 @@ test "handleToolTransformRequest rejects handler returning a number" {
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(_) return 42 end)
+        \\zag.tools.transform_output("bash", function(_) return 42 end)
     );
 
     var req = agent_events.ToolTransformRequest.init("bash", "{}", "out", false, alloc);
@@ -12799,7 +12805,7 @@ test "handleToolTransformRequest rejects handler returning a table" {
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(_) return {x=1} end)
+        \\zag.tools.transform_output("bash", function(_) return {x=1} end)
     );
 
     var req = agent_events.ToolTransformRequest.init("bash", "{}", "out", false, alloc);
@@ -12808,27 +12814,27 @@ test "handleToolTransformRequest rejects handler returning a table" {
     try std.testing.expect(req.result == null);
 }
 
-test "zag.tool.transform_output rejects non-string tool name" {
+test "zag.tools.transform_output rejects non-string tool name" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     const result = engine.lua.doString(
-        \\zag.tool.transform_output(42, function() end)
+        \\zag.tools.transform_output(42, function() end)
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(u32, 0), engine.toolTransformHandlers().count());
 }
 
-test "zag.tool.transform_output rejects non-function handler" {
+test "zag.tools.transform_output rejects non-function handler" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     const result = engine.lua.doString(
-        \\zag.tool.transform_output("bash", "not a function")
+        \\zag.tools.transform_output("bash", "not a function")
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(u32, 0), engine.toolTransformHandlers().count());

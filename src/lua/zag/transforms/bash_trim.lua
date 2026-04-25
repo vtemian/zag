@@ -1,7 +1,7 @@
 -- Trim bash tool output past 500 lines.
 --
 -- Opt-in: `require("zag.transforms.bash_trim")` registers a
--- `zag.tool.transform_output("bash", ...)` handler that keeps the first
+-- `zag.tools.transform_output("bash", ...)` handler that keeps the first
 -- 500 lines of stdout/stderr and replaces everything after with a single
 -- `... [N lines elided]` marker. Successful results only; error output
 -- passes through untouched so the agent still sees the failure tail.
@@ -35,7 +35,7 @@ local function head(s, max)
   return s:sub(1, cursor - 1), elided
 end
 
-zag.tool.transform_output("bash", function(ctx)
+zag.tools.transform_output("bash", function(ctx)
   if ctx.is_error then return nil end
   if type(ctx.output) ~= "string" then return nil end
 

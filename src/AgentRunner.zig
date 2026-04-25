@@ -1327,7 +1327,7 @@ test "tool_transform_request round-trips via main thread" {
     defer engine.deinit();
     engine.storeSelfPointer();
     try engine.lua.doString(
-        \\zag.tool.transform_output("bash", function(ctx)
+        \\zag.tools.transform_output("bash", function(ctx)
         \\  return "transformed: " .. ctx.output
         \\end)
     );

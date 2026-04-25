@@ -235,15 +235,15 @@ zag.prompt.for_model(pattern, prompt_text_or_fn)
   -- pattern: substring or Lua pattern; matched against model.id
   -- registers a cache="stable", priority=0 layer
 
-zag.reminder(text, { scope = "next_turn", id = "plan-active", once = true })
-zag.reminder_clear("plan-active")
+zag.reminders.push(text, { scope = "next_turn", id = "plan-active", once = true })
+zag.reminders.clear("plan-active")
 
 zag.context.on_tool_result("read", function(result)
   -- result = { tool, input, output, metadata }
   return "..."  -- appended under the tool result, or nil
 end)
 
-zag.tool.transform_output("bash", function(result)
+zag.tools.transform_output("bash", function(result)
   return rewritten  -- or nil for passthrough
 end)
 
@@ -272,8 +272,8 @@ zag.context.ancestors(cwd, root)
 | `zag.prompt.layer` fn | `string` | Append to the layer's cache class |
 | `zag.prompt.layer` fn | `nil` | Skip this layer this turn |
 | `zag.context.on_tool_result` fn | `string` | Append as JIT context under the tool result |
-| `zag.tool.transform_output` fn | `string` | Replace the tool output |
-| `zag.tool.transform_output` fn | `nil` | Passthrough |
+| `zag.tools.transform_output` fn | `string` | Replace the tool output |
+| `zag.tools.transform_output` fn | `nil` | Passthrough |
 | `zag.tools.gate` fn | `string[]` | Visible tool name set for this turn |
 | `zag.loop.detect` fn | `{ action, text? }` or `nil` | Intervention or none |
 
@@ -352,7 +352,7 @@ Provider sends `system_stable` with `cache_control: ephemeral`, `system_volatile
 `src/Instruction.zig` (PascalCase) with `systemPaths()` + walk-up. Registered as a default Lua layer. Globals at `~/.claude/CLAUDE.md`, `~/.config/zag/AGENTS.md`.
 
 **PR 7: reminder queue.**
-`src/Reminder.zig`, `zag.reminder` Lua API, `<system-reminder>` wrapping, injection at user-message boundary. First concrete use: mid-loop user-message wrap.
+`src/Reminder.zig`, `zag.reminders.push` Lua API, `<system-reminder>` wrapping, injection at user-message boundary. First concrete use: mid-loop user-message wrap.
 
 **PR 8: JIT context on tool results.**
 `zag.context.on_tool_result` API. Default `lua/zag/jit/agents_md.lua`: walk up from read paths, dedup per-message.

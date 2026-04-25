@@ -765,7 +765,7 @@ fn fireJitContextRequest(
     return req.result;
 }
 
-/// Fire `zag.tool.transform_output` for one tool call and block on a
+/// Fire `zag.tools.transform_output` for one tool call and block on a
 /// main-thread round-trip. Mirrors `fireJitContextRequest`'s structure;
 /// the only semantic difference belongs to the caller, which REPLACES
 /// the tool output rather than appending. Returns the duped replacement
@@ -2394,7 +2394,7 @@ test "tool_transform replaces bash output via executeTools dispatch" {
     defer engine.deinit();
     engine.storeSelfPointer();
     try engine.lua.doString(
-        \\zag.tool.transform_output("echo_fast", function(ctx)
+        \\zag.tools.transform_output("echo_fast", function(ctx)
         \\  return "trimmed"
         \\end)
     );
@@ -2454,7 +2454,7 @@ test "tool_transform returning nil leaves output untouched" {
     defer engine.deinit();
     engine.storeSelfPointer();
     try engine.lua.doString(
-        \\zag.tool.transform_output("echo_fast", function(ctx) return nil end)
+        \\zag.tools.transform_output("echo_fast", function(ctx) return nil end)
     );
 
     var registry = tools.Registry.init(alloc);
@@ -2512,7 +2512,7 @@ test "tool_transform handler error preserves original output" {
     defer engine.deinit();
     engine.storeSelfPointer();
     try engine.lua.doString(
-        \\zag.tool.transform_output("echo_fast", function(ctx) error("plugin bug") end)
+        \\zag.tools.transform_output("echo_fast", function(ctx) error("plugin bug") end)
     );
 
     var registry = tools.Registry.init(alloc);
@@ -2580,7 +2580,7 @@ test "tool_transform sees post-JIT content (JIT runs first, transform replaces)"
         \\zag.context.on_tool_result("echo_fast", function(ctx)
         \\  return "JIT-MARKER"
         \\end)
-        \\zag.tool.transform_output("echo_fast", function(ctx)
+        \\zag.tools.transform_output("echo_fast", function(ctx)
         \\  return "SAW: " .. ctx.output
         \\end)
     );
@@ -3863,7 +3863,7 @@ test "fireToolTransformRequest cancel path waits for handle then frees and retur
     defer engine.deinit();
     engine.storeSelfPointer();
     try engine.lua.doString(
-        \\zag.tool.transform_output("read", function(ctx)
+        \\zag.tools.transform_output("read", function(ctx)
         \\  return "trimmed"
         \\end)
     );
@@ -3950,7 +3950,7 @@ test "fireToolTransformRequest returns null when queue is at capacity" {
     defer engine.deinit();
     engine.storeSelfPointer();
     try engine.lua.doString(
-        \\zag.tool.transform_output("read", function(ctx) return "x" end)
+        \\zag.tools.transform_output("read", function(ctx) return "x" end)
     );
 
     var queue = try agent_events.EventQueue.initBounded(alloc, 1);

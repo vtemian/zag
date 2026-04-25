@@ -15,7 +15,7 @@
 --
 -- # Sandbox: overrides register globally on first dispatch
 --
--- The `zag.loop.detect`, `zag.tools.gate`, and `zag.tool.transform_output`
+-- The `zag.loop.detect`, `zag.tools.gate`, and `zag.tools.transform_output`
 -- registrations below run as top-level statements when the dispatcher
 -- first `require()`s this module (i.e. on the first turn whose
 -- `ctx.model_id` matches `qwen3%-coder`). Lua's `require` cache keeps the
