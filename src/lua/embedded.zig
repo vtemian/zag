@@ -30,6 +30,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.tools.render_diagram", .code = @embedFile("zag/tools/render_diagram.lua") },
     .{ .name = "zag.subagents.filesystem", .code = @embedFile("zag/subagents/filesystem.lua") },
     .{ .name = "zag.layers.env", .code = @embedFile("zag/layers/env.lua") },
+    .{ .name = "zag.prompt", .code = @embedFile("zag/prompt/init.lua") },
 };
 
 /// Find an entry by its dotted module name. Returns null if not found.
@@ -42,7 +43,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 12), entries.len);
+    try std.testing.expectEqual(@as(usize, 13), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -60,6 +61,13 @@ test "find returns the entry for a known provider" {
 
 test "find returns null for an unknown module" {
     try std.testing.expect(find("zag.providers.nonexistent") == null);
+}
+
+test "find returns the entry for the prompt dispatcher" {
+    const e = find("zag.prompt").?;
+    try std.testing.expectEqualStrings("zag.prompt", e.name);
+    // Dispatcher installs a catch-all via `zag.prompt.for_model`.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.prompt.for_model") != null);
 }
 
 test {
