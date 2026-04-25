@@ -516,6 +516,53 @@ fn fireJitContextRequest(
     return req.result;
 }
 
+/// Fire `zag.tool.transform_output` for one tool call and block on a
+/// main-thread round-trip. Mirrors `fireJitContextRequest`'s structure;
+/// the only semantic difference belongs to the caller, which REPLACES
+/// the tool output rather than appending. Returns the duped replacement
+/// string (caller owns) or null when no handler is registered, the
+/// handler returned nil, or the handler errored. Skips the round-trip
+/// entirely when no handler is registered for `tc.name` so the no-op
+/// fast path stays cheap.
+fn fireToolTransformRequest(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    tc: types.ContentBlock.ToolUse,
+    output: []const u8,
+    is_error: bool,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !?[]u8 {
+    const engine = lua_engine orelse return null;
+    if (engine.tool_transform_handlers.count() == 0) return null;
+    if (!engine.tool_transform_handlers.contains(tc.name)) return null;
+
+    var req = agent_events.ToolTransformRequest.init(
+        tc.name,
+        tc.input_raw,
+        output,
+        is_error,
+        allocator,
+    );
+    queue.push(.{ .tool_transform_request = &req }) catch return null;
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                if (req.result) |replacement| allocator.free(replacement);
+                return error.Cancelled;
+            }
+        }
+    }
+    if (req.error_name) |name| {
+        log.warn("tool transform handler '{s}' failed: {s}", .{ tc.name, name });
+        if (req.result) |replacement| allocator.free(replacement);
+        return null;
+    }
+    return req.result;
+}
+
 /// Run one tool call's full pipeline: check cancel, fire ToolPre,
 /// push tool_start, execute the tool (or synthesize a veto result),
 /// push tool_result. Tool execution errors are captured as error
@@ -623,6 +670,16 @@ fn runToolStep(
                 );
                 if (final.owned) allocator.free(final.content);
                 final = .{ .content = combined, .is_error = final.is_error, .owned = true };
+            }
+
+            // Output transform: a registered Lua handler can REPLACE the
+            // tool output entirely (e.g. trimming bash output to head+tail).
+            // Runs AFTER the JIT context attach so transforms see the
+            // post-JIT content; this lets a transform decide whether to
+            // preserve, replace, or trim the appended instructions.
+            if (try fireToolTransformRequest(lua_engine, tc, final.content, final.is_error, allocator, queue, cancel)) |replacement| {
+                if (final.owned) allocator.free(final.content);
+                final = .{ .content = replacement, .is_error = final.is_error, .owned = true };
             }
 
             const result_content = try allocator.dupe(u8, final.content);
@@ -1217,6 +1274,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
+                .tool_transform_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
                 .thinking_stop, .done, .reset_assistant_text => {},
             }
         }
@@ -1755,6 +1816,254 @@ test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" 
             const original_at = std.mem.indexOf(u8, tr.content, "package nested").?;
             const instructions_at = std.mem.indexOf(u8, tr.content, "Instructions from: ").?;
             try std.testing.expect(original_at < instructions_at);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tool_transform replaces bash output via executeTools dispatch" {
+    const AgentRunner = @import("AgentRunner.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool.transform_output("echo_fast", function(ctx)
+        \\  return "trimmed"
+        \\end)
+    );
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(echo_fast_tool);
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_xform", .name = "echo_fast", .input_raw = "{}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expect(!tr.is_error);
+            // The transform returned "trimmed"; original "fast_result"
+            // must be gone (replace, not append).
+            try std.testing.expectEqualStrings("trimmed", tr.content);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tool_transform returning nil leaves output untouched" {
+    const AgentRunner = @import("AgentRunner.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool.transform_output("echo_fast", function(ctx) return nil end)
+    );
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(echo_fast_tool);
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_passthrough", .name = "echo_fast", .input_raw = "{}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expect(!tr.is_error);
+            // echo_fast returns "fast_result" verbatim. Nil transform
+            // result must leave that intact.
+            try std.testing.expectEqualStrings("fast_result", tr.content);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tool_transform handler error preserves original output" {
+    const AgentRunner = @import("AgentRunner.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.tool.transform_output("echo_fast", function(ctx) error("plugin bug") end)
+    );
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(echo_fast_tool);
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_err", .name = "echo_fast", .input_raw = "{}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            // Lua handler error must NOT mark the tool result as an error;
+            // a buggy plugin shouldn't poison the conversation. The
+            // original output is preserved untouched.
+            try std.testing.expect(!tr.is_error);
+            try std.testing.expectEqualStrings("fast_result", tr.content);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tool_transform sees post-JIT content (JIT runs first, transform replaces)" {
+    // This is the load-bearing ordering invariant: JIT context attaches,
+    // THEN transform runs against the appended buffer. A transform that
+    // drops the output entirely (returning a tag string) must therefore
+    // observe both the original output and the JIT-appended instructions.
+    const AgentRunner = @import("AgentRunner.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // JIT appends a marker. The transform receives the post-append output
+    // and ECHOES IT, prefixed with a tag — proving it saw both halves.
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("echo_fast", function(ctx)
+        \\  return "JIT-MARKER"
+        \\end)
+        \\zag.tool.transform_output("echo_fast", function(ctx)
+        \\  return "SAW: " .. ctx.output
+        \\end)
+    );
+
+    var registry = tools.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register(echo_fast_tool);
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_order", .name = "echo_fast", .input_raw = "{}" },
+    };
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    tools.lua_request_queue = &queue;
+    defer tools.lua_request_queue = null;
+
+    const blocks = try executeTools(&tool_calls, &registry, alloc, &queue, &cancel, &engine, null);
+    defer freeToolResults(blocks, alloc);
+    defer drainAndFreeQueue(&queue, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .tool_result => |tr| {
+            try std.testing.expect(!tr.is_error);
+            // Transform replaced the output with "SAW: <whatever it saw>".
+            // What it saw must be the JIT-augmented buffer.
+            try std.testing.expect(std.mem.startsWith(u8, tr.content, "SAW: "));
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "fast_result") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tr.content, "JIT-MARKER") != null);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -175,6 +175,12 @@ pub const LuaEngine = struct {
     /// Re-registering an existing tool name unrefs the old function and
     /// reuses the owned key, so memory does not bloat across reloads.
     jit_context_handlers: std.StringHashMapUnmanaged(JitHandler) = .empty,
+    /// Handlers registered via `zag.tool.transform_output(name, fn)`.
+    /// Same lifecycle and re-registration semantics as
+    /// `jit_context_handlers`; the difference is purely how the agent
+    /// loop consumes the return value: transforms REPLACE the tool
+    /// output rather than appending under it.
+    tool_transform_handlers: std.StringHashMapUnmanaged(JitHandler) = .empty,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -446,6 +452,15 @@ pub const LuaEngine = struct {
             self.allocator.free(entry.value_ptr.tool_name);
         }
         self.jit_context_handlers.deinit(self.allocator);
+        // Same release dance for transform handlers registered via
+        // `zag.tool.transform_output`. Both maps share `JitHandler` so
+        // the cleanup is identical.
+        var transform_iter = self.tool_transform_handlers.iterator();
+        while (transform_iter.next()) |entry| {
+            self.lua.unref(zlua.registry_index, entry.value_ptr.fn_ref);
+            self.allocator.free(entry.value_ptr.tool_name);
+        }
+        self.tool_transform_handlers.deinit(self.allocator);
         self.lua.deinit();
     }
 
@@ -453,8 +468,19 @@ pub const LuaEngine = struct {
     /// Does not store the engine pointer yet (see `storeSelfPointer`).
     fn injectZagGlobal(lua: *Lua) void {
         lua.newTable();
-        lua.pushFunction(zlua.wrap(zagToolFn));
-        lua.setField(-2, "tool");
+        // zag.tool is a callable table: `zag.tool{...}` registers a
+        // Lua-defined tool (the historical entry point), and
+        // `zag.tool.transform_output(name, fn)` hangs the post-execution
+        // output rewriter off the same namespace. Stack after this
+        // block: [zag_table].
+        lua.newTable(); // [zag_table, tool_table]
+        lua.pushFunction(zlua.wrap(zagToolTransformOutputFn));
+        lua.setField(-2, "transform_output");
+        lua.newTable(); // [zag_table, tool_table, mt]
+        lua.pushFunction(zlua.wrap(zagToolCallFn));
+        lua.setField(-2, "__call"); // mt.__call = zagToolCallFn
+        lua.setMetatable(-2); // setmetatable(tool_table, mt)
+        lua.setField(-2, "tool"); // zag.tool = tool_table; [zag_table]
         lua.pushFunction(zlua.wrap(zagHookFn));
         lua.setField(-2, "hook");
         lua.pushFunction(zlua.wrap(zagHookDelFn));
@@ -3177,14 +3203,25 @@ pub const LuaEngine = struct {
     /// Zig function backing `zag.tool(table)`.
     /// Wrapped via `zlua.wrap` so it has the correct C calling convention.
     fn zagToolFn(lua: *Lua) !i32 {
-        return zagToolFnInner(lua) catch |err| {
+        return zagToolFnInner(lua, 1) catch |err| {
             log.err("zag.tool() failed: {}", .{err});
             return err;
         };
     }
 
-    fn zagToolFnInner(lua: *Lua) !i32 {
-        if (!lua.isTable(1)) {
+    /// Metatable __call entry: when a user writes `zag.tool{...}`, Lua
+    /// invokes this with the callable table at slot 1 and the user
+    /// table at slot 2. Delegate to the inner reader with a shifted
+    /// base index so the callable-vs-direct callsites share one body.
+    fn zagToolCallFn(lua: *Lua) !i32 {
+        return zagToolFnInner(lua, 2) catch |err| {
+            log.err("zag.tool() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagToolFnInner(lua: *Lua, table_idx: i32) !i32 {
+        if (!lua.isTable(table_idx)) {
             log.err("zag.tool() expects a table argument", .{});
             return error.LuaError;
         }
@@ -3199,7 +3236,7 @@ pub const LuaEngine = struct {
         const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
 
         // Read name (Lua string, borrowed from VM; invalidated by next pop)
-        _ = lua.getField(1, "name");
+        _ = lua.getField(table_idx, "name");
         const tool_name = lua.toString(-1) catch {
             log.err("zag.tool(): 'name' field must be a string", .{});
             lua.pop(1);
@@ -3208,7 +3245,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
 
         // Read description (Lua string, borrowed from VM; invalidated by next pop)
-        _ = lua.getField(1, "description");
+        _ = lua.getField(table_idx, "description");
         const description = lua.toString(-1) catch {
             log.err("zag.tool(): 'description' field must be a string", .{});
             lua.pop(1);
@@ -3217,7 +3254,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
 
         // Read optional prompt_snippet (Lua string, borrowed from VM; invalidated by next pop)
-        _ = lua.getField(1, "prompt_snippet");
+        _ = lua.getField(table_idx, "prompt_snippet");
         const prompt_snippet: ?[]const u8 = if (lua.isString(-1))
             lua.toString(-1) catch null
         else
@@ -3225,7 +3262,7 @@ pub const LuaEngine = struct {
         lua.pop(1);
 
         // Read input_schema table and serialize to JSON
-        _ = lua.getField(1, "input_schema");
+        _ = lua.getField(table_idx, "input_schema");
         if (!lua.isTable(-1)) {
             log.err("zag.tool(): 'input_schema' field must be a table", .{});
             lua.pop(1);
@@ -3241,7 +3278,7 @@ pub const LuaEngine = struct {
         errdefer engine.allocator.free(schema_json);
 
         // Read execute function and store as registry reference
-        _ = lua.getField(1, "execute");
+        _ = lua.getField(table_idx, "execute");
         if (!lua.isFunction(-1)) {
             log.err("zag.tool(): 'execute' field must be a function", .{});
             lua.pop(1);
@@ -5222,6 +5259,163 @@ pub const LuaEngine = struct {
         self: *LuaEngine,
     ) *std.StringHashMapUnmanaged(JitHandler) {
         return &self.jit_context_handlers;
+    }
+
+    /// Zig function backing `zag.tool.transform_output(tool_name, fn)`.
+    ///
+    /// Registers a Lua handler that the harness invokes after every
+    /// completed call to the tool with the matching name. Same lifecycle
+    /// as `zag.context.on_tool_result`; the difference is purely how the
+    /// agent loop consumes the return value (REPLACE vs append).
+    ///
+    /// Args:
+    /// - arg 1 (string, required, non-empty): tool name to match.
+    /// - arg 2 (function, required): handler `fn(ctx) -> string|nil`.
+    ///
+    /// Re-registering an existing tool name unrefs the previous function
+    /// before stashing the new one; the owned name slice is reused so the
+    /// hashmap key stays stable.
+    fn zagToolTransformOutputFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+
+        if (lua.typeOf(1) != .string) {
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: arg 1 must be a string tool name",
+                .{},
+            );
+        }
+        const tool_name = lua.toString(1) catch {
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: arg 1 could not be read",
+                .{},
+            );
+        };
+        if (tool_name.len == 0) {
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: arg 1 must not be empty",
+                .{},
+            );
+        }
+
+        if (!lua.isFunction(2)) {
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: arg 2 must be a function",
+                .{},
+            );
+        }
+
+        // Push a copy of arg 2 so ref() pops the duplicate and leaves the
+        // original argument frame intact.
+        lua.pushValue(2);
+        const fn_ref = lua.ref(zlua.registry_index) catch {
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: failed to ref handler",
+                .{},
+            );
+        };
+        errdefer lua.unref(zlua.registry_index, fn_ref);
+
+        // Re-registration: unref the old fn but keep the existing owned
+        // name slice (the map key aliases it, so freeing would dangle the
+        // bucket key). Just swap the value in place.
+        if (engine.tool_transform_handlers.getPtr(tool_name)) |existing| {
+            lua.unref(zlua.registry_index, existing.fn_ref);
+            existing.fn_ref = fn_ref;
+            return 0;
+        }
+
+        const owned_name = engine.allocator.dupe(u8, tool_name) catch {
+            lua.unref(zlua.registry_index, fn_ref);
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: out of memory duping tool name",
+                .{},
+            );
+        };
+        errdefer engine.allocator.free(owned_name);
+
+        engine.tool_transform_handlers.put(engine.allocator, owned_name, .{
+            .tool_name = owned_name,
+            .fn_ref = fn_ref,
+        }) catch {
+            lua.unref(zlua.registry_index, fn_ref);
+            engine.allocator.free(owned_name);
+            lua.raiseErrorStr(
+                "zag.tool.transform_output: out of memory inserting handler",
+                .{},
+            );
+        };
+
+        return 0;
+    }
+
+    /// Run the tool-output transform handler for `req.tool_name` on the
+    /// main thread. Builds a Lua-side context table identical in shape to
+    /// the JIT context handler's, calls the registered function via
+    /// `protectedCall`, and dupes the returned string into `req.allocator`
+    /// (success path). When no handler is registered the request returns
+    /// with `result = null` and `error_name = null` so the worker proceeds
+    /// with the original output. Lua-side errors set the caller's
+    /// `error_name` via the returned error and leave `result` null.
+    /// Caller is responsible for `req.done.set()`.
+    pub fn handleToolTransformRequest(
+        self: *LuaEngine,
+        req: *agent_events.ToolTransformRequest,
+    ) anyerror!void {
+        const handler = self.tool_transform_handlers.get(req.tool_name) orelse return;
+
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, handler.fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn(
+                "tool transform handler for '{s}': registry slot is not a function",
+                .{req.tool_name},
+            );
+            return;
+        }
+
+        // Same context-table shape as the JIT context handler so a plugin
+        // can swap between append-semantics and replace-semantics by
+        // changing the registration entry point only.
+        lua.newTable();
+        _ = lua.pushString(req.tool_name);
+        lua.setField(-2, "tool");
+        _ = lua.pushString(req.input);
+        lua.setField(-2, "input");
+        _ = lua.pushString(req.output);
+        lua.setField(-2, "output");
+        lua.pushBoolean(req.is_error);
+        lua.setField(-2, "is_error");
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn(
+                "tool transform handler for '{s}' raised: {s}",
+                .{ req.tool_name, err_msg },
+            );
+            lua.pop(1);
+            return error.LuaHandlerError;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return;
+        if (lua.typeOf(-1) != .string) {
+            log.warn(
+                "tool transform handler for '{s}' returned non-string (type {s})",
+                .{ req.tool_name, @tagName(lua.typeOf(-1)) },
+            );
+            return error.ToolTransformNotString;
+        }
+        const out = lua.toString(-1) catch return error.ToolTransformReadFailed;
+        req.result = try req.allocator.dupe(u8, out);
+    }
+
+    /// Test-only accessor for the tool transform handler map. Same
+    /// rationale as `jitContextHandlers`.
+    pub fn toolTransformHandlers(
+        self: *LuaEngine,
+    ) *std.StringHashMapUnmanaged(JitHandler) {
+        return &self.tool_transform_handlers;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -11548,6 +11742,177 @@ test "zag.context.on_tool_result rejects non-function handler" {
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(u32, 0), engine.jitContextHandlers().count());
+}
+
+test "zag.tool.transform_output registers a handler keyed by tool name" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx)
+        \\  return "trimmed: " .. ctx.output
+        \\end)
+    );
+    try std.testing.expectEqual(@as(u32, 1), engine.toolTransformHandlers().count());
+    try std.testing.expect(engine.tool_transform_handlers.contains("bash"));
+}
+
+test "zag.tool.transform_output re-registration unrefs old function" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx) return "v1" end)
+    );
+    const first_ref = engine.tool_transform_handlers.get("bash").?.fn_ref;
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx) return "v2" end)
+    );
+    try std.testing.expectEqual(@as(u32, 1), engine.toolTransformHandlers().count());
+    const second_ref = engine.tool_transform_handlers.get("bash").?.fn_ref;
+    try std.testing.expect(first_ref != second_ref);
+    // testing.allocator + Lua deinit catch a leaked old fn_ref. This test
+    // body would fail under the leak detector if the old ref was kept.
+}
+
+test "handleToolTransformRequest invokes registered handler and dupes result" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx)
+        \\  return "ok " .. ctx.tool .. " in=" .. ctx.input .. " out=" .. ctx.output
+        \\end)
+    );
+
+    var req = agent_events.ToolTransformRequest.init(
+        "bash",
+        "{\"cmd\":\"ls\"}",
+        "raw",
+        false,
+        alloc,
+    );
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+    defer alloc.free(req.result.?);
+    try std.testing.expectEqualStrings(
+        "ok bash in={\"cmd\":\"ls\"} out=raw",
+        req.result.?,
+    );
+}
+
+test "handleToolTransformRequest with unknown tool name leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var req = agent_events.ToolTransformRequest.init("write", "{}", "x", false, alloc);
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "handleToolTransformRequest surfaces Lua handler error via @errorName" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx) error("blew up") end)
+    );
+
+    var req = agent_events.ToolTransformRequest.init("bash", "{}", "out", false, alloc);
+    const result = engine.handleToolTransformRequest(&req);
+    try std.testing.expectError(error.LuaHandlerError, result);
+    try std.testing.expect(req.result == null);
+}
+
+test "handleToolTransformRequest passes is_error through to ctx" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx)
+        \\  if ctx.is_error then return "STAYS-ERR" else return "STAYS-OK" end
+        \\end)
+    );
+
+    var req = agent_events.ToolTransformRequest.init("bash", "{}", "x", true, alloc);
+    try engine.handleToolTransformRequest(&req);
+    defer if (req.result) |s| alloc.free(s);
+    try std.testing.expectEqualStrings("STAYS-ERR", req.result.?);
+}
+
+test "handleToolTransformRequest with nil return leaves result null" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool.transform_output("bash", function(ctx) return nil end)
+    );
+
+    var req = agent_events.ToolTransformRequest.init("bash", "{}", "x", false, alloc);
+    try engine.handleToolTransformRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "zag.tool.transform_output rejects non-string tool name" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.tool.transform_output(42, function() end)
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expectEqual(@as(u32, 0), engine.toolTransformHandlers().count());
+}
+
+test "zag.tool.transform_output rejects non-function handler" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString(
+        \\zag.tool.transform_output("bash", "not a function")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    try std.testing.expectEqual(@as(u32, 0), engine.toolTransformHandlers().count());
+}
+
+test "zag.tool callable form still registers Lua tools" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.tool({
+        \\  name = "noop",
+        \\  description = "does nothing",
+        \\  input_schema = { type = "object", properties = {} },
+        \\  execute = function(input) return "ok" end,
+        \\})
+    );
+    try std.testing.expectEqual(@as(usize, 1), engine.tools.items.len);
+    try std.testing.expectEqualStrings("noop", engine.tools.items[0].name);
 }
 
 test "loadBuiltinPlugins eager-loads zag.jit.* entries" {

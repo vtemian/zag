@@ -71,6 +71,12 @@ pub const AgentEvent = union(enum) {
     /// tool result content. Same main-thread marshalling rationale as
     /// `prompt_assembly_request`. The request is caller-owned.
     jit_context_request: *JitContextRequest,
+    /// Round-trip: the agent thread asks main to invoke the Lua handler
+    /// registered via `zag.tool.transform_output(name, fn)` for a just
+    /// completed tool call. Unlike `jit_context_request` (which appends),
+    /// the returned text REPLACES the tool's output. Same main-thread
+    /// marshalling rationale; the request is caller-owned.
+    tool_transform_request: *ToolTransformRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -124,6 +130,10 @@ pub const AgentEvent = union(enum) {
             // JIT request still has a worker parked on `done`. Signal it so
             // the worker unblocks and proceeds without the appended context.
             .jit_context_request => |req| req.done.set(),
+            // Same parking rationale as `jit_context_request`. A dropped
+            // transform request leaves the worker awaiting `done`; signal
+            // so it proceeds with the original (untransformed) output.
+            .tool_transform_request => |req| req.done.set(),
         }
     }
 };
@@ -428,6 +438,65 @@ pub const JitContextRequest = struct {
         is_error: bool,
         allocator: Allocator,
     ) JitContextRequest {
+        return .{
+            .tool_name = tool_name,
+            .input = input,
+            .output = output,
+            .is_error = is_error,
+            .allocator = allocator,
+        };
+    }
+};
+
+/// Round-trip request pushed by the agent thread when a tool call has
+/// just completed and a Lua handler is registered via
+/// `zag.tool.transform_output(tool_name, fn)`. Lua is pinned to the main
+/// thread, so the worker marshals here exactly like `JitContextRequest`.
+///
+/// The semantic difference from `JitContextRequest`: the handler's
+/// returned string REPLACES the tool output rather than being appended.
+/// A nil return passes the original output through untouched; a Lua-side
+/// error sets `error_name` and leaves `result` null so the caller can
+/// log and fall back to the untransformed output.
+///
+/// Lifecycle mirrors `JitContextRequest`. The waiter owns `result` and
+/// frees it after consuming.
+pub const ToolTransformRequest = struct {
+    /// Registered tool name. Lookup key in
+    /// `LuaEngine.tool_transform_handlers`.
+    tool_name: []const u8,
+    /// Raw JSON the agent passed to the tool. Borrowed; main thread
+    /// must not retain pointers past `done.set()`.
+    input: []const u8,
+    /// Tool output text (post-execution, post-JIT-context). Same borrow
+    /// rules as `input`.
+    output: []const u8,
+    /// Whether the tool reported an error. Surfaced as `is_error` on the
+    /// Lua-side context table so a transform can decide to skip on
+    /// failure.
+    is_error: bool,
+    /// Allocator used to dupe the handler's returned string into
+    /// `result`. Caller promises thread-safety.
+    allocator: Allocator,
+    /// Signalled by the main thread when either `result`, `error_name`,
+    /// or neither (handler returned nil) has been finalized.
+    done: std.Thread.ResetEvent = .{},
+    /// Handler return value, duped into `allocator`. Null when the
+    /// handler returned nil, when no handler was registered, or when
+    /// the call errored. Owned by the waiter.
+    result: ?[]u8 = null,
+    /// `@errorName` of whatever went wrong on the main thread (Lua call
+    /// failure, return value type mismatch, OOM duping the result).
+    /// Borrowed from rodata; do not free.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(
+        tool_name: []const u8,
+        input: []const u8,
+        output: []const u8,
+        is_error: bool,
+        allocator: Allocator,
+    ) ToolTransformRequest {
         return .{
             .tool_name = tool_name,
             .input = input,
@@ -750,6 +819,35 @@ test "push and drain jit_context_request event" {
 test "freeOwned signals jit_context_request done" {
     var req = JitContextRequest.init("read", "in", "out", false, std.testing.allocator);
     const ev: AgentEvent = .{ .jit_context_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned(std.testing.allocator);
+    try std.testing.expect(req.done.isSet());
+}
+
+test "push and drain tool_transform_request event" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    defer queue.deinit();
+
+    var req = ToolTransformRequest.init(
+        "bash",
+        "{\"cmd\":\"ls\"}",
+        "raw output",
+        false,
+        std.testing.allocator,
+    );
+
+    try queue.push(.{ .tool_transform_request = &req });
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("bash", buf[0].tool_transform_request.tool_name);
+    try std.testing.expectEqualStrings("raw output", buf[0].tool_transform_request.output);
+    try std.testing.expect(!buf[0].tool_transform_request.is_error);
+}
+
+test "freeOwned signals tool_transform_request done" {
+    var req = ToolTransformRequest.init("bash", "in", "out", false, std.testing.allocator);
+    const ev: AgentEvent = .{ .tool_transform_request = &req };
     try std.testing.expect(!req.done.isSet());
     ev.freeOwned(std.testing.allocator);
     try std.testing.expect(req.done.isSet());
