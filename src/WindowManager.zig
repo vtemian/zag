@@ -1425,18 +1425,37 @@ fn dumpTraceFile(self: *WindowManager) void {
     self.appendStatus(dump_msg);
 }
 
+/// Resolve the live Viewport the pane's buffer is wired to. Root uses
+/// the inline `Pane.viewport` field; extras use the heap Viewport on
+/// their PaneEntry (storage stays stable across `extra_panes` realloc,
+/// while the inline field on extras is a dead orphan no render path
+/// observes). Falls back to the inline field when the pane pointer
+/// matches no tracked entry, which keeps the function total without
+/// hiding the wiring drift in callers.
+pub fn viewportFor(self: *WindowManager, pane: *Pane) *Viewport {
+    if (pane == &self.root_pane) return &self.root_pane.viewport;
+    for (self.extra_panes.items) |*entry| {
+        if (&entry.pane == pane) {
+            if (entry.viewport_storage) |vp| return vp;
+            break;
+        }
+    }
+    return &pane.viewport;
+}
+
 /// Drain a pane's agent events, snap the pane viewport to the bottom
 /// whenever any event was processed, and auto-name the session on first
 /// completion. Hook dispatch is folded into AgentRunner.drainEvents
 /// (dispatchHookRequests). Non-agent panes (no runner) have nothing to
 /// drain. The pane pointer must reference the pane's final stable
-/// storage (root_pane or an extra_panes entry) so the viewport write
-/// lands on the right slot.
+/// storage (root_pane or an extra_panes entry) so `viewportFor` can
+/// resolve it back to the heap Viewport the buffer is actually wired
+/// to (extras) rather than the dead inline slot.
 pub fn drainPane(self: *WindowManager, pane: *Pane) void {
     const runner = pane.runner orelse return;
     const result = runner.drainEvents(self.allocator);
     if (result.any_drained) {
-        pane.viewport.setScrollOffset(0);
+        self.viewportFor(pane).setScrollOffset(0);
     }
     if (result.finished) {
         self.autoNameSession(pane.*);
@@ -1728,6 +1747,77 @@ test "multiple splits maintain stable viewport pointers" {
     _ = try wm.createSplitPane();
     try std.testing.expectEqual(pane1_storage, wm.extra_panes.items[0].pane.view.?.viewport);
     try std.testing.expectEqual(pane1_storage, pane1_attached_vp);
+}
+
+test "drainPane snaps the heap viewport on extra panes" {
+    const allocator = std.testing.allocator;
+
+    // Same minimal scaffolding as the other createSplitPane tests: Layout
+    // is created but never driven, session_mgr points at a null optional
+    // so attachSession falls through, screen/compositor/provider stay
+    // undefined because drainPane never reaches them.
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = undefined,
+        .layout = &layout,
+        .compositor = undefined,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = CommandRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    _ = try wm.createSplitPane();
+    const entry = &wm.extra_panes.items[wm.extra_panes.items.len - 1];
+
+    // Prime both viewports to non-zero so we can tell which one drainPane
+    // actually wrote to. The buffer's vtable points at the heap viewport
+    // (proven by adjacent tests), so a correct drainPane must reset that
+    // one. The inline `pane.viewport` on extras is a dead orphan that no
+    // render path observes; writing to it is the bug we're catching.
+    entry.viewport_storage.?.setScrollOffset(7);
+    entry.pane.viewport.setScrollOffset(11);
+
+    // Stand up just enough AgentRunner state for drainEvents to advance.
+    // No real agent thread is needed: spawn a no-op thread so
+    // `agent_thread != null`, then push a `.done` event so drainEvents
+    // joins the thread, sets `any_drained=true`, and exits cleanly.
+    const pane_runner = entry.pane.runner.?;
+    pane_runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 4);
+    pane_runner.queue_active = true;
+    const Noop = struct {
+        fn run() void {}
+    };
+    pane_runner.agent_thread = try std.Thread.spawn(.{}, Noop.run, .{});
+    try pane_runner.event_queue.push(.done);
+
+    wm.drainPane(&entry.pane);
+
+    // Heap viewport (the one the buffer is actually wired to) must have
+    // been snapped to bottom. The dead inline viewport must NOT have been
+    // touched: confirms the fix routes through `viewportFor`.
+    try std.testing.expectEqual(@as(u32, 0), entry.viewport_storage.?.scroll_offset);
+    try std.testing.expectEqual(@as(u32, 11), entry.pane.viewport.scroll_offset);
 }
 
 test "WindowManager exposes a NodeRegistry" {
