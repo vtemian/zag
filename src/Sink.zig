@@ -1,10 +1,8 @@
 //! Sink: runtime-polymorphic output channel for AgentRunner content events.
 //!
-//! Thread-safety invariant: Sink.push is called only from the main-thread
-//! drain loop (AgentRunner.drainEvents). The worker thread enqueues
-//! AgentEvents into the runner's event_queue; it never calls Sink.push
-//! directly. All Sink implementations assume single-threaded access to
-//! their internal state.
+//! Thread-safety contract: Sink implementations assume single-threaded
+//! access. The owner of each Sink guarantees no concurrent push. Each
+//! impl documents which thread it expects in its own module doc.
 
 const std = @import("std");
 

@@ -4,6 +4,11 @@
 //! flips `done = true` on `run_end`. Every other event variant is dropped.
 //! Intended for subagent task tools that need a concluding message string
 //! without a UI-backed buffer.
+//!
+//! Thread-safety: single-threaded; the owner guarantees no concurrent
+//! push. The owner is the tool-execution thread that runs `task.execute`:
+//! pushes happen only from that thread's drain of the child agent's
+//! event queue. Internal state needs no locking.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -7,8 +7,9 @@
 //! removes the dangling-*Node hazard on pane / provider swaps, because
 //! the runner no longer holds buffer-relative node pointers.
 //!
-//! Thread-safety invariant (inherited from Sink.zig): `push` is only
-//! called from the main-thread drain loop in `AgentRunner.drainEvents`.
+//! Thread-safety: single-threaded; the owner guarantees no concurrent
+//! push. The owner is the pane's main-thread drain loop: pushes happen
+//! only from `AgentRunner.handleAgentEvent` running on the main thread.
 //! Internal state is touched from that one thread and needs no locking.
 
 const std = @import("std");

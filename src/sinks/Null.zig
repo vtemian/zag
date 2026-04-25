@@ -2,6 +2,8 @@
 //!
 //! Used as a placeholder in AgentRunner tests that do not need to observe
 //! output, and during teardown paths where the prior Sink is being replaced.
+//!
+//! Thread-safety: no internal state; safe to push from any thread (no-op).
 
 const Sink = @import("../Sink.zig").Sink;
 const Event = @import("../Sink.zig").Event;
