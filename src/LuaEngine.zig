@@ -347,11 +347,12 @@ pub const LuaEngine = struct {
         };
     }
 
-    /// Require every embedded `zag.builtin.*`, `zag.layers.*`, and the
-    /// `zag.prompt` dispatcher so the side effects (slash command
-    /// registrations, keymap bindings, prompt layer registrations) land
-    /// in the engine's registries. Must be called before `loadUserConfig`
-    /// so a user's overrides win via the command registry's last-write-wins
+    /// Require every embedded `zag.builtin.*`, `zag.layers.*`,
+    /// `zag.jit.*`, and the `zag.prompt` dispatcher so the side effects
+    /// (slash command registrations, keymap bindings, prompt layer
+    /// registrations, JIT context handlers) land in the engine's
+    /// registries. Must be called before `loadUserConfig` so a user's
+    /// overrides win via the command registry's last-write-wins
     /// semantics and so that stable-class prompt layers register before
     /// the user's config has a chance to trigger the first render.
     ///
@@ -370,8 +371,9 @@ pub const LuaEngine = struct {
         for (embedded.entries) |entry| {
             const is_builtin = std.mem.startsWith(u8, entry.name, "zag.builtin.");
             const is_layer = std.mem.startsWith(u8, entry.name, "zag.layers.");
+            const is_jit = std.mem.startsWith(u8, entry.name, "zag.jit.");
             const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
-            if (!is_builtin and !is_layer and !is_prompt_dispatcher) continue;
+            if (!is_builtin and !is_layer and !is_jit and !is_prompt_dispatcher) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -11546,4 +11548,140 @@ test "zag.context.on_tool_result rejects non-function handler" {
     );
     try std.testing.expectError(error.LuaRuntime, result);
     try std.testing.expectEqual(@as(u32, 0), engine.jitContextHandlers().count());
+}
+
+test "loadBuiltinPlugins eager-loads zag.jit.* entries" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expectEqual(@as(u32, 0), engine.jitContextHandlers().count());
+
+    engine.loadBuiltinPlugins();
+
+    // The agents_md JIT module registers exactly one handler under "read".
+    try std.testing.expect(engine.jitContextHandlers().get("read") != null);
+}
+
+test "zag.jit.agents_md attaches AGENTS.md from the read file's parent" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
+    try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.jit.agents_md')");
+
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const tool_input = try std.fmt.bufPrint(&input_buf, "{{\"path\": \"{s}/code.go\"}}", .{root});
+
+    var req = agent_events.JitContextRequest.init("read", tool_input, "package main", false, alloc);
+    try engine.handleJitContextRequest(&req);
+    defer if (req.result) |s| alloc.free(s);
+
+    try std.testing.expect(req.result != null);
+    try std.testing.expect(std.mem.startsWith(u8, req.result.?, "Instructions from: "));
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.result.?, "Use TDD always.") != null);
+}
+
+test "zag.jit.agents_md returns nil when no instruction file exists" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.jit.agents_md')");
+
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const tool_input = try std.fmt.bufPrint(&input_buf, "{{\"path\": \"{s}/code.go\"}}", .{root});
+
+    var req = agent_events.JitContextRequest.init("read", tool_input, "package main", false, alloc);
+    try engine.handleJitContextRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
+}
+
+test "zag.jit.agents_md dedups within a turn" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD." });
+    try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.jit.agents_md')");
+
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input_a = try std.fmt.bufPrint(&input_buf, "{{\"path\": \"{s}/a.go\"}}", .{root});
+    var req_a = agent_events.JitContextRequest.init("read", input_a, "package a", false, alloc);
+    try engine.handleJitContextRequest(&req_a);
+    defer if (req_a.result) |s| alloc.free(s);
+    try std.testing.expect(req_a.result != null);
+
+    // Reusing the buffer is fine: handleJitContextRequest only borrows
+    // `input` for the duration of the call.
+    var input_buf2: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input_b = try std.fmt.bufPrint(&input_buf2, "{{\"path\": \"{s}/b.go\"}}", .{root});
+    var req_b = agent_events.JitContextRequest.init("read", input_b, "package b", false, alloc);
+    try engine.handleJitContextRequest(&req_b);
+    defer if (req_b.result) |s| alloc.free(s);
+
+    // Same parent dir => same AGENTS.md => second hit dedups to nil.
+    try std.testing.expect(req_b.result == null);
+}
+
+test "zag.jit.agents_md skips when ctx.is_error is true" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Should be skipped." });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &pbuf);
+
+    try engine.lua.doString("require('zag.jit.agents_md')");
+
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const tool_input = try std.fmt.bufPrint(&input_buf, "{{\"path\": \"{s}/missing.go\"}}", .{root});
+
+    var req = agent_events.JitContextRequest.init("read", tool_input, "error: not found", true, alloc);
+    try engine.handleJitContextRequest(&req);
+    try std.testing.expect(req.result == null);
+}
+
+test "zag.jit.agents_md returns nil when input has no path key" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.jit.agents_md')");
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "x", false, alloc);
+    try engine.handleJitContextRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
 }
