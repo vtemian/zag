@@ -314,8 +314,8 @@ const crash_log_tail_lines: usize = 40;
 const CrashDescription = struct { text: []const u8 };
 
 /// Render a `WaitPidResult.status` as a human-readable string, or return
-/// `null` when the exit doesn't qualify as a crash. Owned by the static
-/// `signal_table`, so the returned slice doesn't need freeing.
+/// `null` when the exit doesn't qualify as a crash. Backed by the static
+/// `status_scratch` buffer, so the returned slice doesn't need freeing.
 fn describeStatus(status: u32, was_killed_by_harness: bool) ?CrashDescription {
     if (posix.W.IFEXITED(status)) {
         const code = posix.W.EXITSTATUS(status);
@@ -340,7 +340,32 @@ fn formatExit(code: u8) []const u8 {
     return std.fmt.bufPrint(&status_scratch, "exit {d}", .{code}) catch "exit ?";
 }
 
+/// Static lookup of POSIX signal numbers to their canonical names. Numbers
+/// vary across platforms, so we resolve via `posix.SIG.*` rather than
+/// hardcoding integers. Covers the signals a child is most likely to die
+/// from in this harness; unknowns fall back to a numeric rendering.
+const signal_table = [_]struct { sig: u32, name: []const u8 }{
+    .{ .sig = posix.SIG.ABRT, .name = "SIGABRT" },
+    .{ .sig = posix.SIG.SEGV, .name = "SIGSEGV" },
+    .{ .sig = posix.SIG.BUS, .name = "SIGBUS" },
+    .{ .sig = posix.SIG.FPE, .name = "SIGFPE" },
+    .{ .sig = posix.SIG.ILL, .name = "SIGILL" },
+    .{ .sig = posix.SIG.KILL, .name = "SIGKILL" },
+    .{ .sig = posix.SIG.TERM, .name = "SIGTERM" },
+    .{ .sig = posix.SIG.PIPE, .name = "SIGPIPE" },
+    .{ .sig = posix.SIG.INT, .name = "SIGINT" },
+    .{ .sig = posix.SIG.HUP, .name = "SIGHUP" },
+    .{ .sig = posix.SIG.QUIT, .name = "SIGQUIT" },
+    .{ .sig = posix.SIG.USR1, .name = "SIGUSR1" },
+    .{ .sig = posix.SIG.USR2, .name = "SIGUSR2" },
+};
+
 fn formatSignal(sig: u32) []const u8 {
+    for (signal_table) |entry| {
+        if (entry.sig == sig) {
+            return std.fmt.bufPrint(&status_scratch, "{s} ({d})", .{ entry.name, sig }) catch "signal ?";
+        }
+    }
     return std.fmt.bufPrint(&status_scratch, "signal {d}", .{sig}) catch "signal ?";
 }
 
@@ -439,6 +464,39 @@ test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "exit 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "zag-sim crash report") != null);
+}
+
+test "formatSignal decodes known signals to SIGNAME (n)" {
+    try std.testing.expectEqualStrings("SIGABRT (6)", formatSignal(posix.SIG.ABRT));
+    try std.testing.expectEqualStrings("SIGSEGV (11)", formatSignal(posix.SIG.SEGV));
+    try std.testing.expectEqualStrings("SIGTERM (15)", formatSignal(posix.SIG.TERM));
+}
+
+test "formatSignal falls back to numeric for unknown signals" {
+    // 99 is outside the signal_table; verify we still produce a sensible string.
+    try std.testing.expectEqualStrings("signal 99", formatSignal(99));
+}
+
+test "writeCrashReportIfBad records SIGABRT name when child aborts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
+    defer artifacts.destroy();
+
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    const argv = [_][*:0]const u8{ "/bin/sh", "-c", "kill -ABRT $$" };
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try r.executeWaitExit(2000);
+
+    try r.writeCrashReportIfBad(artifacts);
+    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "crash.txt", 64 * 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "SIGABRT") != null);
 }
 
 test "writeCrashReportIfBad is a noop on clean exit" {
