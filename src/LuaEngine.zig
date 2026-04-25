@@ -378,10 +378,11 @@ pub const LuaEngine = struct {
     }
 
     /// Require every embedded `zag.builtin.*`, `zag.layers.*`,
-    /// `zag.jit.*`, `zag.loop.*`, and the `zag.prompt` dispatcher so the
-    /// side effects (slash command registrations, keymap bindings,
-    /// prompt layer registrations, JIT context handlers, loop detector
-    /// handlers) land in the engine's registries. Must be called before
+    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, and the `zag.prompt`
+    /// dispatcher so the side effects (slash command registrations,
+    /// keymap bindings, prompt layer registrations, JIT context
+    /// handlers, loop detector handlers, compaction strategy handlers)
+    /// land in the engine's registries. Must be called before
     /// `loadUserConfig` so a user's
     /// overrides win via the command registry's last-write-wins
     /// semantics and so that stable-class prompt layers register before
@@ -404,8 +405,9 @@ pub const LuaEngine = struct {
             const is_layer = std.mem.startsWith(u8, entry.name, "zag.layers.");
             const is_jit = std.mem.startsWith(u8, entry.name, "zag.jit.");
             const is_loop = std.mem.startsWith(u8, entry.name, "zag.loop.");
+            const is_compact = std.mem.startsWith(u8, entry.name, "zag.compact.");
             const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
-            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_prompt_dispatcher) continue;
+            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -13493,8 +13495,9 @@ test "handleCompactRequest rejects malformed entry" {
     try std.testing.expect(req.result == null);
 }
 
-test "zag.compact.strategy is not auto-loaded by builtin plugins" {
-    // PR 10 ships only the socket; the default strategy is task 10.4.
+test "loadBuiltinPlugins eager-loads zag.compact.* entries" {
+    // The default compaction strategy registers a single global
+    // handler so the socket is no longer a no-op out of the box.
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
@@ -13502,7 +13505,114 @@ test "zag.compact.strategy is not auto-loaded by builtin plugins" {
 
     try std.testing.expect(engine.compactHandler() == null);
     engine.loadBuiltinPlugins();
-    try std.testing.expect(engine.compactHandler() == null);
+    try std.testing.expect(engine.compactHandler() != null);
+}
+
+test "zag.compact.default elides older assistant messages" {
+    // Five-message conversation:
+    //   [1] user      "first ask"      (older turn)
+    //   [2] assistant "first answer"   (older turn -> elided)
+    //   [3] user      "second ask"     (older turn anchor still in past)
+    //   [4] assistant "second answer"  (older turn -> elided)
+    //   [5] user      "current ask"    (most recent user; survives)
+    // The strategy keeps every user message intact and replaces every
+    // assistant message before index 5 with the elision marker.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.compact.default')");
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "first ask" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "first answer" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "second ask" } }};
+    var b4 = [_]types.ContentBlock{.{ .text = .{ .text = "second answer" } }};
+    var b5 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+        .{ .role = .assistant, .content = &b2 },
+        .{ .role = .user, .content = &b3 },
+        .{ .role = .assistant, .content = &b4 },
+        .{ .role = .user, .content = &b5 },
+    };
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.error_name == null);
+    try std.testing.expect(req.result != null);
+
+    const out = req.result.?;
+    try std.testing.expectEqual(@as(usize, 5), out.len);
+
+    try std.testing.expectEqual(types.Role.user, out[0].role);
+    try std.testing.expectEqualStrings("first ask", out[0].content[0].text.text);
+
+    try std.testing.expectEqual(types.Role.assistant, out[1].role);
+    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "<elided") != null);
+
+    try std.testing.expectEqual(types.Role.user, out[2].role);
+    try std.testing.expectEqualStrings("second ask", out[2].content[0].text.text);
+
+    try std.testing.expectEqual(types.Role.assistant, out[3].role);
+    try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "<elided") != null);
+
+    try std.testing.expectEqual(types.Role.user, out[4].role);
+    try std.testing.expectEqualStrings("current ask", out[4].content[0].text.text);
+}
+
+test "zag.compact.default keeps a trailing assistant after the latest user" {
+    // When the latest message is a fresh assistant reply to the current
+    // user turn, that assistant survives because it sits AFTER the most
+    // recent user index. Older assistants are still elided.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.compact.default')");
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "older ask" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "older answer" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
+    var b4 = [_]types.ContentBlock{.{ .text = .{ .text = "current answer" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+        .{ .role = .assistant, .content = &b2 },
+        .{ .role = .user, .content = &b3 },
+        .{ .role = .assistant, .content = &b4 },
+    };
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.result != null);
+
+    const out = req.result.?;
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "<elided") != null);
+    try std.testing.expectEqualStrings("current answer", out[3].content[0].text.text);
+}
+
+test "zag.compact.default passes through when no user message exists" {
+    // Without a user anchor the strategy has no notion of "current
+    // turn" and refuses to elide. Returning nil keeps the socket
+    // semantically equivalent to "no compaction this cycle".
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("require('zag.compact.default')");
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "lonely assistant" } }};
+    const messages = [_]types.Message{
+        .{ .role = .assistant, .content = &b1 },
+    };
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeResult();
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.result == null);
+    try std.testing.expect(req.error_name == null);
 }
 
 test "zag.loop.default treats a streak reset as a non-event" {
