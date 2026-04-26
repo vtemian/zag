@@ -491,20 +491,20 @@ pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
 
     try jw.objectField("root");
     if (self.layout.root) |root| {
-        const id = try self.handleForNode(root);
-        const id_str = try NodeRegistry.formatId(alloc, id);
-        defer alloc.free(id_str);
-        try jw.write(id_str);
+        const handle = try self.handleForNode(root);
+        const id = try NodeRegistry.formatId(alloc, handle);
+        defer alloc.free(id);
+        try jw.write(id);
     } else {
         try jw.write(null);
     }
 
     try jw.objectField("focus");
     if (self.layout.focused) |f| {
-        const id = try self.handleForNode(f);
-        const id_str = try NodeRegistry.formatId(alloc, id);
-        defer alloc.free(id_str);
-        try jw.write(id_str);
+        const handle = try self.handleForNode(f);
+        const id = try NodeRegistry.formatId(alloc, handle);
+        defer alloc.free(id);
+        try jw.write(id);
     } else {
         try jw.write(null);
     }
@@ -513,10 +513,10 @@ pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
     try jw.beginObject();
     for (self.node_registry.slots.items, 0..) |slot, i| {
         const node = slot.node orelse continue;
-        const id: NodeRegistry.Handle = .{ .index = @intCast(i), .generation = slot.generation };
-        const id_str = try NodeRegistry.formatId(alloc, id);
-        defer alloc.free(id_str);
-        try jw.objectField(id_str);
+        const handle: NodeRegistry.Handle = .{ .index = @intCast(i), .generation = slot.generation };
+        const id = try NodeRegistry.formatId(alloc, handle);
+        defer alloc.free(id);
+        try jw.objectField(id);
         try self.writeNodeJson(&jw, node, alloc);
     }
     try jw.endObject();
@@ -611,18 +611,18 @@ pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutReques
                         },
                     }
                 };
-                const new_id = self.splitById(handle, dir, attached) catch |err|
+                const new_handle = self.splitById(handle, dir, attached) catch |err|
                     break :blk errorOutcome(alloc, @errorName(err));
-                const id_str = NodeRegistry.formatId(alloc, new_id) catch
+                const new_id = NodeRegistry.formatId(alloc, new_handle) catch
                     break :blk errorOutcome(alloc, "oom");
-                defer alloc.free(id_str);
+                defer alloc.free(new_id);
                 const tree = self.describe(alloc) catch
                     break :blk errorOutcome(alloc, "describe_failed");
                 defer alloc.free(tree);
                 const merged = std.fmt.allocPrint(
                     alloc,
                     "{{\"ok\":true,\"new_id\":\"{s}\",\"tree\":{s}}}",
-                    .{ id_str, tree },
+                    .{ new_id, tree },
                 ) catch break :blk errorOutcome(alloc, "oom");
                 break :blk .{ .bytes = merged, .is_error = false };
             },
@@ -2393,10 +2393,10 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
     var id_buf: [16]u8 = undefined;
-    const id_str = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
+    const id = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
 
     var req = agent_events.LayoutRequest.init(.{ .split = .{
-        .id = id_str,
+        .id = id,
         .direction = "vertical",
         .buffer = .{ .handle = @bitCast(bh) },
     } });
@@ -2411,9 +2411,9 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     // the main thread built borrows the scratch buffer by pointer.
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
-    const new_id_str = parsed.value.object.get("new_id").?.string;
-    const new_id: NodeRegistry.Handle = try NodeRegistry.parseId(new_id_str);
-    const new_node = try wm.node_registry.resolve(new_id);
+    const new_id = parsed.value.object.get("new_id").?.string;
+    const new_handle: NodeRegistry.Handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
     try std.testing.expectEqual(@as(u32, scratch_id), new_node.leaf.buffer.getId());
     try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
 
@@ -2466,12 +2466,12 @@ test "handleLayoutRequest split rejects stale buffer handle" {
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
     var id_buf: [16]u8 = undefined;
-    const id_str = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
+    const id = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
 
     // Bogus handle: index 99 is past slot_count.
     const bogus: BufferRegistry.Handle = .{ .index = 99, .generation = 0 };
     var req = agent_events.LayoutRequest.init(.{ .split = .{
-        .id = id_str,
+        .id = id,
         .direction = "vertical",
         .buffer = .{ .handle = @bitCast(bogus) },
     } });
@@ -2781,24 +2781,24 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
     // Lua sees the same opaque string a plugin would.
     const bh = try wm.buffer_registry.createScratch("picker");
     const scratch_buf = try wm.buffer_registry.asBuffer(bh);
-    const buf_id_str = try BufferRegistry.formatId(allocator, bh);
-    defer allocator.free(buf_id_str);
+    const buffer_id = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buffer_id);
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
-    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
-    defer allocator.free(pane_id_str);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
 
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\_G.new_id = zag.layout.split("{s}", "horizontal", {{ buffer = "{s}" }})
-    , .{ pane_id_str, buf_id_str }, 0);
+    , .{ pane_id, buffer_id }, 0);
     defer allocator.free(script);
     try engine.lua.doString(script);
 
     _ = try engine.lua.getGlobal("new_id");
     defer engine.lua.pop(1);
-    const new_id_str = try engine.lua.toString(-1);
-    const new_id = try NodeRegistry.parseId(new_id_str);
-    const new_node = try wm.node_registry.resolve(new_id);
+    const new_id = try engine.lua.toString(-1);
+    const new_handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
     try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
 }
 
@@ -2856,23 +2856,23 @@ test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form wo
     engine.buffer_registry = &wm.buffer_registry;
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
-    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
-    defer allocator.free(pane_id_str);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
 
     // Legacy table form: the new pane gets a fresh ConversationBuffer
     // built by doSplit (not borrowed), so its pointer differs from the
     // root pane's pointer but the call succeeds.
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\_G.new_id = zag.layout.split("{s}", "horizontal", {{ buffer = {{ type = "conversation" }} }})
-    , .{pane_id_str}, 0);
+    , .{pane_id}, 0);
     defer allocator.free(script);
     try engine.lua.doString(script);
 
     _ = try engine.lua.getGlobal("new_id");
     defer engine.lua.pop(1);
-    const new_id_str = try engine.lua.toString(-1);
-    const new_id = try NodeRegistry.parseId(new_id_str);
-    _ = try wm.node_registry.resolve(new_id);
+    const new_id = try engine.lua.toString(-1);
+    const new_handle = try NodeRegistry.parseId(new_id);
+    _ = try wm.node_registry.resolve(new_handle);
 }
 
 test "zag.layout.split rejects a malformed buffer handle string" {
@@ -2930,12 +2930,12 @@ test "zag.layout.split rejects a malformed buffer handle string" {
     engine.buffer_registry = &wm.buffer_registry;
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
-    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
-    defer allocator.free(pane_id_str);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
 
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\zag.layout.split("{s}", "horizontal", {{ buffer = "not-a-handle" }})
-    , .{pane_id_str}, 0);
+    , .{pane_id}, 0);
     defer allocator.free(script);
     const result = engine.lua.doString(script);
     try std.testing.expectError(error.LuaRuntime, result);
@@ -2995,10 +2995,10 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     const scratch_buf = try wm.buffer_registry.asBuffer(bh);
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
-    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
-    defer allocator.free(pane_id_str);
-    const buf_id_str = try BufferRegistry.formatId(allocator, bh);
-    defer allocator.free(buf_id_str);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+    const buffer_id = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buffer_id);
 
     // Stand up an EventQueue and drain thread so `dispatch` has
     // something to hand the LayoutRequest to. The tool call blocks on
@@ -3040,7 +3040,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     const input_json = try std.fmt.allocPrint(
         allocator,
         "{{\"id\":\"{s}\",\"direction\":\"vertical\",\"buffer\":\"{s}\"}}",
-        .{ pane_id_str, buf_id_str },
+        .{ pane_id, buffer_id },
     );
     defer allocator.free(input_json);
 
@@ -3054,9 +3054,9 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     try std.testing.expect(!tool_result.is_error);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, tool_result.content, .{});
     defer parsed.deinit();
-    const new_id_str = parsed.value.object.get("new_id").?.string;
-    const new_id = try NodeRegistry.parseId(new_id_str);
-    const new_node = try wm.node_registry.resolve(new_id);
+    const new_id = parsed.value.object.get("new_id").?.string;
+    const new_handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
     try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
 }
 
@@ -3446,12 +3446,12 @@ test "zag.pane.set_model swaps via the Lua surface" {
     engine.window_manager = &f.wm;
 
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
-    defer allocator.free(pane_id_str);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
 
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\zag.pane.set_model("{s}", "provB/b1")
-    , .{pane_id_str}, 0);
+    , .{pane_id}, 0);
     defer allocator.free(script);
     try engine.lua.doString(script);
 
@@ -3475,12 +3475,12 @@ test "zag.pane.current_model returns the resolved model string" {
     engine.window_manager = &f.wm;
 
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    const pane_id_str = try NodeRegistry.formatId(allocator, root_handle);
-    defer allocator.free(pane_id_str);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
 
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\_G.model = zag.pane.current_model("{s}")
-    , .{pane_id_str}, 0);
+    , .{pane_id}, 0);
     defer allocator.free(script);
     try engine.lua.doString(script);
 
@@ -3494,7 +3494,7 @@ test "zag.pane.current_model returns the resolved model string" {
     try f.wm.swapProviderForPane(root_handle, "provB", "b2");
     const script2 = try std.fmt.allocPrintSentinel(allocator,
         \\_G.model2 = zag.pane.current_model("{s}")
-    , .{pane_id_str}, 0);
+    , .{pane_id}, 0);
     defer allocator.free(script2);
     try engine.lua.doString(script2);
     _ = try engine.lua.getGlobal("model2");
