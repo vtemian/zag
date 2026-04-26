@@ -257,7 +257,7 @@ fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
 /// used by the CLI subcommand paths that need a working provider table
 /// without a user's config.lua.
 ///
-/// Failures on individual modules are logged and skipped — one broken stdlib
+/// Failures on individual modules are logged and skipped; one broken stdlib
 /// entry must not take down the whole picker. Returns the number of modules
 /// that loaded successfully.
 fn bootstrapStdlibProviders(engine: *LuaEngine) usize {
@@ -1103,7 +1103,7 @@ pub fn main() !void {
             defer paths.deinit(allocator);
             // Auth subcommands run before the main Lua engine boots. Spin up
             // a throwaway engine, load the user's config.lua, and fall back
-            // to the stdlib if that left the registry empty — the wizard
+            // to the stdlib if that left the registry empty; the wizard
             // picker needs something to iterate over either way.
             var subcmd_engine = try LuaEngine.init(allocator);
             defer subcmd_engine.deinit();
@@ -1290,7 +1290,7 @@ pub fn main() !void {
     var provider = llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
         if (err != error.MissingCredential) return err;
 
-        // OAuth providers can't be fixed by the api-key wizard — point the
+        // OAuth providers can't be fixed by the api-key wizard; point the
         // user at `zag --login=<provider>` and exit with the original error.
         const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
         const spec = llm.parseModelString(model_id);

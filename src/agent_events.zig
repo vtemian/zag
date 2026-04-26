@@ -1029,7 +1029,7 @@ test "pushWithBackpressure waits for drain and succeeds" {
     const payload = try alloc.dupe(u8, "after-drain");
     try queue.pushWithBackpressure(.{ .info = payload }, 5_000);
 
-    // Poll for the drainer to finish — bounded by the join() in defer so a
+    // Poll for the drainer to finish; bounded by the join() in defer so a
     // busted wake-up would hang the test rather than silently passing.
     while (drainer.drained_n.load(.acquire) == 0) std.Thread.yield() catch {};
 
