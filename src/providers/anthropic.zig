@@ -15,7 +15,7 @@ const log = std.log.scoped(.anthropic);
 const default_max_tokens = 8192;
 
 /// Default thinking budget Anthropic advertises as a safe floor for the
-/// thinking-capable Claude families. Picked to match the plan (PR 1) —
+/// thinking-capable Claude families. Picked to match the plan (PR 1).
 /// PR 3 will let Lua layers raise or lower this per call.
 const default_thinking_budget_tokens: u32 = 4096;
 
@@ -199,10 +199,10 @@ fn writeThinking(thinking: ?llm.ThinkingConfig, w: anytype) !void {
 /// Emit the `system` field as a JSON array of two text parts. The stable
 /// half carries `cache_control: {type: "ephemeral"}` so Anthropic caches it
 /// across turns; the volatile half is appended uncached. When the stable
-/// half is empty (rare — e.g., a Lua plugin that bypasses the prompt packs
+/// half is empty (rare; e.g., a Lua plugin that bypasses the prompt packs
 /// entirely), fall back to a plain string for back-compat: no cache_control,
 /// since there is nothing stable to anchor a cache hit on. When both halves
-/// are empty, emit nothing — the caller still has the trailing comma logic
+/// are empty, emit nothing; the caller still has the trailing comma logic
 /// to think about, so the field is always followed by a comma when present.
 fn writeSystem(stable: []const u8, per_turn: []const u8, w: anytype) !void {
     if (stable.len == 0 and per_turn.len == 0) return;
@@ -1404,7 +1404,7 @@ test "anthropic body emits 2-part system array when both halves are non-empty" {
     const volatile_part = system.items[1].object;
     try testing.expectEqualStrings("text", volatile_part.get("type").?.string);
     try testing.expectEqualStrings("Today is 2026-04-22.", volatile_part.get("text").?.string);
-    // Volatile half MUST NOT carry cache_control — cache anchors only on stable.
+    // Volatile half MUST NOT carry cache_control; cache anchors only on stable.
     try testing.expect(volatile_part.get("cache_control") == null);
 }
 
@@ -1743,7 +1743,7 @@ test "anthropic writeMessage escapes thinking text with special characters" {
 }
 
 test "buildRequestBody preserves cache_control ordering across stable and volatile halves" {
-    // The stable half MUST come first in the array — Anthropic's prompt
+    // The stable half MUST come first in the array; Anthropic's prompt
     // cache requires the cached prefix to be a contiguous head of the
     // request, so any reordering would silently bust the cache.
     const allocator = std.testing.allocator;

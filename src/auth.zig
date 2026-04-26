@@ -489,8 +489,8 @@ fn defaultNow() i64 {
 ///   persisted via `upsertOAuth` before the new token is returned.
 ///
 /// Errors:
-/// - `error.NotLoggedIn` — no entry for `provider_name`.
-/// - `error.LoginExpired` — refresh endpoint rejected the refresh token
+/// - `error.NotLoggedIn`: no entry for `provider_name`.
+/// - `error.LoginExpired`: refresh endpoint rejected the refresh token
 ///   (invalid_grant family). Caller should prompt `zag --login=<provider>`.
 /// - Any other error from the underlying load/refresh/save propagates.
 ///
@@ -528,7 +528,7 @@ pub fn resolveCredential(
 
             // Need to refresh. Copy the old refresh_token/id_token/account_id
             // into locals first so we can free the AuthFile before the
-            // network call — `upsertOAuth` will re-load auth.json under the
+            // network call; `upsertOAuth` will re-load auth.json under the
             // lock and we don't want to double-hold the map.
             const old_rt = try alloc.dupe(u8, o.refresh_token);
             defer alloc.free(old_rt);
@@ -990,7 +990,7 @@ test "resolveCredential returns error.NotLoggedIn when entry missing" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
 
-    // No auth.json at all — loader returns empty map, lookup fails.
+    // No auth.json at all; loader returns empty map, lookup fails.
     try std.testing.expectError(
         error.NotLoggedIn,
         resolveCredential(std.testing.allocator, path, "missing", test_codex_opts),
@@ -1030,7 +1030,7 @@ test "resolveCredential returns current oauth tokens when well before expiry" {
     };
 
     // Pointing token_url at an unreachable loopback port would panic the
-    // test if the refresh path were taken — we expect it not to be.
+    // test if the refresh path were taken; we expect it not to be.
     const got = try resolveCredential(std.testing.allocator, path, "openai-oauth", .{
         .token_url = "http://127.0.0.1:1/should-not-be-hit",
         .client_id = test_codex_opts.client_id,
@@ -1297,7 +1297,7 @@ test "resolveCredential maps LoginExpired from refresh endpoint" {
     ));
 }
 
-test "ResolveOptions has no Codex defaults — all three fields required" {
+test "ResolveOptions has no Codex defaults: all three fields required" {
     const fields = @typeInfo(ResolveOptions).@"struct".fields;
     inline for (fields) |f| {
         if (std.mem.eql(u8, f.name, "token_url")) {

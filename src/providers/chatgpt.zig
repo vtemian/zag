@@ -24,7 +24,7 @@ const log = std.log.scoped(.chatgpt);
 /// ChatGPT Responses API serializer state. Pairs an endpoint descriptor with
 /// the on-disk auth location so each request can resolve a fresh OAuth access
 /// token (Codex rotates tokens on refresh). The serializer never caches the
-/// token itself — `buildHeaders` reloads from `auth.json` per request, so a
+/// token itself; `buildHeaders` reloads from `auth.json` per request, so a
 /// concurrent refresh from another tab picks up immediately.
 pub const ChatgptSerializer = struct {
     /// Endpoint connection details (URL, oauth auth kind, static headers).
@@ -370,7 +370,7 @@ pub const StreamEmitter = struct {
 /// us which field mapping to apply; `data` is the JSON payload.
 ///
 /// Unknown event types (reasoning streaming, future additions) log at debug
-/// and return — we never fail the stream on an event we don't recognize,
+/// and return; we never fail the stream on an event we don't recognize,
 /// because OpenAI iterates `/responses` faster than we can keep up.
 pub fn dispatchEvent(
     evt: llm.streaming.StreamingResponse.SseEvent,
@@ -454,7 +454,7 @@ fn handleTextDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 }
 
 /// Return the most recent text block, but only if it's still the most recent
-/// block overall — a tool call in between should force a fresh text block so
+/// block overall; a tool call in between should force a fresh text block so
 /// ordering is preserved.
 fn lastTextBlock(blocks: *std.ArrayList(StreamingBlock)) ?*StreamingBlock {
     if (blocks.items.len == 0) return null;
@@ -529,7 +529,7 @@ fn handleOutputItemDone(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
 
     // If the server shipped the final arguments in one lump under
     // `item.arguments` rather than via deltas, use that as the authoritative
-    // value — but only when no deltas have landed yet, to avoid duplication
+    // value, but only when no deltas have landed yet, to avoid duplication
     // when both mechanisms fire.
     const call_id_value = item.get("call_id") orelse return;
     if (call_id_value != .string) return;
@@ -602,7 +602,7 @@ fn handleReasoningItemDone(item: std.json.ObjectMap, emit: *StreamEmitter) !void
     }
 
     // If the added frame didn't carry the id but the done frame does, adopt
-    // it — it's the canonical identifier for the round-trip.
+    // it: it's the canonical identifier for the round-trip.
     if (id_slice.len > 0 and block.call_id.len == 0) {
         const owned = try emit.allocator.dupe(u8, id_slice);
         emit.allocator.free(block.call_id);
@@ -695,7 +695,7 @@ fn handleFunctionCallArgsDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !v
     if (delta_value != .string) return;
     const delta = delta_value.string;
 
-    // Prefer `call_id` but fall back to `item_id` — Responses API sometimes
+    // Prefer `call_id` but fall back to `item_id`; Responses API sometimes
     // uses one, sometimes the other. Fall back further to the last
     // function_call block if neither is present.
     const key: ?[]const u8 = blk: {
@@ -830,7 +830,7 @@ fn handleIncomplete(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
     };
 
     // "max_output_tokens" is the Responses API's counterpart to Chat
-    // Completions' "length" — pin it to `.max_tokens` so the agent loop can
+    // Completions' "length"; pin it to `.max_tokens` so the agent loop can
     // detect truncation without string sniffing.
     if (std.mem.eql(u8, reason, "max_output_tokens") or std.mem.eql(u8, reason, "max_tokens")) {
         emit.stop_reason.* = .max_tokens;
@@ -1303,7 +1303,7 @@ test "chatgpt SSE: response.failed returns error to caller" {
             .event_type = "response.failed",
             .data = "{\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}",
         },
-        // Events after the failure should never run — dispatch aborted.
+        // Events after the failure should never run; dispatch aborted.
         .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\" more\"}" },
     });
     try std.testing.expectError(error.ProviderResponseFailed, result);
@@ -1346,7 +1346,7 @@ test "chatgpt SSE: malformed JSON in data is logged and skipped" {
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
 
-    // A broken delta followed by a good one — parser should recover.
+    // A broken delta followed by a good one; parser should recover.
     try fx.run(allocator, &.{
         .{ .event_type = "response.output_text.delta", .data = "{not json at all" },
         .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"ok\"}" },
@@ -1690,7 +1690,7 @@ const auth_mod = @import("../auth.zig");
 
 /// Build a minimal JWT with `exp` set to `exp_seconds`. Copied from
 /// `llm.zig` test helpers (the originals there are test-private). The
-/// signature is fake — `extractExp` only parses the payload.
+/// signature is fake; `extractExp` only parses the payload.
 fn testAccessTokenWithExp(alloc: Allocator, exp_seconds: i64) ![]const u8 {
     const enc = std.base64.url_safe_no_pad.Encoder;
     const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
@@ -1729,7 +1729,7 @@ const canned_text_sse =
 ///
 /// A single `read()` is NOT sufficient: zig's `std.http.Client` can send
 /// headers and body in separate syscalls, and the accept/read/write race
-/// hangs the client — the server starts writing before the body hits the
+/// hangs the client; the server starts writing before the body hits the
 /// socket, the client's `receiveHead` blocks waiting for response bytes
 /// that are already in flight but the connection is still mid-write.
 /// Draining until `\r\n\r\n` (end of request headers) plus any

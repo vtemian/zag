@@ -140,7 +140,7 @@ pub const ThinkingConfig = union(enum) {
 };
 
 /// Report whether a Claude model identifier advertises extended-thinking
-/// support. Substring match, not an exhaustive catalog — the set of
+/// support. Substring match, not an exhaustive catalog; the set of
 /// thinking-capable Claude models grows and this function is the one place
 /// to extend when a new family ships. PR 3 moves this decision into Lua.
 pub fn supportsExtendedThinking(model_id: []const u8) bool {
@@ -301,7 +301,7 @@ pub const ModelSpec = struct {
     model_id: []const u8,
     /// Maximum input tokens this model accepts in one request, copied from
     /// `Endpoint.models[i].context_window` when the registry knows about
-    /// the model. Zero means "no rate card" — the agent loop's compaction
+    /// the model. Zero means "no rate card"; the agent loop's compaction
     /// fire helper short-circuits on a zero ceiling so unknown models
     /// don't trigger spurious compactions.
     context_window: u32 = 0,
@@ -390,7 +390,7 @@ pub const ProviderResult = struct {
 /// `default_model` is the model string the user set via
 /// `zag.set_default_model("prov/id")` (null falls back to
 /// `anthropic/claude-sonnet-4-20250514`). Credentials are not loaded
-/// eagerly here — the serializer holds the path and resolves fresh bytes
+/// eagerly here; the serializer holds the path and resolves fresh bytes
 /// per request via `buildHeaders`. A single up-front existence check keeps
 /// the fail-fast behaviour for api-key providers: a missing entry surfaces
 /// as `error.MissingCredential` before the TUI boots.
