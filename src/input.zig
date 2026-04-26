@@ -282,6 +282,7 @@ test "parse SGR mouse press: CSI < 0;10;5 M" {
             try std.testing.expectEqual(@as(u16, 10), m.x);
             try std.testing.expectEqual(@as(u16, 5), m.y);
             try std.testing.expectEqual(true, m.is_press);
+            try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
             try std.testing.expectEqual(KeyEvent.no_modifiers, m.modifiers);
         },
         else => return error.TestUnexpectedResult,
@@ -297,6 +298,7 @@ test "parse SGR mouse release" {
             try std.testing.expectEqual(@as(u16, 3), m.x);
             try std.testing.expectEqual(@as(u16, 7), m.y);
             try std.testing.expectEqual(false, m.is_press);
+            try std.testing.expectEqual(MouseEvent.Kind.release, m.kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -505,6 +507,44 @@ test "parse SGR mouse with Ctrl modifier" {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(true, m.modifiers.ctrl);
             try std.testing.expectEqual(true, m.is_press);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SGR wheel-up (button bit 0x40, low bit 0)" {
+    // ESC [ < 6 4 ; 5 ; 5 M  -- 64 = 0x40, wheel + up
+    const event = parseBytes(&.{ 0x1b, '[', '<', '6', '4', ';', '5', ';', '5', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(MouseEvent.Kind.wheel_up, m.kind);
+            try std.testing.expectEqual(@as(u16, 5), m.x);
+            try std.testing.expectEqual(@as(u16, 5), m.y);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SGR wheel-down (button bit 0x40, low bit 1)" {
+    // ESC [ < 6 5 ; 5 ; 5 M  -- 65 = 0x40 | 0x01, wheel + down
+    const event = parseBytes(&.{ 0x1b, '[', '<', '6', '5', ';', '5', ';', '5', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(MouseEvent.Kind.wheel_down, m.kind);
+            try std.testing.expectEqual(@as(u16, 5), m.x);
+            try std.testing.expectEqual(@as(u16, 5), m.y);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SGR wheel preserves modifiers" {
+    // 64 | 0x10 = 80 (ctrl + wheel-up)
+    const event = parseBytes(&.{ 0x1b, '[', '<', '8', '0', ';', '5', ';', '5', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(MouseEvent.Kind.wheel_up, m.kind);
+            try std.testing.expectEqual(true, m.modifiers.ctrl);
         },
         else => return error.TestUnexpectedResult,
     }

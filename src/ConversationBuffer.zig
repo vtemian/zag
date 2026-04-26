@@ -582,12 +582,31 @@ fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
     _ = focused;
 }
 
+/// Number of lines to scroll per wheel tick. Three is the conventional
+/// terminal-scroll cadence; matches less(1) and most pagers' `-3` on
+/// wheel events.
+const wheel_scroll_step: u32 = 3;
+
 fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) Buffer.HandleResult {
-    _ = ptr;
-    _ = ev;
     _ = local_x;
     _ = local_y;
-    return .passthrough;
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const viewport = self.viewport orelse return .passthrough;
+    switch (ev.kind) {
+        .wheel_up => {
+            // Wheel-up looks at older content: scroll_offset counts lines
+            // back from the tail, so increment (saturating).
+            viewport.setScrollOffset(viewport.scroll_offset +| wheel_scroll_step);
+            return .consumed;
+        },
+        .wheel_down => {
+            const cur = viewport.scroll_offset;
+            const next = if (cur > wheel_scroll_step) cur - wheel_scroll_step else 0;
+            viewport.setScrollOffset(next);
+            return .consumed;
+        },
+        .press, .release => return .passthrough,
+    }
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -936,6 +955,91 @@ test "setScrollOffset marks dirty only when value changes" {
     // Setting back to 5 should not mark dirty
     b.setScrollOffset(5);
     try std.testing.expect(!b.isDirty());
+}
+
+test "wheel_down increments scroll_offset (looks at older content)" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_up,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    const result = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, result);
+    try std.testing.expectEqual(@as(u32, wheel_scroll_step), viewport.scroll_offset);
+}
+
+test "wheel_down decrements scroll_offset toward latest content" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+    viewport.scroll_offset = 10;
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_down,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    const result = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, result);
+    try std.testing.expectEqual(@as(u32, 10 - wheel_scroll_step), viewport.scroll_offset);
+}
+
+test "wheel_down clamps at zero" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+    viewport.scroll_offset = 1;
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_down,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
+
+test "press/release pass through" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .press,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    const result = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, result);
+    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
 }
 
 test "synthetic id scratch fits maxInt(u32)" {
