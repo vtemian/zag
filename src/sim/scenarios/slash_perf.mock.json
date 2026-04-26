@@ -1,0 +1,10 @@
+{
+  "turns": [
+    {
+      "chunks": [
+        {"delta": {"content": "unused"}},
+        {"finish_reason": "stop"}
+      ]
+    }
+  ]
+}

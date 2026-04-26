@@ -164,24 +164,48 @@ pub fn reset(self: *MockScript) void {
 
 // --- internals --------------------------------------------------------------
 
-/// Build the owned JSON bytes we hand to the SSE emitter. We only emit
-/// whichever of `delta`/`finish_reason` is populated; `delay_ms` is harness
-/// metadata and never appears on the wire.
+/// Build the owned JSON bytes we hand to the SSE emitter, wrapped in
+/// the OpenAI streaming envelope `{"choices":[{"index":0,...}]}`. The
+/// openai parser at `src/providers/openai.zig:390` skips any chunk that
+/// lacks `choices`, so an unwrapped `{"delta":...}` would be silently
+/// discarded. `delay_ms` is harness metadata and never appears on the
+/// wire.
+///
+/// Two separate Choice shapes (delta-only vs finish_reason-only) keep
+/// the unused field absent from the emitted JSON. A single `?Value`
+/// field would round-trip as `"delta":null`, which the openai parser
+/// at line 408 (`delta.object.get("content")`) then panics on.
 fn stringifyChunk(
     alloc: std.mem.Allocator,
     raw: anytype,
 ) LoadError![]u8 {
     if (raw.delta) |delta| {
-        const Wrapper = struct {
+        const DeltaChoice = struct {
+            index: u32 = 0,
             delta: std.json.Value,
         };
-        return std.json.Stringify.valueAlloc(alloc, Wrapper{ .delta = delta }, .{});
+        const Wrapper = struct {
+            choices: [1]DeltaChoice,
+        };
+        return std.json.Stringify.valueAlloc(
+            alloc,
+            Wrapper{ .choices = .{.{ .delta = delta }} },
+            .{},
+        );
     }
     if (raw.finish_reason) |finish| {
-        const Wrapper = struct {
+        const FinishChoice = struct {
+            index: u32 = 0,
             finish_reason: std.json.Value,
         };
-        return std.json.Stringify.valueAlloc(alloc, Wrapper{ .finish_reason = finish }, .{});
+        const Wrapper = struct {
+            choices: [1]FinishChoice,
+        };
+        return std.json.Stringify.valueAlloc(
+            alloc,
+            Wrapper{ .choices = .{.{ .finish_reason = finish }} },
+            .{},
+        );
     }
     return error.InvalidChunk;
 }

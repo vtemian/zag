@@ -132,6 +132,45 @@ pub fn build(b: *std.Build) void {
     e2e_canary.step.dependOn(b.getInstallStep());
     sim_e2e_step.dependOn(&e2e_canary.step);
 
+    // Feature-coverage scenarios: each pairs a .zsm with its mock script
+    // and asserts visible UI text. The pattern is intentionally identical
+    // to the canary above so adding a new scenario is one new tuple.
+    const feature_scenarios = [_]struct {
+        name: []const u8,
+        zsm: []const u8,
+        mock: []const u8,
+    }{
+        .{
+            .name = "multi-turn-chat",
+            .zsm = "src/sim/scenarios/multi_turn_chat.zsm",
+            .mock = "src/sim/scenarios/multi_turn_chat.mock.json",
+        },
+        .{
+            .name = "tool-use-round-trip",
+            .zsm = "src/sim/scenarios/tool_use_round_trip.zsm",
+            .mock = "src/sim/scenarios/tool_use_round_trip.mock.json",
+        },
+        .{
+            .name = "slash-perf",
+            .zsm = "src/sim/scenarios/slash_perf.zsm",
+            .mock = "src/sim/scenarios/slash_perf.mock.json",
+        },
+        .{
+            .name = "cancel-mid-turn",
+            .zsm = "src/sim/scenarios/cancel_mid_turn.zsm",
+            .mock = "src/sim/scenarios/cancel_mid_turn.mock.json",
+        },
+    };
+    for (feature_scenarios) |s| {
+        const run = b.addRunArtifact(sim_exe);
+        run.setName(b.fmt("sim-e2e-{s}", .{s.name}));
+        run.addArgs(&.{ "run", b.path(s.zsm).getPath(b) });
+        run.addArg(b.fmt("--mock={s}", .{b.path(s.mock).getPath(b)}));
+        run.expectExitCode(0);
+        run.step.dependOn(b.getInstallStep());
+        sim_e2e_step.dependOn(&run.step);
+    }
+
     // Round-trip the replay-gen pipeline: parse a fixture session JSONL,
     // emit scenario.zsm + mock.json into a stable cache subdir, then run
     // zag-sim against the kit. Stable path (not b.makeTempPath) so the

@@ -1,0 +1,15 @@
+# Slash-command path: /perf invokes a built-in command that does NOT
+# touch the provider. With metrics off (the default build), the
+# WindowManager appends a status line saying so. Verifies the
+# CommandRegistry and modal input handling are wired without needing
+# any model round-trip. Mock is attached only to keep the config
+# scaffold happy; no turns are consumed.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "/perf" <Enter>
+wait_idle 1s
+expect_text /metrics not enabled/
+send "/quit" <Enter>
+wait_exit
