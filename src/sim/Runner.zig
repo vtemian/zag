@@ -233,9 +233,18 @@ pub const Runner = struct {
         while (true) {
             const remaining = @max(@as(i64, 0), deadline - std.time.milliTimestamp());
             if (remaining == 0) return error.WaitExitTimeout;
-            const status = try self.pumpOnce(@intCast(@min(remaining, 250)));
-            if (status == .exited) {
+            const pump_status = try self.pumpOnce(@intCast(@min(remaining, 250)));
+            if (pump_status == .exited) {
                 self.reapExitedChild();
+                // Honesty: a wait_exit that reaps a signaled or non-zero
+                // exit must surface as a crash, not a clean pass. Otherwise
+                // a SIGSEGV during the final wait_exit would let the
+                // scenario's outcome stay `pass` and `expected_term=0`
+                // would silently match a real crash.
+                const reaped = self.child_status orelse return;
+                if (describeStatus(reaped, self.was_killed_by_harness) != null) {
+                    return error.ChildExitedDuringWait;
+                }
                 return;
             }
         }
@@ -457,7 +466,13 @@ test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
     const argv = [_][*:0]const u8{ "/bin/sh", "-c", "exit 42" };
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try r.executeWaitExit(2000);
+    // executeWaitExit now surfaces non-zero status as ChildExitedDuringWait;
+    // this test exercises crash.txt writing, so swallow the expected error
+    // and let writeCrashReportIfBad inspect child_status.
+    r.executeWaitExit(2000) catch |e| switch (e) {
+        error.ChildExitedDuringWait => {},
+        else => return e,
+    };
 
     try r.writeCrashReportIfBad(artifacts);
     const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "crash.txt", 64 * 1024);
@@ -491,7 +506,12 @@ test "writeCrashReportIfBad records SIGABRT name when child aborts" {
     const argv = [_][*:0]const u8{ "/bin/sh", "-c", "kill -ABRT $$" };
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try r.executeWaitExit(2000);
+    // Same as above: wait_exit now correctly errors on signal exit; this
+    // test only cares that writeCrashReportIfBad records the signal name.
+    r.executeWaitExit(2000) catch |e| switch (e) {
+        error.ChildExitedDuringWait => {},
+        else => return e,
+    };
 
     try r.writeCrashReportIfBad(artifacts);
     const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "crash.txt", 64 * 1024);
@@ -519,13 +539,32 @@ test "writeCrashReportIfBad is a noop on clean exit" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("crash.txt", .{}));
 }
 
-test "executeWaitExit returns when child exits" {
+test "executeWaitExit returns when child exits cleanly" {
     var r = try Runner.init(std.testing.allocator);
     defer r.deinit();
     const argv = [_][*:0]const u8{"/usr/bin/true"};
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
     try r.executeWaitExit(2000);
+}
+
+test "executeWaitExit surfaces non-zero exit as ChildExitedDuringWait" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    const argv = [_][*:0]const u8{ "/bin/sh", "-c", "exit 42" };
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try std.testing.expectError(error.ChildExitedDuringWait, r.executeWaitExit(2000));
+}
+
+test "executeWaitExit surfaces signaled exit as ChildExitedDuringWait" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    // Self-abort: child raises SIGABRT against itself, exits via signal.
+    const argv = [_][*:0]const u8{ "/bin/sh", "-c", "kill -ABRT $$" };
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try std.testing.expectError(error.ChildExitedDuringWait, r.executeWaitExit(2000));
 }
 
 test "executeSetEnv stores KEY=VALUE" {
