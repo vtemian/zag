@@ -108,15 +108,24 @@ pub const KeyEvent = struct {
 /// A mouse event in SGR encoding: button, position, press/release, modifiers.
 pub const MouseEvent = struct {
     /// Which button was involved (0 = left, 1 = middle, 2 = right, 3 = release in X10).
+    /// For wheel events the value is 0; consult `kind` instead.
     button: u8,
     /// Column (1-based).
     x: u16,
     /// Row (1-based).
     y: u16,
-    /// true for press (M), false for release (m).
+    /// true for press (M), false for release (m). Wheel events report `true`.
     is_press: bool,
+    /// What the event represents. `press`/`release` carry button clicks;
+    /// `wheel_up`/`wheel_down` carry scroll-wheel ticks. Wheel events are
+    /// emitted by the SGR encoder when the high bit (0x40) of the button
+    /// byte is set.
+    kind: Kind = .press,
     /// Modifier keys held during the mouse event.
     modifiers: KeyEvent.Modifiers,
+
+    /// Discriminator for what the mouse byte encoded.
+    pub const Kind = enum { press, release, wheel_up, wheel_down };
 };
 
 /// Result of trying to parse one event from the head of a byte buffer.
