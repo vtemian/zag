@@ -65,7 +65,7 @@ If you already have a `config.lua` the wizard leaves it alone and only writes `a
 
 Inside the TUI, type `/model` at the prompt to open a numbered picker listing every `provider/model` pair currently registered. Select one and zag cancels the in-flight agent turn, drains the provider cleanly (with a 5 s safety cap), rebuilds the provider result, and resumes the same session with the new model. No restart, no lost history.
 
-This pairs naturally with adding your own provider definitions in `config.lua` — new entries show up in the picker automatically.
+This pairs naturally with adding your own provider definitions in `config.lua`. New entries show up in the picker automatically.
 
 ## Headless mode (harbor / Terminal-Bench)
 
@@ -202,14 +202,14 @@ Zag embeds Lua 5.4 and ships an async plugin runtime. Hooks, custom tools, keyma
 
 Primitives exposed on the `zag.*` table:
 
-- `zag.spawn(fn, ...)` / `zag.detach(fn, ...)` — coroutine task handles with `:join()`, `:cancel()`, `:done()`
-- `zag.sleep(ms)` — yield the current coroutine
-- `zag.all(tasks)`, `zag.race(tasks)`, `zag.timeout(ms, task)` — task combinators
-- `zag.cmd(cmd, args...)` — spawn subprocesses with stdin/stdout/stderr, `:lines()` iterator, `:kill()`, timeouts
-- `zag.http.get/post/stream` — non-blocking HTTP with streaming body iteration
-- `zag.fs.read/write/append/mkdir/remove/list/stat/exists` — filesystem I/O
-- `zag.layout.tree/focus/split/close/resize`, `zag.pane.read` — introspect and mutate the window system
-- `zag.log.debug/info/warn/err`, `zag.notify` — structured logging and notifications
+- `zag.spawn(fn, ...)` / `zag.detach(fn, ...)`: coroutine task handles with `:join()`, `:cancel()`, `:done()`
+- `zag.sleep(ms)`: yield the current coroutine
+- `zag.all(tasks)`, `zag.race(tasks)`, `zag.timeout(ms, task)`: task combinators
+- `zag.cmd(cmd, args...)`: spawn subprocesses with stdin/stdout/stderr, `:lines()` iterator, `:kill()`, timeouts
+- `zag.http.get/post/stream`: non-blocking HTTP with streaming body iteration
+- `zag.fs.read/write/append/mkdir/remove/list/stat/exists`: filesystem I/O
+- `zag.layout.tree/focus/split/close/resize`, `zag.pane.read`: introspect and mutate the window system
+- `zag.log.debug/info/warn/err`, `zag.notify`: structured logging and notifications
 
 Hooks, the primitive reference, error conventions, and worked examples (remote policy hooks, git watchers, file watchers) are documented inline in the source under `src/lua/` and the embedded stdlib at `src/lua/zag/`.
 

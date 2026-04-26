@@ -4418,7 +4418,7 @@ pub const LuaEngine = struct {
     /// schema from the Lua table (name, url, wire, auth, headers,
     /// default_model, models), constructs a fully-owned `Endpoint`, and
     /// upserts it into the engine's `providers_registry`. Lua declarations
-    /// always win against builtins — if an entry with the same `name`
+    /// always win against builtins; if an entry with the same `name`
     /// already exists (builtin or prior Lua declaration) it is removed and
     /// replaced, so a full-schema declaration effectively overrides the
     /// builtin for that name.

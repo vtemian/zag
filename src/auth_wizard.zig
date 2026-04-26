@@ -135,7 +135,7 @@ pub fn formatDefaultModelString(
 ///
 /// `registry` is used only to resolve the picked endpoint (so the default
 /// model can be read). The commented-out list is driven by the embedded
-/// stdlib manifest, not the registry — this keeps the first-run scaffold
+/// stdlib manifest, not the registry; this keeps the first-run scaffold
 /// tied to shipped modules rather than whatever happens to be registered
 /// at call time.
 ///
@@ -144,8 +144,8 @@ pub fn formatDefaultModelString(
 /// `makePath`. File mode is `0o644` because `config.lua` isn't secret.
 ///
 /// Errors:
-/// - `error.UnknownProvider` — `provider_name` not in `registry`.
-/// - `error.InvalidConfigPath` — `config_path` has no parent component.
+/// - `error.UnknownProvider`: `provider_name` not in `registry`.
+/// - `error.InvalidConfigPath`: `config_path` has no parent component.
 /// - Anything `std.fs` / allocator APIs propagate.
 pub fn scaffoldConfigLua(
     allocator: std.mem.Allocator,
@@ -659,7 +659,7 @@ pub fn promptPicker(
 /// Short auth-kind marker rendered next to each picker row. The intent is to
 /// give a developer audience an at-a-glance signal of which path the wizard
 /// will take on selection; pretty marketing labels ("Anthropic") are not
-/// carried — the endpoint's raw `name` is the user-visible identifier.
+/// carried; the endpoint's raw `name` is the user-visible identifier.
 fn authKindTag(ep: *const Endpoint) []const u8 {
     return switch (ep.auth) {
         .oauth => "OAuth",
@@ -942,11 +942,11 @@ fn dispatchProviderCredential(deps: *const WizardDeps, picked: *const Endpoint) 
 /// absent.
 ///
 /// Error contract:
-/// - `error.NonInteractiveFirstRun` — attempted first-run (`scaffold_config &&
+/// - `error.NonInteractiveFirstRun`: attempted first-run (`scaffold_config &&
 ///   !forced_provider`) under a non-TTY stdin and `allow_non_tty_first_run`
 ///   was false. Callers should point the user at `zag auth login <prov>`.
-/// - `error.UnknownProvider` — `forced_provider` is not in the registry.
-/// - `error.NoProvidersConfigured` — registry has zero entries.
+/// - `error.UnknownProvider`: `forced_provider` is not in the registry.
+/// - `error.NoProvidersConfigured`: registry has zero entries.
 /// - Anything `promptChoice` / `promptSecret` / `auth.*` / `oauth.*` propagate.
 ///
 /// Ownership: `result.provider_name` is owned by `deps.allocator`. The caller
@@ -1918,7 +1918,7 @@ test "runWizard refuses non-TTY first-run" {
         .scaffold_config = true,
         .forced_provider = null,
         .registry = &registry,
-        // allow_non_tty_first_run defaults to false — production wiring.
+        // allow_non_tty_first_run defaults to false; production wiring.
     };
 
     try testing.expectError(error.NonInteractiveFirstRun, runWizard(deps));
@@ -2160,7 +2160,7 @@ test "removeAuth removes existing entry" {
 
 // Test-scoped state for the OAuth dispatch seam test. The wizard expects
 // `WizardDeps.oauth_run_fn` to be a plain function pointer, so we can't
-// close over test locals — stash the observed arguments in file-scope vars
+// close over test locals; stash the observed arguments in file-scope vars
 // and assert on them.
 var test_oauth_call_count: usize = 0;
 var test_oauth_last_provider: []const u8 = "";

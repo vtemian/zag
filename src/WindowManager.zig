@@ -48,7 +48,7 @@ pub const spinner_chars = "|/-\\";
 
 /// Pane composition: a rendered Buffer plus the optional agent-pane
 /// trio (ConversationBuffer + ConversationHistory + AgentRunner). The
-/// `buffer` field is always valid — it carries the type-erased Buffer
+/// `buffer` field is always valid; it carries the type-erased Buffer
 /// the compositor renders. Agent panes own the conversation triple;
 /// scratch-backed panes borrow their Buffer from `BufferRegistry` and
 /// leave the trio null. Every read site of `runner`, `session`, or
@@ -381,7 +381,7 @@ pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
 /// Split the leaf identified by `handle` and return the handle of the
 /// freshly created leaf. When `attached` is null the new leaf holds a
 /// freshly allocated conversation pane (today's default). When
-/// `attached` is set, the new leaf borrows that Buffer directly — no
+/// `attached` is set, the new leaf borrows that Buffer directly: no
 /// AgentRunner / ConversationHistory / ConversationBuffer is allocated
 /// and the pane is entered into `extra_panes` with `runner`, `session`
 /// and `view` all null. Callers that pass `attached` must keep the
@@ -1085,7 +1085,7 @@ pub fn paneFromBuffer(self: *WindowManager, b: Buffer) ?Pane {
 /// no longer holds a session reference.
 pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Allocator) !void {
     // Session restore only makes sense for agent panes. A scratch-backed
-    // pane has no conversation to rehydrate, so bail out loudly — the
+    // pane has no conversation to rehydrate, so bail out loudly. The
     // only caller today is main.zig's `--session=<id>` boot path, which
     // owns a freshly-allocated agent pane.
     const view = pane.view orelse return error.NotAnAgentPane;
@@ -2418,7 +2418,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
 
     // The scratch pane is tracked in extra_panes but carries null
-    // runner/session/view — scratch buffers are not agent panes.
+    // runner/session/view; scratch buffers are not agent panes.
     try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
     const scratch_pane = wm.extra_panes.items[0].pane;
     try std.testing.expectEqual(@as(?*AgentRunner, null), scratch_pane.runner);

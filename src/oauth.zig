@@ -1330,7 +1330,7 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     const browser_thread = try std.Thread.spawn(.{}, BrowserCtx.run, .{ callback_port, state });
     defer browser_thread.join();
 
-    // Pre-generated PKCE — tests can stub this since `runLoginFlowWithCodes`
+    // Pre-generated PKCE; tests can stub this since `runLoginFlowWithCodes`
     // accepts it directly.
     const pkce_verifier = try std.testing.allocator.dupe(u8, "test_verifier_xyz");
     const pkce_challenge = try std.testing.allocator.dupe(u8, "test_challenge_xyz");
