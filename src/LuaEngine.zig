@@ -4399,6 +4399,75 @@ pub const LuaEngine = struct {
         };
     }
 
+    /// Validate that `value` matches one of `allowed`. Returns `value` on
+    /// success; logs and returns `error.LuaError` on mismatch. Used for the
+    /// closed enum-like fields on `ReasoningConfig` so a typo in `config.lua`
+    /// surfaces at config-load time rather than after the request fails.
+    fn requireOneOf(value: []const u8, allowed: []const []const u8, field: [:0]const u8) ![]const u8 {
+        for (allowed) |opt| {
+            if (std.mem.eql(u8, value, opt)) return value;
+        }
+        // Build a comma-joined preview of the allowed set for the warning.
+        // Bounded to a small stack buffer because the allowed lists are tiny
+        // (3-4 short string literals).
+        var preview_buf: [128]u8 = undefined;
+        var written: usize = 0;
+        for (allowed, 0..) |opt, i| {
+            const sep_len: usize = if (i > 0) 1 else 0;
+            if (written + sep_len + opt.len > preview_buf.len) break;
+            if (sep_len == 1) {
+                preview_buf[written] = ',';
+                written += 1;
+            }
+            @memcpy(preview_buf[written..][0..opt.len], opt);
+            written += opt.len;
+        }
+        log.warn("zag.provider(): field '{s}' got '{s}' (allowed: {s})", .{ field, value, preview_buf[0..written] });
+        return error.LuaError;
+    }
+
+    /// Read the optional `reasoning_effort` / `reasoning_summary` /
+    /// `verbosity` fields off the outer `zag.provider{...}` table and
+    /// produce a fully-owned `Endpoint.ReasoningConfig`. Each absent
+    /// field falls back to its `Endpoint.ReasoningConfig` default; the
+    /// returned strings are always heap-allocated on `allocator` so
+    /// `Endpoint.free` can release them uniformly regardless of whether
+    /// the user customized any single field.
+    fn readReasoningConfig(
+        lua: *Lua,
+        table_idx: i32,
+        allocator: Allocator,
+    ) !llm.Endpoint.ReasoningConfig {
+        const effort_in = try readStringField(lua, table_idx, "reasoning_effort", .optional, allocator);
+        errdefer if (effort_in) |s| allocator.free(s);
+        if (effort_in) |s| {
+            _ = try requireOneOf(s, &[_][]const u8{ "minimal", "low", "medium", "high" }, "reasoning_effort");
+        }
+
+        const summary_in = try readStringField(lua, table_idx, "reasoning_summary", .optional, allocator);
+        errdefer if (summary_in) |s| allocator.free(s);
+        if (summary_in) |s| {
+            _ = try requireOneOf(s, &[_][]const u8{ "auto", "concise", "detailed", "none" }, "reasoning_summary");
+        }
+
+        const verbosity_in = try readStringField(lua, table_idx, "verbosity", .optional, allocator);
+        errdefer if (verbosity_in) |s| allocator.free(s);
+        if (verbosity_in) |s| {
+            _ = try requireOneOf(s, &[_][]const u8{ "low", "medium", "high" }, "verbosity");
+        }
+
+        // Promote unset fields to a heap copy of the static default so the
+        // caller's `Endpoint.free` can blindly free all three slots.
+        const defaults: llm.Endpoint.ReasoningConfig = .{};
+        const effort = effort_in orelse try allocator.dupe(u8, defaults.effort);
+        errdefer if (effort_in == null) allocator.free(effort);
+        const summary = summary_in orelse try allocator.dupe(u8, defaults.summary);
+        errdefer if (summary_in == null) allocator.free(summary);
+        const verbosity = verbosity_in orelse try allocator.dupe(u8, defaults.verbosity);
+
+        return .{ .effort = effort, .summary = summary, .verbosity = verbosity };
+    }
+
     /// Read a nullable float. Nil/absent → `null`. Number → that value.
     fn readNullableFloat(lua: *Lua, table_idx: i32, name: [:0]const u8) !?f64 {
         _ = lua.getField(table_idx, name);
@@ -4483,6 +4552,13 @@ pub const LuaEngine = struct {
             allocator.free(models);
         }
 
+        const reasoning = try readReasoningConfig(lua, 1, allocator);
+        errdefer {
+            allocator.free(reasoning.effort);
+            allocator.free(reasoning.summary);
+            allocator.free(reasoning.verbosity);
+        }
+
         const ep: llm.Endpoint = .{
             .name = name,
             .serializer = serializer,
@@ -4491,6 +4567,7 @@ pub const LuaEngine = struct {
             .headers = headers,
             .default_model = default_model,
             .models = models,
+            .reasoning = reasoning,
         };
 
         // Override-on-conflict: remove any prior entry (builtin or earlier
@@ -8179,6 +8256,111 @@ test "zag.provider{}: requires a name field" {
     try std.testing.expectError(
         error.LuaRuntime,
         engine.lua.doString("zag.provider { }"),
+    );
+}
+
+test "zag.provider{}: reasoning fields default to medium/auto/medium when omitted" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider {
+        \\  name = "p-default",
+        \\  url = "https://example.com",
+        \\  wire = "chatgpt",
+        \\  auth = { kind = "none" },
+        \\  default_model = "m1",
+        \\  models = {},
+        \\}
+    );
+    const ep = engine.providers_registry.find("p-default") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("medium", ep.reasoning.effort);
+    try std.testing.expectEqualStrings("auto", ep.reasoning.summary);
+    try std.testing.expectEqualStrings("medium", ep.reasoning.verbosity);
+}
+
+test "zag.provider{}: reasoning_effort/summary/verbosity round-trip onto the endpoint" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider {
+        \\  name = "p-tuned",
+        \\  url = "https://example.com",
+        \\  wire = "chatgpt",
+        \\  auth = { kind = "none" },
+        \\  default_model = "m1",
+        \\  models = {},
+        \\  reasoning_effort = "high",
+        \\  reasoning_summary = "none",
+        \\  verbosity = "low",
+        \\}
+    );
+    const ep = engine.providers_registry.find("p-tuned") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("high", ep.reasoning.effort);
+    try std.testing.expectEqualStrings("none", ep.reasoning.summary);
+    try std.testing.expectEqualStrings("low", ep.reasoning.verbosity);
+}
+
+test "zag.provider{}: invalid reasoning_effort surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString(
+            \\zag.provider {
+            \\  name = "bad",
+            \\  url = "https://example.com",
+            \\  wire = "chatgpt",
+            \\  auth = { kind = "none" },
+            \\  default_model = "m",
+            \\  models = {},
+            \\  reasoning_effort = "ludicrous",
+            \\}
+        ),
+    );
+}
+
+test "zag.provider{}: invalid reasoning_summary surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString(
+            \\zag.provider {
+            \\  name = "bad",
+            \\  url = "https://example.com",
+            \\  wire = "chatgpt",
+            \\  auth = { kind = "none" },
+            \\  default_model = "m",
+            \\  models = {},
+            \\  reasoning_summary = "verbose",
+            \\}
+        ),
+    );
+}
+
+test "zag.provider{}: invalid verbosity surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString(
+            \\zag.provider {
+            \\  name = "bad",
+            \\  url = "https://example.com",
+            \\  wire = "chatgpt",
+            \\  auth = { kind = "none" },
+            \\  default_model = "m",
+            \\  models = {},
+            \\  verbosity = "extreme",
+            \\}
+        ),
     );
 }
 

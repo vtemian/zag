@@ -64,7 +64,14 @@ pub const ChatgptSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
+        const body = try buildStreamingRequestBodyWithReasoning(
+            self.model,
+            system_joined,
+            req.messages,
+            req.tool_definitions,
+            self.endpoint.reasoning,
+            req.allocator,
+        );
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -95,7 +102,14 @@ pub const ChatgptSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
+        const body = try buildStreamingRequestBodyWithReasoning(
+            self.model,
+            system_joined,
+            req.messages,
+            req.tool_definitions,
+            self.endpoint.reasoning,
+            req.allocator,
+        );
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -108,7 +122,9 @@ pub const ChatgptSerializer = struct {
     }
 };
 
-/// Serialize a non-streaming Responses API request body.
+/// Serialize a non-streaming Responses API request body. Uses the legacy
+/// hardcoded reasoning/verbosity defaults so existing call sites (and golden
+/// fixtures) keep producing byte-identical output.
 pub fn buildRequestBody(
     model: []const u8,
     system_prompt: []const u8,
@@ -116,10 +132,11 @@ pub fn buildRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, .{}, allocator);
 }
 
-/// Serialize a streaming Responses API request body (`stream: true`).
+/// Serialize a streaming Responses API request body (`stream: true`). See
+/// `buildRequestBody` for the default reasoning shape.
 pub fn buildStreamingRequestBody(
     model: []const u8,
     system_prompt: []const u8,
@@ -127,7 +144,21 @@ pub fn buildStreamingRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, .{}, allocator);
+}
+
+/// Streaming variant that lets the caller plug in a per-endpoint
+/// `ReasoningConfig`. The transport (`callImpl` / `callStreamingImpl`)
+/// uses this so plugins can lift effort / verbosity through `zag.provider{}`.
+pub fn buildStreamingRequestBodyWithReasoning(
+    model: []const u8,
+    system_prompt: []const u8,
+    messages: []const types.Message,
+    tool_definitions: []const types.ToolDefinition,
+    reasoning: llm.Endpoint.ReasoningConfig,
+    allocator: Allocator,
+) ![]const u8 {
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, reasoning, allocator);
 }
 
 fn serializeRequest(
@@ -136,6 +167,7 @@ fn serializeRequest(
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -171,10 +203,24 @@ fn serializeRequest(
     // rejects requests for reasoning models without `reasoning` and
     // (with `store: false`) requires `include` so the encrypted
     // reasoning blob round-trips between tool calls within a turn.
-    // TODO(harness): expose effort/summary/verbosity via zag.provider{} or a per-model config socket. See docs/plans/2026-04-23-harness-engineering-design.md:328.
-    try w.writeAll(",\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"}");
+    //
+    // `reasoning.effort` / `reasoning.summary` / `text.verbosity` are
+    // sourced from the `Endpoint.ReasoningConfig` plumbed in via
+    // `zag.provider{...}`. Defaults reproduce the historical Codex CLI
+    // hardcode (effort=medium / summary=auto / verbosity=medium) so
+    // golden fixtures stay byte-identical when no override is set.
+    // `summary == "none"` is a local sentinel that omits the key.
+    // The `include` array is *not* configurable: the endpoint rejects
+    // a `store:false` request without `reasoning.encrypted_content`
+    // round-tripped between tool calls inside a single turn.
+    try w.writeAll(",\"reasoning\":{");
+    try w.print("\"effort\":\"{s}\"", .{reasoning.effort});
+    if (!std.mem.eql(u8, reasoning.summary, "none")) {
+        try w.print(",\"summary\":\"{s}\"", .{reasoning.summary});
+    }
+    try w.writeAll("}");
     try w.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
-    try w.writeAll(",\"text\":{\"verbosity\":\"medium\"}");
+    try w.print(",\"text\":{{\"verbosity\":\"{s}\"}}", .{reasoning.verbosity});
     if (stream) {
         try w.writeAll(",\"stream\":true");
     } else {
@@ -2084,4 +2130,62 @@ test "Request.joinedSystem matches single-string chatgpt body byte-for-byte" {
     defer allocator.free(single_body);
 
     try std.testing.expectEqualStrings(single_body, split_body);
+}
+
+test "chatgpt: default reasoning matches the legacy hardcoded snippet byte-for-byte" {
+    // Pin the on-the-wire bytes Codex previously expected so the new
+    // `Endpoint.ReasoningConfig` plumbing is invisible to existing
+    // callers. Any drift here is a regression: the old recorded
+    // fixtures (and pi-mono / opencode parity) depend on these exact
+    // substrings.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildRequestBody("gpt-5-codex", "", &messages, &.{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"include\":[\"reasoning.encrypted_content\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"verbosity\":\"medium\"}") != null);
+}
+
+test "chatgpt: reasoning override emits effort/summary/verbosity from ReasoningConfig" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBodyWithReasoning(
+        "gpt-5-codex",
+        "",
+        &messages,
+        &.{},
+        .{ .effort = "high", .summary = "concise", .verbosity = "low" },
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\",\"summary\":\"concise\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"verbosity\":\"low\"}") != null);
+    // `include` is not configurable; it must still ride along.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"include\":[\"reasoning.encrypted_content\"]") != null);
+}
+
+test "chatgpt: summary='none' omits the summary key entirely" {
+    // Some Codex deployments reject `summary: null`; the local sentinel
+    // `"none"` instructs the serializer to skip the key.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBodyWithReasoning(
+        "gpt-5-codex",
+        "",
+        &messages,
+        &.{},
+        .{ .effort = "minimal", .summary = "none", .verbosity = "high" },
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"minimal\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"summary\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"verbosity\":\"high\"}") != null);
 }
