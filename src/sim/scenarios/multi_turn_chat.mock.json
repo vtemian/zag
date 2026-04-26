@@ -1,0 +1,25 @@
+{
+  "turns": [
+    {
+      "chunks": [
+        {"delta": {"content": "alpha-reply"}},
+        {"finish_reason": "stop"}
+      ],
+      "usage": {"prompt_tokens": 8, "completion_tokens": 2}
+    },
+    {
+      "chunks": [
+        {"delta": {"content": "auto-named session"}},
+        {"finish_reason": "stop"}
+      ],
+      "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+    },
+    {
+      "chunks": [
+        {"delta": {"content": "beta-reply"}},
+        {"finish_reason": "stop"}
+      ],
+      "usage": {"prompt_tokens": 12, "completion_tokens": 2}
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "turns": [
+    {
+      "chunks": [
+        {"delta": {"tool_calls": [{"index": 0, "id": "call_echo_1", "function": {"name": "bash", "arguments": "{\"command\":\"echo hello-from-tool\"}"}}]}},
+        {"finish_reason": "tool_calls"}
+      ],
+      "usage": {"prompt_tokens": 20, "completion_tokens": 8}
+    },
+    {
+      "chunks": [
+        {"delta": {"content": "the tool ran and printed hello-from-tool"}},
+        {"finish_reason": "stop"}
+      ],
+      "usage": {"prompt_tokens": 30, "completion_tokens": 6}
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+# Two consecutive chat turns through the mock provider. Verifies that
+# the conversation buffer accepts a second `send` after the first turn
+# settles, that history rendering keeps the first reply visible, and
+# that the runner's per-turn HTTP client tear-down doesn't wedge the
+# next turn.
+#
+# The mock script carries three turns, not two: zag fires a silent
+# session-auto-name request (`WindowManager.generateSessionName`)
+# after the first text-bearing assistant turn finishes. That request
+# eats turn 2 of the script and renames the session; subsequent
+# user prompts then claim turn 3. Auto-name is gated by `name_len > 0`
+# so it only fires once per session.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "first" <Enter>
+wait_idle 5s
+expect_text /alpha-reply/
+send "second" <Enter>
+wait_idle 5s
+expect_text /beta-reply/
+send "/quit" <Enter>
+wait_exit

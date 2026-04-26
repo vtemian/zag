@@ -1,0 +1,18 @@
+# Tool-use round-trip through the agent loop. Mock turn 1 emits a
+# bash tool_call (echo hello-from-tool); zag executes it via the real
+# bash tool implementation and feeds the stdout back. Mock turn 2
+# returns assistant text that quotes the echoed sentinel, proving
+# the tool result was threaded into the second request and rendered
+# back into the conversation buffer. A regression in tool dispatch,
+# tool_use_id correlation, or message-shape serialization would
+# either crash before turn 2 or never surface the sentinel.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "run echo" <Enter>
+wait_idle 8s
+expect_text /hello-from-tool/
+expect_text /tool ran/
+send "/quit" <Enter>
+wait_exit

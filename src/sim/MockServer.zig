@@ -130,8 +130,13 @@ fn acceptLoop(self: *MockServer) void {
 fn handleConnection(self: *MockServer, conn: std.net.Server.Connection) !void {
     defer conn.stream.close();
 
-    var recv_buf: [8192]u8 = undefined;
-    var send_buf: [4096]u8 = undefined;
+    // Sized to fit zag's `/v1/chat/completions` POST head + body:
+    // the system prompt plus the full tool-schema set (read/write/edit/
+    // bash/layout/task) easily clears 32 KB, and `std.http.Server`
+    // surfaces an HttpHeadersOversize on the receiveHead path the moment
+    // the head + buffered body exceeds the buffer.
+    var recv_buf: [256 * 1024]u8 = undefined;
+    var send_buf: [64 * 1024]u8 = undefined;
     var stream_reader = conn.stream.reader(&recv_buf);
     var stream_writer = conn.stream.writer(&send_buf);
     var server: std.http.Server = .init(stream_reader.interface(), &stream_writer.interface);
@@ -254,8 +259,11 @@ test "MockServer with script streams SSE chunks + usage + DONE" {
     try std.testing.expectEqual(std.http.Status.ok, res.status);
 
     const got = body.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, got, "data: {\"delta\":{\"content\":\"hi\"}}\n\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "data: {\"finish_reason\":\"stop\"}\n\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"delta\":{\"content\":\"hi\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"finish_reason\":\"stop\"") != null);
+    // Both content and finish_reason chunks must be wrapped in choices[]
+    // so the openai-wire client doesn't skip them at parseStreamingResponse.
+    try std.testing.expect(std.mem.indexOf(u8, got, "data: {\"choices\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"prompt_tokens\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"completion_tokens\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"choices\":[]") != null);
