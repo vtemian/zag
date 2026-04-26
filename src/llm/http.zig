@@ -155,7 +155,7 @@ fn mergeInjectedHeader(
 }
 
 /// Apply an OAuth credential to an outgoing header list using the
-/// endpoint's `inject` recipe. Consumes `resolved` — the helper takes
+/// endpoint's `inject` recipe. Consumes `resolved`; the helper takes
 /// ownership of the access-token and account-id buffers and frees them
 /// before returning (or on any error after the initial destructure).
 ///
@@ -568,7 +568,7 @@ fn buildFreshAccessToken(alloc: Allocator, exp_seconds: i64) ![]const u8 {
 
 test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id from spec" {
     // Mirrors the ChatGPT happy path but constructs the endpoint
-    // programmatically — no builtin lookup — to prove that OAuth data
+    // programmatically (no builtin lookup) to prove that OAuth data
     // sourced from `zag.provider{}` reaches buildHeaders correctly.
     const allocator = std.testing.allocator;
 

@@ -114,7 +114,7 @@ pub const SubagentRegistry = struct {
     }
 
     /// Emit the minified JSON Schema for the `task` tool's `input_schema`
-    /// (the bare parameters object — no `name`/`description`/`parameters`
+    /// (the bare parameters object: no `name`/`description`/`parameters`
     /// wrapper, since providers add their own envelope around it). The
     /// `agent` property's enum lists every registered name; its
     /// description enumerates each entry as `"<name>: <description>."`

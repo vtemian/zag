@@ -2593,10 +2593,10 @@ pub const LuaEngine = struct {
         if (lua.typeOf(arg_index) != .string) {
             lua.raiseErrorStr(op_name ++ ": id must be a string", .{});
         }
-        const id_str = lua.toString(arg_index) catch {
+        const id = lua.toString(arg_index) catch {
             lua.raiseErrorStr(op_name ++ ": id must be a string", .{});
         };
-        return NodeRegistry.parseId(id_str) catch {
+        return NodeRegistry.parseId(id) catch {
             lua.raiseErrorStr(op_name ++ ": invalid id", .{});
         };
     }
@@ -2695,11 +2695,11 @@ pub const LuaEngine = struct {
             const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split: {s}", .{@errorName(err)}) catch "zag.layout.split failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
         };
-        const id_str = NodeRegistry.formatId(engine.allocator, new_handle) catch {
+        const new_id = NodeRegistry.formatId(engine.allocator, new_handle) catch {
             lua.raiseErrorStr("zag.layout.split: id format failed", .{});
         };
-        defer engine.allocator.free(id_str);
-        _ = lua.pushString(id_str);
+        defer engine.allocator.free(new_id);
+        _ = lua.pushString(new_id);
         return 1;
     }
 
@@ -2974,15 +2974,15 @@ pub const LuaEngine = struct {
         };
         lua.pop(1);
 
-        const id_str = BufferRegistry.formatId(engine.allocator, handle) catch {
+        const buffer_id = BufferRegistry.formatId(engine.allocator, handle) catch {
             // Best effort: if we can't format the id, the buffer still
             // lives in the registry. Remove it so we don't leak a slot
             // the caller can't name.
             registry.remove(handle) catch {};
             lua.raiseErrorStr("zag.buffer.create: id format failed", .{});
         };
-        defer engine.allocator.free(id_str);
-        _ = lua.pushString(id_str);
+        defer engine.allocator.free(buffer_id);
+        _ = lua.pushString(buffer_id);
         return 1;
     }
 
@@ -4418,7 +4418,7 @@ pub const LuaEngine = struct {
     /// schema from the Lua table (name, url, wire, auth, headers,
     /// default_model, models), constructs a fully-owned `Endpoint`, and
     /// upserts it into the engine's `providers_registry`. Lua declarations
-    /// always win against builtins — if an entry with the same `name`
+    /// always win against builtins; if an entry with the same `name`
     /// already exists (builtin or prior Lua declaration) it is removed and
     /// replaced, so a full-schema declaration effectively overrides the
     /// builtin for that name.
@@ -5933,9 +5933,9 @@ pub const LuaEngine = struct {
             );
             return error.CompactEntryMissingContent;
         }
-        const content_str = lua.toString(-1) catch return error.CompactEntryReadFailed;
+        const content = lua.toString(-1) catch return error.CompactEntryReadFailed;
 
-        const owned_text = try allocator.dupe(u8, content_str);
+        const owned_text = try allocator.dupe(u8, content);
         errdefer allocator.free(owned_text);
         const blocks = try allocator.alloc(types.ContentBlock, 1);
         errdefer allocator.free(blocks);
@@ -7619,8 +7619,8 @@ test "zag.keymap table form with buffer scope only fires for that buffer" {
 
     const handle = try buffer_registry.createScratch("picker");
     const buffer_id = (try buffer_registry.asBuffer(handle)).getId();
-    const id_str = try BufferRegistry.formatId(alloc, handle);
-    defer alloc.free(id_str);
+    const id = try BufferRegistry.formatId(alloc, handle);
+    defer alloc.free(id);
 
     const script = try std.fmt.allocPrintSentinel(alloc,
         \\zag.keymap {{
@@ -7629,7 +7629,7 @@ test "zag.keymap table form with buffer scope only fires for that buffer" {
         \\  buffer = "{s}",
         \\  action = "close_window",
         \\}}
-    , .{id_str}, 0);
+    , .{id}, 0);
     defer alloc.free(script);
     try engine.lua.doString(script);
 
@@ -10866,8 +10866,8 @@ test "zag.keymap rejects a handle that doesn't live in the registry" {
 
     // Fabricate a parseable-but-unregistered handle.
     const bogus: BufferRegistry.Handle = .{ .index = 99, .generation = 0 };
-    const id_str = try BufferRegistry.formatId(alloc, bogus);
-    defer alloc.free(id_str);
+    const id = try BufferRegistry.formatId(alloc, bogus);
+    defer alloc.free(id);
     const script = try std.fmt.allocPrintSentinel(alloc,
         \\zag.keymap {{
         \\  mode = "normal",
@@ -10875,7 +10875,7 @@ test "zag.keymap rejects a handle that doesn't live in the registry" {
         \\  buffer = "{s}",
         \\  action = "close_window",
         \\}}
-    , .{id_str}, 0);
+    , .{id}, 0);
     defer alloc.free(script);
     const result = engine.lua.doString(script);
     try std.testing.expectError(error.LuaRuntime, result);

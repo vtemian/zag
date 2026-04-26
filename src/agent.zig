@@ -2309,7 +2309,7 @@ test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" 
     defer tmp.cleanup();
 
     // The JIT handler probes the file's immediate parent only (see
-    // `src/lua/zag/jit/agents_md.lua` — a true cwd-bounded walk-up
+    // `src/lua/zag/jit/agents_md.lua`; a true cwd-bounded walk-up
     // needs the JIT context to carry cwd, which is not yet exposed).
     // Drop AGENTS.md alongside the child file in `nested/` so the
     // single-directory probe matches.
@@ -2575,7 +2575,7 @@ test "tool_transform sees post-JIT content (JIT runs first, transform replaces)"
     defer engine.deinit();
     engine.storeSelfPointer();
     // JIT appends a marker. The transform receives the post-append output
-    // and ECHOES IT, prefixed with a tag — proving it saw both halves.
+    // and ECHOES IT, prefixed with a tag, proving it saw both halves.
     try engine.lua.doString(
         \\zag.context.on_tool_result("echo_fast", function(ctx)
         \\  return "JIT-MARKER"

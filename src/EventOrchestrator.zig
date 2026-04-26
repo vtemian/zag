@@ -811,9 +811,9 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     // leaf automatically (doSplit's contract).
     const root_handle = try wm.handleForNode(wm.layout.root.?);
     var id_buf: [16]u8 = undefined;
-    const id_str = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
+    const id = try std.fmt.bufPrint(&id_buf, "n{d}", .{@as(u32, @bitCast(root_handle))});
     var req = agent_events.LayoutRequest.init(.{ .split = .{
-        .id = id_str,
+        .id = id,
         .direction = "vertical",
         .buffer = .{ .handle = @bitCast(bh) },
     } });
@@ -828,8 +828,8 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     // the new leaf's handle and move focus there.
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
-    const new_id_str = parsed.value.object.get("new_id").?.string;
-    const new_handle: NodeRegistry.Handle = try NodeRegistry.parseId(new_id_str);
+    const new_id = parsed.value.object.get("new_id").?.string;
+    const new_handle: NodeRegistry.Handle = try NodeRegistry.parseId(new_id);
     try wm.focusById(new_handle);
 
     // Sanity: focused pane is the scratch, not root.
