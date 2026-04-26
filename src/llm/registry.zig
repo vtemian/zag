@@ -31,6 +31,12 @@ pub const Endpoint = struct {
     /// limits, dollar pricing). Empty slice means no per-model rates are
     /// known; callers must fall back to defaults or fail loudly.
     models: []const ModelRate,
+    /// Reasoning / verbosity controls for serializers that emit them
+    /// (currently only `.chatgpt`, the Codex Responses API). Defaults
+    /// reproduce the legacy hardcoded `effort=medium / summary=auto /
+    /// verbosity=medium` block byte-for-byte. Other serializers ignore
+    /// the field.
+    reasoning: ReasoningConfig = .{},
 
     /// How the API key is sent in HTTP headers. The `.oauth` variant carries
     /// the full `OAuthSpec` so auth.zig / oauth.zig / llm/http.zig can drive
@@ -105,6 +111,26 @@ pub const Endpoint = struct {
         use_account_id: bool,
         /// Header name used when `use_account_id` is true. Empty otherwise.
         account_id_header: []const u8,
+    };
+
+    /// Codex Responses-API reasoning + verbosity knobs. Surfaced as a
+    /// first-class config seam through `zag.provider{...}` so plugins can
+    /// raise effort, suppress chain-of-thought summaries, or quiet down
+    /// verbose output without forking the serializer. The chatgpt
+    /// serializer is the only consumer today; other wires ignore this.
+    pub const ReasoningConfig = struct {
+        /// Reasoning effort tier passed in `reasoning.effort`. Codex
+        /// accepts `minimal`, `low`, `medium`, `high`. Default `"medium"`
+        /// matches the historical Codex CLI hardcode.
+        effort: []const u8 = "medium",
+        /// Reasoning summary style passed in `reasoning.summary`. Codex
+        /// accepts `auto`, `concise`, `detailed`. The sentinel `"none"`
+        /// is local: it tells the serializer to omit the `summary` key
+        /// entirely (some Codex deployments dislike `null`).
+        summary: []const u8 = "auto",
+        /// Output verbosity tier passed in `text.verbosity`. Codex
+        /// accepts `low`, `medium`, `high`.
+        verbosity: []const u8 = "medium",
     };
 
     /// Per-model rate card: context limits and dollar cost per million tokens.
@@ -194,6 +220,13 @@ pub const Endpoint = struct {
             else => {},
         };
 
+        const reasoning_effort = try allocator.dupe(u8, self.reasoning.effort);
+        errdefer allocator.free(reasoning_effort);
+        const reasoning_summary = try allocator.dupe(u8, self.reasoning.summary);
+        errdefer allocator.free(reasoning_summary);
+        const reasoning_verbosity = try allocator.dupe(u8, self.reasoning.verbosity);
+        errdefer allocator.free(reasoning_verbosity);
+
         return .{
             .name = name,
             .serializer = self.serializer,
@@ -202,11 +235,19 @@ pub const Endpoint = struct {
             .headers = headers,
             .default_model = default_model,
             .models = models,
+            .reasoning = .{
+                .effort = reasoning_effort,
+                .summary = reasoning_summary,
+                .verbosity = reasoning_verbosity,
+            },
         };
     }
 
     /// Free all heap-allocated strings. Pair with dupe().
     pub fn free(self: Endpoint, allocator: Allocator) void {
+        allocator.free(self.reasoning.effort);
+        allocator.free(self.reasoning.summary);
+        allocator.free(self.reasoning.verbosity);
         switch (self.auth) {
             .oauth => |spec| freeOAuthSpec(spec, allocator),
             else => {},

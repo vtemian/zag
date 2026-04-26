@@ -27,6 +27,11 @@ zag.provider {
     { name = "originator",  value = "zag_cli" },
     { name = "User-Agent",  value = "zag_cli" },
   },
+  -- Codex reasoning + verbosity knobs (optional). Uncomment and tweak to
+  -- override the defaults below; omit to keep the legacy hardcoded shape.
+  --   reasoning_effort  = "medium",   -- "minimal" | "low" | "medium" | "high"
+  --   reasoning_summary = "auto",     -- "auto" | "concise" | "detailed" | "none" (omit summary key)
+  --   verbosity         = "medium",   -- "low" | "medium" | "high"
   default_model = "gpt-5.2",
   models = {
     { id = "gpt-5.2",        label = "gpt-5.2 (recommended)", recommended = true, context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
