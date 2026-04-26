@@ -85,6 +85,79 @@ test "parseBytes decodes Kitty release event as CSI 97;1:3u" {
     }
 }
 
+test "parseBytes decodes Kitty plain 'a' as CSI 97;1u" {
+    // codepoint 97 = 'a'; mods 1 = no modifiers (the protocol baseline).
+    const seq = [_]u8{ 0x1b, '[', '9', '7', ';', '1', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'a' }, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+            try std.testing.expectEqual(KeyEvent.EventType.press, k.event_type);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseBytes decodes Kitty F1 as CSI 57364u" {
+    // KKP allocates F1 at PUA codepoint 57364 (decimal); F2..F24 follow contiguously.
+    const seq = [_]u8{ 0x1b, '[', '5', '7', '3', '6', '4', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .function = 1 }, k.key);
+            try std.testing.expectEqual(KeyEvent.no_modifiers, k.modifiers);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseBytes decodes Kitty Ctrl+Enter as CSI 13;5u" {
+    // Legacy CSI cannot carry Ctrl+Enter (Enter and Ctrl+Enter both sent 0x0d).
+    // KKP carries it: codepoint 13 (Enter) plus mod bitmask 5 = ctrl.
+    const seq = [_]u8{ 0x1b, '[', '1', '3', ';', '5', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key.enter, k.key);
+            try std.testing.expect(k.modifiers.ctrl);
+            try std.testing.expect(!k.modifiers.shift);
+            try std.testing.expect(!k.modifiers.alt);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseBytes decodes Kitty Ctrl+i as CSI 105;5u distinct from Tab" {
+    // The classic KKP disambiguation: legacy terminals collapse Ctrl+i and
+    // Tab onto the same byte (0x09). KKP reports Ctrl+i as codepoint 105
+    // ('i') with the ctrl modifier set, which differs from Tab.
+    const seq = [_]u8{ 0x1b, '[', '1', '0', '5', ';', '5', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'i' }, k.key);
+            try std.testing.expect(k.modifiers.ctrl);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseBytes decodes Kitty Super+a via CSI 97;9u" {
+    // mod bitmask 9 = (9-1)=8 = Super only.
+    const seq = [_]u8{ 0x1b, '[', '9', '7', ';', '9', 'u' };
+    const event = parseBytes(&seq) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .key => |k| {
+            try std.testing.expectEqual(KeyEvent.Key{ .char = 'a' }, k.key);
+            try std.testing.expect(k.modifiers.super);
+            try std.testing.expect(!k.modifiers.ctrl);
+            try std.testing.expect(!k.modifiers.shift);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "Parser emits a single paste event for a bracketed paste block" {
     var p: Parser = .{};
     const body = "hello\nworld";
