@@ -200,8 +200,10 @@ pub fn run(self: *EventOrchestrator) !void {
     // Initial render
     var leaves_buf: [max_visible_leaves]*Layout.LayoutNode = undefined;
     var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
+    var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
     const initial_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
-    self.window_manager.compositor.composite(self.window_manager.layout, initial_drafts, .{
+    const initial_float_drafts = self.collectFloatDrafts(&float_drafts_buf);
+    self.window_manager.compositor.composite(self.window_manager.layout, initial_drafts, initial_float_drafts, .{
         .mode = self.window_manager.current_mode,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
@@ -361,8 +363,10 @@ fn tick(
     } else "";
     var leaves_buf: [max_visible_leaves]*Layout.LayoutNode = undefined;
     var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
+    var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
     const tick_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
-    self.window_manager.compositor.composite(self.window_manager.layout, tick_drafts, .{
+    const tick_float_drafts = self.collectFloatDrafts(&float_drafts_buf);
+    self.window_manager.compositor.composite(self.window_manager.layout, tick_drafts, tick_float_drafts, .{
         .mode = self.window_manager.current_mode,
         .status = status,
         .agent_running = agent_running,
@@ -381,6 +385,37 @@ fn tick(
 /// panes; 32 is wildly generous and keeps the per-frame snapshot off the
 /// heap.
 const max_visible_leaves: usize = 32;
+
+/// Stack-allocated cap for the float-drafts buffer. Same rationale as
+/// `max_visible_leaves`: realistic UIs hover in the 0-3 float range
+/// (one picker, maybe an autocomplete and a toast), 32 is far more
+/// than any plugin should produce.
+const max_visible_floats: usize = 32;
+
+/// Build the per-frame `FloatDraft` slice from `Layout.floats` and the
+/// matching `extra_floats` panes. Walks in z-sorted order (the layout
+/// keeps the list ascending) so the compositor's later passes can
+/// stack higher-z floats on top by simply iterating in order. Floats
+/// whose pane is missing from `extra_floats` are dropped from the
+/// frame rather than crashing.
+fn collectFloatDrafts(
+    self: *EventOrchestrator,
+    out: []Compositor.FloatDraft,
+) []const Compositor.FloatDraft {
+    var count: usize = 0;
+    const focused_handle = self.window_manager.layout.focused_float;
+    for (self.window_manager.layout.floats.items) |f| {
+        if (count >= out.len) break;
+        const pane = self.window_manager.paneFromBufferPtr(f.buffer) orelse continue;
+        const is_focused = blk: {
+            const h = focused_handle orelse break :blk false;
+            break :blk h.index == f.handle.index and h.generation == f.handle.generation;
+        };
+        out[count] = .{ .float = f, .draft = pane.getDraft(), .focused = is_focused };
+        count += 1;
+    }
+    return out[0..count];
+}
 
 /// Walk the layout's visible leaves and pair each with its pane's draft.
 /// Returns a slice into `drafts_buf` valid until the next call. Leaves

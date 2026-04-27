@@ -1,9 +1,10 @@
 -- Builtin /model picker implemented against the zag primitive set.
--- Typing /model opens a scratch buffer in a horizontal split with one
--- line per registered provider/model. j/k navigate (default scratch
--- buffer motions), Enter commits the current row, q or Esc closes
--- without changing the model. If no providers are registered the
--- command is a no-op so first-run users never see an empty picker.
+-- Typing /model opens a scratch buffer as a centered editor-anchored
+-- float with one line per registered provider/model. j/k navigate
+-- (default scratch buffer motions), Enter commits the current row, q
+-- or Esc closes without changing the model. If no providers are
+-- registered the command is a no-op so first-run users never see an
+-- empty picker.
 
 local function render_lines()
     local tree = zag.layout.tree()
@@ -35,7 +36,21 @@ local function open()
     zag.buffer.set_lines(buf, lines)
 
     local focused = zag.layout.tree().focus
-    local picker_pane = zag.layout.split(focused, "horizontal", { buffer = buf })
+
+    -- Static centered float for slice 1. Layout doesn't surface screen
+    -- dimensions to Lua yet, so the picker hardcodes a reasonable size
+    -- and offset. Slice 2 swaps these for size-to-content + cursor or
+    -- editor-center anchors once `zag.layout.tree()` exposes the root
+    -- rect.
+    local picker_pane = zag.layout.float(buf, {
+        relative = "editor",
+        row      = 4,
+        col      = 10,
+        width    = 60,
+        height   = 20,
+        border   = "rounded",
+        title    = "Models",
+    })
 
     -- Snapshot the caller's mode and flip to normal so the picker's
     -- j/k motions and <CR>/q/<Esc> bindings (all bound in normal mode)

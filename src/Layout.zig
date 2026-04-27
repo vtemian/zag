@@ -67,6 +67,59 @@ pub const LayoutNode = union(enum) {
     };
 };
 
+/// Border style for a floating pane's chrome.
+pub const FloatBorder = enum { none, square, rounded };
+
+/// Static configuration captured at float creation time. Slice 1 only
+/// uses screen-anchored floats so the rect is supplied directly; later
+/// slices add anchor resolution and size-to-content.
+pub const FloatConfig = struct {
+    border: FloatBorder = .rounded,
+    /// Optional title rendered into the top border. Borrowed; the caller
+    /// (Lua engine via FloatNode storage) keeps the bytes alive for the
+    /// life of the float.
+    title: ?[]const u8 = null,
+    z: u32 = 50,
+    focusable: bool = true,
+    /// Whether to take focus on creation. Slice 1 defaults to true so a
+    /// /model-style picker's buffer-scoped keymaps actually fire.
+    enter: bool = true,
+};
+
+/// A floating pane: lives outside the tiled tree, drawn on top of it
+/// with a static screen-anchored rect. Owned by `Layout.floats`; the
+/// pane storage itself (and its Buffer) lives on `WindowManager`.
+pub const FloatNode = struct {
+    /// Stable id allocated at creation; uses the high bit of the index
+    /// field so `n<u32>` formatting cannot collide with regular layout
+    /// node handles produced by `NodeRegistry`.
+    handle: NodeRegistry.Handle,
+    /// The Buffer rendered inside the float. Borrowed from
+    /// WindowManager's `extra_floats` PaneEntry.
+    buffer: Buffer,
+    /// Resolved screen rect. For slice 1 this is set explicitly on
+    /// `addFloat`; later slices recompute it each frame from anchor +
+    /// size.
+    rect: Rect,
+    /// Static creation-time configuration; copied into the float so the
+    /// caller's struct does not need to outlive the float.
+    config: FloatConfig,
+    /// Owned title bytes when the caller passed a title. Layout duplicates
+    /// the title on `addFloat` and frees it on `removeFloat`. Null when
+    /// no title was supplied.
+    title_storage: ?[]u8 = null,
+};
+
+/// High bit set on `Handle.index` marks a float handle. Float storage
+/// is a parallel array on `Layout.floats`; using the high bit keeps
+/// the `n<u32>` Lua-facing format unified with tile handles while still
+/// letting `rectFor` route to the right table without a registry walk.
+pub const FLOAT_HANDLE_BIT: u16 = 0x8000;
+
+pub fn isFloatHandle(handle: NodeRegistry.Handle) bool {
+    return (handle.index & FLOAT_HANDLE_BIT) != 0;
+}
+
 /// Root of the binary layout tree. Null when no buffer is set.
 root: ?*LayoutNode,
 /// The currently focused leaf node. Null when no buffer is set.
@@ -77,6 +130,22 @@ allocator: Allocator,
 /// owns and frees the `*LayoutNode` memory; the registry only tracks
 /// handles for stable external addressing.
 registry: ?*NodeRegistry = null,
+/// Floating panes drawn on top of the tiled tree. Sorted ascending by
+/// `config.z` so the compositor can iterate in stacking order. Owned:
+/// each `*FloatNode` is allocated by `addFloat` and freed by
+/// `removeFloat`. Float handles use the `FLOAT_HANDLE_BIT` namespace so
+/// they don't collide with NodeRegistry handles for tile nodes.
+floats: std.ArrayList(*FloatNode) = .empty,
+/// Currently focused float, if any. Set by WindowManager when a float
+/// opens with `config.enter = true`; cleared on close. The orchestrator
+/// checks this before falling back to the tile tree's focused leaf so
+/// buffer-scoped keymaps on the float fire.
+focused_float: ?NodeRegistry.Handle = null,
+/// Monotonic counter for float handles. Starts at `FLOAT_HANDLE_BIT` so
+/// every value has the high bit set; bumped on every successful
+/// `addFloat`. Generation stays 0 for slice 1 because float handles are
+/// never reused.
+next_float_index: u16 = FLOAT_HANDLE_BIT,
 
 /// Create a new empty layout with no root.
 pub fn init(allocator: Allocator) Layout {
@@ -94,6 +163,112 @@ pub fn deinit(self: *Layout) void {
         self.root = null;
         self.focused = null;
     }
+    for (self.floats.items) |f| {
+        if (f.title_storage) |t| self.allocator.free(t);
+        self.allocator.destroy(f);
+    }
+    self.floats.deinit(self.allocator);
+    self.focused_float = null;
+}
+
+/// Append a float to the layout. The caller supplies the buffer to
+/// render and the resolved screen rect. Layout owns the FloatNode
+/// allocation; on `removeFloat` (or `deinit`) the storage is freed.
+/// Returns the float's stable handle for later close / focus calls.
+pub fn addFloat(
+    self: *Layout,
+    buffer: Buffer,
+    rect: Rect,
+    config: FloatConfig,
+) !NodeRegistry.Handle {
+    if (self.next_float_index == 0) return error.FloatHandleSpaceExhausted;
+    const float = try self.allocator.create(FloatNode);
+    errdefer self.allocator.destroy(float);
+
+    var owned_title: ?[]u8 = null;
+    if (config.title) |t| {
+        owned_title = try self.allocator.dupe(u8, t);
+    }
+    errdefer if (owned_title) |t| self.allocator.free(t);
+
+    const handle: NodeRegistry.Handle = .{ .index = self.next_float_index, .generation = 0 };
+    var stored_config = config;
+    stored_config.title = if (owned_title) |t| t else null;
+    float.* = .{
+        .handle = handle,
+        .buffer = buffer,
+        .rect = rect,
+        .config = stored_config,
+        .title_storage = owned_title,
+    };
+
+    // Insert sorted ascending by z so the compositor's left-to-right
+    // iteration paints lower z first and higher z on top.
+    var insert_at: usize = self.floats.items.len;
+    for (self.floats.items, 0..) |existing, i| {
+        if (existing.config.z > config.z) {
+            insert_at = i;
+            break;
+        }
+    }
+    try self.floats.insert(self.allocator, insert_at, float);
+    self.next_float_index +%= 1;
+    if (self.next_float_index < FLOAT_HANDLE_BIT) self.next_float_index = FLOAT_HANDLE_BIT;
+    return handle;
+}
+
+/// Remove a float by handle. Frees the FloatNode and any owned title.
+/// Clears `focused_float` if it pointed at the removed float so a stale
+/// handle never leaks into the next focus check. Returns
+/// `error.StaleNode` when the handle does not match a live float.
+pub fn removeFloat(self: *Layout, handle: NodeRegistry.Handle) !void {
+    if (!isFloatHandle(handle)) return error.StaleNode;
+    var idx_opt: ?usize = null;
+    for (self.floats.items, 0..) |f, i| {
+        if (f.handle.index == handle.index and f.handle.generation == handle.generation) {
+            idx_opt = i;
+            break;
+        }
+    }
+    const idx = idx_opt orelse return error.StaleNode;
+    const float = self.floats.orderedRemove(idx);
+    if (float.title_storage) |t| self.allocator.free(t);
+    self.allocator.destroy(float);
+    if (self.focused_float) |ff| {
+        if (ff.index == handle.index and ff.generation == handle.generation) {
+            self.focused_float = null;
+        }
+    }
+}
+
+/// Resolve any layout handle to the rect it occupies on screen. Walks
+/// the float list first when the high bit marks a float, otherwise
+/// resolves through the layout's NodeRegistry to find a leaf or split.
+/// Returns null when the handle does not match any live node.
+pub fn rectFor(self: *const Layout, handle: NodeRegistry.Handle) ?Rect {
+    if (isFloatHandle(handle)) {
+        for (self.floats.items) |f| {
+            if (f.handle.index == handle.index and f.handle.generation == handle.generation) {
+                return f.rect;
+            }
+        }
+        return null;
+    }
+    const r = self.registry orelse return null;
+    const node = r.resolve(handle) catch return null;
+    return node.getRect();
+}
+
+/// Look up a float by handle. Returns null on a stale or non-float
+/// handle. Linear scan; float counts in real layouts are tiny (≤10).
+pub fn findFloat(self: *const Layout, handle: NodeRegistry.Handle) ?*FloatNode {
+    if (!isFloatHandle(handle)) return null;
+    for (self.floats.items) |f| {
+        if (f.handle.index == handle.index and f.handle.generation == handle.generation) {
+            return f;
+        }
+    }
+    return null;
 }
 
 /// Set a single buffer as the root leaf. Replaces any existing tree.
@@ -807,6 +982,61 @@ test "resizeSplit rejects non-split nodes" {
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     try layout.setRoot(dummy_buf);
     try std.testing.expectError(error.NotASplit, layout.resizeSplit(layout.root.?, 0.3));
+}
+
+test "addFloat appends, rectFor resolves, removeFloat frees" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const rect: Rect = .{ .x = 4, .y = 2, .width = 30, .height = 10 };
+    const handle = try layout.addFloat(dummy_buf, rect, .{ .title = "Models" });
+
+    try std.testing.expect(isFloatHandle(handle));
+    try std.testing.expectEqual(@as(usize, 1), layout.floats.items.len);
+
+    const resolved = layout.rectFor(handle).?;
+    try std.testing.expectEqual(rect.x, resolved.x);
+    try std.testing.expectEqual(rect.y, resolved.y);
+    try std.testing.expectEqual(rect.width, resolved.width);
+    try std.testing.expectEqual(rect.height, resolved.height);
+
+    const float = layout.findFloat(handle).?;
+    try std.testing.expectEqualStrings("Models", float.config.title.?);
+
+    try layout.removeFloat(handle);
+    try std.testing.expectEqual(@as(usize, 0), layout.floats.items.len);
+    try std.testing.expectEqual(@as(?Rect, null), layout.rectFor(handle));
+}
+
+test "addFloat keeps floats sorted ascending by z" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const top = try layout.addFloat(dummy_buf, r, .{ .z = 100 });
+    const middle = try layout.addFloat(dummy_buf, r, .{ .z = 50 });
+    const back = try layout.addFloat(dummy_buf, r, .{ .z = 25 });
+
+    try std.testing.expectEqual(back.index, layout.floats.items[0].handle.index);
+    try std.testing.expectEqual(middle.index, layout.floats.items[1].handle.index);
+    try std.testing.expectEqual(top.index, layout.floats.items[2].handle.index);
+}
+
+test "removeFloat clears focused_float when matching" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const handle = try layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{});
+    layout.focused_float = handle;
+
+    try layout.removeFloat(handle);
+    try std.testing.expectEqual(@as(?NodeRegistry.Handle, null), layout.focused_float);
 }
 
 test "resizeSplit clamps ratio to valid open interval" {
