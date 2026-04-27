@@ -129,6 +129,12 @@ pub fn parseKeySpec(s: []const u8) ParseError!KeySpec {
         .{ "Down", .down },
         .{ "Left", .left },
         .{ "Right", .right },
+        .{ "Home", .home },
+        .{ "End", .end },
+        .{ "PageUp", .page_up },
+        .{ "PageDown", .page_down },
+        .{ "Del", .delete },
+        .{ "Ins", .insert },
     };
     for (named_table) |e| {
         if (std.ascii.eqlIgnoreCase(e[0], rest)) {
@@ -136,11 +142,75 @@ pub fn parseKeySpec(s: []const u8) ParseError!KeySpec {
         }
     }
 
+    // Function keys: <F1>..<F12> (or any number). Function keys live
+    // outside the named_table because they carry an integer payload.
+    if ((rest[0] == 'F' or rest[0] == 'f') and rest.len >= 2) {
+        const n = std.fmt.parseInt(u8, rest[1..], 10) catch return error.InvalidKeySpec;
+        return .{ .key = .{ .function = n }, .modifiers = modifiers };
+    }
+
     // Fallback: a single codepoint inside the angle brackets (e.g. "<C-a>").
     var it = (std.unicode.Utf8View.init(rest) catch return error.InvalidKeySpec).iterator();
     const cp = it.nextCodepoint() orelse return error.InvalidKeySpec;
     if (it.nextCodepoint() != null) return error.InvalidKeySpec;
     return .{ .key = .{ .char = cp }, .modifiers = modifiers };
+}
+
+/// Render a `KeyEvent` (or any equivalent key + modifiers tuple) into
+/// the canonical key-spec string that `parseKeySpec` accepts. Used by
+/// the orchestrator to feed Lua-side `on_key` filters the same string
+/// shape plugin authors write for `zag.keymap{ key = ... }`. Bare ASCII
+/// printables with no modifiers stringify to themselves ("h"); all
+/// other forms use angle brackets ("<C-S-x>", "<Esc>", "<CR>", ...).
+/// Returns the slice of `buf` actually filled.
+pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    const w = stream.writer();
+
+    // Bare-char shortcut: a single printable ASCII char with no
+    // modifiers round-trips through `parseKeySpec` as a bare char,
+    // which is the canonical compact form for typing letters.
+    const has_mods = ev.modifiers.ctrl or ev.modifiers.alt or ev.modifiers.shift;
+    if (!has_mods) switch (ev.key) {
+        .char => |ch| if (ch >= 0x20 and ch < 0x7f and ch != ' ') {
+            w.writeByte(@intCast(ch)) catch {};
+            return stream.getWritten();
+        },
+        else => {},
+    };
+
+    w.writeAll("<") catch {};
+    if (ev.modifiers.ctrl) w.writeAll("C-") catch {};
+    if (ev.modifiers.alt) w.writeAll("M-") catch {};
+    if (ev.modifiers.shift) w.writeAll("S-") catch {};
+    switch (ev.key) {
+        .char => |ch| {
+            if (ch == ' ') {
+                w.writeAll("Space") catch {};
+            } else if (ch >= 0x20 and ch < 0x7f) {
+                w.writeByte(@intCast(ch)) catch {};
+            } else {
+                std.fmt.format(w, "u{d}", .{@as(u32, ch)}) catch {};
+            }
+        },
+        .escape => w.writeAll("Esc") catch {},
+        .enter => w.writeAll("CR") catch {},
+        .tab => w.writeAll("Tab") catch {},
+        .backspace => w.writeAll("BS") catch {},
+        .up => w.writeAll("Up") catch {},
+        .down => w.writeAll("Down") catch {},
+        .left => w.writeAll("Left") catch {},
+        .right => w.writeAll("Right") catch {},
+        .home => w.writeAll("Home") catch {},
+        .end => w.writeAll("End") catch {},
+        .page_up => w.writeAll("PageUp") catch {},
+        .page_down => w.writeAll("PageDown") catch {},
+        .delete => w.writeAll("Del") catch {},
+        .insert => w.writeAll("Ins") catch {},
+        .function => |n| std.fmt.format(w, "F{d}", .{n}) catch {},
+    }
+    w.writeAll(">") catch {};
+    return stream.getWritten();
 }
 
 /// A single (mode, key-spec) -> action entry stored in the registry.
@@ -395,6 +465,40 @@ test "Action.lua_callback carries a Lua registry ref" {
     const a: Action = .{ .lua_callback = 7 };
     try std.testing.expect(a == .lua_callback);
     try std.testing.expectEqual(@as(i32, 7), a.lua_callback);
+}
+
+test "formatKeySpec round-trips through parseKeySpec for the common shapes" {
+    // The on_key filter passes a string description to Lua plugins;
+    // they're expected to compare it against the same form
+    // `parseKeySpec` accepts. Round-trip the canonical shapes so the
+    // two functions can never drift.
+    var buf: [32]u8 = undefined;
+
+    const cases = [_]struct {
+        ev: input.KeyEvent,
+        text: []const u8,
+    }{
+        .{ .ev = .{ .key = .{ .char = 'h' }, .modifiers = .{} }, .text = "h" },
+        .{ .ev = .{ .key = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } }, .text = "<C-a>" },
+        .{ .ev = .{ .key = .{ .char = 'x' }, .modifiers = .{ .ctrl = true, .shift = true } }, .text = "<C-S-x>" },
+        .{ .ev = .{ .key = .escape, .modifiers = .{} }, .text = "<Esc>" },
+        .{ .ev = .{ .key = .enter, .modifiers = .{} }, .text = "<CR>" },
+        .{ .ev = .{ .key = .tab, .modifiers = .{} }, .text = "<Tab>" },
+        .{ .ev = .{ .key = .backspace, .modifiers = .{} }, .text = "<BS>" },
+        .{ .ev = .{ .key = .{ .char = ' ' }, .modifiers = .{} }, .text = "<Space>" },
+        .{ .ev = .{ .key = .{ .char = ' ' }, .modifiers = .{ .ctrl = true } }, .text = "<C-Space>" },
+        .{ .ev = .{ .key = .up, .modifiers = .{} }, .text = "<Up>" },
+        .{ .ev = .{ .key = .home, .modifiers = .{} }, .text = "<Home>" },
+        .{ .ev = .{ .key = .page_down, .modifiers = .{} }, .text = "<PageDown>" },
+        .{ .ev = .{ .key = .delete, .modifiers = .{} }, .text = "<Del>" },
+        .{ .ev = .{ .key = .{ .function = 5 }, .modifiers = .{} }, .text = "<F5>" },
+    };
+    for (cases) |c| {
+        const got = formatKeySpec(&buf, c.ev);
+        try std.testing.expectEqualStrings(c.text, got);
+        const parsed = try parseKeySpec(got);
+        try std.testing.expect(parsed.eql(.{ .key = c.ev.key, .modifiers = c.ev.modifiers }));
+    }
 }
 
 test "registry lookup skips Pass 1 entirely when focused_buffer_id is null" {

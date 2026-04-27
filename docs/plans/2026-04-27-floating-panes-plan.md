@@ -198,8 +198,8 @@ local handle = zag.layout.float(buffer_handle, {
     -- Lifecycle
     time      = 3000,               -- auto-close after ms
     moved     = "any",              -- close on focused-pane cursor move ("any" | nil)
-    on_close  = function(result) ... end,
-    on_key    = function(key) return "consumed" end,  -- Vim-style filter (optional)
+    on_close  = function() ... end,                 -- fires on user-initiated close (no args; capture context via closure)
+    on_key    = function(key) return "consumed" end, -- Vim-style filter (optional)
 })
 
 -- Reposition without recreating
@@ -300,7 +300,7 @@ Each slice is independently shippable.
    - `EventOrchestrator`: "auto-close fires after time ms" — fake clock, assert float closed.
    - `EventOrchestrator`: "moved=any closes float on next keystroke that mutates draft".
    - `LuaEngine`: "zag.layout.float_raise bumps z and re-orders".
-   - `LuaEngine`: "on_close callback fires with the result value".
+   - `LuaEngine`: "on_close callback fires (no args) on user-initiated close, and is suppressed during shutdown teardown".
    - `LuaEngine`: "on_key consumed return value blocks default key handling".
 
 ## Test plan (per slice)
@@ -361,7 +361,7 @@ These are the exact insertion sites identified during the research phase. Slice 
 
 7. **z-sort stability.** `floats` is sorted by z. When two floats share a z, insertion order wins (stable sort). `float_raise` increments to `max_z + 1` to avoid ties. Document.
 
-8. **Lua callback lifetimes.** `on_close` and `on_key` refs must be unrefenced exactly once. Path: `closeFloatById` → invoke `on_close` → unref. Failure path: if zag exits with floats still open, `LuaEngine.deinit` needs to walk `extra_floats` and unref any pending refs. Add to the deinit checklist.
+8. **Lua callback lifetimes.** `on_close` and `on_key` refs must be unrefenced exactly once. Path: `closeFloatById` → invoke `on_close` (no args) → unref. Failure path: if zag exits with floats still open, `WindowManager.deinit` walks `extra_floats` and unrefs any pending refs WITHOUT firing `on_close` — the Lua heap is being torn down around the call so a callback that touched `zag.layout` would observe a half-deinited engine. The contract: `on_close` fires only on user-initiated close (closeFloatById, auto-close sweep, dismissal); shutdown is the OS's job. Plugins capture context via closures rather than receiving a result argument; threading a return value across the Zig/Lua boundary adds plumbing for marginal benefit when closures already cover the use case.
 
 ## Success criteria
 

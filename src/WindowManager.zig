@@ -431,13 +431,17 @@ pub fn deinit(self: *WindowManager) void {
     // Drain any Lua callback refs still held by live floats so the
     // registry slots are released exactly once. We do this before
     // freeing the FloatNode storage in `Layout.deinit` (which runs
-    // after this function under main.zig's defer chain). The
-    // `closeFloatById` path normally does this; deinit is the
-    // shutdown-with-floats-still-open fallback.
+    // after this function under main.zig's defer chain). Shutdown
+    // intentionally does NOT fire `on_close`: the Lua heap is being
+    // torn down around this call, and a callback that touched
+    // `zag.layout` (or any other engine surface) would observe a
+    // half-deinited engine. Plugins relying on `on_close` for cleanup
+    // of resources must use the normal close path; shutdown teardown
+    // is the OS's job. We still `unref` so the registry slot is
+    // released before the engine itself goes away.
     if (self.lua_engine) |engine| {
         for (self.layout.floats.items) |f| {
             if (f.config.on_close_ref) |ref| {
-                engine.invokeCallback(ref);
                 engine.lua.unref(zlua.registry_index, ref);
             }
             if (f.config.on_key_ref) |ref| {
@@ -1351,16 +1355,19 @@ pub fn openFloatPane(
     const handle = try self.layout.addFloat(buffer, rect, config);
     errdefer self.layout.removeFloat(handle) catch {};
 
-    // Snapshot the *current* focused pane's draft length so the
-    // orchestrator's auto-close sweep has a baseline to compare
-    // against on every tick. Capture it BEFORE flipping focus to the
-    // float so a `close_on_cursor_moved` toast does not see itself as
-    // the "tile that just moved". The find-after-add path here can
+    // Snapshot the *current* focused pane's draft length AND record
+    // its buffer so the orchestrator's `close_on_cursor_moved` sweep
+    // can compare the right pane's live draft length each tick.
+    // Capture both BEFORE flipping focus to the float; otherwise
+    // `enter=true` would point the snapshot at the float's own
+    // (typically empty) draft and the very next sweep would see
+    // "moved" on every keystroke. The find-after-add path here can
     // only fail on stale handles, which we just produced — bug if it
     // ever fires.
     if (self.layout.findFloat(handle)) |f| {
-        const focused_draft = self.getFocusedPanePtr().draft_len;
-        f.cursor_draft_len_at_open = focused_draft;
+        const origin = self.getFocusedPanePtr();
+        f.cursor_draft_len_at_open = origin.draft_len;
+        f.origin_buffer = origin.buffer;
     }
 
     if (config.enter) {

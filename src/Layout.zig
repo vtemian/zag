@@ -157,9 +157,15 @@ pub const FloatConfig = struct {
     /// Vim's `moved = "any"`.
     close_on_cursor_moved: bool = false,
 
-    /// Lua registry ref invoked when the float closes. The owner of
-    /// the ref is the WindowManager: closeFloatById is responsible for
-    /// firing the callback then `lua.unref`-ing the slot exactly once.
+    /// Lua registry ref invoked when the float closes via a normal
+    /// close path (`closeFloatById`, auto-close sweep, user dismissal).
+    /// Shutdown teardown (`WindowManager.deinit`) does NOT fire the
+    /// callback: the Lua heap is being torn down around the call and
+    /// touching `zag.layout` from inside it would observe a half-dead
+    /// engine. The callback receives no arguments; plugins capture
+    /// context via closures. The owner of the ref is the WindowManager:
+    /// closeFloatById is responsible for firing the callback then
+    /// `lua.unref`-ing the slot exactly once.
     on_close_ref: ?i32 = null,
     /// Lua registry ref invoked before each key event would route to
     /// the focused float. The callback receives a string description of
@@ -195,11 +201,23 @@ pub const FloatNode = struct {
     /// `config.auto_close_ms` to decide whether the float has timed
     /// out. Set by `addFloat`.
     created_at_ms: i64 = 0,
-    /// Snapshot of the focused pane's draft length captured at open
+    /// Snapshot of the originating pane's draft length captured at open
     /// time. The orchestrator's `close_on_cursor_moved` sweep compares
-    /// this against the live focused-pane draft length each tick;
-    /// any difference triggers a close.
+    /// this against the live origin-pane draft length each tick;
+    /// any difference triggers a close. Paired with `origin_buffer`:
+    /// the originating pane is resolved by buffer pointer each sweep
+    /// because PaneEntry storage may relocate when `extra_panes` /
+    /// `extra_floats` grow.
     cursor_draft_len_at_open: usize = 0,
+    /// Buffer of the pane that owned focus at open time. Captured
+    /// BEFORE `enter=true` flips focus to the float so the
+    /// `close_on_cursor_moved` predicate compares the right pane's
+    /// draft length, not the float's own (which is typically empty).
+    /// Null on test fixtures and `enter=false` paths where capturing
+    /// would be redundant; the sweep treats null as "skip the moved
+    /// predicate for this float". Buffer is a borrowed vtable handle:
+    /// no ownership, no deinit.
+    origin_buffer: ?Buffer = null,
 };
 
 /// High bit set on `Handle.index` marks a float handle. Float storage
@@ -300,6 +318,7 @@ pub fn addFloat(
         .title_storage = owned_title,
         .created_at_ms = std.time.milliTimestamp(),
         .cursor_draft_len_at_open = 0,
+        .origin_buffer = null,
     };
 
     // Insert sorted ascending by z so the compositor's left-to-right
