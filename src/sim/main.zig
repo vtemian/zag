@@ -20,9 +20,6 @@ comptime {
     _ = @import("Args.zig");
     _ = @import("Runner.zig");
     _ = @import("Scenario.zig");
-    _ = @import("MockServer.zig");
-    _ = @import("MockScript.zig");
-    _ = @import("ConfigScaffold.zig");
     _ = @import("Artifacts.zig");
     _ = @import("Summary.zig");
     _ = @import("Replay.zig");
@@ -69,15 +66,10 @@ pub fn main() !u8 {
 fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var artifacts_override: ?[]const u8 = null;
     var scenario_path: ?[]const u8 = null;
-    var mock_script_path: ?[]const u8 = null;
 
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--artifacts=")) {
             artifacts_override = arg["--artifacts=".len..];
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, "--mock=")) {
-            mock_script_path = arg["--mock=".len..];
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -105,7 +97,6 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     const result = Scenario.runFile(alloc, path, .{
         .artifacts = artifacts,
-        .mock_script_path = mock_script_path,
     }) catch |e| {
         reportFmt("zag-sim run: {s}: {s}\n", .{ path, @errorName(e) });
         return exit_harness_error;
@@ -122,11 +113,11 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return code;
 }
 
-/// Parse `replay-gen` flags and emit a reproducer kit (scenario + mock script)
-/// derived from a zag session JSONL. Drops the trailing turn when it has no
-/// assistant output (mid-turn truncation) unless `--include-partial` keeps it
-/// for crash repros. Any failure before both files are on disk maps to
-/// `harness_error` and is reported to stderr.
+/// Parse `replay-gen` flags and emit a `.zsm` scenario derived from a zag
+/// session JSONL. Drops the trailing turn when it has no assistant output
+/// (mid-turn truncation) unless `--include-partial` keeps it for crash repros.
+/// Any failure before the file is on disk maps to `harness_error` and is
+/// reported to stderr.
 fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var session_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
@@ -216,19 +207,9 @@ fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return exit_harness_error;
     };
 
-    const mock_path = std.fs.path.join(alloc, &.{ dir, "mock.json" }) catch |e| {
-        reportFmt("zag-sim replay-gen: path join failed: {s}\n", .{@errorName(e)});
-        return exit_harness_error;
-    };
-    defer alloc.free(mock_path);
-    writeMockScript(alloc, mock_path, turns) catch |e| {
-        reportFmt("zag-sim replay-gen: write mock '{s}' failed: {s}\n", .{ mock_path, @errorName(e) });
-        return exit_harness_error;
-    };
-
     var scratch: [1024]u8 = undefined;
-    const summary = std.fmt.bufPrint(&scratch, "replay-gen wrote {s} and {s} ({d} turns)\n", .{
-        scenario_path, mock_path, turns.len,
+    const summary = std.fmt.bufPrint(&scratch, "replay-gen wrote {s} ({d} turns)\n", .{
+        scenario_path, turns.len,
     }) catch "replay-gen: ok\n";
     _ = stdoutFile().write(summary) catch {};
     return 0;
@@ -248,25 +229,12 @@ fn writeScenario(
     try fw.interface.flush();
 }
 
-fn writeMockScript(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    turns: []const Replay.Turn,
-) !void {
-    const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer f.close();
-    var fw_buf: [4096]u8 = undefined;
-    var fw = f.writer(&fw_buf);
-    try Replay.emitMockScript(alloc, &fw.interface, turns);
-    try fw.interface.flush();
-}
-
 fn printUsage(file: std.fs.File) void {
     const msg =
         \\zag-sim: terminal scenario driver
         \\
         \\usage:
-        \\  zag-sim run <scenario.zsm> [--artifacts=<dir>] [--mock=<script.json>]
+        \\  zag-sim run <scenario.zsm> [--artifacts=<dir>]
         \\  zag-sim replay-gen <session.jsonl> --out=<dir> [--include-partial]
         \\  zag-sim --help | -h
         \\
