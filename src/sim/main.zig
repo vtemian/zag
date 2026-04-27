@@ -114,22 +114,17 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 }
 
 /// Parse `replay-gen` flags and emit a `.zsm` scenario derived from a zag
-/// session JSONL. Drops the trailing turn when it has no assistant output
-/// (mid-turn truncation) unless `--include-partial` keeps it for crash repros.
-/// Any failure before the file is on disk maps to `harness_error` and is
-/// reported to stderr.
+/// session JSONL. The scenario types every recorded `user_message` back at
+/// a fresh zag run; everything else is opaque LLM-system output and is
+/// silently skipped at parse time. Any failure before the file is on disk
+/// maps to `harness_error` and is reported to stderr.
 fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var session_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
-    var include_partial: bool = false;
 
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--out=")) {
             out_dir = arg["--out=".len..];
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--include-partial")) {
-            include_partial = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -159,56 +154,24 @@ fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return exit_harness_error;
     };
 
-    const entries = Replay.parseFile(alloc, path) catch |e| {
+    const turns = Replay.parseFile(alloc, path) catch |e| {
         reportFmt("zag-sim replay-gen: parse '{s}' failed: {s}\n", .{ path, @errorName(e) });
         return exit_harness_error;
     };
-    defer Replay.freeEntries(alloc, entries);
-
-    var turns = Replay.groupTurns(alloc, entries) catch |e| {
-        reportFmt("zag-sim replay-gen: groupTurns failed: {s}\n", .{@errorName(e)});
-        return exit_harness_error;
-    };
     defer Replay.freeTurns(alloc, turns);
-
-    // Drop a trailing turn that has no assistant response: mid-stream tear,
-    // not something we want to drive zag through. Keep it under
-    // --include-partial so crash repros can record the prompt that triggered
-    // the cut. The kept slice is a fresh allocation: free the dropped Turn's
-    // sub-allocations explicitly, free the original outer slice container,
-    // and reassign so the deferred `freeTurns` operates on the new slice.
-    if (!include_partial and turns.len > 0) {
-        const last = turns[turns.len - 1];
-        const incomplete = last.assistant_text.len == 0 and
-            last.tools.len == 0 and
-            last.notes.len == 0;
-        if (incomplete) {
-            const kept = alloc.alloc(Replay.Turn, turns.len - 1) catch |e| {
-                reportFmt("zag-sim replay-gen: trim alloc failed: {s}\n", .{@errorName(e)});
-                return exit_harness_error;
-            };
-            @memcpy(kept, turns[0 .. turns.len - 1]);
-            Replay.freeTurn(alloc, last);
-            alloc.free(turns);
-            turns = kept;
-        }
-    }
 
     const scenario_path = std.fs.path.join(alloc, &.{ dir, "scenario.zsm" }) catch |e| {
         reportFmt("zag-sim replay-gen: path join failed: {s}\n", .{@errorName(e)});
         return exit_harness_error;
     };
     defer alloc.free(scenario_path);
-    writeScenario(alloc, scenario_path, turns, .{
-        .source_path = path,
-        .include_partial = include_partial,
-    }) catch |e| {
+    writeScenario(scenario_path, turns, .{ .source_path = path }) catch |e| {
         reportFmt("zag-sim replay-gen: write scenario '{s}' failed: {s}\n", .{ scenario_path, @errorName(e) });
         return exit_harness_error;
     };
 
     var scratch: [1024]u8 = undefined;
-    const summary = std.fmt.bufPrint(&scratch, "replay-gen wrote {s} ({d} turns)\n", .{
+    const summary = std.fmt.bufPrint(&scratch, "replay-gen wrote {s} ({d} user turn(s))\n", .{
         scenario_path, turns.len,
     }) catch "replay-gen: ok\n";
     _ = stdoutFile().write(summary) catch {};
@@ -216,16 +179,15 @@ fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 }
 
 fn writeScenario(
-    alloc: std.mem.Allocator,
     path: []const u8,
-    turns: []const Replay.Turn,
+    turns: []const Replay.UserTurn,
     opts: Replay.EmitOptions,
 ) !void {
     const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer f.close();
     var fw_buf: [4096]u8 = undefined;
     var fw = f.writer(&fw_buf);
-    try Replay.emitScenario(alloc, &fw.interface, turns, opts);
+    try Replay.emitScenario(&fw.interface, turns, opts);
     try fw.interface.flush();
 }
 
@@ -235,7 +197,7 @@ fn printUsage(file: std.fs.File) void {
         \\
         \\usage:
         \\  zag-sim run <scenario.zsm> [--artifacts=<dir>]
-        \\  zag-sim replay-gen <session.jsonl> --out=<dir> [--include-partial]
+        \\  zag-sim replay-gen <session.jsonl> --out=<dir>
         \\  zag-sim --help | -h
         \\
         \\exit codes:
