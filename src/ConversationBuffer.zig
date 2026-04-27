@@ -20,10 +20,6 @@ const ConversationBuffer = @This();
 
 const log = std.log.scoped(.conversation_buffer);
 
-/// Maximum bytes of in-progress draft a single pane can hold. Fixed so
-/// the draft lives inline on the buffer struct with no separate alloc.
-pub const MAX_DRAFT = 4096;
-
 /// Re-export of the tree's node type enum, so external call sites that
 /// named it `ConversationBuffer.NodeType` keep compiling during the
 /// migration. Prefer `ConversationTree.NodeType` for new code.
@@ -56,11 +52,6 @@ renderer: NodeRenderer,
 /// text from `Node.content.items` so the cache must not outlive the
 /// node tree that produced it.
 cache: NodeLineCache,
-/// In-progress text the user is editing at this pane's prompt.
-/// Becomes the next user message when Enter is pressed.
-draft: [MAX_DRAFT]u8 = undefined,
-/// Number of valid bytes in `draft`.
-draft_len: usize = 0,
 
 /// Create a new empty buffer with the given id and name. The buffer is a
 /// pure view; its LLM messages live on `ConversationHistory` and its
@@ -383,79 +374,6 @@ pub fn toggleAllThinkingCollapsed(self: *ConversationBuffer) usize {
     return self.tree.toggleAllThinkingCollapsed();
 }
 
-// -- Draft input --------------------------------------------------------
-
-/// Append a single byte to the draft. No-op if the draft is full.
-/// Does not touch the dirty channels; the compositor repaints the
-/// prompt every frame regardless of buffer-level dirty state.
-pub fn appendToDraft(self: *ConversationBuffer, ch: u8) void {
-    if (self.draft_len >= self.draft.len) return;
-    self.draft[self.draft_len] = ch;
-    self.draft_len += 1;
-}
-
-/// Remove the last byte from the draft. No-op on empty.
-pub fn deleteBackFromDraft(self: *ConversationBuffer) void {
-    if (self.draft_len == 0) return;
-    self.draft_len -= 1;
-}
-
-/// Remove the last word from the draft along with any trailing spaces
-/// before the word and any separator space after it. Matches Ctrl+W in
-/// shells and vim: "strip trailing space, the word, then the separator".
-pub fn deleteWordFromDraft(self: *ConversationBuffer) void {
-    // Strip trailing spaces.
-    while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
-        self.draft_len -= 1;
-    }
-    // Strip the word itself.
-    while (self.draft_len > 0 and self.draft[self.draft_len - 1] != ' ') {
-        self.draft_len -= 1;
-    }
-    // Strip separator spaces left between the word and what preceded it,
-    // so "hello world" → "hello" (not "hello ").
-    while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
-        self.draft_len -= 1;
-    }
-}
-
-/// Append a chunk of bytes to the draft, e.g. from a bracketed paste.
-/// Silently truncates past `draft.len`; a warning is logged so overflow
-/// is observable without interrupting the paste.
-pub fn appendPaste(self: *ConversationBuffer, data: []const u8) void {
-    const room = self.draft.len - self.draft_len;
-    const to_copy = @min(room, data.len);
-    @memcpy(self.draft[self.draft_len..][0..to_copy], data[0..to_copy]);
-    self.draft_len += to_copy;
-    if (to_copy < data.len) {
-        std.log.scoped(.buffer).warn("paste truncated: {d} bytes dropped (draft full)", .{data.len - to_copy});
-    }
-}
-
-/// Clear the draft entirely.
-pub fn clearDraft(self: *ConversationBuffer) void {
-    self.draft_len = 0;
-}
-
-/// Return the current draft as a borrowed slice. Invalid after any
-/// mutation above.
-pub fn getDraft(self: *const ConversationBuffer) []const u8 {
-    return self.draft[0..self.draft_len];
-}
-
-/// Copy the current draft into `dest` and clear it. Returns a slice of
-/// `dest` for the copied bytes. Used by the submit pipeline so the
-/// orchestrator never touches the draft's internal representation.
-/// Caller's buffer must be at least `MAX_DRAFT` bytes.
-pub fn consumeDraft(self: *ConversationBuffer, dest: []u8) []const u8 {
-    const n = self.draft_len;
-    // Cold submit path: caller hands us a `MAX_DRAFT`-sized scratch and `draft_len <= MAX_DRAFT` by construction, so this is a comptime-bounded contract check, not a per-frame branch.
-    std.debug.assert(dest.len >= n);
-    @memcpy(dest[0..n], self.draft[0..n]);
-    self.draft_len = 0;
-    return dest[0..n];
-}
-
 // -- Buffer interface --------------------------------------------------------
 
 /// Create a Buffer interface from this ConversationBuffer.
@@ -523,48 +441,24 @@ fn bufClearDirty(ptr: *anyopaque) void {
     if (self.viewport) |v| v.clearDirty(self.tree.currentGeneration());
 }
 
-/// Handle a key event aimed at the buffer's in-progress draft. The
-/// orchestrator strips universal shortcuts (Ctrl+C) and keymap bindings
-/// before this runs, so everything here is insert-mode editing of the
-/// draft buffer. Enter and page_up/page_down stay on the orchestrator
-/// because they touch the submit pipeline and the layout's focused
-/// leaf's scroll offset, neither of which belongs to the view alone.
+/// Handle a key event the buffer claims as its own. Drafts moved to
+/// `WindowManager.Pane`, so this is now reserved for buffer-internal
+/// chords. Today only Ctrl+R (toggle all thinking-block collapse)
+/// applies; everything else passes through and `Pane.handleKey` decides
+/// whether to land it in the draft or drop it.
 pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleResult {
     if (ev.modifiers.ctrl) {
         switch (ev.key) {
             .char => |ch| {
-                if (ch == 'w') {
-                    self.deleteWordFromDraft();
-                    return .consumed;
-                }
                 if (ch == 'r') {
-                    // Toggle all thinking blocks in this buffer. The tree
-                    // bumps its own generation on a non-zero touch count,
-                    // which `isDirty()` already picks up. When there are no
-                    // thinking nodes, still consume so the chord doesn't
-                    // leak into the draft.
                     _ = self.toggleAllThinkingCollapsed();
                     return .consumed;
                 }
             },
             else => {},
         }
-        return .passthrough;
     }
-    switch (ev.key) {
-        .backspace => {
-            self.deleteBackFromDraft();
-            return .consumed;
-        },
-        .char => |ch| {
-            if (ch >= 0x20 and ch < 0x7f) {
-                self.appendToDraft(@intCast(ch));
-                return .consumed;
-            }
-            return .passthrough;
-        },
-        else => return .passthrough,
-    }
+    return .passthrough;
 }
 
 fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
@@ -1151,100 +1045,22 @@ test "getVisibleLines reflects collapsed-to-expanded toggle" {
     try std.testing.expectEqual(@as(usize, 3), expanded_lines.items.len);
 }
 
-test "draft starts empty" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    try std.testing.expectEqualStrings("", cb.getDraft());
-    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
-}
-
-test "appendToDraft grows the draft" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    cb.appendToDraft('h');
-    cb.appendToDraft('i');
-    try std.testing.expectEqualStrings("hi", cb.getDraft());
-}
-
-test "appendToDraft respects MAX_DRAFT cap" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    var i: usize = 0;
-    while (i < MAX_DRAFT + 10) : (i += 1) cb.appendToDraft('x');
-    try std.testing.expectEqual(@as(usize, MAX_DRAFT), cb.draft_len);
-}
-
-test "deleteBackFromDraft shrinks by one" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    cb.appendToDraft('h');
-    cb.appendToDraft('i');
-    cb.deleteBackFromDraft();
-    try std.testing.expectEqualStrings("h", cb.getDraft());
-    cb.deleteBackFromDraft();
-    cb.deleteBackFromDraft(); // no-op on empty
-    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
-}
-
-test "deleteWordFromDraft strips trailing word plus spaces" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    for ("hello world") |ch| cb.appendToDraft(ch);
-    cb.deleteWordFromDraft();
-    try std.testing.expectEqualStrings("hello", cb.getDraft());
-}
-
-test "clearDraft resets length to zero" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    for ("hello") |ch| cb.appendToDraft(ch);
-    cb.clearDraft();
-    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
-    try std.testing.expectEqualStrings("", cb.getDraft());
-}
-
-test "handleKey appends printable chars to the draft" {
+test "handleKey returns passthrough for printable chars (drafts moved to Pane)" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
-    try std.testing.expectEqualStrings("a", cb.getDraft());
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
 }
 
-test "handleKey on backspace deletes one char" {
+test "handleKey returns passthrough for backspace (drafts moved to Pane)" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
 
-    for ("hi") |ch| cb.appendToDraft(ch);
     const r = cb.handleKey(.{ .key = .backspace, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
-    try std.testing.expectEqualStrings("h", cb.getDraft());
-}
-
-test "handleKey on Ctrl+W deletes the trailing word" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    for ("hello world") |ch| cb.appendToDraft(ch);
-    const r = cb.handleKey(.{ .key = .{ .char = 'w' }, .modifiers = .{ .ctrl = true } });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
-    try std.testing.expectEqualStrings("hello", cb.getDraft());
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
 }
 
 test "handleKey returns passthrough for Enter (orchestrator retains the submit path)" {
@@ -1265,36 +1081,12 @@ test "handleKey returns passthrough for unrelated ctrl chords" {
     try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
 }
 
-test "consumeDraft snapshots into dest and clears" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    for ("hello") |ch| cb.appendToDraft(ch);
-    var scratch: [MAX_DRAFT]u8 = undefined;
-    const taken = cb.consumeDraft(&scratch);
-    try std.testing.expectEqualStrings("hello", taken);
-    try std.testing.expectEqual(@as(usize, 0), cb.draft_len);
-    try std.testing.expectEqualStrings("", cb.getDraft());
-}
-
-test "consumeDraft on empty returns empty slice" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
-    defer cb.deinit();
-
-    var scratch: [MAX_DRAFT]u8 = undefined;
-    const taken = cb.consumeDraft(&scratch);
-    try std.testing.expectEqual(@as(usize, 0), taken.len);
-}
-
-test "handleKey dispatches through the Buffer interface" {
+test "handleKey passthrough flows through the Buffer vtable" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
 
     const b = cb.buf();
     const r = b.handleKey(.{ .key = .{ .char = 'Z' }, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
-    try std.testing.expectEqualStrings("Z", cb.getDraft());
+    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
 }

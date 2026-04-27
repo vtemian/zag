@@ -198,7 +198,10 @@ pub fn run(self: *EventOrchestrator) !void {
     var running = true;
 
     // Initial render
-    self.window_manager.compositor.composite(self.window_manager.layout, .{
+    var leaves_buf: [max_visible_leaves]*Layout.LayoutNode = undefined;
+    var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
+    const initial_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
+    self.window_manager.compositor.composite(self.window_manager.layout, initial_drafts, .{
         .mode = self.window_manager.current_mode,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
@@ -356,7 +359,10 @@ fn tick(
         const info = focused.runner.?.lastInfo();
         break :blk if (info.len > 0) info else "streaming...";
     } else "";
-    self.window_manager.compositor.composite(self.window_manager.layout, .{
+    var leaves_buf: [max_visible_leaves]*Layout.LayoutNode = undefined;
+    var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
+    const tick_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
+    self.window_manager.compositor.composite(self.window_manager.layout, tick_drafts, .{
         .mode = self.window_manager.current_mode,
         .status = status,
         .agent_running = agent_running,
@@ -368,6 +374,37 @@ fn tick(
         error.WriteTimeout => {},
         else => return err,
     };
+}
+
+/// Stack-allocated cap for the visible-leaves buffer used per frame to
+/// build the `LeafDraft` slice. Real layouts have at most a handful of
+/// panes; 32 is wildly generous and keeps the per-frame snapshot off the
+/// heap.
+const max_visible_leaves: usize = 32;
+
+/// Walk the layout's visible leaves and pair each with its pane's draft.
+/// Returns a slice into `drafts_buf` valid until the next call. Leaves
+/// whose buffer doesn't resolve to a registered pane are skipped, which
+/// the compositor renders as an empty prompt row rather than crashing.
+fn collectLeafDrafts(
+    self: *EventOrchestrator,
+    leaves_buf: []*Layout.LayoutNode,
+    drafts_buf: []Compositor.LeafDraft,
+) []const Compositor.LeafDraft {
+    var n: usize = 0;
+    self.window_manager.layout.visibleLeaves(leaves_buf, &n);
+    var count: usize = 0;
+    for (leaves_buf[0..n]) |node| {
+        if (count >= drafts_buf.len) break;
+        const leaf_ptr: *Layout.LayoutNode.Leaf = switch (node.*) {
+            .leaf => &node.leaf,
+            .split => continue,
+        };
+        const pane = self.window_manager.paneFromBufferPtr(leaf_ptr.buffer) orelse continue;
+        drafts_buf[count] = .{ .leaf = leaf_ptr, .draft = pane.getDraft() };
+        count += 1;
+    }
+    return drafts_buf[0..count];
 }
 
 // -- Input handling ----------------------------------------------------------
@@ -387,7 +424,9 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // disappear as soon as the user does anything.
     self.window_manager.transient_status_len = 0;
 
-    const focused = self.window_manager.getFocusedPane();
+    // Pointer so draft mutations land on the live pane and do not copy
+    // the 4 KB draft buffer on every key.
+    const focused = self.window_manager.getFocusedPanePtr();
 
     // Ctrl+C is always-on regardless of mode: it's the universal escape
     // hatch (cancel a running agent, or quit the app).
@@ -438,17 +477,11 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // the focused buffer, which owns draft editing through its vtable.
     switch (k.key) {
         .enter => {
-            // The Enter submit pipeline is conversation-only: it reads a
-            // draft, runs slash commands, and hands text to the agent
-            // runner. Scratch-backed panes have no view/runner, so Enter
-            // there falls through to the buffer's own vtable (where a
-            // plugin-bound keymap or the buffer's handleKey decides).
-            const view = focused.view orelse {
-                return switch (focused.buffer.handleKey(k)) {
-                    .consumed => .redraw,
-                    .passthrough => .none,
-                };
-            };
+            // The Enter submit pipeline reads the pane's draft and hands
+            // it to the agent runner. Scratch-backed panes have no
+            // runner, so Enter there falls through to the buffer's own
+            // vtable (a plugin-bound keymap or the buffer's handleKey
+            // decides what Enter means there).
             const runner = focused.runner orelse {
                 return switch (focused.buffer.handleKey(k)) {
                     .consumed => .redraw,
@@ -456,7 +489,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
                 };
             };
 
-            const draft = view.getDraft();
+            const draft = focused.getDraft();
             if (draft.len == 0) return .none;
 
             // Commands fire regardless of agent state; a running agent
@@ -465,16 +498,16 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
             switch (self.handleCommand(draft)) {
                 .quit => return .quit,
                 .handled => {
-                    var scratch: [ConversationBuffer.MAX_DRAFT]u8 = undefined;
-                    _ = view.consumeDraft(&scratch);
+                    var scratch: [WindowManager.MAX_DRAFT]u8 = undefined;
+                    _ = focused.consumeDraft(&scratch);
                     return .redraw;
                 },
                 .not_a_command => {
                     if (runner.isAgentRunning()) return .none;
 
-                    var scratch: [ConversationBuffer.MAX_DRAFT]u8 = undefined;
-                    const user_input = view.consumeDraft(&scratch);
-                    self.onUserInputSubmitted(focused, user_input) catch |err| {
+                    var scratch: [WindowManager.MAX_DRAFT]u8 = undefined;
+                    const user_input = focused.consumeDraft(&scratch);
+                    self.onUserInputSubmitted(focused.*, user_input) catch |err| {
                         log.warn("submit failed: {}", .{err});
                         return .none;
                     };
@@ -499,7 +532,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
             return .redraw;
         },
         else => {
-            return switch (focused.buffer.handleKey(k)) {
+            return switch (focused.handleKey(k)) {
                 .consumed => .redraw,
                 .passthrough => .none,
             };
@@ -524,11 +557,12 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 fn handlePaste(self: *EventOrchestrator, bytes: []const u8) void {
     self.window_manager.transient_status_len = 0;
     if (self.window_manager.current_mode != .insert) return;
-    const focused = self.window_manager.getFocusedPane();
-    // Only conversation panes carry a draft; a paste on a scratch pane
-    // has nowhere to land, so drop it.
-    const view = focused.view orelse return;
-    view.appendPaste(bytes);
+    const focused = self.window_manager.getFocusedPanePtr();
+    // Drafts are pane-scoped now; paste lands on whichever pane is
+    // focused. Submit-side gating still applies (only agent panes
+    // submit), so a paste into a scratch pane is harmless: it sits in
+    // the draft until focus moves or the user clears it.
+    focused.appendPaste(bytes);
 }
 
 fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
