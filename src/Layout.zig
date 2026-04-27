@@ -70,9 +70,21 @@ pub const LayoutNode = union(enum) {
 /// Border style for a floating pane's chrome.
 pub const FloatBorder = enum { none, square, rounded };
 
-/// Static configuration captured at float creation time. Slice 1 only
-/// uses screen-anchored floats so the rect is supplied directly; later
-/// slices add anchor resolution and size-to-content.
+/// Anchor source for a float's resolved screen rect. Slice 2 implements
+/// `editor` and `cursor`; `win` is reserved for slice 3 and currently
+/// resolves to null (the float is then clamped to the editor center).
+/// `mouse`, `bufpos`, `laststatus`, `tabline` are slice-3+ work; we
+/// model them as no-anchor today so a future slice can wire them up
+/// without a config-shape break.
+pub const FloatAnchor = enum { editor, cursor, win };
+
+/// Which corner of the float aligns to the resolved anchor point.
+pub const FloatCorner = enum { NW, NE, SW, SE };
+
+/// Static configuration captured at float creation time. Slice 1 used
+/// screen-anchored floats with a pre-computed rect; slice 2 stores the
+/// anchor + offsets + size bounds and resolves the rect each frame from
+/// `recalculateFloats`.
 pub const FloatConfig = struct {
     border: FloatBorder = .rounded,
     /// Optional title rendered into the top border. Borrowed; the caller
@@ -84,6 +96,40 @@ pub const FloatConfig = struct {
     /// Whether to take focus on creation. Slice 1 defaults to true so a
     /// /model-style picker's buffer-scoped keymaps actually fire.
     enter: bool = true,
+    /// Whether mouse events that hit the float's rect route to the
+    /// float's pane. When false the click falls through to the tile
+    /// underneath; when true a click also makes the float the focused
+    /// float.
+    mouse: bool = true,
+
+    /// Anchor source. `editor` resolves to the screen rect minus the
+    /// status row; `cursor` reads `Layout.cursor_anchor`; `win` is a
+    /// slice-3 stub. The orchestrator updates `cursor_anchor` each
+    /// frame before calling `recalculate`.
+    relative: FloatAnchor = .editor,
+    /// Which corner of the float lines up with the anchor point.
+    corner: FloatCorner = .NW,
+    /// Row offset added to the anchor's y before corner adjustment.
+    row_offset: i32 = 0,
+    /// Col offset added to the anchor's x before corner adjustment.
+    col_offset: i32 = 0,
+
+    /// Explicit width. Wins over `min_width`/`max_width` when set.
+    width: ?u16 = null,
+    /// Explicit height. Wins over `min_height`/`max_height` when set.
+    height: ?u16 = null,
+    /// Lower bound for size-to-content width. Used only when `width`
+    /// is null.
+    min_width: ?u16 = null,
+    /// Upper bound for size-to-content width. Used only when `width`
+    /// is null.
+    max_width: ?u16 = null,
+    /// Lower bound for size-to-content height. Used only when `height`
+    /// is null.
+    min_height: ?u16 = null,
+    /// Upper bound for size-to-content height. Used only when `height`
+    /// is null.
+    max_height: ?u16 = null,
 };
 
 /// A floating pane: lives outside the tiled tree, drawn on top of it
@@ -141,6 +187,12 @@ floats: std.ArrayList(*FloatNode) = .empty,
 /// checks this before falling back to the tile tree's focused leaf so
 /// buffer-scoped keymaps on the float fire.
 focused_float: ?NodeRegistry.Handle = null,
+/// One-cell rect at the focused tile's prompt cursor cell, supplied by
+/// the orchestrator before each `recalculate()` call. `relative=cursor`
+/// floats anchor on this; null means no tile is focused (or the
+/// orchestrator hasn't published yet) and cursor-anchored floats fall
+/// back to editor-center so they don't disappear off-screen.
+cursor_anchor: ?Rect = null,
 
 /// Create a new empty layout with no root.
 pub fn init(allocator: Allocator) Layout {
@@ -406,16 +458,213 @@ pub fn resizeSplit(self: *Layout, node: *LayoutNode, ratio: f32) !void {
 /// Recompute all rects in the layout tree.
 /// Reserves the last row for the status line. Content starts at row 0.
 pub fn recalculate(self: *Layout, screen_width: u16, screen_height: u16) void {
-    const r = self.root orelse return;
     if (screen_height < 2 or screen_width == 0) return;
 
-    const content_rect = Rect{
+    if (self.root) |r| {
+        const content_rect = Rect{
+            .x = 0,
+            .y = 0,
+            .width = screen_width,
+            .height = screen_height - 1, // last row = status line
+        };
+        recalculateNode(r, content_rect);
+    }
+
+    self.recalculateFloats(screen_width, screen_height);
+}
+
+/// Resolve every float's rect for the current frame. Called from
+/// `recalculate()` after the tile tree has been laid out so any anchor
+/// that reads tile geometry sees up-to-date rects. Anchors:
+///
+///   * `editor`: full screen minus the status row (`(0,0,W,H-1)`).
+///   * `cursor`: `cursor_anchor` if the orchestrator published one,
+///     otherwise editor center (so the float still appears).
+///   * `win`: slice-3 stub; null today, falls through to editor.
+///
+/// Size resolution:
+///   * Explicit `width`/`height` always win.
+///   * Otherwise, fall back to `min_*`/`max_*` clamped against the
+///     buffer's `lineCount` and longest visible line. The longest-line
+///     measurement reads plain-text byte length from the styled spans
+///     (see slice 2 plan risk #2: ASCII-only buffers in practice today,
+///     a future revision can do grapheme-cluster width).
+///   * If none of the bounds apply, the float keeps its prior rect so
+///     the recalc is a no-op.
+///
+/// After computing the rect, the float is clamped to fit on screen
+/// (Neovim's behaviour: floats are truncated rather than disappearing).
+pub fn recalculateFloats(self: *Layout, screen_width: u16, screen_height: u16) void {
+    if (screen_height < 2 or screen_width == 0) return;
+
+    const editor_rect: Rect = .{
         .x = 0,
         .y = 0,
         .width = screen_width,
-        .height = screen_height - 1, // last row = status line
+        .height = screen_height - 1,
     };
-    recalculateNode(r, content_rect);
+
+    for (self.floats.items) |f| {
+        const anchor = self.resolveAnchor(f.config.relative, editor_rect) orelse editor_rect;
+
+        // Anchor origin point: anchor.{x,y} + offsets. Use signed math
+        // so a negative offset (e.g. SW with row_offset = -2) is
+        // expressible without underflowing u16.
+        const anchor_x: i32 = @as(i32, anchor.x) + f.config.col_offset;
+        const anchor_y: i32 = @as(i32, anchor.y) + f.config.row_offset;
+
+        const sized = self.sizeForFloat(f, editor_rect);
+        const w: i32 = sized.width;
+        const h: i32 = sized.height;
+
+        // Corner alignment: the anchor point becomes the named corner
+        // of the float, so SE means anchor = bottom-right cell.
+        const top_left_x: i32 = switch (f.config.corner) {
+            .NW, .SW => anchor_x,
+            .NE, .SE => anchor_x - w + 1,
+        };
+        const top_left_y: i32 = switch (f.config.corner) {
+            .NW, .NE => anchor_y,
+            .SW, .SE => anchor_y - h + 1,
+        };
+
+        // Clamp to fit on screen (truncate width/height if the rect
+        // would overrun). This matches Neovim's "truncated to fit"
+        // semantics; explicit `fixed = true` would disable the clamp
+        // but is out of scope for slice 2.
+        const screen_max_x: i32 = @as(i32, editor_rect.x) + @as(i32, editor_rect.width);
+        const screen_max_y: i32 = @as(i32, editor_rect.y) + @as(i32, editor_rect.height);
+
+        var x = top_left_x;
+        var y = top_left_y;
+        var fw = w;
+        var fh = h;
+
+        if (x < @as(i32, editor_rect.x)) {
+            // Negative-overflow: shift right and shrink width.
+            const shift = @as(i32, editor_rect.x) - x;
+            x = editor_rect.x;
+            fw -= shift;
+        }
+        if (y < @as(i32, editor_rect.y)) {
+            const shift = @as(i32, editor_rect.y) - y;
+            y = editor_rect.y;
+            fh -= shift;
+        }
+        if (x + fw > screen_max_x) fw = screen_max_x - x;
+        if (y + fh > screen_max_y) fh = screen_max_y - y;
+
+        if (fw <= 0 or fh <= 0) {
+            // Float would be entirely off-screen; collapse to a 1x1 at
+            // the editor's NW corner so the FloatNode stays addressable
+            // but the compositor's `< 2` width/height guard skips it.
+            f.rect = .{ .x = editor_rect.x, .y = editor_rect.y, .width = 0, .height = 0 };
+            continue;
+        }
+
+        f.rect = .{
+            .x = @intCast(x),
+            .y = @intCast(y),
+            .width = @intCast(fw),
+            .height = @intCast(fh),
+        };
+    }
+}
+
+/// Resolve a float's anchor source to a screen rect. `editor` is the
+/// content area minus the status row; `cursor` is the orchestrator's
+/// per-frame cursor cell; `win` is a slice-3 stub returning null.
+fn resolveAnchor(self: *const Layout, kind: FloatAnchor, editor_rect: Rect) ?Rect {
+    return switch (kind) {
+        .editor => editor_rect,
+        .cursor => self.cursor_anchor,
+        .win => null,
+    };
+}
+
+/// Resolve the float's size from explicit width/height or from
+/// size-to-content bounds. Falls back to the float's existing rect
+/// when neither path applies (so a float opened with no size hints at
+/// all keeps whatever the caller seeded into `addFloat`).
+fn sizeForFloat(self: *const Layout, f: *const FloatNode, editor_rect: Rect) struct { width: i32, height: i32 } {
+    _ = self;
+    const explicit_w: ?u16 = f.config.width;
+    const explicit_h: ?u16 = f.config.height;
+
+    var width: i32 = if (explicit_w) |w| @as(i32, w) else @as(i32, f.rect.width);
+    var height: i32 = if (explicit_h) |h| @as(i32, h) else @as(i32, f.rect.height);
+
+    if (explicit_w == null and (f.config.min_width != null or f.config.max_width != null)) {
+        const longest_line = measureLongestLine(f.buffer);
+        // Pad by 2 for the left+right border glyphs so size-to-content
+        // measures the chrome-inclusive rect, matching what the
+        // compositor draws.
+        var content_w: i32 = @as(i32, @intCast(longest_line)) + 2;
+        if (f.config.min_width) |mn| {
+            if (content_w < @as(i32, mn)) content_w = mn;
+        }
+        if (f.config.max_width) |mx| {
+            if (content_w > @as(i32, mx)) content_w = mx;
+        }
+        if (content_w < 2) content_w = 2;
+        width = content_w;
+    }
+
+    if (explicit_h == null and (f.config.min_height != null or f.config.max_height != null)) {
+        const total_lines = f.buffer.lineCount() catch 0;
+        var content_h: i32 = @as(i32, @intCast(@min(total_lines, std.math.maxInt(i32) - 2))) + 2;
+        if (f.config.min_height) |mn| {
+            if (content_h < @as(i32, mn)) content_h = mn;
+        }
+        if (f.config.max_height) |mx| {
+            if (content_h > @as(i32, mx)) content_h = mx;
+        }
+        if (content_h < 2) content_h = 2;
+        height = content_h;
+    }
+
+    // Cap to editor rect so a runaway max_width can't request a width
+    // larger than the screen and confuse the clamp loop.
+    if (width > @as(i32, editor_rect.width)) width = editor_rect.width;
+    if (height > @as(i32, editor_rect.height)) height = editor_rect.height;
+    if (width < 0) width = 0;
+    if (height < 0) height = 0;
+    return .{ .width = width, .height = height };
+}
+
+/// Measure the longest line width (in cells) the buffer would render.
+/// Walks the styled spans returned by `getVisibleLines` and sums their
+/// `text.len` per line. Falls back to 0 on any buffer-side error so
+/// the caller treats it as "no content" and clamps to `min_*`.
+///
+/// Risk #2 from the plan: this approximates display width with
+/// byte length, which is correct for ASCII content (the picker's
+/// "[N] provider/model" lines today) but undercounts wide CJK and
+/// overcounts combining marks. A future slice can swap to the
+/// grapheme-cluster width API once we have a non-ASCII consumer.
+fn measureLongestLine(buf: Buffer) usize {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const total = buf.lineCount() catch return 0;
+    if (total == 0) return 0;
+
+    // Cap the scan so a buffer with millions of lines doesn't stall the
+    // frame. Real consumers (pickers, popups) are well under this.
+    const max_scan: usize = 1024;
+    const scan_count = if (total > max_scan) max_scan else total;
+
+    const Theme = @import("Theme.zig");
+    const theme = Theme.defaultTheme();
+
+    const lines = buf.getVisibleLines(arena.allocator(), arena.allocator(), &theme, 0, scan_count) catch return 0;
+    var longest: usize = 0;
+    for (lines.items) |line| {
+        var width: usize = 0;
+        for (line.spans) |s| width += s.text.len;
+        if (width > longest) longest = width;
+    }
+    return longest;
 }
 
 /// Return the focused leaf, or null if no root is set.
@@ -1107,6 +1356,98 @@ test "addFloat exhaustion returns an error and never collides with live floats" 
         error.FloatHandleSpaceExhausted,
         layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{}),
     );
+}
+
+test "recalculateFloats positions cursor-anchored float at the focused leaf's prompt cursor" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    // Cursor anchor matches what the orchestrator publishes from a
+    // focused leaf with a 3-char draft: prompt row at the bottom of
+    // a 24-row screen, cursor col after the prompt glyph + draft len.
+    layout.cursor_anchor = .{ .x = 7, .y = 22, .width = 1, .height = 1 };
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const handle = try layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 12, .height = 4 }, .{
+        .relative = .cursor,
+        .corner = .NW,
+        .row_offset = -5,
+        .col_offset = 0,
+        .width = 12,
+        .height = 4,
+    });
+
+    layout.recalculate(80, 24);
+
+    const rect = layout.rectFor(handle).?;
+    try std.testing.expectEqual(@as(u16, 7), rect.x);
+    // anchor.y (22) + row_offset (-5) = 17
+    try std.testing.expectEqual(@as(u16, 17), rect.y);
+    try std.testing.expectEqual(@as(u16, 12), rect.width);
+    try std.testing.expectEqual(@as(u16, 4), rect.height);
+}
+
+test "recalculateFloats clamps floats whose rect would extend past the screen" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    // Editor anchor at (0,0,80,23): a 60-wide float with col_offset=50
+    // would end at col 110, well past the right edge. Clamp must
+    // truncate width so the rect stays inside the editor area.
+    const handle = try layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 60, .height = 4 }, .{
+        .relative = .editor,
+        .corner = .NW,
+        .col_offset = 50,
+        .row_offset = 2,
+        .width = 60,
+        .height = 4,
+    });
+
+    layout.recalculate(80, 24);
+    const rect = layout.rectFor(handle).?;
+
+    try std.testing.expectEqual(@as(u16, 50), rect.x);
+    try std.testing.expectEqual(@as(u16, 2), rect.y);
+    // Truncated to fit: 80 - 50 = 30 cells of width.
+    try std.testing.expectEqual(@as(u16, 30), rect.width);
+    try std.testing.expectEqual(@as(u16, 4), rect.height);
+}
+
+test "recalculateFloats sizes a float to longest-line bounded by max_width" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var cb = try ConversationBuffer.init(allocator, 0, "picker");
+    defer cb.deinit();
+    // Three lines, longest is 14 chars. We bound max_width to 10 so
+    // the size-to-content path picks the bound, not the full width.
+    _ = try cb.appendNode(null, .user_message, "abc");
+    _ = try cb.appendNode(null, .user_message, "abcdefghijklmn");
+    _ = try cb.appendNode(null, .user_message, "abcdef");
+
+    const handle = try layout.addFloat(cb.buf(), .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
+        .relative = .editor,
+        .corner = .NW,
+        .min_width = 4,
+        .max_width = 10,
+        .min_height = 3,
+        .max_height = 8,
+    });
+
+    layout.recalculate(80, 24);
+    const rect = layout.rectFor(handle).?;
+
+    // Capped at max_width (10).
+    try std.testing.expectEqual(@as(u16, 10), rect.width);
+    // Height: ConversationBuffer renders user messages with prompt
+    // glyphs / spacing; the exact line count is not load-bearing
+    // here, only that it sits in [min_height, max_height].
+    try std.testing.expect(rect.height >= 3);
+    try std.testing.expect(rect.height <= 8);
 }
 
 test "resizeSplit clamps ratio to valid open interval" {

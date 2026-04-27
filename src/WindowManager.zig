@@ -672,6 +672,29 @@ pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
     }
     try jw.endObject();
 
+    // Floats are a parallel namespace: handles live in the same
+    // `n<u32>` string format but addressed via Layout.floats rather
+    // than node_registry. Plugins enumerate them through this array
+    // (slice 2 surfaces them; slice 3 will add float_move/float_raise
+    // primitives keyed on these handles).
+    try jw.objectField("floats");
+    try jw.beginArray();
+    for (self.layout.floats.items) |f| {
+        const id = try NodeRegistry.formatId(alloc, f.handle);
+        defer alloc.free(id);
+        try jw.write(id);
+    }
+    try jw.endArray();
+
+    try jw.objectField("focused_float");
+    if (self.layout.focused_float) |ff| {
+        const id = try NodeRegistry.formatId(alloc, ff);
+        defer alloc.free(id);
+        try jw.write(id);
+    } else {
+        try jw.write(null);
+    }
+
     try jw.endObject();
     return try aw.toOwnedSlice();
 }
@@ -1310,6 +1333,11 @@ pub fn openFloatPane(
         self.layout.focused_float = handle;
     }
 
+    // Resolve the float's anchor + size against the live screen now so
+    // the FloatNode rect is correct on the very first frame; without
+    // this the seed rect (passed in by openFloatPane) is what the
+    // compositor draws until the next handleResize.
+    self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     return handle;
 }
@@ -4261,4 +4289,189 @@ test "deinit tears down extra_floats with no leaks" {
     _ = try wm.openFloatPane(buf2, .{ .x = 5, .y = 5, .width = 10, .height = 4 }, .{ .title = "second" });
 
     wm.deinit();
+}
+
+test "zag.layout.tree returns floats and focused_float fields" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Open the picker so a float exists to surface in zag.layout.tree.
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    f.engine.invokeCallback(cmd.lua_callback);
+
+    try f.engine.lua.doString(
+        \\_t = zag.layout.tree()
+        \\_floats_kind = type(_t.floats)
+        \\_floats_n = #_t.floats
+        \\_focused = _t.focused_float
+    );
+
+    _ = try f.engine.lua.getGlobal("_floats_kind");
+    defer f.engine.lua.pop(1);
+    const kind = try f.engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("table", kind);
+
+    _ = try f.engine.lua.getGlobal("_floats_n");
+    defer f.engine.lua.pop(1);
+    const n = try f.engine.lua.toInteger(-1);
+    try std.testing.expectEqual(@as(@TypeOf(n), 1), n);
+
+    _ = try f.engine.lua.getGlobal("_focused");
+    defer f.engine.lua.pop(1);
+    try std.testing.expectEqual(@import("zlua").LuaType.string, f.engine.lua.typeOf(-1));
+}
+
+test "zag.layout.float accepts relative=cursor and corner=NE/SW/SE" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Create a scratch buffer through zag.buffer.create so we have a
+    // valid `b<u32>` handle; zag.layout.float expects that handle
+    // string in arg 1.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\zag.buffer.set_lines(_buf, { "hello" })
+        \\
+        \\_h_cursor = zag.layout.float(_buf, {
+        \\  relative = "cursor",
+        \\  row = 0, col = 0,
+        \\  width = 10, height = 4,
+        \\  corner = "NE",
+        \\})
+        \\
+        \\_h_sw = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 5, col = 5,
+        \\  width = 10, height = 4,
+        \\  corner = "SW",
+        \\})
+        \\
+        \\_h_se = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 5, col = 5,
+        \\  width = 10, height = 4,
+        \\  corner = "SE",
+        \\})
+    );
+
+    // All four float ids exist (handles are non-empty strings).
+    _ = try f.engine.lua.getGlobal("_h_cursor");
+    defer f.engine.lua.pop(1);
+    const cursor_id = try f.engine.lua.toString(-1);
+    try std.testing.expect(cursor_id.len > 0);
+
+    _ = try f.engine.lua.getGlobal("_h_sw");
+    defer f.engine.lua.pop(1);
+    const sw_id = try f.engine.lua.toString(-1);
+    try std.testing.expect(sw_id.len > 0);
+
+    _ = try f.engine.lua.getGlobal("_h_se");
+    defer f.engine.lua.pop(1);
+    const se_id = try f.engine.lua.toString(-1);
+    try std.testing.expect(se_id.len > 0);
+
+    // Three floats now live on the layout.
+    try std.testing.expectEqual(@as(usize, 3), f.layout.floats.items.len);
+}
+
+test "zag.layout.float rejects an unknown corner" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\_ok, _err = pcall(function()
+        \\  return zag.layout.float(_buf, {
+        \\    relative = "editor",
+        \\    row = 0, col = 0,
+        \\    width = 10, height = 4,
+        \\    corner = "WAT",
+        \\  })
+        \\end)
+    );
+
+    _ = try f.engine.lua.getGlobal("_ok");
+    defer f.engine.lua.pop(1);
+    try std.testing.expect(!f.engine.lua.toBoolean(-1));
+}
+
+test "describe surfaces floats array and focused_float" {
+    const allocator = std.testing.allocator;
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    const Theme = @import("Theme.zig");
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(80, 24);
+
+    const bh = try wm.buffer_registry.createScratch("picker");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const handle = try wm.openFloatPane(
+        scratch_buf,
+        .{ .x = 10, .y = 4, .width = 30, .height = 8 },
+        .{ .title = "Models", .enter = true },
+    );
+
+    const bytes = try wm.describe(allocator);
+    defer allocator.free(bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const floats_val = parsed.value.object.get("floats") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(floats_val == .array);
+    try std.testing.expectEqual(@as(usize, 1), floats_val.array.items.len);
+
+    const expected_id = try NodeRegistry.formatId(allocator, handle);
+    defer allocator.free(expected_id);
+    try std.testing.expectEqualStrings(expected_id, floats_val.array.items[0].string);
+
+    const focused_val = parsed.value.object.get("focused_float") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(focused_val == .string);
+    try std.testing.expectEqualStrings(expected_id, focused_val.string);
 }

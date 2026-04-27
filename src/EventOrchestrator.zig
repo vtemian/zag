@@ -202,6 +202,7 @@ pub fn run(self: *EventOrchestrator) !void {
     var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
     var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
     const initial_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
+    self.publishCursorAnchor(initial_drafts);
     const initial_float_drafts = self.collectFloatDrafts(&float_drafts_buf);
     self.window_manager.compositor.composite(self.window_manager.layout, initial_drafts, initial_float_drafts, .{
         .mode = self.window_manager.current_mode,
@@ -365,6 +366,10 @@ fn tick(
     var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
     var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
     const tick_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
+    self.publishCursorAnchor(tick_drafts);
+    // After publishing the cursor anchor, re-resolve float rects so
+    // cursor-anchored floats track the prompt cursor as it moves.
+    self.window_manager.layout.recalculateFloats(self.screen.width, self.screen.height);
     const tick_float_drafts = self.collectFloatDrafts(&float_drafts_buf);
     self.window_manager.compositor.composite(self.window_manager.layout, tick_drafts, tick_float_drafts, .{
         .mode = self.window_manager.current_mode,
@@ -605,6 +610,37 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
     const screen_x: u16 = ev.x - 1;
     const screen_y: u16 = ev.y - 1;
 
+    // Floats sit on top of the tile tree, so a click that lands inside
+    // a float's rect must route to that float (and on a press also
+    // make it the focused float). Walk in reverse z-order so the
+    // top-most float wins. Only floats with `mouse=true` participate.
+    const layout = self.window_manager.layout;
+    var i: usize = layout.floats.items.len;
+    while (i > 0) {
+        i -= 1;
+        const f = layout.floats.items[i];
+        if (!f.config.mouse) continue;
+        const rect = f.rect;
+        if (rect.width == 0 or rect.height == 0) continue;
+        if (screen_x < rect.x or screen_x >= rect.x + rect.width) continue;
+        if (screen_y < rect.y or screen_y >= rect.y + rect.height) continue;
+
+        // On press (not release/drag), promote this float to focused.
+        // The kind enum from `input.MouseEvent` distinguishes button
+        // edges from motion; we only re-focus on a real button press
+        // so a drag that exits and re-enters the float doesn't keep
+        // toggling focus.
+        if (ev.kind == .press and f.config.focusable) {
+            self.window_manager.layout.focused_float = f.handle;
+            self.window_manager.compositor.layout_dirty = true;
+        }
+
+        const local_x = screen_x - rect.x;
+        const local_y = screen_y - rect.y;
+        _ = f.buffer.onMouse(ev, local_x, local_y);
+        return;
+    }
+
     var leaves: [64]*Layout.LayoutNode = undefined;
     var count: usize = 0;
     self.window_manager.layout.visibleLeaves(&leaves, &count);
@@ -617,6 +653,58 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         _ = node.leaf.buffer.onMouse(ev, local_x, local_y);
         return;
     }
+}
+
+/// Compute the focused tile's prompt cursor cell and publish it to
+/// `Layout.cursor_anchor` so cursor-anchored floats can pin to it.
+/// When the focused leaf is too small for a prompt row, or the focus
+/// is on a float (the cursor anchor follows the underlying tile, not
+/// the float itself), publishes null so floats fall back to editor.
+fn publishCursorAnchor(self: *EventOrchestrator, leaf_drafts: []const Compositor.LeafDraft) void {
+    const layout = self.window_manager.layout;
+    const focused_node = layout.focused orelse {
+        layout.cursor_anchor = null;
+        return;
+    };
+    const leaf = switch (focused_node.*) {
+        .leaf => &focused_node.leaf,
+        .split => {
+            layout.cursor_anchor = null;
+            return;
+        },
+    };
+    if (leaf.rect.height < 4 or leaf.rect.width < 4) {
+        layout.cursor_anchor = null;
+        return;
+    }
+
+    const theme = self.window_manager.compositor.theme;
+    const prompt_row = leaf.rect.y + leaf.rect.height - 2;
+    const content_x = leaf.rect.x + 1 + theme.spacing.padding_h;
+
+    // Drafts can be missing for scratch panes; treat as empty draft so
+    // the cursor still publishes at the prompt-glyph + space tail.
+    var draft: []const u8 = "";
+    for (leaf_drafts) |entry| {
+        if (entry.leaf == leaf) {
+            draft = entry.draft;
+            break;
+        }
+    }
+
+    // `\u{203A} ` is the prompt glyph plus a trailing space, two
+    // visual cells. Cursor sits one cell after the draft, matching
+    // Compositor.drawPanePrompt.
+    const after_prompt: u16 = content_x +| 2;
+    const draft_len: u16 = @intCast(@min(draft.len, std.math.maxInt(u16)));
+    const cursor_col: u16 = after_prompt +| draft_len;
+
+    layout.cursor_anchor = .{
+        .x = cursor_col,
+        .y = prompt_row,
+        .width = 1,
+        .height = 1,
+    };
 }
 
 // -- Helpers -----------------------------------------------------------------
@@ -930,5 +1018,125 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
 
     // Move the (possibly mutated) WindowManager back so `defer wm.deinit()`
     // frees the canonical copy.
+    wm.* = orch.window_manager;
+}
+
+test "mouse click on a focusable float makes it the focused float" {
+    const allocator = std.testing.allocator;
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    const TestNullSink = struct {
+        fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+        fn deinitVT(_: *anyopaque) void {}
+        const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+        fn sink() Sink {
+            return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+        }
+    };
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: WindowManager.Pane = .{
+        .buffer = view.buf(),
+        .view = &view,
+        .session = &session_scratch,
+        .runner = &runner,
+    };
+    var session_mgr: ?Session.SessionManager = null;
+
+    var command_registry = CommandRegistry.init(allocator);
+    defer command_registry.deinit();
+    try command_registry.registerBuiltIn("/quit", .quit);
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .command_registry = &command_registry,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(80, 24);
+
+    // Two floats: a low-z one in the NW, a high-z one (50) overlapping
+    // the same area. The mouse hit-test must walk reverse-z so the
+    // top-most float (the second one we add) wins the click.
+    const bh1 = try wm.buffer_registry.createScratch("bg");
+    const bh2 = try wm.buffer_registry.createScratch("top");
+    const buf1 = try wm.buffer_registry.asBuffer(bh1);
+    const buf2 = try wm.buffer_registry.asBuffer(bh2);
+
+    _ = try wm.openFloatPane(buf1, .{ .x = 5, .y = 5, .width = 20, .height = 6 }, .{
+        .relative = .editor,
+        .col_offset = 5,
+        .row_offset = 5,
+        .width = 20,
+        .height = 6,
+        .z = 25,
+        .enter = false,
+        .focusable = true,
+        .mouse = true,
+    });
+    const top_handle = try wm.openFloatPane(buf2, .{ .x = 5, .y = 5, .width = 20, .height = 6 }, .{
+        .relative = .editor,
+        .col_offset = 5,
+        .row_offset = 5,
+        .width = 20,
+        .height = 6,
+        .z = 75,
+        .enter = false,
+        .focusable = true,
+        .mouse = true,
+    });
+
+    // Force focus off both floats so the test exercises the
+    // re-focus-on-press behavior, not the initial enter=true path.
+    layout.focused_float = null;
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = wm.*;
+
+    // SGR mouse coords are 1-based; cell (10, 7) is well inside both
+    // floats (rect.x=5, rect.y=5, w=20, h=6 → x ∈ [5..25), y ∈ [5..11)).
+    const ev: input.MouseEvent = .{
+        .button = 0,
+        .x = 11,
+        .y = 8,
+        .modifiers = .{},
+        .is_press = true,
+        .kind = .press,
+    };
+    orch.handleMouse(ev);
+
+    const focused = orch.window_manager.layout.focused_float orelse {
+        wm.* = orch.window_manager;
+        return error.TestExpectedFloatFocused;
+    };
+    try std.testing.expectEqual(top_handle.index, focused.index);
+    try std.testing.expectEqual(top_handle.generation, focused.generation);
+
     wm.* = orch.window_manager;
 }
