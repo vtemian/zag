@@ -1140,3 +1140,126 @@ test "mouse click on a focusable float makes it the focused float" {
 
     wm.* = orch.window_manager;
 }
+
+test "handleKey routes a printable char to the focused float's pane draft" {
+    // When `layout.focused_float` is set, getFocusedPanePtr must return
+    // the float's pane (not the underlying tile leaf), so a printable
+    // keystroke in insert mode lands on the float's draft. This guards
+    // the routing wired up in slice 1 (focused_float wins in
+    // getFocusedPanePtr) once slice 2 made floats focusable for real.
+    const allocator = std.testing.allocator;
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    const TestNullSink = struct {
+        fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+        fn deinitVT(_: *anyopaque) void {}
+        const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+        fn sink() Sink {
+            return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+        }
+    };
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: WindowManager.Pane = .{
+        .buffer = view.buf(),
+        .view = &view,
+        .session = &session_scratch,
+        .runner = &runner,
+    };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    var command_registry = CommandRegistry.init(allocator);
+    defer command_registry.deinit();
+    try command_registry.registerBuiltIn("/quit", .quit);
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .command_registry = &command_registry,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(80, 24);
+
+    // Open a focusable float with `enter = true` so it becomes the
+    // focused float. The float's buffer is a scratch (no runner), so
+    // the printable-char arm of the orchestrator lands in
+    // `Pane.handleKey` -> `appendToDraft`.
+    const bh = try wm.buffer_registry.createScratch("float-draft");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const float_handle = try wm.openFloatPane(
+        scratch_buf,
+        .{ .x = 10, .y = 5, .width = 20, .height = 6 },
+        .{
+            .relative = .editor,
+            .col_offset = 10,
+            .row_offset = 5,
+            .width = 20,
+            .height = 6,
+            .z = 50,
+            .enter = true,
+            .focusable = true,
+            .mouse = true,
+        },
+    );
+    defer wm.closeFloatById(float_handle) catch {};
+
+    // Sanity: the float owns focus, and getFocusedPanePtr resolves to
+    // the float's pane (not the root pane).
+    try std.testing.expect(layout.focused_float != null);
+    const focused_pane_ptr = wm.getFocusedPanePtr();
+    try std.testing.expectEqual(scratch_buf.ptr, focused_pane_ptr.buffer.ptr);
+    try std.testing.expect(focused_pane_ptr != &wm.root_pane);
+
+    // Insert mode is required for printable chars to reach the
+    // fall-through arm that delegates to Pane.handleKey.
+    wm.current_mode = .insert;
+
+    // Move the WindowManager value into the orchestrator (single-owner
+    // discipline; mirrors the scratch-pane test above) so handleKey
+    // operates on the canonical state.
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = wm.*;
+
+    const ev: input.KeyEvent = .{ .key = .{ .char = 'h' }, .modifiers = .{} };
+    const action = orch.handleKey(ev);
+    try std.testing.expectEqual(Action.redraw, action);
+
+    // The float's pane received the byte; the root pane's draft must
+    // remain empty (proving the route did not fall back to root).
+    const float_pane = orch.window_manager.paneFromFloatHandle(float_handle) orelse {
+        wm.* = orch.window_manager;
+        return error.TestExpectedFloatPane;
+    };
+    try std.testing.expectEqualStrings("h", float_pane.getDraft());
+    try std.testing.expectEqual(@as(usize, 0), orch.window_manager.root_pane.draft_len);
+
+    // Move the (mutated) WindowManager back so deinit frees the canon.
+    wm.* = orch.window_manager;
+}

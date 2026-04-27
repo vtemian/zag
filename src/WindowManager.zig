@@ -4402,6 +4402,37 @@ test "zag.layout.float rejects an unknown corner" {
     try std.testing.expect(!f.engine.lua.toBoolean(-1));
 }
 
+test "zag.layout.float requires a width/min_width/max_width signal" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // No width, no min_width, no max_width: zag.layout.float must reject
+    // rather than silently produce a 0-cell float that disappears.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\_ok, _err = pcall(function()
+        \\  return zag.layout.float(_buf, {
+        \\    relative = "editor",
+        \\    row = 0, col = 0,
+        \\  })
+        \\end)
+    );
+
+    _ = try f.engine.lua.getGlobal("_ok");
+    defer f.engine.lua.pop(1);
+    try std.testing.expect(!f.engine.lua.toBoolean(-1));
+
+    _ = try f.engine.lua.getGlobal("_err");
+    defer f.engine.lua.pop(1);
+    const err_msg = try f.engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "width") != null);
+
+    // No floats should have been registered.
+    try std.testing.expectEqual(@as(usize, 0), f.layout.floats.items.len);
+}
+
 test "describe surfaces floats array and focused_float" {
     const allocator = std.testing.allocator;
 
