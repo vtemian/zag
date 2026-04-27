@@ -1,0 +1,21 @@
+# Real-provider smoke: drives one chat turn through whatever provider/model
+# is currently set as default in ~/.config/zag/config.lua, using the user's
+# real ~/.config/zag/auth.json. No --mock flag means the harness leaves
+# $HOME alone, so zag picks up the real config the same way it does in a
+# normal terminal session.
+#
+# Probabilistic by design: we don't expect_text the model output (gpt-5.2
+# won't say the same words twice). We only assert the welcome banner,
+# wait long enough for first-token latency + a short reply, snapshot the
+# screen so we can eyeball the artifact, and then /quit cleanly. A
+# regression in real-provider plumbing (auth, streaming, SSE parser)
+# would either time out at wait_idle or trip wait_exit's crash check.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "say hi in three words" <Enter>
+wait_idle 20s
+snapshot final
+send "/quit" <Enter>
+wait_exit

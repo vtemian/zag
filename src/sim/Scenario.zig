@@ -32,10 +32,6 @@ pub const RunOptions = struct {
     /// Default timeout for `wait_text` / `wait_exit` when the step itself
     /// doesn't specify one. Per-step overrides arrive in a later task.
     wait_default_ms: u32 = 10_000,
-    /// Path to a mock-provider script. When set, the runner stands up an
-    /// in-process HTTP mock + throwaway `config.lua` before any `spawn`
-    /// step runs, and points the child's `$HOME` at the scaffolded dir.
-    mock_script_path: ?[]const u8 = null,
 };
 
 /// Readable cap on scenario file size. Scenarios are hand-written; anything
@@ -77,13 +73,6 @@ fn runSourceImpl(
     // post-run record; losing it because parse failed defeats its purpose.
     defer summary.flush() catch {};
 
-    // Tail zag's own log into artifacts before flushing summary. We need to
-    // do this *before* `r.deinit()` runs (which deletes the mock tempdir and
-    // takes the log with it), but the structure here is `r` declared below
-    // with `defer r.deinit()`. Defer order is LIFO, so a `defer` on the
-    // tailer registered *after* the runner's defer fires *before* it. Done
-    // inline below right after Runner.init.
-
     const steps = Dsl.parse(alloc, src) catch |e| {
         summary.outcome = .harness_error;
         summary.failing_error = @errorName(e);
@@ -97,22 +86,11 @@ fn runSourceImpl(
     var r = try Runner.init(alloc);
     defer r.deinit();
     // Registered after r.init so they fire *before* r.deinit (LIFO defer).
-    // The mock harness's tempdir is the spawned zag's $HOME; tail the log
-    // and emit the crash report before deinit yanks the directory.
+    // Tail the user's real ~/.local/share/zag log and write the crash report
+    // while the child's status is still observable.
     defer {
         r.writeCrashReportIfBad(opts.artifacts) catch {};
-        if (r.mock) |h| opts.artifacts.tailZagLog(h.tmp_root) catch {};
-    }
-
-    if (opts.mock_script_path) |mock_path| {
-        r.attachMock(mock_path) catch |e| {
-            summary.outcome = .harness_error;
-            summary.failing_error = @errorName(e);
-            return RunResult{
-                .outcome = .harness_error,
-                .error_name = @errorName(e),
-            };
-        };
+        if (r.env.get("HOME")) |home| opts.artifacts.tailZagLog(home) catch {};
     }
 
     for (steps, 0..) |step, idx| {
