@@ -677,10 +677,9 @@ fn drawPaneTitle(self: *Compositor, rect: Layout.Rect, name: []const u8, border:
 
 /// Draw every float on top of the tiled tree. Each float clears its
 /// rect, paints the buffer content inside the chrome, then draws the
-/// border + title. Slice 1 floats are scratch-backed pickers without a
-/// prompt row, so the prompt-row reservation is disabled here.
+/// border + title. The focused float gets the focused-border highlight
+/// and (in insert mode) a cursor block at the end of its draft.
 fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputState) void {
-    _ = input;
     for (float_drafts) |fd| {
         const float = fd.float;
         const rect = float.rect;
@@ -693,6 +692,26 @@ fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputS
 
         self.drawBufferIntoRect(float.buffer, rect, false);
         self.drawRoundedBox(rect, fd.focused, float.config.title, float.config.border);
+
+        // Insert-mode cursor block for the focused float. Floats today
+        // don't reserve their own prompt row (the picker pattern reads
+        // keys directly through buffer-scoped keymaps), but a focused
+        // float in insert mode still wants a block-cursor hint at the
+        // float's NW interior cell so the user sees keystrokes are
+        // landing there. This is intentionally a single-cell hint, not
+        // a full prompt row; slice 3 will revisit if drafts move onto
+        // floats.
+        if (fd.focused and input.mode == .insert) {
+            const cursor_row = rect.y + 1;
+            const cursor_col = rect.x + 1;
+            if (cursor_row < self.screen.height and cursor_col < self.screen.width) {
+                const cell = self.screen.getCell(cursor_row, cursor_col);
+                cell.codepoint = ' ';
+                cell.style = .{};
+                cell.fg = self.theme.colors.fg;
+                cell.bg = self.theme.colors.accent;
+            }
+        }
     }
 }
 
@@ -1493,6 +1512,68 @@ test "scratch leaf still renders correctly with a float overhead" {
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
+}
+
+test "focused float draws with the focused border highlight" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    defer root_cb.deinit();
+    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    defer float_cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(root_cb.buf());
+    layout.recalculate(40, 12);
+
+    const rect: Layout.Rect = .{ .x = 6, .y = 2, .width = 20, .height = 6 };
+    _ = try layout.addFloat(float_cb.buf(), rect, .{ .border = .rounded, .title = "f" });
+
+    const float_drafts = [_]Compositor.FloatDraft{
+        .{ .float = layout.floats.items[0], .draft = "", .focused = true },
+    };
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &float_drafts, .{ .mode = .normal });
+
+    const focused = Theme.resolve(theme.highlights.border_focused, &theme);
+    try std.testing.expect(std.meta.eql(screen.getCellConst(rect.y, rect.x).fg, focused.fg));
+}
+
+test "non-focused float draws with the plain border highlight" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    defer root_cb.deinit();
+    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    defer float_cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(root_cb.buf());
+    layout.recalculate(40, 12);
+
+    const rect: Layout.Rect = .{ .x = 6, .y = 2, .width = 20, .height = 6 };
+    _ = try layout.addFloat(float_cb.buf(), rect, .{ .border = .rounded, .title = "f" });
+
+    const float_drafts = [_]Compositor.FloatDraft{
+        .{ .float = layout.floats.items[0], .draft = "", .focused = false },
+    };
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &float_drafts, .{ .mode = .normal });
+
+    const plain = Theme.resolve(theme.highlights.border, &theme);
+    try std.testing.expect(std.meta.eql(screen.getCellConst(rect.y, rect.x).fg, plain.fg));
 }
 
 test "tiny pane (height 3) skips the prompt reservation" {

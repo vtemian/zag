@@ -2744,17 +2744,23 @@ pub const LuaEngine = struct {
     }
 
     /// `zag.layout.float(buffer_handle, opts)`: open a floating pane
-    /// over the tiled tree. Slice 1 only accepts `relative = "editor"`
-    /// floats anchored by absolute `(row, col)` and explicit
-    /// `(width, height)`. Returns the float's stable handle string.
+    /// over the tiled tree. Returns the float's stable handle string.
     ///
     /// Required opts:
-    ///   * `relative = "editor"` (only value accepted in slice 1)
-    ///   * `row`, `col`, `width`, `height` (integers; clamped to u16)
+    ///   * `relative = "editor" | "cursor"` (slice 2; "win"/"mouse"/...
+    ///     deferred to slice 3)
+    ///   * `row`, `col` (integers; offsets from the resolved anchor)
     /// Optional opts:
+    ///   * `width`, `height` (explicit size; integers)
+    ///   * `min_width`, `max_width`, `min_height`, `max_height`
+    ///     (size-to-content bounds; ignored when width/height is set)
+    ///   * `corner` ("NW" | "NE" | "SW" | "SE"; default "NW")
     ///   * `border` ("none" | "square" | "rounded"; default "rounded")
     ///   * `title` (string)
     ///   * `zindex` (integer; default 50)
+    ///   * `focusable` (bool; default true)
+    ///   * `mouse` (bool; default true)
+    ///   * `enter` (bool; default true)
     fn zagLayoutFloatFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const wm = engine.window_manager orelse {
@@ -2780,16 +2786,15 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.layout.float: stale buffer handle", .{});
         };
 
-        // Arg 2: options table. Required for slice 1 since position +
-        // size are mandatory; later slices will let `relative = "win"`
-        // skip many of these.
+        // Arg 2: options table. Required since at minimum we need
+        // `relative` + `row`/`col` (offsets) to anchor the float.
         if (!lua.isTable(2)) {
             lua.raiseErrorStr("zag.layout.float: opts must be a table", .{});
         }
 
-        // `relative` — only "editor" in slice 1. Each field read pops
-        // immediately after the value is consumed so the stack stays
-        // clean and `pushString(id)` at the end is the unambiguous top.
+        // `relative` — slice 2 accepts "editor" and "cursor". Each
+        // field read pops immediately so the stack stays clean and the
+        // final `pushString(id)` is the unambiguous top.
         _ = lua.getField(2, "relative");
         if (lua.typeOf(-1) != .string) {
             lua.raiseErrorStr("zag.layout.float: relative must be a string", .{});
@@ -2797,18 +2802,63 @@ pub const LuaEngine = struct {
         const relative = lua.toString(-1) catch {
             lua.raiseErrorStr("zag.layout.float: relative must be a string", .{});
         };
-        if (!std.mem.eql(u8, relative, "editor")) {
-            lua.raiseErrorStr("zag.layout.float: relative=\"editor\" is the only value supported in slice 1", .{});
+        var anchor: Layout.FloatAnchor = .editor;
+        if (std.mem.eql(u8, relative, "editor")) {
+            anchor = .editor;
+        } else if (std.mem.eql(u8, relative, "cursor")) {
+            anchor = .cursor;
+        } else {
+            lua.raiseErrorStr("zag.layout.float: relative must be \"editor\" or \"cursor\"", .{});
         }
         lua.pop(1);
 
-        const row = readU16Field(lua, 2, "row", "zag.layout.float");
-        const col = readU16Field(lua, 2, "col", "zag.layout.float");
-        const width = readU16Field(lua, 2, "width", "zag.layout.float");
-        const height = readU16Field(lua, 2, "height", "zag.layout.float");
-        if (width == 0 or height == 0) {
-            lua.raiseErrorStr("zag.layout.float: width and height must be positive", .{});
+        const row_offset = readI32Field(lua, 2, "row", "zag.layout.float");
+        const col_offset = readI32Field(lua, 2, "col", "zag.layout.float");
+
+        const width_opt = readOptionalU16Field(lua, 2, "width", "zag.layout.float");
+        const height_opt = readOptionalU16Field(lua, 2, "height", "zag.layout.float");
+
+        const min_width = readOptionalU16Field(lua, 2, "min_width", "zag.layout.float");
+        const max_width = readOptionalU16Field(lua, 2, "max_width", "zag.layout.float");
+        const min_height = readOptionalU16Field(lua, 2, "min_height", "zag.layout.float");
+        const max_height = readOptionalU16Field(lua, 2, "max_height", "zag.layout.float");
+
+        // Float must have *some* way to determine its size. Either an
+        // explicit dimension or a min/max pair. Otherwise the float
+        // ends up at width=0 / height=0 and disappears, which is hard
+        // to debug from a test plugin.
+        if (width_opt == null and min_width == null and max_width == null) {
+            lua.raiseErrorStr("zag.layout.float: width or min_width/max_width is required", .{});
         }
+        if (height_opt == null and min_height == null and max_height == null) {
+            lua.raiseErrorStr("zag.layout.float: height or min_height/max_height is required", .{});
+        }
+
+        var corner: Layout.FloatCorner = .NW;
+        _ = lua.getField(2, "corner");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: corner must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "NW")) {
+                    corner = .NW;
+                } else if (std.mem.eql(u8, s, "NE")) {
+                    corner = .NE;
+                } else if (std.mem.eql(u8, s, "SW")) {
+                    corner = .SW;
+                } else if (std.mem.eql(u8, s, "SE")) {
+                    corner = .SE;
+                } else {
+                    lua.raiseErrorStr("zag.layout.float: corner must be \"NW\" | \"NE\" | \"SW\" | \"SE\"", .{});
+                }
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.float: corner must be a string", .{});
+            },
+        }
+        lua.pop(1);
 
         var border_kind: Layout.FloatBorder = .rounded;
         _ = lua.getField(2, "border");
@@ -2834,10 +2884,9 @@ pub const LuaEngine = struct {
         }
         lua.pop(1);
 
-        // Title bytes live in the Lua string interner: copy onto the
-        // engine allocator before calling into Layout (which dupes the
-        // bytes itself anyway, but we cannot risk the GC freeing the
-        // borrowed slice between getField and the addFloat call).
+        // Title bytes live in the Lua string interner: pop only after
+        // openFloatPane has handed them to Layout (which dupes the
+        // bytes onto its own allocator).
         var title_owned: ?[]const u8 = null;
         _ = lua.getField(2, "title");
         switch (lua.typeOf(-1)) {
@@ -2852,10 +2901,6 @@ pub const LuaEngine = struct {
                 lua.raiseErrorStr("zag.layout.float: title must be a string", .{});
             },
         }
-        // Defer the pop until after openFloatPane: the title slice
-        // borrows into the Lua string slot we'd otherwise release.
-        // `Layout.addFloat` dupes the bytes onto its own allocator
-        // before we pop, so the pop here is safe.
 
         var z: u32 = 50;
         _ = lua.getField(2, "zindex");
@@ -2876,15 +2921,37 @@ pub const LuaEngine = struct {
         }
         lua.pop(1);
 
+        const focusable = readOptionalBoolField(lua, 2, "focusable", "zag.layout.float") orelse true;
+        const mouse_flag = readOptionalBoolField(lua, 2, "mouse", "zag.layout.float") orelse true;
+        const enter = readOptionalBoolField(lua, 2, "enter", "zag.layout.float") orelse true;
+
+        // Seed rect: openFloatPane needs *some* rect for the FloatNode
+        // until `recalculateFloats` runs against the live screen. Use
+        // explicit width/height when given; otherwise fall back to
+        // min_* (or 1) so the seed clamps to a positive cell.
+        const seed_w: u16 = width_opt orelse (min_width orelse 1);
+        const seed_h: u16 = height_opt orelse (min_height orelse 1);
+
         const handle = wm.openFloatPane(
             buffer,
-            .{ .x = col, .y = row, .width = width, .height = height },
+            .{ .x = 0, .y = 0, .width = seed_w, .height = seed_h },
             .{
                 .border = border_kind,
                 .title = title_owned,
                 .z = z,
-                .focusable = true,
-                .enter = true,
+                .focusable = focusable,
+                .mouse = mouse_flag,
+                .enter = enter,
+                .relative = anchor,
+                .corner = corner,
+                .row_offset = row_offset,
+                .col_offset = col_offset,
+                .width = width_opt,
+                .height = height_opt,
+                .min_width = min_width,
+                .max_width = max_width,
+                .min_height = min_height,
+                .max_height = max_height,
             },
         ) catch |err| {
             lua.pop(1); // title
@@ -2902,6 +2969,60 @@ pub const LuaEngine = struct {
         defer engine.allocator.free(id);
         _ = lua.pushString(id);
         return 1;
+    }
+
+    /// Read an optional u16 from a Lua table; returns null when the
+    /// field is nil/missing. Pops the field after read.
+    fn readOptionalU16Field(lua: *Lua, tbl: i32, comptime name: [:0]const u8, comptime op: []const u8) ?u16 {
+        _ = lua.getField(tbl, name);
+        defer lua.pop(1);
+        switch (lua.typeOf(-1)) {
+            .nil, .none => return null,
+            .number => {},
+            else => lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{}),
+        }
+        const n = lua.toInteger(-1) catch {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{});
+        };
+        if (n < 0) {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " must be >= 0", .{});
+        }
+        if (n > std.math.maxInt(u16)) {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " exceeds u16 range", .{});
+        }
+        return @intCast(n);
+    }
+
+    /// Read a signed integer offset (i32). Default zero on missing.
+    fn readI32Field(lua: *Lua, tbl: i32, comptime name: [:0]const u8, comptime op: []const u8) i32 {
+        _ = lua.getField(tbl, name);
+        defer lua.pop(1);
+        switch (lua.typeOf(-1)) {
+            .nil, .none => return 0,
+            .number => {},
+            else => lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{}),
+        }
+        const n = lua.toInteger(-1) catch {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{});
+        };
+        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " exceeds i32 range", .{});
+        }
+        return @intCast(n);
+    }
+
+    /// Read an optional boolean field. Returns null on nil/missing,
+    /// the value on bool, raises on anything else.
+    fn readOptionalBoolField(lua: *Lua, tbl: i32, comptime name: [:0]const u8, comptime op: []const u8) ?bool {
+        _ = lua.getField(tbl, name);
+        defer lua.pop(1);
+        return switch (lua.typeOf(-1)) {
+            .nil, .none => null,
+            .boolean => lua.toBoolean(-1),
+            else => {
+                lua.raiseErrorStr(op ++ ": " ++ name ++ " must be a boolean", .{});
+            },
+        };
     }
 
     /// Read an integer field from a Lua table at stack index `tbl`,
