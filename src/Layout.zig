@@ -70,13 +70,21 @@ pub const LayoutNode = union(enum) {
 /// Border style for a floating pane's chrome.
 pub const FloatBorder = enum { none, square, rounded };
 
-/// Anchor source for a float's resolved screen rect. Slice 2 implements
-/// `editor` and `cursor`; `win` is reserved for slice 3 and currently
-/// resolves to null (the float is then clamped to the editor center).
-/// `mouse`, `bufpos`, `laststatus`, `tabline` are slice-3+ work; we
-/// model them as no-anchor today so a future slice can wire them up
-/// without a config-shape break.
-pub const FloatAnchor = enum { editor, cursor, win };
+/// Anchor source for a float's resolved screen rect.
+///
+/// * `editor`     full content area minus the global status row.
+/// * `cursor`     orchestrator-published cell at the focused tile's prompt.
+/// * `win`        another window's rect (resolved via `relative_to`).
+///                With `FloatConfig.bufpos != null`, the anchor is the
+///                screen cell of `(line, col)` inside the win's buffer
+///                after the leaf's scroll offset is applied; off-screen
+///                bufpos collapses the float (rect width/height = 0).
+///                Falls back to editor when the handle is stale.
+/// * `mouse`      orchestrator-published last-seen mouse cell.
+/// * `laststatus` the global status row (`(0, screen_h - 1, screen_w, 1)`).
+/// * `tabline`    placeholder for a future tabline; resolves to the top
+///                edge so tabline-anchored plugins still appear sensibly.
+pub const FloatAnchor = enum { editor, cursor, win, mouse, laststatus, tabline };
 
 /// Which corner of the float aligns to the resolved anchor point.
 pub const FloatCorner = enum { NW, NE, SW, SE };
@@ -102,11 +110,19 @@ pub const FloatConfig = struct {
     /// float.
     mouse: bool = true,
 
-    /// Anchor source. `editor` resolves to the screen rect minus the
-    /// status row; `cursor` reads `Layout.cursor_anchor`; `win` is a
-    /// slice-3 stub. The orchestrator updates `cursor_anchor` each
-    /// frame before calling `recalculate`.
+    /// Anchor source. The orchestrator updates `cursor_anchor` and
+    /// `mouse_anchor` each frame before calling `recalculate`; the
+    /// `win` and `bufpos` paths read from `Layout.rectFor(relative_to)`.
     relative: FloatAnchor = .editor,
+    /// Window handle for `relative = .win` and `.bufpos` resolution.
+    /// Null with `.win`/`.bufpos` falls through to editor anchor.
+    relative_to: ?NodeRegistry.Handle = null,
+    /// Buffer-position anchor as (line, col) within the `relative_to`
+    /// window. Only valid when `relative = .bufpos`. Lines and columns
+    /// are 0-indexed. Off-screen positions (after applying the leaf's
+    /// scroll offset) collapse the float to a 0-cell rect, which the
+    /// compositor's `< 2` guard skips.
+    bufpos: ?[2]i32 = null,
     /// Which corner of the float lines up with the anchor point.
     corner: FloatCorner = .NW,
     /// Row offset added to the anchor's y before corner adjustment.
@@ -130,6 +146,26 @@ pub const FloatConfig = struct {
     /// Upper bound for size-to-content height. Used only when `height`
     /// is null.
     max_height: ?u16 = null,
+
+    /// Auto-close after this many milliseconds. Null disables. The
+    /// orchestrator's per-tick sweep compares
+    /// `now - FloatNode.created_at_ms` against this bound.
+    auto_close_ms: ?u32 = null,
+    /// When true, close the float as soon as the focused tile's draft
+    /// length differs from the snapshot taken at open time. The
+    /// snapshot lives on `FloatNode.cursor_draft_len_at_open`. Mirrors
+    /// Vim's `moved = "any"`.
+    close_on_cursor_moved: bool = false,
+
+    /// Lua registry ref invoked when the float closes. The owner of
+    /// the ref is the WindowManager: closeFloatById is responsible for
+    /// firing the callback then `lua.unref`-ing the slot exactly once.
+    on_close_ref: ?i32 = null,
+    /// Lua registry ref invoked before each key event would route to
+    /// the focused float. The callback receives a string description of
+    /// the key; returning the string `"consumed"` blocks the default
+    /// key handling for that event.
+    on_key_ref: ?i32 = null,
 };
 
 /// A floating pane: lives outside the tiled tree, drawn on top of it
@@ -154,6 +190,16 @@ pub const FloatNode = struct {
     /// the title on `addFloat` and frees it on `removeFloat`. Null when
     /// no title was supplied.
     title_storage: ?[]u8 = null,
+    /// Wall-clock timestamp captured when the float was added. The
+    /// orchestrator's auto-close sweep reads this against
+    /// `config.auto_close_ms` to decide whether the float has timed
+    /// out. Set by `addFloat`.
+    created_at_ms: i64 = 0,
+    /// Snapshot of the focused pane's draft length captured at open
+    /// time. The orchestrator's `close_on_cursor_moved` sweep compares
+    /// this against the live focused-pane draft length each tick;
+    /// any difference triggers a close.
+    cursor_draft_len_at_open: usize = 0,
 };
 
 /// High bit set on `Handle.index` marks a float handle. Float storage
@@ -193,6 +239,11 @@ focused_float: ?NodeRegistry.Handle = null,
 /// orchestrator hasn't published yet) and cursor-anchored floats fall
 /// back to editor-center so they don't disappear off-screen.
 cursor_anchor: ?Rect = null,
+/// One-cell rect at the last seen mouse cell (0-based grid coords).
+/// `relative=mouse` floats anchor on this; the orchestrator publishes
+/// it from `handleMouse` so a follower-style float tracks the pointer
+/// across motion events without waiting for a click.
+mouse_anchor: ?Rect = null,
 
 /// Create a new empty layout with no root.
 pub fn init(allocator: Allocator) Layout {
@@ -247,6 +298,8 @@ pub fn addFloat(
         .rect = rect,
         .config = stored_config,
         .title_storage = owned_title,
+        .created_at_ms = std.time.milliTimestamp(),
+        .cursor_draft_len_at_open = 0,
     };
 
     // Insert sorted ascending by z so the compositor's left-to-right
@@ -335,6 +388,103 @@ pub fn findFloat(self: *const Layout, handle: NodeRegistry.Handle) ?*FloatNode {
         }
     }
     return null;
+}
+
+/// Patch fields of a live float's `FloatConfig` in place. Any non-null
+/// field on `patch` overwrites the corresponding `FloatConfig` field;
+/// null fields preserve the existing value. The orchestrator picks up
+/// the change on the next `recalculateFloats` pass — callers should set
+/// `compositor.layout_dirty` so a frame is actually drawn.
+pub const FloatMovePatch = struct {
+    row_offset: ?i32 = null,
+    col_offset: ?i32 = null,
+    width: ?u16 = null,
+    height: ?u16 = null,
+    corner: ?FloatCorner = null,
+    z: ?u32 = null,
+};
+
+/// Update the FloatConfig of an existing float without re-creating it.
+/// Returns `error.StaleNode` for invalid handles. When `z` changes the
+/// float is re-inserted to maintain the ascending-z invariant on
+/// `floats.items`.
+pub fn floatMove(self: *Layout, handle: NodeRegistry.Handle, patch: FloatMovePatch) !void {
+    const f = self.findFloat(handle) orelse return error.StaleNode;
+    if (patch.row_offset) |v| f.config.row_offset = v;
+    if (patch.col_offset) |v| f.config.col_offset = v;
+    if (patch.width) |v| f.config.width = v;
+    if (patch.height) |v| f.config.height = v;
+    if (patch.corner) |v| f.config.corner = v;
+    if (patch.z) |v| {
+        if (f.config.z != v) {
+            f.config.z = v;
+            self.reorderFloatByZ(handle);
+        }
+    }
+}
+
+/// Move a float to the top of the z-stack so it paints above every
+/// other float. The z-band is set to `(max existing z) + 1` to break
+/// ties stably; the float list ends up with this float at the tail.
+/// Returns `error.StaleNode` for invalid handles.
+pub fn floatRaise(self: *Layout, handle: NodeRegistry.Handle) !void {
+    const f = self.findFloat(handle) orelse return error.StaleNode;
+    var max_z: u32 = 0;
+    for (self.floats.items) |existing| {
+        if (existing.handle.index == handle.index and
+            existing.handle.generation == handle.generation) continue;
+        if (existing.config.z > max_z) max_z = existing.config.z;
+    }
+    f.config.z = max_z +| 1;
+    self.reorderFloatByZ(handle);
+}
+
+/// Re-insert the float identified by `handle` so the `floats.items`
+/// list stays sorted ascending by `config.z`. Used by `floatRaise` and
+/// the `z` patch path of `floatMove` when the new z would violate the
+/// invariant.
+fn reorderFloatByZ(self: *Layout, handle: NodeRegistry.Handle) void {
+    var idx_opt: ?usize = null;
+    for (self.floats.items, 0..) |existing, i| {
+        if (existing.handle.index == handle.index and
+            existing.handle.generation == handle.generation)
+        {
+            idx_opt = i;
+            break;
+        }
+    }
+    const idx = idx_opt orelse return;
+    const float = self.floats.orderedRemove(idx);
+
+    var insert_at: usize = self.floats.items.len;
+    for (self.floats.items, 0..) |existing, i| {
+        if (existing.config.z > float.config.z) {
+            insert_at = i;
+            break;
+        }
+    }
+    // `insert_at <= floats.items.len` after `orderedRemove`, and we
+    // already had room for the prior occupant, so `insert` cannot
+    // allocate. Fall back to logging on the impossible-OOM path
+    // rather than propagating an error: float reordering is purely
+    // cosmetic and dropping the operation is safer than partial
+    // state.
+    self.floats.insert(self.allocator, insert_at, float) catch {
+        self.floats.append(self.allocator, float) catch {};
+    };
+}
+
+/// Caller-provided buffer variant: copy every live float handle into
+/// `out` and return the populated prefix. Used by the Lua
+/// `zag.layout.floats()` binding so the caller controls allocation.
+pub fn floatsList(self: *const Layout, out: []NodeRegistry.Handle) []NodeRegistry.Handle {
+    var n: usize = 0;
+    for (self.floats.items) |f| {
+        if (n >= out.len) break;
+        out[n] = f.handle;
+        n += 1;
+    }
+    return out[0..n];
 }
 
 /// Set a single buffer as the root leaf. Replaces any existing tree.
@@ -506,7 +656,17 @@ pub fn recalculateFloats(self: *Layout, screen_width: u16, screen_height: u16) v
     };
 
     for (self.floats.items) |f| {
-        const anchor = self.resolveAnchor(f.config.relative, editor_rect) orelse editor_rect;
+        const resolved = self.resolveAnchor(f, editor_rect, screen_width, screen_height);
+        // `bufpos` is the only anchor that means "hide me when off
+        // screen" — every other anchor falls back to the editor rect
+        // so a stale `relative_to` handle still draws somewhere
+        // sensible. Distinguish the two cases with a separate collapse
+        // flag rather than overloading null.
+        if (resolved.collapse) {
+            f.rect = .{ .x = editor_rect.x, .y = editor_rect.y, .width = 0, .height = 0 };
+            continue;
+        }
+        const anchor = resolved.rect orelse editor_rect;
 
         // Anchor origin point: anchor.{x,y} + offsets. Use signed math
         // so a negative offset (e.g. SW with row_offset = -2) is
@@ -533,23 +693,39 @@ pub fn recalculateFloats(self: *Layout, screen_width: u16, screen_height: u16) v
         // would overrun). This matches Neovim's "truncated to fit"
         // semantics; explicit `fixed = true` would disable the clamp
         // but is out of scope for slice 2.
-        const screen_max_x: i32 = @as(i32, editor_rect.x) + @as(i32, editor_rect.width);
-        const screen_max_y: i32 = @as(i32, editor_rect.y) + @as(i32, editor_rect.height);
+        //
+        // The clamp region depends on the anchor: status- and
+        // tabline-anchored floats are intentionally placed on the
+        // status row / top edge, so clamping them to `editor_rect`
+        // (which excludes the status row) would push them back into
+        // the content area. Use the full screen rect for those
+        // anchors and `editor_rect` for everything else.
+        const clamp_rect: Rect = switch (f.config.relative) {
+            .laststatus, .tabline => .{
+                .x = 0,
+                .y = 0,
+                .width = screen_width,
+                .height = screen_height,
+            },
+            else => editor_rect,
+        };
+        const screen_max_x: i32 = @as(i32, clamp_rect.x) + @as(i32, clamp_rect.width);
+        const screen_max_y: i32 = @as(i32, clamp_rect.y) + @as(i32, clamp_rect.height);
 
         var x = top_left_x;
         var y = top_left_y;
         var fw = w;
         var fh = h;
 
-        if (x < @as(i32, editor_rect.x)) {
+        if (x < @as(i32, clamp_rect.x)) {
             // Negative-overflow: shift right and shrink width.
-            const shift = @as(i32, editor_rect.x) - x;
-            x = editor_rect.x;
+            const shift = @as(i32, clamp_rect.x) - x;
+            x = clamp_rect.x;
             fw -= shift;
         }
-        if (y < @as(i32, editor_rect.y)) {
-            const shift = @as(i32, editor_rect.y) - y;
-            y = editor_rect.y;
+        if (y < @as(i32, clamp_rect.y)) {
+            const shift = @as(i32, clamp_rect.y) - y;
+            y = clamp_rect.y;
             fh -= shift;
         }
         if (x + fw > screen_max_x) fw = screen_max_x - x;
@@ -572,14 +748,92 @@ pub fn recalculateFloats(self: *Layout, screen_width: u16, screen_height: u16) v
     }
 }
 
-/// Resolve a float's anchor source to a screen rect. `editor` is the
-/// content area minus the status row; `cursor` is the orchestrator's
-/// per-frame cursor cell; `win` is a slice-3 stub returning null.
-fn resolveAnchor(self: *const Layout, kind: FloatAnchor, editor_rect: Rect) ?Rect {
-    return switch (kind) {
-        .editor => editor_rect,
-        .cursor => self.cursor_anchor,
-        .win => null,
+/// Outcome of an anchor resolution. `rect == null` means "no usable
+/// anchor, fall back to editor"; `collapse == true` means "this float
+/// is intentionally off-screen, draw nothing this frame" (the only
+/// caller is the `bufpos` path).
+const ResolvedAnchor = struct { rect: ?Rect, collapse: bool = false };
+
+/// Resolve a float's anchor source to a screen rect.
+///
+///   * `editor`     full content area minus the status row.
+///   * `cursor`     orchestrator-published `Layout.cursor_anchor`.
+///   * `mouse`      orchestrator-published `Layout.mouse_anchor`.
+///   * `laststatus` `(0, screen_h - 1, screen_w, 1)`.
+///   * `tabline`    `(0, 0, screen_w, 1)`. Zag has no tabline today;
+///                  the resolver is wired so future plugins anchored
+///                  here appear at the top edge instead of vanishing.
+///   * `win`        `Layout.rectFor(relative_to)`. A stale handle (or
+///                  a `relative_to == null`) returns `rect = null`,
+///                  which the caller treats as "fall back to editor".
+///   * `bufpos`     a (line, col) inside the `relative_to` window's
+///                  buffer, translated through the leaf's scroll
+///                  offset. Off-screen positions (after scroll) set
+///                  `collapse = true` so the caller paints a 0-cell
+///                  rect — the float is effectively hidden until the
+///                  bufpos comes back into view.
+fn resolveAnchor(
+    self: *const Layout,
+    f: *const FloatNode,
+    editor_rect: Rect,
+    screen_width: u16,
+    screen_height: u16,
+) ResolvedAnchor {
+    return switch (f.config.relative) {
+        .editor => .{ .rect = editor_rect },
+        .cursor => .{ .rect = self.cursor_anchor },
+        .mouse => .{ .rect = self.mouse_anchor },
+        .laststatus => .{ .rect = .{
+            .x = 0,
+            .y = if (screen_height == 0) 0 else screen_height - 1,
+            .width = screen_width,
+            .height = 1,
+        } },
+        .tabline => .{ .rect = .{ .x = 0, .y = 0, .width = screen_width, .height = 1 } },
+        .win => blk: {
+            const handle = f.config.relative_to orelse break :blk .{ .rect = null };
+            const win_rect = self.rectFor(handle) orelse break :blk .{ .rect = null };
+            const bp = f.config.bufpos orelse break :blk .{ .rect = win_rect };
+
+            // bufpos -> screen translation: subtract the leaf's
+            // vertical scroll offset from the buffer line, then place
+            // the cell inside `win_rect`. There is no horizontal
+            // scrolling today, so col passes through. A future
+            // grapheme-aware width pass would refine this.
+            const scroll: i32 = if (handle.index & FLOAT_HANDLE_BIT != 0)
+                0
+            else if (self.registry) |r| sblk: {
+                const node = r.resolve(handle) catch break :sblk @as(i32, 0);
+                break :sblk leafScrollOffset(node);
+            } else 0;
+
+            const screen_y: i32 = @as(i32, win_rect.y) + bp[0] - scroll;
+            const screen_x: i32 = @as(i32, win_rect.x) + bp[1];
+
+            const win_max_x: i32 = @as(i32, win_rect.x) + @as(i32, win_rect.width);
+            const win_max_y: i32 = @as(i32, win_rect.y) + @as(i32, win_rect.height);
+            if (screen_y < @as(i32, win_rect.y) or screen_y >= win_max_y) {
+                break :blk .{ .rect = null, .collapse = true };
+            }
+            if (screen_x < @as(i32, win_rect.x) or screen_x >= win_max_x) {
+                break :blk .{ .rect = null, .collapse = true };
+            }
+            break :blk .{ .rect = .{
+                .x = @intCast(screen_x),
+                .y = @intCast(screen_y),
+                .width = 1,
+                .height = 1,
+            } };
+        },
+    };
+}
+
+/// Read the vertical scroll offset of a leaf node. Splits have no
+/// scroll state; return 0 so the caller treats them as "no scroll".
+fn leafScrollOffset(node: *const LayoutNode) i32 {
+    return switch (node.*) {
+        .leaf => |leaf| @intCast(@min(leaf.buffer.getScrollOffset(), std.math.maxInt(i32))),
+        .split => 0,
     };
 }
 
@@ -1449,6 +1703,115 @@ test "recalculateFloats sizes a float to longest-line bounded by max_width" {
     // here, only that it sits in [min_height, max_height].
     try std.testing.expect(rect.height >= 3);
     try std.testing.expect(rect.height <= 8);
+}
+
+test "floatRaise bumps z and re-orders floats" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const a = try layout.addFloat(dummy_buf, r, .{ .z = 25 });
+    const b = try layout.addFloat(dummy_buf, r, .{ .z = 50 });
+    const c = try layout.addFloat(dummy_buf, r, .{ .z = 100 });
+
+    // Pre-condition: ascending z, with c on top.
+    try std.testing.expectEqual(c.index, layout.floats.items[2].handle.index);
+
+    // Raise the middle float; it must end up above the previous max.
+    try layout.floatRaise(b);
+    try std.testing.expectEqual(b.index, layout.floats.items[2].handle.index);
+    try std.testing.expect(layout.findFloat(b).?.config.z > 100);
+
+    // The other two preserve their relative order.
+    try std.testing.expectEqual(a.index, layout.floats.items[0].handle.index);
+    try std.testing.expectEqual(c.index, layout.floats.items[1].handle.index);
+}
+
+test "floatMove updates rect after recalculate" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    // Open at (5, 5) with explicit size; recalculate so the seed rect
+    // matches the resolved anchor + offsets.
+    const handle = try layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .corner = .NW,
+        .row_offset = 5,
+        .col_offset = 5,
+        .width = 10,
+        .height = 4,
+    });
+
+    layout.recalculate(80, 24);
+    try std.testing.expectEqual(@as(u16, 5), layout.rectFor(handle).?.x);
+    try std.testing.expectEqual(@as(u16, 5), layout.rectFor(handle).?.y);
+
+    try layout.floatMove(handle, .{ .row_offset = 10, .col_offset = 10 });
+    layout.recalculate(80, 24);
+
+    const rect = layout.rectFor(handle).?;
+    try std.testing.expectEqual(@as(u16, 10), rect.x);
+    try std.testing.expectEqual(@as(u16, 10), rect.y);
+    try std.testing.expectEqual(@as(u16, 10), rect.width);
+    try std.testing.expectEqual(@as(u16, 4), rect.height);
+}
+
+test "floatsList returns every live float handle" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const a = try layout.addFloat(dummy_buf, r, .{});
+    _ = try layout.addFloat(dummy_buf, r, .{});
+
+    var out: [4]NodeRegistry.Handle = undefined;
+    const slice = layout.floatsList(&out);
+    try std.testing.expectEqual(@as(usize, 2), slice.len);
+    try std.testing.expectEqual(a.index, slice[0].index);
+}
+
+test "recalculateFloats laststatus anchor places float on the status row" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const handle = try layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
+        .relative = .laststatus,
+        .corner = .NW,
+        .width = 20,
+        .height = 1,
+    });
+    layout.recalculate(80, 24);
+    const rect = layout.rectFor(handle).?;
+    try std.testing.expectEqual(@as(u16, 23), rect.y);
+    try std.testing.expectEqual(@as(u16, 0), rect.x);
+}
+
+test "recalculateFloats mouse anchor reads layout.mouse_anchor" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    layout.mouse_anchor = .{ .x = 30, .y = 10, .width = 1, .height = 1 };
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const handle = try layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
+        .relative = .mouse,
+        .corner = .NW,
+        .width = 8,
+        .height = 2,
+    });
+    layout.recalculate(80, 24);
+    const rect = layout.rectFor(handle).?;
+    try std.testing.expectEqual(@as(u16, 30), rect.x);
+    try std.testing.expectEqual(@as(u16, 10), rect.y);
 }
 
 test "resizeSplit clamps ratio to valid open interval" {

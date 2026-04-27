@@ -630,6 +630,12 @@ pub const LuaEngine = struct {
         lua.setField(-2, "split");
         lua.pushFunction(zlua.wrap(zagLayoutFloatFn));
         lua.setField(-2, "float");
+        lua.pushFunction(zlua.wrap(zagLayoutFloatMoveFn));
+        lua.setField(-2, "float_move");
+        lua.pushFunction(zlua.wrap(zagLayoutFloatRaiseFn));
+        lua.setField(-2, "float_raise");
+        lua.pushFunction(zlua.wrap(zagLayoutFloatsFn));
+        lua.setField(-2, "floats");
         lua.pushFunction(zlua.wrap(zagLayoutCloseFn));
         lua.setField(-2, "close");
         lua.pushFunction(zlua.wrap(zagLayoutResizeFn));
@@ -2807,8 +2813,78 @@ pub const LuaEngine = struct {
             anchor = .editor;
         } else if (std.mem.eql(u8, relative, "cursor")) {
             anchor = .cursor;
+        } else if (std.mem.eql(u8, relative, "win")) {
+            anchor = .win;
+        } else if (std.mem.eql(u8, relative, "mouse")) {
+            anchor = .mouse;
+        } else if (std.mem.eql(u8, relative, "laststatus")) {
+            anchor = .laststatus;
+        } else if (std.mem.eql(u8, relative, "tabline")) {
+            anchor = .tabline;
         } else {
-            lua.raiseErrorStr("zag.layout.float: relative must be \"editor\" or \"cursor\"", .{});
+            lua.raiseErrorStr("zag.layout.float: relative must be \"editor\" | \"cursor\" | \"win\" | \"mouse\" | \"laststatus\" | \"tabline\"", .{});
+        }
+        lua.pop(1);
+
+        // Optional `win` (only meaningful with relative = "win"): the
+        // `n<u32>` handle string of the window the float anchors to.
+        // Stored as the FloatConfig.relative_to field; null falls
+        // through to editor in resolveAnchor.
+        var relative_to: ?NodeRegistry.Handle = null;
+        _ = lua.getField(2, "win");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const handle_str = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: win must be a handle string", .{});
+                };
+                relative_to = NodeRegistry.parseId(handle_str) catch {
+                    lua.raiseErrorStr("zag.layout.float: invalid win handle", .{});
+                };
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.float: win must be a handle string", .{});
+            },
+        }
+        lua.pop(1);
+
+        // Optional `bufpos = { line, col }` (only meaningful with
+        // relative = "win"). Read both ints and stash as a [2]i32 on
+        // FloatConfig; the resolver translates through the win's
+        // scroll offset. An out-of-range bufpos collapses the float
+        // to a 0-cell rect (it's hidden until the position scrolls
+        // back into view).
+        var bufpos: ?[2]i32 = null;
+        _ = lua.getField(2, "bufpos");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .table => {
+                _ = lua.rawGetIndex(-1, 1);
+                if (lua.typeOf(-1) != .number) {
+                    lua.raiseErrorStr("zag.layout.float: bufpos[1] (line) must be an integer", .{});
+                }
+                const line = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: bufpos[1] (line) must be an integer", .{});
+                };
+                lua.pop(1);
+                _ = lua.rawGetIndex(-1, 2);
+                if (lua.typeOf(-1) != .number) {
+                    lua.raiseErrorStr("zag.layout.float: bufpos[2] (col) must be an integer", .{});
+                }
+                const col = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: bufpos[2] (col) must be an integer", .{});
+                };
+                lua.pop(1);
+                if (line < std.math.minInt(i32) or line > std.math.maxInt(i32) or
+                    col < std.math.minInt(i32) or col > std.math.maxInt(i32))
+                {
+                    lua.raiseErrorStr("zag.layout.float: bufpos out of i32 range", .{});
+                }
+                bufpos = .{ @intCast(line), @intCast(col) };
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.float: bufpos must be a table {line, col}", .{});
+            },
         }
         lua.pop(1);
 
@@ -2925,6 +3001,93 @@ pub const LuaEngine = struct {
         const mouse_flag = readOptionalBoolField(lua, 2, "mouse", "zag.layout.float") orelse true;
         const enter = readOptionalBoolField(lua, 2, "enter", "zag.layout.float") orelse true;
 
+        // `time = N` (ms): auto-close the float after N milliseconds.
+        // Read through the existing optional-u32 path; Lua integers
+        // exceeding u32 raise.
+        var auto_close_ms: ?u32 = null;
+        _ = lua.getField(2, "time");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .number => {
+                const n = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: time must be an integer", .{});
+                };
+                if (n < 0) {
+                    lua.raiseErrorStr("zag.layout.float: time must be >= 0", .{});
+                }
+                if (n > std.math.maxInt(u32)) {
+                    lua.raiseErrorStr("zag.layout.float: time exceeds u32 range", .{});
+                }
+                auto_close_ms = @intCast(n);
+            },
+            else => lua.raiseErrorStr("zag.layout.float: time must be an integer", .{}),
+        }
+        lua.pop(1);
+
+        // `moved = "any"`: close the float as soon as the focused
+        // pane's draft length differs from the snapshot taken at open
+        // time. Other strings are reserved for future Vim-style
+        // movement granularities (e.g. "word", "char") and currently
+        // raise so plugins fail loud rather than silently.
+        var close_on_cursor_moved = false;
+        _ = lua.getField(2, "moved");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: moved must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "any")) {
+                    close_on_cursor_moved = true;
+                } else {
+                    lua.raiseErrorStr("zag.layout.float: moved must be \"any\"", .{});
+                }
+            },
+            else => lua.raiseErrorStr("zag.layout.float: moved must be a string", .{}),
+        }
+        lua.pop(1);
+
+        // `on_close` and `on_key` are Lua functions stored in the
+        // registry; the i32 slot id travels through FloatConfig.
+        // closeFloatById invokes (close) and unrefs both. Fail-fast
+        // if any but the function-or-nil pattern is supplied so a
+        // misconfigured opts table never leaks a ref into the
+        // registry.
+        var on_close_ref: ?i32 = null;
+        _ = lua.getField(2, "on_close");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => lua.pop(1),
+            .function => {
+                on_close_ref = lua.ref(zlua.registry_index) catch {
+                    lua.raiseErrorStr("zag.layout.float: on_close ref alloc failed", .{});
+                };
+            },
+            else => {
+                lua.pop(1);
+                lua.raiseErrorStr("zag.layout.float: on_close must be a function", .{});
+            },
+        }
+        // Free on_close ref on any subsequent failure path so we never
+        // leak a registry slot from this binding. errdefer cannot run
+        // through `lua.raiseErrorStr` (longjmp-style escape), so we
+        // chain the cleanup manually below.
+        var on_key_ref: ?i32 = null;
+        _ = lua.getField(2, "on_key");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => lua.pop(1),
+            .function => {
+                on_key_ref = lua.ref(zlua.registry_index) catch {
+                    if (on_close_ref) |r| lua.unref(zlua.registry_index, r);
+                    lua.raiseErrorStr("zag.layout.float: on_key ref alloc failed", .{});
+                };
+            },
+            else => {
+                lua.pop(1);
+                if (on_close_ref) |r| lua.unref(zlua.registry_index, r);
+                lua.raiseErrorStr("zag.layout.float: on_key must be a function", .{});
+            },
+        }
+
         // Seed rect: openFloatPane needs *some* rect for the FloatNode
         // until `recalculateFloats` runs against the live screen. Use
         // explicit width/height when given; otherwise fall back to
@@ -2943,6 +3106,8 @@ pub const LuaEngine = struct {
                 .mouse = mouse_flag,
                 .enter = enter,
                 .relative = anchor,
+                .relative_to = relative_to,
+                .bufpos = bufpos,
                 .corner = corner,
                 .row_offset = row_offset,
                 .col_offset = col_offset,
@@ -2952,9 +3117,19 @@ pub const LuaEngine = struct {
                 .max_width = max_width,
                 .min_height = min_height,
                 .max_height = max_height,
+                .auto_close_ms = auto_close_ms,
+                .close_on_cursor_moved = close_on_cursor_moved,
+                .on_close_ref = on_close_ref,
+                .on_key_ref = on_key_ref,
             },
         ) catch |err| {
             lua.pop(1); // title
+            // openFloatPane failed before taking ownership of the
+            // refs; release them so we don't leak Lua registry
+            // slots. The float never existed, so nothing else will
+            // do this for us.
+            if (on_close_ref) |r| lua.unref(zlua.registry_index, r);
+            if (on_key_ref) |r| lua.unref(zlua.registry_index, r);
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.layout.float: {s}", .{@errorName(err)}) catch "zag.layout.float failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
@@ -2968,6 +3143,150 @@ pub const LuaEngine = struct {
         };
         defer engine.allocator.free(id);
         _ = lua.pushString(id);
+        return 1;
+    }
+
+    /// `zag.layout.float_move(handle, opts)`: patch a live float's
+    /// geometry without re-creating it. Accepts a partial opts table
+    /// with any of `row`, `col`, `width`, `height`, `corner`, `zindex`.
+    /// Triggers a `recalculateFloats` next frame.
+    fn zagLayoutFloatMoveFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.float_move: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.layout.float_move");
+        if (!lua.isTable(2)) {
+            lua.raiseErrorStr("zag.layout.float_move: opts must be a table", .{});
+        }
+
+        var patch: Layout.FloatMovePatch = .{};
+        // row / col map onto the float's row_offset / col_offset; this
+        // matches the `zag.layout.float` opts shape so float_move and
+        // float share field names.
+        _ = lua.getField(2, "row");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .number => {
+                const n = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float_move: row must be an integer", .{});
+                };
+                if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
+                    lua.raiseErrorStr("zag.layout.float_move: row out of i32 range", .{});
+                }
+                patch.row_offset = @intCast(n);
+            },
+            else => lua.raiseErrorStr("zag.layout.float_move: row must be an integer", .{}),
+        }
+        lua.pop(1);
+
+        _ = lua.getField(2, "col");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .number => {
+                const n = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float_move: col must be an integer", .{});
+                };
+                if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
+                    lua.raiseErrorStr("zag.layout.float_move: col out of i32 range", .{});
+                }
+                patch.col_offset = @intCast(n);
+            },
+            else => lua.raiseErrorStr("zag.layout.float_move: col must be an integer", .{}),
+        }
+        lua.pop(1);
+
+        patch.width = readOptionalU16Field(lua, 2, "width", "zag.layout.float_move");
+        patch.height = readOptionalU16Field(lua, 2, "height", "zag.layout.float_move");
+
+        _ = lua.getField(2, "corner");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float_move: corner must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "NW")) {
+                    patch.corner = .NW;
+                } else if (std.mem.eql(u8, s, "NE")) {
+                    patch.corner = .NE;
+                } else if (std.mem.eql(u8, s, "SW")) {
+                    patch.corner = .SW;
+                } else if (std.mem.eql(u8, s, "SE")) {
+                    patch.corner = .SE;
+                } else {
+                    lua.raiseErrorStr("zag.layout.float_move: corner must be \"NW\" | \"NE\" | \"SW\" | \"SE\"", .{});
+                }
+            },
+            else => lua.raiseErrorStr("zag.layout.float_move: corner must be a string", .{}),
+        }
+        lua.pop(1);
+
+        _ = lua.getField(2, "zindex");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .number => {
+                const n = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float_move: zindex must be an integer", .{});
+                };
+                if (n < 0 or n > std.math.maxInt(u32)) {
+                    lua.raiseErrorStr("zag.layout.float_move: zindex out of u32 range", .{});
+                }
+                patch.z = @intCast(n);
+            },
+            else => lua.raiseErrorStr("zag.layout.float_move: zindex must be an integer", .{}),
+        }
+        lua.pop(1);
+
+        wm.floatMove(handle, patch) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.float_move: {s}", .{@errorName(err)}) catch "zag.layout.float_move failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
+    /// `zag.layout.float_raise(handle)`: bump the float to the top of
+    /// the z-stack so subsequent frames paint it above every other
+    /// float.
+    fn zagLayoutFloatRaiseFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.float_raise: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.layout.float_raise");
+        wm.floatRaise(handle) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.float_raise: {s}", .{@errorName(err)}) catch "zag.layout.float_raise failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        return 0;
+    }
+
+    /// `zag.layout.floats() -> { handle_str, ... }`: return a Lua
+    /// array of `n<u32>` handle strings for every live float, in
+    /// ascending z order.
+    fn zagLayoutFloatsFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.floats: no window manager bound", .{});
+        };
+
+        // Real layouts hold a handful of floats; a 64-entry stack
+        // buffer matches the orchestrator's per-frame caps and avoids
+        // a heap allocation for the common case.
+        var handles: [64]NodeRegistry.Handle = undefined;
+        const slice = wm.floatsList(&handles);
+
+        lua.createTable(@intCast(slice.len), 0);
+        for (slice, 0..) |h, i| {
+            const id = NodeRegistry.formatId(engine.allocator, h) catch {
+                lua.raiseErrorStr("zag.layout.floats: id format failed", .{});
+            };
+            defer engine.allocator.free(id);
+            _ = lua.pushString(id);
+            lua.setIndex(-2, @intCast(i + 1));
+        }
         return 1;
     }
 
