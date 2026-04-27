@@ -80,7 +80,119 @@ pub const Pane = struct {
     /// Scratch-backed panes leave it at defaults; they have no
     /// ConversationBuffer to attach.
     viewport: Viewport = .{},
+    /// In-progress text the user is editing at this pane's prompt. Lives
+    /// at pane scope (not on the buffer) so non-conversation buffers in
+    /// non-focused panes do not get reinterpreted as ConversationBuffer
+    /// memory by the compositor (the bug the buffer-pane-runner-decoupling
+    /// plan flagged for `/model`-style multi-buffer layouts).
+    draft: [MAX_DRAFT]u8 = undefined,
+    /// Number of valid bytes in `draft`.
+    draft_len: usize = 0,
+
+    /// Append a single byte to the draft. No-op if the draft is full.
+    /// Does not touch any dirty channels; the compositor repaints the
+    /// prompt every frame regardless.
+    pub fn appendToDraft(self: *Pane, ch: u8) void {
+        if (self.draft_len >= self.draft.len) return;
+        self.draft[self.draft_len] = ch;
+        self.draft_len += 1;
+    }
+
+    /// Remove the last byte from the draft. No-op on empty.
+    pub fn deleteBackFromDraft(self: *Pane) void {
+        if (self.draft_len == 0) return;
+        self.draft_len -= 1;
+    }
+
+    /// Remove the last word from the draft along with any trailing
+    /// spaces before the word and any separator space after it.
+    /// Matches Ctrl+W in shells and vim.
+    pub fn deleteWordFromDraft(self: *Pane) void {
+        while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
+            self.draft_len -= 1;
+        }
+        while (self.draft_len > 0 and self.draft[self.draft_len - 1] != ' ') {
+            self.draft_len -= 1;
+        }
+        while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
+            self.draft_len -= 1;
+        }
+    }
+
+    /// Append a chunk of bytes to the draft (e.g. a bracketed paste).
+    /// Truncates past `draft.len` with a warn log.
+    pub fn appendPaste(self: *Pane, data: []const u8) void {
+        const room = self.draft.len - self.draft_len;
+        const to_copy = @min(room, data.len);
+        @memcpy(self.draft[self.draft_len..][0..to_copy], data[0..to_copy]);
+        self.draft_len += to_copy;
+        if (to_copy < data.len) {
+            log.warn("paste truncated: {d} bytes dropped (draft full)", .{data.len - to_copy});
+        }
+    }
+
+    /// Clear the draft entirely.
+    pub fn clearDraft(self: *Pane) void {
+        self.draft_len = 0;
+    }
+
+    /// Return the current draft as a borrowed slice. Invalid after any
+    /// mutation above.
+    pub fn getDraft(self: *const Pane) []const u8 {
+        return self.draft[0..self.draft_len];
+    }
+
+    /// Copy the current draft into `dest` and clear it. Caller's buffer
+    /// must be at least `MAX_DRAFT` bytes.
+    pub fn consumeDraft(self: *Pane, dest: []u8) []const u8 {
+        const n = self.draft_len;
+        std.debug.assert(dest.len >= n);
+        @memcpy(dest[0..n], self.draft[0..n]);
+        self.draft_len = 0;
+        return dest[0..n];
+    }
+
+    /// Pane-level key dispatch for insert mode: try buffer-internal
+    /// handling first (e.g. ConversationBuffer's Ctrl+R thinking-toggle),
+    /// then draft editing on this pane. Used by EventOrchestrator's
+    /// fall-through arm. Enter / page-nav / Ctrl+C stay on the
+    /// orchestrator because they touch submit/scroll/quit, not draft.
+    pub fn handleKey(self: *Pane, ev: input.KeyEvent) Buffer.HandleResult {
+        const buf_result = self.buffer.handleKey(ev);
+        if (buf_result == .consumed) return .consumed;
+
+        if (ev.modifiers.ctrl) {
+            switch (ev.key) {
+                .char => |ch| {
+                    if (ch == 'w') {
+                        self.deleteWordFromDraft();
+                        return .consumed;
+                    }
+                },
+                else => {},
+            }
+            return .passthrough;
+        }
+        switch (ev.key) {
+            .backspace => {
+                self.deleteBackFromDraft();
+                return .consumed;
+            },
+            .char => |ch| {
+                if (ch >= 0x20 and ch < 0x7f) {
+                    self.appendToDraft(@intCast(ch));
+                    return .consumed;
+                }
+                return .passthrough;
+            },
+            else => return .passthrough,
+        }
+    }
 };
+
+/// Maximum bytes of in-progress draft a single pane can hold. Fixed so
+/// the draft lives inline on the Pane struct with no separate alloc.
+pub const MAX_DRAFT = 4096;
 
 /// A registered pane plus the persistence handle that keeps it tied to
 /// an on-disk session. WindowManager owns each `PaneEntry`: deinit
@@ -1067,6 +1179,18 @@ pub fn providerFor(self: *const WindowManager, pane: *const Pane) *llm.ProviderR
     return pane.provider orelse self.provider;
 }
 
+/// Pointer variant of `paneFromBuffer` for callers that need to mutate
+/// pane-local state (e.g. the compositor reading `pane.draft` without
+/// copying the whole 4 KB struct, or anyone editing draft helpers).
+/// Returns `null` on the same drift case as `paneFromBuffer`.
+pub fn paneFromBufferPtr(self: *WindowManager, b: Buffer) ?*Pane {
+    if (self.root_pane.buffer.ptr == b.ptr) return &self.root_pane;
+    for (self.extra_panes.items) |*entry| {
+        if (entry.pane.buffer.ptr == b.ptr) return &entry.pane;
+    }
+    return null;
+}
+
 /// Look up the pane whose view backs `b`. Returns null if no registered
 /// pane matches, which Compositor and any other reader should treat as a
 /// soft failure rather than a crash.
@@ -1642,6 +1766,82 @@ test "Pane composes view + session + runner" {
     try std.testing.expectEqual(runner, pane.runner.?);
     try std.testing.expectEqual(session, pane.runner.?.session);
     try std.testing.expectEqualStrings("pane-test", pane.view.?.name);
+}
+
+test "Pane draft starts empty and grows via appendToDraft" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    try std.testing.expectEqualStrings("", pane.getDraft());
+    pane.appendToDraft('h');
+    pane.appendToDraft('i');
+    try std.testing.expectEqualStrings("hi", pane.getDraft());
+}
+
+test "Pane appendToDraft caps at MAX_DRAFT" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    var i: usize = 0;
+    while (i < MAX_DRAFT + 10) : (i += 1) pane.appendToDraft('x');
+    try std.testing.expectEqual(MAX_DRAFT, pane.draft_len);
+}
+
+test "Pane deleteBackFromDraft + deleteWordFromDraft" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    for ("hello world") |ch| pane.appendToDraft(ch);
+    pane.deleteWordFromDraft();
+    try std.testing.expectEqualStrings("hello", pane.getDraft());
+    pane.deleteBackFromDraft();
+    try std.testing.expectEqualStrings("hell", pane.getDraft());
+}
+
+test "Pane consumeDraft snapshots into dest and clears" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    for ("hi") |ch| pane.appendToDraft(ch);
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = pane.consumeDraft(&scratch);
+    try std.testing.expectEqualStrings("hi", taken);
+    try std.testing.expectEqualStrings("", pane.getDraft());
+}
+
+test "Pane.handleKey appends printable + deletes via backspace + Ctrl+W" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    _ = pane.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
+    _ = pane.handleKey(.{ .key = .{ .char = 'b' }, .modifiers = .{} });
+    try std.testing.expectEqualStrings("ab", pane.getDraft());
+
+    _ = pane.handleKey(.{ .key = .backspace, .modifiers = .{} });
+    try std.testing.expectEqualStrings("a", pane.getDraft());
+
+    pane.clearDraft();
+    for ("hello world") |ch| pane.appendToDraft(ch);
+    _ = pane.handleKey(.{ .key = .{ .char = 'w' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings("hello", pane.getDraft());
+}
+
+test "Pane.handleKey delegates to buffer for buffer-internal chords (Ctrl+R)" {
+    // Ctrl+R is ConversationBuffer's thinking-toggle: Pane.handleKey must
+    // try the buffer first so this chord doesn't accidentally land in the
+    // draft.
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    const r = pane.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqualStrings("", pane.getDraft());
 }
 
 test "extra pane viewport is attached to its buffer" {

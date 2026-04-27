@@ -87,10 +87,26 @@ pub const InputState = struct {
     spinner_frame: u8 = 0,
 };
 
+/// Per-frame leaf -> draft mapping. The owner (EventOrchestrator) builds
+/// this from the layout's visible leaves and the pane registry just
+/// before each `composite()` call. The compositor reads `draft` directly
+/// without needing to know about Pane / WindowManager: leaves whose
+/// underlying buffer has no pane (which is a soft drift case) simply
+/// don't appear in the slice and their prompt row is left blank.
+pub const LeafDraft = struct {
+    leaf: *const Layout.LayoutNode.Leaf,
+    draft: []const u8,
+};
+
 /// Composite the layout into the screen grid.
 /// Only redraws leaves whose buffer is dirty. Always redraws the input/status row.
 /// On layout changes (layout_dirty), clears the full screen and redraws everything.
-pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) void {
+pub fn composite(
+    self: *Compositor,
+    layout: *const Layout,
+    leaf_drafts: []const LeafDraft,
+    input: InputState,
+) void {
     // Reset per-frame arena: the previous frame's output lists and any
     // spans arrays allocated for non-cached buffer paths are released
     // in bulk. Cache-owned allocations live on `self.allocator` and are
@@ -160,7 +176,7 @@ pub fn composite(self: *Compositor, layout: *const Layout, input: InputState) vo
     {
         var s = trace.span("pane_prompts");
         defer s.end();
-        self.drawPanePrompts(root, focused, input);
+        self.drawPanePrompts(root, focused, leaf_drafts, input);
     }
 }
 
@@ -407,27 +423,44 @@ fn drawPanePrompts(
     self: *Compositor,
     root: *const Layout.LayoutNode,
     focused: *const Layout.LayoutNode,
+    leaf_drafts: []const LeafDraft,
     input: InputState,
 ) void {
-    self.drawPanePromptsPass(root, focused, input);
+    self.drawPanePromptsPass(root, focused, leaf_drafts, input);
 }
 
 fn drawPanePromptsPass(
     self: *Compositor,
     node: *const Layout.LayoutNode,
     focused: *const Layout.LayoutNode,
+    leaf_drafts: []const LeafDraft,
     input: InputState,
 ) void {
     switch (node.*) {
         .leaf => {
             const is_focused = (node == focused);
-            self.drawPanePrompt(&node.leaf, is_focused, input);
+            const draft = draftForLeaf(leaf_drafts, &node.leaf);
+            self.drawPanePrompt(&node.leaf, is_focused, draft, input);
         },
         .split => |s| {
-            self.drawPanePromptsPass(s.first, focused, input);
-            self.drawPanePromptsPass(s.second, focused, input);
+            self.drawPanePromptsPass(s.first, focused, leaf_drafts, input);
+            self.drawPanePromptsPass(s.second, focused, leaf_drafts, input);
         },
     }
+}
+
+/// Linear scan: leaf counts in this UI are tiny (single-digit), so a
+/// hash map is overkill. Returns null when the leaf has no registered
+/// pane (drift between layout and pane registry; the prompt is then
+/// drawn empty rather than crashing on a buffer downcast).
+fn draftForLeaf(
+    leaf_drafts: []const LeafDraft,
+    leaf: *const Layout.LayoutNode.Leaf,
+) ?[]const u8 {
+    for (leaf_drafts) |entry| {
+        if (entry.leaf == leaf) return entry.draft;
+    }
+    return null;
 }
 
 /// Paint one pane's prompt row. No-op when the pane is too short/narrow.
@@ -438,6 +471,7 @@ fn drawPanePrompt(
     self: *Compositor,
     leaf: *const Layout.LayoutNode.Leaf,
     focused: bool,
+    draft_opt: ?[]const u8,
     input: InputState,
 ) void {
     const rect = leaf.rect;
@@ -475,8 +509,11 @@ fn drawPanePrompt(
         return;
     }
 
-    const cb = ConversationBuffer.fromBuffer(leaf.buffer);
-    const draft = cb.getDraft();
+    // Pane-scoped draft: the orchestrator pre-resolves the draft for
+    // each visible leaf before calling `composite()`. Leaves with no
+    // registered pane (drift case) get a null draft and we skip the
+    // prompt row entirely instead of guessing.
+    const draft = draft_opt orelse return;
 
     const prompt = Theme.resolve(self.theme.highlights.input_prompt, self.theme);
     const text = Theme.resolve(self.theme.highlights.input_text, self.theme);
@@ -696,7 +733,7 @@ test "composite with empty layout does not crash" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 }
 
 test "composite writes buffer content at leaf rect with padding" {
@@ -719,7 +756,7 @@ test "composite writes buffer content at leaf rect with padding" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     // Frame shifts content by +1 row / +1 col; content row is 1, content col is 1 + pad_h.
@@ -747,7 +784,7 @@ test "composite draws status line on last row" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     // Last row is now the sole status line: `[INSERT] mybuf | 40x9`
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
@@ -787,7 +824,7 @@ test "composite skips clean buffer leaves" {
     layout.recalculate(40, 10);
 
     // First composite: buffer is dirty, content should appear
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
@@ -796,7 +833,7 @@ test "composite skips clean buffer leaves" {
     screen.getCell(1, 1 + pad_h + 2).codepoint = 'Z';
 
     // Second composite: buffer is clean (clearDirty was called), so leaf is skipped.
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     // The 'Z' survives because the clean leaf was not redrawn.
     try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
@@ -843,7 +880,7 @@ test "status row in normal mode shows mode label and buffer name only" {
     try layout.setRoot(cb.buf());
     layout.recalculate(80, 10);
 
-    compositor.composite(&layout, .{ .mode = .normal });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .normal });
 
     const last_row = screen.height - 1;
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
@@ -870,7 +907,7 @@ test "composite draws rounded frame around a single pane" {
     try layout.setRoot(cb.buf());
     layout.recalculate(20, 6);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     // Corners at pane bounds (screen height 6 reserves row 5 for status,
     // so the pane rect is 20x5 - bottom edge lives on row 4).
@@ -907,7 +944,7 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
     // can check the focused/unfocused contrast on the left/right pair.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     const focused = Theme.resolve(theme.highlights.border_focused, &theme);
     const plain = Theme.resolve(theme.highlights.border, &theme);
@@ -942,7 +979,7 @@ test "focused pane title has inverse style, unfocused is plain" {
     // Focus followed the split; refocus left so `a` is the focused pane.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     // Find the `a` name glyph in the focused pane's top edge (cols 0..19).
     var found_focused_a = false;
@@ -985,7 +1022,7 @@ test "title is suppressed when pane width is below 6" {
     try layout.setRoot(cb.buf());
     layout.recalculate(5, 6);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     // No cell on the top row should carry a name character.
     var saw_name_char = false;
@@ -1018,7 +1055,7 @@ test "long titles are truncated with ellipsis" {
     try layout.setRoot(cb.buf());
     layout.recalculate(12, 6);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     var saw_ellipsis = false;
     for (0..12) |c| {
@@ -1040,14 +1077,16 @@ test "focused pane renders its draft with a block cursor at end" {
     compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
-    for ("hi") |ch| cb.appendToDraft(ch);
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 8);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    const drafts = [_]Compositor.LeafDraft{
+        .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
+    };
+    compositor.composite(&layout, &drafts, .{ .mode = .insert });
 
     // Pane is 40x7 (8 rows minus 1 for global status row).
     // Prompt row = rect.y + rect.height - 2 = 5.
@@ -1081,16 +1120,18 @@ test "cursor bg does not bleed across keystrokes" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 8);
 
+    const leaf = &layout.root.?.leaf;
+
     // Frame 1: user types "hi". Cursor lands at col 6 with accent bg.
-    for ("hi") |ch| cb.appendToDraft(ch);
-    compositor.composite(&layout, .{ .mode = .insert });
+    var drafts1 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi" }};
+    compositor.composite(&layout, &drafts1, .{ .mode = .insert });
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 
     // Frame 2: user types one more char. New cursor at col 7. The cell
     // at col 6 now holds the glyph `s` (from "his") and MUST have
     // default bg - no accent smear.
-    cb.appendToDraft('s');
-    compositor.composite(&layout, .{ .mode = .insert });
+    var drafts2 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "his" }};
+    compositor.composite(&layout, &drafts2, .{ .mode = .insert });
     try std.testing.expectEqual(@as(u21, 's'), screen.getCellConst(5, 6).codepoint);
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
     // New cursor at col 7 picks up the accent.
@@ -1098,8 +1139,8 @@ test "cursor bg does not bleed across keystrokes" {
 
     // Frame 3: delete back to "hi". Col 7's old cursor cell must also
     // reset to default bg - nothing trailing off the right of the draft.
-    cb.deleteBackFromDraft();
-    compositor.composite(&layout, .{ .mode = .insert });
+    var drafts3 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi" }};
+    compositor.composite(&layout, &drafts3, .{ .mode = .insert });
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 7).bg, Screen.Color.default));
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 }
@@ -1116,7 +1157,6 @@ test "unfocused pane shows its draft without a cursor block" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "b");
     defer cb2.deinit();
-    for ("world") |ch| cb2.appendToDraft(ch);
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -1128,7 +1168,13 @@ test "unfocused pane shows its draft without a cursor block" {
     // pane (cb2) is the unfocused one whose prompt row we inspect below.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    // After splitVertical, root is a split with first=left-leaf, second=right-leaf.
+    const root_split = &layout.root.?.split;
+    const drafts = [_]Compositor.LeafDraft{
+        .{ .leaf = &root_split.first.leaf, .draft = "" },
+        .{ .leaf = &root_split.second.leaf, .draft = "world" },
+    };
+    compositor.composite(&layout, &drafts, .{ .mode = .insert });
 
     // Right pane rect is (x=20, width=20). Prompt row = 5. Content col = 20+1+1 = 22.
     try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(5, 22).codepoint);
@@ -1154,14 +1200,16 @@ test "normal mode does not paint a block cursor in the focused pane" {
     compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
-    for ("hi") |ch| cb.appendToDraft(ch);
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 8);
 
-    compositor.composite(&layout, .{ .mode = .normal });
+    const drafts = [_]Compositor.LeafDraft{
+        .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
+    };
+    compositor.composite(&layout, &drafts, .{ .mode = .normal });
 
     // Prompt row = 5. Draft shows but no cursor block.
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(5, 4).codepoint);
@@ -1194,7 +1242,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
     const input: Compositor.InputState = .{ .mode = .normal };
 
     // First frame: layout dirty, draws everything, populates the cache.
-    compositor.composite(&layout, input);
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, input);
     try std.testing.expect(compositor.last_status_key.valid);
 
     // Scribble a sentinel on the status row; if the second frame redraws
@@ -1204,7 +1252,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
     sentinel_cell.codepoint = '#';
 
     // Second frame: same inputs, layout stable; status line must skip.
-    compositor.composite(&layout, input);
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, input);
     try std.testing.expectEqual(@as(u21, '#'), screen.getCellConst(last_row, 5).codepoint);
 }
 
@@ -1232,7 +1280,7 @@ test "composite twice produces identical screen content" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     // Snapshot the first frame's cell codepoints.
     const cell_count: usize = @as(usize, screen.width) * @as(usize, screen.height);
@@ -1244,7 +1292,7 @@ test "composite twice produces identical screen content" {
 
     // Force a full redraw and composite again.
     compositor.layout_dirty = true;
-    compositor.composite(&layout, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
 
     for (0..screen.height) |r| for (0..screen.width) |c| {
         const cp = screen.getCellConst(@intCast(r), @intCast(c)).codepoint;
@@ -1262,7 +1310,6 @@ test "tiny pane (height 3) skips the prompt reservation" {
     compositor.layout_dirty = true;
     var cb = try ConversationBuffer.init(allocator, 0, "p");
     defer cb.deinit();
-    for ("hi") |ch| cb.appendToDraft(ch);
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -1271,7 +1318,10 @@ test "tiny pane (height 3) skips the prompt reservation" {
     // Pane rect = 20x3 (4 rows - 1 for status). Too small for a prompt row,
     // so the composite must not crash and must not draw a prompt glyph.
 
-    compositor.composite(&layout, .{ .mode = .insert });
+    const drafts = [_]Compositor.LeafDraft{
+        .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
+    };
+    compositor.composite(&layout, &drafts, .{ .mode = .insert });
 
     var saw_prompt = false;
     for (0..screen.height) |r| for (0..screen.width) |c| {
