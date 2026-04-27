@@ -27,6 +27,7 @@ const Viewport = @import("Viewport.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const zlua = @import("zlua");
 const Session = @import("Session.zig");
 const Keymap = @import("Keymap.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
@@ -427,6 +428,27 @@ pub fn deinit(self: *WindowManager) void {
         }
     }
     self.extra_panes.deinit(self.allocator);
+    // Drain any Lua callback refs still held by live floats so the
+    // registry slots are released exactly once. We do this before
+    // freeing the FloatNode storage in `Layout.deinit` (which runs
+    // after this function under main.zig's defer chain). The
+    // `closeFloatById` path normally does this; deinit is the
+    // shutdown-with-floats-still-open fallback.
+    if (self.lua_engine) |engine| {
+        for (self.layout.floats.items) |f| {
+            if (f.config.on_close_ref) |ref| {
+                engine.invokeCallback(ref);
+                engine.lua.unref(zlua.registry_index, ref);
+            }
+            if (f.config.on_key_ref) |ref| {
+                engine.lua.unref(zlua.registry_index, ref);
+            }
+            // Null the refs so a downstream walker (e.g. a future
+            // engine.deinit double-check) cannot unref twice.
+            f.config.on_close_ref = null;
+            f.config.on_key_ref = null;
+        }
+    }
     // Tear down floats with the same dependency-ordered sequence used
     // for extra_panes. Floats are simpler today (no agent runner / no
     // session handle in slice 1, mostly scratch-backed) but the same
@@ -1329,6 +1351,18 @@ pub fn openFloatPane(
     const handle = try self.layout.addFloat(buffer, rect, config);
     errdefer self.layout.removeFloat(handle) catch {};
 
+    // Snapshot the *current* focused pane's draft length so the
+    // orchestrator's auto-close sweep has a baseline to compare
+    // against on every tick. Capture it BEFORE flipping focus to the
+    // float so a `close_on_cursor_moved` toast does not see itself as
+    // the "tile that just moved". The find-after-add path here can
+    // only fail on stale handles, which we just produced — bug if it
+    // ever fires.
+    if (self.layout.findFloat(handle)) |f| {
+        const focused_draft = self.getFocusedPanePtr().draft_len;
+        f.cursor_draft_len_at_open = focused_draft;
+    }
+
     if (config.enter) {
         self.layout.focused_float = handle;
     }
@@ -1345,8 +1379,22 @@ pub fn openFloatPane(
 /// Close the float identified by `handle`. Frees the float's pane entry,
 /// removes the float from `Layout.floats`, and triggers a full layout
 /// repaint on the next frame so cells under the float are restored.
+///
+/// Callback discipline: any `on_close_ref` and `on_key_ref` stored on
+/// the float's `FloatConfig` is invoked (close) or unref'd here so the
+/// Lua registry never grows past the float's lifetime. `on_close` fires
+/// before the rect/pane is torn down so the callback sees a still-live
+/// layout.
 pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     const float = self.layout.findFloat(handle) orelse return error.StaleNode;
+    const on_close_ref = float.config.on_close_ref;
+    const on_key_ref = float.config.on_key_ref;
+    // Null the refs *before* invoking on_close so a callback that
+    // (deliberately or otherwise) re-enters via zag.layout.close does
+    // not double-fire and double-unref the same registry slot. From
+    // the callback's view the float is "in the middle of closing".
+    float.config.on_close_ref = null;
+    float.config.on_key_ref = null;
 
     var entry_idx_opt: ?usize = null;
     for (self.extra_floats.items, 0..) |entry, i| {
@@ -1356,8 +1404,26 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
         }
     }
 
+    // Fire the on_close callback before we tear down anything else;
+    // the callback might still want to read float metadata via
+    // `zag.layout.tree`. After the call, drop the registry slot so
+    // the ref does not outlive the FloatNode.
+    if (self.lua_engine) |engine| {
+        if (on_close_ref) |ref| engine.invokeCallback(ref);
+        if (on_close_ref) |ref| engine.lua.unref(zlua.registry_index, ref);
+        if (on_key_ref) |ref| engine.lua.unref(zlua.registry_index, ref);
+    }
+
     // `removeFloat` clears `layout.focused_float` if it was pointing at
-    // this handle, so we don't need to clear it here.
+    // this handle, so we don't need to clear it here. If on_close
+    // already removed the float (re-entrant close), `findFloat` would
+    // have returned non-null at the top of this function but the
+    // pointer would be stale by now — guard with another findFloat to
+    // make the second close a clean no-op.
+    if (self.layout.findFloat(handle) == null) {
+        self.compositor.layout_dirty = true;
+        return;
+    }
     try self.layout.removeFloat(handle);
 
     if (entry_idx_opt) |idx| {
@@ -1390,6 +1456,31 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     }
 
     self.compositor.layout_dirty = true;
+}
+
+/// Patch a live float's geometry (offsets, size, corner, z) without
+/// closing and re-opening it. Returns `error.StaleNode` for invalid
+/// handles. Callers are the Lua `zag.layout.float_move` binding and
+/// any future Zig consumer.
+pub fn floatMove(self: *WindowManager, handle: NodeRegistry.Handle, patch: Layout.FloatMovePatch) !void {
+    try self.layout.floatMove(handle, patch);
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+}
+
+/// Bump a float to the top of the z-stack so subsequent frames paint
+/// it above every other float. Returns `error.StaleNode` for invalid
+/// handles.
+pub fn floatRaise(self: *WindowManager, handle: NodeRegistry.Handle) !void {
+    try self.layout.floatRaise(handle);
+    self.compositor.layout_dirty = true;
+}
+
+/// Copy every live float handle into the caller-provided buffer and
+/// return the populated prefix. Used by the Lua
+/// `zag.layout.floats()` binding so the caller controls allocation.
+pub fn floatsList(self: *const WindowManager, out: []NodeRegistry.Handle) []NodeRegistry.Handle {
+    return self.layout.floatsList(out);
 }
 
 /// Restore a pane from an on-disk session: rebuilds both the view tree
@@ -2994,7 +3085,6 @@ test "executeAction focus_left goes through handle path" {
 
 test "executeAction lua_callback runs the Lua function via the engine" {
     const allocator = std.testing.allocator;
-    const zlua = @import("zlua");
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4505,4 +4595,102 @@ test "describe surfaces floats array and focused_float" {
     const focused_val = parsed.value.object.get("focused_float") orelse return error.TestUnexpectedResult;
     try std.testing.expect(focused_val == .string);
     try std.testing.expectEqualStrings(expected_id, focused_val.string);
+}
+
+test "zag.layout.floats() lists every open float handle" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\_h1 = zag.layout.float(_buf, { relative = "editor", row = 0, col = 0, width = 10, height = 4 })
+        \\_h2 = zag.layout.float(_buf, { relative = "editor", row = 5, col = 5, width = 10, height = 4 })
+        \\_floats = zag.layout.floats()
+        \\_n = #_floats
+        \\_first = _floats[1]
+    );
+
+    _ = try f.engine.lua.getGlobal("_n");
+    defer f.engine.lua.pop(1);
+    try std.testing.expectEqual(@as(@TypeOf(try f.engine.lua.toInteger(-1)), 2), try f.engine.lua.toInteger(-1));
+
+    _ = try f.engine.lua.getGlobal("_first");
+    defer f.engine.lua.pop(1);
+    const first_id = try f.engine.lua.toString(-1);
+    try std.testing.expect(first_id.len > 0);
+}
+
+test "zag.layout.float_move repositions an existing float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\_h = zag.layout.float(_buf, { relative = "editor", row = 5, col = 5, width = 10, height = 4 })
+        \\zag.layout.float_move(_h, { row = 12, col = 20 })
+    );
+
+    _ = try f.engine.lua.getGlobal("_h");
+    defer f.engine.lua.pop(1);
+    const id = try f.engine.lua.toString(-1);
+    const handle = try NodeRegistry.parseId(id);
+
+    const rect = f.layout.rectFor(handle).?;
+    try std.testing.expectEqual(@as(u16, 20), rect.x);
+    try std.testing.expectEqual(@as(u16, 12), rect.y);
+}
+
+test "zag.layout.float_raise reorders the z-stack so the raised float is on top" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\_a = zag.layout.float(_buf, { relative = "editor", row = 0, col = 0, width = 10, height = 4, zindex = 25 })
+        \\_b = zag.layout.float(_buf, { relative = "editor", row = 0, col = 0, width = 10, height = 4, zindex = 50 })
+        \\_c = zag.layout.float(_buf, { relative = "editor", row = 0, col = 0, width = 10, height = 4, zindex = 100 })
+        \\zag.layout.float_raise(_a)
+    );
+
+    _ = try f.engine.lua.getGlobal("_a");
+    defer f.engine.lua.pop(1);
+    const id = try f.engine.lua.toString(-1);
+    const a_handle = try NodeRegistry.parseId(id);
+
+    // After raising, `_a` must be the top float (last in the z-sorted
+    // floats array).
+    const top = f.layout.floats.items[f.layout.floats.items.len - 1];
+    try std.testing.expectEqual(a_handle.index, top.handle.index);
+}
+
+test "zag.layout.float on_close callback fires and unrefs cleanly on close" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Open a float with an on_close callback, close it, and observe
+    // the side-effect global. The unref happens inside closeFloatById;
+    // testing.allocator wouldn't catch a registry-slot leak, but the
+    // engine.deinit walk in fixture.deinit asserts that any still-live
+    // refs are released. A double-unref would surface as a Lua error.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "t" }
+        \\_closed = false
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor", row = 0, col = 0, width = 10, height = 4,
+        \\  on_close = function() _closed = true end,
+        \\})
+        \\zag.layout.close(_h)
+    );
+
+    _ = try f.engine.lua.getGlobal("_closed");
+    defer f.engine.lua.pop(1);
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
 }

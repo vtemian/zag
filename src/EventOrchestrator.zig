@@ -26,6 +26,7 @@ const ConversationHistory = @import("ConversationHistory.zig");
 const Layout = @import("Layout.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const zlua = @import("zlua");
 const Session = @import("Session.zig");
 const WindowManager = @import("WindowManager.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
@@ -325,6 +326,16 @@ fn tick(
         self.window_manager.drainPane(&entry.pane);
     }
 
+    // Auto-close sweep: walk floats once per tick and close any whose
+    // lifecycle bound has fired. Two predicates today:
+    //   * `auto_close_ms`: time-based; fires after the configured ms
+    //     elapse since `addFloat` recorded `created_at_ms`.
+    //   * `close_on_cursor_moved`: any change to the focused tile's
+    //     draft length since open (Vim's `moved = "any"`).
+    // Close before the composite call so the closures take effect this
+    // frame and `layout_dirty` is set in time for the redraw below.
+    self.sweepFloatsForAutoClose();
+
     // Check if any pane has pending visual changes. `buffer.isDirty()`
     // ORs the tree-generation delta with the view-only scroll bit, so
     // both tree mutations and scrolls trigger a spinner tick here.
@@ -397,6 +408,121 @@ const max_visible_leaves: usize = 32;
 /// than any plugin should produce.
 const max_visible_floats: usize = 32;
 
+/// Invoke a float's `on_key_ref` Lua filter with a string descriptor
+/// of the key event, then read the return value. The callback's
+/// contract: returning the string `"consumed"` means the float ate
+/// the event and the orchestrator must skip the default key dispatch.
+/// Anything else (nil, a different string, an error) falls through.
+fn invokeOnKeyFilter(self: *EventOrchestrator, ref: i32, ev: input.KeyEvent) bool {
+    const engine = self.window_manager.lua_engine orelse return false;
+    const lua = engine.lua;
+
+    _ = lua.rawGetIndex(zlua.registry_index, ref);
+    if (!lua.isFunction(-1)) {
+        lua.pop(1);
+        return false;
+    }
+
+    var key_buf: [32]u8 = undefined;
+    const key_str = formatKeyEvent(&key_buf, ev);
+    _ = lua.pushString(key_str);
+
+    lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+        const msg = lua.toString(-1) catch "<unprintable>";
+        log.warn("float on_key callback raised: {s}", .{msg});
+        lua.pop(1);
+        return false;
+    };
+    defer lua.pop(1);
+
+    if (lua.typeOf(-1) != .string) return false;
+    const ret = lua.toString(-1) catch return false;
+    return std.mem.eql(u8, ret, "consumed");
+}
+
+/// Render a `KeyEvent` into a stable string descriptor for the Lua
+/// `on_key` filter. ASCII printables stringify to themselves (with
+/// modifier prefixes when held); named keys stringify to their tag
+/// inside angle brackets (`<enter>`, `<esc>`, `<tab>`, etc.). The
+/// format is intentionally compact and stable so plugins can pattern
+/// match on it without parsing modifier flags.
+fn formatKeyEvent(buf: []u8, ev: input.KeyEvent) []const u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    const w = stream.writer();
+    if (ev.modifiers.ctrl) w.writeAll("C-") catch {};
+    if (ev.modifiers.alt) w.writeAll("A-") catch {};
+    if (ev.modifiers.shift) w.writeAll("S-") catch {};
+    switch (ev.key) {
+        .char => |ch| {
+            if (ch >= 0x20 and ch < 0x7f) {
+                w.writeByte(@intCast(ch)) catch {};
+            } else {
+                std.fmt.format(w, "<u{d}>", .{@as(u32, ch)}) catch {};
+            }
+        },
+        .escape => w.writeAll("<esc>") catch {},
+        .enter => w.writeAll("<enter>") catch {},
+        .tab => w.writeAll("<tab>") catch {},
+        .backspace => w.writeAll("<bs>") catch {},
+        .up => w.writeAll("<up>") catch {},
+        .down => w.writeAll("<down>") catch {},
+        .left => w.writeAll("<left>") catch {},
+        .right => w.writeAll("<right>") catch {},
+        .home => w.writeAll("<home>") catch {},
+        .end => w.writeAll("<end>") catch {},
+        .page_up => w.writeAll("<pageup>") catch {},
+        .page_down => w.writeAll("<pagedown>") catch {},
+        .delete => w.writeAll("<del>") catch {},
+        .insert => w.writeAll("<ins>") catch {},
+        .function => |n| std.fmt.format(w, "<f{d}>", .{n}) catch {},
+    }
+    return stream.getWritten();
+}
+
+/// Walk every live float once and close those whose lifecycle bound
+/// has fired this tick. Two predicates today:
+///   * `auto_close_ms != null` and `now - created_at_ms > auto_close_ms`.
+///   * `close_on_cursor_moved == true` and the focused pane's draft
+///     length has changed since the float was opened.
+/// Doomed floats are collected first and closed in a second pass so
+/// the iteration over `layout.floats` is not invalidated mid-walk.
+/// A close also fires the float's `on_close` Lua callback (via
+/// `closeFloatById`) and unrefs every callback ref it held.
+fn sweepFloatsForAutoClose(self: *EventOrchestrator) void {
+    const layout = self.window_manager.layout;
+    if (layout.floats.items.len == 0) return;
+
+    const now = std.time.milliTimestamp();
+    const focused_draft_len = self.window_manager.getFocusedPanePtr().draft_len;
+
+    // Real layouts hold ≤ 10 floats; a fixed-size stack scratch is
+    // plenty. The cap matches the orchestrator's other per-frame
+    // float buffers.
+    var doomed: [max_visible_floats]NodeRegistry.Handle = undefined;
+    var doomed_n: usize = 0;
+    for (layout.floats.items) |f| {
+        if (doomed_n >= doomed.len) break;
+        var should_close = false;
+        if (f.config.auto_close_ms) |ms| {
+            const elapsed = now - f.created_at_ms;
+            if (elapsed >= 0 and @as(u64, @intCast(elapsed)) > @as(u64, ms)) should_close = true;
+        }
+        if (!should_close and f.config.close_on_cursor_moved) {
+            if (focused_draft_len != f.cursor_draft_len_at_open) should_close = true;
+        }
+        if (should_close) {
+            doomed[doomed_n] = f.handle;
+            doomed_n += 1;
+        }
+    }
+
+    for (doomed[0..doomed_n]) |handle| {
+        self.window_manager.closeFloatById(handle) catch |err| {
+            log.warn("auto-close failed for float n{d}: {}", .{ handle.index, err });
+        };
+    }
+}
+
 /// Build the per-frame `FloatDraft` slice from `Layout.floats` and the
 /// matching `extra_floats` panes. Walks in z-sorted order (the layout
 /// keeps the list ascending) so the compositor's later passes can
@@ -467,6 +593,19 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // Pointer so draft mutations land on the live pane and do not copy
     // the 4 KB draft buffer on every key.
     const focused = self.window_manager.getFocusedPanePtr();
+
+    // If the focused pane belongs to a float with an on_key filter,
+    // give the Lua callback first crack at the event. Returning the
+    // string `"consumed"` blocks the default key handling for this
+    // keystroke; any other return value falls through to the normal
+    // dispatch chain. Mirrors Vim's `popup_filter` mechanism.
+    if (self.window_manager.layout.focused_float) |fh| {
+        if (self.window_manager.layout.findFloat(fh)) |float| {
+            if (float.config.on_key_ref) |ref| {
+                if (self.invokeOnKeyFilter(ref, k)) return .redraw;
+            }
+        }
+    }
 
     // Ctrl+C is always-on regardless of mode: it's the universal escape
     // hatch (cancel a running agent, or quit the app).
@@ -609,6 +748,17 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
     if (ev.x == 0 or ev.y == 0) return;
     const screen_x: u16 = ev.x - 1;
     const screen_y: u16 = ev.y - 1;
+
+    // Publish the cursor cell so a `relative = "mouse"` float follows
+    // the pointer on every event (motion, drag, click, wheel). Cursor
+    // anchor stays separate so a popup stuck to the typing cursor
+    // does not jitter with the pointer.
+    self.window_manager.layout.mouse_anchor = .{
+        .x = screen_x,
+        .y = screen_y,
+        .width = 1,
+        .height = 1,
+    };
 
     // Floats sit on top of the tile tree, so a click that lands inside
     // a float's rect must route to that float (and on a press also
@@ -1262,4 +1412,270 @@ test "handleKey routes a printable char to the focused float's pane draft" {
 
     // Move the (mutated) WindowManager back so deinit frees the canon.
     wm.* = orch.window_manager;
+}
+
+/// Stand up a minimal WindowManager + Layout for slice-3 lifecycle
+/// tests (auto-close, moved=any). The fixture mirrors the harness used
+/// by the slice-1 mouse / slice-2 focus tests above; pulled out so
+/// each test can stay focused on the assertion under exam.
+const FloatLifecycleFixture = struct {
+    allocator: Allocator,
+    screen: Screen,
+    theme: @import("Theme.zig"),
+    compositor: Compositor,
+    layout: Layout,
+    session_history: ConversationHistory,
+    view: ConversationBuffer,
+    runner: AgentRunner,
+    command_registry: CommandRegistry,
+    session_mgr: ?Session.SessionManager,
+    wm: *WindowManager,
+
+    const TestNullSink = struct {
+        fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+        fn deinitVT(_: *anyopaque) void {}
+        const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+        fn sink() Sink {
+            return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+        }
+    };
+
+    fn init(self: *FloatLifecycleFixture, allocator: Allocator) !void {
+        self.allocator = allocator;
+        self.screen = try Screen.init(allocator, 80, 24);
+        self.theme = @import("Theme.zig").defaultTheme();
+        self.compositor = Compositor.init(&self.screen, allocator, &self.theme);
+        self.layout = Layout.init(allocator);
+        self.session_history = ConversationHistory.init(allocator);
+        self.view = try ConversationBuffer.init(allocator, 0, "root");
+        self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.session_history);
+        self.command_registry = CommandRegistry.init(allocator);
+        try self.command_registry.registerBuiltIn("/quit", .quit);
+        self.session_mgr = null;
+
+        const root_pane: WindowManager.Pane = .{
+            .buffer = self.view.buf(),
+            .view = &self.view,
+            .session = &self.session_history,
+            .runner = &self.runner,
+        };
+
+        self.wm = try allocator.create(WindowManager);
+        self.wm.* = .{
+            .allocator = allocator,
+            .screen = &self.screen,
+            .layout = &self.layout,
+            .compositor = &self.compositor,
+            .root_pane = root_pane,
+            .provider = undefined,
+            .session_mgr = &self.session_mgr,
+            .lua_engine = null,
+            .command_registry = &self.command_registry,
+            .wake_write_fd = 0,
+            .node_registry = NodeRegistry.init(allocator),
+            .buffer_registry = BufferRegistry.init(allocator),
+        };
+
+        try self.wm.attachLayoutRegistry();
+        try self.layout.setRoot(self.view.buf());
+        self.layout.recalculate(80, 24);
+    }
+
+    fn deinit(self: *FloatLifecycleFixture) void {
+        self.wm.deinit();
+        self.allocator.destroy(self.wm);
+        self.command_registry.deinit();
+        self.runner.deinit();
+        self.view.deinit();
+        self.session_history.deinit();
+        self.layout.deinit();
+        self.compositor.deinit();
+        self.screen.deinit();
+    }
+};
+
+test "sweepFloatsForAutoClose closes a float whose time has elapsed" {
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const bh = try f.wm.buffer_registry.createScratch("toast");
+    const buf = try f.wm.buffer_registry.asBuffer(bh);
+    const handle = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .width = 10,
+        .height = 4,
+        .auto_close_ms = 1,
+        .enter = false,
+    });
+
+    // Backdate created_at_ms to well outside the timeout so the next
+    // sweep observes the float as expired without sleeping the test.
+    f.layout.findFloat(handle).?.created_at_ms = std.time.milliTimestamp() - 1000;
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.sweepFloatsForAutoClose();
+    f.wm.* = orch.window_manager;
+
+    try std.testing.expectEqual(@as(usize, 0), f.layout.floats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_floats.items.len);
+}
+
+test "sweepFloatsForAutoClose closes a moved=any float when the focused draft mutates" {
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const bh = try f.wm.buffer_registry.createScratch("popup");
+    const buf = try f.wm.buffer_registry.asBuffer(bh);
+    const handle = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .width = 10,
+        .height = 4,
+        .close_on_cursor_moved = true,
+        // Crucially the float does NOT take focus: we want the
+        // open-time snapshot to capture the *root* pane's draft_len
+        // and the underlying tile's mutation to fire the close.
+        .enter = false,
+    });
+
+    // Verify the snapshot baselined to 0 (root pane's draft is empty
+    // at fixture init).
+    try std.testing.expectEqual(@as(usize, 0), f.layout.findFloat(handle).?.cursor_draft_len_at_open);
+
+    // Mutate the focused (root) pane's draft. The next sweep must
+    // observe the change and close the float.
+    f.wm.root_pane.appendToDraft('x');
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.sweepFloatsForAutoClose();
+    f.wm.* = orch.window_manager;
+
+    try std.testing.expectEqual(@as(usize, 0), f.layout.floats.items.len);
+}
+
+test "handleKey routes through on_key filter and consumes when callback returns \"consumed\"" {
+    const allocator = std.testing.allocator;
+
+    // The on_key path needs a live Lua engine because the filter ref
+    // is invoked via lua.protectedCall. Stand up an engine, register
+    // a callback in Lua-land, plug its registry slot into a fake
+    // FloatConfig.on_key_ref, and verify the orchestrator's
+    // invokeOnKeyFilter blocks the keystroke from reaching the
+    // float's pane.
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    const TestNullSink = struct {
+        fn pushVT(_: *anyopaque, _: SinkEvent) void {}
+        fn deinitVT(_: *anyopaque) void {}
+        const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+        fn sink() Sink {
+            return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
+        }
+    };
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+
+    var session_mgr: ?Session.SessionManager = null;
+    var command_registry = CommandRegistry.init(allocator);
+    defer command_registry.deinit();
+    try command_registry.registerBuiltIn("/quit", .quit);
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner },
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .command_registry = &command_registry,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(80, 24);
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    // Stash a Lua function that always returns "consumed" and grab
+    // the registry ref. Mirrors what zag.layout.float would do, but
+    // without going through the full opts parser.
+    try engine.lua.doString(
+        \\_filter = function(k) return "consumed" end
+    );
+    _ = try engine.lua.getGlobal("_filter");
+    const on_key_ref = try engine.lua.ref(zlua.registry_index);
+
+    const bh = try wm.buffer_registry.createScratch("popup");
+    const buf = try wm.buffer_registry.asBuffer(bh);
+    const handle = try wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .width = 10,
+        .height = 4,
+        .enter = true,
+        .on_key_ref = on_key_ref,
+    });
+
+    wm.current_mode = .insert;
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = wm.*;
+    const ev: input.KeyEvent = .{ .key = .{ .char = 'h' }, .modifiers = .{} };
+    _ = orch.handleKey(ev);
+    wm.* = orch.window_manager;
+
+    // The float pane's draft must remain empty: the filter consumed
+    // the event before the default handler could append.
+    const float_pane = wm.paneFromFloatHandle(handle).?;
+    try std.testing.expectEqual(@as(usize, 0), float_pane.draft_len);
+}
+
+test "sweepFloatsForAutoClose leaves intact a float whose time has not yet elapsed" {
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const bh = try f.wm.buffer_registry.createScratch("toast");
+    const buf = try f.wm.buffer_registry.asBuffer(bh);
+    _ = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .width = 10,
+        .height = 4,
+        .auto_close_ms = 60_000, // one minute from now
+        .enter = false,
+    });
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.sweepFloatsForAutoClose();
+    f.wm.* = orch.window_manager;
+
+    try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
 }
