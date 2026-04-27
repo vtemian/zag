@@ -628,6 +628,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "focus");
         lua.pushFunction(zlua.wrap(zagLayoutSplitFn));
         lua.setField(-2, "split");
+        lua.pushFunction(zlua.wrap(zagLayoutFloatFn));
+        lua.setField(-2, "float");
         lua.pushFunction(zlua.wrap(zagLayoutCloseFn));
         lua.setField(-2, "close");
         lua.pushFunction(zlua.wrap(zagLayoutResizeFn));
@@ -2714,21 +2716,214 @@ pub const LuaEngine = struct {
         return 1;
     }
 
-    /// `zag.layout.close(id)`: close the leaf identified by `id`.
-    /// Plugin-level calls run on the main thread as user code, so they
-    /// bypass the caller-pane guard (no caller pane exists here).
+    /// `zag.layout.close(id)`: close the leaf or float identified by
+    /// `id`. Plugin-level calls run on the main thread as user code, so
+    /// they bypass the caller-pane guard (no caller pane exists here).
+    /// Float handles route to `closeFloatById`; tile handles route to
+    /// the existing `closeById` path.
     fn zagLayoutCloseFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const wm = engine.window_manager orelse {
             lua.raiseErrorStr("zag.layout.close: no window manager bound", .{});
         };
         const handle = requireLayoutHandle(lua, 1, "zag.layout.close");
+        if (Layout.isFloatHandle(handle)) {
+            wm.closeFloatById(handle) catch |err| {
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(&buf, "zag.layout.close: {s}", .{@errorName(err)}) catch "zag.layout.close failed";
+                lua.raiseErrorStr("%s", .{msg.ptr});
+            };
+            return 0;
+        }
         wm.closeById(handle, null) catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.layout.close: {s}", .{@errorName(err)}) catch "zag.layout.close failed";
             lua.raiseErrorStr("%s", .{msg.ptr});
         };
         return 0;
+    }
+
+    /// `zag.layout.float(buffer_handle, opts)`: open a floating pane
+    /// over the tiled tree. Slice 1 only accepts `relative = "editor"`
+    /// floats anchored by absolute `(row, col)` and explicit
+    /// `(width, height)`. Returns the float's stable handle string.
+    ///
+    /// Required opts:
+    ///   * `relative = "editor"` (only value accepted in slice 1)
+    ///   * `row`, `col`, `width`, `height` (integers; clamped to u16)
+    /// Optional opts:
+    ///   * `border` ("none" | "square" | "rounded"; default "rounded")
+    ///   * `title` (string)
+    ///   * `zindex` (integer; default 50)
+    fn zagLayoutFloatFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.layout.float: no window manager bound", .{});
+        };
+
+        // Arg 1: buffer handle string. Slice 1 only borrows registered
+        // buffers (the picker pattern); a future variant will accept a
+        // table { type = "conversation" } like split does.
+        if (lua.typeOf(1) != .string) {
+            lua.raiseErrorStr("zag.layout.float: buffer handle must be a string", .{});
+        }
+        const raw_handle = lua.toString(1) catch {
+            lua.raiseErrorStr("zag.layout.float: buffer handle must be a string", .{});
+        };
+        const bh = BufferRegistry.parseId(raw_handle) catch {
+            lua.raiseErrorStr("zag.layout.float: invalid buffer handle", .{});
+        };
+        const buffer_registry = engine.buffer_registry orelse {
+            lua.raiseErrorStr("zag.layout.float: no buffer registry bound", .{});
+        };
+        const buffer = buffer_registry.asBuffer(bh) catch {
+            lua.raiseErrorStr("zag.layout.float: stale buffer handle", .{});
+        };
+
+        // Arg 2: options table. Required for slice 1 since position +
+        // size are mandatory; later slices will let `relative = "win"`
+        // skip many of these.
+        if (!lua.isTable(2)) {
+            lua.raiseErrorStr("zag.layout.float: opts must be a table", .{});
+        }
+
+        // `relative` — only "editor" in slice 1. Each field read pops
+        // immediately after the value is consumed so the stack stays
+        // clean and `pushString(id)` at the end is the unambiguous top.
+        _ = lua.getField(2, "relative");
+        if (lua.typeOf(-1) != .string) {
+            lua.raiseErrorStr("zag.layout.float: relative must be a string", .{});
+        }
+        const relative = lua.toString(-1) catch {
+            lua.raiseErrorStr("zag.layout.float: relative must be a string", .{});
+        };
+        if (!std.mem.eql(u8, relative, "editor")) {
+            lua.raiseErrorStr("zag.layout.float: relative=\"editor\" is the only value supported in slice 1", .{});
+        }
+        lua.pop(1);
+
+        const row = readU16Field(lua, 2, "row", "zag.layout.float");
+        const col = readU16Field(lua, 2, "col", "zag.layout.float");
+        const width = readU16Field(lua, 2, "width", "zag.layout.float");
+        const height = readU16Field(lua, 2, "height", "zag.layout.float");
+        if (width == 0 or height == 0) {
+            lua.raiseErrorStr("zag.layout.float: width and height must be positive", .{});
+        }
+
+        var border_kind: Layout.FloatBorder = .rounded;
+        _ = lua.getField(2, "border");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: border must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "none")) {
+                    border_kind = .none;
+                } else if (std.mem.eql(u8, s, "square")) {
+                    border_kind = .square;
+                } else if (std.mem.eql(u8, s, "rounded")) {
+                    border_kind = .rounded;
+                } else {
+                    lua.raiseErrorStr("zag.layout.float: border must be \"none\" | \"square\" | \"rounded\"", .{});
+                }
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.float: border must be a string", .{});
+            },
+        }
+        lua.pop(1);
+
+        // Title bytes live in the Lua string interner: copy onto the
+        // engine allocator before calling into Layout (which dupes the
+        // bytes itself anyway, but we cannot risk the GC freeing the
+        // borrowed slice between getField and the addFloat call).
+        var title_owned: ?[]const u8 = null;
+        _ = lua.getField(2, "title");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: title must be a string", .{});
+                };
+                title_owned = s;
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.float: title must be a string", .{});
+            },
+        }
+        // Defer the pop until after openFloatPane: the title slice
+        // borrows into the Lua string slot we'd otherwise release.
+        // `Layout.addFloat` dupes the bytes onto its own allocator
+        // before we pop, so the pop here is safe.
+
+        var z: u32 = 50;
+        _ = lua.getField(2, "zindex");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .number => {
+                const n = lua.toInteger(-1) catch {
+                    lua.raiseErrorStr("zag.layout.float: zindex must be an integer", .{});
+                };
+                if (n < 0) {
+                    lua.raiseErrorStr("zag.layout.float: zindex must be >= 0", .{});
+                }
+                z = @intCast(n);
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.float: zindex must be an integer", .{});
+            },
+        }
+        lua.pop(1);
+
+        const handle = wm.openFloatPane(
+            buffer,
+            .{ .x = col, .y = row, .width = width, .height = height },
+            .{
+                .border = border_kind,
+                .title = title_owned,
+                .z = z,
+                .focusable = true,
+                .enter = true,
+            },
+        ) catch |err| {
+            lua.pop(1); // title
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.layout.float: {s}", .{@errorName(err)}) catch "zag.layout.float failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        // Title bytes are now owned by the FloatNode (Layout.addFloat
+        // duped them); release the borrowed Lua slice.
+        lua.pop(1);
+
+        const id = NodeRegistry.formatId(engine.allocator, handle) catch {
+            lua.raiseErrorStr("zag.layout.float: id format failed", .{});
+        };
+        defer engine.allocator.free(id);
+        _ = lua.pushString(id);
+        return 1;
+    }
+
+    /// Read an integer field from a Lua table at stack index `tbl`,
+    /// raising a typed Lua error on miss / non-integer / negative.
+    /// Shared between the various `zag.layout.float` field readers so
+    /// the error messages stay uniform. Pops the field after read.
+    fn readU16Field(lua: *Lua, tbl: i32, comptime name: [:0]const u8, comptime op: []const u8) u16 {
+        _ = lua.getField(tbl, name);
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .number) {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{});
+        }
+        const n = lua.toInteger(-1) catch {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{});
+        };
+        if (n < 0) {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " must be >= 0", .{});
+        }
+        if (n > std.math.maxInt(u16)) {
+            lua.raiseErrorStr(op ++ ": " ++ name ++ " exceeds u16 range", .{});
+        }
+        return @intCast(n);
     }
 
     /// `zag.layout.resize(id, ratio)`: apply a new split ratio to the

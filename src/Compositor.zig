@@ -98,6 +98,25 @@ pub const LeafDraft = struct {
     draft: []const u8,
 };
 
+/// Per-frame float drawing input. Parallel to `LeafDraft`, kept on a
+/// separate slice because the compositor's float pass differs enough
+/// from the tile pass (z-ordered, screen-anchored, no split tree) that a
+/// tagged-union LeafDraft would force a switch in every drawer. The
+/// orchestrator builds this each frame from `Layout.floats` and the
+/// matching `extra_floats` panes.
+pub const FloatDraft = struct {
+    float: *const Layout.FloatNode,
+    /// Owning pane's draft, for rendering the prompt row. Empty when
+    /// the float's pane has no draft state (slice 1 floats are
+    /// scratch-backed pickers that never grow drafts, but the field
+    /// stays so slice 2's focus routing has a place to drop drafts).
+    draft: []const u8 = "",
+    /// Whether this float currently owns input focus. Drives the
+    /// border-highlight contrast (slice 2 polish; slice 1 always passes
+    /// `true` for the modal picker case).
+    focused: bool = false,
+};
+
 /// Composite the layout into the screen grid.
 /// Only redraws leaves whose buffer is dirty. Always redraws the input/status row.
 /// On layout changes (layout_dirty), clears the full screen and redraws everything.
@@ -105,6 +124,7 @@ pub fn composite(
     self: *Compositor,
     layout: *const Layout,
     leaf_drafts: []const LeafDraft,
+    float_drafts: []const FloatDraft,
     input: InputState,
 ) void {
     // Reset per-frame arena: the previous frame's output lists and any
@@ -177,6 +197,15 @@ pub fn composite(
         var s = trace.span("pane_prompts");
         defer s.end();
         self.drawPanePrompts(root, focused, leaf_drafts, input);
+    }
+
+    // Floats overlay the tiled tree. Drawn last so they win every cell
+    // they overlap. Iterated in the supplied order (already z-sorted
+    // ascending by the orchestrator), so higher-z floats stack on top.
+    {
+        var s = trace.span("floats");
+        defer s.end();
+        self.drawFloats(float_drafts, input);
     }
 }
 
@@ -262,22 +291,29 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
 /// resolved style. Shrinks the rect by 1 cell on each side to leave room
 /// for the pane's frame, then applies padding_h/padding_v from the theme.
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
-    const outer = leaf.rect;
-    // Each pane owns a 1-cell frame on every side. Content must fit inside.
+    self.drawBufferIntoRect(leaf.buffer, leaf.rect, true);
+}
+
+/// Render `buf` into `outer`, where `outer` is the chrome-inclusive
+/// rect. When `reserve_prompt_row` is true, the bottom-most interior
+/// row is reserved for a `›` prompt and the content stops one row
+/// short — same shape used by tiled leaves. Floats pass `false` because
+/// they do not draw a prompt today.
+fn drawBufferIntoRect(
+    self: *Compositor,
+    buf: Buffer,
+    outer: Layout.Rect,
+    reserve_prompt_row: bool,
+) void {
     if (outer.width < 3 or outer.height < 3) return;
 
-    // Reserve the bottom-most content row for the per-pane prompt whenever
-    // the pane is tall enough. A 3-row pane only has room for frame + one
-    // content row, so we skip the reservation there.
-    const reserve_prompt: u16 = if (outer.height >= 4) 1 else 0;
+    const reserve_prompt: u16 = if (reserve_prompt_row and outer.height >= 4) 1 else 0;
     const rect = Layout.Rect{
         .x = outer.x + 1,
         .y = outer.y + 1,
         .width = outer.width - 2,
         .height = outer.height - 2 - reserve_prompt,
     };
-
-    const buf = leaf.buffer;
 
     // Compute visible window dimensions
     const pad_h = self.theme.spacing.padding_h;
@@ -365,8 +401,60 @@ fn drawFramesPass(self: *Compositor, node: *const Layout.LayoutNode, focused: *c
 
 /// Draw a single rounded rectangle with an embedded title on the top edge.
 fn drawPaneFrame(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, focused: bool) void {
-    const rect = leaf.rect;
+    self.drawRoundedBox(leaf.rect, focused, leaf.buffer.getName(), .rounded);
+}
+
+/// Border glyph quartet plus edges, parameterized so floats can render
+/// `.square` and `.rounded` chrome without duplicating the wall-paint
+/// loops. `.none` short-circuits to a no-op so a borderless float still
+/// gets its rect cleared and its content drawn.
+const BorderGlyphs = struct {
+    top_left: u21,
+    top_right: u21,
+    bottom_left: u21,
+    bottom_right: u21,
+    horizontal: u21,
+    vertical: u21,
+};
+
+fn glyphsForBorder(self: *const Compositor, kind: Layout.FloatBorder) ?BorderGlyphs {
+    return switch (kind) {
+        .none => null,
+        .rounded => .{
+            .top_left = self.theme.borders.top_left,
+            .top_right = self.theme.borders.top_right,
+            .bottom_left = self.theme.borders.bottom_left,
+            .bottom_right = self.theme.borders.bottom_right,
+            .horizontal = self.theme.borders.horizontal,
+            .vertical = self.theme.borders.vertical,
+        },
+        // Slice 1 only ships rounded chrome; .square reuses the same
+        // glyph set for now. A future theme entry can swap to ASCII
+        // corners (`+`/`-`/`|`) without touching this site.
+        .square => .{
+            .top_left = self.theme.borders.top_left,
+            .top_right = self.theme.borders.top_right,
+            .bottom_left = self.theme.borders.bottom_left,
+            .bottom_right = self.theme.borders.bottom_right,
+            .horizontal = self.theme.borders.horizontal,
+            .vertical = self.theme.borders.vertical,
+        },
+    };
+}
+
+/// Draw a single bordered rectangle with an embedded title on the top
+/// edge. Shared between tiled panes (`drawPaneFrame`) and floating
+/// panes (`drawFloats`) so glyph + title logic lives in one place.
+fn drawRoundedBox(
+    self: *Compositor,
+    rect: Layout.Rect,
+    focused: bool,
+    title_name: ?[]const u8,
+    border_kind: Layout.FloatBorder,
+) void {
     if (rect.width < 2 or rect.height < 2) return;
+
+    const glyphs = self.glyphsForBorder(border_kind) orelse return;
 
     const border = if (focused)
         Theme.resolve(self.theme.highlights.border_focused, self.theme)
@@ -382,27 +470,26 @@ fn drawPaneFrame(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, focused
     const left = rect.x;
     const right = rect.x + rect.width - 1;
 
-    // Corners
-    self.paintCell(top, left, self.theme.borders.top_left, border);
-    self.paintCell(top, right, self.theme.borders.top_right, border);
-    self.paintCell(bottom, left, self.theme.borders.bottom_left, border);
-    self.paintCell(bottom, right, self.theme.borders.bottom_right, border);
+    self.paintCell(top, left, glyphs.top_left, border);
+    self.paintCell(top, right, glyphs.top_right, border);
+    self.paintCell(bottom, left, glyphs.bottom_left, border);
+    self.paintCell(bottom, right, glyphs.bottom_right, border);
 
-    // Top and bottom edges (title will overwrite the top as needed)
     var col: u16 = left + 1;
     while (col < right) : (col += 1) {
-        self.paintCell(top, col, self.theme.borders.horizontal, border);
-        self.paintCell(bottom, col, self.theme.borders.horizontal, border);
+        self.paintCell(top, col, glyphs.horizontal, border);
+        self.paintCell(bottom, col, glyphs.horizontal, border);
     }
 
-    // Left and right edges
     var row: u16 = top + 1;
     while (row < bottom) : (row += 1) {
-        self.paintCell(row, left, self.theme.borders.vertical, border);
-        self.paintCell(row, right, self.theme.borders.vertical, border);
+        self.paintCell(row, left, glyphs.vertical, border);
+        self.paintCell(row, right, glyphs.vertical, border);
     }
 
-    self.drawPaneTitle(rect, leaf.buffer.getName(), border, title, focused);
+    if (title_name) |name| if (name.len > 0) {
+        self.drawPaneTitle(rect, name, border, title, focused);
+    };
 }
 
 /// Paint a single cell: codepoint + style + fg. Leaves bg untouched so the
@@ -588,6 +675,27 @@ fn drawPaneTitle(self: *Compositor, rect: Layout.Rect, name: []const u8, border:
     }
 }
 
+/// Draw every float on top of the tiled tree. Each float clears its
+/// rect, paints the buffer content inside the chrome, then draws the
+/// border + title. Slice 1 floats are scratch-backed pickers without a
+/// prompt row, so the prompt-row reservation is disabled here.
+fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputState) void {
+    _ = input;
+    for (float_drafts) |fd| {
+        const float = fd.float;
+        const rect = float.rect;
+        if (rect.width < 2 or rect.height < 2) continue;
+
+        // Clear under the float so the tile-tree content doesn't bleed
+        // through the chrome cells. Cells outside the screen bounds are
+        // ignored by Screen.clearRect itself.
+        self.screen.clearRect(rect.y, rect.x, rect.width, rect.height);
+
+        self.drawBufferIntoRect(float.buffer, rect, false);
+        self.drawRoundedBox(rect, fd.focused, float.config.title, float.config.border);
+    }
+}
+
 /// Copy `name` into `dest`, truncating with U+2026 if it exceeds `max` display
 /// columns. Assumes ASCII input (buffer names today are `"session"`,
 /// `"scratch N"`, `"test"`). Returns a slice backed by `dest` or `name`.
@@ -733,7 +841,7 @@ test "composite with empty layout does not crash" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 }
 
 test "composite writes buffer content at leaf rect with padding" {
@@ -756,7 +864,7 @@ test "composite writes buffer content at leaf rect with padding" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     // Frame shifts content by +1 row / +1 col; content row is 1, content col is 1 + pad_h.
@@ -784,7 +892,7 @@ test "composite draws status line on last row" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // Last row is now the sole status line: `[INSERT] mybuf | 40x9`
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
@@ -824,7 +932,7 @@ test "composite skips clean buffer leaves" {
     layout.recalculate(40, 10);
 
     // First composite: buffer is dirty, content should appear
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
@@ -833,7 +941,7 @@ test "composite skips clean buffer leaves" {
     screen.getCell(1, 1 + pad_h + 2).codepoint = 'Z';
 
     // Second composite: buffer is clean (clearDirty was called), so leaf is skipped.
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // The 'Z' survives because the clean leaf was not redrawn.
     try std.testing.expectEqual(@as(u21, 'Z'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
@@ -880,7 +988,7 @@ test "status row in normal mode shows mode label and buffer name only" {
     try layout.setRoot(cb.buf());
     layout.recalculate(80, 10);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .normal });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .normal });
 
     const last_row = screen.height - 1;
     try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
@@ -907,7 +1015,7 @@ test "composite draws rounded frame around a single pane" {
     try layout.setRoot(cb.buf());
     layout.recalculate(20, 6);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // Corners at pane bounds (screen height 6 reserves row 5 for status,
     // so the pane rect is 20x5 - bottom edge lives on row 4).
@@ -944,7 +1052,7 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
     // can check the focused/unfocused contrast on the left/right pair.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     const focused = Theme.resolve(theme.highlights.border_focused, &theme);
     const plain = Theme.resolve(theme.highlights.border, &theme);
@@ -979,7 +1087,7 @@ test "focused pane title has inverse style, unfocused is plain" {
     // Focus followed the split; refocus left so `a` is the focused pane.
     layout.focusDirection(.left);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // Find the `a` name glyph in the focused pane's top edge (cols 0..19).
     var found_focused_a = false;
@@ -1022,7 +1130,7 @@ test "title is suppressed when pane width is below 6" {
     try layout.setRoot(cb.buf());
     layout.recalculate(5, 6);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // No cell on the top row should carry a name character.
     var saw_name_char = false;
@@ -1055,7 +1163,7 @@ test "long titles are truncated with ellipsis" {
     try layout.setRoot(cb.buf());
     layout.recalculate(12, 6);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     var saw_ellipsis = false;
     for (0..12) |c| {
@@ -1086,7 +1194,7 @@ test "focused pane renders its draft with a block cursor at end" {
     const drafts = [_]Compositor.LeafDraft{
         .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
     };
-    compositor.composite(&layout, &drafts, .{ .mode = .insert });
+    compositor.composite(&layout, &drafts, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // Pane is 40x7 (8 rows minus 1 for global status row).
     // Prompt row = rect.y + rect.height - 2 = 5.
@@ -1124,14 +1232,14 @@ test "cursor bg does not bleed across keystrokes" {
 
     // Frame 1: user types "hi". Cursor lands at col 6 with accent bg.
     var drafts1 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi" }};
-    compositor.composite(&layout, &drafts1, .{ .mode = .insert });
+    compositor.composite(&layout, &drafts1, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 
     // Frame 2: user types one more char. New cursor at col 7. The cell
     // at col 6 now holds the glyph `s` (from "his") and MUST have
     // default bg - no accent smear.
     var drafts2 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "his" }};
-    compositor.composite(&layout, &drafts2, .{ .mode = .insert });
+    compositor.composite(&layout, &drafts2, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
     try std.testing.expectEqual(@as(u21, 's'), screen.getCellConst(5, 6).codepoint);
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
     // New cursor at col 7 picks up the accent.
@@ -1140,7 +1248,7 @@ test "cursor bg does not bleed across keystrokes" {
     // Frame 3: delete back to "hi". Col 7's old cursor cell must also
     // reset to default bg - nothing trailing off the right of the draft.
     var drafts3 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi" }};
-    compositor.composite(&layout, &drafts3, .{ .mode = .insert });
+    compositor.composite(&layout, &drafts3, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 7).bg, Screen.Color.default));
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 }
@@ -1174,7 +1282,7 @@ test "unfocused pane shows its draft without a cursor block" {
         .{ .leaf = &root_split.first.leaf, .draft = "" },
         .{ .leaf = &root_split.second.leaf, .draft = "world" },
     };
-    compositor.composite(&layout, &drafts, .{ .mode = .insert });
+    compositor.composite(&layout, &drafts, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // Right pane rect is (x=20, width=20). Prompt row = 5. Content col = 20+1+1 = 22.
     try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(5, 22).codepoint);
@@ -1209,7 +1317,7 @@ test "normal mode does not paint a block cursor in the focused pane" {
     const drafts = [_]Compositor.LeafDraft{
         .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
     };
-    compositor.composite(&layout, &drafts, .{ .mode = .normal });
+    compositor.composite(&layout, &drafts, &[_]Compositor.FloatDraft{}, .{ .mode = .normal });
 
     // Prompt row = 5. Draft shows but no cursor block.
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(5, 4).codepoint);
@@ -1242,7 +1350,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
     const input: Compositor.InputState = .{ .mode = .normal };
 
     // First frame: layout dirty, draws everything, populates the cache.
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, input);
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, input);
     try std.testing.expect(compositor.last_status_key.valid);
 
     // Scribble a sentinel on the status row; if the second frame redraws
@@ -1252,7 +1360,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
     sentinel_cell.codepoint = '#';
 
     // Second frame: same inputs, layout stable; status line must skip.
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, input);
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, input);
     try std.testing.expectEqual(@as(u21, '#'), screen.getCellConst(last_row, 5).codepoint);
 }
 
@@ -1280,7 +1388,7 @@ test "composite twice produces identical screen content" {
     try layout.setRoot(cb.buf());
     layout.recalculate(40, 10);
 
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     // Snapshot the first frame's cell codepoints.
     const cell_count: usize = @as(usize, screen.width) * @as(usize, screen.height);
@@ -1292,12 +1400,99 @@ test "composite twice produces identical screen content" {
 
     // Force a full redraw and composite again.
     compositor.layout_dirty = true;
-    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, .{ .mode = .insert });
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     for (0..screen.height) |r| for (0..screen.width) |c| {
         const cp = screen.getCellConst(@intCast(r), @intCast(c)).codepoint;
         try std.testing.expectEqual(snapshot1[r * screen.width + c], cp);
     };
+}
+
+test "drawFloats renders content and rounded border in supplied rect" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    defer root_cb.deinit();
+
+    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    defer float_cb.deinit();
+    _ = try float_cb.appendNode(null, .user_message, "hello");
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(root_cb.buf());
+    layout.recalculate(40, 12);
+
+    const rect: Layout.Rect = .{ .x = 8, .y = 2, .width = 20, .height = 6 };
+    const handle = try layout.addFloat(float_cb.buf(), rect, .{ .border = .rounded, .title = "Models" });
+    _ = handle;
+
+    const float_drafts = [_]Compositor.FloatDraft{
+        .{ .float = layout.floats.items[0], .draft = "", .focused = true },
+    };
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &float_drafts, .{ .mode = .normal });
+
+    // Top-left rounded corner of the float at (rect.y, rect.x)
+    try std.testing.expectEqual(theme.borders.top_left, screen.getCellConst(rect.y, rect.x).codepoint);
+    // Bottom-right corner
+    try std.testing.expectEqual(theme.borders.bottom_right, screen.getCellConst(rect.y + rect.height - 1, rect.x + rect.width - 1).codepoint);
+    // Buffer content somewhere inside the rect's interior. Search for
+    // the first letter of the user message; exact column depends on
+    // padding and the prompt-glyph leader.
+    var found_h = false;
+    for (rect.y + 1..rect.y + rect.height - 1) |r| {
+        for (rect.x + 1..rect.x + rect.width - 1) |c| {
+            if (screen.getCellConst(@intCast(r), @intCast(c)).codepoint == 'h') {
+                found_h = true;
+                break;
+            }
+        }
+        if (found_h) break;
+    }
+    try std.testing.expect(found_h);
+}
+
+test "scratch leaf still renders correctly with a float overhead" {
+    // Regression for the /model crash class: the tile under a float
+    // must paint its own content correctly even when a float overlays
+    // a different rect.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    defer root_cb.deinit();
+    _ = try root_cb.appendNode(null, .user_message, "hello");
+
+    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    defer float_cb.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(root_cb.buf());
+    layout.recalculate(40, 12);
+
+    // Float in the lower-right; the tile content at (1, 1+pad_h+2)
+    // must still resolve to 'h' from the user message.
+    _ = try layout.addFloat(float_cb.buf(), .{ .x = 20, .y = 4, .width = 18, .height = 6 }, .{});
+
+    const float_drafts = [_]Compositor.FloatDraft{
+        .{ .float = layout.floats.items[0] },
+    };
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &float_drafts, .{ .mode = .insert });
+
+    const pad_h = theme.spacing.padding_h;
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 }
 
 test "tiny pane (height 3) skips the prompt reservation" {
@@ -1321,7 +1516,7 @@ test "tiny pane (height 3) skips the prompt reservation" {
     const drafts = [_]Compositor.LeafDraft{
         .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
     };
-    compositor.composite(&layout, &drafts, .{ .mode = .insert });
+    compositor.composite(&layout, &drafts, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     var saw_prompt = false;
     for (0..screen.height) |r| for (0..screen.width) |c| {

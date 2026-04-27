@@ -260,6 +260,13 @@ buffer_registry: BufferRegistry,
 command_registry: *CommandRegistry,
 /// Extra panes created by splits, tracked for cleanup.
 extra_panes: std.ArrayList(PaneEntry) = .empty,
+/// Floating panes (modals, pickers, toasts). Lifecycle mirrors
+/// `extra_panes` but the panes are not in the tiled tree; they live on
+/// `Layout.floats` and overlay the tree at render time. Two lists rather
+/// than one because float and tile lifecycle paths diverge enough
+/// (open-by-Lua vs split-by-keymap, focus routing, layer ordering) to
+/// keep separate.
+extra_floats: std.ArrayList(PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
 next_buffer_id: u32 = 1,
 /// Rolling label counter for scratch panes. First split produces
@@ -420,6 +427,38 @@ pub fn deinit(self: *WindowManager) void {
         }
     }
     self.extra_panes.deinit(self.allocator);
+    // Tear down floats with the same dependency-ordered sequence used
+    // for extra_panes. Floats are simpler today (no agent runner / no
+    // session handle in slice 1, mostly scratch-backed) but the same
+    // shape is wired so future additions stay symmetric.
+    for (self.extra_floats.items) |entry| {
+        if (entry.session_handle) |sh| {
+            sh.close();
+            self.allocator.destroy(sh);
+        }
+        if (entry.pane.runner) |r| {
+            r.deinit();
+            self.allocator.destroy(r);
+        }
+        if (entry.sink_storage) |bs| {
+            bs.deinit();
+            self.allocator.destroy(bs);
+        }
+        if (entry.pane.provider) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+        }
+        if (entry.pane.view) |v| {
+            v.deinit();
+            self.allocator.destroy(v);
+        }
+        if (entry.viewport_storage) |vp| self.allocator.destroy(vp);
+        if (entry.pane.session) |s| {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
+    }
+    self.extra_floats.deinit(self.allocator);
     // Tear down the buffer registry AFTER panes. Scratch-backed panes
     // borrow their Buffer out of the registry; destroying the registry
     // first would free the underlying ScratchBuffer while the pane
@@ -1146,7 +1185,13 @@ pub fn attachSession(self: *WindowManager, pane: Pane) ?*Session.SessionHandle {
 /// Get the focused pane. Falls back to the root pane when the layout has
 /// no focused leaf or the focused leaf's buffer is not owned by any pane
 /// (should not happen in practice; the fallback keeps UI code total).
+/// Floats win when `layout.focused_float` is set so a modal picker's
+/// buffer-scoped keymaps fire on its own buffer, not the underlying
+/// tile.
 pub fn getFocusedPane(self: *WindowManager) Pane {
+    if (self.layout.focused_float) |handle| {
+        if (self.paneFromFloatHandle(handle)) |p| return p.*;
+    }
     const leaf = self.layout.getFocusedLeaf() orelse return self.root_pane;
     return self.paneFromBuffer(leaf.buffer) orelse self.root_pane;
 }
@@ -1156,6 +1201,9 @@ pub fn getFocusedPane(self: *WindowManager) Pane {
 /// Falls back to `&self.root_pane` on the same two unfocused branches as
 /// `getFocusedPane`, matching its total-function contract.
 pub fn getFocusedPanePtr(self: *WindowManager) *Pane {
+    if (self.layout.focused_float) |handle| {
+        if (self.paneFromFloatHandle(handle)) |p| return p;
+    }
     const leaf = self.layout.getFocusedLeaf() orelse return &self.root_pane;
     if (self.root_pane.buffer.ptr == leaf.buffer.ptr) return &self.root_pane;
     for (self.extra_panes.items) |*entry| {
@@ -1188,6 +1236,9 @@ pub fn paneFromBufferPtr(self: *WindowManager, b: Buffer) ?*Pane {
     for (self.extra_panes.items) |*entry| {
         if (entry.pane.buffer.ptr == b.ptr) return &entry.pane;
     }
+    for (self.extra_floats.items) |*entry| {
+        if (entry.pane.buffer.ptr == b.ptr) return &entry.pane;
+    }
     return null;
 }
 
@@ -1199,7 +1250,118 @@ pub fn paneFromBuffer(self: *WindowManager, b: Buffer) ?Pane {
     for (self.extra_panes.items) |entry| {
         if (entry.pane.buffer.ptr == b.ptr) return entry.pane;
     }
+    for (self.extra_floats.items) |entry| {
+        if (entry.pane.buffer.ptr == b.ptr) return entry.pane;
+    }
     return null;
+}
+
+/// Resolve a float handle to its pane pointer. Walks `extra_floats`
+/// looking for an entry whose buffer matches the float's recorded
+/// buffer. Returns null when the handle is stale or doesn't address a
+/// live float.
+pub fn paneFromFloatHandle(self: *WindowManager, handle: NodeRegistry.Handle) ?*Pane {
+    const float = self.layout.findFloat(handle) orelse return null;
+    for (self.extra_floats.items) |*entry| {
+        if (entry.pane.buffer.ptr == float.buffer.ptr) return &entry.pane;
+    }
+    return null;
+}
+
+/// Open a floating pane that borrows `buffer`. Allocates a heap
+/// `Viewport` so the buffer's vtable delegation survives any subsequent
+/// `extra_floats.append` reallocation, mirrors the buffer-borrow shape
+/// of `doSplitWithBuffer`, and registers the float on `Layout.floats`.
+/// Returns the float's stable handle.
+///
+/// When `config.enter` is true the float becomes `layout.focused_float`
+/// so its buffer-scoped keymaps fire on the next key event; otherwise
+/// focus stays on whatever tile (or float) was previously focused.
+pub fn openFloatPane(
+    self: *WindowManager,
+    buffer: Buffer,
+    rect: Layout.Rect,
+    config: Layout.FloatConfig,
+) !NodeRegistry.Handle {
+    // Heap-allocate the Viewport so the buffer's borrowed pointer
+    // survives any subsequent `extra_floats.append` that relocates the
+    // items buffer. Owned by the PaneEntry.
+    const viewport = try self.allocator.create(Viewport);
+    errdefer self.allocator.destroy(viewport);
+    viewport.* = .{};
+
+    const pane: Pane = .{
+        .buffer = buffer,
+        .view = null,
+        .session = null,
+        .runner = null,
+    };
+
+    try self.extra_floats.append(self.allocator, .{
+        .pane = pane,
+        .viewport_storage = viewport,
+    });
+    errdefer _ = self.extra_floats.pop();
+
+    const handle = try self.layout.addFloat(buffer, rect, config);
+    errdefer self.layout.removeFloat(handle) catch {};
+
+    if (config.enter) {
+        self.layout.focused_float = handle;
+    }
+
+    self.compositor.layout_dirty = true;
+    return handle;
+}
+
+/// Close the float identified by `handle`. Frees the float's pane entry,
+/// removes the float from `Layout.floats`, and triggers a full layout
+/// repaint on the next frame so cells under the float are restored.
+pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
+    const float = self.layout.findFloat(handle) orelse return error.StaleNode;
+
+    var entry_idx_opt: ?usize = null;
+    for (self.extra_floats.items, 0..) |entry, i| {
+        if (entry.pane.buffer.ptr == float.buffer.ptr) {
+            entry_idx_opt = i;
+            break;
+        }
+    }
+
+    // `removeFloat` clears `layout.focused_float` if it was pointing at
+    // this handle, so we don't need to clear it here.
+    try self.layout.removeFloat(handle);
+
+    if (entry_idx_opt) |idx| {
+        const entry = self.extra_floats.orderedRemove(idx);
+        if (entry.session_handle) |sh| {
+            sh.close();
+            self.allocator.destroy(sh);
+        }
+        if (entry.pane.runner) |r| {
+            r.deinit();
+            self.allocator.destroy(r);
+        }
+        if (entry.sink_storage) |bs| {
+            bs.deinit();
+            self.allocator.destroy(bs);
+        }
+        if (entry.pane.provider) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+        }
+        if (entry.pane.view) |v| {
+            v.deinit();
+            self.allocator.destroy(v);
+        }
+        if (entry.viewport_storage) |vp| self.allocator.destroy(vp);
+        if (entry.pane.session) |s| {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
+    }
+
+    self.compositor.layout_dirty = true;
 }
 
 /// Restore a pane from an on-disk session: rebuilds both the view tree
@@ -3890,7 +4052,7 @@ const ModelPickerPluginFixture = struct {
     }
 };
 
-test "/model plugin opens a split pane with a scratch buffer" {
+test "/model plugin opens a centered float with a scratch buffer" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -3905,14 +4067,20 @@ test "/model plugin opens a split pane with a scratch buffer" {
     try std.testing.expect(cmd == .lua_callback);
     f.engine.invokeCallback(cmd.lua_callback);
 
-    try std.testing.expectEqual(leaf_count_before + 1, countLeaves(f.layout.root));
+    // The picker is a float now; the tile tree is unchanged.
+    try std.testing.expectEqual(leaf_count_before, countLeaves(f.layout.root));
+    try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_floats.items.len);
 
-    // The new pane's buffer must be a scratch buffer (id matched by the
-    // sole entry in `wm.buffer_registry.slots`).
+    // The float's buffer must be a scratch buffer (the sole entry in
+    // `wm.buffer_registry.slots`).
     try std.testing.expectEqual(@as(usize, 1), f.wm.buffer_registry.slots.items.len);
     const scratch_slot = f.wm.buffer_registry.slots.items[0];
     try std.testing.expect(scratch_slot.entry != null);
     try std.testing.expect(scratch_slot.entry.? == .scratch);
+
+    // Float owns focus so its buffer-scoped keymaps fire.
+    try std.testing.expect(f.layout.focused_float != null);
 
     // And a buffer-scoped keymap binding for <CR> should now exist.
     const scratch_buffer = scratch_slot.entry.?.scratch;
@@ -3963,4 +4131,134 @@ fn countLeaves(root: ?*Layout.LayoutNode) usize {
         .leaf => 1,
         .split => |s| countLeaves(s.first) + countLeaves(s.second),
     };
+}
+
+test "openFloatPane allocates, registers, and is reachable via paneFromFloatHandle" {
+    const allocator = std.testing.allocator;
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    const Theme = @import("Theme.zig");
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(80, 24);
+
+    const bh = try wm.buffer_registry.createScratch("picker");
+    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+
+    const handle = try wm.openFloatPane(
+        scratch_buf,
+        .{ .x = 10, .y = 4, .width = 60, .height = 12 },
+        .{ .border = .rounded, .title = "Models", .enter = true },
+    );
+
+    try std.testing.expect(Layout.isFloatHandle(handle));
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_floats.items.len);
+    try std.testing.expectEqual(@as(usize, 1), layout.floats.items.len);
+    try std.testing.expect(compositor.layout_dirty);
+    try std.testing.expect(layout.focused_float != null);
+
+    const pane_ptr = wm.paneFromFloatHandle(handle).?;
+    try std.testing.expectEqual(scratch_buf.ptr, pane_ptr.buffer.ptr);
+
+    try wm.closeFloatById(handle);
+    try std.testing.expectEqual(@as(usize, 0), wm.extra_floats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), layout.floats.items.len);
+    try std.testing.expectEqual(@as(?NodeRegistry.Handle, null), layout.focused_float);
+}
+
+test "deinit tears down extra_floats with no leaks" {
+    const allocator = std.testing.allocator;
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    const Theme = @import("Theme.zig");
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    // No defer wm.deinit(): we call it explicitly below. Two floats
+    // left open exercise the loop in deinit; testing.allocator catches
+    // any missed free.
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(80, 24);
+
+    const bh1 = try wm.buffer_registry.createScratch("p1");
+    const bh2 = try wm.buffer_registry.createScratch("p2");
+    const buf1 = try wm.buffer_registry.asBuffer(bh1);
+    const buf2 = try wm.buffer_registry.asBuffer(bh2);
+
+    _ = try wm.openFloatPane(buf1, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{ .title = "first" });
+    _ = try wm.openFloatPane(buf2, .{ .x = 5, .y = 5, .width = 10, .height = 4 }, .{ .title = "second" });
+
+    wm.deinit();
 }
