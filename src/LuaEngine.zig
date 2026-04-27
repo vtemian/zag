@@ -655,6 +655,17 @@ pub const LuaEngine = struct {
         lua.setField(-2, "list");
         lua.setField(-2, "providers"); // zag.providers = providers_table; [zag_table]
 
+        // zag.mode; switch the global editing mode from Lua. Modal
+        // pickers (e.g. /model) flip to "normal" on open so their
+        // normal-mode key bindings actually fire, and restore the
+        // previous mode on close.
+        lua.newTable(); // [zag_table, mode_table]
+        lua.pushFunction(zlua.wrap(zagModeSetFn));
+        lua.setField(-2, "set");
+        lua.pushFunction(zlua.wrap(zagModeGetFn));
+        lua.setField(-2, "get");
+        lua.setField(-2, "mode"); // zag.mode = mode_table; [zag_table]
+
         // zag.subagent; declarative registry for Lua-defined subagents.
         // `register{}` validates and deep-copies the entry into the
         // engine-owned SubagentRegistry so the `task` tool can dispatch
@@ -2831,6 +2842,47 @@ pub const LuaEngine = struct {
         };
         const resolved = wm.providerFor(pane);
         _ = lua.pushString(resolved.model_id);
+        return 1;
+    }
+
+    /// `zag.mode.set("normal" | "insert")`: flip the global editing
+    /// mode. Returns nothing. Used by modal popups (`/model` etc.) so
+    /// their normal-mode key bindings fire without the user pressing
+    /// Esc first.
+    fn zagModeSetFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.mode.set: no window manager bound", .{});
+        };
+        if (lua.typeOf(1) != .string) {
+            lua.raiseErrorStr("zag.mode.set: mode must be a string", .{});
+        }
+        const name = lua.toString(1) catch {
+            lua.raiseErrorStr("zag.mode.set: mode must be a string", .{});
+        };
+        if (std.mem.eql(u8, name, "normal")) {
+            wm.current_mode = .normal;
+        } else if (std.mem.eql(u8, name, "insert")) {
+            wm.current_mode = .insert;
+        } else {
+            lua.raiseErrorStr("zag.mode.set: mode must be \"normal\" or \"insert\"", .{});
+        }
+        return 0;
+    }
+
+    /// `zag.mode.get()`: return the current editing mode as a string,
+    /// either `"normal"` or `"insert"`. Lets a popup snapshot the mode
+    /// on open so it can restore exactly that mode on close.
+    fn zagModeGetFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.mode.get: no window manager bound", .{});
+        };
+        const name: []const u8 = switch (wm.current_mode) {
+            .normal => "normal",
+            .insert => "insert",
+        };
+        _ = lua.pushString(name);
         return 1;
     }
 
