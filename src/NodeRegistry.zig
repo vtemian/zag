@@ -41,8 +41,18 @@ pub fn register(self: *NodeRegistry, node: *LayoutNode) !Handle {
     if (self.free_indices.pop()) |idx| {
         const slot = &self.slots.items[idx];
         slot.node = node;
+        // Tile handles must keep the high bit clear; that bit is the
+        // float-handle namespace marker (`Layout.FLOAT_HANDLE_BIT`).
+        // Slot reuse implies the index was previously legal, but assert
+        // anyway so a future change that ever produces oversized indices
+        // is caught at the source.
+        std.debug.assert(idx & 0x8000 == 0);
         return .{ .index = idx, .generation = slot.generation };
     }
+    // Same invariant on a fresh slot. Hitting 32K live tile leaves is
+    // unreachable in practice; the assert turns a silent collision into
+    // a debug-mode crash if the assumption ever breaks.
+    std.debug.assert(self.slots.items.len & 0x8000 == 0);
     const idx: u16 = @intCast(self.slots.items.len);
     try self.slots.append(self.allocator, .{ .node = node, .generation = 0 });
     return .{ .index = idx, .generation = 0 };

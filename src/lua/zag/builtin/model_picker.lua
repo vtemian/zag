@@ -42,12 +42,18 @@ local function open()
     -- and offset. Slice 2 swaps these for size-to-content + cursor or
     -- editor-center anchors once `zag.layout.tree()` exposes the root
     -- rect.
+    --
+    -- Geometry (row 4, col 10, w=50, h=16) lands the float in rows 4..20
+    -- on a baseline 80x24 terminal, leaving rows 20..23 free for the
+    -- status row plus a top margin so the picker never paints over the
+    -- bottom chrome. Slice 2 will replace this with screen-dim-aware
+    -- centering once layout exposes its rect.
     local picker_pane = zag.layout.float(buf, {
         relative = "editor",
         row      = 4,
         col      = 10,
-        width    = 60,
-        height   = 20,
+        width    = 50,
+        height   = 16,
         border   = "rounded",
         title    = "Models",
     })

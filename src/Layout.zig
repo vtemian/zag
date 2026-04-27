@@ -141,11 +141,6 @@ floats: std.ArrayList(*FloatNode) = .empty,
 /// checks this before falling back to the tile tree's focused leaf so
 /// buffer-scoped keymaps on the float fire.
 focused_float: ?NodeRegistry.Handle = null,
-/// Monotonic counter for float handles. Starts at `FLOAT_HANDLE_BIT` so
-/// every value has the high bit set; bumped on every successful
-/// `addFloat`. Generation stays 0 for slice 1 because float handles are
-/// never reused.
-next_float_index: u16 = FLOAT_HANDLE_BIT,
 
 /// Create a new empty layout with no root.
 pub fn init(allocator: Allocator) Layout {
@@ -181,7 +176,7 @@ pub fn addFloat(
     rect: Rect,
     config: FloatConfig,
 ) !NodeRegistry.Handle {
-    if (self.next_float_index == 0) return error.FloatHandleSpaceExhausted;
+    const new_index = try self.allocFloatIndex();
     const float = try self.allocator.create(FloatNode);
     errdefer self.allocator.destroy(float);
 
@@ -191,7 +186,7 @@ pub fn addFloat(
     }
     errdefer if (owned_title) |t| self.allocator.free(t);
 
-    const handle: NodeRegistry.Handle = .{ .index = self.next_float_index, .generation = 0 };
+    const handle: NodeRegistry.Handle = .{ .index = new_index, .generation = 0 };
     var stored_config = config;
     stored_config.title = if (owned_title) |t| t else null;
     float.* = .{
@@ -212,9 +207,28 @@ pub fn addFloat(
         }
     }
     try self.floats.insert(self.allocator, insert_at, float);
-    self.next_float_index +%= 1;
-    if (self.next_float_index < FLOAT_HANDLE_BIT) self.next_float_index = FLOAT_HANDLE_BIT;
     return handle;
+}
+
+/// Pick the lowest unused float index in `[FLOAT_HANDLE_BIT, 0xFFFF]`.
+/// Float counts in real layouts are tiny (always < 10), so a linear
+/// scan is effectively free and avoids the wrap-around collision class
+/// of a monotonic counter. Returns `error.FloatHandleSpaceExhausted`
+/// when all 32K slots are live (unreachable in practice).
+fn allocFloatIndex(self: *const Layout) error{FloatHandleSpaceExhausted}!u16 {
+    var candidate: u32 = FLOAT_HANDLE_BIT;
+    while (candidate <= 0xFFFF) : (candidate += 1) {
+        const idx: u16 = @intCast(candidate);
+        var taken = false;
+        for (self.floats.items) |f| {
+            if (f.handle.index == idx) {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken) return idx;
+    }
+    return error.FloatHandleSpaceExhausted;
 }
 
 /// Remove a float by handle. Frees the FloatNode and any owned title.
@@ -1037,6 +1051,62 @@ test "removeFloat clears focused_float when matching" {
 
     try layout.removeFloat(handle);
     try std.testing.expectEqual(@as(?NodeRegistry.Handle, null), layout.focused_float);
+}
+
+test "addFloat reuses the lowest free index after a remove" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+
+    const a = try layout.addFloat(dummy_buf, r, .{});
+    const b = try layout.addFloat(dummy_buf, r, .{});
+    try std.testing.expectEqual(@as(u16, FLOAT_HANDLE_BIT), a.index);
+    try std.testing.expectEqual(@as(u16, FLOAT_HANDLE_BIT + 1), b.index);
+
+    try layout.removeFloat(a);
+
+    // The next allocation must pick the lowest unused index, not blindly
+    // bump a monotonic counter. Otherwise a long-lived layout that ever
+    // crosses 32K addFloat calls wraps and collides with a live float.
+    const c = try layout.addFloat(dummy_buf, r, .{});
+    try std.testing.expectEqual(@as(u16, FLOAT_HANDLE_BIT), c.index);
+
+    // And the still-live `b` must keep its identity intact.
+    try std.testing.expect(layout.findFloat(b) != null);
+}
+
+test "addFloat exhaustion returns an error and never collides with live floats" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    // Fabricate FloatNodes occupying every legal index in
+    // `[FLOAT_HANDLE_BIT, 0xFFFF]` so the next allocation has nowhere to
+    // land. Using stubs keeps the test fast (the linear-scan allocator
+    // visits every slot but we only allocate the floats themselves).
+    const slot_count: usize = 0xFFFF - FLOAT_HANDLE_BIT + 1;
+    try layout.floats.ensureTotalCapacity(allocator, slot_count);
+    var i: u32 = FLOAT_HANDLE_BIT;
+    while (i <= 0xFFFF) : (i += 1) {
+        const stub = try allocator.create(FloatNode);
+        stub.* = .{
+            .handle = .{ .index = @intCast(i), .generation = 0 },
+            .buffer = .{ .ptr = undefined, .vtable = undefined },
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .config = .{},
+            .title_storage = null,
+        };
+        layout.floats.appendAssumeCapacity(stub);
+    }
+
+    const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
+    try std.testing.expectError(
+        error.FloatHandleSpaceExhausted,
+        layout.addFloat(dummy_buf, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{}),
+    );
 }
 
 test "resizeSplit clamps ratio to valid open interval" {
