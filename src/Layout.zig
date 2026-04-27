@@ -479,7 +479,8 @@ pub fn recalculate(self: *Layout, screen_width: u16, screen_height: u16) void {
 ///
 ///   * `editor`: full screen minus the status row (`(0,0,W,H-1)`).
 ///   * `cursor`: `cursor_anchor` if the orchestrator published one,
-///     otherwise editor center (so the float still appears).
+///     otherwise the editor rect (anchor origin (0,0) + offsets) so the
+///     float still appears in a sensible place.
 ///   * `win`: slice-3 stub; null today, falls through to editor.
 ///
 /// Size resolution:
