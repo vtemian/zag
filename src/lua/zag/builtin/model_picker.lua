@@ -37,6 +37,12 @@ local function open()
     local focused = zag.layout.tree().focus
     local picker_pane = zag.layout.split(focused, "horizontal", { buffer = buf })
 
+    -- Snapshot the caller's mode and flip to normal so the picker's
+    -- j/k motions and <CR>/q/<Esc> bindings (all bound in normal mode)
+    -- actually fire. Restored on close.
+    local prev_mode = zag.mode.get()
+    zag.mode.set("normal")
+
     local closed = false
     local function close_picker()
         if closed then
@@ -45,6 +51,7 @@ local function open()
         closed = true
         zag.layout.close(picker_pane)
         zag.buffer.delete(buf)
+        zag.mode.set(prev_mode)
     end
 
     local function commit()
