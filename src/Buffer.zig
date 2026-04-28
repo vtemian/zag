@@ -52,7 +52,10 @@ pub const VTable = struct {
     /// Set the scroll offset.
     setScrollOffset: *const fn (ptr: *anyopaque, offset: u32) void,
 
-    /// Return the total number of display lines in the buffer.
+    /// Return the total number of *logical* display lines the buffer holds.
+    /// Logical lines are width-independent; the Compositor projects them onto
+    /// physical screen rows for the current pane width and uses physical-row
+    /// math for scroll offsets and the visible window.
     lineCount: *const fn (ptr: *anyopaque) anyerror!usize,
 
     /// Whether the buffer has visual changes since the last clear.
@@ -111,7 +114,9 @@ pub fn setScrollOffset(self: Buffer, offset: u32) void {
     self.vtable.setScrollOffset(self.ptr, offset);
 }
 
-/// Return the total number of display lines.
+/// Return the total number of *logical* display lines. The Compositor
+/// projects these onto physical screen rows at the current pane width;
+/// scroll offsets and the visible window operate in physical rows.
 pub fn lineCount(self: Buffer) !usize {
     return self.vtable.lineCount(self.ptr);
 }
