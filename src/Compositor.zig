@@ -336,6 +336,30 @@ fn drawBufferIntoRect(
         buf.getScrollOffset(),
     ) catch return;
 
+    // Publish the projected total back to the buffer so wheel handlers
+    // can clamp their next event against it. One frame stale is fine: by
+    // the next mouse event the user has already seen this paint.
+    buf.setLastTotalRows(plan.total_rows);
+
+    // After a resize that grows pane width, total_rows shrinks and the
+    // saved scroll_offset can land past the new tail. planScroll already
+    // returns take=0 in that case (defensive), but leaving scroll_offset
+    // alone freezes the pane in the dead zone until the user wheels back
+    // down. Clamp here so the next paint pulls visible content.
+    if (plan.total_rows > 0) {
+        const cap = plan.total_rows -| 1;
+        if (buf.getScrollOffset() > cap) buf.setScrollOffset(cap);
+    } else if (buf.getScrollOffset() != 0) {
+        buf.setScrollOffset(0);
+    }
+
+    // Wipe the content rect before redrawing so a frame that emits fewer
+    // rows than the previous one doesn't leave stale glyphs at the
+    // bottom (e.g. wheel-up shrinks `take` mid-buffer). The dirty gate
+    // upstream (`drawDirtyLeaves`) already controls whether this
+    // function runs, so the clear only fires when a repaint was wanted.
+    self.screen.clearRect(content_y, content_x, content_max_col -| content_x, content_max_row -| content_y);
+
     if (plan.take == 0) return;
 
     // Pull the actual styled lines for the chosen window. Output backing
@@ -1964,6 +1988,44 @@ test "planScroll: scroll past total clamps to zero rows" {
     const theme = Theme.defaultTheme();
     const plan = try planScroll(cb.buf(), &theme, arena.allocator(), allocator, 20, 10, 999);
     try std.testing.expectEqual(@as(usize, 0), plan.take);
+}
+
+test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    var viewport: @import("Viewport.zig") = .{};
+    cb.attachViewport(&viewport);
+
+    // Two short logical lines so the first paint draws content rows
+    // 1..2 (first line at row 1, second at row 2 inside an 11-row leaf).
+    _ = try cb.appendNode(null, .user_message, "hello");
+    _ = try cb.appendNode(null, .user_message, "world");
+
+    const outer = Layout.Rect{ .x = 0, .y = 0, .width = 40, .height = 11 };
+
+    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+
+    // Drop a sentinel glyph in the middle of the content rect to mimic a
+    // stale render artefact left over from a previous frame.
+    const pad_h = theme.spacing.padding_h;
+    const pad_v = theme.spacing.padding_v;
+    const sentinel_row: u16 = 1 + pad_v + 4;
+    const sentinel_col: u16 = 1 + pad_h + 5;
+    screen.getCell(sentinel_row, sentinel_col).codepoint = 'Z';
+
+    // Repaint without changing the buffer. The clear should wipe the
+    // sentinel even though no logical line in the buffer ever wrote to
+    // that row.
+    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(sentinel_row, sentinel_col).codepoint);
 }
 
 test "drawStyledLineWrapped: multi-span wrap doesn't drop content (Bug A regression)" {

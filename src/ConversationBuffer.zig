@@ -399,6 +399,8 @@ const vtable: Buffer.VTable = .{
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
+    .getLastTotalRows = bufGetLastTotalRows,
+    .setLastTotalRows = bufSetLastTotalRows,
     .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
@@ -431,6 +433,16 @@ fn bufGetScrollOffset(ptr: *anyopaque) u32 {
 fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     if (self.viewport) |v| v.setScrollOffset(offset);
+}
+
+fn bufGetLastTotalRows(ptr: *anyopaque) u32 {
+    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return if (self.viewport) |v| v.last_total_rows else 0;
+}
+
+fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    if (self.viewport) |v| v.last_total_rows = total;
 }
 
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {
@@ -497,8 +509,17 @@ fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16)
     switch (ev.kind) {
         .wheel_up => {
             // Wheel-up looks at older content: scroll_offset counts lines
-            // back from the tail, so increment (saturating).
-            viewport.setScrollOffset(viewport.scroll_offset +| wheel_scroll_step);
+            // back from the tail, so increment (saturating). Then clamp to
+            // `last_total_rows -| 1` so we never cross the top of the
+            // buffer into a blank-pane dead zone (planScroll returns
+            // take=0 once scroll >= total_rows). last_total_rows is set by
+            // the Compositor at each paint and is one frame stale, which
+            // is fine for clamping the *next* user event. When the buffer
+            // hasn't been painted yet (last_total_rows == 0), the
+            // saturating subtraction collapses the cap to 0.
+            const next = viewport.scroll_offset +| wheel_scroll_step;
+            const cap = viewport.last_total_rows -| 1;
+            viewport.setScrollOffset(@min(next, cap));
             return .consumed;
         },
         .wheel_down => {
@@ -859,13 +880,16 @@ test "setScrollOffset marks dirty only when value changes" {
     try std.testing.expect(!b.isDirty());
 }
 
-test "wheel_down increments scroll_offset (looks at older content)" {
+test "wheel_up increments scroll_offset (looks at older content)" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
     defer cb.deinit();
 
     var viewport: Viewport = .{};
     cb.attachViewport(&viewport);
+    // Compositor recorded enough rows that one wheel-up tick stays well
+    // under the cap; the clamp added for Bug D is exercised separately.
+    viewport.last_total_rows = 100;
 
     const ev = input.MouseEvent{
         .button = 0,
@@ -917,6 +941,55 @@ test "wheel_down clamps at zero" {
         .y = 1,
         .is_press = true,
         .kind = .wheel_down,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
+
+test "wheel_up clamps to last_total_rows -| 1 to avoid overscroll dead zone" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
+    // Compositor recorded total_rows=5 at the last paint; the cap is
+    // therefore 4 (= 5 - 1). Two wheel-ups from offset 4 must stay at 4
+    // rather than running away to 7.
+    viewport.last_total_rows = 5;
+    viewport.scroll_offset = 4;
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_up,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
+
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
+}
+
+test "wheel_up with last_total_rows=0 stays at 0 (no paint yet)" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_up,
         .modifiers = input.KeyEvent.no_modifiers,
     };
     _ = cb.buf().onMouse(ev, 0, 0);

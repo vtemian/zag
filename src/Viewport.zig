@@ -21,6 +21,12 @@ last_seen_generation: u32 = 0,
 scroll_dirty: bool = false,
 /// Most recent layout rect the pane was assigned, or null before first layout.
 cached_rect: ?Layout.Rect = null,
+/// Total physical rows the buffer occupied at the last `planScroll`. Written
+/// by the Compositor each frame after projecting logical lines onto the
+/// current pane width; read by wheel handlers to clamp `scroll_offset`
+/// before it lands past the tail. One-frame-lagged is fine: the next user
+/// event reads a value that reflects the geometry at the previous paint.
+last_total_rows: u32 = 0,
 
 pub fn setScrollOffset(self: *Viewport, offset: u32) void {
     if (self.scroll_offset == offset) return;
@@ -67,4 +73,11 @@ test "isDirty tracks generation drift" {
     v.clearDirty(1);
     try std.testing.expect(!v.isDirty(1));
     try std.testing.expect(v.isDirty(2));
+}
+
+test "last_total_rows defaults to 0 and is settable" {
+    var v: Viewport = .{};
+    try std.testing.expectEqual(@as(u32, 0), v.last_total_rows);
+    v.last_total_rows = 42;
+    try std.testing.expectEqual(@as(u32, 42), v.last_total_rows);
 }
