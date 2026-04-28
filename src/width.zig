@@ -500,3 +500,79 @@ test "wrappedRowCount: over-wide cluster after content stops counting" {
     // contained any drawn cluster: row 0 ('a'), no further rows.
     try std.testing.expectEqual(@as(u32, 1), wrappedRowCount("a漢", 1));
 }
+
+/// Like `wrappedRowCount`, but measures across an ordered list of byte slices
+/// that together form one logical line. The cluster walk continues across
+/// slice boundaries without joining: column state carries over so a span that
+/// happens to end at a column boundary triggers a wrap when the next span's
+/// first cluster lands.
+///
+/// The slice-of-slices shape sidesteps a circular import (`width.zig` cannot
+/// reach `Theme.StyledSpan` without going through `Theme` -> `Screen` ->
+/// `width`), and lets callers project styled spans into a stack-allocated
+/// view without copying their bytes.
+pub fn wrappedRowCountMulti(parts: []const []const u8, width: u16) u32 {
+    if (width == 0) return 1;
+    var rows: u32 = 1;
+    var col: u16 = 0;
+    for (parts) |part| {
+        const view = std.unicode.Utf8View.initUnchecked(part);
+        var iter = view.iterator();
+        while (nextCluster(&iter)) |cluster| {
+            const w = cluster.width;
+            if (w == 0) continue;
+            // Over-wide cluster: writeStrWrapped bails without writing it,
+            // so no additional row is consumed and the outer span loop also
+            // stops to mirror the render path's give-up semantics.
+            if (w > width) return rows;
+            if (col + w > width) {
+                rows += 1;
+                col = 0;
+            }
+            col += w;
+        }
+    }
+    return rows;
+}
+
+test "wrappedRowCountMulti: matches single-span path for one span" {
+    const parts = [_][]const u8{"a" ** 25};
+    try std.testing.expectEqual(@as(u32, 3), wrappedRowCountMulti(&parts, 10));
+}
+
+test "wrappedRowCountMulti: column carries between spans" {
+    // "abc" + "def" at width 5: 6 chars total, fits in 2 rows.
+    const parts = [_][]const u8{ "abc", "def" };
+    try std.testing.expectEqual(@as(u32, 2), wrappedRowCountMulti(&parts, 5));
+}
+
+test "wrappedRowCountMulti: span boundary inside wrap point" {
+    // "abcde" + "fg" at width 5: first span fills row 0 exactly; second span wraps.
+    const parts = [_][]const u8{ "abcde", "fg" };
+    try std.testing.expectEqual(@as(u32, 2), wrappedRowCountMulti(&parts, 5));
+}
+
+test "wrappedRowCountMulti: empty parts list is one row" {
+    const parts = [_][]const u8{};
+    try std.testing.expectEqual(@as(u32, 1), wrappedRowCountMulti(&parts, 10));
+}
+
+test "wrappedRowCountMulti: width 0 returns at least 1 row" {
+    const parts = [_][]const u8{ "abc", "def" };
+    try std.testing.expectEqual(@as(u32, 1), wrappedRowCountMulti(&parts, 0));
+}
+
+test "wrappedRowCountMulti: agrees with wrappedRowCount on a long joined line" {
+    // 5 KiB joined line is the regression that motivated this helper. The
+    // single-span path and the multi-span path must both report the same
+    // total. Pick width 80; 5120 chars -> 64 rows.
+    const big = "a" ** 5120;
+    const parts = [_][]const u8{ "a" ** 1024, "a" ** 1024, "a" ** 1024, "a" ** 1024, "a" ** 1024 };
+    try std.testing.expectEqual(wrappedRowCount(big, 80), wrappedRowCountMulti(&parts, 80));
+}
+
+test "wrappedRowCountMulti: over-wide cluster across span boundary stops counting" {
+    // "a" then 漢 (w=2) at width=1: render bails. Result: 1 row.
+    const parts = [_][]const u8{ "a", "漢" };
+    try std.testing.expectEqual(@as(u32, 1), wrappedRowCountMulti(&parts, 1));
+}
