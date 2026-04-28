@@ -262,6 +262,13 @@ cursor_anchor: ?Rect = null,
 /// it from `handleMouse` so a follower-style float tracks the pointer
 /// across motion events without waiting for a click.
 mouse_anchor: ?Rect = null,
+/// Per-frame scratch allocator used by size-to-content measurement.
+/// The orchestrator points this at `compositor.frame_arena.allocator()`
+/// before every `recalculate()` so the longest-line scan participates
+/// in the per-frame arena reset rhythm and never touches the global
+/// allocator. Null in tests and headless setups; `measureLongestLine`
+/// falls back to an internal page-allocator arena for that case.
+frame_allocator: ?Allocator = null,
 
 /// Create a new empty layout with no root.
 pub fn init(allocator: Allocator) Layout {
@@ -861,7 +868,6 @@ fn leafScrollOffset(node: *const LayoutNode) i32 {
 /// when neither path applies (so a float opened with no size hints at
 /// all keeps whatever the caller seeded into `addFloat`).
 fn sizeForFloat(self: *const Layout, f: *const FloatNode, editor_rect: Rect) struct { width: i32, height: i32 } {
-    _ = self;
     const explicit_w: ?u16 = f.config.width;
     const explicit_h: ?u16 = f.config.height;
 
@@ -869,7 +875,7 @@ fn sizeForFloat(self: *const Layout, f: *const FloatNode, editor_rect: Rect) str
     var height: i32 = if (explicit_h) |h| @as(i32, h) else @as(i32, f.rect.height);
 
     if (explicit_w == null and (f.config.min_width != null or f.config.max_width != null)) {
-        const longest_line = measureLongestLine(f.buffer);
+        const longest_line = measureLongestLine(f.buffer, self.frame_allocator);
         // Pad by 2 for the left+right border glyphs so size-to-content
         // measures the chrome-inclusive rect, matching what the
         // compositor draws.
@@ -911,15 +917,18 @@ fn sizeForFloat(self: *const Layout, f: *const FloatNode, editor_rect: Rect) str
 /// `text.len` per line. Falls back to 0 on any buffer-side error so
 /// the caller treats it as "no content" and clamps to `min_*`.
 ///
+/// `frame_alloc` should be the orchestrator's per-frame arena
+/// allocator so the styled-span scratch participates in the
+/// `compositor.frame_arena` reset cadence and never leaks. When null
+/// (test fixtures, headless setups), the function falls back to the
+/// layout's general-purpose allocator wrapped in a one-shot arena.
+///
 /// Risk #2 from the plan: this approximates display width with
 /// byte length, which is correct for ASCII content (the picker's
 /// "[N] provider/model" lines today) but undercounts wide CJK and
 /// overcounts combining marks. A future slice can swap to the
 /// grapheme-cluster width API once we have a non-ASCII consumer.
-fn measureLongestLine(buf: Buffer) usize {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
+fn measureLongestLine(buf: Buffer, frame_alloc: ?Allocator) usize {
     const total = buf.lineCount() catch return 0;
     if (total == 0) return 0;
 
@@ -931,6 +940,24 @@ fn measureLongestLine(buf: Buffer) usize {
     const Theme = @import("Theme.zig");
     const theme = Theme.defaultTheme();
 
+    if (frame_alloc) |alloc| {
+        // Frame-arena path: allocations are released in bulk at the top
+        // of the next `composite()`. No per-call arena bookkeeping.
+        const lines = buf.getVisibleLines(alloc, alloc, &theme, 0, scan_count) catch return 0;
+        var longest: usize = 0;
+        for (lines.items) |line| {
+            var width: usize = 0;
+            for (line.spans) |s| width += s.text.len;
+            if (width > longest) longest = width;
+        }
+        return longest;
+    }
+
+    // Fallback path: callers that haven't published a frame allocator
+    // (tests, headless harness). Stand up a transient arena over the
+    // standard library's page_allocator so the work is still bounded.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
     const lines = buf.getVisibleLines(arena.allocator(), arena.allocator(), &theme, 0, scan_count) catch return 0;
     var longest: usize = 0;
     for (lines.items) |line| {

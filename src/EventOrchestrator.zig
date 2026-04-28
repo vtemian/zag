@@ -247,6 +247,21 @@ fn pumpLuaCompletions(eng: *LuaEngine) void {
     }
 }
 
+/// True if any pane (root, tile, or float) has pending visual changes
+/// since the last composite. Walks every pane category that the
+/// compositor would draw so a float-only buffer mutation still triggers
+/// a redraw.
+fn anyPaneDirty(self: *const EventOrchestrator) bool {
+    if (self.window_manager.root_pane.buffer.isDirty()) return true;
+    for (self.window_manager.extra_panes.items) |entry| {
+        if (entry.pane.buffer.isDirty()) return true;
+    }
+    for (self.window_manager.extra_floats.items) |entry| {
+        if (entry.pane.buffer.isDirty()) return true;
+    }
+    return false;
+}
+
 /// One iteration of the event loop: poll input, handle resize, drain agent
 /// events, composite, render. Sets `running` to false on quit.
 fn tick(
@@ -341,10 +356,11 @@ fn tick(
     // ORs the tree-generation delta with the view-only scroll bit, so
     // both tree mutations and scrolls trigger a spinner tick here.
     // Scratch-backed panes drive `isDirty()` through their own vtable
-    // path; the check is uniform across pane kinds.
-    const any_dirty = self.window_manager.root_pane.buffer.isDirty() or for (self.window_manager.extra_panes.items) |entry| {
-        if (entry.pane.buffer.isDirty()) break true;
-    } else false;
+    // path; the check is uniform across pane kinds. Floats live in
+    // `extra_floats`, a sibling of `extra_panes`; a plugin that mutates
+    // a float's buffer between user events must trigger a redraw the
+    // same way a tile does.
+    const any_dirty = self.anyPaneDirty();
 
     // Spinner ticks only when actual events arrive
     if (any_dirty) {
@@ -379,6 +395,12 @@ fn tick(
     var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
     const tick_drafts = self.collectLeafDrafts(&leaves_buf, &drafts_buf);
     self.publishCursorAnchor(tick_drafts);
+    // Publish the per-frame arena allocator to the layout so any
+    // size-to-content float measurement runs inside the bulk-reset
+    // arena rather than spinning up a fresh page-allocator arena every
+    // frame. Cleared after `composite` resets the arena so a stale
+    // allocator handle never bleeds into next frame's measurement.
+    self.window_manager.layout.frame_allocator = self.window_manager.compositor.frame_arena.allocator();
     // After publishing the cursor anchor, re-resolve float rects so
     // cursor-anchored floats track the prompt cursor as it moves.
     self.window_manager.layout.recalculateFloats(self.screen.width, self.screen.height);
@@ -1798,6 +1820,71 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
     // filter swallowed Ctrl+C, which is the bug under test.
     try std.testing.expect(action != .none);
     try std.testing.expectEqual(Action.quit, action);
+}
+
+test "anyPaneDirty walks extra_floats so a float-only mutation triggers a redraw" {
+    // Regression: tick()'s dirty check used to walk root_pane and
+    // extra_panes only. A plugin that mutates a float's buffer between
+    // user events without flipping `compositor.layout_dirty` would
+    // observe the float's content go stale because tick would early-out
+    // before composite ran. The fix is to OR in `extra_floats` too;
+    // this asserts the helper sees the mutation.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const bh = try f.wm.buffer_registry.createScratch("popup");
+    const buf = try f.wm.buffer_registry.asBuffer(bh);
+    _ = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 20, .height = 4 }, .{
+        .relative = .editor,
+        .width = 20,
+        .height = 4,
+        .enter = false,
+    });
+
+    // Drain any open-time dirtiness so the next isDirty() reflects only
+    // the test mutation. The float's pane lives on extra_floats[0].
+    f.wm.extra_floats.items[0].pane.buffer.clearDirty();
+    try std.testing.expect(!f.wm.extra_floats.items[0].pane.buffer.isDirty());
+
+    // Mutate the float buffer directly via its scratch handle: this is
+    // the moral equivalent of `zag.buffer.set_lines(buf, ...)` from a
+    // Lua plugin firing between user keystrokes.
+    const ScratchBuffer = @import("buffers/scratch.zig");
+    const sb = ScratchBuffer.fromBuffer(buf);
+    try sb.setLines(&.{ "fresh", "content" });
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    try std.testing.expect(orch.anyPaneDirty());
+    f.wm.* = orch.window_manager;
+}
+
+test "anyPaneDirty stays false when no pane has pending visual changes" {
+    // Counter-test: with all buffers clean, the helper must report
+    // false so tick can skip the composite/render fast-path.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const bh = try f.wm.buffer_registry.createScratch("popup");
+    const buf = try f.wm.buffer_registry.asBuffer(bh);
+    _ = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 20, .height = 4 }, .{
+        .relative = .editor,
+        .width = 20,
+        .height = 4,
+        .enter = false,
+    });
+
+    f.wm.root_pane.buffer.clearDirty();
+    f.wm.extra_floats.items[0].pane.buffer.clearDirty();
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    try std.testing.expect(!orch.anyPaneDirty());
+    f.wm.* = orch.window_manager;
 }
 
 test "sweepFloatsForAutoClose leaves intact a float whose time has not yet elapsed" {
