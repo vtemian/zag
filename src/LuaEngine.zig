@@ -14,6 +14,7 @@ const Buffer = @import("Buffer.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const ScratchBuffer = @import("buffers/scratch.zig");
 const GraphicsBuffer = @import("buffers/graphics.zig");
+const Theme = @import("Theme.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
@@ -653,6 +654,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_model");
         lua.pushFunction(zlua.wrap(zagPaneCurrentModelFn));
         lua.setField(-2, "current_model");
+        lua.pushFunction(zlua.wrap(zagPaneSetDraftFn));
+        lua.setField(-2, "set_draft");
+        lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
+        lua.setField(-2, "replace_draft_range");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
 
         // zag.providers; read-only view of the endpoint registry so a
@@ -730,6 +735,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_png");
         lua.pushFunction(zlua.wrap(zagBufferSetFitFn));
         lua.setField(-2, "set_fit");
+        lua.pushFunction(zlua.wrap(zagBufferSetRowStyleFn));
+        lua.setField(-2, "set_row_style");
+        lua.pushFunction(zlua.wrap(zagBufferClearRowStyleFn));
+        lua.setField(-2, "clear_row_style");
         lua.setField(-2, "buffer"); // zag.buffer = buffer_table; [zag_table]
 
         // Private log entrypoints consumed by the Lua-side wrappers in
@@ -3472,6 +3481,106 @@ pub const LuaEngine = struct {
         return 1;
     }
 
+    /// `zag.pane.set_draft(pane_id, text)`: replace the entire in-progress
+    /// draft of `pane_id` with `text`. Truncates silently to MAX_DRAFT
+    /// with a warn log (matches `appendPaste`'s policy). Used by
+    /// autocomplete plugins that drive the draft from Lua.
+    fn zagPaneSetDraftFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.set_draft: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.set_draft");
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.pane.set_draft: text must be a string", .{});
+        }
+        const text = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.pane.set_draft: text must be a string", .{});
+        };
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.set_draft: {s}", .{@errorName(err)}) catch "zag.pane.set_draft failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        pane.setDraft(text);
+        return 0;
+    }
+
+    /// `zag.pane.replace_draft_range(pane_id, from_byte, to_byte, replacement)`:
+    /// replace bytes `[from_byte, to_byte)` of `pane_id`'s draft with
+    /// `replacement`. **Byte offsets are 0-indexed** (raw byte positions
+    /// over the draft, not 1-indexed Lua positions): autocomplete plugins
+    /// already reason in terms of trigger byte ranges captured against
+    /// `getDraft()`, so 0-indexing keeps that math straight rather than
+    /// forcing every plugin to add and subtract one. `from_byte == to_byte`
+    /// is a valid pure insertion at `from_byte`. Raises on invalid range
+    /// or overflow past MAX_DRAFT — autocomplete plugins know the trigger
+    /// position and want loud failure if anything is off.
+    fn zagPaneReplaceDraftRangeFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.replace_draft_range");
+
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: from_byte must be an integer", .{});
+        }
+        const from_lua = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: from_byte must be an integer", .{});
+        };
+        if (from_lua < 0) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: from_byte must be >= 0", .{});
+        }
+
+        if (lua.typeOf(3) != .number) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: to_byte must be an integer", .{});
+        }
+        const to_lua = lua.toInteger(3) catch {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: to_byte must be an integer", .{});
+        };
+        if (to_lua < 0) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: to_byte must be >= 0", .{});
+        }
+
+        if (lua.typeOf(4) != .string) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: replacement must be a string", .{});
+        }
+        const replacement = lua.toString(4) catch {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: replacement must be a string", .{});
+        };
+
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.replace_draft_range: {s}", .{@errorName(err)}) catch "zag.pane.replace_draft_range failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+
+        const from_byte: usize = @intCast(from_lua);
+        const to_byte: usize = @intCast(to_lua);
+        pane.replaceDraftRange(from_byte, to_byte, replacement) catch |err| switch (err) {
+            error.InvalidRange => {
+                var buf: [192]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(
+                    &buf,
+                    "zag.pane.replace_draft_range: invalid range [{d}, {d}) over draft of {d} bytes",
+                    .{ from_byte, to_byte, pane.getDraft().len },
+                ) catch "zag.pane.replace_draft_range: invalid range";
+                lua.raiseErrorStr("%s", .{msg.ptr});
+            },
+            error.Overflow => {
+                var buf: [192]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(
+                    &buf,
+                    "zag.pane.replace_draft_range: replacement would overflow MAX_DRAFT (replacement={d} bytes, removed={d}, draft={d})",
+                    .{ replacement.len, to_byte - from_byte, pane.getDraft().len },
+                ) catch "zag.pane.replace_draft_range: overflow";
+                lua.raiseErrorStr("%s", .{msg.ptr});
+            },
+        };
+        return 0;
+    }
+
     /// `zag.mode.set("normal" | "insert")`: flip the global editing
     /// mode. Returns nothing. Used by modal popups (`/model` etc.) so
     /// their normal-mode key bindings fire without the user pressing
@@ -3879,6 +3988,71 @@ pub const LuaEngine = struct {
         switch (entry) {
             .graphics => |gb| gb.setFit(fit),
             .scratch => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.set_row_style(handle, row, slot)`: tag a 1-indexed
+    /// row with a theme highlight slot string. The row override paints
+    /// across the row's background at render time. Raises on
+    /// out-of-range row, unknown slot, or graphics handles.
+    fn zagBufferSetRowStyleFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.set_row_style");
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.buffer.set_row_style: row must be an integer", .{});
+        }
+        const row_lua = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.buffer.set_row_style: row must be an integer", .{});
+        };
+        if (row_lua < 1) {
+            lua.raiseErrorStr("zag.buffer.set_row_style: row must be >= 1", .{});
+        }
+        if (lua.typeOf(3) != .string) {
+            lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
+        }
+        const slot_str = lua.toString(3) catch {
+            lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
+        };
+        const slot = Theme.parseHighlightSlot(slot_str) orelse {
+            lua.raiseErrorStr("zag.buffer.set_row_style: unknown slot (valid: \"selection\", \"current_line\", \"error\", \"warning\")", .{});
+        };
+        const row_zero: u32 = @intCast(row_lua - 1);
+        switch (entry) {
+            .scratch => |sb| {
+                sb.setRowStyle(row_zero, slot) catch |err| switch (err) {
+                    error.RowOutOfRange => lua.raiseErrorStr("zag.buffer.set_row_style: row %d is out of range", .{@as(i32, @intCast(row_lua))}),
+                    else => {
+                        var buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.set_row_style: {s}", .{@errorName(err)}) catch "zag.buffer.set_row_style failed";
+                        lua.raiseErrorStr("%s", .{msg.ptr});
+                    },
+                };
+            },
+            .graphics => lua.raiseErrorStr("zag.buffer.set_row_style: not supported on graphics buffers (no row addressing)", .{}),
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.clear_row_style(handle, row)`: drop a row's
+    /// highlight override. No-op when the row has no override, and a
+    /// no-op on graphics buffers (which carry no row-style state).
+    /// Cleanup is permissive; only `set_row_style` raises on graphics
+    /// since it expresses an intent that cannot take effect.
+    fn zagBufferClearRowStyleFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.clear_row_style");
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.buffer.clear_row_style: row must be an integer", .{});
+        }
+        const row_lua = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.buffer.clear_row_style: row must be an integer", .{});
+        };
+        if (row_lua < 1) {
+            lua.raiseErrorStr("zag.buffer.clear_row_style: row must be >= 1", .{});
+        }
+        const row_zero: u32 = @intCast(row_lua - 1);
+        switch (entry) {
+            .scratch => |sb| sb.clearRowStyle(row_zero),
+            .graphics => {},
         }
         return 0;
     }
@@ -8105,6 +8279,94 @@ test "fireHook invokes Lua callback for matching event" {
     engine.lua.pop(1);
 }
 
+test "non-draft hooks fire up to depth 7 without tripping the per-kind guard" {
+    // The per-event-kind cap exists so a draft hook (cap 1) cannot also
+    // throttle unrelated kinds. Simulate a tool_post chain mid-flight by
+    // pre-bumping the dispatcher's tool_post depth: the hook must still
+    // run at depth 7 (one slot below the 8-cap), and must be skipped at
+    // depth 8.
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.tool_post_count = 0
+        \\zag.hook("ToolPost", function(evt)
+        \\  _G.tool_post_count = (_G.tool_post_count or 0) + 1
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_post = .{
+        .name = "bash",
+        .call_id = "id1",
+        .content = "ok",
+        .is_error = false,
+        .duration_ms = 0,
+        .content_rewrite = null,
+        .is_error_rewrite = null,
+    } };
+
+    // Depth 0: trivially under the cap; baseline fire.
+    _ = try engine.fireHook(&payload);
+
+    // Walk depth from 1..=7. Each level is still < 8, so the hook fires.
+    var d: u32 = 1;
+    while (d <= 7) : (d += 1) {
+        engine.hook_dispatcher.firing_depth.set(.tool_post, d);
+        _ = try engine.fireHook(&payload);
+    }
+
+    _ = try engine.lua.getGlobal("tool_post_count");
+    // 1 (baseline) + 7 (d=1..=7) = 8 fires.
+    try std.testing.expectEqual(@as(i64, 8), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // At depth 8 (the cap), the dispatcher must skip rather than recurse.
+    engine.hook_dispatcher.firing_depth.set(.tool_post, 8);
+    _ = try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("tool_post_count");
+    try std.testing.expectEqual(@as(i64, 8), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // Reset so deinit doesn't trip any leak / state assertion.
+    engine.hook_dispatcher.firing_depth.set(.tool_post, 0);
+}
+
+test "draft hook still caps at depth 1 even when other kinds have higher budgets" {
+    // Companion to the tool_post test: pre-bumping draft to 1 must
+    // skip the next draft fire (cap = 1), even though tool_post would
+    // happily fire at the same depth.
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.draft_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.draft_count = (_G.draft_count or 0) + 1
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .pane_draft_change = .{
+        .pane_handle = "n1",
+        .draft_text = "hi",
+        .previous_text = "h",
+        .draft_rewrite = null,
+    } };
+
+    engine.hook_dispatcher.firing_depth.set(.pane_draft_change, 1);
+    _ = try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("draft_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    engine.hook_dispatcher.firing_depth.set(.pane_draft_change, 0);
+}
+
 test "end-to-end: config file to registry execution" {
     const AgentRunner = @import("AgentRunner.zig");
 
@@ -11650,6 +11912,142 @@ test "zag.buffer.set_fit rejects a scratch handle" {
         \\zag.buffer.set_fit(b, "contain")
     );
     try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_row_style happy path stamps row_style on rendered line" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "scratch", name = "popup" }
+        \\zag.buffer.set_lines(_G.handle, { "alpha", "beta", "gamma" })
+        \\zag.buffer.set_row_style(_G.handle, 2, "selection")
+    );
+    _ = try engine.lua.getGlobal("handle");
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    engine.lua.pop(1);
+    const entry = try buffer_registry.resolve(handle);
+    const sb = entry.scratch;
+
+    const theme = Theme.defaultTheme();
+    var lines = try sb.buf().getVisibleLines(alloc, alloc, &theme, 0, 10);
+    defer Theme.freeStyledLines(&lines, alloc);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[1].row_style);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), lines.items[0].row_style);
+}
+
+test "zag.buffer.set_row_style rejects out-of-range row" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_lines(b, { "a", "b" })
+        \\zag.buffer.set_row_style(b, 99, "selection")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_row_style rejects unknown slot" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_lines(b, { "a" })
+        \\zag.buffer.set_row_style(b, 1, "rainbow")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_row_style rejects graphics buffer" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "graphics" }
+        \\zag.buffer.set_row_style(b, 1, "selection")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.clear_row_style is a no-op on graphics buffers" {
+    // Cleanup is permissive: graphics buffers carry no row-style state,
+    // so dropping an override is trivially a no-op rather than a raise.
+    // Only set_row_style is strict, since it expresses an intent that
+    // cannot take effect.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "graphics" }
+        \\zag.buffer.clear_row_style(b, 1)
+        \\zag.buffer.clear_row_style(b, 99)
+        \\_G.ok = true
+    );
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.clear_row_style is a no-op for unset rows" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_lines(b, { "a", "b", "c" })
+        \\zag.buffer.set_row_style(b, 2, "selection")
+        \\zag.buffer.clear_row_style(b, 2)
+        \\zag.buffer.clear_row_style(b, 3) -- never set; must not raise
+        \\_G.ok = true
+    );
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(engine.lua.toBoolean(-1));
     engine.lua.pop(1);
 }
 

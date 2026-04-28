@@ -18,6 +18,7 @@ pub const EventKind = enum {
     text_delta,
     agent_done,
     agent_err,
+    pane_draft_change,
 };
 
 /// Map a Lua-facing event name like "ToolPre" to an EventKind.
@@ -32,6 +33,7 @@ pub fn parseEventName(name: []const u8) ?EventKind {
         .{ "TextDelta", .text_delta },
         .{ "AgentDone", .agent_done },
         .{ "AgentErr", .agent_err },
+        .{ "PaneDraftChange", .pane_draft_change },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) return entry[1];
@@ -99,6 +101,23 @@ pub const HookPayload = union(EventKind) {
     text_delta: struct { text: []const u8 },
     agent_done: void,
     agent_err: struct { message: []const u8 },
+    pane_draft_change: struct {
+        /// Stable layout handle of the mutated pane, formatted via
+        /// `NodeRegistry.formatId`. Used as the pattern key so plugins
+        /// can scope a hook to a single pane.
+        pane_handle: []const u8,
+        /// The post-mutation draft text. Borrowed from the pane's draft
+        /// buffer; valid for the duration of the hook fire only.
+        draft_text: []const u8,
+        /// Pre-mutation snapshot, owned by the caller of `fireHook`.
+        /// Optional because the helper that fires this event may choose
+        /// to skip the snapshot (e.g. if the previous text was empty).
+        previous_text: ?[]const u8,
+        /// Rewrite slot. If a hook returns `{ draft_text = "..." }`,
+        /// the dispatcher allocates a copy via the registry allocator
+        /// and stores it here. The caller of `fireHook` owns and frees.
+        draft_rewrite: ?[]const u8,
+    },
 
     pub fn kind(self: HookPayload) EventKind {
         return std.meta.activeTag(self);
@@ -253,9 +272,10 @@ test "matchesPattern covers null, wildcard, exact, and comma list" {
     try std.testing.expect(!Hooks.matchesPattern("bash,read", "write"));
 }
 
-test "parseEventName maps all nine strings" {
+test "parseEventName maps all known event strings" {
     try std.testing.expectEqual(Hooks.EventKind.tool_pre, Hooks.parseEventName("ToolPre").?);
     try std.testing.expectEqual(Hooks.EventKind.agent_err, Hooks.parseEventName("AgentErr").?);
+    try std.testing.expectEqual(Hooks.EventKind.pane_draft_change, Hooks.parseEventName("PaneDraftChange").?);
     try std.testing.expect(Hooks.parseEventName("Nope") == null);
 }
 
