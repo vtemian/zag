@@ -360,31 +360,133 @@ fn drawBufferIntoRect(
     const default_fg = self.theme.colors.fg;
     const max_row = @min(content_max_row, content_y +| plan.visible_rows);
 
+    var leading_skip = plan.leading_skip_rows;
     for (lines.items) |line| {
         if (cur_row >= max_row) break;
         if (cur_row >= self.screen.height) break;
 
-        const start_row = cur_row;
-        var col = content_x;
-        for (line.spans) |s| {
-            const resolved = Theme.resolve(s.style, self.theme);
-            const pos = self.screen.writeStrWrapped(
-                cur_row,
-                col,
-                max_row,
-                content_max_col,
-                s.text,
-                resolved.screen_style,
-                if (s.style.fg != null) resolved.fg else default_fg,
-            );
-            cur_row = pos.row;
-            col = pos.col;
-        }
-        // After writing, cur_row points to the row containing the last
-        // cluster (or to start_row if the line was empty). Advancing past
-        // it gives the next free row for the next logical line.
-        cur_row = if (cur_row >= start_row) cur_row + 1 else start_row + 1;
+        const consumed = drawStyledLineWrapped(
+            self.screen,
+            line.spans,
+            self.theme,
+            default_fg,
+            cur_row,
+            content_x,
+            max_row,
+            content_max_col,
+            leading_skip,
+        );
+        cur_row +|= consumed;
+        // leading_skip clips the top of the first rendered line only.
+        leading_skip = 0;
     }
+}
+
+/// Render a single styled logical line wrapped to the pane's content width,
+/// walking clusters across all spans in one pass.
+///
+/// Mirrors `width.wrappedRowCountMulti`'s wrap math so render and measurement
+/// agree by construction. Writing per-cluster (instead of chaining
+/// `Screen.writeStrWrapped` per span) eliminates the silent-drop bug that
+/// triggered when a non-first span's `start_col` was already inside the wrap
+/// boundary, and lets wrapped continuations restart at `content_x` instead of
+/// the span's mid-line column.
+///
+/// `leading_skip_rows` clips physical rows from the top of this line: clusters
+/// that would land above `start_row` are measured (so column state stays
+/// consistent) but not written. Used by `drawBufferIntoRect` to honor
+/// sub-line scroll precision when the visible window starts mid-line.
+///
+/// `max_row` and `max_col` are the right/bottom clipping bounds (exclusive).
+/// Returns the number of physical rows consumed *within* the visible region;
+/// the caller advances its row cursor by that amount. The clipped rows above
+/// `start_row` are not counted because the caller has not reserved screen
+/// space for them.
+fn drawStyledLineWrapped(
+    screen: *Screen,
+    spans: []const Theme.StyledSpan,
+    theme: *const Theme,
+    default_fg: Screen.Color,
+    start_row: u16,
+    content_x: u16,
+    max_row: u16,
+    max_col: u16,
+    leading_skip_rows: u16,
+) u16 {
+    // Empty pane width or empty bounds: no clusters can render but the line
+    // still occupies one visual row in the layout. Match wrappedRowCountMulti.
+    if (max_col <= content_x) return 1;
+    const pane_width: u16 = max_col - content_x;
+
+    // Track row as i32 so leading_skip_rows can pull it above start_row
+    // without underflow. Writes are gated on row >= start_row.
+    var row: i32 = @as(i32, start_row) - @as(i32, leading_skip_rows);
+    var col: u16 = content_x;
+    var any_visible_cluster = false;
+
+    for (spans) |span| {
+        const resolved = Theme.resolve(span.style, theme);
+        const fg = if (span.style.fg != null) resolved.fg else default_fg;
+
+        const view = std.unicode.Utf8View.initUnchecked(span.text);
+        var iter = view.iterator();
+        while (true) {
+            const cluster_start = iter.i;
+            const cluster = width.nextCluster(&iter) orelse break;
+            const w = cluster.width;
+            if (w == 0) continue;
+
+            // Cluster wider than the pane: render path bails entirely (matches
+            // wrappedRowCountMulti's `return rows`). Stop walking the line.
+            if (w > pane_width) {
+                if (any_visible_cluster) {
+                    const final_row = row;
+                    if (final_row < start_row) return 0;
+                    if (final_row >= max_row) return max_row - start_row;
+                    return @intCast(final_row - @as(i32, start_row) + 1);
+                }
+                return 1;
+            }
+
+            if (col + w > max_col) {
+                row += 1;
+                col = content_x;
+            }
+
+            const visible = row >= @as(i32, start_row) and row < @as(i32, max_row);
+            if (visible) {
+                const row_u: u16 = @intCast(row);
+                if (row_u < screen.height and col + w <= screen.width) {
+                    screen.writeCluster(
+                        row_u,
+                        col,
+                        span.text[cluster_start..][0..cluster.byte_len],
+                        cluster.base,
+                        w,
+                        resolved.screen_style,
+                        fg,
+                    );
+                }
+                any_visible_cluster = true;
+            }
+            col += w;
+
+            // Stop walking once we've fallen off the bottom of the visible
+            // region; remaining clusters can't contribute to consumed rows.
+            if (row >= @as(i32, max_row)) break;
+        }
+        if (row >= @as(i32, max_row)) break;
+    }
+
+    // No cluster ever became visible (empty span list, all-zero-width
+    // clusters, or fully clipped above start_row): the empty line still
+    // occupies one row in the visible region.
+    if (!any_visible_cluster) return 1;
+
+    const final_row = row;
+    if (final_row < start_row) return 0;
+    if (final_row >= max_row) return max_row - start_row;
+    return @intCast(final_row - @as(i32, start_row) + 1);
 }
 
 /// Result of projecting logical buffer lines onto pane-width physical rows.
@@ -424,9 +526,11 @@ fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u
 /// agent transcript are small; if profiling later shows hot-loop pressure,
 /// cache widths inside `NodeLineCache` instead of optimizing here.
 ///
-/// TODO: scroll precision below the logical-line boundary. Today, when the
-/// visible-start row falls mid-line, we drop the entire partial line rather
-/// than blitting its tail rows. Whole-line steps match the existing UX feel.
+/// `leading_skip_rows` is the number of physical rows to clip from the top of
+/// the first rendered line when the visible window starts mid-line. The
+/// renderer (`drawStyledLineWrapped`) honors this natively, so streaming
+/// transcripts don't jitter at the bottom edge as logical lines straddle the
+/// visible-start boundary.
 fn planScroll(
     buf: Buffer,
     theme: *const Theme,
@@ -503,14 +607,6 @@ fn planScroll(
             .leading_skip_rows = 0,
             .visible_rows = visible_rows,
         };
-    }
-
-    // Simplification: when the window starts mid-line, drop the partial
-    // line entirely so scrolling steps in whole-logical-line increments.
-    // Sub-line precision is a TODO above.
-    if (leading > 0) {
-        skip_idx += 1;
-        leading = 0;
     }
 
     if (skip_idx >= total_logical) {
@@ -1868,4 +1964,143 @@ test "planScroll: scroll past total clamps to zero rows" {
     const theme = Theme.defaultTheme();
     const plan = try planScroll(cb.buf(), &theme, arena.allocator(), allocator, 20, 10, 999);
     try std.testing.expectEqual(@as(usize, 0), plan.take);
+}
+
+test "drawStyledLineWrapped: multi-span wrap doesn't drop content (Bug A regression)" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 10, 5);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    const spans = [_]Theme.StyledSpan{
+        .{ .text = "abcde", .style = .{} },
+        .{ .text = "f", .style = .{} },
+    };
+
+    const consumed = drawStyledLineWrapped(
+        &screen,
+        &spans,
+        &theme,
+        theme.colors.fg,
+        0, // start_row
+        0, // content_x
+        5, // max_row
+        5, // max_col
+        0, // leading_skip_rows
+    );
+
+    // First span fills row 0 (cols 0..4). Second span 'f' must wrap to row 1 col 0.
+    try std.testing.expectEqual(@as(u16, 2), consumed);
+    try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'e'), screen.getCellConst(0, 4).codepoint);
+    try std.testing.expectEqual(@as(u21, 'f'), screen.getCellConst(1, 0).codepoint);
+}
+
+test "drawStyledLineWrapped: wrapped continuation returns to content_x (Bug B regression)" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 20, 5);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    // Pane indent: content_x = 2, max_col = 12, so usable width = 10.
+    // Span 1 "hello " (6 cols) lands at cols 2..7. Span 2 "world from beyond"
+    // (17 cols) starts at col 8, fills 8..11 with "worl", then must wrap. The
+    // wrapped continuation must restart at content_x=2, not at col 8.
+    const spans = [_]Theme.StyledSpan{
+        .{ .text = "hello ", .style = .{} },
+        .{ .text = "world from beyond", .style = .{} },
+    };
+
+    const consumed = drawStyledLineWrapped(
+        &screen,
+        &spans,
+        &theme,
+        theme.colors.fg,
+        0,
+        2, // content_x
+        5,
+        12, // max_col
+        0,
+    );
+
+    try std.testing.expect(consumed >= 2);
+    // First wrap row: 'd' (last cluster of "worl") at col 11, then 'd' wraps;
+    // wait: "world" = w-o-r-l-d. cols 8,9,10,11 hold w,o,r,l. 'd' would be
+    // col 12 which equals max_col, so wraps to row 1 col 2. Confirm.
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(0, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'w'), screen.getCellConst(0, 8).codepoint);
+    try std.testing.expectEqual(@as(u21, 'l'), screen.getCellConst(0, 11).codepoint);
+    // Wrapped continuation lands at col 2 (content_x), not col 8.
+    try std.testing.expectEqual(@as(u21, 'd'), screen.getCellConst(1, 2).codepoint);
+    // Col 0 and 1 (outside content area) must remain empty (initial space).
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 1).codepoint);
+}
+
+test "drawStyledLineWrapped: leading_skip_rows clips top of line (Bug C regression)" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 10, 5);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    // 25 'a's at width 10 -> 3 wrapped rows (10 + 10 + 5).
+    // start_row = 2 (so the visible portion of the screen begins at row 2),
+    // leading_skip_rows = 2. Only the bottom row (5 'a's) should be visible
+    // at row 2 col 0..4. Rows 0 and 1 must remain untouched.
+    const spans = [_]Theme.StyledSpan{
+        .{ .text = "a" ** 25, .style = .{} },
+    };
+
+    const consumed = drawStyledLineWrapped(
+        &screen,
+        &spans,
+        &theme,
+        theme.colors.fg,
+        2, // start_row
+        0,
+        5, // max_row
+        10, // max_col
+        2, // leading_skip_rows
+    );
+
+    // Visible portion = 1 physical row (the bottom 5-cell tail).
+    try std.testing.expectEqual(@as(u16, 1), consumed);
+    try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(2, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(2, 4).codepoint);
+    // Col 5 on the visible row was not written (initial space remains).
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 5).codepoint);
+    // Rows above start_row must remain untouched (initial space).
+    for (0..2) |r| {
+        for (0..10) |c| {
+            try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(@intCast(r), @intCast(c)).codepoint);
+        }
+    }
+}
+
+test "drawStyledLineWrapped: matches wrappedRowCountMulti on consumed rows" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 10, 5);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    const spans = [_]Theme.StyledSpan{
+        .{ .text = "漢字漢", .style = .{} },
+        .{ .text = "abc", .style = .{} },
+    };
+    const parts = [_][]const u8{ "漢字漢", "abc" };
+
+    const expected_rows = width.wrappedRowCountMulti(&parts, 5);
+    const consumed = drawStyledLineWrapped(
+        &screen,
+        &spans,
+        &theme,
+        theme.colors.fg,
+        0,
+        0,
+        5,
+        5,
+        0,
+    );
+
+    try std.testing.expectEqual(@as(u16, @intCast(expected_rows)), consumed);
 }
