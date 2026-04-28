@@ -41,6 +41,26 @@ var total_frame_allocs: u64 = 0;
 /// Total number of frames recorded.
 var total_frame_count: u64 = 0;
 
+/// Cumulative main-thread work microseconds across all ticks (poll-wait excluded).
+var total_tick_work_us: u64 = 0;
+
+/// Maximum main-thread work microseconds observed in any single tick.
+var max_tick_work_us: u64 = 0;
+
+/// Total number of orchestrator ticks measured.
+var tick_count: u64 = 0;
+
+/// Cumulative drain microseconds across all ticks.
+var total_drain_us: u64 = 0;
+
+/// Maximum drain microseconds observed in any single tick.
+var max_drain_us: u64 = 0;
+
+/// Number of ticks that recorded a drain duration. Equals tick_count once
+/// the orchestrator has been instrumented; kept separate so older callers
+/// that only record tick work do not skew the drain average.
+var drain_count: u64 = 0;
+
 /// High water mark for memory usage across the session. `Stats.peak_memory_bytes`
 /// (see below) is a snapshot of this value at `getStats()` time; the shared name
 /// is intentional; the struct field mirrors this running counter.
@@ -56,10 +76,72 @@ fn usSinceStart() u64 {
     return @intCast(now.since(start) / std.time.ns_per_us);
 }
 
+/// Public clock used by callers that need a coarse "now in µs since
+/// session start" for diff-style measurement (orchestrator tick start
+/// timestamps, drain phase boundaries). Lazily anchors session_start
+/// on first call so the first tick records a real duration instead of
+/// a runaway value off zero.
+pub inline fn nowUs() u64 {
+    if (!enabled) return 0;
+    if (session_start == null) {
+        session_start = std.time.Instant.now() catch return 0;
+    }
+    return usSinceStart();
+}
+
 /// Record a completed span event into the ring buffer.
 fn recordEvent(ev: SpanEvent) void {
     ring[ring_head % ring_size] = ev;
     ring_head += 1;
+}
+
+/// Serialize an anonymous struct's fields as a flat JSON object into
+/// the caller-owned buffer. Returns the slice that was filled. Supports
+/// integer, float, and bool fields; anything else writes the literal
+/// JSON null so the output stays parseable. Used by SpanHandle to write
+/// metadata into the trace ring buffer.
+fn formatArgsAsJson(buf: []u8, args: anytype) ![]const u8 {
+    var len: usize = 0;
+    if (buf.len < 2) return error.NoSpaceLeft;
+    buf[len] = '{';
+    len += 1;
+
+    const T = @TypeOf(args);
+    const info = @typeInfo(T);
+    if (info == .@"struct") {
+        inline for (info.@"struct".fields, 0..) |f, i| {
+            const value = @field(args, f.name);
+            const sep = if (i > 0) "," else "";
+            const written = switch (@typeInfo(@TypeOf(value))) {
+                .int, .comptime_int => try std.fmt.bufPrint(
+                    buf[len..],
+                    "{s}\"{s}\":{d}",
+                    .{ sep, f.name, value },
+                ),
+                .float, .comptime_float => try std.fmt.bufPrint(
+                    buf[len..],
+                    "{s}\"{s}\":{d}",
+                    .{ sep, f.name, value },
+                ),
+                .bool => try std.fmt.bufPrint(
+                    buf[len..],
+                    "{s}\"{s}\":{any}",
+                    .{ sep, f.name, value },
+                ),
+                else => try std.fmt.bufPrint(
+                    buf[len..],
+                    "{s}\"{s}\":null",
+                    .{ sep, f.name },
+                ),
+            };
+            len += written.len;
+        }
+    }
+
+    if (len >= buf.len) return error.NoSpaceLeft;
+    buf[len] = '}';
+    len += 1;
+    return buf[0..len];
 }
 
 /// Handle returned by span(). Call end() or endWithArgs() when the span is done.
@@ -82,7 +164,12 @@ pub const SpanHandle = if (enabled) struct {
         recordEvent(ev);
     }
 
-    /// End the span with structured metadata args.
+    /// End the span with structured metadata args. The args struct is
+    /// serialized as a JSON object into the span event so the trace
+    /// dump produces a valid Chrome Trace Event document. Previously we
+    /// used `"{}"` formatting on the anonymous struct, which emitted
+    /// Zig literal syntax (`.{ .field = 5 }`) and broke any tool that
+    /// parsed `zag-trace.json` (jq, perfetto, chrome://tracing).
     pub fn endWithArgs(self: *@This(), args: anytype) void {
         const now = usSinceStart();
         var ev = SpanEvent{};
@@ -92,7 +179,7 @@ pub const SpanHandle = if (enabled) struct {
         ev.dur_us = now -| self.start_us;
 
         var args_scratch: [96]u8 = undefined;
-        const args_formatted = std.fmt.bufPrint(&args_scratch, "{}", .{args}) catch "";
+        const args_formatted = formatArgsAsJson(&args_scratch, args) catch "";
         ev.args_len = @intCast(args_formatted.len);
         if (args_formatted.len > 0) {
             @memcpy(ev.args[0..args_formatted.len], args_formatted);
@@ -178,6 +265,31 @@ pub inline fn getLastFrameTimeUs() u64 {
     return last_frame_dur_us;
 }
 
+/// Record the main-thread work duration of one orchestrator tick. The
+/// caller measures from immediately after the blocking poll() returns
+/// until the tick handler is about to wait again, so any IO, lock wait,
+/// Lua callback, or other blockage on the main thread shows up here.
+/// Frame stats only cover the optional render path inside the tick;
+/// without this, a per-token fsync chain on the drain path would be
+/// invisible to /perf.
+pub inline fn recordTickWork(dur_us: u64) void {
+    if (!enabled) return;
+    total_tick_work_us += dur_us;
+    tick_count += 1;
+    if (dur_us > max_tick_work_us) max_tick_work_us = dur_us;
+}
+
+/// Record the duration of the event drain phase within a single tick.
+/// Tracked separately from tick work so the user can tell whether a
+/// long tick was caused by drain (per-event handlers, hooks, persist
+/// IO) versus render or input handling.
+pub inline fn recordDrain(dur_us: u64) void {
+    if (!enabled) return;
+    total_drain_us += dur_us;
+    drain_count += 1;
+    if (dur_us > max_drain_us) max_drain_us = dur_us;
+}
+
 /// Snapshot of allocation metrics for the status bar.
 pub const FrameAllocStats = struct {
     frame_us: u64,
@@ -213,10 +325,32 @@ pub const Stats = struct {
     peak_memory_bytes: u64,
     /// Average allocations per frame.
     avg_allocs_per_frame: f64,
+    /// Number of orchestrator ticks measured.
+    tick_count: u64,
+    /// Average main-thread work per tick (poll-wait excluded), microseconds.
+    avg_tick_work_us: u64,
+    /// Maximum main-thread work observed in a single tick, microseconds.
+    /// A multi-second value here means the UI could not respond to input
+    /// for that long; surface it prominently in `/perf`.
+    max_tick_work_us: u64,
+    /// Number of ticks where a drain duration was recorded.
+    drain_count: u64,
+    /// Average drain duration per tick, microseconds.
+    avg_drain_us: u64,
+    /// Maximum drain duration observed in a single tick, microseconds.
+    max_drain_us: u64,
 };
 
 /// Compute aggregate stats from the ring buffer on demand.
 pub fn getStats() Stats {
+    const avg_tick_work: u64 = if (tick_count > 0)
+        total_tick_work_us / tick_count
+    else
+        0;
+    const avg_drain: u64 = if (drain_count > 0)
+        total_drain_us / drain_count
+    else
+        0;
     const zero = Stats{
         .frame_count = 0,
         .avg_frame_us = 0,
@@ -224,6 +358,12 @@ pub fn getStats() Stats {
         .max_frame_us = 0,
         .peak_memory_bytes = peak_memory_bytes,
         .avg_allocs_per_frame = 0,
+        .tick_count = tick_count,
+        .avg_tick_work_us = avg_tick_work,
+        .max_tick_work_us = max_tick_work_us,
+        .drain_count = drain_count,
+        .avg_drain_us = avg_drain,
+        .max_drain_us = max_drain_us,
     };
     if (!enabled) return zero;
 
@@ -271,6 +411,12 @@ pub fn getStats() Stats {
         .max_frame_us = max_us,
         .peak_memory_bytes = peak_memory_bytes,
         .avg_allocs_per_frame = avg_allocs,
+        .tick_count = tick_count,
+        .avg_tick_work_us = avg_tick_work,
+        .max_tick_work_us = max_tick_work_us,
+        .drain_count = drain_count,
+        .avg_drain_us = avg_drain,
+        .max_drain_us = max_drain_us,
     };
 }
 
@@ -346,6 +492,12 @@ pub fn init() void {
     last_frame_dur_us = 0;
     total_frame_allocs = 0;
     total_frame_count = 0;
+    total_tick_work_us = 0;
+    max_tick_work_us = 0;
+    tick_count = 0;
+    total_drain_us = 0;
+    max_drain_us = 0;
+    drain_count = 0;
     peak_memory_bytes = 0;
     session_start = null;
     counting_state = null;
@@ -507,6 +659,86 @@ test "getStats computes correct aggregates" {
     try std.testing.expectEqual(@as(u64, 300), stats.max_frame_us);
     try std.testing.expectEqual(@as(u64, 4096), stats.peak_memory_bytes);
     try std.testing.expect(stats.avg_allocs_per_frame == 3.0);
+}
+
+test "recordTickWork tracks max and average across ticks" {
+    // Regression: a long main-thread blockage between frames (per-token
+    // fsync chain in the drain path) was invisible to /perf because the
+    // existing frame span only wrapped the render path. recordTickWork
+    // captures the time main-thread spent NOT waiting on poll() so any
+    // blockage shows up in stats.
+    if (!enabled) return;
+    init();
+
+    recordTickWork(500);
+    recordTickWork(1500);
+    recordTickWork(800);
+
+    const stats = getStats();
+    try std.testing.expectEqual(@as(u64, 3), stats.tick_count);
+    try std.testing.expectEqual(@as(u64, 1500), stats.max_tick_work_us);
+    try std.testing.expectEqual(@as(u64, (500 + 1500 + 800) / 3), stats.avg_tick_work_us);
+}
+
+test "recordDrain tracks drain time independently of tick work" {
+    // The drain phase is the prime suspect when max_tick_work_us spikes,
+    // so it gets its own bucket. A tick can record both: tick work is
+    // the outer envelope, drain is the inner subset.
+    if (!enabled) return;
+    init();
+
+    recordTickWork(2000);
+    recordDrain(1700);
+    recordTickWork(2000);
+    recordDrain(1900);
+
+    const stats = getStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.drain_count);
+    try std.testing.expectEqual(@as(u64, 1900), stats.max_drain_us);
+    try std.testing.expectEqual(@as(u64, 1800), stats.avg_drain_us);
+    // Drain is bounded above by tick work for the same tick.
+    try std.testing.expect(stats.max_drain_us <= stats.max_tick_work_us);
+}
+
+test "endWithArgs emits parseable JSON object for span metadata" {
+    // Regression: zag-trace.json was unparseable by jq because
+    // endWithArgs used `{}` formatting on the anonymous struct, which
+    // produced Zig literal syntax (`.{ .field = value }`). The fix
+    // formats fields as a real JSON object so Chrome Trace Event
+    // tooling (perfetto, jq, chrome://tracing) can load the dump.
+    if (!enabled) return;
+    init();
+
+    var s = span("test_args_json");
+    s.endWithArgs(.{ .cells_changed = @as(u32, 42), .bytes = @as(usize, 1024) });
+
+    const slot = ring[(ring_head - 1) % ring_size];
+    const args_str = slot.args[0..slot.args_len];
+    try std.testing.expectEqualStrings(
+        "{\"cells_changed\":42,\"bytes\":1024}",
+        args_str,
+    );
+}
+
+test "endWithArgs handles empty struct as empty JSON object" {
+    if (!enabled) return;
+    init();
+    var s = span("test_empty");
+    s.endWithArgs(.{});
+    const slot = ring[(ring_head - 1) % ring_size];
+    try std.testing.expectEqualStrings("{}", slot.args[0..slot.args_len]);
+}
+
+test "init resets tick and drain counters" {
+    if (!enabled) return;
+    recordTickWork(9999);
+    recordDrain(5555);
+    init();
+    const stats = getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.tick_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_tick_work_us);
+    try std.testing.expectEqual(@as(u64, 0), stats.drain_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_drain_us);
 }
 
 test "dump writes valid JSON" {

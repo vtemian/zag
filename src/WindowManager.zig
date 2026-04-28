@@ -2040,21 +2040,38 @@ pub fn handlePerfCommand(self: *WindowManager, command: []const u8) void {
 }
 
 /// Format the current performance snapshot and append it as a status node.
+/// Reports two parallel views: frame-level stats (the optional render
+/// path) and tick-level stats (the full main-thread iteration). The tick
+/// view is the one to watch when the UI feels stuck: max_tick_work and
+/// max_drain capture blockage that frame stats miss because the freeze
+/// returns early at the !frame_dirty guard or sits in drain before the
+/// frame span starts.
 fn showPerfStats(self: *WindowManager) void {
     const stats = trace.getStats();
-    var scratch: [512]u8 = undefined;
+    var scratch: [768]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch,
-        \\Performance (last {d} frames):
-        \\  avg frame:       {d:.1}ms
-        \\  p99 frame:       {d:.1}ms
-        \\  max frame:       {d:.1}ms
-        \\  peak memory:     {d:.1}MB
-        \\  avg allocs/frame: {d:.1}
+        \\Performance:
+        \\  frames recorded:   {d}
+        \\  avg frame:         {d:.1}ms
+        \\  p99 frame:         {d:.1}ms
+        \\  max frame:         {d:.1}ms
+        \\  ticks recorded:    {d}
+        \\  avg tick work:     {d:.1}ms
+        \\  max tick work:     {d:.1}ms
+        \\  avg drain:         {d:.1}ms
+        \\  max drain:         {d:.1}ms
+        \\  peak memory:       {d:.1}MB
+        \\  avg allocs/frame:  {d:.1}
     , .{
         stats.frame_count,
         @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0,
+        stats.tick_count,
+        @as(f64, @floatFromInt(stats.avg_tick_work_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.max_tick_work_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.avg_drain_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.max_drain_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
         stats.avg_allocs_per_frame,
     }) catch "Performance: error formatting";
