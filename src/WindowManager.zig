@@ -5737,3 +5737,317 @@ test "zag.layout.float on_close callback fires and unrefs cleanly on close" {
     defer f.engine.lua.pop(1);
     try std.testing.expect(f.engine.lua.toBoolean(-1));
 }
+
+// -----------------------------------------------------------------------------
+// zag.popup.list (Slice 4) integration tests
+//
+// The helper module is pure Lua glue over Groups A+B+C; these tests exercise
+// it end-to-end against the real WindowManager + LuaEngine fixture, so the
+// cross-primitive seams (set_row_style, replace_draft_range, PaneDraftChange)
+// are exercised together rather than in isolation.
+
+test "zag.popup.list.open creates a float, populates the buffer, and selects row 1" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 0 }},
+        \\  items = function(query)
+        \\    return {{
+        \\      {{ word = "foo", abbr = "foo", kind = "fn" }},
+        \\      {{ word = "bar", abbr = "bar", kind = "fn" }},
+        \\      {{ word = "baz", abbr = "baz", kind = "fn" }},
+        \\    }}
+        \\  end,
+        \\}})
+        \\_G.float_count = #zag.layout.floats()
+        \\local state = popup._state(_G.handle)
+        \\_G.line_count = zag.buffer.line_count(state.buf)
+        \\_G.selection = state.selection_index
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("float_count");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("line_count");
+    try std.testing.expectEqual(@as(i64, 3), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("selection");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    // Tear the popup down explicitly so its scratch buffer is freed
+    // before the engine deinit walk runs.
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+}
+
+test "zag.popup.list down arrow advances selection and clamps at the end" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{
+        \\    {{ word = "alpha" }},
+        \\    {{ word = "beta" }},
+        \\  }} end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<Down>")
+        \\_G.after_first = popup._state(_G.handle).selection_index
+        \\popup.invoke_key(_G.handle, "<Down>")
+        \\_G.after_clamp = popup._state(_G.handle).selection_index
+        \\popup.invoke_key(_G.handle, "<Up>")
+        \\_G.after_up = popup._state(_G.handle).selection_index
+        \\popup.close(_G.handle)
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("after_first");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_clamp");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_up");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list re-narrows on PaneDraftChange and resets selection" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Items() filters by query prefix. After the popup is open, mutate
+    // the underlying draft via zag.pane.set_draft to fire
+    // PaneDraftChange and observe that the popup's items list contains
+    // only entries matching the new prefix.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\local source = {{
+        \\  {{ word = "foo" }},
+        \\  {{ word = "foobar" }},
+        \\  {{ word = "baz" }},
+        \\}}
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 0 }},
+        \\  items = function(query)
+        \\    local out = {{}}
+        \\    for _, item in ipairs(source) do
+        \\      if query == "" or string.sub(item.word, 1, #query) == query then
+        \\        table.insert(out, item)
+        \\      end
+        \\    end
+        \\    return out
+        \\  end,
+        \\}})
+        \\local state = popup._state(_G.handle)
+        \\_G.before = #state.current_items
+        \\state.trigger_to = 2
+        \\zag.pane.set_draft("{s}", "fo")
+        \\_G.after = #state.current_items
+        \\_G.selection_after = state.selection_index
+        \\popup.close(_G.handle)
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before");
+    try std.testing.expectEqual(@as(i64, 3), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("selection_after");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list commit replaces the trigger range with item.word" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Pre-fill the draft with "fo bar" and mount the popup over the
+    // first two bytes ("fo"); committing the first item ("foobar")
+    // must rewrite the draft to "foobar bar".
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\zag.pane.set_draft("{s}", "fo bar")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 2 }},
+        \\  items = function() return {{
+        \\    {{ word = "foobar" }},
+        \\    {{ word = "fizz" }},
+        \\  }} end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<CR>")
+        \\_G.float_count_after = #zag.layout.floats()
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    try std.testing.expectEqualStrings("foobar bar", f.wm.root_pane.getDraft());
+
+    _ = try f.engine.lua.getGlobal("float_count_after");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list cancel fires on_cancel, leaves draft unchanged, closes float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\zag.pane.set_draft("{s}", "untouched")
+        \\_G.cancel_count = 0
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  on_cancel = function() _G.cancel_count = _G.cancel_count + 1 end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<Esc>")
+        \\_G.float_count_after = #zag.layout.floats()
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("cancel_count");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("float_count_after");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    try std.testing.expectEqualStrings("untouched", f.wm.root_pane.getDraft());
+}
+
+test "zag.popup.list.close tears down hook, buffer, and float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\}})
+        \\_G.before = #zag.layout.floats()
+        \\popup.close(_G.handle)
+        \\_G.after = #zag.layout.floats()
+        \\local state = popup._state(_G.handle)
+        \\_G.closed_flag = state.closed
+        \\_G.hook_id_nil = state.draft_hook_id == nil
+        \\_G.buf_nil = state.buf == nil
+        \\popup.close(_G.handle) -- idempotent: must not raise
+        \\_G.after_second_close = #zag.layout.floats()
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("closed_flag");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    // After close, hook id and buffer handle are nilled. The Lua-side
+    // booleans confirm this without trying to fetch nil globals through
+    // zlua's getGlobal (which raises on nil).
+    _ = try f.engine.lua.getGlobal("hook_id_nil");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("buf_nil");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    // Second close was idempotent: float count stays at 0, no raise.
+    _ = try f.engine.lua.getGlobal("after_second_close");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
