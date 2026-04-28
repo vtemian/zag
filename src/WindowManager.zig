@@ -39,6 +39,7 @@ const skills_mod = @import("skills.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
 const input = @import("input.zig");
+const Hooks = @import("Hooks.zig");
 
 const log = std.log.scoped(.window_manager);
 
@@ -89,26 +90,47 @@ pub const Pane = struct {
     draft: [MAX_DRAFT]u8 = undefined,
     /// Number of valid bytes in `draft`.
     draft_len: usize = 0,
+    /// Stable layout handle that addresses this pane. Set at pane
+    /// creation (root, split, or float) so draft-change hooks can
+    /// pattern-match on a pane id without an O(n) reverse lookup. Null
+    /// for test fixtures that wire `Pane` by hand without driving the
+    /// layout tree.
+    handle: ?NodeRegistry.Handle = null,
+    /// Back-pointer to the owning WindowManager so draft-mutation
+    /// methods can fire `pane_draft_change` hooks. Null for fixtures
+    /// without a manager (and for the brief window before the pane is
+    /// installed at its final storage site). Hook firing is best-effort:
+    /// a null `wm` or `wm.lua_engine` skips the hook silently.
+    wm: ?*WindowManager = null,
 
     /// Append a single byte to the draft. No-op if the draft is full.
     /// Does not touch any dirty channels; the compositor repaints the
     /// prompt every frame regardless.
     pub fn appendToDraft(self: *Pane, ch: u8) void {
         if (self.draft_len >= self.draft.len) return;
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
         self.draft[self.draft_len] = ch;
         self.draft_len += 1;
+        self.fireDraftChange(prev);
     }
 
     /// Remove the last byte from the draft. No-op on empty.
     pub fn deleteBackFromDraft(self: *Pane) void {
         if (self.draft_len == 0) return;
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
         self.draft_len -= 1;
+        self.fireDraftChange(prev);
     }
 
     /// Remove the last word from the draft along with any trailing
     /// spaces before the word and any separator space after it.
     /// Matches Ctrl+W in shells and vim.
     pub fn deleteWordFromDraft(self: *Pane) void {
+        if (self.draft_len == 0) return;
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
         while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
             self.draft_len -= 1;
         }
@@ -118,23 +140,39 @@ pub const Pane = struct {
         while (self.draft_len > 0 and self.draft[self.draft_len - 1] == ' ') {
             self.draft_len -= 1;
         }
+        self.fireDraftChange(prev);
     }
 
     /// Append a chunk of bytes to the draft (e.g. a bracketed paste).
-    /// Truncates past `draft.len` with a warn log.
+    /// Truncates past `draft.len` with a warn log. Skips the snapshot
+    /// and hook fire when no bytes will land (empty input or full draft):
+    /// firing `pane_draft_change` with previous == current is observably
+    /// a no-op event, and plugins should not have to filter it.
     pub fn appendPaste(self: *Pane, data: []const u8) void {
+        if (data.len == 0) return;
         const room = self.draft.len - self.draft_len;
         const to_copy = @min(room, data.len);
+        if (to_copy == 0) {
+            log.warn("paste truncated: {d} bytes dropped (draft full)", .{data.len});
+            return;
+        }
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
         @memcpy(self.draft[self.draft_len..][0..to_copy], data[0..to_copy]);
         self.draft_len += to_copy;
         if (to_copy < data.len) {
             log.warn("paste truncated: {d} bytes dropped (draft full)", .{data.len - to_copy});
         }
+        self.fireDraftChange(prev);
     }
 
     /// Clear the draft entirely.
     pub fn clearDraft(self: *Pane) void {
+        if (self.draft_len == 0) return;
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
         self.draft_len = 0;
+        self.fireDraftChange(prev);
     }
 
     /// Return the current draft as a borrowed slice. Invalid after any
@@ -145,12 +183,157 @@ pub const Pane = struct {
 
     /// Copy the current draft into `dest` and clear it. Caller's buffer
     /// must be at least `MAX_DRAFT` bytes.
+    ///
+    /// Does NOT fire `pane_draft_change`. The submit pipeline drains the
+    /// draft to send it to the agent; firing the hook here would make
+    /// any plugin observe an empty draft right after the user pressed
+    /// Enter — misleading, and a recursion footgun (a hook that
+    /// re-populates the draft on every clear would loop). Plugins that
+    /// want to react to submission should use `UserMessagePre` or
+    /// `UserMessagePost` instead.
     pub fn consumeDraft(self: *Pane, dest: []u8) []const u8 {
         const n = self.draft_len;
         std.debug.assert(dest.len >= n);
         @memcpy(dest[0..n], self.draft[0..n]);
         self.draft_len = 0;
         return dest[0..n];
+    }
+
+    /// Replace the entire draft with `text`. Truncates silently to
+    /// `MAX_DRAFT` with a warn log (matches `appendPaste`'s policy: a
+    /// caller that pushes more than the cap loses the tail rather than
+    /// failing the whole operation). No-ops when `text` (after
+    /// truncation) already equals the current draft: a Slice 4 popup
+    /// helper that defensively echoes the current value back through
+    /// `set_draft` should not pay for a hook fire on every keystroke.
+    pub fn setDraft(self: *Pane, text: []const u8) void {
+        const to_copy = @min(self.draft.len, text.len);
+        const incoming = text[0..to_copy];
+        if (std.mem.eql(u8, incoming, self.getDraft())) {
+            if (to_copy < text.len) {
+                log.warn("setDraft truncated: {d} bytes dropped (over MAX_DRAFT)", .{text.len - to_copy});
+            }
+            return;
+        }
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
+        @memcpy(self.draft[0..to_copy], incoming);
+        self.draft_len = to_copy;
+        if (to_copy < text.len) {
+            log.warn("setDraft truncated: {d} bytes dropped (over MAX_DRAFT)", .{text.len - to_copy});
+        }
+        self.fireDraftChange(prev);
+    }
+
+    /// Replace bytes `[from_byte, to_byte)` in the draft with
+    /// `replacement`. Offsets are 0-indexed half-open `[from_byte, to_byte)`,
+    /// matching `getDraft()` slicing. `from_byte == to_byte` is valid and
+    /// acts as a pure insertion at `from_byte`. Strict errors on invalid
+    /// range (`from_byte > to_byte` or `to_byte > draft_len`) and on
+    /// overflow past `MAX_DRAFT` — autocomplete plugins know the trigger
+    /// range and want loud failure if anything is off.
+    pub fn replaceDraftRange(
+        self: *Pane,
+        from_byte: usize,
+        to_byte: usize,
+        replacement: []const u8,
+    ) error{ InvalidRange, Overflow }!void {
+        if (from_byte > to_byte) return error.InvalidRange;
+        if (to_byte > self.draft_len) return error.InvalidRange;
+
+        const removed = to_byte - from_byte;
+        const tail_len = self.draft_len - to_byte;
+        const new_len = self.draft_len - removed + replacement.len;
+        if (new_len > self.draft.len) return error.Overflow;
+
+        // Snapshot before the mutation so the hook payload can carry the
+        // pre-mutation text. Captured after the validation arms above so
+        // an `error.InvalidRange` / `error.Overflow` doesn't pay for a
+        // copy that's about to be discarded.
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
+
+        // Shift the trailing bytes to their new home before writing the
+        // replacement. When the replacement grows the draft (`replacement.len
+        // > removed`), the tail moves right and source/dest overlap with
+        // dest > src — a forward `@memcpy` would clobber unread source
+        // bytes, so we copy backward via `std.mem.copyBackwards`. When
+        // the replacement shrinks, the tail moves left (dest < src) and a
+        // forward `std.mem.copyForwards` is correct.
+        const tail_src_start = to_byte;
+        const tail_dst_start = from_byte + replacement.len;
+        if (tail_len > 0 and tail_dst_start != tail_src_start) {
+            const dst = self.draft[tail_dst_start .. tail_dst_start + tail_len];
+            const src = self.draft[tail_src_start .. tail_src_start + tail_len];
+            if (tail_dst_start > tail_src_start) {
+                std.mem.copyBackwards(u8, dst, src);
+            } else {
+                std.mem.copyForwards(u8, dst, src);
+            }
+        }
+
+        if (replacement.len > 0) {
+            @memcpy(self.draft[from_byte .. from_byte + replacement.len], replacement);
+        }
+
+        self.draft_len = new_len;
+        self.fireDraftChange(prev);
+    }
+
+    /// Fire a `pane_draft_change` event to any registered hooks. Best-
+    /// effort: a missing window manager / Lua engine / cached handle
+    /// silently skips the event so test fixtures and pre-init mutations
+    /// don't crash. Hook errors are logged and dropped (a buggy hook
+    /// must not block draft editing). When a hook returns
+    /// `{ draft_text = ... }` and the rewrite differs from the current
+    /// draft, the rewrite is applied directly to the draft buffer
+    /// without re-firing the hook. The dispatcher's recursion-depth
+    /// guard separately catches a hook body that calls back into a
+    /// draft-mutation path while still inside the fire.
+    fn fireDraftChange(self: *Pane, previous: []const u8) void {
+        const wm = self.wm orelse return;
+        const engine = wm.lua_engine orelse return;
+        const handle = self.handle orelse return;
+
+        // Format the handle into a stack buffer; `formatId` allocates,
+        // but we know the encoded size fits comfortably in 16 bytes
+        // ("n" + u32 max digits = 11 chars). Format inline to dodge the
+        // alloc on every keystroke.
+        var handle_buf: [16]u8 = undefined;
+        const packed_u32: u32 = @bitCast(handle);
+        const handle_str = std.fmt.bufPrint(&handle_buf, "n{d}", .{packed_u32}) catch return;
+
+        var payload: Hooks.HookPayload = .{ .pane_draft_change = .{
+            .pane_handle = handle_str,
+            .draft_text = self.getDraft(),
+            .previous_text = previous,
+            .draft_rewrite = null,
+        } };
+
+        _ = engine.fireHook(&payload) catch |err| {
+            log.warn("pane_draft_change hook fire failed: {}", .{err});
+            return;
+        };
+
+        // Apply any rewrite the hook returned by writing directly into
+        // the draft buffer rather than calling back through `setDraft`.
+        // Routing through `setDraft` would fire `pane_draft_change` a
+        // second time for the same logical edit, doubling per-keystroke
+        // hook costs and surprising plugins that observe one user input
+        // as two events. Skip the apply when the rewrite is a no-op
+        // (avoids needless dirty-flagging) and free the buffer the
+        // dispatcher allocated.
+        if (payload.pane_draft_change.draft_rewrite) |rewrite| {
+            defer engine.hook_dispatcher.allocator.free(rewrite);
+            if (!std.mem.eql(u8, rewrite, self.getDraft())) {
+                const to_copy = @min(self.draft.len, rewrite.len);
+                @memcpy(self.draft[0..to_copy], rewrite[0..to_copy]);
+                self.draft_len = to_copy;
+                if (to_copy < rewrite.len) {
+                    log.warn("pane_draft_change rewrite truncated: {d} bytes dropped", .{rewrite.len - to_copy});
+                }
+            }
+        }
     }
 
     /// Pane-level key dispatch for insert mode: try buffer-internal
@@ -190,6 +373,16 @@ pub const Pane = struct {
         }
     }
 };
+
+/// Copy the current draft into `dest` and return the slice covering
+/// the copied bytes. Used by mutation methods to capture the
+/// pre-mutation text for the `pane_draft_change` payload before the
+/// in-place edit clobbers it.
+fn snapshotDraft(pane: *const Pane, dest: []u8) []const u8 {
+    const n = pane.draft_len;
+    @memcpy(dest[0..n], pane.draft[0..n]);
+    return dest[0..n];
+}
 
 /// Maximum bytes of in-progress draft a single pane can hold. Fixed so
 /// the draft lives inline on the Pane struct with no separate alloc.
@@ -349,6 +542,19 @@ pub fn init(cfg: Config) !WindowManager {
 pub fn attachLayoutRegistry(self: *WindowManager) !void {
     self.layout.registry = &self.node_registry;
     if (self.layout.root) |root| try registerSubtree(&self.node_registry, root);
+
+    // Cache the root pane's stable handle + back-pointer so draft-change
+    // hooks fire with a usable pane_handle. The root buffer is the
+    // matching leaf; locate it once now rather than walking the registry
+    // on every keystroke.
+    self.root_pane.wm = self;
+    if (self.layout.root) |root| {
+        if (self.handleForNode(root)) |handle| {
+            self.root_pane.handle = handle;
+        } else |err| {
+            log.warn("root pane handle lookup failed: {}", .{err});
+        }
+    }
 }
 
 fn registerSubtree(registry: *NodeRegistry, node: *Layout.LayoutNode) !void {
@@ -1065,9 +1271,20 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     // createSplitPane runs before the split (the new buffer has to exist
     // first), so this is the earliest point the handle is known. Only
     // agent panes carry a runner, so the null branch is a no-op.
+    //
+    // Also stamp the handle onto the matching `extra_panes` entry so
+    // `pane_draft_change` hooks fire with the new pane's stable id. The
+    // copy `pane` returned by createSplitPane is by-value; the handle
+    // must land on the entry's stored Pane, not on this stack copy.
     if (self.layout.focused) |new_leaf| {
         if (self.handleForNode(new_leaf)) |handle| {
             if (pane.runner) |r| r.pane_handle_packed = @bitCast(handle);
+            for (self.extra_panes.items) |*entry| {
+                if (entry.pane.buffer.ptr == pane.buffer.ptr) {
+                    entry.pane.handle = handle;
+                    break;
+                }
+            }
         } else |err| {
             log.warn("new leaf missing from registry after split: {}", .{err});
         }
@@ -1103,6 +1320,7 @@ pub fn doSplitWithBuffer(
         .view = null,
         .session = null,
         .runner = null,
+        .wm = self,
     };
     try self.extra_panes.append(self.allocator, .{ .pane = pane });
     // On any downstream failure undo the append so extra_panes and the
@@ -1112,6 +1330,17 @@ pub fn doSplitWithBuffer(
     switch (direction) {
         .vertical => try self.layout.splitVertical(0.5, attached),
         .horizontal => try self.layout.splitHorizontal(0.5, attached),
+    }
+
+    // Stamp the new leaf's stable handle onto the entry's pane so
+    // draft-change hooks fire with the correct id. The newly focused
+    // leaf is always the freshly inserted pane.
+    if (self.layout.focused) |new_leaf| {
+        if (self.handleForNode(new_leaf)) |handle| {
+            self.extra_panes.items[self.extra_panes.items.len - 1].pane.handle = handle;
+        } else |err| {
+            log.warn("attached split leaf missing from registry: {}", .{err});
+        }
     }
 
     self.layout.recalculate(self.screen.width, self.screen.height);
@@ -1184,7 +1413,13 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
 
-    const pane: Pane = .{ .buffer = cb.buf(), .view = cb, .session = cs, .runner = runner };
+    const pane: Pane = .{
+        .buffer = cb.buf(),
+        .view = cb,
+        .session = cs,
+        .runner = runner,
+        .wm = self,
+    };
 
     // Heap-allocate the Viewport so the buffer's borrowed pointer survives
     // any subsequent `extra_panes.append` that relocates the items buffer.
@@ -1348,6 +1583,7 @@ pub fn openFloatPane(
         .view = null,
         .session = null,
         .runner = null,
+        .wm = self,
     };
 
     try self.extra_floats.append(self.allocator, .{
@@ -1358,6 +1594,11 @@ pub fn openFloatPane(
 
     const handle = try self.layout.addFloat(buffer, rect, config);
     errdefer self.layout.removeFloat(handle) catch {};
+
+    // Stamp the float's stable handle onto the entry's pane so
+    // `pane_draft_change` hooks fire with the correct id when a plugin
+    // mutates this float's draft via `zag.pane.set_draft`.
+    self.extra_floats.items[self.extra_floats.items.len - 1].pane.handle = handle;
 
     // Snapshot the *current* focused pane's draft length AND record
     // its buffer so the orchestrator's `close_on_cursor_moved` sweep
@@ -1613,9 +1854,15 @@ pub fn swapProviderForPane(
 }
 
 /// Resolve a node handle to the `*Pane` whose buffer the leaf carries.
-/// Rejects splits and unregistered panes loudly; handles that point at
-/// a scratch-backed pane still succeed.
+/// Float handles route to `paneFromFloatHandle` so plugin callers can
+/// pass float ids interchangeably with tile ids — the float bit
+/// otherwise trips `node_registry.resolve` with `StaleNode`. Rejects
+/// splits and unregistered panes loudly; handles that point at a
+/// scratch-backed pane still succeed.
 pub fn paneFromHandle(self: *WindowManager, handle: NodeRegistry.Handle) !*Pane {
+    if (Layout.isFloatHandle(handle)) {
+        return self.paneFromFloatHandle(handle) orelse error.PaneNotFound;
+    }
     const node = try self.node_registry.resolve(handle);
     if (node.* != .leaf) return error.NotALeaf;
     const leaf_buffer = node.leaf.buffer;
@@ -2134,6 +2381,110 @@ test "Pane.handleKey delegates to buffer for buffer-internal chords (Ctrl+R)" {
     const r = pane.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
     try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
     try std.testing.expectEqualStrings("", pane.getDraft());
+}
+
+test "Pane setDraft replaces the entire draft" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    for ("hello") |ch| pane.appendToDraft(ch);
+    pane.setDraft("world");
+    try std.testing.expectEqualStrings("world", pane.getDraft());
+
+    pane.setDraft("");
+    try std.testing.expectEqualStrings("", pane.getDraft());
+}
+
+test "Pane setDraft truncates input larger than MAX_DRAFT" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    var oversized: [MAX_DRAFT + 32]u8 = undefined;
+    @memset(&oversized, 'x');
+    pane.setDraft(&oversized);
+
+    try std.testing.expectEqual(MAX_DRAFT, pane.draft_len);
+    for (pane.getDraft()) |b| try std.testing.expectEqual(@as(u8, 'x'), b);
+}
+
+test "Pane replaceDraftRange replaces a word in the middle" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("foo bar baz");
+    try pane.replaceDraftRange(4, 7, "qux");
+    try std.testing.expectEqualStrings("foo qux baz", pane.getDraft());
+}
+
+test "Pane replaceDraftRange treats from == to as insertion" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("hello world");
+    try pane.replaceDraftRange(5, 5, "_INS_");
+    try std.testing.expectEqualStrings("hello_INS_ world", pane.getDraft());
+}
+
+test "Pane replaceDraftRange shifts trailing bytes right when replacement grows" {
+    // Critical case: replacement.len > removed and trailing content
+    // present. Naive forward memcpy would overwrite source bytes before
+    // they were copied; the implementation must walk the tail backward.
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abXYef");
+    try pane.replaceDraftRange(2, 4, "QQQQ");
+    try std.testing.expectEqualStrings("abQQQQef", pane.getDraft());
+}
+
+test "Pane replaceDraftRange shifts trailing bytes left when replacement shrinks" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abXXXXef");
+    try pane.replaceDraftRange(2, 6, "Q");
+    try std.testing.expectEqualStrings("abQef", pane.getDraft());
+}
+
+test "Pane replaceDraftRange rejects from > to" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abcdef");
+    try std.testing.expectError(error.InvalidRange, pane.replaceDraftRange(4, 2, "x"));
+    // Original draft is unchanged on error.
+    try std.testing.expectEqualStrings("abcdef", pane.getDraft());
+}
+
+test "Pane replaceDraftRange rejects to past draft_len" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abc");
+    try std.testing.expectError(error.InvalidRange, pane.replaceDraftRange(0, 99, "x"));
+    try std.testing.expectEqualStrings("abc", pane.getDraft());
+}
+
+test "Pane replaceDraftRange rejects overflow past MAX_DRAFT" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    // Fill the draft to MAX_DRAFT - 1, then try to insert 8 bytes —
+    // the resulting length would exceed MAX_DRAFT, so the op must
+    // raise without touching the draft.
+    var i: usize = 0;
+    while (i < MAX_DRAFT - 1) : (i += 1) pane.appendToDraft('a');
+    try std.testing.expectError(error.Overflow, pane.replaceDraftRange(0, 0, "12345678"));
+    try std.testing.expectEqual(MAX_DRAFT - 1, pane.draft_len);
 }
 
 test "extra pane viewport is attached to its buffer" {
@@ -4062,6 +4413,612 @@ test "zag.pane.current_model returns the resolved model string" {
     try std.testing.expectEqualStrings("provB/b2", try engine.lua.toString(-1));
 }
 
+test "zag.pane.set_draft writes through to the pane's draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "hello from lua")
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    try std.testing.expectEqualStrings("hello from lua", f.wm.root_pane.getDraft());
+}
+
+test "zag.pane.set_draft writes through to a float pane's draft" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Open a focused float (`enter = true` so a real `Pane` is registered
+    // in `extra_floats`), then set its draft via the Lua surface using
+    // the float handle string — the same `zag.pane.set_draft` call that
+    // works on tile handles must work on float handles.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "picker" }
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 2, col = 2,
+        \\  width = 20, height = 6,
+        \\  enter = true,
+        \\})
+        \\zag.pane.set_draft(_h, "hello from float")
+    );
+
+    _ = try f.engine.lua.getGlobal("_h");
+    defer f.engine.lua.pop(1);
+    const float_id = try f.engine.lua.toString(-1);
+    const handle = try NodeRegistry.parseId(float_id);
+
+    const float_pane = f.wm.paneFromFloatHandle(handle).?;
+    try std.testing.expectEqualStrings("hello from float", float_pane.getDraft());
+}
+
+test "zag.pane.set_draft truncates input larger than MAX_DRAFT" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // Build a Lua string literal of `(MAX_DRAFT + 32)` 'x' characters via
+    // `string.rep` so the test does not need to bake the constant into a
+    // literal — keeps the assertion robust to a future MAX_DRAFT bump.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", string.rep("x", {d}))
+    , .{ pane_id, MAX_DRAFT + 32 }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    try std.testing.expectEqual(MAX_DRAFT, f.wm.root_pane.draft_len);
+}
+
+test "zag.pane.set_draft raises on invalid pane handle" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    // `n9999` cannot resolve to any registered leaf in this fixture; the
+    // call must surface a Lua error rather than silently swallowing it.
+    const result = engine.lua.doString(
+        \\zag.pane.set_draft("n9999", "x")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.pane.replace_draft_range replaces a slice of the draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // 0-indexed, half-open: replace `bar` (bytes 4..7) with `qux`.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "foo bar baz")
+        \\zag.pane.replace_draft_range("{s}", 4, 7, "qux")
+    , .{ pane_id, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    try std.testing.expectEqualStrings("foo qux baz", f.wm.root_pane.getDraft());
+}
+
+test "zag.pane.replace_draft_range raises with helpful message on invalid range" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "abc")
+        \\local ok, err = pcall(function()
+        \\  zag.pane.replace_draft_range("{s}", 0, 99, "x")
+        \\end)
+        \\_G.ok = ok
+        \\_G.err = err
+    , .{ pane_id, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("err");
+    defer engine.lua.pop(1);
+    const err_msg = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "invalid range") != null);
+    // Draft is preserved on the rejected mutation.
+    try std.testing.expectEqualStrings("abc", f.wm.root_pane.getDraft());
+}
+
+test "zag.pane.replace_draft_range raises with helpful message on overflow" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // Fill the draft to MAX_DRAFT - 1, then attempt an insertion of 8
+    // bytes — replacement plus existing tail exceed the cap, so the call
+    // must raise rather than silently corrupt.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", string.rep("a", {d}))
+        \\local ok, err = pcall(function()
+        \\  zag.pane.replace_draft_range("{s}", 0, 0, "12345678")
+        \\end)
+        \\_G.ok = ok
+        \\_G.err = err
+    , .{ pane_id, MAX_DRAFT - 1, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("err");
+    defer engine.lua.pop(1);
+    const err_msg = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "overflow") != null);
+    try std.testing.expectEqual(MAX_DRAFT - 1, f.wm.root_pane.draft_len);
+}
+
+test "PaneDraftChange fires on root pane draft mutation" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    const root_handle = f.wm.root_pane.handle.?;
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.fired_count = 0
+        \\_G.last_draft = nil
+        \\_G.last_prev = nil
+        \\zag.hook("PaneDraftChange", {{ pattern = "{s}" }}, function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\  _G.last_draft = evt.draft_text
+        \\  _G.last_prev = evt.previous_text
+        \\end)
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    f.wm.root_pane.appendToDraft('h');
+    f.wm.root_pane.appendToDraft('i');
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 2), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_draft");
+    try std.testing.expectEqualStrings("hi", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_prev");
+    try std.testing.expectEqualStrings("h", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire for non-matching pane handle" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    // Register a hook on a fictitious pane handle. Mutating the root
+    // pane must not fire it because the pattern key is its layout id.
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", { pattern = "n9999" }, function(evt)
+        \\  _G.fired_count = _G.fired_count + 1
+        \\end)
+    );
+
+    f.wm.root_pane.appendToDraft('x');
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange rewrite return value replaces the draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  if evt.draft_text ~= "rewritten" then
+        \\    return { draft_text = "rewritten" }
+        \\  end
+        \\end)
+    );
+
+    f.wm.root_pane.appendToDraft('a');
+
+    try std.testing.expectEqualStrings("rewritten", f.wm.root_pane.getDraft());
+}
+
+test "PaneDraftChange recursion guard blocks reentrant set_draft from hook" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    const root_handle = f.wm.root_pane.handle.?;
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // Hook calls set_draft on its own pane. Without the recursion-depth
+    // guard this would loop forever; with it, the inner fire is skipped
+    // and control returns. Counter tracks how many times the body ran;
+    // the guard skips the inner reentrant fire so it ran exactly once.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.fired = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired = _G.fired + 1
+        \\  if _G.fired < 5 then
+        \\    zag.pane.set_draft("{s}", "from-hook-" .. _G.fired)
+        \\  end
+        \\end)
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    f.wm.root_pane.appendToDraft('a');
+
+    _ = try engine.lua.getGlobal("fired");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange fires on float draft via zag.pane.set_draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    var screen = try Screen.init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    f.wm.screen = &screen;
+    f.wm.compositor = &compositor;
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+    f.wm.layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    var float_view = try ConversationBuffer.init(allocator, 99, "float");
+    defer float_view.deinit();
+
+    const float_handle = try f.wm.openFloatPane(
+        float_view.buf(),
+        .{ .x = 10, .y = 5, .width = 30, .height = 5 },
+        .{ .border = .rounded, .focusable = false, .enter = false },
+    );
+    const float_id = try NodeRegistry.formatId(allocator, float_handle);
+    defer allocator.free(float_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.fired_count = 0
+        \\_G.last_draft = nil
+        \\zag.hook("PaneDraftChange", {{ pattern = "{s}" }}, function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\  _G.last_draft = evt.draft_text
+        \\end)
+        \\zag.pane.set_draft("{s}", "hello")
+    , .{ float_id, float_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_draft");
+    try std.testing.expectEqualStrings("hello", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire when appendPaste is called with empty data" {
+    // Pasting zero bytes is observably a no-op; a hook fire here would
+    // surface previous == current and force every observer to filter it.
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    f.wm.root_pane.appendPaste("");
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire when appendPaste has no room in the draft" {
+    // The draft is already full; appendPaste cannot land any bytes, so
+    // it must not fire the hook. The truncation warn still logs.
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    // Fill the draft to MAX_DRAFT directly (avoids 4096 hook fires).
+    f.wm.root_pane.draft_len = MAX_DRAFT;
+    @memset(f.wm.root_pane.draft[0..MAX_DRAFT], 'a');
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    f.wm.root_pane.appendPaste("more");
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire when setDraft is called with current draft text" {
+    // Plugins (e.g. the Slice 4 popup helper) may defensively echo the
+    // current value back through set_draft. That must not fire the hook,
+    // because the draft did not actually change.
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    f.wm.root_pane.setDraft("hello");
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    f.wm.root_pane.setDraft("hello");
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // Sanity: a real change still fires.
+    f.wm.root_pane.setDraft("world");
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire on consumeDraft" {
+    // Submission drains the draft via consumeDraft; firing the hook here
+    // would expose plugins to a misleading "draft cleared" event right
+    // after the user pressed Enter. Locks the contract documented on
+    // `consumeDraft`.
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    // Sanity: a draft mutation still fires the hook.
+    f.wm.root_pane.appendToDraft('h');
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // The contract: consumeDraft must NOT fire pane_draft_change.
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = f.wm.root_pane.consumeDraft(&scratch);
+    try std.testing.expectEqualStrings("h", taken);
+    try std.testing.expectEqualStrings("", f.wm.root_pane.getDraft());
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange hook ref cleanup leaves no leaks on engine deinit" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\zag.hook("PaneDraftChange", function(evt) end)
+    );
+
+    // testing.allocator catches the leak if `Hook.pattern` or the
+    // dispatcher's pending_cancel_reason isn't freed on deinit.
+    f.wm.lua_engine = null;
+}
+
 test "zag.providers.list reflects the endpoint registry" {
     const allocator = std.testing.allocator;
 
@@ -4395,6 +5352,12 @@ test "openFloatPane allocates, registers, and is reachable via paneFromFloatHand
 
     const pane_ptr = wm.paneFromFloatHandle(handle).?;
     try std.testing.expectEqual(scratch_buf.ptr, pane_ptr.buffer.ptr);
+
+    // `paneFromHandle` must accept float handles too — it routes through
+    // `paneFromFloatHandle` so plugin callers can pass a float id where
+    // any pane id is expected (e.g. `zag.pane.set_draft`).
+    const via_pane_from_handle = try wm.paneFromHandle(handle);
+    try std.testing.expectEqual(pane_ptr, via_pane_from_handle);
 
     try wm.closeFloatById(handle);
     try std.testing.expectEqual(@as(usize, 0), wm.extra_floats.items.len);
@@ -4773,4 +5736,318 @@ test "zag.layout.float on_close callback fires and unrefs cleanly on close" {
     _ = try f.engine.lua.getGlobal("_closed");
     defer f.engine.lua.pop(1);
     try std.testing.expect(f.engine.lua.toBoolean(-1));
+}
+
+// -----------------------------------------------------------------------------
+// zag.popup.list (Slice 4) integration tests
+//
+// The helper module is pure Lua glue over Groups A+B+C; these tests exercise
+// it end-to-end against the real WindowManager + LuaEngine fixture, so the
+// cross-primitive seams (set_row_style, replace_draft_range, PaneDraftChange)
+// are exercised together rather than in isolation.
+
+test "zag.popup.list.open creates a float, populates the buffer, and selects row 1" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 0 }},
+        \\  items = function(query)
+        \\    return {{
+        \\      {{ word = "foo", abbr = "foo", kind = "fn" }},
+        \\      {{ word = "bar", abbr = "bar", kind = "fn" }},
+        \\      {{ word = "baz", abbr = "baz", kind = "fn" }},
+        \\    }}
+        \\  end,
+        \\}})
+        \\_G.float_count = #zag.layout.floats()
+        \\local state = popup._state(_G.handle)
+        \\_G.line_count = zag.buffer.line_count(state.buf)
+        \\_G.selection = state.selection_index
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("float_count");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("line_count");
+    try std.testing.expectEqual(@as(i64, 3), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("selection");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    // Tear the popup down explicitly so its scratch buffer is freed
+    // before the engine deinit walk runs.
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+}
+
+test "zag.popup.list down arrow advances selection and clamps at the end" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{
+        \\    {{ word = "alpha" }},
+        \\    {{ word = "beta" }},
+        \\  }} end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<Down>")
+        \\_G.after_first = popup._state(_G.handle).selection_index
+        \\popup.invoke_key(_G.handle, "<Down>")
+        \\_G.after_clamp = popup._state(_G.handle).selection_index
+        \\popup.invoke_key(_G.handle, "<Up>")
+        \\_G.after_up = popup._state(_G.handle).selection_index
+        \\popup.close(_G.handle)
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("after_first");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_clamp");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_up");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list re-narrows on PaneDraftChange and resets selection" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Items() filters by query prefix. After the popup is open, mutate
+    // the underlying draft via zag.pane.set_draft to fire
+    // PaneDraftChange and observe that the popup's items list contains
+    // only entries matching the new prefix.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\local source = {{
+        \\  {{ word = "foo" }},
+        \\  {{ word = "foobar" }},
+        \\  {{ word = "baz" }},
+        \\}}
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 0 }},
+        \\  items = function(query)
+        \\    local out = {{}}
+        \\    for _, item in ipairs(source) do
+        \\      if query == "" or string.sub(item.word, 1, #query) == query then
+        \\        table.insert(out, item)
+        \\      end
+        \\    end
+        \\    return out
+        \\  end,
+        \\}})
+        \\local state = popup._state(_G.handle)
+        \\_G.before = #state.current_items
+        \\state.trigger_to = 2
+        \\zag.pane.set_draft("{s}", "fo")
+        \\_G.after = #state.current_items
+        \\_G.selection_after = state.selection_index
+        \\popup.close(_G.handle)
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before");
+    try std.testing.expectEqual(@as(i64, 3), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("selection_after");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list commit replaces the trigger range with item.word" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Pre-fill the draft with "fo bar" and mount the popup over the
+    // first two bytes ("fo"); committing the first item ("foobar")
+    // must rewrite the draft to "foobar bar".
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\zag.pane.set_draft("{s}", "fo bar")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 2 }},
+        \\  items = function() return {{
+        \\    {{ word = "foobar" }},
+        \\    {{ word = "fizz" }},
+        \\  }} end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<CR>")
+        \\_G.float_count_after = #zag.layout.floats()
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    try std.testing.expectEqualStrings("foobar bar", f.wm.root_pane.getDraft());
+
+    _ = try f.engine.lua.getGlobal("float_count_after");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list cancel fires on_cancel, leaves draft unchanged, closes float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\zag.pane.set_draft("{s}", "untouched")
+        \\_G.cancel_count = 0
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  on_cancel = function() _G.cancel_count = _G.cancel_count + 1 end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<Esc>")
+        \\_G.float_count_after = #zag.layout.floats()
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("cancel_count");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("float_count_after");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    try std.testing.expectEqualStrings("untouched", f.wm.root_pane.getDraft());
+}
+
+test "zag.popup.list.close tears down hook, buffer, and float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
+    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
+    // fires with a usable pane handle.
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    f.wm.root_pane.handle = root_handle;
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\}})
+        \\_G.before = #zag.layout.floats()
+        \\popup.close(_G.handle)
+        \\_G.after = #zag.layout.floats()
+        \\local state = popup._state(_G.handle)
+        \\_G.closed_flag = state.closed
+        \\_G.hook_id_nil = state.draft_hook_id == nil
+        \\_G.buf_nil = state.buf == nil
+        \\popup.close(_G.handle) -- idempotent: must not raise
+        \\_G.after_second_close = #zag.layout.floats()
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("closed_flag");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    // After close, hook id and buffer handle are nilled. The Lua-side
+    // booleans confirm this without trying to fetch nil globals through
+    // zlua's getGlobal (which raises on nil).
+    _ = try f.engine.lua.getGlobal("hook_id_nil");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("buf_nil");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    // Second close was idempotent: float count stays at 0, no raise.
+    _ = try f.engine.lua.getGlobal("after_second_close");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
 }

@@ -380,6 +380,7 @@ fn drawBufferIntoRect(
         if (cur_row >= max_row) break;
         if (cur_row >= self.screen.height) break;
 
+        const start_row = cur_row;
         const consumed = drawStyledLineWrapped(
             self.screen,
             line.spans,
@@ -392,8 +393,43 @@ fn drawBufferIntoRect(
             leading_skip,
         );
         cur_row +|= consumed;
+        // Apply the buffer-driven row override last so spans win the
+        // foreground but the row's background paints uniformly across
+        // every physical row a wrapped logical line occupies. The
+        // override walks every interior column in the rect (including
+        // padding) so the bg fill reads as a single bar, not just the
+        // text region.
+        if (line.row_style) |slot| {
+            const style = Theme.resolveSlot(slot, self.theme);
+            if (style.bg) |override_bg| {
+                var paint_row: u16 = start_row;
+                while (paint_row < cur_row and paint_row < content_max_row) : (paint_row += 1) {
+                    self.paintRowBackground(paint_row, rect.x, content_max_col, override_bg);
+                }
+            }
+        }
         // leading_skip clips the top of the first rendered line only.
         leading_skip = 0;
+    }
+}
+
+/// Override `bg` on every cell in `[x_start, x_end)` of `row`.
+/// Foregrounds, codepoints, and styles are left untouched so span
+/// content remains visible. Used by the per-line row_style override
+/// path in `drawBufferIntoRect`.
+fn paintRowBackground(
+    self: *Compositor,
+    row: u16,
+    x_start: u16,
+    x_end: u16,
+    override_bg: Screen.Color,
+) void {
+    if (row >= self.screen.height) return;
+    const right = @min(x_end, self.screen.width);
+    var col = x_start;
+    while (col < right) : (col += 1) {
+        const cell = self.screen.getCell(row, col);
+        cell.bg = override_bg;
     }
 }
 
@@ -1127,6 +1163,42 @@ fn paintModeLabel(self: *Compositor, row: u16, mode: Keymap.Mode) u16 {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "row_style override paints background bar without overwriting span fg" {
+    const ScratchBuffer = @import("buffers/scratch.zig");
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 30, 8);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var sb = try ScratchBuffer.create(allocator, 1, "popup");
+    defer sb.destroy();
+    try sb.setLines(&.{ "alpha", "beta", "gamma" });
+    try sb.setRowStyle(1, .selection);
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    try layout.setRoot(sb.buf());
+    layout.recalculate(30, 8);
+
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
+
+    const pad_h = theme.spacing.padding_h;
+    const sel_bg = Theme.resolveSlot(.selection, &theme).bg.?;
+    // Row 0 (alpha) and row 2 (gamma) should keep the default bg.
+    try std.testing.expect(std.meta.eql(screen.getCellConst(1, 1 + pad_h).bg, Screen.Color.default));
+    try std.testing.expect(std.meta.eql(screen.getCellConst(3, 1 + pad_h).bg, Screen.Color.default));
+    // Row 1 (beta) should have the selection bg painted across the
+    // interior (we sample the text region and a column past the text).
+    try std.testing.expect(std.meta.eql(screen.getCellConst(2, 1 + pad_h).bg, sel_bg));
+    try std.testing.expect(std.meta.eql(screen.getCellConst(2, 1 + pad_h + 1).bg, sel_bg));
+    // Codepoint stays as the rendered glyph; the override only touches bg.
+    try std.testing.expectEqual(@as(u21, 'b'), screen.getCellConst(2, 1 + pad_h).codepoint);
 }
 
 test "composite with empty layout does not crash" {

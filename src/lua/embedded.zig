@@ -41,6 +41,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.prompt.default", .code = @embedFile("zag/prompt/default.lua") },
     .{ .name = "zag.transforms.rg_trim", .code = @embedFile("zag/transforms/rg_trim.lua") },
     .{ .name = "zag.transforms.bash_trim", .code = @embedFile("zag/transforms/bash_trim.lua") },
+    .{ .name = "zag.popup.list", .code = @embedFile("zag/popup/list.lua") },
 };
 
 /// Find an entry by its dotted module name. Returns null if not found.
@@ -53,7 +54,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 23), entries.len);
+    try std.testing.expectEqual(@as(usize, 24), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -150,6 +151,15 @@ test "find returns the entry for the default loop detector" {
     // 5-identical-call threshold.
     try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.loop.detect") != null);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "identical_streak >= 5") != null);
+}
+
+test "find returns the entry for the popup-list helper" {
+    const e = find("zag.popup.list").?;
+    try std.testing.expectEqualStrings("zag.popup.list", e.name);
+    // Helper exposes `M.open`, `M.close`, and a `format_columns` utility.
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "function M.format_columns") != null);
 }
 
 test "find returns the entry for the default compaction strategy" {
