@@ -133,6 +133,30 @@ local function contains(haystack, needle)
     return false
 end
 
+-- Cell-width measurement. Prefer the host-provided primitive
+-- (`zag.width.cells`), which walks grapheme clusters and respects East
+-- Asian Width / emoji rules. Tests run this module against a Lua VM
+-- without the host bindings, so fall back to `#str` (byte length) when
+-- the primitive is missing - good enough for ASCII content, which is
+-- the only case the pure-Lua test fixtures exercise.
+local function cells(str)
+    if zag and zag.width and zag.width.cells then
+        return zag.width.cells(str)
+    end
+    return #str
+end
+
+-- Right-pad `str` with spaces to `target` cells. `string.format("%-Ns", str)`
+-- pads to BYTES, which under-pads any string containing wide clusters
+-- (CJK / emoji). We measure cells, then append the diff in spaces.
+local function pad_cells(str, target)
+    local w = cells(str)
+    if w >= target then
+        return str
+    end
+    return str .. string.rep(" ", target - w)
+end
+
 -- Format a single item into a display string. Falls back to item.word
 -- when abbr/kind/menu are absent.
 local function default_format_item(item, widths)
@@ -140,25 +164,26 @@ local function default_format_item(item, widths)
     local kind = item.kind or ""
     local menu = item.menu or ""
     if widths then
-        return string.format(
-            "%-" .. widths.abbr .. "s  %-" .. widths.kind .. "s  %s",
-            abbr,
-            kind,
-            menu
-        )
+        return pad_cells(abbr, widths.abbr)
+            .. "  "
+            .. pad_cells(kind, widths.kind)
+            .. "  "
+            .. menu
     end
     if kind == "" and menu == "" then
         return abbr
     end
-    return string.format("%s  %s  %s", abbr, kind, menu)
+    return abbr .. "  " .. kind .. "  " .. menu
 end
 
--- Compute reasonable column widths from a list of items.
+-- Compute reasonable column widths from a list of items. Widths are in
+-- terminal cells, not bytes, so a CJK-heavy completion list aligns
+-- correctly when rendered.
 local function compute_widths(items)
     local w = { abbr = 1, kind = 1 }
     for _, item in ipairs(items) do
-        local a = #(item.abbr or item.word or "")
-        local k = #(item.kind or "")
+        local a = cells(item.abbr or item.word or "")
+        local k = cells(item.kind or "")
         if a > w.abbr then
             w.abbr = a
         end
