@@ -153,6 +153,65 @@ pub const Pane = struct {
         return dest[0..n];
     }
 
+    /// Replace the entire draft with `text`. Truncates silently to
+    /// `MAX_DRAFT` with a warn log (matches `appendPaste`'s policy: a
+    /// caller that pushes more than the cap loses the tail rather than
+    /// failing the whole operation).
+    pub fn setDraft(self: *Pane, text: []const u8) void {
+        const to_copy = @min(self.draft.len, text.len);
+        @memcpy(self.draft[0..to_copy], text[0..to_copy]);
+        self.draft_len = to_copy;
+        if (to_copy < text.len) {
+            log.warn("setDraft truncated: {d} bytes dropped (over MAX_DRAFT)", .{text.len - to_copy});
+        }
+    }
+
+    /// Replace bytes `[from_byte, to_byte)` in the draft with
+    /// `replacement`. `from_byte == to_byte` is valid and acts as a pure
+    /// insertion at `from_byte`. Strict errors on invalid range
+    /// (`from_byte > to_byte` or `to_byte > draft_len`) and on overflow
+    /// past `MAX_DRAFT` — autocomplete plugins know the trigger range
+    /// and want loud failure if anything is off.
+    pub fn replaceDraftRange(
+        self: *Pane,
+        from_byte: usize,
+        to_byte: usize,
+        replacement: []const u8,
+    ) error{ InvalidRange, Overflow }!void {
+        if (from_byte > to_byte) return error.InvalidRange;
+        if (to_byte > self.draft_len) return error.InvalidRange;
+
+        const removed = to_byte - from_byte;
+        const tail_len = self.draft_len - to_byte;
+        const new_len = self.draft_len - removed + replacement.len;
+        if (new_len > self.draft.len) return error.Overflow;
+
+        // Shift the trailing bytes to their new home before writing the
+        // replacement. When the replacement grows the draft (`replacement.len
+        // > removed`), the tail moves right and source/dest overlap with
+        // dest > src — a forward `@memcpy` would clobber unread source
+        // bytes, so we copy backward via `std.mem.copyBackwards`. When
+        // the replacement shrinks, the tail moves left (dest < src) and a
+        // forward `std.mem.copyForwards` is correct.
+        const tail_src_start = to_byte;
+        const tail_dst_start = from_byte + replacement.len;
+        if (tail_len > 0 and tail_dst_start != tail_src_start) {
+            const dst = self.draft[tail_dst_start .. tail_dst_start + tail_len];
+            const src = self.draft[tail_src_start .. tail_src_start + tail_len];
+            if (tail_dst_start > tail_src_start) {
+                std.mem.copyBackwards(u8, dst, src);
+            } else {
+                std.mem.copyForwards(u8, dst, src);
+            }
+        }
+
+        if (replacement.len > 0) {
+            @memcpy(self.draft[from_byte .. from_byte + replacement.len], replacement);
+        }
+
+        self.draft_len = new_len;
+    }
+
     /// Pane-level key dispatch for insert mode: try buffer-internal
     /// handling first (e.g. ConversationBuffer's Ctrl+R thinking-toggle),
     /// then draft editing on this pane. Used by EventOrchestrator's
@@ -2136,6 +2195,110 @@ test "Pane.handleKey delegates to buffer for buffer-internal chords (Ctrl+R)" {
     try std.testing.expectEqualStrings("", pane.getDraft());
 }
 
+test "Pane setDraft replaces the entire draft" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    for ("hello") |ch| pane.appendToDraft(ch);
+    pane.setDraft("world");
+    try std.testing.expectEqualStrings("world", pane.getDraft());
+
+    pane.setDraft("");
+    try std.testing.expectEqualStrings("", pane.getDraft());
+}
+
+test "Pane setDraft truncates input larger than MAX_DRAFT" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    var oversized: [MAX_DRAFT + 32]u8 = undefined;
+    @memset(&oversized, 'x');
+    pane.setDraft(&oversized);
+
+    try std.testing.expectEqual(MAX_DRAFT, pane.draft_len);
+    for (pane.getDraft()) |b| try std.testing.expectEqual(@as(u8, 'x'), b);
+}
+
+test "Pane replaceDraftRange replaces a word in the middle" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("foo bar baz");
+    try pane.replaceDraftRange(4, 7, "qux");
+    try std.testing.expectEqualStrings("foo qux baz", pane.getDraft());
+}
+
+test "Pane replaceDraftRange treats from == to as insertion" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("hello world");
+    try pane.replaceDraftRange(5, 5, "_INS_");
+    try std.testing.expectEqualStrings("hello_INS_ world", pane.getDraft());
+}
+
+test "Pane replaceDraftRange shifts trailing bytes right when replacement grows" {
+    // Critical case: replacement.len > removed and trailing content
+    // present. Naive forward memcpy would overwrite source bytes before
+    // they were copied; the implementation must walk the tail backward.
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abXYef");
+    try pane.replaceDraftRange(2, 4, "QQQQ");
+    try std.testing.expectEqualStrings("abQQQQef", pane.getDraft());
+}
+
+test "Pane replaceDraftRange shifts trailing bytes left when replacement shrinks" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abXXXXef");
+    try pane.replaceDraftRange(2, 6, "Q");
+    try std.testing.expectEqualStrings("abQef", pane.getDraft());
+}
+
+test "Pane replaceDraftRange rejects from > to" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abcdef");
+    try std.testing.expectError(error.InvalidRange, pane.replaceDraftRange(4, 2, "x"));
+    // Original draft is unchanged on error.
+    try std.testing.expectEqualStrings("abcdef", pane.getDraft());
+}
+
+test "Pane replaceDraftRange rejects to past draft_len" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    pane.setDraft("abc");
+    try std.testing.expectError(error.InvalidRange, pane.replaceDraftRange(0, 99, "x"));
+    try std.testing.expectEqualStrings("abc", pane.getDraft());
+}
+
+test "Pane replaceDraftRange rejects overflow past MAX_DRAFT" {
+    var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
+    defer view.deinit();
+    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+
+    // Fill the draft to MAX_DRAFT - 1, then try to insert 8 bytes —
+    // the resulting length would exceed MAX_DRAFT, so the op must
+    // raise without touching the draft.
+    var i: usize = 0;
+    while (i < MAX_DRAFT - 1) : (i += 1) pane.appendToDraft('a');
+    try std.testing.expectError(error.Overflow, pane.replaceDraftRange(0, 0, "12345678"));
+    try std.testing.expectEqual(MAX_DRAFT - 1, pane.draft_len);
+}
+
 test "extra pane viewport is attached to its buffer" {
     const allocator = std.testing.allocator;
 
@@ -4060,6 +4223,202 @@ test "zag.pane.current_model returns the resolved model string" {
     _ = try engine.lua.getGlobal("model2");
     defer engine.lua.pop(1);
     try std.testing.expectEqualStrings("provB/b2", try engine.lua.toString(-1));
+}
+
+test "zag.pane.set_draft writes through to the pane's draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "hello from lua")
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    try std.testing.expectEqualStrings("hello from lua", f.wm.root_pane.getDraft());
+}
+
+test "zag.pane.set_draft truncates input larger than MAX_DRAFT" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // Build a Lua string literal of `(MAX_DRAFT + 32)` 'x' characters via
+    // `string.rep` so the test does not need to bake the constant into a
+    // literal — keeps the assertion robust to a future MAX_DRAFT bump.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", string.rep("x", {d}))
+    , .{ pane_id, MAX_DRAFT + 32 }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    try std.testing.expectEqual(MAX_DRAFT, f.wm.root_pane.draft_len);
+}
+
+test "zag.pane.set_draft raises on invalid pane handle" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    // `n9999` cannot resolve to any registered leaf in this fixture; the
+    // call must surface a Lua error rather than silently swallowing it.
+    const result = engine.lua.doString(
+        \\zag.pane.set_draft("n9999", "x")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.pane.replace_draft_range replaces a slice of the draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // 0-indexed, half-open: replace `bar` (bytes 4..7) with `qux`.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "foo bar baz")
+        \\zag.pane.replace_draft_range("{s}", 4, 7, "qux")
+    , .{ pane_id, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    try std.testing.expectEqualStrings("foo qux baz", f.wm.root_pane.getDraft());
+}
+
+test "zag.pane.replace_draft_range raises with helpful message on invalid range" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "abc")
+        \\local ok, err = pcall(function()
+        \\  zag.pane.replace_draft_range("{s}", 0, 99, "x")
+        \\end)
+        \\_G.ok = ok
+        \\_G.err = err
+    , .{ pane_id, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("err");
+    defer engine.lua.pop(1);
+    const err_msg = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "invalid range") != null);
+    // Draft is preserved on the rejected mutation.
+    try std.testing.expectEqualStrings("abc", f.wm.root_pane.getDraft());
+}
+
+test "zag.pane.replace_draft_range raises with helpful message on overflow" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // Fill the draft to MAX_DRAFT - 1, then attempt an insertion of 8
+    // bytes — replacement plus existing tail exceed the cap, so the call
+    // must raise rather than silently corrupt.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", string.rep("a", {d}))
+        \\local ok, err = pcall(function()
+        \\  zag.pane.replace_draft_range("{s}", 0, 0, "12345678")
+        \\end)
+        \\_G.ok = ok
+        \\_G.err = err
+    , .{ pane_id, MAX_DRAFT - 1, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("err");
+    defer engine.lua.pop(1);
+    const err_msg = try engine.lua.toString(-1);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "overflow") != null);
+    try std.testing.expectEqual(MAX_DRAFT - 1, f.wm.root_pane.draft_len);
 }
 
 test "zag.providers.list reflects the endpoint registry" {
