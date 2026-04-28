@@ -167,11 +167,12 @@ pub const Pane = struct {
     }
 
     /// Replace bytes `[from_byte, to_byte)` in the draft with
-    /// `replacement`. `from_byte == to_byte` is valid and acts as a pure
-    /// insertion at `from_byte`. Strict errors on invalid range
-    /// (`from_byte > to_byte` or `to_byte > draft_len`) and on overflow
-    /// past `MAX_DRAFT` — autocomplete plugins know the trigger range
-    /// and want loud failure if anything is off.
+    /// `replacement`. Offsets are 0-indexed half-open `[from_byte, to_byte)`,
+    /// matching `getDraft()` slicing. `from_byte == to_byte` is valid and
+    /// acts as a pure insertion at `from_byte`. Strict errors on invalid
+    /// range (`from_byte > to_byte` or `to_byte > draft_len`) and on
+    /// overflow past `MAX_DRAFT` — autocomplete plugins know the trigger
+    /// range and want loud failure if anything is off.
     pub fn replaceDraftRange(
         self: *Pane,
         from_byte: usize,
@@ -1672,9 +1673,15 @@ pub fn swapProviderForPane(
 }
 
 /// Resolve a node handle to the `*Pane` whose buffer the leaf carries.
-/// Rejects splits and unregistered panes loudly; handles that point at
-/// a scratch-backed pane still succeed.
+/// Float handles route to `paneFromFloatHandle` so plugin callers can
+/// pass float ids interchangeably with tile ids — the float bit
+/// otherwise trips `node_registry.resolve` with `StaleNode`. Rejects
+/// splits and unregistered panes loudly; handles that point at a
+/// scratch-backed pane still succeed.
 pub fn paneFromHandle(self: *WindowManager, handle: NodeRegistry.Handle) !*Pane {
+    if (Layout.isFloatHandle(handle)) {
+        return self.paneFromFloatHandle(handle) orelse error.PaneNotFound;
+    }
     const node = try self.node_registry.resolve(handle);
     if (node.* != .leaf) return error.NotALeaf;
     const leaf_buffer = node.leaf.buffer;
@@ -4252,6 +4259,36 @@ test "zag.pane.set_draft writes through to the pane's draft" {
     try std.testing.expectEqualStrings("hello from lua", f.wm.root_pane.getDraft());
 }
 
+test "zag.pane.set_draft writes through to a float pane's draft" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Open a focused float (`enter = true` so a real `Pane` is registered
+    // in `extra_floats`), then set its draft via the Lua surface using
+    // the float handle string — the same `zag.pane.set_draft` call that
+    // works on tile handles must work on float handles.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "picker" }
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 2, col = 2,
+        \\  width = 20, height = 6,
+        \\  enter = true,
+        \\})
+        \\zag.pane.set_draft(_h, "hello from float")
+    );
+
+    _ = try f.engine.lua.getGlobal("_h");
+    defer f.engine.lua.pop(1);
+    const float_id = try f.engine.lua.toString(-1);
+    const handle = try NodeRegistry.parseId(float_id);
+
+    const float_pane = f.wm.paneFromFloatHandle(handle).?;
+    try std.testing.expectEqualStrings("hello from float", float_pane.getDraft());
+}
+
 test "zag.pane.set_draft truncates input larger than MAX_DRAFT" {
     const allocator = std.testing.allocator;
     var f: PickerFixture = undefined;
@@ -4754,6 +4791,12 @@ test "openFloatPane allocates, registers, and is reachable via paneFromFloatHand
 
     const pane_ptr = wm.paneFromFloatHandle(handle).?;
     try std.testing.expectEqual(scratch_buf.ptr, pane_ptr.buffer.ptr);
+
+    // `paneFromHandle` must accept float handles too — it routes through
+    // `paneFromFloatHandle` so plugin callers can pass a float id where
+    // any pane id is expected (e.g. `zag.pane.set_draft`).
+    const via_pane_from_handle = try wm.paneFromHandle(handle);
+    try std.testing.expectEqual(pane_ptr, via_pane_from_handle);
 
     try wm.closeFloatById(handle);
     try std.testing.expectEqual(@as(usize, 0), wm.extra_floats.items.len);
