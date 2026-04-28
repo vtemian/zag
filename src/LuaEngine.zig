@@ -14,6 +14,7 @@ const Buffer = @import("Buffer.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const ScratchBuffer = @import("buffers/scratch.zig");
 const GraphicsBuffer = @import("buffers/graphics.zig");
+const Theme = @import("Theme.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
@@ -730,6 +731,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_png");
         lua.pushFunction(zlua.wrap(zagBufferSetFitFn));
         lua.setField(-2, "set_fit");
+        lua.pushFunction(zlua.wrap(zagBufferSetRowStyleFn));
+        lua.setField(-2, "set_row_style");
+        lua.pushFunction(zlua.wrap(zagBufferClearRowStyleFn));
+        lua.setField(-2, "clear_row_style");
         lua.setField(-2, "buffer"); // zag.buffer = buffer_table; [zag_table]
 
         // Private log entrypoints consumed by the Lua-side wrappers in
@@ -3879,6 +3884,70 @@ pub const LuaEngine = struct {
         switch (entry) {
             .graphics => |gb| gb.setFit(fit),
             .scratch => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.set_row_style(handle, row, slot)`: tag a 1-indexed
+    /// row with a theme highlight slot string. The row override paints
+    /// across the row's background at render time. Raises on
+    /// out-of-range row, unknown slot, or graphics handles.
+    fn zagBufferSetRowStyleFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.set_row_style");
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.buffer.set_row_style: row must be an integer", .{});
+        }
+        const row_lua = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.buffer.set_row_style: row must be an integer", .{});
+        };
+        if (row_lua < 1) {
+            lua.raiseErrorStr("zag.buffer.set_row_style: row must be >= 1", .{});
+        }
+        if (lua.typeOf(3) != .string) {
+            lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
+        }
+        const slot_str = lua.toString(3) catch {
+            lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
+        };
+        const slot = Theme.parseHighlightSlot(slot_str) orelse {
+            lua.raiseErrorStr("zag.buffer.set_row_style: unknown slot (valid: \"selection\", \"current_line\", \"err\", \"warning\")", .{});
+        };
+        const row_zero: u32 = @intCast(row_lua - 1);
+        switch (entry) {
+            .scratch => |sb| {
+                sb.setRowStyle(row_zero, slot) catch |err| switch (err) {
+                    error.RowOutOfRange => lua.raiseErrorStr("zag.buffer.set_row_style: row %d is out of range", .{@as(i32, @intCast(row_lua))}),
+                    else => {
+                        var buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.set_row_style: {s}", .{@errorName(err)}) catch "zag.buffer.set_row_style failed";
+                        lua.raiseErrorStr("%s", .{msg.ptr});
+                    },
+                };
+            },
+            .graphics => lua.raiseErrorStr("zag.buffer.set_row_style: not supported on graphics buffers (no row addressing)", .{}),
+        }
+        return 0;
+    }
+
+    /// `zag.buffer.clear_row_style(handle, row)`: drop a row's
+    /// highlight override. No-op when the row has no override.
+    /// Graphics handles raise; scratch handles never raise on missing
+    /// rows (symmetric with set_row_style's simple put).
+    fn zagBufferClearRowStyleFn(lua: *Lua) i32 {
+        const entry = requireBufferEntry(lua, 1, "zag.buffer.clear_row_style");
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.buffer.clear_row_style: row must be an integer", .{});
+        }
+        const row_lua = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.buffer.clear_row_style: row must be an integer", .{});
+        };
+        if (row_lua < 1) {
+            lua.raiseErrorStr("zag.buffer.clear_row_style: row must be >= 1", .{});
+        }
+        const row_zero: u32 = @intCast(row_lua - 1);
+        switch (entry) {
+            .scratch => |sb| sb.clearRowStyle(row_zero),
+            .graphics => lua.raiseErrorStr("zag.buffer.clear_row_style: not supported on graphics buffers (no row addressing)", .{}),
         }
         return 0;
     }
@@ -11650,6 +11719,117 @@ test "zag.buffer.set_fit rejects a scratch handle" {
         \\zag.buffer.set_fit(b, "contain")
     );
     try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_row_style happy path stamps row_style on rendered line" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\_G.handle = zag.buffer.create { kind = "scratch", name = "popup" }
+        \\zag.buffer.set_lines(_G.handle, { "alpha", "beta", "gamma" })
+        \\zag.buffer.set_row_style(_G.handle, 2, "selection")
+    );
+    _ = try engine.lua.getGlobal("handle");
+    const handle_str = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_str);
+    engine.lua.pop(1);
+    const entry = try buffer_registry.resolve(handle);
+    const sb = entry.scratch;
+
+    const theme = Theme.defaultTheme();
+    var lines = try sb.buf().getVisibleLines(alloc, alloc, &theme, 0, 10);
+    defer Theme.freeStyledLines(&lines, alloc);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[1].row_style);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), lines.items[0].row_style);
+}
+
+test "zag.buffer.set_row_style rejects out-of-range row" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_lines(b, { "a", "b" })
+        \\zag.buffer.set_row_style(b, 99, "selection")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_row_style rejects unknown slot" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_lines(b, { "a" })
+        \\zag.buffer.set_row_style(b, 1, "rainbow")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.set_row_style rejects graphics buffer" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    const result = engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "graphics" }
+        \\zag.buffer.set_row_style(b, 1, "selection")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.clear_row_style is a no-op for unset rows" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "scratch" }
+        \\zag.buffer.set_lines(b, { "a", "b", "c" })
+        \\zag.buffer.set_row_style(b, 2, "selection")
+        \\zag.buffer.clear_row_style(b, 2)
+        \\zag.buffer.clear_row_style(b, 3) -- never set; must not raise
+        \\_G.ok = true
+    );
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(engine.lua.toBoolean(-1));
     engine.lua.pop(1);
 }
 
