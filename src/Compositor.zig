@@ -19,6 +19,7 @@ const EventOrchestrator = @import("EventOrchestrator.zig");
 const Theme = @import("Theme.zig");
 const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
+const width = @import("width.zig");
 
 const Compositor = @This();
 
@@ -403,19 +404,15 @@ const ScrollPlan = struct {
     visible_rows: u16,
 };
 
-/// Join all spans of a styled line into a fixed scratch buffer and return the
-/// resulting slice. Lines longer than the buffer (4 KiB) are clamped; that's
-/// pathological for scroll measurement and clamping is fine.
-fn joinLineForMeasure(line: Theme.StyledLine, scratch: []u8) []const u8 {
-    var written: usize = 0;
-    for (line.spans) |span| {
-        if (written >= scratch.len) break;
-        const remaining = scratch.len - written;
-        const take = @min(remaining, span.text.len);
-        @memcpy(scratch[written .. written + take], span.text[0..take]);
-        written += take;
-    }
-    return scratch[0..written];
+/// Project a styled line's spans into a `[]const []const u8` view backed by
+/// the supplied allocator. No bytes are copied; only slice headers. Lets
+/// `width.wrappedRowCountMulti` measure the line span-by-span without joining,
+/// which avoids truncating long lines (markdown blocks, bash output, error
+/// trace pastes) at any fixed scratch size.
+fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, line.spans.len);
+    for (line.spans, 0..) |span, idx| out[idx] = span.text;
+    return out;
 }
 
 /// Project the buffer's logical lines onto pane-width physical rows and pick
@@ -453,10 +450,9 @@ fn planScroll(
     const all = try buf.getVisibleLines(frame_alloc, cache_alloc, theme, 0, total_logical);
 
     var total: u32 = 0;
-    var scratch: [4096]u8 = undefined;
     for (all.items) |line| {
-        const joined = joinLineForMeasure(line, &scratch);
-        total += @import("width.zig").wrappedRowCount(joined, content_width);
+        const parts = try lineSpansAsBytes(line, frame_alloc);
+        total += width.wrappedRowCountMulti(parts, content_width);
     }
     const total_rows = total;
     // Scrolled the entire content off the top: nothing to draw. Defensive
@@ -489,8 +485,8 @@ fn planScroll(
     var leading: u16 = 0;
     var found = false;
     for (all.items, 0..) |line, idx| {
-        const joined = joinLineForMeasure(line, &scratch);
-        const rows = @import("width.zig").wrappedRowCount(joined, content_width);
+        const parts = try lineSpansAsBytes(line, frame_alloc);
+        const rows = width.wrappedRowCountMulti(parts, content_width);
         if (cum + rows > visible_start_rows) {
             skip_idx = idx;
             leading = @intCast(visible_start_rows - cum);
@@ -1796,6 +1792,11 @@ test "planScroll: short content fits, no scroll" {
 }
 
 test "planScroll: long line wraps and scroll math is in physical rows" {
+    // Depends on NodeRenderer's "> " prefix for user_message: 60 content chars
+    // plus the 2-char prefix = 62 cells, which at width 20 occupy 4 physical
+    // rows (20 + 20 + 20 + 2). A renderer change to that prefix would break
+    // this test deliberately so the assertion has to be revisited alongside
+    // the prefix change.
     const allocator = std.testing.allocator;
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
@@ -1807,8 +1808,6 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
     defer arena.deinit();
 
     const theme = Theme.defaultTheme();
-    // user_message renders with "> " prefix, so 62 cols total -> 4 rows at width 20
-    // (rows of 20, 20, 20, 2). Confirm planScroll sees 4 rows.
     const plan = try planScroll(
         cb.buf(),
         &theme,
@@ -1835,6 +1834,13 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     defer arena.deinit();
 
     const theme = Theme.defaultTheme();
+    // 10 user_messages with content "abcdefghi" (9 chars) plus the "> "
+    // prefix = 11 cells per logical line. Width 5 wraps each line into
+    // 3 physical rows (5 + 5 + 1), so total_rows = 30. visible_rows = 6,
+    // scroll = 0 -> visible_start_rows = 24. Walking lines of 3 rows,
+    // cum reaches 24 exactly after lines 0-7 (8 lines x 3 rows). Line 8
+    // is the first where cum + rows > visible_start_rows, so skip = 8 and
+    // leading_skip_rows = 24 - 24 = 0.
     const plan = try planScroll(
         cb.buf(),
         &theme,
@@ -1844,9 +1850,10 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
         6,
         0,
     );
-    try std.testing.expect(plan.total_rows >= 20);
+    try std.testing.expectEqual(@as(u32, 30), plan.total_rows);
     try std.testing.expectEqual(@as(u16, 6), plan.visible_rows);
-    try std.testing.expect(plan.skip >= 7);
+    try std.testing.expectEqual(@as(usize, 8), plan.skip);
+    try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
 }
 
 test "planScroll: scroll past total clamps to zero rows" {
