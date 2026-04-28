@@ -2133,64 +2133,70 @@ pub fn drainPane(self: *WindowManager, pane: *Pane) void {
 /// If `pane` has a session without a name and enough conversation to summarize,
 /// ask the provider for a 3-5 word title and rename the session.
 /// Best-effort: any failure is logged and swallowed.
+/// Auto-rename a freshly-created session at the end of its first turn.
+/// Pulls the first user-message text out of the conversation history and
+/// derives a name from it deterministically; no LLM round-trip, no main
+/// thread blockage. Skipped when the session already has a name or when
+/// no user message has landed yet.
 fn autoNameSession(self: *WindowManager, pane: Pane) void {
+    _ = self;
     const session = pane.session orelse return;
     const sh = session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
     const inputs = session.sessionSummaryInputs() orelse return;
 
-    const summary = self.generateSessionName(inputs) catch |err| {
-        log.debug("auto-name failed: {}", .{err});
-        return;
-    };
-    defer self.allocator.free(summary);
+    var name_buf: [128]u8 = undefined;
+    const name = deriveSessionName(&name_buf, inputs.user_text);
+    if (name.len == 0) return;
 
-    sh.rename(summary) catch |err| {
+    sh.rename(name) catch |err| {
         log.warn("session rename failed: {}", .{err});
     };
 }
 
-/// Send a minimal LLM request to summarize the first exchange in 3-5 words.
-fn generateSessionName(
-    self: *WindowManager,
-    inputs: ConversationHistory.SessionSummaryInputs,
-) ![]const u8 {
-    const allocator = self.allocator;
+/// Build a session name from the user's first message: take up to five
+/// words separated by single space, stop at sentence-ending punctuation
+/// or newline, collapse runs of whitespace, trim leading/trailing
+/// whitespace, and truncate to fit `buf`. Pure function with no IO so
+/// `autoNameSession` runs in microseconds on the main thread.
+///
+/// Replaces a synchronous LLM round-trip that previously blocked the
+/// orchestrator tick for 5-30 seconds on the first turn of every new
+/// session, freezing pane and mode switches behind it.
+fn deriveSessionName(buf: []u8, user_text: []const u8) []const u8 {
+    const max_words: usize = 5;
 
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = inputs.user_text } };
+    const State = enum { leading, in_word, between_words };
+    var state: State = .leading;
+    var written: usize = 0;
+    var word_count: usize = 0;
 
-    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(assistant_content);
-    assistant_content[0] = .{ .text = .{ .text = inputs.assistant_text } };
+    for (user_text) |b| {
+        if (b == '\n' or b == '.' or b == '!' or b == '?') break;
 
-    var summary_msgs = [_]types.Message{
-        .{ .role = .user, .content = user_content },
-        .{ .role = .assistant, .content = assistant_content },
-    };
-
-    const req = llm.Request{
-        .system_stable = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        .messages = &summary_msgs,
-        .tool_definitions = &.{},
-        .allocator = allocator,
-    };
-    const response = try self.provider.provider.call(&req);
-    defer response.deinit(allocator);
-
-    allocator.free(user_content);
-    allocator.free(assistant_content);
-
-    for (response.content) |block| {
-        switch (block) {
-            .text => |t| return try allocator.dupe(u8, t.text),
-            else => {},
+        const is_space = b == ' ' or b == '\t' or b == '\r';
+        if (is_space) {
+            if (state == .in_word) {
+                word_count += 1;
+                if (word_count >= max_words) break;
+                if (written < buf.len) {
+                    buf[written] = ' ';
+                    written += 1;
+                }
+                state = .between_words;
+            }
+            continue;
         }
+
+        if (state != .in_word) state = .in_word;
+        if (written >= buf.len) break;
+        buf[written] = b;
+        written += 1;
     }
 
-    return error.NoResponseText;
+    while (written > 0 and buf[written - 1] == ' ') written -= 1;
+    return buf[0..written];
 }
 
 // ---------------------------------------------------------------------------
@@ -2199,6 +2205,62 @@ fn generateSessionName(
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "deriveSessionName takes up to 5 words from user text" {
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "fix the streaming freeze in compositor please");
+    try std.testing.expectEqualStrings("fix the streaming freeze in", out);
+}
+
+test "deriveSessionName trims leading and trailing whitespace" {
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "   hello   world   ");
+    try std.testing.expectEqualStrings("hello world", out);
+}
+
+test "deriveSessionName stops at sentence-ending punctuation" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("what is", deriveSessionName(&buf, "what is. this thing"));
+    try std.testing.expectEqualStrings("hold on", deriveSessionName(&buf, "hold on! a moment"));
+    try std.testing.expectEqualStrings("really", deriveSessionName(&buf, "really? maybe so"));
+}
+
+test "deriveSessionName stops at the first newline" {
+    // A multi-line first message would otherwise produce a name that
+    // re-flows oddly in the session list. Cut at the first newline so
+    // long pasted prompts contribute only their first line.
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "summary line\nsecond line continues");
+    try std.testing.expectEqualStrings("summary line", out);
+}
+
+test "deriveSessionName collapses runs of whitespace into single spaces" {
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "hi\t\tthere    friend");
+    try std.testing.expectEqualStrings("hi there friend", out);
+}
+
+test "deriveSessionName returns empty when input has no usable text" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("", deriveSessionName(&buf, ""));
+    try std.testing.expectEqualStrings("", deriveSessionName(&buf, "   \n\t  "));
+    try std.testing.expectEqualStrings("", deriveSessionName(&buf, ".!?"));
+}
+
+test "deriveSessionName preserves a single short word" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("hello", deriveSessionName(&buf, "hello"));
+}
+
+test "deriveSessionName truncates to fit caller buffer" {
+    // Real callers pass Meta.name (128 bytes); make sure a 5-word name
+    // longer than the buffer comes back truncated rather than panicking
+    // or returning an out-of-bounds slice.
+    var buf: [10]u8 = undefined;
+    const out = deriveSessionName(&buf, "supercalifragilistic word two three four");
+    try std.testing.expect(out.len <= buf.len);
+    try std.testing.expectEqualStrings("supercalif", out);
 }
 
 /// Test helper: drop-every-event Sink for tests that construct an
