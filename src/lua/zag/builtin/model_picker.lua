@@ -1,12 +1,12 @@
--- Builtin /model picker rewritten on top of `zag.popup.list`. Slice B
--- of the popup-list followups: the picker validates the helper as a
--- real production consumer.
+-- Builtin /model picker built on top of `zag.popup.list`.
 --
 -- Behaviour:
---   * `/model` opens a centered list popup anchored at the cursor of
---     the focused pane (popup.list always anchors at the cursor; for a
---     slash-command-driven picker that means just-below-the-typed-/model
---     in the input area).
+--   * `/model` opens a centered-modal list popup anchored to the
+--     editor (NOT to the cursor). Geometry mirrors the original
+--     floating-panes picker: editor-relative, row=2/col=4 with
+--     min_width=40 / max_width=70 / min_height=6 / max_height=18 so
+--     the float shrinks on small terminals and never overflows on a
+--     default 80x24.
 --   * The popup renders one row per registered provider/model pair; the
 --     current model is marked with `kind = "*"` and `menu = "(current)"`.
 --   * Up/Down move the selection. Enter swaps the focused pane's model
@@ -82,8 +82,18 @@ local function open()
             zag.pane.set_model(focused, item.word)
         end,
         on_cancel = function() end,
+        -- Centered-modal placement: editor-relative, size-to-content
+        -- inside min/max bounds so the picker shrinks on small
+        -- terminals and never overflows the default 80x24 chrome.
+        relative = "editor",
+        row = 2,
+        col = 4,
+        min_width = 40,
         max_width = 70,
+        min_height = 6,
         max_height = 18,
+        border = "rounded",
+        title = "Models",
     })
 
     -- Route Up/Down/<CR>/<Esc> into the popup. Buffer-scoping these to
@@ -94,21 +104,19 @@ local function open()
     --
     -- Caveat: `zag.keymap` has no remove API, so these bindings linger
     -- after the popup closes. The route() closures detect a closed
-    -- popup via `popup._state(handle).closed` and become no-ops; the
-    -- next `/model` invocation re-registers them with a fresh handle.
+    -- popup via `popup.is_closed(handle)` and become no-ops; the next
+    -- `/model` invocation re-registers them with a fresh handle.
     -- Filed as a follow-up: a `zag.keymap_remove` (or buffer-scoping
     -- against the focused tile's underlying buffer id) would let the
     -- picker self-clean.
     local function route(key)
         return function()
-            local state = popup._state(handle)
-            if not state or state.closed then
+            if popup.is_closed(handle) then
                 restore_mode()
                 return
             end
             popup.invoke_key(handle, key)
-            local after = popup._state(handle)
-            if after and after.closed then
+            if popup.is_closed(handle) then
                 restore_mode()
             end
         end
