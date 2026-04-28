@@ -308,7 +308,12 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .user_message => _ = try self.appendNode(null, .user_message, entry.content),
             .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
             .tool_call => {
-                last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+                const node = try self.appendNode(null, .tool_call, entry.tool_name);
+                // Match the live BufferSink path: tool_calls reload collapsed
+                // so prior turns read as compact `[tool] foo` headers, with
+                // Ctrl-R as the opt-in to inspect the body.
+                node.collapsed = true;
+                last_tool_call = node;
             },
             .tool_result => {
                 _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
@@ -328,7 +333,9 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             // delegation in the JSONL stream.
             .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
             .task_tool_use => {
-                last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+                const node = try self.appendNode(null, .tool_call, entry.tool_name);
+                node.collapsed = true;
+                last_tool_call = node;
             },
             .task_tool_result => {
                 _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
@@ -990,6 +997,25 @@ test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes
     try std.testing.expect(cb.tree.root_children.items[1].collapsed);
     try std.testing.expectEqualStrings("let me think", cb.tree.root_children.items[1].content.items);
     try std.testing.expectEqual(NodeType.thinking_redacted, cb.tree.root_children.items[2].node_type);
+    try std.testing.expect(cb.tree.root_children.items[2].collapsed);
+}
+
+test "loadFromEntries reloads tool_call nodes collapsed" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-reload");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "list", .timestamp = 0 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .content = "", .timestamp = 1 },
+        .{ .entry_type = .tool_result, .content = "row\nrow\nrow", .timestamp = 2 },
+        .{ .entry_type = .task_tool_use, .tool_name = "read", .content = "", .timestamp = 3 },
+    };
+    try cb.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(NodeType.tool_call, cb.tree.root_children.items[1].node_type);
+    try std.testing.expect(cb.tree.root_children.items[1].collapsed);
+    try std.testing.expectEqual(NodeType.tool_call, cb.tree.root_children.items[2].node_type);
     try std.testing.expect(cb.tree.root_children.items[2].collapsed);
 }
 
