@@ -48,13 +48,29 @@
 --                              -- Defaults to "".
 --       keys,                  -- optional override of the default
 --                              -- key bindings (see DEFAULT_KEYS).
---       max_height,            -- popup max rows (default 10).
+--
+--       -- Placement opts (all optional; defaults reproduce the
+--       -- cursor-anchored autocomplete UX). Forwarded straight to
+--       -- `zag.layout.float`.
+--       relative,              -- "cursor" | "editor" | "win"
+--                              -- (default "cursor").
+--       row,                   -- integer offset (default 1).
+--       col,                   -- integer offset (default 0).
+--       corner,                -- "NW" | "NE" | "SW" | "SE"
+--                              -- (default "NW").
+--       min_width,             -- popup min columns (default 10).
 --       max_width,             -- popup max columns (default 50).
+--       min_height,            -- popup min rows (default 1).
+--       max_height,            -- popup max rows (default 10).
 --       border,                -- "rounded" | "square" | "none"
 --                              -- (default "rounded").
+--       title,                 -- optional border title string.
 --   })
 --
 --   popup.close(handle)
+--   popup.is_closed(handle)
+--   popup.invoke_key(handle, key)
+--   popup.format_columns(items, widths?)
 --
 -- Default key bindings mirror Vim's popupmenu-keys:
 --
@@ -391,18 +407,22 @@ function M.open(opts)
     render(state)
 
     local float_opts = {
-        relative = "cursor",
-        row = 1,
-        col = 0,
-        min_width = 10,
+        relative = opts.relative or "cursor",
+        row = opts.row or 1,
+        col = opts.col or 0,
+        corner = opts.corner or "NW",
+        min_width = opts.min_width or 10,
         max_width = opts.max_width or 50,
-        min_height = 1,
+        min_height = opts.min_height or 1,
         max_height = opts.max_height or 10,
         border = opts.border or "rounded",
         focusable = false,
         enter = false,
         on_key = build_on_key(state),
     }
+    if opts.title then
+        float_opts.title = opts.title
+    end
     state.float_handle = zag.layout.float(buf, float_opts)
 
     state.draft_hook_id = zag.hook(
@@ -452,6 +472,15 @@ function M._state(handle)
         return nil
     end
     return handle._state
+end
+
+-- Public: returns true if the popup has been torn down (via commit,
+-- cancel, or popup.close), false otherwise. Stable surface for plugins
+-- that synthesize keys via popup.invoke_key and need to detect when
+-- the popup self-closed (e.g. <CR> commit, <Esc> cancel).
+function M.is_closed(handle)
+    local state = M._state(handle)
+    return state == nil or state.closed == true
 end
 
 return M

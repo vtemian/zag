@@ -5323,7 +5323,7 @@ const ModelPickerPluginFixture = struct {
     }
 };
 
-test "/model plugin opens a popup-list float anchored to the cursor" {
+test "/model plugin opens a centered-modal popup-list float" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -6184,5 +6184,134 @@ test "zag.popup.list.close tears down hook, buffer, and float" {
     // Second close was idempotent: float count stays at 0, no raise.
     _ = try f.engine.lua.getGlobal("after_second_close");
     try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list.open forwards placement opts to zag.layout.float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Open the popup with editor-relative placement and explicit
+    // row/col/min/max bounds. The helper must thread these straight to
+    // `zag.layout.float`; the resulting FloatNode's config records the
+    // anchor and offsets so we can assert them off `Layout.floats`.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  relative = "editor",
+        \\  row = 5,
+        \\  col = 10,
+        \\  min_width = 30,
+        \\  max_width = 60,
+        \\  min_height = 4,
+        \\  max_height = 12,
+        \\  border = "rounded",
+        \\  title = "Picker",
+        \\}})
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
+    const node = f.layout.floats.items[0];
+    try std.testing.expectEqual(Layout.FloatAnchor.editor, node.config.relative);
+    try std.testing.expectEqual(@as(i32, 5), node.config.row_offset);
+    try std.testing.expectEqual(@as(i32, 10), node.config.col_offset);
+    try std.testing.expectEqual(@as(?u16, 30), node.config.min_width);
+    try std.testing.expectEqual(@as(?u16, 60), node.config.max_width);
+    try std.testing.expectEqual(@as(?u16, 4), node.config.min_height);
+    try std.testing.expectEqual(@as(?u16, 12), node.config.max_height);
+    try std.testing.expect(node.config.title != null);
+    try std.testing.expectEqualStrings("Picker", node.config.title.?);
+
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+}
+
+test "zag.popup.list.open defaults to cursor anchor when placement opts are omitted" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // No placement opts: the helper must preserve the original
+    // cursor-anchored autocomplete UX (relative=cursor, row=1, col=0).
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\}})
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
+    const node = f.layout.floats.items[0];
+    try std.testing.expectEqual(Layout.FloatAnchor.cursor, node.config.relative);
+    try std.testing.expectEqual(@as(i32, 1), node.config.row_offset);
+    try std.testing.expectEqual(@as(i32, 0), node.config.col_offset);
+
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+}
+
+test "zag.popup.list.is_closed reports lifecycle accurately" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Lifecycle: false on open, true after close, true after a second
+    // close (idempotent). Also assert is_closed(nil) returns true so
+    // route() callers can short-circuit cleanly on a stale handle.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\}})
+        \\_G.before_close = popup.is_closed(_G.handle)
+        \\popup.close(_G.handle)
+        \\_G.after_close = popup.is_closed(_G.handle)
+        \\popup.close(_G.handle)
+        \\_G.after_second_close = popup.is_closed(_G.handle)
+        \\_G.nil_is_closed = popup.is_closed(nil)
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before_close");
+    try std.testing.expect(!f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_close");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_second_close");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("nil_is_closed");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
     f.engine.lua.pop(1);
 }
