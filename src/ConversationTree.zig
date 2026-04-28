@@ -294,15 +294,19 @@ pub fn loadFromEntriesFlat(self: *ConversationTree, entries: []const Session.Ent
     }
 }
 
-/// Toggle `collapsed` on every `.thinking` and `.thinking_redacted` node
-/// in the tree. Bumps each node's `content_version` so the NodeLineCache
-/// invalidates its entries, and pushes each id onto `dirty_nodes` for the
-/// compositor. Returns the number of nodes affected so callers can skip a
-/// redraw when the tree has no thinking blocks.
-pub fn toggleAllThinkingCollapsed(self: *ConversationTree) usize {
+/// Toggle `collapsed` on every foldable node (`.thinking`,
+/// `.thinking_redacted`, `.tool_call`) in the tree. Bumps each node's
+/// `content_version` so the NodeLineCache invalidates its entries, and
+/// pushes each id onto `dirty_nodes` for the compositor. Returns the
+/// number of nodes affected so callers can skip a redraw when nothing
+/// foldable is present.
+pub fn toggleAllFoldableCollapsed(self: *ConversationTree) usize {
     var touched: usize = 0;
     for (self.root_children.items) |node| {
-        if (node.node_type != .thinking and node.node_type != .thinking_redacted) continue;
+        switch (node.node_type) {
+            .thinking, .thinking_redacted, .tool_call => {},
+            else => continue,
+        }
         node.collapsed = !node.collapsed;
         node.markDirty();
         self.dirty_nodes.push(node.id);
@@ -421,7 +425,7 @@ test "loadFromEntriesFlat surfaces thinking entries as collapsed thinking nodes"
     try std.testing.expect(tree.root_children.items[1].collapsed);
 }
 
-test "toggleAllThinkingCollapsed flips state and bumps cache version" {
+test "toggleAllFoldableCollapsed flips state and bumps cache version" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
@@ -435,24 +439,24 @@ test "toggleAllThinkingCollapsed flips state and bumps cache version" {
     const ver_before_other = other.content_version;
     const gen_before = tree.currentGeneration();
 
-    const touched = tree.toggleAllThinkingCollapsed();
+    const touched = tree.toggleAllFoldableCollapsed();
     try std.testing.expectEqual(@as(usize, 2), touched);
     try std.testing.expect(!t1.collapsed);
     try std.testing.expect(t2.collapsed);
     try std.testing.expectEqual(ver_before_t1 +% 1, t1.content_version);
-    // Non-thinking node untouched.
+    // Non-foldable node untouched.
     try std.testing.expectEqual(ver_before_other, other.content_version);
     try std.testing.expectEqual(gen_before +% 1, tree.currentGeneration());
 }
 
-test "toggleAllThinkingCollapsed is a no-op when no thinking nodes exist" {
+test "toggleAllFoldableCollapsed is a no-op when no foldable nodes exist" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
     _ = try tree.appendNode(null, .user_message, "hi");
     const gen_before = tree.currentGeneration();
 
-    const touched = tree.toggleAllThinkingCollapsed();
+    const touched = tree.toggleAllFoldableCollapsed();
     try std.testing.expectEqual(@as(usize, 0), touched);
     try std.testing.expectEqual(gen_before, tree.currentGeneration());
 }

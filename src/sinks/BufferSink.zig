@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ConversationBuffer = @import("../ConversationBuffer.zig");
+const ConversationTree = @import("../ConversationTree.zig");
 const Node = ConversationBuffer.Node;
 const Sink = @import("../Sink.zig").Sink;
 const Event = @import("../Sink.zig").Event;
@@ -107,9 +108,8 @@ pub const BufferSink = struct {
                     self.buffer.appendToNode(node, e.text) catch return;
                 } else {
                     const node = self.buffer.appendNode(null, .thinking, e.text) catch return;
-                    // Live streaming: expanded while tokens arrive; the
-                    // `.thinking_stop` event folds it when the block ends.
-                    node.collapsed = false;
+                    // Collapsed even during streaming: the user opts into reasoning content with Ctrl-R.
+                    node.collapsed = true;
                     self.current_thinking_node = node;
                 }
             },
@@ -128,6 +128,7 @@ pub const BufferSink = struct {
                 self.current_assistant_node = null;
                 self.current_thinking_node = null;
                 const node = self.buffer.appendNode(null, .tool_call, e.name) catch return;
+                node.collapsed = true;
                 self.last_tool_call = node;
                 if (e.call_id) |id| {
                     const gop = self.pending_tool_calls.getOrPut(self.alloc, id) catch return;
@@ -161,6 +162,12 @@ pub const BufferSink = struct {
                     break :blk self.last_tool_call;
                 } orelse return;
                 _ = self.buffer.appendNode(parent, .tool_result, e.content) catch return;
+                // Bump the parent so the cached one-line tool_call rendering
+                // refreshes into the collapsed-with-hint two-line rendering
+                // now that a non-empty tool_result child exists.
+                parent.markDirty();
+                self.buffer.tree.generation +%= 1;
+                self.buffer.tree.dirty_nodes.push(parent.id);
             },
             .run_end => {
                 // Clear the full correlation state, not just the live
@@ -325,6 +332,67 @@ test "BufferSink resetCorrelation can be called externally" {
     s.push(.{ .tool_use = .{ .name = "t1", .call_id = "id-A" } });
     bs.resetCorrelation();
     try std.testing.expectEqual(@as(u32, 0), bs.pending_tool_calls.count());
+}
+
+test "tool_use event creates collapsed tool_call by default" {
+    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(std.testing.allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .tool_use = .{ .name = "bash", .call_id = null } });
+
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    const node = cb.tree.root_children.items[0];
+    try std.testing.expectEqual(ConversationBuffer.NodeType.tool_call, node.node_type);
+    try std.testing.expect(node.collapsed);
+}
+
+test "thinking_delta event creates collapsed thinking by default" {
+    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(std.testing.allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .thinking_delta = .{ .text = "first thoughts" } });
+
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    const node = cb.tree.root_children.items[0];
+    try std.testing.expectEqual(ConversationBuffer.NodeType.thinking, node.node_type);
+    try std.testing.expect(node.collapsed);
+}
+
+test "tool_result event bumps parent tool_call dirty state" {
+    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(std.testing.allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .tool_use = .{ .name = "bash", .call_id = "id-A" } });
+    const parent = cb.tree.root_children.items[0];
+    const version_before_result = parent.content_version;
+
+    s.push(.{ .tool_result = .{ .content = "some output", .call_id = "id-A" } });
+
+    try std.testing.expect(parent.content_version != version_before_result);
+
+    // The parent id must land in the dirty ring so the renderer drops the
+    // cached one-line tool_call rendering. appendNode for the child already
+    // pushes the *child* id; this assertion is what pins the parent bump.
+    var out: [ConversationTree.DirtyRing.capacity]u32 = undefined;
+    const drained = cb.tree.dirty_nodes.drain(&out);
+    var saw_parent = false;
+    for (out[0..drained.written]) |id| if (id == parent.id) {
+        saw_parent = true;
+        break;
+    };
+    try std.testing.expect(saw_parent);
 }
 
 test "BufferSink error_event appends an err node" {

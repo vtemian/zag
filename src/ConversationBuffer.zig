@@ -308,7 +308,12 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             .user_message => _ = try self.appendNode(null, .user_message, entry.content),
             .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
             .tool_call => {
-                last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+                const node = try self.appendNode(null, .tool_call, entry.tool_name);
+                // Match the live BufferSink path: tool_calls reload collapsed
+                // so prior turns read as compact `[tool] foo` headers, with
+                // Ctrl-R as the opt-in to inspect the body.
+                node.collapsed = true;
+                last_tool_call = node;
             },
             .tool_result => {
                 _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
@@ -328,7 +333,9 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
             // delegation in the JSONL stream.
             .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
             .task_tool_use => {
-                last_tool_call = try self.appendNode(null, .tool_call, entry.tool_name);
+                const node = try self.appendNode(null, .tool_call, entry.tool_name);
+                node.collapsed = true;
+                last_tool_call = node;
             },
             .task_tool_result => {
                 _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
@@ -367,11 +374,11 @@ pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
 }
 
-/// Flip `collapsed` on every `.thinking` / `.thinking_redacted` node in
-/// the tree. Returns the number of nodes touched. Used by the Ctrl-R
-/// keybinding; scoped to the buffer so the state is per-pane.
-pub fn toggleAllThinkingCollapsed(self: *ConversationBuffer) usize {
-    return self.tree.toggleAllThinkingCollapsed();
+/// Flip `collapsed` on every foldable node (thinking, thinking_redacted,
+/// tool_call) in the tree. Returns the number of nodes touched. Used by
+/// the Ctrl-R keybinding; scoped to the buffer so the state is per-pane.
+pub fn toggleAllFoldableCollapsed(self: *ConversationBuffer) usize {
+    return self.tree.toggleAllFoldableCollapsed();
 }
 
 // -- Buffer interface --------------------------------------------------------
@@ -392,6 +399,8 @@ const vtable: Buffer.VTable = .{
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
+    .getLastTotalRows = bufGetLastTotalRows,
+    .setLastTotalRows = bufSetLastTotalRows,
     .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
@@ -426,6 +435,16 @@ fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     if (self.viewport) |v| v.setScrollOffset(offset);
 }
 
+fn bufGetLastTotalRows(ptr: *anyopaque) u32 {
+    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return if (self.viewport) |v| v.last_total_rows else 0;
+}
+
+fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    if (self.viewport) |v| v.last_total_rows = total;
+}
+
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
     return self.lineCount();
@@ -443,15 +462,16 @@ fn bufClearDirty(ptr: *anyopaque) void {
 
 /// Handle a key event the buffer claims as its own. Drafts moved to
 /// `WindowManager.Pane`, so this is now reserved for buffer-internal
-/// chords. Today only Ctrl+R (toggle all thinking-block collapse)
-/// applies; everything else passes through and `Pane.handleKey` decides
-/// whether to land it in the draft or drop it.
+/// chords. Today only Ctrl+R applies, toggling collapse on every
+/// foldable node (thinking, thinking_redacted, tool_call); everything
+/// else passes through and `Pane.handleKey` decides whether to land it
+/// in the draft or drop it.
 pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleResult {
     if (ev.modifiers.ctrl) {
         switch (ev.key) {
             .char => |ch| {
                 if (ch == 'r') {
-                    _ = self.toggleAllThinkingCollapsed();
+                    _ = self.toggleAllFoldableCollapsed();
                     return .consumed;
                 }
             },
@@ -476,9 +496,9 @@ fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
     _ = focused;
 }
 
-/// Number of lines to scroll per wheel tick. Three is the conventional
-/// terminal-scroll cadence; matches less(1) and most pagers' `-3` on
-/// wheel events.
+/// Number of physical rows to scroll per wheel tick. Three is the
+/// conventional terminal-scroll cadence; matches less(1) and most pagers'
+/// `-3` on wheel events.
 const wheel_scroll_step: u32 = 3;
 
 fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) Buffer.HandleResult {
@@ -488,9 +508,20 @@ fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16)
     const viewport = self.viewport orelse return .passthrough;
     switch (ev.kind) {
         .wheel_up => {
-            // Wheel-up looks at older content: scroll_offset counts lines
-            // back from the tail, so increment (saturating).
-            viewport.setScrollOffset(viewport.scroll_offset +| wheel_scroll_step);
+            // Wheel-up looks at older content: scroll_offset counts physical
+            // rows back from the tail (set per frame from
+            // `planScroll.total_rows` via `Viewport.last_total_rows`), so
+            // increment (saturating). Then clamp to `last_total_rows -| 1`
+            // so we never cross the top of the buffer into a blank-pane
+            // dead zone (planScroll returns take=0 once scroll >=
+            // total_rows). last_total_rows is set by the Compositor at each
+            // paint and is one frame stale, which is fine for clamping the
+            // *next* user event. When the buffer hasn't been painted yet
+            // (last_total_rows == 0), the saturating subtraction collapses
+            // the cap to 0.
+            const next = viewport.scroll_offset +| wheel_scroll_step;
+            const cap = viewport.last_total_rows -| 1;
+            viewport.setScrollOffset(@min(next, cap));
             return .consumed;
         },
         .wheel_down => {
@@ -851,13 +882,16 @@ test "setScrollOffset marks dirty only when value changes" {
     try std.testing.expect(!b.isDirty());
 }
 
-test "wheel_down increments scroll_offset (looks at older content)" {
+test "wheel_up increments scroll_offset (looks at older content)" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
     defer cb.deinit();
 
     var viewport: Viewport = .{};
     cb.attachViewport(&viewport);
+    // Compositor recorded enough rows that one wheel-up tick stays well
+    // under the cap; the clamp added for Bug D is exercised separately.
+    viewport.last_total_rows = 100;
 
     const ev = input.MouseEvent{
         .button = 0,
@@ -909,6 +943,55 @@ test "wheel_down clamps at zero" {
         .y = 1,
         .is_press = true,
         .kind = .wheel_down,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
+
+test "wheel_up clamps to last_total_rows -| 1 to avoid overscroll dead zone" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
+    // Compositor recorded total_rows=5 at the last paint; the cap is
+    // therefore 4 (= 5 - 1). Two wheel-ups from offset 4 must stay at 4
+    // rather than running away to 7.
+    viewport.last_total_rows = 5;
+    viewport.scroll_offset = 4;
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_up,
+        .modifiers = input.KeyEvent.no_modifiers,
+    };
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
+
+    _ = cb.buf().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
+}
+
+test "wheel_up with last_total_rows=0 stays at 0 (no paint yet)" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
+    defer cb.deinit();
+
+    var viewport: Viewport = .{};
+    cb.attachViewport(&viewport);
+
+    const ev = input.MouseEvent{
+        .button = 0,
+        .x = 1,
+        .y = 1,
+        .is_press = true,
+        .kind = .wheel_up,
         .modifiers = input.KeyEvent.no_modifiers,
     };
     _ = cb.buf().onMouse(ev, 0, 0);
@@ -992,6 +1075,25 @@ test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes
     try std.testing.expect(cb.tree.root_children.items[2].collapsed);
 }
 
+test "loadFromEntries reloads tool_call nodes collapsed" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-reload");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "list", .timestamp = 0 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .content = "", .timestamp = 1 },
+        .{ .entry_type = .tool_result, .content = "row\nrow\nrow", .timestamp = 2 },
+        .{ .entry_type = .task_tool_use, .tool_name = "read", .content = "", .timestamp = 3 },
+    };
+    try cb.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(NodeType.tool_call, cb.tree.root_children.items[1].node_type);
+    try std.testing.expect(cb.tree.root_children.items[1].collapsed);
+    try std.testing.expectEqual(NodeType.tool_call, cb.tree.root_children.items[2].node_type);
+    try std.testing.expect(cb.tree.root_children.items[2].collapsed);
+}
+
 test "Ctrl-R toggles collapsed on every thinking node" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "thinking-toggle");
@@ -1011,6 +1113,21 @@ test "Ctrl-R toggles collapsed on every thinking node" {
     _ = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
     try std.testing.expect(t1.collapsed);
     try std.testing.expect(t2.collapsed);
+}
+
+test "Ctrl-R toggles collapsed on tool_call nodes too" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-toggle");
+    defer cb.deinit();
+
+    const call = try cb.appendNode(null, .tool_call, "bash");
+    call.collapsed = true;
+
+    _ = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expect(!call.collapsed);
+
+    _ = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expect(call.collapsed);
 }
 
 test "Ctrl-R is consumed even with no thinking nodes" {
@@ -1037,7 +1154,7 @@ test "getVisibleLines reflects collapsed-to-expanded toggle" {
     defer collapsed_lines.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), collapsed_lines.items.len);
 
-    _ = cb.toggleAllThinkingCollapsed();
+    _ = cb.toggleAllFoldableCollapsed();
 
     var expanded_lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
     defer expanded_lines.deinit(allocator);

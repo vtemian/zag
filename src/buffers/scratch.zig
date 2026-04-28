@@ -83,6 +83,8 @@ const vtable: Buffer.VTable = .{
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
+    .getLastTotalRows = bufGetLastTotalRows,
+    .setLastTotalRows = bufSetLastTotalRows,
     .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
@@ -140,6 +142,16 @@ fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
     const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
     self.scroll_offset = offset;
     self.dirty = true;
+}
+
+fn bufGetLastTotalRows(ptr: *anyopaque) u32 {
+    _ = ptr;
+    return 0;
+}
+
+fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
+    _ = ptr;
+    _ = total;
 }
 
 fn bufLineCount(ptr: *anyopaque) anyerror!usize {

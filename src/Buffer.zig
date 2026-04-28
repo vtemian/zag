@@ -52,7 +52,20 @@ pub const VTable = struct {
     /// Set the scroll offset.
     setScrollOffset: *const fn (ptr: *anyopaque, offset: u32) void,
 
-    /// Return the total number of display lines in the buffer.
+    /// Return the total physical rows the buffer occupied at the last
+    /// successful `planScroll`. Buffers without per-pane viewport state
+    /// return 0. Wheel handlers read this to clamp `scroll_offset` before
+    /// it lands past the buffer's tail.
+    getLastTotalRows: *const fn (ptr: *anyopaque) u32,
+
+    /// Record the total physical rows the Compositor projected at the
+    /// current pane width. Buffers without per-pane viewport state no-op.
+    setLastTotalRows: *const fn (ptr: *anyopaque, total: u32) void,
+
+    /// Return the total number of *logical* display lines the buffer holds.
+    /// Logical lines are width-independent; the Compositor projects them onto
+    /// physical screen rows for the current pane width and uses physical-row
+    /// math for scroll offsets and the visible window.
     lineCount: *const fn (ptr: *anyopaque) anyerror!usize,
 
     /// Whether the buffer has visual changes since the last clear.
@@ -111,7 +124,20 @@ pub fn setScrollOffset(self: Buffer, offset: u32) void {
     self.vtable.setScrollOffset(self.ptr, offset);
 }
 
-/// Return the total number of display lines.
+/// Total physical rows the buffer occupied at the last `planScroll`.
+/// Returns 0 for buffers without per-pane viewport state.
+pub fn getLastTotalRows(self: Buffer) u32 {
+    return self.vtable.getLastTotalRows(self.ptr);
+}
+
+/// Record the total physical rows projected by the Compositor.
+pub fn setLastTotalRows(self: Buffer, total: u32) void {
+    self.vtable.setLastTotalRows(self.ptr, total);
+}
+
+/// Return the total number of *logical* display lines. The Compositor
+/// projects these onto physical screen rows at the current pane width;
+/// scroll offsets and the visible window operate in physical rows.
 pub fn lineCount(self: Buffer) !usize {
     return self.vtable.lineCount(self.ptr);
 }
@@ -164,6 +190,14 @@ test "Buffer vtable dispatches correctly" {
             .getId = getIdImpl,
             .getScrollOffset = getScrollOffsetImpl,
             .setScrollOffset = setScrollOffsetImpl,
+            .getLastTotalRows = @ptrCast(&struct {
+                fn f(_: *anyopaque) u32 {
+                    return 0;
+                }
+            }.f),
+            .setLastTotalRows = @ptrCast(&struct {
+                fn f(_: *anyopaque, _: u32) void {}
+            }.f),
             .lineCount = @ptrCast(&struct {
                 fn f(_: *anyopaque) anyerror!usize {
                     return 0;
