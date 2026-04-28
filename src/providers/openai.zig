@@ -221,10 +221,20 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
             switch (block) {
                 .tool_use => |tu| {
                     if (tc_idx > 0) try w.writeAll(",");
+                    // OpenAI spec wires `function.arguments` as a JSON-
+                    // encoded string, NOT an inline object. Real
+                    // openai.com accepts either form, but strict
+                    // providers (Moonshot/Kimi K2) reject the inline
+                    // object with "invalid character '/' after object
+                    // key" once the agent echoes a prior tool_use back
+                    // in its second turn. Use Stringify.value to wrap
+                    // and escape input_raw verbatim.
                     try w.print(
-                        "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
-                        .{ tu.id, tu.name, tu.input_raw },
+                        "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":",
+                        .{ tu.id, tu.name },
                     );
+                    try std.json.Stringify.value(tu.input_raw, .{}, w);
+                    try w.writeAll("}}");
                     tc_idx += 1;
                 },
                 else => {},
@@ -826,6 +836,45 @@ test "streaming flag is omitted by default" {
     const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\"") == null);
+}
+
+test "openai writeMessage encodes tool_use arguments as JSON-encoded string per spec" {
+    // Regression: serializeRequest used to inject input_raw as a raw
+    // JSON object inside `function.arguments`, e.g.
+    //     "arguments":{"path":"/foo"}
+    // OpenAI's spec and strict-mode providers (Moonshot/Kimi K2) want
+    // a JSON-encoded string instead:
+    //     "arguments":"{\"path\":\"/foo\"}"
+    // Real openai.com is lenient and accepts either, which masked the
+    // bug. Moonshot rejects with a misleading "invalid character '/'
+    // after object key" because its parser stops on the second turn
+    // when the agent echoes the prior assistant tool_use back. The
+    // sibling Anthropic wire uses object form on its `input` field
+    // and is unaffected; ChatGPT's Responses wire already emits the
+    // string form (see src/providers/chatgpt.zig).
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{\"path\":\"/tmp/test.txt\"}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const tc = parsed.value.object.get("tool_calls").?.array;
+    const arguments = tc.items[0].object.get("function").?.object.get("arguments").?;
+    try std.testing.expect(arguments == .string);
+    try std.testing.expectEqualStrings("{\"path\":\"/tmp/test.txt\"}", arguments.string);
 }
 
 test "openai writeMessage flattens tool_use into tool_calls" {
