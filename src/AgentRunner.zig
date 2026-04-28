@@ -31,6 +31,7 @@ const skills_mod = @import("skills.zig");
 const subagents_mod = @import("subagents.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
+const trace = @import("Metrics.zig");
 
 const AgentRunner = @This();
 
@@ -608,22 +609,36 @@ pub const DrainResult = struct {
 pub fn drainEvents(self: *AgentRunner, allocator: Allocator) DrainResult {
     if (self.agent_thread == null) return .{};
 
-    dispatchHookRequests(&self.event_queue, self.lua_engine, self.window_manager);
+    // Split drain into two timed sub-phases so /perf can localize a long
+    // drain to either synchronous Lua hook dispatch (jit_context, tool
+    // transform, hook_request) or per-event handling (persist, sink
+    // push, observer hooks). A 13s drain alone can't tell us which arm
+    // owns the time; this split can.
+    {
+        var s = trace.span("dispatch_hooks");
+        defer s.end();
+        dispatchHookRequests(&self.event_queue, self.lua_engine, self.window_manager);
+    }
 
     var drain: [64]agent_events.AgentEvent = undefined;
     const count = self.event_queue.drain(&drain);
     var result: DrainResult = .{};
 
-    for (drain[0..count]) |event| {
-        result.any_drained = true;
-        self.handleAgentEvent(event, allocator);
+    {
+        var s = trace.span("handle_events");
+        defer s.endWithArgs(.{ .events = @as(u32, @intCast(count)) });
 
-        if (event == .done) {
-            if (self.agent_thread) |t| t.join();
-            self.agent_thread = null;
-            self.event_queue.deinit();
-            self.queue_active = false;
-            result.finished = true;
+        for (drain[0..count]) |event| {
+            result.any_drained = true;
+            self.handleAgentEvent(event, allocator);
+
+            if (event == .done) {
+                if (self.agent_thread) |t| t.join();
+                self.agent_thread = null;
+                self.event_queue.deinit();
+                self.queue_active = false;
+                result.finished = true;
+            }
         }
     }
 
