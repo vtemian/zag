@@ -362,21 +362,12 @@ fn drawBufferIntoRect(
 
     if (plan.take == 0) return;
 
-    // Pull the actual styled lines for the chosen window. Output backing
-    // is per-frame arena; spans and their text are cache-owned or borrowed
-    // into Node.content.items.
-    var visible_lines_span = trace.span("get_visible_lines");
-    const lines = buf.getVisibleLines(
-        self.frame_arena.allocator(),
-        self.allocator,
-        self.theme,
-        plan.skip,
-        plan.take,
-    ) catch {
-        visible_lines_span.end();
-        return;
-    };
-    visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
+    // Slice the materialized list `planScroll` already produced. Avoids a
+    // second `getVisibleLines` walk (which would re-render every node
+    // through the cache) just to fetch the visible window. Spans and their
+    // text are cache-owned or borrowed into `Node.content.items`; the
+    // ArrayList header and the slice both live on the per-frame arena.
+    const lines_slice = plan.lines.items[plan.skip .. plan.skip + plan.take];
 
     // Write styled lines to screen, advancing cur_row by the actual number
     // of physical rows each logical line consumed (accounts for wrapping).
@@ -385,7 +376,7 @@ fn drawBufferIntoRect(
     const max_row = @min(content_max_row, content_y +| plan.visible_rows);
 
     var leading_skip = plan.leading_skip_rows;
-    for (lines.items) |line| {
+    for (lines_slice) |line| {
         if (cur_row >= max_row) break;
         if (cur_row >= self.screen.height) break;
 
@@ -521,13 +512,19 @@ const ScrollPlan = struct {
     skip: usize,
     /// Number of logical lines to render starting at `skip`.
     take: usize,
-    /// Physical rows to drop from the top of the first rendered line. The
-    /// current implementation always normalizes this to 0 by advancing
-    /// `skip` past any partial line; the field stays for future sub-line
-    /// scroll precision.
+    /// Physical rows to drop from the top of the first rendered line. Read by
+    /// `drawStyledLineWrapped` via the `leading_skip` parameter so the
+    /// renderer can clip clusters that would land above the visible region.
+    /// Carries sub-line scroll precision when the visible window starts mid
+    /// logical line.
     leading_skip_rows: u16,
     /// Maximum physical rows the visible region can fit.
     visible_rows: u16,
+    /// Materialized logical lines for indices `[0, total_logical)`. The render
+    /// path slices `[skip, skip + take)` to avoid a second `getVisibleLines`
+    /// walk. Backed by `frame_alloc` (the Compositor's per-frame arena);
+    /// lifetime is the current composite frame only.
+    lines: std.ArrayList(Theme.StyledLine),
 };
 
 /// Project a styled line's spans into a `[]const []const u8` view backed by
@@ -545,10 +542,13 @@ fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u
 /// the [skip, take) window that lands the requested scroll offset at the
 /// bottom of the visible region.
 ///
-/// Walks the buffer twice: once to total the wrapped row count, once to find
-/// the logical line containing the visible-window start row. Buffers in the
-/// agent transcript are small; if profiling later shows hot-loop pressure,
-/// cache widths inside `NodeLineCache` instead of optimizing here.
+/// Materializes the buffer's logical lines once via `getVisibleLines` and
+/// returns them inside the plan so `drawBufferIntoRect` can slice them
+/// without a second walk. Two cheap passes over the in-memory list compute
+/// total wrapped rows and the logical line containing the visible-window
+/// start row. Buffers in the agent transcript are small; if profiling later
+/// shows hot-loop pressure, cache widths inside `NodeLineCache` instead of
+/// optimizing here.
 ///
 /// `leading_skip_rows` is the number of physical rows to clip from the top of
 /// the first rendered line when the visible window starts mid-line. The
@@ -572,6 +572,7 @@ fn planScroll(
             .take = 0,
             .leading_skip_rows = 0,
             .visible_rows = visible_rows,
+            .lines = .empty,
         };
     }
 
@@ -593,6 +594,7 @@ fn planScroll(
             .take = 0,
             .leading_skip_rows = 0,
             .visible_rows = visible_rows,
+            .lines = all,
         };
     }
     const visible_end_rows: u32 = total_rows - scroll_rows;
@@ -605,6 +607,7 @@ fn planScroll(
             .take = 0,
             .leading_skip_rows = 0,
             .visible_rows = visible_rows,
+            .lines = all,
         };
     }
 
@@ -630,6 +633,7 @@ fn planScroll(
             .take = 0,
             .leading_skip_rows = 0,
             .visible_rows = visible_rows,
+            .lines = all,
         };
     }
 
@@ -640,6 +644,7 @@ fn planScroll(
             .take = 0,
             .leading_skip_rows = 0,
             .visible_rows = visible_rows,
+            .lines = all,
         };
     }
 
@@ -649,6 +654,7 @@ fn planScroll(
         .take = total_logical - skip_idx,
         .leading_skip_rows = leading,
         .visible_rows = visible_rows,
+        .lines = all,
     };
 }
 
