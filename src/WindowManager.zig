@@ -5323,7 +5323,7 @@ const ModelPickerPluginFixture = struct {
     }
 };
 
-test "/model plugin opens a centered float with a scratch buffer" {
+test "/model plugin opens a popup-list float anchored to the cursor" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -5341,29 +5341,29 @@ test "/model plugin opens a centered float with a scratch buffer" {
     // The picker is a float now; the tile tree is unchanged.
     try std.testing.expectEqual(leaf_count_before, countLeaves(f.layout.root));
     try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
-    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_floats.items.len);
 
-    // The float's buffer must be a scratch buffer (the sole entry in
-    // `wm.buffer_registry.slots`).
+    // popup.list opens its float with `focusable = false` / `enter =
+    // false`, so focus stays on the underlying pane and no `extra_floats`
+    // pane entry is required for the picker to function. The float's
+    // backing scratch buffer is the sole BufferRegistry entry.
+    try std.testing.expectEqual(@as(?NodeRegistry.Handle, null), f.layout.focused_float);
     try std.testing.expectEqual(@as(usize, 1), f.wm.buffer_registry.slots.items.len);
     const scratch_slot = f.wm.buffer_registry.slots.items[0];
     try std.testing.expect(scratch_slot.entry != null);
     try std.testing.expect(scratch_slot.entry.? == .scratch);
 
-    // Float owns focus so its buffer-scoped keymaps fire.
-    try std.testing.expect(f.layout.focused_float != null);
-
-    // And a buffer-scoped keymap binding for <CR> should now exist.
-    const scratch_buffer = scratch_slot.entry.?.scratch;
+    // Up/Down/<CR>/<Esc> are registered as global normal-mode keymaps
+    // so they fire while focus stays on the underlying pane. Buffer-
+    // scoping them to the popup's scratch buffer would be inert.
     const hit = f.engine.keymap_registry.lookup(
         .normal,
         .{ .key = .enter, .modifiers = .{} },
-        scratch_buffer.buf().getId(),
+        null,
     ) orelse return error.TestExpectedKeymap;
     try std.testing.expect(hit == .lua_callback);
 }
 
-test "/model plugin commit fires set_model for the cursor row" {
+test "/model plugin commit fires set_model for the default selection" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -5373,20 +5373,56 @@ test "/model plugin commit fires set_model for the cursor row" {
         return error.TestExpectedCommand;
     f.engine.invokeCallback(cmd.lua_callback);
 
-    // Move cursor to row 2 (the second model entry, provA/a2) and fire
-    // the buffer-scoped <CR> binding; the callback should swap the
-    // focused pane's model to "provA/a2" via `zag.pane.set_model`.
-    const scratch_slot = f.wm.buffer_registry.slots.items[0];
-    const scratch_buffer = scratch_slot.entry.?.scratch;
-    scratch_buffer.cursor_row = 1; // 0-based; entries[2] in Lua = row 2
-
+    // popup.list starts with `selection_index = 1`, so firing the global
+    // <CR> binding without a preceding <Down> commits the FIRST item
+    // (provA/a1) — the same model the fixture starts with, so the swap
+    // is a no-op. We assert that the model_picker's `on_commit` ran by
+    // checking the override side-effect: set_model writes a fresh
+    // ProviderResult into root_pane.provider.
     const hit = f.engine.keymap_registry.lookup(
         .normal,
         .{ .key = .enter, .modifiers = .{} },
-        scratch_buffer.buf().getId(),
+        null,
     ) orelse return error.TestExpectedKeymap;
     try std.testing.expect(hit == .lua_callback);
     f.engine.invokeCallback(hit.lua_callback);
+
+    const override = f.wm.root_pane.provider orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("provA/a1", override.model_id);
+}
+
+test "/model plugin selects the second model after <Down> + <CR>" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    f.engine.invokeCallback(cmd.lua_callback);
+
+    // Fire the global <Down> binding once: routes through
+    // `popup.invoke_key("<Down>")` and bumps the popup's selection from
+    // 1 to 2. Then fire <CR> to commit; on_commit should swap the
+    // focused pane's model to the SECOND item (provA/a2). This test
+    // exercises the popup.list-specific Up/Down navigation path the
+    // old direct-cursor-row picker did not have.
+    const down_hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .down, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(down_hit == .lua_callback);
+    f.engine.invokeCallback(down_hit.lua_callback);
+
+    const cr_hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .enter, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(cr_hit == .lua_callback);
+    f.engine.invokeCallback(cr_hit.lua_callback);
 
     const override = f.wm.root_pane.provider orelse
         return error.TestUnexpectedResult;
@@ -5546,12 +5582,19 @@ test "zag.layout.tree returns floats and focused_float fields" {
     try f.init(allocator);
     defer f.deinit();
 
-    // Open the picker so a float exists to surface in zag.layout.tree.
-    const cmd = f.engine.command_registry.lookup("/model") orelse
-        return error.TestExpectedCommand;
-    f.engine.invokeCallback(cmd.lua_callback);
-
+    // Open a focused float directly via `zag.layout.float`. The /model
+    // picker can no longer be used here because it now opens a non-
+    // focusable popup-list float (focusable = false / enter = false), so
+    // `focused_float` would stay nil — defeating the whole point of the
+    // assertion below.
     try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "tree-test" }
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 2, col = 2,
+        \\  width = 20, height = 6,
+        \\  enter = true,
+        \\})
         \\_t = zag.layout.tree()
         \\_floats_kind = type(_t.floats)
         \\_floats_n = #_t.floats
