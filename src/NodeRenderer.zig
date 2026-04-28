@@ -43,6 +43,21 @@ const Prefixes = struct {
     const tool_collapsed_hint_suffix = " lines hidden (Ctrl-R to expand)";
 };
 
+/// Pre-baked decimal digit strings for the most common collapsed-tool hint
+/// counts. Static-lifetime entries satisfy the StyledSpan borrowed-text
+/// contract; lookup is bounded by `digit_strings.len`.
+const digit_strings: [1024][]const u8 = blk: {
+    @setEvalBranchQuota(200000);
+    var out: [1024][]const u8 = undefined;
+    for (&out, 0..) |*slot, i| {
+        slot.* = std.fmt.comptimePrint("{d}", .{i});
+    }
+    break :blk out;
+};
+
+/// Fallback for hidden-line counts that exceed `digit_strings.len`.
+const digit_overflow_label = "many";
+
 /// Function signature for a custom node renderer.
 ///
 /// Appends one or more StyledLines to `lines`. The renderer must uphold
@@ -280,9 +295,9 @@ fn renderDefault(
             try lines.append(allocator, try twoSpanLine(allocator, Prefixes.tool_call, style, content, style));
             const hidden = hiddenToolResultLineCount(node);
             if (hidden == 0) return;
-            // Format the digits into an allocator-owned slice so the span's
-            // borrowed-text contract holds for the lifetime of `lines`.
-            const digits = try std.fmt.allocPrint(allocator, "{d}", .{hidden});
+            // Static-lifetime digit slice keeps the span's borrowed-text
+            // contract intact without an allocation per render.
+            const digits: []const u8 = if (hidden < digit_strings.len) digit_strings[hidden] else digit_overflow_label;
             const hint_style = theme.highlights.tool_result;
             const spans = try allocator.alloc(StyledSpan, 3);
             spans[0] = .{ .text = Prefixes.tool_collapsed_hint_prefix, .style = hint_style };
@@ -810,4 +825,31 @@ test "lineCountForNode counts hidden tool_result child lines when tool_call is c
     const renderer = NodeRenderer.initDefault();
     // tool_call collapsed: its own header line plus a hint line that names the hidden body.
     try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call));
+}
+
+test "rendering a collapsed tool_call with a tool_result child does not leak under testing.allocator" {
+    const allocator = std.testing.allocator;
+    var tree = @import("ConversationTree.zig").init(allocator);
+    defer tree.deinit();
+
+    const call = try tree.appendNode(null, .tool_call, "bash");
+    _ = try tree.appendNode(call, .tool_result, "row one\nrow two\nrow three");
+    call.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+
+    // Render twice with a content_version bump in between, mirroring what
+    // happens when the cache invalidates and refills. testing.allocator
+    // would flag a leak in either pass if span text were owned-but-never-freed.
+    inline for (0..2) |_| {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(call, &lines, allocator, &theme);
+        try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+        // Confirm the hint line carries the expected count token.
+        const hint_text = try lines.items[1].toText(allocator);
+        defer allocator.free(hint_text);
+        try std.testing.expect(std.mem.indexOf(u8, hint_text, "3 lines hidden") != null);
+        call.markDirty();
+    }
 }
