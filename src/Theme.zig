@@ -51,6 +51,42 @@ pub const CellStyle = struct {
     inverse: bool = false,
 };
 
+/// Named slot for a buffer-driven row-background override. Plugins
+/// (e.g. popup-completion lists) tag a row via `setRowStyle(row, slot)`
+/// and the Compositor resolves the slot to a `CellStyle` against the
+/// active theme. New slots are additive: extend the enum, the parser,
+/// and the resolver together.
+pub const HighlightSlot = enum {
+    selection,
+    current_line,
+    err,
+    warning,
+};
+
+/// Parse a slot name as a string. Returns null for unknown names so
+/// the caller can decide between raising a Lua error and silently
+/// dropping the override.
+pub fn parseHighlightSlot(s: []const u8) ?HighlightSlot {
+    if (std.mem.eql(u8, s, "selection")) return .selection;
+    if (std.mem.eql(u8, s, "current_line")) return .current_line;
+    if (std.mem.eql(u8, s, "err")) return .err;
+    if (std.mem.eql(u8, s, "warning")) return .warning;
+    return null;
+}
+
+/// Resolve a `HighlightSlot` against the active theme into the
+/// `CellStyle` that the Compositor stamps onto the row's background.
+/// Only the `bg` is consumed by the row-override path; foreground from
+/// the per-span paint loop is preserved.
+pub fn resolveSlot(slot: HighlightSlot, theme: *const Theme) CellStyle {
+    return switch (slot) {
+        .selection => theme.highlights.selection,
+        .current_line => theme.highlights.current_line,
+        .err => theme.highlights.err,
+        .warning => .{ .fg = theme.colors.warning, .bold = true },
+    };
+}
+
 /// Named highlight groups covering conversation, chrome, mode, and
 /// markdown elements. Plugins swap the whole struct at runtime.
 pub const Highlights = struct {
@@ -106,6 +142,12 @@ pub const Highlights = struct {
     mode_insert: CellStyle,
     /// Modal indicator in the status line (normal mode).
     mode_normal: CellStyle,
+    /// Row background for the "current selection" in popup-list /
+    /// completion UIs. PmenuSel equivalent.
+    selection: CellStyle,
+    /// Row background for "the line the cursor is on". Cursorline
+    /// equivalent.
+    current_line: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.
@@ -171,6 +213,13 @@ pub const StyledSpan = struct {
 pub const StyledLine = struct {
     /// Ordered spans composing this line.
     spans: []const StyledSpan,
+
+    /// Optional buffer-driven row override. When non-null the
+    /// Compositor resolves the slot to a `CellStyle` and stamps the
+    /// `bg` across every cell in the row, leaving span foregrounds
+    /// intact. Used by popup-list selection highlighting and similar
+    /// "this row is special" UIs.
+    row_style: ?HighlightSlot = null,
 
     /// Concatenate all span texts into a single owned string.
     pub fn toText(self: StyledLine, allocator: std.mem.Allocator) ![]const u8 {
@@ -253,6 +302,12 @@ pub fn defaultTheme() Theme {
     const err_color = Screen.Color{ .rgb = .{ .r = 247, .g = 118, .b = 142 } };
     const info = Screen.Color{ .rgb = .{ .r = 125, .g = 207, .b = 255 } };
     const code_bg = Screen.Color{ .rgb = .{ .r = 24, .g = 26, .b = 34 } };
+    // Selection background: dim accent, dark enough to read regular
+    // foreground text against. Bold lifts the selected row.
+    const selection_bg = Screen.Color{ .rgb = .{ .r = 41, .g = 56, .b = 92 } };
+    // Cursorline background: a step above the default surface, distinct
+    // from selection so both can coexist on the same row visually.
+    const current_line_bg = Screen.Color{ .rgb = .{ .r = 30, .g = 33, .b = 44 } };
 
     return .{
         .colors = .{
@@ -293,6 +348,8 @@ pub fn defaultTheme() Theme {
             .md_hr = .{ .fg = dim },
             .mode_insert = .{ .fg = success, .bold = true },
             .mode_normal = .{ .fg = accent, .bold = true },
+            .selection = .{ .bg = selection_bg, .bold = true },
+            .current_line = .{ .bg = current_line_bg },
         },
         .spacing = .{
             .turn_gap = 1,
@@ -527,6 +584,42 @@ test "default theme exposes focused border and title highlights" {
     try std.testing.expect(title_on.screen_style.inverse);
     try std.testing.expect(!title_off.screen_style.inverse);
     try std.testing.expectEqual(@as(u21, 0x2026), ellipsis);
+}
+
+test "parseHighlightSlot round-trips known names and rejects unknowns" {
+    try std.testing.expectEqual(HighlightSlot.selection, parseHighlightSlot("selection").?);
+    try std.testing.expectEqual(HighlightSlot.current_line, parseHighlightSlot("current_line").?);
+    try std.testing.expectEqual(HighlightSlot.err, parseHighlightSlot("err").?);
+    try std.testing.expectEqual(HighlightSlot.warning, parseHighlightSlot("warning").?);
+    try std.testing.expect(parseHighlightSlot("nope") == null);
+    try std.testing.expect(parseHighlightSlot("") == null);
+    try std.testing.expect(parseHighlightSlot("Selection") == null);
+}
+
+test "default theme defines selection and current_line slots with backgrounds" {
+    const theme = defaultTheme();
+    try std.testing.expect(theme.highlights.selection.bg != null);
+    try std.testing.expect(theme.highlights.current_line.bg != null);
+    // The two slots must read distinctly so a "selected" row stays
+    // visually separable from the cursor row when both apply.
+    try std.testing.expect(!std.meta.eql(theme.highlights.selection.bg, theme.highlights.current_line.bg));
+}
+
+test "resolveSlot pulls from theme.highlights" {
+    const theme = defaultTheme();
+    const sel = resolveSlot(.selection, &theme);
+    const cur = resolveSlot(.current_line, &theme);
+    try std.testing.expect(sel.bg != null);
+    try std.testing.expect(cur.bg != null);
+    try std.testing.expect(sel.bold);
+    try std.testing.expect(!cur.bold);
+}
+
+test "StyledLine row_style defaults to null" {
+    const allocator = std.testing.allocator;
+    const line = try singleSpanLine(allocator, "x", .{});
+    defer line.deinit(allocator);
+    try std.testing.expect(line.row_style == null);
 }
 
 test "StyledLine construction" {

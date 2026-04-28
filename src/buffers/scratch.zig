@@ -20,6 +20,11 @@ lines: std.ArrayList([]u8),
 cursor_row: u32 = 0,
 scroll_offset: u32 = 0,
 dirty: bool = true,
+/// Sparse map of 0-indexed row -> theme highlight slot, applied as a
+/// row-background override during render. Cleared on `setLines` so
+/// renumbered rows don't carry stale overrides; lifetime ends with
+/// the buffer. Documented in `setRowStyle` below.
+row_styles: std.AutoHashMapUnmanaged(u32, Theme.HighlightSlot) = .empty,
 
 pub fn create(allocator: Allocator, id: u32, name: []const u8) !*ScratchBuffer {
     const self = try allocator.create(ScratchBuffer);
@@ -38,6 +43,7 @@ pub fn create(allocator: Allocator, id: u32, name: []const u8) !*ScratchBuffer {
 pub fn destroy(self: *ScratchBuffer) void {
     for (self.lines.items) |line| self.allocator.free(line);
     self.lines.deinit(self.allocator);
+    self.row_styles.deinit(self.allocator);
     self.allocator.free(self.name);
     self.allocator.destroy(self);
 }
@@ -54,7 +60,28 @@ pub fn setLines(self: *ScratchBuffer, lines: []const []const u8) !void {
     if (self.cursor_row >= lines.len) {
         self.cursor_row = if (lines.len == 0) 0 else @intCast(lines.len - 1);
     }
+    // Renumbering rows would silently misalign existing overrides;
+    // wipe the map so the caller has to opt back in via setRowStyle.
+    self.row_styles.clearRetainingCapacity();
     self.dirty = true;
+}
+
+/// Tag a row with a theme highlight slot. The Compositor resolves
+/// the slot to a `CellStyle` and stamps `bg` across every cell in the
+/// row, leaving span foregrounds intact. Errors when `row` is past
+/// the current line count so plugins fail loudly on stale indices.
+pub fn setRowStyle(self: *ScratchBuffer, row: u32, slot: Theme.HighlightSlot) !void {
+    if (row >= self.lines.items.len) return error.RowOutOfRange;
+    try self.row_styles.put(self.allocator, row, slot);
+    self.dirty = true;
+}
+
+/// Drop a row's highlight override. No-op when the row has no
+/// override, symmetric with `setRowStyle`'s simple put.
+pub fn clearRowStyle(self: *ScratchBuffer, row: u32) void {
+    if (self.row_styles.remove(row)) {
+        self.dirty = true;
+    }
 }
 
 pub fn appendLine(self: *ScratchBuffer, line: []const u8) !void {
@@ -117,7 +144,8 @@ fn bufGetVisibleLines(
             theme.highlights.user_message
         else
             .{};
-        const sl = try Theme.singleSpanLine(frame_alloc, line, style);
+        var sl = try Theme.singleSpanLine(frame_alloc, line, style);
+        sl.row_style = self.row_styles.get(@intCast(idx));
         try out.append(frame_alloc, sl);
     }
     return out;
@@ -319,6 +347,61 @@ test "getVisibleLines returns styled lines with cursor highlighted" {
     // second line should carry the cursor style; the exact style depends
     // on theme.highlights.user_message. Assert the style is non-default
     // by comparing spans' bold or foreground presence.
+}
+
+test "setRowStyle stamps row_style on the rendered StyledLine" {
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 1, "test");
+    defer sb.destroy();
+    try sb.setLines(&.{ "alpha", "beta", "gamma" });
+    try sb.setRowStyle(1, .selection);
+    const theme = Theme.defaultTheme();
+    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    defer Theme.freeStyledLines(&lines, gpa);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), lines.items[0].row_style);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[1].row_style);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), lines.items[2].row_style);
+}
+
+test "setRowStyle out of range returns error" {
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 1, "test");
+    defer sb.destroy();
+    try sb.setLines(&.{ "a", "b" });
+    try std.testing.expectError(error.RowOutOfRange, sb.setRowStyle(2, .selection));
+    try std.testing.expectError(error.RowOutOfRange, sb.setRowStyle(99, .err));
+}
+
+test "clearRowStyle removes the override and is a no-op for unset rows" {
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 1, "test");
+    defer sb.destroy();
+    try sb.setLines(&.{ "a", "b", "c" });
+    try sb.setRowStyle(1, .selection);
+    sb.clearRowStyle(1);
+    sb.clearRowStyle(2); // never set; must not raise
+    const theme = Theme.defaultTheme();
+    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    defer Theme.freeStyledLines(&lines, gpa);
+    for (lines.items) |line| {
+        try std.testing.expect(line.row_style == null);
+    }
+}
+
+test "setLines clears all row style overrides" {
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 1, "test");
+    defer sb.destroy();
+    try sb.setLines(&.{ "a", "b", "c" });
+    try sb.setRowStyle(0, .selection);
+    try sb.setRowStyle(2, .err);
+    try sb.setLines(&.{ "x", "y", "z" });
+    const theme = Theme.defaultTheme();
+    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    defer Theme.freeStyledLines(&lines, gpa);
+    for (lines.items) |line| {
+        try std.testing.expect(line.row_style == null);
+    }
 }
 
 test {

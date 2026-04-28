@@ -52,6 +52,13 @@ renderer: NodeRenderer,
 /// text from `Node.content.items` so the cache must not outlive the
 /// node tree that produced it.
 cache: NodeLineCache,
+/// Sparse map of 0-indexed visible-line row -> theme highlight slot,
+/// stamped onto the rendered `StyledLine.row_style` during
+/// `getVisibleLines`. No active consumer today; symmetry with
+/// `ScratchBuffer.row_styles` enables future "highlight the line that
+/// triggered this error" UIs and lets popup helpers operate on
+/// either buffer kind without branching.
+row_styles: std.AutoHashMapUnmanaged(u32, Theme.HighlightSlot) = .empty,
 
 /// Create a new empty buffer with the given id and name. The buffer is a
 /// pure view; its LLM messages live on `ConversationHistory` and its
@@ -82,7 +89,23 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
 pub fn deinit(self: *ConversationBuffer) void {
     self.cache.deinit();
     self.tree.deinit();
+    self.row_styles.deinit(self.allocator);
     self.allocator.free(self.name);
+}
+
+/// Tag a 0-indexed visible row with a theme highlight slot. The
+/// Compositor stamps `bg` across the row at render time. No bounds
+/// check against the live tree because rows are computed lazily from
+/// the renderer; setting an out-of-range row simply has no observable
+/// effect until that row exists.
+pub fn setRowStyle(self: *ConversationBuffer, row: u32, slot: Theme.HighlightSlot) !void {
+    try self.row_styles.put(self.allocator, row, slot);
+}
+
+/// Drop a row's highlight override. No-op when the row has no
+/// override.
+pub fn clearRowStyle(self: *ConversationBuffer, row: u32) void {
+    _ = self.row_styles.remove(row);
 }
 
 /// Attach a borrowed Viewport pointer. The Pane owns the Viewport
@@ -135,6 +158,15 @@ pub fn getVisibleLines(
     for (self.tree.root_children.items) |node| {
         if (collected >= max_lines) break;
         try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected);
+    }
+
+    // Stamp row-background overrides keyed by absolute visible-row
+    // index. Output index `i` corresponds to absolute row `skip + i`.
+    if (self.row_styles.count() > 0) {
+        for (lines.items, 0..) |*line, i| {
+            const abs_row: u32 = @intCast(skip + i);
+            if (self.row_styles.get(abs_row)) |slot| line.row_style = slot;
+        }
     }
 
     return lines;
@@ -581,6 +613,33 @@ test "getVisibleLines returns rendered lines" {
     const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
     try std.testing.expectEqualStrings("> hello", line0);
+}
+
+test "row_styles round trip: set, render, clear" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 4, "row-style");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "first");
+    _ = try cb.appendNode(null, .user_message, "second");
+
+    try cb.setRowStyle(0, .selection);
+    try cb.setRowStyle(1, .err);
+
+    const theme = Theme.defaultTheme();
+    var lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines.deinit(allocator);
+
+    try std.testing.expect(lines.items.len >= 2);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[0].row_style);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .err), lines.items[1].row_style);
+
+    cb.clearRowStyle(0);
+    cb.clearRowStyle(99); // unset row, must not raise
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
+    try std.testing.expect(lines2.items[0].row_style == null);
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .err), lines2.items[1].row_style);
 }
 
 test "readText emits user and assistant turns as plain text" {
