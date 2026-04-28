@@ -323,46 +323,54 @@ fn drawBufferIntoRect(
     const content_max_col = rect.x + rect.width;
     const content_max_row = rect.y + rect.height;
     const visible_rows = content_max_row -| content_y;
+    const content_width: u16 = if (content_max_col > content_x) content_max_col - content_x else 0;
 
-    // Compute skip/max_lines from scroll offset and total line count
-    const total_lines = buf.lineCount() catch return;
-    const scroll = buf.getScrollOffset();
+    const plan = planScroll(
+        buf,
+        self.theme,
+        self.frame_arena.allocator(),
+        self.allocator,
+        content_width,
+        visible_rows,
+        buf.getScrollOffset(),
+    ) catch return;
 
-    const visible_end = if (total_lines > scroll)
-        total_lines - scroll
-    else
-        0;
-    const visible_start = if (visible_end > visible_rows)
-        visible_end - visible_rows
-    else
-        0;
-    const lines_needed = visible_end - visible_start;
+    if (plan.take == 0) return;
 
-    // Request only the visible range from the buffer. The output list
-    // backing lives on the per-frame arena; spans and their text are
-    // cache-owned or borrowed into content.items.
+    // Pull the actual styled lines for the chosen window. Output backing
+    // is per-frame arena; spans and their text are cache-owned or borrowed
+    // into Node.content.items.
     var visible_lines_span = trace.span("get_visible_lines");
-    const lines = buf.getVisibleLines(self.frame_arena.allocator(), self.allocator, self.theme, visible_start, lines_needed) catch {
+    const lines = buf.getVisibleLines(
+        self.frame_arena.allocator(),
+        self.allocator,
+        self.theme,
+        plan.skip,
+        plan.take,
+    ) catch {
         visible_lines_span.end();
         return;
     };
     visible_lines_span.endWithArgs(.{ .line_count = lines.items.len });
 
-    // Write styled lines to screen
+    // Write styled lines to screen, advancing cur_row by the actual number
+    // of physical rows each logical line consumed (accounts for wrapping).
     var cur_row = content_y;
     const default_fg = self.theme.colors.fg;
+    const max_row = @min(content_max_row, content_y +| plan.visible_rows);
 
     for (lines.items) |line| {
-        if (cur_row >= content_max_row) break;
+        if (cur_row >= max_row) break;
         if (cur_row >= self.screen.height) break;
 
+        const start_row = cur_row;
         var col = content_x;
         for (line.spans) |s| {
             const resolved = Theme.resolve(s.style, self.theme);
             const pos = self.screen.writeStrWrapped(
                 cur_row,
                 col,
-                content_max_row,
+                max_row,
                 content_max_col,
                 s.text,
                 resolved.screen_style,
@@ -371,8 +379,161 @@ fn drawBufferIntoRect(
             cur_row = pos.row;
             col = pos.col;
         }
-        cur_row += 1;
+        // After writing, cur_row points to the row containing the last
+        // cluster (or to start_row if the line was empty). Advancing past
+        // it gives the next free row for the next logical line.
+        cur_row = if (cur_row >= start_row) cur_row + 1 else start_row + 1;
     }
+}
+
+/// Result of projecting logical buffer lines onto pane-width physical rows.
+const ScrollPlan = struct {
+    /// Total physical rows the buffer would occupy at the current pane width.
+    total_rows: u32,
+    /// Logical line index where rendering must start.
+    skip: usize,
+    /// Number of logical lines to render starting at `skip`.
+    take: usize,
+    /// Physical rows to drop from the top of the first rendered line. The
+    /// current implementation always normalizes this to 0 by advancing
+    /// `skip` past any partial line; the field stays for future sub-line
+    /// scroll precision.
+    leading_skip_rows: u16,
+    /// Maximum physical rows the visible region can fit.
+    visible_rows: u16,
+};
+
+/// Join all spans of a styled line into a fixed scratch buffer and return the
+/// resulting slice. Lines longer than the buffer (4 KiB) are clamped; that's
+/// pathological for scroll measurement and clamping is fine.
+fn joinLineForMeasure(line: Theme.StyledLine, scratch: []u8) []const u8 {
+    var written: usize = 0;
+    for (line.spans) |span| {
+        if (written >= scratch.len) break;
+        const remaining = scratch.len - written;
+        const take = @min(remaining, span.text.len);
+        @memcpy(scratch[written .. written + take], span.text[0..take]);
+        written += take;
+    }
+    return scratch[0..written];
+}
+
+/// Project the buffer's logical lines onto pane-width physical rows and pick
+/// the [skip, take) window that lands the requested scroll offset at the
+/// bottom of the visible region.
+///
+/// Walks the buffer twice: once to total the wrapped row count, once to find
+/// the logical line containing the visible-window start row. Buffers in the
+/// agent transcript are small; if profiling later shows hot-loop pressure,
+/// cache widths inside `NodeLineCache` instead of optimizing here.
+///
+/// TODO: scroll precision below the logical-line boundary. Today, when the
+/// visible-start row falls mid-line, we drop the entire partial line rather
+/// than blitting its tail rows. Whole-line steps match the existing UX feel.
+fn planScroll(
+    buf: Buffer,
+    theme: *const Theme,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
+    content_width: u16,
+    visible_rows: u16,
+    scroll_rows: u32,
+) !ScrollPlan {
+    const total_logical = try buf.lineCount();
+    if (total_logical == 0 or visible_rows == 0 or content_width == 0) {
+        return .{
+            .total_rows = 0,
+            .skip = 0,
+            .take = 0,
+            .leading_skip_rows = 0,
+            .visible_rows = visible_rows,
+        };
+    }
+
+    const all = try buf.getVisibleLines(frame_alloc, cache_alloc, theme, 0, total_logical);
+
+    var total: u32 = 0;
+    var scratch: [4096]u8 = undefined;
+    for (all.items) |line| {
+        const joined = joinLineForMeasure(line, &scratch);
+        total += @import("width.zig").wrappedRowCount(joined, content_width);
+    }
+    const total_rows = total;
+    // Scrolled the entire content off the top: nothing to draw. Defensive
+    // clamp because wheel-scroll handlers in ConversationBuffer don't bound
+    // the offset by themselves.
+    if (scroll_rows >= total_rows) {
+        return .{
+            .total_rows = total_rows,
+            .skip = total_logical,
+            .take = 0,
+            .leading_skip_rows = 0,
+            .visible_rows = visible_rows,
+        };
+    }
+    const visible_end_rows: u32 = total_rows - scroll_rows;
+    const visible_start_rows: u32 = if (visible_end_rows > visible_rows) visible_end_rows - visible_rows else 0;
+
+    if (visible_start_rows >= total_rows) {
+        return .{
+            .total_rows = total_rows,
+            .skip = total_logical,
+            .take = 0,
+            .leading_skip_rows = 0,
+            .visible_rows = visible_rows,
+        };
+    }
+
+    var cum: u32 = 0;
+    var skip_idx: usize = 0;
+    var leading: u16 = 0;
+    var found = false;
+    for (all.items, 0..) |line, idx| {
+        const joined = joinLineForMeasure(line, &scratch);
+        const rows = @import("width.zig").wrappedRowCount(joined, content_width);
+        if (cum + rows > visible_start_rows) {
+            skip_idx = idx;
+            leading = @intCast(visible_start_rows - cum);
+            found = true;
+            break;
+        }
+        cum += rows;
+    }
+    if (!found) {
+        return .{
+            .total_rows = total_rows,
+            .skip = total_logical,
+            .take = 0,
+            .leading_skip_rows = 0,
+            .visible_rows = visible_rows,
+        };
+    }
+
+    // Simplification: when the window starts mid-line, drop the partial
+    // line entirely so scrolling steps in whole-logical-line increments.
+    // Sub-line precision is a TODO above.
+    if (leading > 0) {
+        skip_idx += 1;
+        leading = 0;
+    }
+
+    if (skip_idx >= total_logical) {
+        return .{
+            .total_rows = total_rows,
+            .skip = total_logical,
+            .take = 0,
+            .leading_skip_rows = 0,
+            .visible_rows = visible_rows,
+        };
+    }
+
+    return .{
+        .total_rows = total_rows,
+        .skip = skip_idx,
+        .take = total_logical - skip_idx,
+        .leading_skip_rows = leading,
+        .visible_rows = visible_rows,
+    };
 }
 
 /// Draw a rounded frame with title for every leaf. Two-pass so the focused
@@ -1607,4 +1768,97 @@ test "tiny pane (height 3) skips the prompt reservation" {
         }
     };
     try std.testing.expect(!saw_prompt);
+}
+
+test "planScroll: short content fits, no scroll" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hi");
+    _ = try cb.appendNode(null, .assistant_text, "ok");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const theme = Theme.defaultTheme();
+    const plan = try planScroll(
+        cb.buf(),
+        &theme,
+        arena.allocator(),
+        allocator,
+        20,
+        10,
+        0,
+    );
+    try std.testing.expectEqual(@as(u32, 2), plan.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), plan.skip);
+    try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
+}
+
+test "planScroll: long line wraps and scroll math is in physical rows" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const long = "a" ** 60;
+    _ = try cb.appendNode(null, .user_message, long);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const theme = Theme.defaultTheme();
+    // user_message renders with "> " prefix, so 62 cols total -> 4 rows at width 20
+    // (rows of 20, 20, 20, 2). Confirm planScroll sees 4 rows.
+    const plan = try planScroll(
+        cb.buf(),
+        &theme,
+        arena.allocator(),
+        allocator,
+        20,
+        10,
+        0,
+    );
+    try std.testing.expectEqual(@as(u32, 4), plan.total_rows);
+}
+
+test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        _ = try cb.appendNode(null, .user_message, "abcdefghi");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const theme = Theme.defaultTheme();
+    const plan = try planScroll(
+        cb.buf(),
+        &theme,
+        arena.allocator(),
+        allocator,
+        5,
+        6,
+        0,
+    );
+    try std.testing.expect(plan.total_rows >= 20);
+    try std.testing.expectEqual(@as(u16, 6), plan.visible_rows);
+    try std.testing.expect(plan.skip >= 7);
+}
+
+test "planScroll: scroll past total clamps to zero rows" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hi");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const theme = Theme.defaultTheme();
+    const plan = try planScroll(cb.buf(), &theme, arena.allocator(), allocator, 20, 10, 999);
+    try std.testing.expectEqual(@as(usize, 0), plan.take);
 }
