@@ -63,14 +63,17 @@ pub const HookDispatcher = struct {
     /// `setHookBudgetMs`.
     hook_budget_ms: i64 = 500,
 
-    /// Re-entry guard. Incremented at the start of `fireHook` /
-    /// `fireHookSync`, decremented on exit. When the depth would exceed
-    /// `max_depth`, the dispatcher logs a warning and skips the fire
-    /// rather than recurse. Prevents infinite loops when a hook body
-    /// mutates state that itself fires hooks (e.g. a `PaneDraftChange`
-    /// hook calling `zag.pane.set_draft` on the same pane).
-    firing_depth: u32 = 0,
-    max_depth: u32 = 1,
+    /// Re-entry guard, tracked per event kind. Incremented at the start
+    /// of `fireHook` / `fireHookSync`, decremented on exit. When the
+    /// depth for a given kind would meet or exceed `maxDepthFor(kind)`,
+    /// the dispatcher logs a warning and skips that fire rather than
+    /// recurse. Per-kind so a re-entrant draft hook (capped at 1) does
+    /// not also throttle unrelated `tool_post` chains. Prevents infinite
+    /// loops when a hook body mutates state that itself fires hooks
+    /// (e.g. a `PaneDraftChange` hook calling `zag.pane.set_draft` on
+    /// the same pane).
+    firing_depth: std.EnumArray(Hooks.EventKind, u32) =
+        std.EnumArray(Hooks.EventKind, u32).initFill(0),
 
     /// Internal veto channel between `applyHookReturn` /
     /// `applyHookReturnFromCoroutine` (which inspect the callback return
@@ -135,15 +138,21 @@ pub const HookDispatcher = struct {
         // skip the inner fire rather than recurse without bound. The
         // hook author can still observe the rewrite via the return-table
         // mechanism, which the dispatcher applies after the body retires.
-        if (self.firing_depth >= self.max_depth) {
+        // Tracked per event kind so a draft-only cap of 1 does not also
+        // clamp legitimate re-entry on unrelated kinds (e.g. a tool_post
+        // hook that triggers another tool indirectly).
+        const kind = payload.kind();
+        const cur_depth = self.firing_depth.get(kind);
+        const cap = maxDepthFor(kind);
+        if (cur_depth >= cap) {
             log.warn(
                 "hook recursion depth {d} >= max {d}; skipping {s}",
-                .{ self.firing_depth, self.max_depth, @tagName(payload.kind()) },
+                .{ cur_depth, cap, @tagName(kind) },
             );
             return null;
         }
-        self.firing_depth += 1;
-        defer self.firing_depth -= 1;
+        self.firing_depth.set(kind, cur_depth + 1);
+        defer self.firing_depth.set(kind, self.firing_depth.get(kind) - 1);
 
         const pattern_key = hookPatternKey(payload.*);
 
@@ -227,15 +236,18 @@ pub const HookDispatcher = struct {
     /// that try to call yielding primitives in this mode will error out,
     /// which is fine; that combination is never exercised in tests.
     pub fn fireHookSync(self: *HookDispatcher, payload: *Hooks.HookPayload, lua: *Lua) !void {
-        if (self.firing_depth >= self.max_depth) {
+        const kind = payload.kind();
+        const cur_depth = self.firing_depth.get(kind);
+        const cap = maxDepthFor(kind);
+        if (cur_depth >= cap) {
             log.warn(
                 "hook recursion depth {d} >= max {d}; skipping {s}",
-                .{ self.firing_depth, self.max_depth, @tagName(payload.kind()) },
+                .{ cur_depth, cap, @tagName(kind) },
             );
             return;
         }
-        self.firing_depth += 1;
-        defer self.firing_depth -= 1;
+        self.firing_depth.set(kind, cur_depth + 1);
+        defer self.firing_depth.set(kind, self.firing_depth.get(kind) - 1);
 
         const pattern_key = hookPatternKey(payload.*);
         var it = self.registry.iterMatching(payload.kind(), pattern_key);
@@ -521,6 +533,22 @@ pub const HookDispatcher = struct {
     }
 };
 
+/// Maximum re-entry depth permitted for a given event kind.
+///
+/// `pane_draft_change` is capped at 1 because draft mutations are the
+/// classic recursion footgun: a hook that calls `set_draft` on its own
+/// pane would loop forever, and per-keystroke firing means even a small
+/// constant blow-up is a perf cliff. Other events get a generous budget
+/// so legitimate fan-out (e.g. a `tool_post` hook whose body invokes
+/// another tool that itself fires `tool_pre`/`tool_post`) is not
+/// silently throttled.
+pub fn maxDepthFor(kind: Hooks.EventKind) u32 {
+    return switch (kind) {
+        .pane_draft_change => 1,
+        else => 8,
+    };
+}
+
 /// Key used for pattern matching against a hook's pattern.
 /// ToolPre/ToolPost use the tool name, PaneDraftChange uses the pane
 /// handle string; all other events use "".
@@ -577,4 +605,44 @@ test "hookPatternKey returns tool name for tool_pre" {
 test "hookPatternKey returns empty for unkeyed events" {
     const payload: Hooks.HookPayload = .{ .agent_done = {} };
     try std.testing.expectEqualStrings("", hookPatternKey(payload));
+}
+
+test "maxDepthFor caps pane_draft_change at 1, others at 8" {
+    try std.testing.expectEqual(@as(u32, 1), maxDepthFor(.pane_draft_change));
+    try std.testing.expectEqual(@as(u32, 8), maxDepthFor(.tool_pre));
+    try std.testing.expectEqual(@as(u32, 8), maxDepthFor(.tool_post));
+    try std.testing.expectEqual(@as(u32, 8), maxDepthFor(.text_delta));
+    try std.testing.expectEqual(@as(u32, 8), maxDepthFor(.agent_done));
+}
+
+test "firing_depth tracks each EventKind independently" {
+    // Pre-loading one kind's depth must not affect the gate for other
+    // kinds: a draft fire pushes draft to its cap, but tool_post still
+    // has its full budget available.
+    var d = HookDispatcher.init(std.testing.allocator);
+    defer d.deinit();
+
+    d.firing_depth.set(.pane_draft_change, 1);
+    try std.testing.expectEqual(@as(u32, 1), d.firing_depth.get(.pane_draft_change));
+    try std.testing.expect(d.firing_depth.get(.pane_draft_change) >= maxDepthFor(.pane_draft_change));
+
+    try std.testing.expectEqual(@as(u32, 0), d.firing_depth.get(.tool_post));
+    try std.testing.expect(d.firing_depth.get(.tool_post) < maxDepthFor(.tool_post));
+
+    // tool_post can climb to 7 before tripping the gate at 8.
+    var i: u32 = 0;
+    while (i < 7) : (i += 1) {
+        const cur = d.firing_depth.get(.tool_post);
+        try std.testing.expect(cur < maxDepthFor(.tool_post));
+        d.firing_depth.set(.tool_post, cur + 1);
+    }
+    try std.testing.expectEqual(@as(u32, 7), d.firing_depth.get(.tool_post));
+    try std.testing.expect(d.firing_depth.get(.tool_post) < maxDepthFor(.tool_post));
+
+    // One more push reaches the cap.
+    d.firing_depth.set(.tool_post, 8);
+    try std.testing.expect(d.firing_depth.get(.tool_post) >= maxDepthFor(.tool_post));
+
+    // Draft kind is untouched by the tool_post climb.
+    try std.testing.expectEqual(@as(u32, 1), d.firing_depth.get(.pane_draft_change));
 }

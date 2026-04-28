@@ -8279,6 +8279,94 @@ test "fireHook invokes Lua callback for matching event" {
     engine.lua.pop(1);
 }
 
+test "non-draft hooks fire up to depth 7 without tripping the per-kind guard" {
+    // The per-event-kind cap exists so a draft hook (cap 1) cannot also
+    // throttle unrelated kinds. Simulate a tool_post chain mid-flight by
+    // pre-bumping the dispatcher's tool_post depth: the hook must still
+    // run at depth 7 (one slot below the 8-cap), and must be skipped at
+    // depth 8.
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.tool_post_count = 0
+        \\zag.hook("ToolPost", function(evt)
+        \\  _G.tool_post_count = (_G.tool_post_count or 0) + 1
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_post = .{
+        .name = "bash",
+        .call_id = "id1",
+        .content = "ok",
+        .is_error = false,
+        .duration_ms = 0,
+        .content_rewrite = null,
+        .is_error_rewrite = null,
+    } };
+
+    // Depth 0: trivially under the cap; baseline fire.
+    _ = try engine.fireHook(&payload);
+
+    // Walk depth from 1..=7. Each level is still < 8, so the hook fires.
+    var d: u32 = 1;
+    while (d <= 7) : (d += 1) {
+        engine.hook_dispatcher.firing_depth.set(.tool_post, d);
+        _ = try engine.fireHook(&payload);
+    }
+
+    _ = try engine.lua.getGlobal("tool_post_count");
+    // 1 (baseline) + 7 (d=1..=7) = 8 fires.
+    try std.testing.expectEqual(@as(i64, 8), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // At depth 8 (the cap), the dispatcher must skip rather than recurse.
+    engine.hook_dispatcher.firing_depth.set(.tool_post, 8);
+    _ = try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("tool_post_count");
+    try std.testing.expectEqual(@as(i64, 8), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // Reset so deinit doesn't trip any leak / state assertion.
+    engine.hook_dispatcher.firing_depth.set(.tool_post, 0);
+}
+
+test "draft hook still caps at depth 1 even when other kinds have higher budgets" {
+    // Companion to the tool_post test: pre-bumping draft to 1 must
+    // skip the next draft fire (cap = 1), even though tool_post would
+    // happily fire at the same depth.
+    std.testing.log_level = .err;
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.draft_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.draft_count = (_G.draft_count or 0) + 1
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .pane_draft_change = .{
+        .pane_handle = "n1",
+        .draft_text = "hi",
+        .previous_text = "h",
+        .draft_rewrite = null,
+    } };
+
+    engine.hook_dispatcher.firing_depth.set(.pane_draft_change, 1);
+    _ = try engine.fireHook(&payload);
+
+    _ = try engine.lua.getGlobal("draft_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    engine.hook_dispatcher.firing_depth.set(.pane_draft_change, 0);
+}
+
 test "end-to-end: config file to registry execution" {
     const AgentRunner = @import("AgentRunner.zig");
 
