@@ -654,6 +654,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_model");
         lua.pushFunction(zlua.wrap(zagPaneCurrentModelFn));
         lua.setField(-2, "current_model");
+        lua.pushFunction(zlua.wrap(zagPaneSetDraftFn));
+        lua.setField(-2, "set_draft");
+        lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
+        lua.setField(-2, "replace_draft_range");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
 
         // zag.providers; read-only view of the endpoint registry so a
@@ -3475,6 +3479,106 @@ pub const LuaEngine = struct {
         const resolved = wm.providerFor(pane);
         _ = lua.pushString(resolved.model_id);
         return 1;
+    }
+
+    /// `zag.pane.set_draft(pane_id, text)`: replace the entire in-progress
+    /// draft of `pane_id` with `text`. Truncates silently to MAX_DRAFT
+    /// with a warn log (matches `appendPaste`'s policy). Used by
+    /// autocomplete plugins that drive the draft from Lua.
+    fn zagPaneSetDraftFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.set_draft: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.set_draft");
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.pane.set_draft: text must be a string", .{});
+        }
+        const text = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.pane.set_draft: text must be a string", .{});
+        };
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.set_draft: {s}", .{@errorName(err)}) catch "zag.pane.set_draft failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        pane.setDraft(text);
+        return 0;
+    }
+
+    /// `zag.pane.replace_draft_range(pane_id, from_byte, to_byte, replacement)`:
+    /// replace bytes `[from_byte, to_byte)` of `pane_id`'s draft with
+    /// `replacement`. **Byte offsets are 0-indexed** (raw byte positions
+    /// over the draft, not 1-indexed Lua positions): autocomplete plugins
+    /// already reason in terms of trigger byte ranges captured against
+    /// `getDraft()`, so 0-indexing keeps that math straight rather than
+    /// forcing every plugin to add and subtract one. `from_byte == to_byte`
+    /// is a valid pure insertion at `from_byte`. Raises on invalid range
+    /// or overflow past MAX_DRAFT — autocomplete plugins know the trigger
+    /// position and want loud failure if anything is off.
+    fn zagPaneReplaceDraftRangeFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.replace_draft_range");
+
+        if (lua.typeOf(2) != .number) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: from_byte must be an integer", .{});
+        }
+        const from_lua = lua.toInteger(2) catch {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: from_byte must be an integer", .{});
+        };
+        if (from_lua < 0) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: from_byte must be >= 0", .{});
+        }
+
+        if (lua.typeOf(3) != .number) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: to_byte must be an integer", .{});
+        }
+        const to_lua = lua.toInteger(3) catch {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: to_byte must be an integer", .{});
+        };
+        if (to_lua < 0) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: to_byte must be >= 0", .{});
+        }
+
+        if (lua.typeOf(4) != .string) {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: replacement must be a string", .{});
+        }
+        const replacement = lua.toString(4) catch {
+            lua.raiseErrorStr("zag.pane.replace_draft_range: replacement must be a string", .{});
+        };
+
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.replace_draft_range: {s}", .{@errorName(err)}) catch "zag.pane.replace_draft_range failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+
+        const from_byte: usize = @intCast(from_lua);
+        const to_byte: usize = @intCast(to_lua);
+        pane.replaceDraftRange(from_byte, to_byte, replacement) catch |err| switch (err) {
+            error.InvalidRange => {
+                var buf: [192]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(
+                    &buf,
+                    "zag.pane.replace_draft_range: invalid range [{d}, {d}) over draft of {d} bytes",
+                    .{ from_byte, to_byte, pane.getDraft().len },
+                ) catch "zag.pane.replace_draft_range: invalid range";
+                lua.raiseErrorStr("%s", .{msg.ptr});
+            },
+            error.Overflow => {
+                var buf: [192]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(
+                    &buf,
+                    "zag.pane.replace_draft_range: replacement would overflow MAX_DRAFT (replacement={d} bytes, removed={d}, draft={d})",
+                    .{ replacement.len, to_byte - from_byte, pane.getDraft().len },
+                ) catch "zag.pane.replace_draft_range: overflow";
+                lua.raiseErrorStr("%s", .{msg.ptr});
+            },
+        };
+        return 0;
     }
 
     /// `zag.mode.set("normal" | "insert")`: flip the global editing
