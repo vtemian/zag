@@ -14,8 +14,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const error_detail = @import("error_detail.zig");
+const error_class = @import("error_class.zig");
+const http_mod = @import("http.zig");
+const telemetry = @import("telemetry.zig");
 
 const log = std.log.scoped(.streaming);
+
+/// Cap on the number of response headers we snapshot per response. Defends
+/// against pathological gateway responses while comfortably covering every
+/// realistic provider header set (Anthropic and Codex top out around 20).
+const MAX_RESPONSE_HEADERS: usize = 64;
 
 /// Cap on the error body we drain on non-2xx status. Enough to capture a
 /// JSON `{"error": {"message": "..."}}` envelope without blowing up logs.
@@ -73,10 +81,17 @@ pub const StreamingResponse = struct {
 
     /// Open a streaming HTTP POST connection.
     /// Caller must call `destroy` when done.
+    ///
+    /// `telemetry_opt` is optional. When non-null, `onResponse` fires once
+    /// after `receiveHead` for both success and failure paths, and on a
+    /// non-2xx status the side-channel re-fetch path additionally invokes
+    /// `onHttpError` so observability sees the response body the streaming
+    /// reader can't safely drain (see `body_done` field doc).
     pub fn create(
         url: []const u8,
         body: []const u8,
         extra_headers: []const std.http.Header,
+        telemetry_opt: ?*telemetry.Telemetry,
         allocator: Allocator,
     ) !*StreamingResponse {
         const self = try allocator.create(StreamingResponse);
@@ -150,29 +165,96 @@ pub const StreamingResponse = struct {
         };
 
         if (response.head.status != .ok) {
-            // Body drainage on the streaming path panicked in stdlib
-            // reader under some 4xx shapes so we skip it for now. To
-            // compensate for the missing response body, log the
-            // request URL and body snippet we sent: most 4xx failures
-            // are payload shape bugs, and seeing what we sent is
-            // sufficient to diagnose them. The plain HTTP path in
-            // http.zig still captures response body snippets for
-            // non-streaming errors.
+            const status: u16 = @intFromEnum(response.head.status);
+
+            // Snapshot response headers BEFORE we drop `response`. The
+            // headers slice points into the request's internal HEAD buffer,
+            // so we dupe immediately to keep it valid past return.
+            const captured_headers = captureHeaders(allocator, &response.head) catch |err| blk: {
+                log.warn("streaming: captureHeaders failed: {s}", .{@errorName(err)});
+                break :blk @as([]std.http.Header, &[_]std.http.Header{});
+            };
+            defer if (captured_headers.len > 0) freeHeaders(allocator, captured_headers);
+
+            // Fire onResponse so telemetry sees the failure status. Same
+            // hook fires on the success path below.
+            if (telemetry_opt) |t| {
+                t.onResponse(status, captured_headers, body);
+            }
+
+            // Side-channel re-fetch via the safe non-streaming path. The
+            // streaming reader's contentLengthStream panics on .ready
+            // state for some 4xx body shapes (see body_done field doc),
+            // so we cannot drain inline. The re-fetch is OBSERVABILITY
+            // ONLY — we still return error.ApiError. Retry policy is
+            // explicitly out of scope for this slice.
+            const side_channel_headers = buildSideChannelHeaders(allocator, extra_headers) catch |err| blk: {
+                log.warn("streaming: buildSideChannelHeaders failed: {s}", .{@errorName(err)});
+                break :blk @as([]std.http.Header, &[_]std.http.Header{});
+            };
+            defer if (side_channel_headers.len > 0) freeSideChannelHeaders(allocator, side_channel_headers);
+
+            const response_body: []const u8 = http_mod.httpPostJson(
+                url,
+                body,
+                side_channel_headers,
+                allocator,
+            ) catch |err| blk: {
+                log.warn("streaming: side-channel re-fetch failed: {s}", .{@errorName(err)});
+                break :blk @as([]const u8, "");
+            };
+            const owns_body = response_body.len > 0;
+            defer if (owns_body) allocator.free(response_body);
+
+            // Run the classifier and let telemetry persist the artifact
+            // pair. When telemetry is absent, still classify so the
+            // user-facing detail benefits from the structured message.
+            var classification: ?error_class.ErrorClass = null;
+            if (telemetry_opt) |t| {
+                classification = t.onHttpError(status, captured_headers, body, response_body) catch |err| inner_blk: {
+                    log.warn("streaming: telemetry.onHttpError failed: {s}", .{@errorName(err)});
+                    break :inner_blk null;
+                };
+            } else {
+                classification = error_class.classify(status, response_body, captured_headers);
+            }
+
+            // Set user-facing detail. Prefer classifier output; fall back
+            // to a status-only message if classification is unavailable
+            // or `userMessage` itself fails.
+            const detail: []u8 = if (classification) |c|
+                error_class.userMessage(c, allocator) catch
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "HTTP {d} ({s}). Check ~/.zag/logs for the request body.",
+                        .{ status, @tagName(response.head.status) },
+                    )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "HTTP {d} ({s}). Check ~/.zag/logs for the request body.",
+                    .{ status, @tagName(response.head.status) },
+                );
+            error_detail.set(allocator, detail);
+
+            // Existing diagnostic log line stays — useful when telemetry
+            // is null and the artifact pair won't be written.
             const req_snippet = body[0..@min(body.len, MAX_ERROR_BODY_BYTES)];
             log.err("streaming: HTTP {d} {s}. url={s} sent_body={s}", .{
-                @intFromEnum(response.head.status),
-                @tagName(response.head.status),
-                url,
-                req_snippet,
+                status, @tagName(response.head.status), url, req_snippet,
             });
-            if (std.fmt.allocPrint(
-                allocator,
-                "HTTP {d} ({s}). Check ~/.zag/logs for the request body.",
-                .{ @intFromEnum(response.head.status), @tagName(response.head.status) },
-            )) |detail| {
-                error_detail.set(allocator, detail);
-            } else |_| {}
             return error.ApiError;
+        }
+
+        // Success path: fire onResponse so the timeline log line shows
+        // status=200 alongside the request size and elapsed time.
+        if (telemetry_opt) |t| {
+            const success_headers = captureHeaders(allocator, &response.head) catch |err| blk: {
+                log.warn("streaming: captureHeaders (success) failed: {s}", .{@errorName(err)});
+                break :blk @as([]std.http.Header, &[_]std.http.Header{});
+            };
+            defer if (success_headers.len > 0) freeHeaders(allocator, success_headers);
+            t.onResponse(@intFromEnum(response.head.status), success_headers, body);
         }
 
         // Obtain the incremental body reader. The pointer into transfer_buf
@@ -189,6 +271,91 @@ pub const StreamingResponse = struct {
         self.req.deinit();
         self.client.deinit();
         alloc.destroy(self);
+    }
+
+    /// Snapshot response headers into an owned slice. Both name and value
+    /// strings are duped on `allocator`. Caller frees with `freeHeaders`.
+    /// Caps at `MAX_RESPONSE_HEADERS` to defend against pathological
+    /// responses; excess headers are silently dropped (telemetry artifacts
+    /// don't need exhaustive capture).
+    fn captureHeaders(
+        allocator: Allocator,
+        head: *const std.http.Client.Response.Head,
+    ) ![]std.http.Header {
+        var captured: std.ArrayList(std.http.Header) = .empty;
+        errdefer {
+            for (captured.items) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            captured.deinit(allocator);
+        }
+        var it = head.iterateHeaders();
+        while (it.next()) |h| {
+            if (captured.items.len >= MAX_RESPONSE_HEADERS) break;
+            const name = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, h.value);
+            errdefer allocator.free(value);
+            try captured.append(allocator, .{ .name = name, .value = value });
+        }
+        return captured.toOwnedSlice(allocator);
+    }
+
+    /// Free a header slice produced by `captureHeaders`. Safe on empty
+    /// slices (no-op).
+    fn freeHeaders(allocator: Allocator, headers: []std.http.Header) void {
+        for (headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(headers);
+    }
+
+    /// Build the header list for the side-channel non-streaming POST.
+    /// Strips any existing `Accept` header from `extra_headers` and forces
+    /// `Accept: application/json` so the server returns a structured error
+    /// envelope instead of starting an SSE stream we can't consume on the
+    /// non-streaming HTTP path.
+    ///
+    /// Each name/value is duped onto `allocator` so the returned slice is
+    /// self-contained; the original `extra_headers` slice may outlive or
+    /// underlive this call freely. Free with `freeSideChannelHeaders`.
+    fn buildSideChannelHeaders(
+        allocator: Allocator,
+        extra_headers: []const std.http.Header,
+    ) ![]std.http.Header {
+        var headers: std.ArrayList(std.http.Header) = .empty;
+        errdefer {
+            for (headers.items) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            headers.deinit(allocator);
+        }
+        for (extra_headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "Accept")) continue;
+            const name = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, h.value);
+            errdefer allocator.free(value);
+            try headers.append(allocator, .{ .name = name, .value = value });
+        }
+        const accept_name = try allocator.dupe(u8, "Accept");
+        errdefer allocator.free(accept_name);
+        const accept_value = try allocator.dupe(u8, "application/json");
+        errdefer allocator.free(accept_value);
+        try headers.append(allocator, .{ .name = accept_name, .value = accept_value });
+        return headers.toOwnedSlice(allocator);
+    }
+
+    /// Free a header slice produced by `buildSideChannelHeaders`.
+    fn freeSideChannelHeaders(allocator: Allocator, headers: []std.http.Header) void {
+        for (headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(headers);
     }
 
     /// Read the next line from the SSE stream (delimited by '\n').
@@ -445,7 +612,24 @@ test "StreamingResponse.create returns InvalidUri on malformed endpoint" {
     // `create` allocates before parsing, so a failure here also exercises
     // the errdefer cleanup for the heap struct.
     const allocator = std.testing.allocator;
-    const result = StreamingResponse.create("not a url", "", &.{}, allocator);
+    const result = StreamingResponse.create("not a url", "", &.{}, null, allocator);
+    try std.testing.expectError(error.InvalidUri, result);
+}
+
+test "StreamingResponse.create accepts non-null telemetry pointer" {
+    // The signature change must keep compiling when callers pass a real
+    // Telemetry. We aim at a deliberately-unreachable URL so the call
+    // fails in network land — anything that isn't a compile error or a
+    // panic is a pass for this test.
+    const allocator = std.testing.allocator;
+    const t = try telemetry.Telemetry.init(.{
+        .allocator = allocator,
+        .session_id = "test",
+        .turn = 1,
+        .model = "test/test",
+    });
+    defer t.deinit();
+    const result = StreamingResponse.create("not a url", "", &.{}, t, allocator);
     try std.testing.expectError(error.InvalidUri, result);
 }
 
@@ -531,6 +715,118 @@ test "nextSseEvent skips event with invalid UTF-8 in data" {
 
     const second = try sr.nextSseEvent(&cancel, &event_buf, &event_data);
     try std.testing.expect(second == null);
+}
+
+test "buildSideChannelHeaders strips Accept and adds JSON" {
+    const allocator = std.testing.allocator;
+    const input = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer x" },
+        .{ .name = "Accept", .value = "text/event-stream" },
+    };
+    const out = try StreamingResponse.buildSideChannelHeaders(allocator, &input);
+    defer StreamingResponse.freeSideChannelHeaders(allocator, out);
+
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expectEqualStrings("Authorization", out[0].name);
+    try std.testing.expectEqualStrings("Bearer x", out[0].value);
+    try std.testing.expectEqualStrings("Accept", out[1].name);
+    try std.testing.expectEqualStrings("application/json", out[1].value);
+}
+
+test "buildSideChannelHeaders strips Accept regardless of case" {
+    const allocator = std.testing.allocator;
+    const input = [_]std.http.Header{
+        .{ .name = "ACCEPT", .value = "text/event-stream" },
+        .{ .name = "X-Foo", .value = "bar" },
+    };
+    const out = try StreamingResponse.buildSideChannelHeaders(allocator, &input);
+    defer StreamingResponse.freeSideChannelHeaders(allocator, out);
+
+    // No header may name-match Accept except the appended JSON one.
+    var accept_count: usize = 0;
+    for (out) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Accept")) accept_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), accept_count);
+    try std.testing.expectEqualStrings("application/json", out[out.len - 1].value);
+}
+
+test "buildSideChannelHeaders preserves non-Accept headers" {
+    const allocator = std.testing.allocator;
+    const input = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer x" },
+        .{ .name = "X-Custom", .value = "val" },
+        .{ .name = "User-Agent", .value = "zag/test" },
+    };
+    const out = try StreamingResponse.buildSideChannelHeaders(allocator, &input);
+    defer StreamingResponse.freeSideChannelHeaders(allocator, out);
+
+    // Three input headers, none of them Accept, plus the appended Accept.
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expectEqualStrings("Authorization", out[0].name);
+    try std.testing.expectEqualStrings("X-Custom", out[1].name);
+    try std.testing.expectEqualStrings("User-Agent", out[2].name);
+    try std.testing.expectEqualStrings("Accept", out[3].name);
+}
+
+test "buildSideChannelHeaders empty input produces only Accept" {
+    const allocator = std.testing.allocator;
+    const out = try StreamingResponse.buildSideChannelHeaders(allocator, &.{});
+    defer StreamingResponse.freeSideChannelHeaders(allocator, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings("Accept", out[0].name);
+    try std.testing.expectEqualStrings("application/json", out[0].value);
+}
+
+test "captureHeaders dupes names and values from a parsed Head" {
+    const allocator = std.testing.allocator;
+    const response_bytes = "HTTP/1.1 400 Bad Request\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "X-Request-Id: abc-123\r\n" ++
+        "\r\n";
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    const captured = try StreamingResponse.captureHeaders(allocator, &head);
+    defer StreamingResponse.freeHeaders(allocator, captured);
+
+    try std.testing.expectEqual(@as(usize, 2), captured.len);
+    try std.testing.expectEqualStrings("Content-Type", captured[0].name);
+    try std.testing.expectEqualStrings("application/json", captured[0].value);
+    try std.testing.expectEqualStrings("X-Request-Id", captured[1].name);
+    try std.testing.expectEqualStrings("abc-123", captured[1].value);
+
+    // Names/values must be duped: bytes must NOT alias the source buffer.
+    try std.testing.expect(@intFromPtr(captured[0].name.ptr) < @intFromPtr(response_bytes.ptr) or
+        @intFromPtr(captured[0].name.ptr) >= @intFromPtr(response_bytes.ptr) + response_bytes.len);
+}
+
+test "captureHeaders caps at MAX_RESPONSE_HEADERS" {
+    const allocator = std.testing.allocator;
+
+    // Build a HEAD with 100 trivial headers; capture should stop at 64.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "HTTP/1.1 200 OK\r\n");
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        try buf.writer(allocator).print("X-Hdr-{d}: v\r\n", .{i});
+    }
+    try buf.appendSlice(allocator, "\r\n");
+
+    const head = try std.http.Client.Response.Head.parse(buf.items);
+    const captured = try StreamingResponse.captureHeaders(allocator, &head);
+    defer StreamingResponse.freeHeaders(allocator, captured);
+
+    try std.testing.expectEqual(MAX_RESPONSE_HEADERS, captured.len);
+}
+
+test "freeHeaders is leak-clean on captured slice" {
+    // testing.allocator panics on leaks; reaching the end is the assertion.
+    const allocator = std.testing.allocator;
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "A: 1\r\nB: 2\r\nC: 3\r\n\r\n";
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    const captured = try StreamingResponse.captureHeaders(allocator, &head);
+    StreamingResponse.freeHeaders(allocator, captured);
 }
 
 test {

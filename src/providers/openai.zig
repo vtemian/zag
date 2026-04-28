@@ -85,7 +85,7 @@ pub const OpenAiSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
+        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, null, req.allocator);
         defer stream.destroy();
 
         return parseSseStream(stream, req.allocator, req.callback, req.cancel);
