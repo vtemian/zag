@@ -69,7 +69,7 @@ pub const HighlightSlot = enum {
 pub fn parseHighlightSlot(s: []const u8) ?HighlightSlot {
     if (std.mem.eql(u8, s, "selection")) return .selection;
     if (std.mem.eql(u8, s, "current_line")) return .current_line;
-    if (std.mem.eql(u8, s, "err")) return .err;
+    if (std.mem.eql(u8, s, "error")) return .err;
     if (std.mem.eql(u8, s, "warning")) return .warning;
     return null;
 }
@@ -83,7 +83,7 @@ pub fn resolveSlot(slot: HighlightSlot, theme: *const Theme) CellStyle {
         .selection => theme.highlights.selection,
         .current_line => theme.highlights.current_line,
         .err => theme.highlights.err,
-        .warning => .{ .fg = theme.colors.warning, .bold = true },
+        .warning => theme.highlights.warning,
     };
 }
 
@@ -148,6 +148,10 @@ pub const Highlights = struct {
     /// Row background for "the line the cursor is on". Cursorline
     /// equivalent.
     current_line: CellStyle,
+    /// Warning highlight, used by buffer row-style overrides via the
+    /// `"warning"` slot. Defaults to bold warning-colored fg; themes may
+    /// override with a bg or other styling.
+    warning: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.
@@ -350,6 +354,7 @@ pub fn defaultTheme() Theme {
             .mode_normal = .{ .fg = accent, .bold = true },
             .selection = .{ .bg = selection_bg, .bold = true },
             .current_line = .{ .bg = current_line_bg },
+            .warning = .{ .fg = warning, .bold = true },
         },
         .spacing = .{
             .turn_gap = 1,
@@ -589,7 +594,7 @@ test "default theme exposes focused border and title highlights" {
 test "parseHighlightSlot round-trips known names and rejects unknowns" {
     try std.testing.expectEqual(HighlightSlot.selection, parseHighlightSlot("selection").?);
     try std.testing.expectEqual(HighlightSlot.current_line, parseHighlightSlot("current_line").?);
-    try std.testing.expectEqual(HighlightSlot.err, parseHighlightSlot("err").?);
+    try std.testing.expectEqual(HighlightSlot.err, parseHighlightSlot("error").?);
     try std.testing.expectEqual(HighlightSlot.warning, parseHighlightSlot("warning").?);
     try std.testing.expect(parseHighlightSlot("nope") == null);
     try std.testing.expect(parseHighlightSlot("") == null);

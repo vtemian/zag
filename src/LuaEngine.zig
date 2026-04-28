@@ -3910,7 +3910,7 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
         };
         const slot = Theme.parseHighlightSlot(slot_str) orelse {
-            lua.raiseErrorStr("zag.buffer.set_row_style: unknown slot (valid: \"selection\", \"current_line\", \"err\", \"warning\")", .{});
+            lua.raiseErrorStr("zag.buffer.set_row_style: unknown slot (valid: \"selection\", \"current_line\", \"error\", \"warning\")", .{});
         };
         const row_zero: u32 = @intCast(row_lua - 1);
         switch (entry) {
@@ -3930,9 +3930,10 @@ pub const LuaEngine = struct {
     }
 
     /// `zag.buffer.clear_row_style(handle, row)`: drop a row's
-    /// highlight override. No-op when the row has no override.
-    /// Graphics handles raise; scratch handles never raise on missing
-    /// rows (symmetric with set_row_style's simple put).
+    /// highlight override. No-op when the row has no override, and a
+    /// no-op on graphics buffers (which carry no row-style state).
+    /// Cleanup is permissive; only `set_row_style` raises on graphics
+    /// since it expresses an intent that cannot take effect.
     fn zagBufferClearRowStyleFn(lua: *Lua) i32 {
         const entry = requireBufferEntry(lua, 1, "zag.buffer.clear_row_style");
         if (lua.typeOf(2) != .number) {
@@ -3947,7 +3948,7 @@ pub const LuaEngine = struct {
         const row_zero: u32 = @intCast(row_lua - 1);
         switch (entry) {
             .scratch => |sb| sb.clearRowStyle(row_zero),
-            .graphics => lua.raiseErrorStr("zag.buffer.clear_row_style: not supported on graphics buffers (no row addressing)", .{}),
+            .graphics => {},
         }
         return 0;
     }
@@ -11807,6 +11808,31 @@ test "zag.buffer.set_row_style rejects graphics buffer" {
         \\zag.buffer.set_row_style(b, 1, "selection")
     );
     try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.buffer.clear_row_style is a no-op on graphics buffers" {
+    // Cleanup is permissive: graphics buffers carry no row-style state,
+    // so dropping an override is trivially a no-op rather than a raise.
+    // Only set_row_style is strict, since it expresses an intent that
+    // cannot take effect.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(alloc);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try engine.lua.doString(
+        \\local b = zag.buffer.create { kind = "graphics" }
+        \\zag.buffer.clear_row_style(b, 1)
+        \\zag.buffer.clear_row_style(b, 99)
+        \\_G.ok = true
+    );
+    _ = try engine.lua.getGlobal("ok");
+    try std.testing.expect(engine.lua.toBoolean(-1));
     engine.lua.pop(1);
 }
 
