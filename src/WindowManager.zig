@@ -6315,3 +6315,153 @@ test "zag.popup.list.is_closed reports lifecycle accurately" {
     try std.testing.expect(f.engine.lua.toBoolean(-1));
     f.engine.lua.pop(1);
 }
+
+test "zag.popup.list aligns columns by display cells across mixed CJK/ASCII items" {
+    // Regression: `format_columns` previously padded with `string.format`
+    // %-Ns, which counts BYTES, so a CJK row (3 bytes per ideograph,
+    // 2 cells of display width) under-padded relative to ASCII rows.
+    // After the cell-aware rewrite, every line produces the same total
+    // display width when measured through `zag.width.cells`.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Pure Lua exercise of `popup.format_columns`; no pane / float /
+    // hook setup needed. The fixture is here just to give us a live
+    // LuaEngine with `zag.width.cells` registered.
+    try f.engine.lua.doString(
+        \\local popup = require("zag.popup.list")
+        \\local items = {
+        \\  { word = "hello", abbr = "hello", kind = "fn", menu = "ascii" },
+        \\  { word = "中文",  abbr = "中文",  kind = "中",  menu = "cjk"   },
+        \\  { word = "smile", abbr = "😀",   kind = "x",  menu = "emoji" },
+        \\}
+        \\local lines = popup.format_columns(items)
+        \\_G.line_count = #lines
+        \\_G.w0 = zag.width.cells(lines[1])
+        \\_G.w1 = zag.width.cells(lines[2])
+        \\_G.w2 = zag.width.cells(lines[3])
+    );
+
+    _ = try f.engine.lua.getGlobal("line_count");
+    try std.testing.expectEqual(@as(i64, 3), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("w0");
+    const w0 = try f.engine.lua.toInteger(-1);
+    f.engine.lua.pop(1);
+    _ = try f.engine.lua.getGlobal("w1");
+    const w1 = try f.engine.lua.toInteger(-1);
+    f.engine.lua.pop(1);
+    _ = try f.engine.lua.getGlobal("w2");
+    const w2 = try f.engine.lua.toInteger(-1);
+    f.engine.lua.pop(1);
+
+    // Trailing `menu` text differs in length per row, so the totals
+    // aren't identical. The invariant: the *prefix* (abbr + 2 spaces +
+    // kind + 2 spaces) lands at the same display column on every row.
+    // We verify by asserting each line's measured width matches the
+    // expected sum:  max(abbr_cells) + 2 + max(kind_cells) + 2 + len(menu_cells).
+    // abbr cells: hello=5, 中文=4, 😀=2  -> max 5
+    // kind cells: fn=2,    中=2,    x=1   -> max 2
+    // menu cells: ascii=5, cjk=3, emoji=5
+    try std.testing.expectEqual(@as(i64, 5 + 2 + 2 + 2 + 5), w0);
+    try std.testing.expectEqual(@as(i64, 5 + 2 + 2 + 2 + 3), w1);
+    try std.testing.expectEqual(@as(i64, 5 + 2 + 2 + 2 + 5), w2);
+}
+
+test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-keystroke budget" {
+    // Success criterion from the popup-list plan: a cursor-anchored
+    // float that follows the input cursor must add no measurable
+    // per-keystroke latency on a benchmark plugin that registers a
+    // PaneDraftChange hook. This probe stands the popup helper up over
+    // the root pane, drives 100 keystrokes through `Pane.appendToDraft`
+    // (which fires the hook + re-renders the popup buffer + triggers
+    // size-to-content recalculation), and asserts the total wall clock
+    // stays under a generous budget.
+    //
+    // 5 ms per keystroke is the ceiling: at 100 Hz typing the loop has
+    // 10 ms per event and we want clear headroom. Debug builds run hot
+    // (Lua hooks bounce through the dispatcher; the layout recalculates
+    // the float bounds each frame); the budget is a sanity floor, not
+    // a tight bound.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Plumb the compositor's frame arena into the layout so
+    // `measureLongestLine` lands in its fast path on every recalc.
+    // Production wires this in EventOrchestrator.runFrame; the test
+    // fixture skips that drain path, so we do it here once at setup.
+    f.layout.frame_allocator = f.compositor.frame_arena.allocator();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Open the popup with the cursor-anchored placement opts the
+    // autocomplete UX uses (size-to-content via min_width/max_width,
+    // which routes through measureLongestLine on every render). The
+    // items() callback returns a small filter result so the popup
+    // re-renders on every keystroke without exploding into a runaway
+    // list.
+    const open_script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\local source = {{}}
+        \\for i = 1, 16 do
+        \\  source[i] = {{ word = "item_" .. i, abbr = "item_" .. i, kind = "fn" }}
+        \\end
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 0 }},
+        \\  items = function(query)
+        \\    local out = {{}}
+        \\    for _, item in ipairs(source) do
+        \\      if query == "" or string.sub(item.word, 1, #query) == query then
+        \\        out[#out + 1] = item
+        \\      end
+        \\    end
+        \\    return out
+        \\  end,
+        \\  min_width = 12,
+        \\  max_width = 30,
+        \\  min_height = 1,
+        \\  max_height = 8,
+        \\}})
+    , .{root_id}, 0);
+    defer allocator.free(open_script);
+    try f.engine.lua.doString(open_script);
+
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        // Cycle through printable ASCII so each keystroke produces a
+        // distinct draft and the popup actually re-renders rather than
+        // short-circuiting on a no-op rewrite.
+        const ch: u8 = @intCast('a' + (i % 26));
+        f.wm.root_pane.appendToDraft(ch);
+    }
+    const elapsed_ns = timer.read();
+
+    // Tear the popup down before any assert that could fail the test
+    // and skip the cleanup. Test allocator catches leaks regardless,
+    // but explicit close keeps the fixture deinit walk simple.
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+
+    // 500 ms ceiling for 100 keystrokes. Debug builds with Lua hooks
+    // are nowhere near this in practice (single-digit ms total);
+    // emitting the actual elapsed in the failure message makes a
+    // future regression easy to spot.
+    const budget_ns: u64 = 500 * std.time.ns_per_ms;
+    if (elapsed_ns >= budget_ns) {
+        std.log.warn(
+            "popup-list 100 keystrokes took {d} ns (budget {d} ns)",
+            .{ elapsed_ns, budget_ns },
+        );
+        return error.TestPopupListTooSlow;
+    }
+}

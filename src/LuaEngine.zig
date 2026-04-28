@@ -27,6 +27,7 @@ const Instruction = @import("Instruction.zig");
 const Reminder = @import("Reminder.zig");
 const WindowManager = @import("WindowManager.zig");
 const agent_events = @import("agent_events.zig");
+const width = @import("width.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -792,6 +793,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
         lua.setField(-2, "strategy");
         lua.setField(-2, "compact"); // zag.compact = compact_table; [zag_table]
+
+        // zag.width; grapheme-aware terminal-cell width measurement. Plugins
+        // doing column alignment (e.g. popup-completion menus with mixed
+        // ASCII/CJK/emoji content) must call `cells(s)` instead of `#s` so
+        // wide and zero-width clusters don't skew the layout.
+        lua.newTable(); // [zag_table, width_table]
+        lua.pushFunction(zlua.wrap(zagWidthCellsFn));
+        lua.setField(-2, "cells");
+        lua.setField(-2, "width"); // zag.width = width_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -2538,6 +2548,20 @@ pub const LuaEngine = struct {
     ///
     /// Raises a Lua error on unterminated frontmatter or allocator
     /// failure; both are caller-fixable and should surface loudly.
+    /// `zag.width.cells(s)`: return the terminal-cell display width of
+    /// `s`, with grapheme-cluster awareness (CJK is 2, emoji is 2, ZWJ
+    /// sequences and combining marks are absorbed). Falls back to byte
+    /// length for invalid UTF-8 — the iterator runs over `Utf8View.initUnchecked`,
+    /// so callers passing arbitrary bytes get a "best effort" width
+    /// rather than a Lua error. Lua plugins use this in place of `#s`
+    /// when laying out columns over user-supplied content.
+    fn zagWidthCellsFn(lua: *Lua) i32 {
+        const text = lua.checkString(1);
+        const cells = width.displayWidth(text);
+        lua.pushInteger(@intCast(cells));
+        return 1;
+    }
+
     fn zagParseFrontmatterFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const src = lua.checkString(1);
