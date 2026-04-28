@@ -496,9 +496,9 @@ fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
     _ = focused;
 }
 
-/// Number of lines to scroll per wheel tick. Three is the conventional
-/// terminal-scroll cadence; matches less(1) and most pagers' `-3` on
-/// wheel events.
+/// Number of physical rows to scroll per wheel tick. Three is the
+/// conventional terminal-scroll cadence; matches less(1) and most pagers'
+/// `-3` on wheel events.
 const wheel_scroll_step: u32 = 3;
 
 fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) Buffer.HandleResult {
@@ -508,15 +508,17 @@ fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16)
     const viewport = self.viewport orelse return .passthrough;
     switch (ev.kind) {
         .wheel_up => {
-            // Wheel-up looks at older content: scroll_offset counts lines
-            // back from the tail, so increment (saturating). Then clamp to
-            // `last_total_rows -| 1` so we never cross the top of the
-            // buffer into a blank-pane dead zone (planScroll returns
-            // take=0 once scroll >= total_rows). last_total_rows is set by
-            // the Compositor at each paint and is one frame stale, which
-            // is fine for clamping the *next* user event. When the buffer
-            // hasn't been painted yet (last_total_rows == 0), the
-            // saturating subtraction collapses the cap to 0.
+            // Wheel-up looks at older content: scroll_offset counts physical
+            // rows back from the tail (set per frame from
+            // `planScroll.total_rows` via `Viewport.last_total_rows`), so
+            // increment (saturating). Then clamp to `last_total_rows -| 1`
+            // so we never cross the top of the buffer into a blank-pane
+            // dead zone (planScroll returns take=0 once scroll >=
+            // total_rows). last_total_rows is set by the Compositor at each
+            // paint and is one frame stale, which is fine for clamping the
+            // *next* user event. When the buffer hasn't been painted yet
+            // (last_total_rows == 0), the saturating subtraction collapses
+            // the cap to 0.
             const next = viewport.scroll_offset +| wheel_scroll_step;
             const cap = viewport.last_total_rows -| 1;
             viewport.setScrollOffset(@min(next, cap));
