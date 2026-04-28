@@ -37,7 +37,26 @@ const Prefixes = struct {
     const thinking_collapsed = "> thinking (folded, Ctrl-R to expand)";
     const thinking_expanded_header = "v thinking";
     const thinking_redacted = "> thinking (redacted)";
+    /// Indent on the hidden-body hint line under a collapsed tool_call.
+    /// Width matches "[tool] " so the hint visually sits under the tool name.
+    const tool_collapsed_hint_prefix = "       ";
+    const tool_collapsed_hint_suffix = " lines hidden (Ctrl-R to expand)";
 };
+
+/// Pre-baked decimal digit strings for the most common collapsed-tool hint
+/// counts. Static-lifetime entries satisfy the StyledSpan borrowed-text
+/// contract; lookup is bounded by `digit_strings.len`.
+const digit_strings: [1024][]const u8 = blk: {
+    @setEvalBranchQuota(200000);
+    var out: [1024][]const u8 = undefined;
+    for (&out, 0..) |*slot, i| {
+        slot.* = std.fmt.comptimePrint("{d}", .{i});
+    }
+    break :blk out;
+};
+
+/// Fallback for hidden-line counts that exceed `digit_strings.len`.
+const digit_overflow_label = "many";
 
 /// Function signature for a custom node renderer.
 ///
@@ -108,11 +127,39 @@ pub fn render(
     try renderDefault(node, lines, allocator, theme);
 }
 
+/// Number of body lines hidden under a collapsed `tool_call` node, counted as
+/// `(newlines + 1)` over the first `tool_result` child's content. Returns 0
+/// when the node is expanded, has no `tool_result` child, or the first child's
+/// content is empty. Capped at the first child to keep this O(1) in node count.
+fn hiddenToolResultLineCount(node: *const Node) usize {
+    if (!node.collapsed) return 0;
+    if (node.node_type != .tool_call) return 0;
+    for (node.children.items) |child| {
+        if (child.node_type != .tool_result) continue;
+        const content = child.content.items;
+        if (content.len == 0) return 0;
+        var count: usize = 1;
+        for (content) |c| {
+            if (c == '\n') count += 1;
+        }
+        // Match splitAndAppend: a trailing newline yields no extra segment.
+        if (content[content.len - 1] == '\n') count -= 1;
+        return count;
+    }
+    return 0;
+}
+
 /// Return the number of display lines a node produces (without allocating them).
 pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
     return switch (node.node_type) {
         .separator => 1,
-        .tool_call, .err, .thinking_redacted => 1,
+        .err, .thinking_redacted => 1,
+        .tool_call => blk: {
+            // Collapsed tool_call with a non-empty tool_result child gets a
+            // hint line under the [tool] header announcing the hidden body.
+            if (hiddenToolResultLineCount(node) > 0) break :blk 2;
+            break :blk 1;
+        },
         .thinking => blk: {
             // Collapsed thinking nodes render as a single header line; the
             // body is hidden until the user hits Ctrl-R.
@@ -246,6 +293,17 @@ fn renderDefault(
         .tool_call => {
             const style = theme.highlights.tool_call;
             try lines.append(allocator, try twoSpanLine(allocator, Prefixes.tool_call, style, content, style));
+            const hidden = hiddenToolResultLineCount(node);
+            if (hidden == 0) return;
+            // Static-lifetime digit slice keeps the span's borrowed-text
+            // contract intact without an allocation per render.
+            const digits: []const u8 = if (hidden < digit_strings.len) digit_strings[hidden] else digit_overflow_label;
+            const hint_style = theme.highlights.tool_result;
+            const spans = try allocator.alloc(StyledSpan, 3);
+            spans[0] = .{ .text = Prefixes.tool_collapsed_hint_prefix, .style = hint_style };
+            spans[1] = .{ .text = digits, .style = hint_style };
+            spans[2] = .{ .text = Prefixes.tool_collapsed_hint_suffix, .style = hint_style };
+            try lines.append(allocator, .{ .spans = spans });
             return;
         },
         .tool_result => {
@@ -751,4 +809,47 @@ test "lineCountForNode returns 1 for all types" {
         .children = .empty,
     };
     try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(&node));
+}
+
+test "lineCountForNode counts hidden tool_result child lines when tool_call is collapsed" {
+    const allocator = std.testing.allocator;
+
+    var tree = @import("ConversationTree.zig").init(allocator);
+    defer tree.deinit();
+
+    const call = try tree.appendNode(null, .tool_call, "bash");
+    _ = try tree.appendNode(call, .tool_result, "line one\nline two\nline three");
+
+    call.collapsed = true;
+
+    const renderer = NodeRenderer.initDefault();
+    // tool_call collapsed: its own header line plus a hint line that names the hidden body.
+    try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call));
+}
+
+test "rendering a collapsed tool_call with a tool_result child does not leak under testing.allocator" {
+    const allocator = std.testing.allocator;
+    var tree = @import("ConversationTree.zig").init(allocator);
+    defer tree.deinit();
+
+    const call = try tree.appendNode(null, .tool_call, "bash");
+    _ = try tree.appendNode(call, .tool_result, "row one\nrow two\nrow three");
+    call.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+
+    // Render twice with a content_version bump in between, mirroring what
+    // happens when the cache invalidates and refills. testing.allocator
+    // would flag a leak in either pass if span text were owned-but-never-freed.
+    inline for (0..2) |_| {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(call, &lines, allocator, &theme);
+        try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+        // Confirm the hint line carries the expected count token.
+        const hint_text = try lines.items[1].toText(allocator);
+        defer allocator.free(hint_text);
+        try std.testing.expect(std.mem.indexOf(u8, hint_text, "3 lines hidden") != null);
+        call.markDirty();
+    }
 }
