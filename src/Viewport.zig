@@ -13,13 +13,16 @@ const Layout = @import("Layout.zig");
 
 const Viewport = @This();
 
-/// Topmost visible line in the buffer's line model.
+/// Physical rows scrolled back from the latest content. 0 = anchored to
+/// the buffer's tail.
 scroll_offset: u32 = 0,
 /// Tree generation observed by the pane at its last clean render.
 last_seen_generation: u32 = 0,
 /// Set when scroll offset changes between clears; orthogonal to generation drift.
 scroll_dirty: bool = false,
-/// Most recent layout rect the pane was assigned, or null before first layout.
+/// Most recent layout rect the pane was assigned, or null before first
+/// layout. Currently informational; kept as a hook for future per-pane
+/// rect-aware logic (e.g. resize-aware scroll preservation).
 cached_rect: ?Layout.Rect = null,
 /// Total physical rows the buffer occupied at the last `planScroll`. Written
 /// by the Compositor each frame after projecting logical lines onto the
