@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ConversationBuffer = @import("../ConversationBuffer.zig");
+const ConversationTree = @import("../ConversationTree.zig");
 const Node = ConversationBuffer.Node;
 const Sink = @import("../Sink.zig").Sink;
 const Event = @import("../Sink.zig").Event;
@@ -165,8 +166,8 @@ pub const BufferSink = struct {
                 // refreshes into the collapsed-with-hint two-line rendering
                 // now that a non-empty tool_result child exists.
                 parent.markDirty();
-                self.buffer.tree.dirty_nodes.push(parent.id);
                 self.buffer.tree.generation +%= 1;
+                self.buffer.tree.dirty_nodes.push(parent.id);
             },
             .run_end => {
                 // Clear the full correlation state, not just the live
@@ -376,12 +377,22 @@ test "tool_result event bumps parent tool_call dirty state" {
     s.push(.{ .tool_use = .{ .name = "bash", .call_id = "id-A" } });
     const parent = cb.tree.root_children.items[0];
     const version_before_result = parent.content_version;
-    const generation_before_result = cb.tree.currentGeneration();
 
     s.push(.{ .tool_result = .{ .content = "some output", .call_id = "id-A" } });
 
     try std.testing.expect(parent.content_version != version_before_result);
-    try std.testing.expect(cb.tree.currentGeneration() != generation_before_result);
+
+    // The parent id must land in the dirty ring so the renderer drops the
+    // cached one-line tool_call rendering. appendNode for the child already
+    // pushes the *child* id; this assertion is what pins the parent bump.
+    var out: [ConversationTree.DirtyRing.capacity]u32 = undefined;
+    const drained = cb.tree.dirty_nodes.drain(&out);
+    var saw_parent = false;
+    for (out[0..drained.written]) |id| if (id == parent.id) {
+        saw_parent = true;
+        break;
+    };
+    try std.testing.expect(saw_parent);
 }
 
 test "BufferSink error_event appends an err node" {
