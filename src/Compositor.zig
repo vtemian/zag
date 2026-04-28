@@ -2172,3 +2172,217 @@ test "drawStyledLineWrapped: matches wrappedRowCountMulti on consumed rows" {
 
     try std.testing.expectEqual(@as(u16, @intCast(expected_rows)), consumed);
 }
+
+// Custom NodeRenderer hook used by the composite-level Bug A/B regression
+// tests below. Emits the exact 2-span shape requested in `node.content` so
+// the test can craft a logical line whose wrap boundary lands at a span
+// seam (Bug A) or in the middle of a non-first span (Bug B). Span text
+// borrows from `node.content.items`, which outlives the rendered line via
+// `NodeLineCache`.
+const test_renderer_split = struct {
+    fn renderTwoSpansAtSeparator(
+        node: *const ConversationTree.Node,
+        lines: *std.ArrayList(Theme.StyledLine),
+        alloc: Allocator,
+        theme: *const Theme,
+    ) !void {
+        _ = theme;
+        const content = node.content.items;
+        // Find the '|' separator. Span 1 = bytes before, span 2 = bytes after.
+        const idx = std.mem.indexOfScalar(u8, content, '|') orelse content.len;
+        const first = content[0..idx];
+        const second = if (idx < content.len) content[idx + 1 ..] else "";
+        const spans = try alloc.alloc(Theme.StyledSpan, 2);
+        spans[0] = .{ .text = first, .style = .{} };
+        spans[1] = .{ .text = second, .style = .{} };
+        try lines.append(alloc, .{ .spans = spans });
+    }
+}.renderTwoSpansAtSeparator;
+
+test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
+    // Hand-trace against the buggy code (per-span Screen.writeStrWrapped chain):
+    //   - Span 0 "abcde" writes at cur_col=content_x with a 5-cell pane,
+    //     fills cols 0..4, leaves cur_col at the wrap boundary (== max_col).
+    //   - Span 1 "f" arrives with cur_col already past the right edge. The
+    //     prior chained `writeStrWrapped` advanced its own cur_col across
+    //     calls, and a span starting exactly at the wrap boundary silently
+    //     dropped its first cluster (it tried to write at col == max_col,
+    //     hit the bounds check, never wrapped to the next row).
+    //   - Result: the second-span byte 'f' was written nowhere; the cell
+    //     for row content_y+1 stayed an empty space.
+    // The current cluster-walker fix wraps `f` to the next row at content_x.
+    // This composite test would have failed against the buggy code with
+    // 'f' missing from the entire screen.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 8, 6);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    var viewport: @import("Viewport.zig") = .{};
+    cb.attachViewport(&viewport);
+
+    // Swap the default renderer for one that emits exactly the spans we
+    // want. Precedent: NodeRenderer "custom override replaces default
+    // renderer" test.
+    cb.renderer = @import("NodeRenderer.zig").init(allocator);
+    defer cb.renderer.deinit();
+    try cb.renderer.register("custom", test_renderer_split);
+
+    _ = try cb.appendNode(null, .custom, "abcde|f");
+
+    // outer.width=8 -> rect.width=6 -> content_x=2, content_max_col=7,
+    // pane_width=5. Spans ["abcde","f"] fill cols 2..6 then wrap "f" to
+    // the next row at col 2.
+    const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
+    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+
+    // First-row content: 'a' at col 2, 'e' at col 6.
+    try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(1, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'e'), screen.getCellConst(1, 6).codepoint);
+    // Second-span byte must appear somewhere on the screen, not silently
+    // dropped. Specifically, it must land on row content_y+1 at content_x.
+    var found_f = false;
+    for (0..screen.height) |r| for (0..screen.width) |c| {
+        if (screen.getCellConst(@intCast(r), @intCast(c)).codepoint == 'f') {
+            found_f = true;
+            break;
+        }
+    };
+    try std.testing.expect(found_f);
+}
+
+test "composite: wrapped continuation lands at content_x, not span tail (Bug B regression)" {
+    // Hand-trace against the buggy code (per-span Screen.writeStrWrapped chain):
+    //   - Span 0 "hello " (6 cols) writes at content_x=2, ends at col 8.
+    //   - Span 1 "world from beyond" (17 cols) was passed `start_col=8` to
+    //     a per-span writeStrWrapped. That helper wrapped against `max_col`
+    //     using `start_col` as the *left edge of every wrapped row*: a
+    //     wrapped continuation indented to col 8 instead of returning to
+    //     content_x=2. The visible artefact: the wrapped 'd' (and the rest
+    //     of the second span) all sat at col 8+, leaving cols 2..7 of the
+    //     wrapped rows blank.
+    // The current walker resets `col` to content_x on wrap. This composite
+    // test would have failed against the buggy code: the assertion
+    // expectEqual(' ', cell at row content_y+1, col 2) would have fired
+    // because the buggy continuation sat at col 8.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 14, 8);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    var viewport: @import("Viewport.zig") = .{};
+    cb.attachViewport(&viewport);
+
+    cb.renderer = @import("NodeRenderer.zig").init(allocator);
+    defer cb.renderer.deinit();
+    try cb.renderer.register("custom", test_renderer_split);
+
+    // Spans: "hello " (6 cols) + "world from beyond" (17 cols).
+    _ = try cb.appendNode(null, .custom, "hello |world from beyond");
+
+    // outer.width=14 -> rect.width=12 -> content_x=2, content_max_col=13,
+    // pane_width=11. "hello " fills cols 2..7. "world from beyond" begins at
+    // col 8: 'w','o','r','l','d',' ','f','r','o','m','' fills cols 8..12.
+    // Wait pane_width=11 covers cols 2..12 (max_col=13 exclusive).
+    // 'h'2,'e'3,'l'4,'l'5,'o'6,' '7. Then "world from beyond":
+    // 'w'8,'o'9,'r'10,'l'11,'d'12. 'd' at col 12 keeps col<max_col (13).
+    // ' ' would land at col 13 = max_col → wrap. Continuation at content_x=2
+    // begins with ' ', then 'f','r','o','m' at cols 2..6.
+    const outer = Layout.Rect{ .x = 0, .y = 0, .width = 14, .height = 8 };
+    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'w'), screen.getCellConst(1, 8).codepoint);
+    try std.testing.expectEqual(@as(u21, 'd'), screen.getCellConst(1, 12).codepoint);
+    // Wrapped continuation lands at col 2 (content_x). The buggy code put
+    // it at col 8.
+    try std.testing.expectEqual(@as(u21, 'f'), screen.getCellConst(2, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'r'), screen.getCellConst(2, 4).codepoint);
+    // Cols 0 and 1 (outside content area) and the wrap-row gutter must be
+    // blank. The buggy continuation would have put visible glyphs at col 8
+    // on row content_y+1 instead of col 2; assert col 8 of the wrapped row
+    // does not start a continued word.
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(2, 1).codepoint);
+}
+
+test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regression)" {
+    // Hand-trace against the buggy code (planScroll snapping to whole
+    // logical-line boundaries):
+    //   - Buffer has 5 user_messages. Each renders as ["> ", "12345678"]
+    //     totaling 10 cells. At pane_width=5 each line wraps to 2 physical
+    //     rows, so total_rows=10.
+    //   - visible_rows=3, scroll=0 -> visible_end_rows=10,
+    //     visible_start_rows=7. Walking 2-row lines: line 3 ends at row 7,
+    //     line 4 ends at row 9. The visible window covers physical rows
+    //     7..9: bottom row of line 3 + both rows of line 4.
+    //   - The buggy planScroll computed leading_skip_rows but the renderer
+    //     ignored it (stale Screen.writeStrWrapped chain had no concept of
+    //     sub-line skip). Either:
+    //       (a) planScroll snapped skip up to the next whole line (skip=4)
+    //           and rendered only line 4, leaving the top of the visible
+    //           region blank and pushing the latest content to the middle
+    //           instead of the bottom; or
+    //       (b) planScroll set skip=3 with leading=0 and the renderer drew
+    //           line 3 at the top of the visible region, causing line 4's
+    //           bottom row ("45678") to fall *off* the bottom of the pane.
+    //     Either way, the bottom-most visible row of the pane did not
+    //     contain "45678" — there was a blank gap at the bottom.
+    // The current walker honors leading_skip_rows natively, so line 3 is
+    // clipped to its bottom row and line 4 occupies the bottom 2 rows.
+    const allocator = std.testing.allocator;
+    // outer.width=8 -> rect.width=6 -> content_x=2, content_max_col=7,
+    // pane_width=5. outer.height: need visible_rows=3, so rect.height >=
+    // 3 + reserve_prompt(1) = 4 -> outer.height >= 4 + 2 = 6. Pick 6.
+    var screen = try Screen.init(allocator, 8, 6);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    var viewport: @import("Viewport.zig") = .{};
+    cb.attachViewport(&viewport);
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try cb.appendNode(null, .user_message, "12345678");
+    }
+
+    // Sanity-check the precondition: planScroll must produce
+    // leading_skip_rows > 0 for this fixture, otherwise we're not actually
+    // exercising the mid-line scroll path.
+    const probe = try planScroll(
+        cb.buf(),
+        &theme,
+        compositor.frame_arena.allocator(),
+        compositor.allocator,
+        5,
+        3,
+        0,
+    );
+    try std.testing.expect(probe.leading_skip_rows > 0);
+
+    const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
+    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+
+    // content_y = outer.y + 1 + padding_v(0) = 1. visible_rows=3, so
+    // content rows occupy 1..3. The bottom visible row is row 3, holding
+    // line 4's tail "45678" (cols 2..6).
+    const bottom_row: u16 = 3;
+    try std.testing.expectEqual(@as(u21, '4'), screen.getCellConst(bottom_row, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, '5'), screen.getCellConst(bottom_row, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, '8'), screen.getCellConst(bottom_row, 6).codepoint);
+}
