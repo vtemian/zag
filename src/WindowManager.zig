@@ -598,13 +598,16 @@ pub fn splitById(
     return error.HandleMissing;
 }
 
-/// Close the leaf identified by `target`. When `caller` is non-null and
-/// refers to the same pane, the call fails with `error.ClosingActivePane`
-/// so a plugin tool cannot pull the rug out from under its own agent.
-/// After the close, the layout is recalculated and surviving leaves are
-/// notified of their new rects (same post-close work as the
-/// `.close_window` keymap action). Focus is restored to the caller's
-/// previous pane when that pane is still live.
+/// Close the leaf or float identified by `target`. When `caller` is
+/// non-null and refers to the same pane, the call fails with
+/// `error.ClosingActivePane` so a plugin tool cannot pull the rug out
+/// from under its own agent. After a tile close, the layout is
+/// recalculated and surviving leaves are notified of their new rects
+/// (same post-close work as the `.close_window` keymap action). Focus
+/// is restored to the caller's previous pane when that pane is still
+/// live. Float handles are routed to `closeFloatById` so a single entry
+/// point covers both addressing namespaces; the caller never has to
+/// branch on `Layout.isFloatHandle`.
 pub fn closeById(
     self: *WindowManager,
     target: NodeRegistry.Handle,
@@ -615,6 +618,7 @@ pub fn closeById(
             return error.ClosingActivePane;
         }
     }
+    if (Layout.isFloatHandle(target)) return self.closeFloatById(target);
     const node = try self.node_registry.resolve(target);
     if (node.* != .leaf) return error.NotALeaf;
 
@@ -2644,6 +2648,75 @@ test "closeById rejects the caller's own pane" {
         unreachable;
     };
     try std.testing.expectError(error.ClosingActivePane, wm.closeById(root_handle, root_handle));
+}
+
+test "closeById routes float handles to closeFloatById" {
+    // Regression: pre-fix, `closeById(float_handle)` ran the leaf
+    // resolver and returned `error.NotALeaf` — a Lua-side branch on
+    // `Layout.isFloatHandle` was the only thing keeping the picker
+    // close path alive. Now `closeById` checks the float namespace
+    // first so any future Zig-side caller can hand it either kind.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var session_scratch = ConversationHistory.init(allocator);
+    defer session_scratch.deinit();
+    var view = try ConversationBuffer.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(view.buf());
+    layout.recalculate(screen.width, screen.height);
+
+    const bh = try wm.buffer_registry.createScratch("popup");
+    const buf = try wm.buffer_registry.asBuffer(bh);
+    const float_handle = try wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .width = 10,
+        .height = 4,
+        .enter = false,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), layout.floats.items.len);
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_floats.items.len);
+
+    try wm.closeById(float_handle, null);
+
+    try std.testing.expectEqual(@as(usize, 0), layout.floats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), wm.extra_floats.items.len);
 }
 
 test "resizeById applies ratio to parent split" {

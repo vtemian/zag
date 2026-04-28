@@ -37,25 +37,21 @@ local function open()
 
     local focused = zag.layout.tree().focus
 
-    -- Static centered float for slice 1. Layout doesn't surface screen
-    -- dimensions to Lua yet, so the picker hardcodes a reasonable size
-    -- and offset. Slice 2 swaps these for size-to-content + cursor or
-    -- editor-center anchors once `zag.layout.tree()` exposes the root
-    -- rect.
-    --
-    -- Geometry (row 4, col 10, w=50, h=16) lands the float in rows 4..20
-    -- on a baseline 80x24 terminal, leaving rows 20..23 free for the
-    -- status row plus a top margin so the picker never paints over the
-    -- bottom chrome. Slice 2 will replace this with screen-dim-aware
-    -- centering once layout exposes its rect.
+    -- Editor-anchored, size-to-content float. The orchestrator
+    -- re-resolves the rect every frame from the buffer's longest line
+    -- (clamped to `min_/max_*`) so the picker shrinks on small
+    -- terminals and never overflows on a default 80x24 — the static
+    -- 50x16 + (4,10) offset of slice 1 used to clip on a 60x10 PTY.
     local picker_pane = zag.layout.float(buf, {
-        relative = "editor",
-        row      = 4,
-        col      = 10,
-        width    = 50,
-        height   = 16,
-        border   = "rounded",
-        title    = "Models",
+        relative   = "editor",
+        row        = 2,
+        col        = 4,
+        min_width  = 40,
+        max_width  = 70,
+        min_height = 6,
+        max_height = 18,
+        border     = "rounded",
+        title      = "Models",
     })
 
     -- Snapshot the caller's mode and flip to normal so the picker's

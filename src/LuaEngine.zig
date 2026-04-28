@@ -2725,22 +2725,14 @@ pub const LuaEngine = struct {
     /// `zag.layout.close(id)`: close the leaf or float identified by
     /// `id`. Plugin-level calls run on the main thread as user code, so
     /// they bypass the caller-pane guard (no caller pane exists here).
-    /// Float handles route to `closeFloatById`; tile handles route to
-    /// the existing `closeById` path.
+    /// `closeById` routes float handles internally so this dispatcher
+    /// is namespace-agnostic.
     fn zagLayoutCloseFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const wm = engine.window_manager orelse {
             lua.raiseErrorStr("zag.layout.close: no window manager bound", .{});
         };
         const handle = requireLayoutHandle(lua, 1, "zag.layout.close");
-        if (Layout.isFloatHandle(handle)) {
-            wm.closeFloatById(handle) catch |err| {
-                var buf: [128]u8 = undefined;
-                const msg = std.fmt.bufPrintZ(&buf, "zag.layout.close: {s}", .{@errorName(err)}) catch "zag.layout.close failed";
-                lua.raiseErrorStr("%s", .{msg.ptr});
-            };
-            return 0;
-        }
         wm.closeById(handle, null) catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.layout.close: {s}", .{@errorName(err)}) catch "zag.layout.close failed";
