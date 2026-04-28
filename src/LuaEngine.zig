@@ -656,6 +656,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "current_model");
         lua.pushFunction(zlua.wrap(zagPaneSetDraftFn));
         lua.setField(-2, "set_draft");
+        lua.pushFunction(zlua.wrap(zagPaneGetDraftFn));
+        lua.setField(-2, "get_draft");
         lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
         lua.setField(-2, "replace_draft_range");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
@@ -3504,6 +3506,26 @@ pub const LuaEngine = struct {
         };
         pane.setDraft(text);
         return 0;
+    }
+
+    /// `zag.pane.get_draft(pane_id)`: return the current in-progress draft of
+    /// `pane_id` as a Lua string. Returns `""` for a pane that has never been
+    /// typed into. Pairs with `zag.pane.set_draft` so autocomplete plugins
+    /// can read the live draft without the orchestrator having to thread it
+    /// through as an explicit argument.
+    fn zagPaneGetDraftFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.get_draft: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.get_draft");
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.get_draft: {s}", .{@errorName(err)}) catch "zag.pane.get_draft failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        _ = lua.pushString(pane.getDraft());
+        return 1;
     }
 
     /// `zag.pane.replace_draft_range(pane_id, from_byte, to_byte, replacement)`:

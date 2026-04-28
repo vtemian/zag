@@ -4524,6 +4524,116 @@ test "zag.pane.set_draft raises on invalid pane handle" {
     engine.lua.pop(1);
 }
 
+test "zag.pane.get_draft round-trips through set_draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "round trip")
+        \\_G.observed = zag.pane.get_draft("{s}")
+    , .{ pane_id, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("observed");
+    defer engine.lua.pop(1);
+    const observed = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("round trip", observed);
+}
+
+test "zag.pane.get_draft returns empty string for an untouched pane" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.observed = zag.pane.get_draft("{s}")
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("observed");
+    defer engine.lua.pop(1);
+    const observed = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("", observed);
+}
+
+test "zag.pane.get_draft reads a float pane's draft" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Symmetry with the set_draft float test: open a focused float, mutate
+    // its draft, then read it back through the float handle. Confirms
+    // paneFromHandle's float path works for reads as well as writes.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "picker" }
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 2, col = 2,
+        \\  width = 20, height = 6,
+        \\  enter = true,
+        \\})
+        \\zag.pane.set_draft(_h, "float draft")
+        \\_G.observed = zag.pane.get_draft(_h)
+    );
+
+    _ = try f.engine.lua.getGlobal("observed");
+    defer f.engine.lua.pop(1);
+    const observed = try f.engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("float draft", observed);
+}
+
+test "zag.pane.get_draft raises on invalid pane handle" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const result = engine.lua.doString(
+        \\zag.pane.get_draft("n9999")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
 test "zag.pane.replace_draft_range replaces a slice of the draft" {
     const allocator = std.testing.allocator;
     var f: PickerFixture = undefined;
@@ -5183,8 +5293,14 @@ const ModelPickerPluginFixture = struct {
             .command_registry = &self.engine.command_registry,
         };
 
-        try self.wm.attachLayoutRegistry();
+        // setRoot before attachLayoutRegistry so the registry's root_pane
+        // handle backfill at attach time finds a real root to walk.
+        // Reversing the order leaves root_pane.handle nil, which silently
+        // breaks PaneDraftChange dispatch (the hook fires with a missing
+        // pane handle). Production wires them in this order at main.zig
+        // already; the fixture must match.
         try self.layout.setRoot(self.view.buf());
+        try self.wm.attachLayoutRegistry();
         self.layout.recalculate(self.screen.width, self.screen.height);
 
         self.engine.window_manager = self.wm;
@@ -5752,11 +5868,7 @@ test "zag.popup.list.open creates a float, populates the buffer, and selects row
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5806,11 +5918,7 @@ test "zag.popup.list down arrow advances selection and clamps at the end" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5853,11 +5961,7 @@ test "zag.popup.list re-narrows on PaneDraftChange and resets selection" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5915,11 +6019,7 @@ test "zag.popup.list commit replaces the trigger range with item.word" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5956,11 +6056,7 @@ test "zag.popup.list cancel fires on_cancel, leaves draft unchanged, closes floa
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5996,11 +6092,7 @@ test "zag.popup.list.close tears down hook, buffer, and float" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
