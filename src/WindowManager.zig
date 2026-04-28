@@ -144,12 +144,20 @@ pub const Pane = struct {
     }
 
     /// Append a chunk of bytes to the draft (e.g. a bracketed paste).
-    /// Truncates past `draft.len` with a warn log.
+    /// Truncates past `draft.len` with a warn log. Skips the snapshot
+    /// and hook fire when no bytes will land (empty input or full draft):
+    /// firing `pane_draft_change` with previous == current is observably
+    /// a no-op event, and plugins should not have to filter it.
     pub fn appendPaste(self: *Pane, data: []const u8) void {
-        var prev_buf: [MAX_DRAFT]u8 = undefined;
-        const prev = snapshotDraft(self, &prev_buf);
+        if (data.len == 0) return;
         const room = self.draft.len - self.draft_len;
         const to_copy = @min(room, data.len);
+        if (to_copy == 0) {
+            log.warn("paste truncated: {d} bytes dropped (draft full)", .{data.len});
+            return;
+        }
+        var prev_buf: [MAX_DRAFT]u8 = undefined;
+        const prev = snapshotDraft(self, &prev_buf);
         @memcpy(self.draft[self.draft_len..][0..to_copy], data[0..to_copy]);
         self.draft_len += to_copy;
         if (to_copy < data.len) {
@@ -194,12 +202,22 @@ pub const Pane = struct {
     /// Replace the entire draft with `text`. Truncates silently to
     /// `MAX_DRAFT` with a warn log (matches `appendPaste`'s policy: a
     /// caller that pushes more than the cap loses the tail rather than
-    /// failing the whole operation).
+    /// failing the whole operation). No-ops when `text` (after
+    /// truncation) already equals the current draft: a Slice 4 popup
+    /// helper that defensively echoes the current value back through
+    /// `set_draft` should not pay for a hook fire on every keystroke.
     pub fn setDraft(self: *Pane, text: []const u8) void {
+        const to_copy = @min(self.draft.len, text.len);
+        const incoming = text[0..to_copy];
+        if (std.mem.eql(u8, incoming, self.getDraft())) {
+            if (to_copy < text.len) {
+                log.warn("setDraft truncated: {d} bytes dropped (over MAX_DRAFT)", .{text.len - to_copy});
+            }
+            return;
+        }
         var prev_buf: [MAX_DRAFT]u8 = undefined;
         const prev = snapshotDraft(self, &prev_buf);
-        const to_copy = @min(self.draft.len, text.len);
-        @memcpy(self.draft[0..to_copy], text[0..to_copy]);
+        @memcpy(self.draft[0..to_copy], incoming);
         self.draft_len = to_copy;
         if (to_copy < text.len) {
             log.warn("setDraft truncated: {d} bytes dropped (over MAX_DRAFT)", .{text.len - to_copy});
@@ -4824,6 +4842,156 @@ test "PaneDraftChange fires on float draft via zag.pane.set_draft" {
 
     _ = try engine.lua.getGlobal("last_draft");
     try std.testing.expectEqualStrings("hello", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire when appendPaste is called with empty data" {
+    // Pasting zero bytes is observably a no-op; a hook fire here would
+    // surface previous == current and force every observer to filter it.
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    f.wm.root_pane.appendPaste("");
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire when appendPaste has no room in the draft" {
+    // The draft is already full; appendPaste cannot land any bytes, so
+    // it must not fire the hook. The truncation warn still logs.
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    // Fill the draft to MAX_DRAFT directly (avoids 4096 hook fires).
+    f.wm.root_pane.draft_len = MAX_DRAFT;
+    @memset(f.wm.root_pane.draft[0..MAX_DRAFT], 'a');
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    f.wm.root_pane.appendPaste("more");
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire when setDraft is called with current draft text" {
+    // Plugins (e.g. the Slice 4 popup helper) may defensively echo the
+    // current value back through set_draft. That must not fire the hook,
+    // because the draft did not actually change.
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    f.wm.root_pane.setDraft("hello");
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    f.wm.root_pane.setDraft("hello");
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // Sanity: a real change still fires.
+    f.wm.root_pane.setDraft("world");
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneDraftChange does not fire on consumeDraft" {
+    // Submission drains the draft via consumeDraft; firing the hook here
+    // would expose plugins to a misleading "draft cleared" event right
+    // after the user pressed Enter. Locks the contract documented on
+    // `consumeDraft`.
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.layout.setRoot(f.view.buf());
+    try f.wm.attachLayoutRegistry();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+    f.wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneDraftChange", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    // Sanity: a draft mutation still fires the hook.
+    f.wm.root_pane.appendToDraft('h');
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    // The contract: consumeDraft must NOT fire pane_draft_change.
+    var scratch: [MAX_DRAFT]u8 = undefined;
+    const taken = f.wm.root_pane.consumeDraft(&scratch);
+    try std.testing.expectEqualStrings("h", taken);
+    try std.testing.expectEqualStrings("", f.wm.root_pane.getDraft());
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
     engine.lua.pop(1);
 }
 
