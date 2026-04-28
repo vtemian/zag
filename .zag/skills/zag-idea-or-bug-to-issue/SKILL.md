@@ -23,9 +23,11 @@ Use this skill when Vlad says things like:
 ## Principles
 
 - Keep the issue focused on one outcome.
+- Ask Vlad clarifying questions before drafting the issue. Do not jump straight from a rough report to a full issue body.
 - Gather just enough context from the repo to make the issue actionable.
 - Preserve uncertainty explicitly instead of inventing requirements.
-- Prefer links to concrete files, commands, failing behavior, or existing architecture.
+- Prefer concrete facts: commands, exact UI state, files, logs, session IDs, screenshots, and observed behavior.
+- Be precise and concise. No generic motivation paragraphs, broad implementation plans, or AI-sounding filler.
 - Do not create the GitHub issue until Vlad confirms the final draft, unless he explicitly says to create it directly.
 
 ## Procedure

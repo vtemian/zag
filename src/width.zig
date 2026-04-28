@@ -249,6 +249,50 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
     return .{ .base = first, .width = base_width, .byte_len = iter.i - start };
 }
 
+/// Count how many terminal rows `text` occupies when wrapped to `width` columns.
+/// Mirrors `Screen.writeStrWrapped` cluster wrapping so scroll math and
+/// rendering agree on wide glyphs and ZWJ clusters.
+pub fn wrappedRowCount(text: []const u8, width: u16) u32 {
+    if (width == 0 or text.len == 0) return 1;
+
+    var rows: u32 = 1;
+    var col: u16 = 0;
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    while (true) {
+        const cluster = nextCluster(&iter) orelse break;
+        const w = cluster.width;
+        if (w == 0) continue;
+        if (w > width) return rows;
+        if (col + w > width) {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+    }
+    return rows;
+}
+
+test "wrappedRowCount: empty input is one row" {
+    try testing.expectEqual(@as(u32, 1), wrappedRowCount("", 10));
+}
+
+test "wrappedRowCount: short ASCII fits in one row" {
+    try testing.expectEqual(@as(u32, 1), wrappedRowCount("hello", 10));
+}
+
+test "wrappedRowCount: ASCII overflow wraps proportional to width" {
+    try testing.expectEqual(@as(u32, 3), wrappedRowCount("a" ** 25, 10));
+}
+
+test "wrappedRowCount: width 0 returns at least 1 row" {
+    try testing.expectEqual(@as(u32, 1), wrappedRowCount("anything", 0));
+}
+
+test "wrappedRowCount: matches Screen.writeStrWrapped row advance for wide clusters" {
+    try testing.expectEqual(@as(u32, 2), wrappedRowCount("漢字", 3));
+}
+
 fn isRegionalIndicator(cp: u21) bool {
     return cp >= 0x1F1E6 and cp <= 0x1F1FF;
 }
