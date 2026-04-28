@@ -367,11 +367,11 @@ pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
 }
 
-/// Flip `collapsed` on every `.thinking` / `.thinking_redacted` node in
-/// the tree. Returns the number of nodes touched. Used by the Ctrl-R
-/// keybinding; scoped to the buffer so the state is per-pane.
-pub fn toggleAllThinkingCollapsed(self: *ConversationBuffer) usize {
-    return self.tree.toggleAllThinkingCollapsed();
+/// Flip `collapsed` on every foldable node (thinking, thinking_redacted,
+/// tool_call) in the tree. Returns the number of nodes touched. Used by
+/// the Ctrl-R keybinding; scoped to the buffer so the state is per-pane.
+pub fn toggleAllFoldableCollapsed(self: *ConversationBuffer) usize {
+    return self.tree.toggleAllFoldableCollapsed();
 }
 
 // -- Buffer interface --------------------------------------------------------
@@ -443,15 +443,16 @@ fn bufClearDirty(ptr: *anyopaque) void {
 
 /// Handle a key event the buffer claims as its own. Drafts moved to
 /// `WindowManager.Pane`, so this is now reserved for buffer-internal
-/// chords. Today only Ctrl+R (toggle all thinking-block collapse)
-/// applies; everything else passes through and `Pane.handleKey` decides
-/// whether to land it in the draft or drop it.
+/// chords. Today only Ctrl+R applies, toggling collapse on every
+/// foldable node (thinking, thinking_redacted, tool_call); everything
+/// else passes through and `Pane.handleKey` decides whether to land it
+/// in the draft or drop it.
 pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleResult {
     if (ev.modifiers.ctrl) {
         switch (ev.key) {
             .char => |ch| {
                 if (ch == 'r') {
-                    _ = self.toggleAllThinkingCollapsed();
+                    _ = self.toggleAllFoldableCollapsed();
                     return .consumed;
                 }
             },
@@ -1013,6 +1014,21 @@ test "Ctrl-R toggles collapsed on every thinking node" {
     try std.testing.expect(t2.collapsed);
 }
 
+test "Ctrl-R toggles collapsed on tool_call nodes too" {
+    const allocator = std.testing.allocator;
+    var cb = try ConversationBuffer.init(allocator, 0, "tool-toggle");
+    defer cb.deinit();
+
+    const call = try cb.appendNode(null, .tool_call, "bash");
+    call.collapsed = true;
+
+    _ = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expect(!call.collapsed);
+
+    _ = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expect(call.collapsed);
+}
+
 test "Ctrl-R is consumed even with no thinking nodes" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "thinking-empty");
@@ -1037,7 +1053,7 @@ test "getVisibleLines reflects collapsed-to-expanded toggle" {
     defer collapsed_lines.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), collapsed_lines.items.len);
 
-    _ = cb.toggleAllThinkingCollapsed();
+    _ = cb.toggleAllFoldableCollapsed();
 
     var expanded_lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
     defer expanded_lines.deinit(allocator);
