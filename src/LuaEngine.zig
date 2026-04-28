@@ -27,6 +27,7 @@ const Instruction = @import("Instruction.zig");
 const Reminder = @import("Reminder.zig");
 const WindowManager = @import("WindowManager.zig");
 const agent_events = @import("agent_events.zig");
+const width = @import("width.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -656,6 +657,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "current_model");
         lua.pushFunction(zlua.wrap(zagPaneSetDraftFn));
         lua.setField(-2, "set_draft");
+        lua.pushFunction(zlua.wrap(zagPaneGetDraftFn));
+        lua.setField(-2, "get_draft");
         lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
         lua.setField(-2, "replace_draft_range");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
@@ -790,6 +793,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
         lua.setField(-2, "strategy");
         lua.setField(-2, "compact"); // zag.compact = compact_table; [zag_table]
+
+        // zag.width; grapheme-aware terminal-cell width measurement. Plugins
+        // doing column alignment (e.g. popup-completion menus with mixed
+        // ASCII/CJK/emoji content) must call `cells(s)` instead of `#s` so
+        // wide and zero-width clusters don't skew the layout.
+        lua.newTable(); // [zag_table, width_table]
+        lua.pushFunction(zlua.wrap(zagWidthCellsFn));
+        lua.setField(-2, "cells");
+        lua.setField(-2, "width"); // zag.width = width_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -2536,6 +2548,20 @@ pub const LuaEngine = struct {
     ///
     /// Raises a Lua error on unterminated frontmatter or allocator
     /// failure; both are caller-fixable and should surface loudly.
+    /// `zag.width.cells(s)`: return the terminal-cell display width of
+    /// `s`, with grapheme-cluster awareness (CJK is 2, emoji is 2, ZWJ
+    /// sequences and combining marks are absorbed). Falls back to byte
+    /// length for invalid UTF-8 — the iterator runs over `Utf8View.initUnchecked`,
+    /// so callers passing arbitrary bytes get a "best effort" width
+    /// rather than a Lua error. Lua plugins use this in place of `#s`
+    /// when laying out columns over user-supplied content.
+    fn zagWidthCellsFn(lua: *Lua) i32 {
+        const text = lua.checkString(1);
+        const cells = width.displayWidth(text);
+        lua.pushInteger(@intCast(cells));
+        return 1;
+    }
+
     fn zagParseFrontmatterFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const src = lua.checkString(1);
@@ -3504,6 +3530,26 @@ pub const LuaEngine = struct {
         };
         pane.setDraft(text);
         return 0;
+    }
+
+    /// `zag.pane.get_draft(pane_id)`: return the current in-progress draft of
+    /// `pane_id` as a Lua string. Returns `""` for a pane that has never been
+    /// typed into. Pairs with `zag.pane.set_draft` so autocomplete plugins
+    /// can read the live draft without the orchestrator having to thread it
+    /// through as an explicit argument.
+    fn zagPaneGetDraftFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.get_draft: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.get_draft");
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.get_draft: {s}", .{@errorName(err)}) catch "zag.pane.get_draft failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        _ = lua.pushString(pane.getDraft());
+        return 1;
     }
 
     /// `zag.pane.replace_draft_range(pane_id, from_byte, to_byte, replacement)`:
