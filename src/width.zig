@@ -442,9 +442,9 @@ test "nextCluster: byte_len covers combining mark with base" {
 /// Count the screen rows `text` would consume when rendered into a region of
 /// `width` columns. Mirrors the cluster-walk wrap math in
 /// `Screen.writeStrWrapped` so render-time layout and measurement-time layout
-/// agree by construction. Returns at least 1 (an empty buffer still occupies
-/// one row visually, and `width == 0` is treated as a degenerate single row
-/// rather than divided by).
+/// agree by construction. Returns the number of rows that would contain at
+/// least one rendered cluster (always at least 1; `width == 0` is treated as
+/// a degenerate single row rather than divided by).
 pub fn wrappedRowCount(text: []const u8, width: u16) u32 {
     if (width == 0) return 1;
     var rows: u32 = 1;
@@ -454,13 +454,12 @@ pub fn wrappedRowCount(text: []const u8, width: u16) u32 {
     while (nextCluster(&iter)) |cluster| {
         const w = cluster.width;
         if (w == 0) continue;
+        // Over-wide cluster: writeStrWrapped bails without writing it, so no
+        // additional row is consumed.
+        if (w > width) break;
         if (col + w > width) {
             rows += 1;
             col = 0;
-            // Degenerate cluster wider than the whole row: writeStrWrapped's
-            // "still won't fit - give up" path bails out without writing it.
-            // Stop counting further wrapping for this cluster to mirror that.
-            if (col + w > width) break;
         }
         col += w;
     }
@@ -487,4 +486,17 @@ test "wrappedRowCount: width 0 returns at least 1 row" {
 test "wrappedRowCount: matches writeStrWrapped row advance for wide clusters" {
     // Two wide clusters at width 3 -> cluster1 fits (cols 0-1), cluster2 wraps to row 1.
     try std.testing.expectEqual(@as(u32, 2), wrappedRowCount("漢字", 3));
+}
+
+test "wrappedRowCount: over-wide cluster (w > width) does not inflate row count" {
+    // 漢 is width 2; with width=1 it cannot fit anywhere. Render bails after
+    // emitting nothing, so measurement must agree (1 row, the initial one).
+    try std.testing.expectEqual(@as(u32, 1), wrappedRowCount("漢", 1));
+}
+
+test "wrappedRowCount: over-wide cluster after content stops counting" {
+    // "a" fits at width=1, then 漢 (w=2) cannot fit on a fresh row of width=1;
+    // render gives up. wrappedRowCount must report exactly the rows that
+    // contained any drawn cluster: row 0 ('a'), no further rows.
+    try std.testing.expectEqual(@as(u32, 1), wrappedRowCount("a漢", 1));
 }
