@@ -97,8 +97,14 @@ pub const StreamEvent = union(enum) {
     text_delta: []const u8,
     /// Partial extended-thinking text. The `text` slice is borrowed from
     /// the SSE parser's scratch buffer and is only valid for the duration
-    /// of the callback; consumers must copy before stashing.
-    thinking_delta: struct { text: []const u8 },
+    /// of the callback; consumers must copy before stashing. `provider`
+    /// identifies the wire format that produced the delta so downstream
+    /// persistence and replay can preserve the right ThinkingProvider tag
+    /// instead of defaulting to Anthropic for everyone.
+    thinking_delta: struct {
+        text: []const u8,
+        provider: types.ContentBlock.ThinkingProvider = .none,
+    },
     /// End of a thinking block. Lets consumers flush an in-flight thinking
     /// node before the next content block (text or tool_use) begins.
     thinking_stop,

@@ -665,15 +665,24 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
                 .timestamp = ts,
             });
         },
-        .thinking_delta => |text| {
+        .thinking_delta => |td| {
             // Persist per-delta so a crash mid-stream still preserves
             // reasoning text. The history-rebuild path concatenates
             // consecutive thinking entries on replay, same as
-            // assistant_text.
+            // assistant_text. The provider tag travels through from the
+            // wire so cross-provider replay reconstructs the right
+            // ThinkingProvider variant instead of defaulting to
+            // Anthropic for everyone.
+            const provider_name: []const u8 = switch (td.provider) {
+                .anthropic => "anthropic",
+                .openai_responses => "openai_responses",
+                .openai_chat => "openai_chat",
+                .none => "none",
+            };
             self.session.persistEvent(.{
                 .entry_type = .thinking,
-                .content = text,
-                .thinking_provider = "anthropic",
+                .content = td.text,
+                .thinking_provider = provider_name,
                 .timestamp = ts,
             });
         },
@@ -731,9 +740,9 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             }
             self.sink.push(.{ .assistant_delta = .{ .text = text } });
         },
-        .thinking_delta => |text| {
-            defer allocator.free(text);
-            self.sink.push(.{ .thinking_delta = .{ .text = text } });
+        .thinking_delta => |td| {
+            defer allocator.free(td.text);
+            self.sink.push(.{ .thinking_delta = .{ .text = td.text } });
         },
         .thinking_stop => {
             self.sink.push(.thinking_stop);
@@ -916,7 +925,7 @@ test "persistAgentEvent is a no-op without an attached session handle" {
     defer runner.deinit();
 
     runner.persistAgentEvent(.{ .text_delta = "hello" });
-    runner.persistAgentEvent(.{ .thinking_delta = "thinking" });
+    runner.persistAgentEvent(.{ .thinking_delta = .{ .text = "thinking", .provider = .anthropic } });
     runner.persistAgentEvent(.{ .tool_start = .{ .name = "bash" } });
     runner.persistAgentEvent(.{ .tool_result = .{ .content = "ok", .is_error = false } });
     runner.persistAgentEvent(.{ .err = "boom" });
@@ -996,8 +1005,14 @@ test "thinking_delta emits a thinking_delta sink event" {
     var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "let me ") }, allocator);
-    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "reason") }, allocator);
+    runner.handleAgentEvent(.{ .thinking_delta = .{
+        .text = try allocator.dupe(u8, "let me "),
+        .provider = .anthropic,
+    } }, allocator);
+    runner.handleAgentEvent(.{ .thinking_delta = .{
+        .text = try allocator.dupe(u8, "reason"),
+        .provider = .anthropic,
+    } }, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
     try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
@@ -1014,7 +1029,10 @@ test "thinking_stop emits a thinking_stop sink event" {
     var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "hmm") }, allocator);
+    runner.handleAgentEvent(.{ .thinking_delta = .{
+        .text = try allocator.dupe(u8, "hmm"),
+        .provider = .anthropic,
+    } }, allocator);
     runner.handleAgentEvent(.thinking_stop, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
@@ -1035,7 +1053,10 @@ test "text_delta after thinking_delta still emits two sink events in order" {
     var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "reason") }, allocator);
+    runner.handleAgentEvent(.{ .thinking_delta = .{
+        .text = try allocator.dupe(u8, "reason"),
+        .provider = .anthropic,
+    } }, allocator);
     runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "answer") }, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
@@ -1052,7 +1073,10 @@ test "tool_start after thinking_delta emits both sink events in order" {
     var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    runner.handleAgentEvent(.{ .thinking_delta = try allocator.dupe(u8, "plan") }, allocator);
+    runner.handleAgentEvent(.{ .thinking_delta = .{
+        .text = try allocator.dupe(u8, "plan"),
+        .provider = .anthropic,
+    } }, allocator);
     runner.handleAgentEvent(.{ .tool_start = .{
         .name = try allocator.dupe(u8, "bash"),
     } }, allocator);
