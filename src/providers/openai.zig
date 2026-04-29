@@ -191,7 +191,9 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
                     if (!first) try w.writeAll(",");
                     first = false;
                     try w.writeAll("{\"role\":\"tool\",");
-                    try w.print("\"tool_call_id\":\"{s}\",", .{tr.tool_use_id});
+                    try w.writeAll("\"tool_call_id\":");
+                    try std.json.Stringify.value(tr.tool_use_id, .{}, w);
+                    try w.writeAll(",");
                     try w.writeAll("\"content\":");
                     try std.json.Stringify.value(tr.content, .{}, w);
                     try w.writeAll("}");
@@ -234,10 +236,11 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
                     // key" once the agent echoes a prior tool_use back
                     // in its second turn. Use Stringify.value to wrap
                     // and escape input_raw verbatim.
-                    try w.print(
-                        "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":",
-                        .{ tu.id, tu.name },
-                    );
+                    try w.writeAll("{\"id\":");
+                    try std.json.Stringify.value(tu.id, .{}, w);
+                    try w.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+                    try std.json.Stringify.value(tu.name, .{}, w);
+                    try w.writeAll(",\"arguments\":");
                     try std.json.Stringify.value(tu.input_raw, .{}, w);
                     try w.writeAll("}}");
                     tc_idx += 1;
@@ -1011,6 +1014,36 @@ test "openai writeMessage encodes tool_use arguments as JSON-encoded string per 
     const arguments = tc.items[0].object.get("function").?.object.get("arguments").?;
     try std.testing.expect(arguments == .string);
     try std.testing.expectEqualStrings("{\"path\":\"/tmp/test.txt\"}", arguments.string);
+}
+
+test "openai writeMessage escapes tu.id, tu.name, and tr.tool_use_id" {
+    // Defense in depth: tool ids/names come from the LLM and are
+    // assumed alphanumeric, but a malicious or buggy upstream could
+    // send a quote or backslash. Same shape of bug as the just-fixed
+    // arguments injection (commit aac6b7a).
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_use = .{
+        .id = "id\"with\\quote",
+        .name = "name\"with\\quote",
+        .input_raw = "{}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{}, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    // Round-trip parse confirms the JSON is valid AND escapes survived.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const tc = parsed.value.object.get("tool_calls").?.array;
+    try std.testing.expectEqualStrings("id\"with\\quote", tc.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("name\"with\\quote", tc.items[0].object.get("function").?.object.get("name").?.string);
 }
 
 test "openai writeMessage flattens tool_use into tool_calls" {
