@@ -299,7 +299,7 @@ fn writeThinkingEcho(
     if (!has_thinking) return;
 
     try w.writeAll(",\"");
-    try w.writeAll(echo);
+    try types.writeJsonStringContents(w, echo);
     try w.writeAll("\":\"");
     for (msg.content) |block| {
         if (block == .thinking and block.thinking.provider == .openai_chat) {
@@ -1285,4 +1285,46 @@ test "openai writeMessage skips echo when assistant has no .openai_chat thinking
     defer parsed.deinit();
 
     try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
+}
+
+test "openai writeMessage echoes thinking on plain-text assistant messages" {
+    // Coverage gap from b5ebe01: the three sibling tests all use
+    // tool_use messages, exercising only one of writeThinkingEcho's
+    // two call sites. This test asserts the plain-text branch (no
+    // tool_use, no tool_result) also emits the echo before the
+    // closing brace.
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "thinking through the answer",
+        .signature = null,
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .text = .{ .text = "the answer is 42" } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    try std.testing.expect(root.get("reasoning_content") != null);
+    try std.testing.expectEqualStrings(
+        "thinking through the answer",
+        root.get("reasoning_content").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "the answer is 42",
+        root.get("content").?.string,
+    );
+    // No tool_calls in plain-text branch.
+    try std.testing.expect(root.get("tool_calls") == null);
 }
