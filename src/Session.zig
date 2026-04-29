@@ -541,6 +541,11 @@ pub const SessionHandle = struct {
         self.append_mutex.lock();
         defer self.append_mutex.unlock();
 
+        // Empty new_name is treated as "no rename available" rather than
+        // landing as a zero-length name (which would leave the session in
+        // the unnamed state and invite a future caller to overwrite it).
+        if (new_name.len == 0) return false;
+
         if (self.meta.name_len > 0) return false;
 
         const name_len: u8 = @intCast(@min(new_name.len, self.meta.name.len));
@@ -1725,6 +1730,36 @@ test "renameIfUnnamed only renames when meta has no name yet" {
     const second_applied = try handle.renameIfUnnamed("auto-derived");
     try std.testing.expect(!second_applied);
     try std.testing.expectEqualStrings("first turn", handle.meta.name[0..handle.meta.name_len]);
+}
+
+test "renameIfUnnamed treats empty string as no-op" {
+    // Defensive: a caller passing "" must NOT result in name_len = 0
+    // (the unnamed state) which would let the next caller rename. The
+    // function returns false and leaves meta untouched.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    try std.testing.expectEqual(@as(u8, 0), handle.meta.name_len);
+
+    const applied = try handle.renameIfUnnamed("");
+    try std.testing.expect(!applied);
+    try std.testing.expectEqual(@as(u8, 0), handle.meta.name_len);
+
+    // Subsequent non-empty rename still wins.
+    const applied2 = try handle.renameIfUnnamed("real name");
+    try std.testing.expect(applied2);
+    try std.testing.expectEqualStrings("real name", handle.meta.name[0..handle.meta.name_len]);
 }
 
 test "appendEntry persists tool_result content larger than 8 KiB" {
