@@ -407,11 +407,18 @@ fn handleChildEvent(
         // subagent reasoning under the delegation scope. Other events
         // (info, hook round-trips) are still discarded in v1; the parent
         // sees only the final assistant text via the Collector.
-        .thinking_delta => |text| {
-            defer allocator.free(text);
+        .thinking_delta => |td| {
+            defer allocator.free(td.text);
+            const provider_name: []const u8 = switch (td.provider) {
+                .anthropic => "anthropic",
+                .openai_responses => "openai_responses",
+                .openai_chat => "openai_chat",
+                .none => "none",
+            };
             child_history.persistEventInternal(.{
                 .entry_type = .thinking,
-                .content = text,
+                .content = td.text,
+                .thinking_provider = provider_name,
                 .timestamp = std.time.milliTimestamp(),
             }) catch |err| log.warn("child thinking persist failed: {}", .{err});
         },

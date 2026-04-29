@@ -1294,7 +1294,7 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         // node. Task 1.11 will also fan this into the trajectory capture.
         .thinking_delta => |td| blk: {
             const duped = alloc.dupe(u8, td.text) catch return;
-            break :blk .{ .thinking_delta = duped };
+            break :blk .{ .thinking_delta = .{ .text = duped, .provider = td.provider } };
         },
         .thinking_stop => .thinking_stop,
     };
@@ -1797,7 +1797,7 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
         for (buf[0..count]) |ev| {
             switch (ev) {
                 .text_delta => |s| allocator.free(s),
-                .thinking_delta => |s| allocator.free(s),
+                .thinking_delta => |td| allocator.free(td.text),
                 .tool_start => |s| {
                     allocator.free(s.name);
                     if (s.call_id) |id| allocator.free(id);

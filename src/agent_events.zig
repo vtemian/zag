@@ -27,8 +27,14 @@ pub const AgentEvent = union(enum) {
     /// Partial text from the LLM response.
     text_delta: []const u8,
     /// Partial extended-thinking text. Duped by the agent-side stream
-    /// adapter so the payload outlives the provider's SSE buffer.
-    thinking_delta: []const u8,
+    /// adapter so the payload outlives the provider's SSE buffer. The
+    /// `provider` tag travels alongside the text so JSONL persistence
+    /// records the wire format that produced the delta instead of
+    /// hardcoding `"anthropic"` for every provider.
+    thinking_delta: struct {
+        text: []const u8,
+        provider: types.ContentBlock.ThinkingProvider,
+    },
     /// End of a thinking block. Lets the UI collapse the in-progress
     /// thinking node before the next content block begins.
     thinking_stop,
@@ -132,7 +138,7 @@ pub const AgentEvent = union(enum) {
     pub fn freeOwned(self: AgentEvent, allocator: Allocator) void {
         switch (self) {
             .text_delta => |s| allocator.free(s),
-            .thinking_delta => |s| allocator.free(s),
+            .thinking_delta => |td| allocator.free(td.text),
             .tool_start => |t| {
                 allocator.free(t.name);
                 if (t.call_id) |id| allocator.free(id);

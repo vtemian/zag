@@ -487,7 +487,10 @@ fn parseSseStream(
                 if (v != .string) continue;
                 if (v.string.len == 0) continue;
                 try thinking_content.appendSlice(allocator, v.string);
-                callback.on_event(callback.ctx, .{ .thinking_delta = .{ .text = v.string } });
+                callback.on_event(callback.ctx, .{ .thinking_delta = .{
+                    .text = v.string,
+                    .provider = .openai_chat,
+                } });
                 break;
             }
 

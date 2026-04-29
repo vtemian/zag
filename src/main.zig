@@ -719,9 +719,9 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
                     break;
                 },
                 .reset_assistant_text => {},
-                .thinking_delta => |t| {
-                    defer gpa.free(t);
-                    capture.addThinkingDelta(t) catch |err| {
+                .thinking_delta => |td| {
+                    defer gpa.free(td.text);
+                    capture.addThinkingDelta(td.text) catch |err| {
                         log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
                     };
                 },
