@@ -355,6 +355,15 @@ fn childThreadMain(args: ChildArgs) void {
         .model_id = args.model_spec.model_id,
         .context_window = 0,
     };
+    // Inherit the parent's session_id so subagent telemetry lines stay
+    // grouped under the same session in the timeline log. The parent
+    // owns the SessionHandle; the slice is stable across the child's
+    // run because the handle is held alive by the parent runner.
+    const child_session_id: []const u8 = if (args.parent_ctx.session_handle) |sh|
+        sh.id[0..sh.id_len]
+    else
+        "";
+
     agent.runLoopStreaming(
         args.messages,
         args.registry,
@@ -366,6 +375,7 @@ fn childThreadMain(args: ChildArgs) void {
         null,
         &turn_in_progress,
         child_model_spec,
+        child_session_id,
     ) catch |err| {
         // Surface the failure as a text message so the parent sees it in
         // the collected output rather than a silent empty result.

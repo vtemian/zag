@@ -586,6 +586,7 @@ fn runHeadlessWithProvider(deps: HeadlessDeps) !void {
         .model_spec = spec,
         .registry = deps.registry,
         .subagents = if (deps.lua_engine) |eng| eng.subagentRegistry() else null,
+        .session_id = deps.session_id,
     });
 
     // Synthetic ids for tool_start events without a provider-assigned call_id

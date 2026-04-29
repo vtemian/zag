@@ -222,15 +222,42 @@ fn applyOAuthInjection(
     }
 }
 
-/// Send a JSON POST request and return the response body.
-/// Both providers share this HTTP plumbing; only the URL and extra headers differ.
-pub fn httpPostJson(
+/// Raw response from a JSON POST: status code plus body, regardless of
+/// HTTP status. The body is allocator-owned and may be empty (zero-length,
+/// but still allocator-owned) when the server returns no body.
+pub const RawResponse = struct {
+    /// HTTP status as a plain integer (e.g. 200, 404, 502).
+    status: u16,
+    /// Response body. Owned by caller. Free with `allocator.free` or via
+    /// `RawResponse.deinit`.
+    body: []const u8,
+
+    pub fn deinit(self: RawResponse, allocator: Allocator) void {
+        allocator.free(self.body);
+    }
+};
+
+/// Send a JSON POST and return the (status, body) pair, regardless of
+/// HTTP status. Used by streaming.zig's side-channel error capture path
+/// to retrieve provider error envelopes that the streaming reader
+/// cannot drain due to a stdlib contentLengthStream panic on .ready
+/// state for some 4xx body shapes.
+///
+/// Caller owns the returned body and must free it (or call
+/// `RawResponse.deinit`). Body is empty (zero-length, allocator-owned)
+/// if the server returns no body.
+///
+/// Errors are reserved for genuine plumbing failures (URI parse, TCP,
+/// TLS, allocator). HTTP status — including 4xx/5xx — never produces
+/// an error here.
+pub fn httpPostJsonRaw(
     url: []const u8,
     body: []const u8,
     extra_headers: []const std.http.Header,
     allocator: Allocator,
-) ![]const u8 {
+) !RawResponse {
     var out: std.io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -248,21 +275,37 @@ pub fn httpPostJson(
         },
     }) catch return error.ApiError;
 
-    if (result.status != .ok) {
-        const response_bytes = out.toOwnedSlice() catch &[_]u8{};
-        defer allocator.free(response_bytes);
-        const snippet = response_bytes[0..@min(response_bytes.len, MAX_ERROR_BODY_BYTES)];
-        log.err("http {d} {s}: {s}", .{ @intFromEnum(result.status), @tagName(result.status), snippet });
-        const detail = std.fmt.allocPrint(
-            allocator,
-            "HTTP {d} ({s}): {s}",
-            .{ @intFromEnum(result.status), @tagName(result.status), snippet },
-        ) catch return error.ApiError;
-        error_detail.set(allocator, detail);
-        return error.ApiError;
-    }
+    return .{
+        .status = @intFromEnum(result.status),
+        .body = try out.toOwnedSlice(),
+    };
+}
 
-    return out.toOwnedSlice();
+/// Send a JSON POST request and return the response body on 2xx, or
+/// `error.ApiError` (with `error_detail` populated) on any other status.
+/// Both providers share this HTTP plumbing; only the URL and extra headers differ.
+///
+/// This is a thin convenience wrapper over `httpPostJsonRaw` for callers
+/// that want the historical 2xx-or-throw shape. Observability code that
+/// needs the body on 4xx/5xx should call `httpPostJsonRaw` directly.
+pub fn httpPostJson(
+    url: []const u8,
+    body: []const u8,
+    extra_headers: []const std.http.Header,
+    allocator: Allocator,
+) ![]const u8 {
+    const raw = try httpPostJsonRaw(url, body, extra_headers, allocator);
+    if (raw.status >= 200 and raw.status < 300) return raw.body;
+    defer raw.deinit(allocator);
+    const snippet = raw.body[0..@min(raw.body.len, MAX_ERROR_BODY_BYTES)];
+    log.err("http {d}: {s}", .{ raw.status, snippet });
+    const detail = std.fmt.allocPrint(
+        allocator,
+        "HTTP {d}: {s}",
+        .{ raw.status, snippet },
+    ) catch return error.ApiError;
+    error_detail.set(allocator, detail);
+    return error.ApiError;
 }
 
 test "buildHeaders creates correct auth for bearer endpoint" {
@@ -377,6 +420,32 @@ test "httpPostJson returns InvalidUri on malformed endpoint" {
     const allocator = std.testing.allocator;
     const result = httpPostJson("not a url", "", &.{}, allocator);
     try std.testing.expectError(error.InvalidUri, result);
+}
+
+test "httpPostJsonRaw returns InvalidUri on malformed endpoint" {
+    // Plumbing failures still propagate as errors (URI parse is not an
+    // HTTP status). Symmetric with the convenience wrapper above.
+    const allocator = std.testing.allocator;
+    const result = httpPostJsonRaw("not a url", "", &.{}, allocator);
+    try std.testing.expectError(error.InvalidUri, result);
+}
+
+test "RawResponse.deinit frees the body under testing.allocator" {
+    // Manually construct a RawResponse whose body is owned by the
+    // testing allocator and verify deinit releases it without leaking.
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "{\"error\":\"not_found\"}");
+    const raw: RawResponse = .{ .status = 404, .body = body };
+    raw.deinit(allocator);
+}
+
+test "httpPostJsonRaw signature: returns RawResponse" {
+    // Compile-time signature check. If someone later changes
+    // httpPostJsonRaw's return type, this test forces them to update
+    // the callers (streaming.zig's side-channel re-fetch in particular).
+    const Ret = @typeInfo(@TypeOf(httpPostJsonRaw)).@"fn".return_type.?;
+    const Payload = @typeInfo(Ret).error_union.payload;
+    try std.testing.expectEqual(RawResponse, Payload);
 }
 
 test "mergeInjectedHeader: new header appends" {

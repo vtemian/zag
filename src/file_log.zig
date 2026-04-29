@@ -10,6 +10,15 @@ const Allocator = std.mem.Allocator;
 
 /// Borrowed handle, owned by this module while non-null.
 var log_file: ?std.fs.File = null;
+/// Heap-owned active log path string. Allocated with `path_allocator` on
+/// `initWithPath`, freed on `deinit`. Sibling artifact files (request /
+/// response dumps from `Telemetry`) hang off this stem so an `ls
+/// ~/.zag/logs/<uuid>.*` clusters them per process.
+var log_path: ?[]u8 = null;
+/// Allocator that owns `log_path`. std.heap.page_allocator suffices because
+/// we only allocate at most one path string per process and free it in
+/// `deinit`. Kept as a module-level for symmetry with `log_file`.
+const path_allocator: Allocator = std.heap.page_allocator;
 /// Serialises `handler` writes across threads.
 var log_mutex: std.Thread.Mutex = .{};
 /// Per-thread re-entry guard. A bug in the handler (or in std.fs) could
@@ -42,6 +51,11 @@ pub fn initWithPath(path: []const u8) !void {
     // tightened back to 0o600.
     try posix.fchmod(fd, 0o600);
     log_file = std.fs.File{ .handle = fd };
+
+    // Stash the path so callers can drop sibling artifacts next to the log.
+    // `deinit` (called above) already cleared any previous owner. allocPrint
+    // would be cleaner but `dupe` matches the borrow-then-own contract.
+    log_path = try path_allocator.dupe(u8, path);
 }
 
 /// Resolve the log path and open it. Returns `error.NoLogPath` when
@@ -56,6 +70,30 @@ pub fn init(alloc: Allocator) !void {
 pub fn deinit() void {
     if (log_file) |f| f.close();
     log_file = null;
+    if (log_path) |p| path_allocator.free(p);
+    log_path = null;
+}
+
+/// Returns the active log file path, or null if not initialized.
+/// The slice is borrowed from module-level state and remains valid until
+/// the next `initWithPath` / `init` / `deinit` call.
+pub fn currentLogPath() ?[]const u8 {
+    return log_path;
+}
+
+/// Returns an absolute path to a sibling artifact file alongside the
+/// active log: same directory, same UUID stem, custom suffix.
+/// Caller owns the returned slice. Returns null if no log path is active.
+///
+/// Example: log is `/home/x/.zag/logs/abc123.log`, `artifactPath(a, ".turn-3.req.json")`
+/// returns `/home/x/.zag/logs/abc123.turn-3.req.json`.
+pub fn artifactPath(allocator: Allocator, suffix: []const u8) !?[]u8 {
+    const base = log_path orelse return null;
+    const stem = if (std.mem.endsWith(u8, base, ".log"))
+        base[0 .. base.len - ".log".len]
+    else
+        base;
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, suffix });
 }
 
 /// `std.Options.logFn`-compatible handler. Silent no-op if disabled.
@@ -197,6 +235,54 @@ test "initWithPath opens the log file with mode 0o600" {
 test "handler is a silent no-op when uninitialized" {
     deinit();
     handler(.info, .default, "should not crash: {d}", .{42});
+}
+
+test "currentLogPath returns the active path after init" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full_buf, "{s}/abc123.log", .{tmp_abs});
+
+    try initWithPath(path);
+    defer deinit();
+
+    const active = currentLogPath() orelse return error.MissingLogPath;
+    try std.testing.expectEqualStrings(path, active);
+}
+
+test "currentLogPath returns null after deinit" {
+    deinit();
+    try std.testing.expect(currentLogPath() == null);
+}
+
+test "artifactPath returns sibling path with suffix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full_buf, "{s}/abc123.log", .{tmp_abs});
+
+    try initWithPath(path);
+    defer deinit();
+
+    const sibling = (try artifactPath(std.testing.allocator, ".turn-3.req.json")) orelse
+        return error.NoLogPath;
+    defer std.testing.allocator.free(sibling);
+
+    var expected_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "{s}/abc123.turn-3.req.json", .{tmp_abs});
+    try std.testing.expectEqualStrings(expected, sibling);
+}
+
+test "artifactPath returns null when no log path is active" {
+    deinit();
+    const result = try artifactPath(std.testing.allocator, ".turn-1.req.json");
+    try std.testing.expect(result == null);
 }
 
 test "resolvePath returns $HOME/.zag/logs/<uuid>.log" {
