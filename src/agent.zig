@@ -505,10 +505,19 @@ fn callLlm(
         .ctx = &stream_ctx,
         .on_event = &streamEventToQueue,
     };
-    // Snapshot the runtime reasoning_effort knob once per call so the
-    // streaming path and the non-streaming fallback see the same value
-    // even if Lua mutates it mid-flight.
-    const thinking_effort: ?[]const u8 = if (lua_engine) |eng| eng.currentThinkingEffort() else null;
+    // Dupe the runtime reasoning_effort knob so the borrow does not
+    // race a concurrent zag.set_thinking_effort call from the main
+    // thread (which would free the underlying buffer mid-serialization
+    // on the agent thread). Owned for the duration of the turn; freed
+    // when this function returns.
+    const thinking_effort: ?[]const u8 = if (lua_engine) |eng|
+        if (eng.currentThinkingEffort()) |raw|
+            try allocator.dupe(u8, raw)
+        else
+            null
+    else
+        null;
+    defer if (thinking_effort) |s| allocator.free(s);
     const stream_req = llm.StreamRequest{
         .system_stable = system_stable,
         .system_volatile = system_volatile,
@@ -1470,6 +1479,86 @@ test "callLlm leaves StreamRequest.telemetry null when caller passes null" {
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
     try std.testing.expect(!capture.captured_present);
+}
+
+/// Stub provider that captures the `thinking_effort` slice off
+/// `StreamRequest` so the test can assert the agent loop handed the
+/// provider a duped copy rather than the LuaEngine's own buffer.
+const ThinkingEffortCaptureProvider = struct {
+    captured_present: bool = false,
+    captured_ptr: ?[*]const u8 = null,
+    captured_value: []u8 = &.{},
+    snapshot_alloc: std.mem.Allocator,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "thinking_effort_capture",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *ThinkingEffortCaptureProvider = @ptrCast(@alignCast(ptr));
+        if (req.thinking_effort) |effort| {
+            self.captured_present = true;
+            self.captured_ptr = effort.ptr;
+            self.captured_value = self.snapshot_alloc.dupe(u8, effort) catch &.{};
+        }
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 0,
+            .output_tokens = 0,
+        };
+    }
+
+    fn provider(self: *ThinkingEffortCaptureProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *ThinkingEffortCaptureProvider) void {
+        self.snapshot_alloc.free(self.captured_value);
+    }
+};
+
+test "callLlm dupes thinking_effort so providers get an owned copy, not the LuaEngine buffer" {
+    // Pins the cross-thread UaF fix: the agent thread must NOT pass the
+    // LuaEngine's borrowed `thinking_effort` slice through to providers,
+    // because `zag.set_thinking_effort` on the main thread frees and
+    // reassigns that buffer concurrently with provider serialization.
+    // Assert the pointer the provider sees is different from the engine's.
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    // Seed engine.thinking_effort with an owned dupe, mirroring the
+    // production path where `zag.set_thinking_effort("low")` allocates.
+    engine.thinking_effort = try allocator.dupe(u8, "low");
+    const engine_ptr = engine.thinking_effort.?.ptr;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var capture: ThinkingEffortCaptureProvider = .{ .snapshot_alloc = allocator };
+    defer capture.deinit();
+    const p = capture.provider();
+
+    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, &engine);
+    defer response.deinit(allocator);
+
+    try std.testing.expect(capture.captured_present);
+    try std.testing.expectEqualStrings("low", capture.captured_value);
+    // The load-bearing assertion: provider's slice and engine's slice
+    // must NOT alias. If they do, the cross-thread UaF window is open.
+    try std.testing.expect(capture.captured_ptr.? != engine_ptr);
 }
 
 test "runLoopStreaming constructs Telemetry per turn with session_id and provider/model" {

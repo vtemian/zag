@@ -188,10 +188,15 @@ pub const Request = struct {
     /// any thinking-capable Claude).
     thinking: ?ThinkingConfig = null,
     /// Optional runtime reasoning_effort level set via
-    /// `zag.set_thinking_effort(level)`. Borrowed from the LuaEngine for
-    /// the duration of the request. Chat-completions providers that
-    /// declared an `effort_request_field` inject this as a top-level
-    /// JSON field; everyone else drops it silently.
+    /// `zag.set_thinking_effort(level)`. Owned by the caller for the
+    /// duration of the request; providers must NOT retain the slice
+    /// past the call's return. The agent loop dupes the LuaEngine's
+    /// snapshot at the turn boundary because the engine lives on the
+    /// main thread and can free + reassign the underlying buffer
+    /// concurrently with provider serialization on the agent thread.
+    /// Chat-completions providers that declared an `effort_request_field`
+    /// inject this as a top-level JSON field; everyone else drops it
+    /// silently.
     thinking_effort: ?[]const u8 = null,
 
     /// Join the stable and volatile halves with "\n\n" into a single
@@ -237,7 +242,9 @@ pub const StreamRequest = struct {
     cancel: *std.atomic.Value(bool),
     /// Optional extended-thinking override. See `Request.thinking`.
     thinking: ?ThinkingConfig = null,
-    /// Optional runtime reasoning_effort level. See `Request.thinking_effort`.
+    /// Optional runtime reasoning_effort level. See `Request.thinking_effort`
+    /// for the lifetime contract: owned by the caller for the duration of
+    /// the streaming call; providers must NOT retain the slice past return.
     thinking_effort: ?[]const u8 = null,
     /// Optional per-turn observability handle. When non-null, providers
     /// pass it through to `streaming.create` so the telemetry hooks fire
