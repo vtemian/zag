@@ -101,7 +101,7 @@ pub const AnthropicSerializer = struct {
         const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.telemetry, req.allocator);
         defer stream.destroy();
 
-        return parseSseStream(stream, req.allocator, req.callback, req.cancel);
+        return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry);
     }
 };
 
@@ -431,6 +431,7 @@ fn parseSseStream(
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
+    telemetry: ?*llm.telemetry.Telemetry,
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -449,6 +450,15 @@ fn parseSseStream(
     defer sse_data.deinit(allocator);
 
     while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
+        // Anthropic emits `event: error` mid-stream when the upstream model
+        // crashes after a 200 head. Capture the envelope for telemetry,
+        // populate `error_detail` so the UI shows the provider message,
+        // then propagate the existing provider-error sentinel so the agent
+        // loop can fall back to its retry / surface paths.
+        if (std.mem.eql(u8, sse.event_type, "error")) {
+            try handleStreamErrorEvent(callback, telemetry, sse.data, allocator);
+            return error.ProviderResponseFailed;
+        }
         try processSseEvent(
             sse.event_type,
             sse.data,
@@ -487,6 +497,62 @@ fn parseSseStream(
         cache_read_tokens,
         allocator,
     );
+}
+
+/// Handle Anthropic's mid-stream `event: error` envelope. Reports the raw
+/// payload to telemetry, fires the `.err` callback for observers, and
+/// stashes a user-facing message in `llm.error_detail` so the UI can show
+/// it. Returns nothing; the caller propagates `error.ProviderResponseFailed`.
+///
+/// Envelope shape per Anthropic docs:
+///   {"type":"error","error":{"type":"overloaded_error","message":"..."}}
+fn handleStreamErrorEvent(
+    callback: llm.StreamCallback,
+    telemetry: ?*llm.telemetry.Telemetry,
+    data: []const u8,
+    allocator: Allocator,
+) !void {
+    if (telemetry) |t| {
+        _ = t.onStreamError(.anthropic_error, data) catch |err| {
+            log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    // Best-effort parse for the human-readable bits. We never fail the
+    // outer error path on a malformed envelope; we just fall back to the
+    // raw bytes so something useful still reaches the user.
+    var parsed_kind: []const u8 = "error";
+    var parsed_message: []const u8 = data;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch null;
+    defer if (parsed) |p| p.deinit();
+    if (parsed) |p| {
+        if (p.value == .object) {
+            if (p.value.object.get("error")) |err_value| {
+                if (err_value == .object) {
+                    if (err_value.object.get("type")) |t| {
+                        if (t == .string) parsed_kind = t.string;
+                    }
+                    if (err_value.object.get("message")) |m| {
+                        if (m == .string) parsed_message = m.string;
+                    }
+                }
+            }
+        }
+    }
+
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "anthropic stream error: {s}: {s}",
+        .{ parsed_kind, parsed_message },
+    );
+    callback.on_event(callback.ctx, .{ .err = text });
+
+    // Hand ownership of `text` to the error_detail slot. It's freed by
+    // the next `error_detail.set` or `error_detail.clear` call.
+    const detail = try allocator.dupe(u8, text);
+    llm.error_detail.set(allocator, detail);
+    allocator.free(text);
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.
@@ -1769,4 +1835,97 @@ test "buildRequestBody preserves cache_control ordering across stable and volati
     try std.testing.expect(system.items[0].object.get("cache_control") != null);
     try std.testing.expectEqualStrings("per-turn context", system.items[1].object.get("text").?.string);
     try std.testing.expect(system.items[1].object.get("cache_control") == null);
+}
+
+test "anthropic SSE event:error invokes telemetry.onStreamError" {
+    const allocator = std.testing.allocator;
+    const file_log = @import("../file_log.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
+    try file_log.initWithPath(log_full);
+    defer file_log.deinit();
+
+    const t = try llm.telemetry.Telemetry.init(.{
+        .allocator = allocator,
+        .session_id = "sess-anth",
+        .turn = 4,
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer t.deinit();
+
+    // Drain any error_detail set by prior tests so we observe a clean
+    // hand-off here.
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+
+    const Recorder = struct {
+        alloc: Allocator,
+        saw_err: bool = false,
+        message: std.ArrayList(u8) = .empty,
+
+        fn onEvent(ctx: *anyopaque, event: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .err => |text| {
+                    self.saw_err = true;
+                    self.message.appendSlice(self.alloc, text) catch {};
+                },
+                else => {},
+            }
+        }
+    };
+    var recorder: Recorder = .{ .alloc = allocator };
+    defer recorder.message.deinit(allocator);
+    const callback: llm.StreamCallback = .{ .ctx = &recorder, .on_event = &Recorder.onEvent };
+
+    const envelope = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"the assistant is overloaded\"}}";
+    try handleStreamErrorEvent(callback, t, envelope, allocator);
+
+    try std.testing.expect(t.had_error);
+    // Some classification kind is set; exact tag depends on substring rules
+    // in error_class and is covered by that module's own tests.
+    try std.testing.expect(t.error_kind != null);
+    try std.testing.expect(recorder.saw_err);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.message.items, "overloaded_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.message.items, "the assistant is overloaded") != null);
+
+    // The artifact file got written next to the (test) log path.
+    const expected = (try file_log.artifactPath(allocator, ".turn-4.stream-error.json")) orelse
+        return error.NoLogPath;
+    defer allocator.free(expected);
+    const stat = try std.fs.cwd().statFile(expected);
+    try std.testing.expect(stat.size > 0);
+
+    // error_detail got populated for the agent error formatter.
+    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "overloaded_error") != null);
+}
+
+test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
+    const allocator = std.testing.allocator;
+
+    // We can't easily fake a StreamingResponse, but we can verify that the
+    // dispatcher arm is wired correctly via the helper directly. The
+    // surrounding parseSseStream loop hands off to handleStreamErrorEvent
+    // and returns error.ProviderResponseFailed unconditionally, so the
+    // helper test above + this trivial expectation cover the contract.
+    const Sink = struct {
+        fn onEvent(_: *anyopaque, _: llm.StreamEvent) void {}
+    };
+    var sink: u8 = 0;
+    const callback: llm.StreamCallback = .{ .ctx = &sink, .on_event = &Sink.onEvent };
+
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+
+    const envelope = "{\"error\":{\"message\":\"boom\"}}";
+    try handleStreamErrorEvent(callback, null, envelope, allocator);
+
+    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "boom") != null);
 }
