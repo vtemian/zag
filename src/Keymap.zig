@@ -269,13 +269,21 @@ pub const Registry = struct {
     /// prior callback themselves; the registry never touches the Lua
     /// VM. Re-registering an existing (mode, spec, buffer_id) reuses
     /// the EXISTING id — not a fresh one.
+    ///
+    /// Ids are minted from a monotonic u32 counter that never recycles
+    /// removed slots. After `std.math.maxInt(u32)` fresh registrations
+    /// the counter is exhausted and this function returns
+    /// `error.IdSpaceExhausted` rather than wrapping silently (id 0
+    /// would otherwise collide with the Lua wrapper's "no id" sentinel).
+    /// `next_id` is left unchanged on the exhaustion path so the
+    /// registry stays internally consistent.
     pub fn register(
         self: *Registry,
         mode: Mode,
         spec: KeySpec,
         buffer_id: ?u32,
         action: Action,
-    ) !RegisterResult {
+    ) (Allocator.Error || error{IdSpaceExhausted})!RegisterResult {
         for (self.bindings.items) |*b| {
             if (b.mode == mode and b.spec.eql(spec) and scopeEq(b.buffer_id, buffer_id)) {
                 const displaced = b.action;
@@ -284,11 +292,12 @@ pub const Registry = struct {
             }
         }
         const id = self.next_id;
-        self.next_id += 1;
+        const next = std.math.add(u32, self.next_id, 1) catch return error.IdSpaceExhausted;
         try self.bindings.append(
             self.allocator,
             .{ .id = id, .mode = mode, .spec = spec, .buffer_id = buffer_id, .action = action },
         );
+        self.next_id = next;
         return .{ .id = id, .displaced = null };
     }
 
@@ -621,6 +630,24 @@ test "Registry register replacing a lua_callback returns the displaced action fo
         return error.TestExpected;
     try std.testing.expect(live == .lua_callback);
     try std.testing.expectEqual(@as(i32, 200), live.lua_callback);
+}
+
+test "Registry register surfaces IdSpaceExhausted when next_id is at u32 max" {
+    // Synthetic exhaustion: the registry counter is u32, so 4B fresh
+    // registrations are infeasible to drive in a unit test. Pin
+    // `next_id` to `maxInt(u32)` directly via the `Registry` struct
+    // field, then assert that the next fresh insert returns
+    // `error.IdSpaceExhausted` and leaves `next_id` unchanged so the
+    // registry stays internally consistent.
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    r.next_id = std.math.maxInt(u32);
+    const before = r.next_id;
+    const result = r.register(.normal, try parseKeySpec("z"), null, .focus_left);
+    try std.testing.expectError(error.IdSpaceExhausted, result);
+    try std.testing.expectEqual(before, r.next_id);
+    try std.testing.expectEqual(@as(usize, 0), r.bindings.items.len);
 }
 
 test "registry lookup skips Pass 1 entirely when focused_buffer_id is null" {

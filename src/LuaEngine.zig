@@ -4858,12 +4858,14 @@ pub const LuaEngine = struct {
     }
 
     fn zagKeymapRemoveFnInner(lua: *Lua) !i32 {
-        const raw = lua.toInteger(1) catch {
-            log.warn("zag.keymap_remove(): first argument must be a keymap id integer", .{});
-            return error.LuaError;
-        };
-        if (raw <= 0) {
-            log.warn("zag.keymap_remove(): id must be positive, got {d}", .{raw});
+        // `checkInteger` raises a Lua error if the argument is missing,
+        // not a number, or a non-integer-representable number (e.g.
+        // 3.7). Using `toInteger` here would silently truncate floats,
+        // so `zag.keymap_remove(3.7)` would unbind id 3 instead of
+        // surfacing the bug to the plugin.
+        const raw = lua.checkInteger(1);
+        if (raw <= 0 or raw > std.math.maxInt(u32)) {
+            log.warn("zag.keymap_remove(): id must be a positive u32, got {d}", .{raw});
             return error.LuaError;
         }
         const id: u32 = @intCast(raw);
@@ -8986,6 +8988,23 @@ test "zag.keymap_remove on a non-positive id raises a Lua error" {
     engine.storeSelfPointer();
 
     const result = engine.lua.doString("zag.keymap_remove(0)");
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.keymap_remove rejects non-integer numbers instead of truncating" {
+    // Regression: `lua.toInteger` silently coerces 3.7 -> 3, which
+    // would unbind whatever lives at id 3. Using `lua.checkInteger`
+    // makes Lua raise on any value that isn't a true integer, so
+    // plugin bugs that pass a float surface immediately rather than
+    // corrupting the registry.
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString("zag.keymap_remove(3.7)");
     try std.testing.expectError(error.LuaRuntime, result);
     engine.lua.pop(1);
 }

@@ -91,6 +91,12 @@ local function open()
             zag.pane.set_model(focused, item.word)
         end,
         on_cancel = function() end,
+        -- on_close fires after popup teardown for ANY close path
+        -- (commit, cancel, external popup.close). Routing cleanup
+        -- through on_close means our global keymaps come down even if
+        -- the popup is closed by code that doesn't go through one of
+        -- our route() bindings.
+        on_close = cleanup,
         -- Centered-modal placement: editor-relative, size-to-content
         -- inside min/max bounds so the picker shrinks on small
         -- terminals and never overflows the default 80x24 chrome.
@@ -112,20 +118,29 @@ local function open()
     -- focused buffer while the picker is up.
     --
     -- Each binding's id is captured into `keymap_ids` so `cleanup()`
-    -- can `zag.keymap_remove` it after the popup closes (commit or
-    -- cancel). The `popup.is_closed(handle)` short-circuit inside
-    -- `route` is kept as defense-in-depth: if a future code path closes
-    -- the popup without going through cleanup() we still no-op
-    -- gracefully instead of forwarding the key into a dead handle.
+    -- can `zag.keymap_remove` it. We don't manually call cleanup()
+    -- from route() because `on_close = cleanup` on the popup handles
+    -- every close path uniformly. The `popup.is_closed(handle)` guard
+    -- stays as defense-in-depth: it avoids forwarding into a dead
+    -- handle (which `invoke_key` would error on).
+    --
+    -- `popup.invoke_key` runs the popup's selection state machine,
+    -- which calls user-supplied on_commit / on_cancel. Wrapping it in
+    -- pcall stops a faulty callback from propagating into the keymap
+    -- dispatch path: the keymap stays installed (route() runs again
+    -- next keystroke) and on_close still fires once the popup actually
+    -- transitions to closed.
     local function route(key)
         return function()
             if popup.is_closed(handle) then
-                cleanup()
                 return
             end
-            popup.invoke_key(handle, key)
-            if popup.is_closed(handle) then
-                cleanup()
+            local ok, err = pcall(popup.invoke_key, handle, key)
+            if not ok then
+                zag.notify(
+                    "/model: popup.invoke_key error: " .. tostring(err),
+                    { level = "warn" }
+                )
             end
         end
     end
