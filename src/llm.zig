@@ -187,6 +187,12 @@ pub const Request = struct {
     /// a sensible default for the model (Anthropic turns thinking on for
     /// any thinking-capable Claude).
     thinking: ?ThinkingConfig = null,
+    /// Optional runtime reasoning_effort level set via
+    /// `zag.set_thinking_effort(level)`. Borrowed from the LuaEngine for
+    /// the duration of the request. Chat-completions providers that
+    /// declared an `effort_request_field` inject this as a top-level
+    /// JSON field; everyone else drops it silently.
+    thinking_effort: ?[]const u8 = null,
 
     /// Join the stable and volatile halves with "\n\n" into a single
     /// owned string. Providers that can only emit one system field
@@ -231,6 +237,8 @@ pub const StreamRequest = struct {
     cancel: *std.atomic.Value(bool),
     /// Optional extended-thinking override. See `Request.thinking`.
     thinking: ?ThinkingConfig = null,
+    /// Optional runtime reasoning_effort level. See `Request.thinking_effort`.
+    thinking_effort: ?[]const u8 = null,
     /// Optional per-turn observability handle. When non-null, providers
     /// pass it through to `streaming.create` so the telemetry hooks fire
     /// for status capture, error artifacts, and timeline emission. Owned
