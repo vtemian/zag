@@ -52,7 +52,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
+        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -61,7 +61,7 @@ pub const OpenAiSerializer = struct {
         const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
         defer req.allocator.free(response_bytes);
 
-        return parseResponse(response_bytes, req.allocator);
+        return parseResponse(response_bytes, self.endpoint.reasoning, req.allocator);
     }
 
     fn callStreamingImpl(
@@ -79,7 +79,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -88,7 +88,7 @@ pub const OpenAiSerializer = struct {
         const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.allocator);
         defer stream.destroy();
 
-        return parseSseStream(stream, req.allocator, req.callback, req.cancel);
+        return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel);
     }
 };
 
@@ -97,9 +97,10 @@ fn buildRequestBody(
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, reasoning, allocator);
 }
 
 fn buildStreamingRequestBody(
@@ -107,9 +108,10 @@ fn buildStreamingRequestBody(
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, reasoning, allocator);
 }
 
 fn serializeRequest(
@@ -119,6 +121,7 @@ fn serializeRequest(
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
     max_tokens: u32,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -130,7 +133,7 @@ fn serializeRequest(
     try w.print("\"max_tokens\":{d},", .{max_tokens});
     if (stream) try w.writeAll("\"stream\":true,\"stream_options\":{\"include_usage\":true},");
 
-    try writeMessagesWithSystem(system_prompt, messages, w);
+    try writeMessagesWithSystem(system_prompt, messages, reasoning, w);
 
     if (tool_definitions.len > 0) {
         try w.writeAll(",");
@@ -154,19 +157,20 @@ fn writeToolDefinitions(defs: []const types.ToolDefinition, w: anytype) !void {
     try w.writeAll("]");
 }
 
-fn writeMessagesWithSystem(system: []const u8, msgs: []const types.Message, w: anytype) !void {
+fn writeMessagesWithSystem(system: []const u8, msgs: []const types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: anytype) !void {
     try w.writeAll("\"messages\":[");
     try w.writeAll("{\"role\":\"system\",\"content\":");
     try std.json.Stringify.value(system, .{}, w);
     try w.writeAll("}");
     for (msgs) |msg| {
         try w.writeAll(",");
-        try writeMessage(msg, w);
+        try writeMessage(msg, reasoning, w);
     }
     try w.writeAll("]");
 }
 
-fn writeMessage(msg: types.Message, w: anytype) !void {
+fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: anytype) !void {
+    _ = reasoning; // Wired in Task 9 for the echo path.
     var has_text = false;
     var has_tool_use = false;
     var has_tool_result = false;
@@ -271,7 +275,8 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
 }
 
 /// Parses a raw JSON response from OpenAI's Chat Completions API into a typed LlmResponse.
-fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmResponse {
+fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningConfig, allocator: Allocator) !types.LlmResponse {
+    _ = reasoning; // Wired in Task 8 for the response_fields scrape.
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -348,10 +353,12 @@ const StreamingToolCall = struct {
 /// the final LlmResponse.
 fn parseSseStream(
     stream: *llm.streaming.StreamingResponse,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
 ) !types.LlmResponse {
+    _ = reasoning; // Wired in Task 10 for streaming reasoning accumulation.
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
@@ -507,7 +514,7 @@ test "buildRequestBody produces valid JSON with system as first message" {
         },
     };
 
-    const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -536,7 +543,7 @@ test "buildRequestBody formats tools with function wrapper" {
         },
     };
 
-    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -562,7 +569,7 @@ test "buildRequestBody omits tools when none provided" {
     const messages = [_]types.Message{};
     const tool_defs = [_]types.ToolDefinition{};
 
-    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -576,7 +583,7 @@ test "buildStreamingRequestBody includes stream:true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, allocator);
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -590,7 +597,7 @@ test "buildStreamingRequestBody sets stream_options.include_usage=true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, allocator);
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, allocator);
     defer allocator.free(body);
 
     // Raw-substring check pins the on-the-wire JSON shape: OpenAI only emits
@@ -628,7 +635,7 @@ test "parseResponse parses text-only response" {
         \\}
     ;
 
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), response.content.len);
@@ -675,7 +682,7 @@ test "parseResponse parses tool_calls response" {
         \\}
     ;
 
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), response.content.len);
@@ -696,28 +703,28 @@ test "parseResponse maps finish_reason correctly" {
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.end_turn, r.stop_reason);
     }
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.max_tokens, r.stop_reason);
     }
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.tool_use, r.stop_reason);
     }
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"something_new\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.end_turn, r.stop_reason);
     }
@@ -726,7 +733,7 @@ test "parseResponse maps finish_reason correctly" {
 test "parseResponse handles missing usage gracefully" {
     const allocator = std.testing.allocator;
     const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
@@ -739,7 +746,7 @@ test "parseResponse captures cached_tokens from prompt_tokens_details" {
         \\ "usage":{"prompt_tokens":20,"completion_tokens":5,
         \\          "prompt_tokens_details":{"cached_tokens":7}}}
     ;
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 20), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 5), response.output_tokens);
@@ -749,14 +756,14 @@ test "parseResponse captures cached_tokens from prompt_tokens_details" {
 
 test "parseResponse returns error for malformed JSON" {
     const allocator = std.testing.allocator;
-    const result = parseResponse("not valid json at all", allocator);
+    const result = parseResponse("not valid json at all", .{}, allocator);
     try std.testing.expectError(error.SyntaxError, result);
 }
 
 test "parseResponse returns error for empty choices" {
     const allocator = std.testing.allocator;
     const json = "{\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}";
-    const result = parseResponse(json, allocator);
+    const result = parseResponse(json, .{}, allocator);
     try std.testing.expectError(error.MalformedResponse, result);
 }
 
@@ -786,7 +793,7 @@ test "parseResponse parses text alongside tool_calls" {
         \\}
     ;
 
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), response.content.len);
@@ -806,7 +813,7 @@ test "parseResponse parses text alongside tool_calls" {
 }
 
 test "openai body places system as first message" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\",\"content\":\"sys\"") != null);
 }
@@ -816,7 +823,7 @@ test "openai wraps tool as type-function object" {
         .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"function\":{\"name\":\"t\",") != null);
@@ -824,7 +831,7 @@ test "openai wraps tool as type-function object" {
 }
 
 test "openai omits tools field when none are provided" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -833,7 +840,7 @@ test "openai omits tools field when none are provided" {
 }
 
 test "streaming flag is omitted by default" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\"") == null);
 }
@@ -864,7 +871,7 @@ test "openai writeMessage encodes tool_use arguments as JSON-encoded string per 
 
     const msg = types.Message{ .role = .assistant, .content = content };
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -891,7 +898,7 @@ test "openai writeMessage flattens tool_use into tool_calls" {
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -929,7 +936,7 @@ test "openai writeMessage preserves all text blocks when interleaved with tool_u
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -959,7 +966,7 @@ test "openai writeMessage concatenates multiple pure-text blocks" {
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -1008,7 +1015,7 @@ test "parseSseStream captures usage and cached_tokens from final chunk" {
         .on_event = &noopStreamCallback,
     };
 
-    const response = try parseSseStream(&sr, allocator, callback, &cancel);
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 12), response.input_tokens);
@@ -1031,7 +1038,7 @@ test "openai writeMessage emits tool role for tool_result" {
     const msg = types.Message{ .role = .user, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -1062,7 +1069,7 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
     const joined = try split_req.joinedSystem(allocator);
     defer allocator.free(joined);
 
-    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, allocator);
+    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, .{}, allocator);
     defer allocator.free(split_body);
 
     const single_body = try buildRequestBody(
@@ -1070,6 +1077,7 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
         "stable prefix\n\nper-turn suffix",
         &messages,
         &.{},
+        .{},
         allocator,
     );
     defer allocator.free(single_body);
