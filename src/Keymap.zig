@@ -219,7 +219,13 @@ pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
 /// A non-null `buffer_id` scopes the binding to that buffer handle only,
 /// which lets plugins attach keymaps to scratch buffers without leaking
 /// them into conversation panes.
+///
+/// `id` is a stable monotonic handle minted by `Registry.register`; Lua
+/// callers stash it from `zag.keymap{...}` and pass it back to
+/// `zag.keymap_remove(id)` to unregister the binding (and unref the
+/// `.lua_callback` ref). Mirrors the `Hooks.Registry` shape.
 pub const Binding = struct {
+    id: u32,
     mode: Mode,
     spec: KeySpec,
     buffer_id: ?u32,
@@ -231,36 +237,74 @@ pub const Binding = struct {
 pub const Registry = struct {
     allocator: Allocator,
     bindings: std.ArrayList(Binding),
+    next_id: u32,
 
     pub fn init(allocator: Allocator) Registry {
-        return .{ .allocator = allocator, .bindings = .empty };
+        return .{ .allocator = allocator, .bindings = .empty, .next_id = 1 };
     }
 
     pub fn deinit(self: *Registry) void {
         self.bindings.deinit(self.allocator);
     }
 
+    /// Outcome of `Registry.register`. `id` is the stable handle for the
+    /// binding (newly minted on a fresh insert, reused on overwrite).
+    /// `displaced` carries the prior action when overwriting so the
+    /// caller can release any resources it owned (chiefly the Lua
+    /// registry ref behind `.lua_callback`); it is null on fresh
+    /// inserts. Mirrors `CommandRegistry.registerLua`.
+    pub const RegisterResult = struct {
+        id: u32,
+        displaced: ?Action,
+    };
+
     /// Register (or overwrite) a binding. If a binding already exists
     /// for (mode, spec, buffer_id) its action is replaced so user config
     /// can remap defaults without duplicating entries. Scope is part of
     /// the identity: a global `j` and a buffer-local `j` coexist.
+    ///
+    /// Returns the binding's stable id alongside the displaced `Action`
+    /// when an existing entry was overwritten. Callers that bind
+    /// `.lua_callback` payloads MUST inspect `displaced` and unref the
+    /// prior callback themselves; the registry never touches the Lua
+    /// VM. Re-registering an existing (mode, spec, buffer_id) reuses
+    /// the EXISTING id — not a fresh one.
     pub fn register(
         self: *Registry,
         mode: Mode,
         spec: KeySpec,
         buffer_id: ?u32,
         action: Action,
-    ) !void {
+    ) !RegisterResult {
         for (self.bindings.items) |*b| {
             if (b.mode == mode and b.spec.eql(spec) and scopeEq(b.buffer_id, buffer_id)) {
+                const displaced = b.action;
                 b.action = action;
-                return;
+                return .{ .id = b.id, .displaced = displaced };
             }
         }
+        const id = self.next_id;
+        self.next_id += 1;
         try self.bindings.append(
             self.allocator,
-            .{ .mode = mode, .spec = spec, .buffer_id = buffer_id, .action = action },
+            .{ .id = id, .mode = mode, .spec = spec, .buffer_id = buffer_id, .action = action },
         );
+        return .{ .id = id, .displaced = null };
+    }
+
+    /// Remove a binding by id. Returns the removed `Action` so the
+    /// caller can clean up Lua registry refs held in `.lua_callback`
+    /// payloads. Returns `error.NotFound` when no binding has that id.
+    /// Does NOT unref `.lua_callback` itself; the Lua engine wrapper
+    /// owns that side of the contract because it owns the Lua VM.
+    pub fn unregister(self: *Registry, id: u32) error{NotFound}!Action {
+        for (self.bindings.items, 0..) |b, i| {
+            if (b.id == id) {
+                _ = self.bindings.orderedRemove(i);
+                return b.action;
+            }
+        }
+        return error.NotFound;
     }
 
     /// Find the action bound to (mode, event). Two-pass: buffer-local
@@ -310,7 +354,7 @@ pub const Registry = struct {
         };
         for (defaults) |d| {
             const spec = try parseKeySpec(d[1]);
-            try self.register(d[0], spec, null, d[2]);
+            _ = try self.register(d[0], spec, null, d[2]);
         }
     }
 };
@@ -400,8 +444,8 @@ test "Registry round-trip: register then lookup" {
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.register(.normal, try parseKeySpec("h"), null, .focus_left);
-    try r.register(.normal, try parseKeySpec("<C-q>"), null, .close_window);
+    _ = try r.register(.normal, try parseKeySpec("h"), null, .focus_left);
+    _ = try r.register(.normal, try parseKeySpec("<C-q>"), null, .close_window);
 
     const ev_h: input.KeyEvent = .{ .key = .{ .char = 'h' }, .modifiers = .{} };
     try std.testing.expect(r.lookup(.normal, ev_h, null).? == .focus_left);
@@ -421,8 +465,8 @@ test "Registry re-register overwrites" {
     defer r.deinit();
 
     const spec = try parseKeySpec("q");
-    try r.register(.normal, spec, null, .close_window);
-    try r.register(.normal, spec, null, .enter_insert_mode);
+    _ = try r.register(.normal, spec, null, .close_window);
+    _ = try r.register(.normal, spec, null, .enter_insert_mode);
 
     try std.testing.expect(
         r.lookup(.normal, .{ .key = .{ .char = 'q' }, .modifiers = .{} }, null).? == .enter_insert_mode,
@@ -448,9 +492,9 @@ test "registry lookup prefers buffer-local binding over global" {
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
     // Global binding
-    try r.register(.normal, .{ .key = .{ .char = 'j' }, .modifiers = .{} }, null, .focus_down);
+    _ = try r.register(.normal, .{ .key = .{ .char = 'j' }, .modifiers = .{} }, null, .focus_down);
     // Buffer-local overrides it for buffer 42
-    try r.register(.normal, .{ .key = .{ .char = 'j' }, .modifiers = .{} }, 42, .focus_up);
+    _ = try r.register(.normal, .{ .key = .{ .char = 'j' }, .modifiers = .{} }, 42, .focus_up);
 
     const ev: input.KeyEvent = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
     const hit_local = r.lookup(.normal, ev, 42) orelse return error.TestExpected;
@@ -501,6 +545,84 @@ test "formatKeySpec round-trips through parseKeySpec for the common shapes" {
     }
 }
 
+test "Registry register returns a stable id; unregister removes by id" {
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const id1 = (try r.register(.normal, try parseKeySpec("a"), null, .focus_left)).id;
+    const id2 = (try r.register(.normal, try parseKeySpec("b"), null, .focus_right)).id;
+    try std.testing.expect(id1 != id2);
+
+    const removed = try r.unregister(id1);
+    try std.testing.expect(removed == .focus_left);
+
+    const ev_a: input.KeyEvent = .{ .key = .{ .char = 'a' }, .modifiers = .{} };
+    try std.testing.expectEqual(@as(?Action, null), r.lookup(.normal, ev_a, null));
+
+    // The surviving binding is unaffected.
+    const ev_b: input.KeyEvent = .{ .key = .{ .char = 'b' }, .modifiers = .{} };
+    try std.testing.expect(r.lookup(.normal, ev_b, null).? == .focus_right);
+
+    // A subsequent register mints a fresh id (monotonic, not recycled).
+    const id3 = (try r.register(.normal, try parseKeySpec("c"), null, .focus_up)).id;
+    try std.testing.expect(id3 != id1);
+    try std.testing.expect(id3 != id2);
+}
+
+test "Registry unregister returns the lua_callback action so the caller can unref" {
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const id = (try r.register(.normal, try parseKeySpec("x"), null, .{ .lua_callback = 42 })).id;
+    const removed = try r.unregister(id);
+    try std.testing.expect(removed == .lua_callback);
+    try std.testing.expectEqual(@as(i32, 42), removed.lua_callback);
+}
+
+test "Registry unregister returns NotFound for unknown id" {
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    try std.testing.expectError(error.NotFound, r.unregister(99999));
+}
+
+test "Registry register overwrite returns the existing id" {
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const spec = try parseKeySpec("q");
+    const first = try r.register(.normal, spec, null, .close_window);
+    try std.testing.expectEqual(@as(?Action, null), first.displaced);
+    const second = try r.register(.normal, spec, null, .enter_insert_mode);
+    try std.testing.expectEqual(first.id, second.id);
+    try std.testing.expectEqual(@as(usize, 1), r.bindings.items.len);
+}
+
+test "Registry register replacing a lua_callback returns the displaced action for unref" {
+    // Re-binding the same (mode, spec, buffer_id) overwrites in place.
+    // When the prior action was a `.lua_callback`, the registry must
+    // surface its ref back to the caller so the Lua engine can release
+    // it; otherwise the ref leaks until process teardown sweeps it up.
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const spec = try parseKeySpec("<CR>");
+    const first = try r.register(.insert, spec, null, .{ .lua_callback = 100 });
+    try std.testing.expectEqual(@as(?Action, null), first.displaced);
+
+    const second = try r.register(.insert, spec, null, .{ .lua_callback = 200 });
+    try std.testing.expectEqual(first.id, second.id);
+    try std.testing.expect(second.displaced != null);
+    try std.testing.expect(second.displaced.? == .lua_callback);
+    try std.testing.expectEqual(@as(i32, 100), second.displaced.?.lua_callback);
+
+    // The live binding now points at the new ref.
+    const live = r.lookup(.insert, .{ .key = .enter, .modifiers = .{} }, null) orelse
+        return error.TestExpected;
+    try std.testing.expect(live == .lua_callback);
+    try std.testing.expectEqual(@as(i32, 200), live.lua_callback);
+}
+
 test "registry lookup skips Pass 1 entirely when focused_buffer_id is null" {
     // Invariant: with no global binding registered, a keystroke whose only
     // matches are buffer-local (to *any* buffer) must not fire when no
@@ -509,8 +631,8 @@ test "registry lookup skips Pass 1 entirely when focused_buffer_id is null" {
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
     const spec: KeySpec = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
-    try r.register(.normal, spec, 42, .focus_down);
-    try r.register(.normal, spec, 43, .focus_up);
+    _ = try r.register(.normal, spec, 42, .focus_down);
+    _ = try r.register(.normal, spec, 43, .focus_up);
 
     const ev: input.KeyEvent = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
     try std.testing.expectEqual(@as(?Action, null), r.lookup(.normal, ev, null));
