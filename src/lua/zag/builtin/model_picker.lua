@@ -141,6 +141,13 @@ local function open()
                     "/model: popup.invoke_key error: " .. tostring(err),
                     { level = "warn" }
                 )
+                -- Belt-and-suspenders: if invoke_key faulted, the popup
+                -- may be stuck open (state.closed never flipped, on_close
+                -- never fires, picker keymaps would leak). Force a close;
+                -- popup.close is idempotent and triggers on_close ->
+                -- cleanup, so the keymaps come down even on the rare
+                -- internal-error path.
+                pcall(popup.close, handle)
             end
         end
     end
