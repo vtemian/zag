@@ -57,6 +57,11 @@ pub fn runLoopStreaming(
     /// compaction entirely so callers without a rate card (some tests,
     /// the headless eval) still run cleanly.
     model_spec: llm.ModelSpec,
+    /// Stable session identifier surfaced in the per-turn `Telemetry`
+    /// timeline line and artifact files. Borrowed; the caller (main.zig
+    /// for the TUI, the headless harness for `--instruction-file`) keeps
+    /// it alive across the loop. Pass `""` from tests that don't care.
+    session_id: []const u8,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
@@ -112,10 +117,34 @@ pub fn runLoopStreaming(
     // turn so compaction never runs against an empty conversation.
     var last_input_tokens: u32 = 0;
 
+    // Compose `provider/model_id` once for the per-turn `Telemetry.model`
+    // field. Telemetry borrows the slice; freeing here at the end of the
+    // run is correct because every turn's `defer telemetry_handle.deinit()`
+    // fires before this defer runs.
+    const telemetry_model = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ model_spec.provider_name, model_spec.model_id },
+    );
+    defer allocator.free(telemetry_model);
+
     var turn_num: u32 = 0;
     while (true) {
         if (cancel.load(.acquire)) return;
         turn_num += 1;
+
+        // One `Telemetry` per turn. Created up front so the streaming
+        // path (callLlm -> provider.callStreaming -> streaming.create)
+        // can hand it a borrowed pointer; `deinit` emits the timeline
+        // log line and frees the heap allocation. A turn that errors
+        // out unwinds through this defer just like the success path.
+        const telemetry_handle = try llm.telemetry.Telemetry.init(.{
+            .allocator = allocator,
+            .session_id = session_id,
+            .turn = turn_num,
+            .model = telemetry_model,
+        });
+        defer telemetry_handle.deinit();
 
         // Fire `zag.compact.strategy` before assembling the next
         // request. The strategy may rewrite the message history (e.g.
@@ -183,7 +212,7 @@ pub fn runLoopStreaming(
         );
         defer if (filtered_owned) |d| allocator.free(d);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel);
+        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);
         // Snapshot the latest input token count so the next iteration's
@@ -468,6 +497,7 @@ fn callLlm(
     allocator: Allocator,
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
+    telemetry_opt: ?*llm.telemetry.Telemetry,
 ) !types.LlmResponse {
     var stream_ctx: StreamContext = .{ .queue = queue, .allocator = allocator };
     const callback: llm.StreamCallback = .{
@@ -482,6 +512,7 @@ fn callLlm(
         .allocator = allocator,
         .callback = callback,
         .cancel = cancel,
+        .telemetry = telemetry_opt,
     };
 
     return provider.callStreaming(&stream_req) catch |streaming_err| {
@@ -1326,6 +1357,166 @@ test "streamEventToQueue drops StreamEvent.done so it does not signal terminal" 
 
     var buf: [4]agent_events.AgentEvent = undefined;
     try std.testing.expectEqual(@as(usize, 0), queue.drain(&buf));
+}
+
+/// Minimal streaming provider that snapshots fields off `req.telemetry`
+/// during the call so the per-turn wiring can be asserted without keeping
+/// the borrowed Telemetry pointer alive past `runLoopStreaming`'s
+/// per-iteration `defer deinit()`. Returns an empty assistant message so
+/// `runLoopStreaming` exits the while loop after one iteration (no tool
+/// calls -> break).
+const TelemetryCaptureProvider = struct {
+    captured_present: bool = false,
+    captured_session_id: []u8 = &.{},
+    captured_model: []u8 = &.{},
+    captured_turn: u32 = 0,
+    call_count: u32 = 0,
+    snapshot_alloc: std.mem.Allocator,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "telemetry_capture",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *TelemetryCaptureProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (req.telemetry) |t| {
+            self.captured_present = true;
+            self.captured_turn = t.turn;
+            // Dupe the borrowed slices because the agent loop frees the
+            // Telemetry (and any allocator-owned model string) at the end
+            // of its iteration via `defer telemetry_handle.deinit()`.
+            self.captured_session_id = self.snapshot_alloc.dupe(u8, t.session_id) catch &.{};
+            self.captured_model = self.snapshot_alloc.dupe(u8, t.model) catch &.{};
+        }
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 0,
+            .output_tokens = 0,
+        };
+    }
+
+    fn provider(self: *TelemetryCaptureProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *TelemetryCaptureProvider) void {
+        self.snapshot_alloc.free(self.captured_session_id);
+        self.snapshot_alloc.free(self.captured_model);
+    }
+};
+
+test "callLlm threads telemetry handle through StreamRequest into provider" {
+    const allocator = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var capture: TelemetryCaptureProvider = .{ .snapshot_alloc = allocator };
+    defer capture.deinit();
+    const p = capture.provider();
+
+    const handle = try llm.telemetry.Telemetry.init(.{
+        .allocator = allocator,
+        .session_id = "sess-cap",
+        .turn = 1,
+        .model = "stub/model",
+    });
+    defer handle.deinit();
+
+    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, handle);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), capture.call_count);
+    try std.testing.expect(capture.captured_present);
+    try std.testing.expectEqualStrings("sess-cap", capture.captured_session_id);
+    try std.testing.expectEqualStrings("stub/model", capture.captured_model);
+    try std.testing.expectEqual(@as(u32, 1), capture.captured_turn);
+}
+
+test "callLlm leaves StreamRequest.telemetry null when caller passes null" {
+    // Pins the negative case: optional field stays optional. Guards against
+    // a future refactor that accidentally hardcodes a non-null value.
+    const allocator = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var capture: TelemetryCaptureProvider = .{ .snapshot_alloc = allocator };
+    defer capture.deinit();
+    const p = capture.provider();
+
+    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null);
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), capture.call_count);
+    try std.testing.expect(!capture.captured_present);
+}
+
+test "runLoopStreaming constructs Telemetry per turn with session_id and provider/model" {
+    // Drives one full iteration through `runLoopStreaming` with a stub
+    // provider that returns end_turn on the first call so the loop exits.
+    // The stub snapshots the per-turn `Telemetry` fields during the call
+    // because the agent loop frees the handle on iteration end (defer).
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+
+    var capture: TelemetryCaptureProvider = .{ .snapshot_alloc = allocator };
+    defer capture.deinit();
+    const p = capture.provider();
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer messages.deinit(allocator);
+
+    const spec: llm.ModelSpec = .{
+        .provider_name = "stubprov",
+        .model_id = "stubmodel-1",
+        .context_window = 0,
+    };
+
+    try runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-runloop",
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), capture.call_count);
+    try std.testing.expect(capture.captured_present);
+    try std.testing.expectEqualStrings("sess-runloop", capture.captured_session_id);
+    try std.testing.expectEqualStrings("stubprov/stubmodel-1", capture.captured_model);
+    try std.testing.expectEqual(@as(u32, 1), capture.captured_turn);
 }
 
 test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt output" {

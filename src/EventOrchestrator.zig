@@ -945,6 +945,16 @@ fn onUserInputSubmitted(
     if (runner.isAgentRunning()) return;
 
     const spec = llm.resolveModelSpec(&self.provider.registry, self.provider.model_id);
+    // Derive the per-run session id from the pane's attached
+    // SessionHandle. The slice points into `SessionHandle.id` (an inline
+    // [32]u8 array) which is stable for the handle's lifetime; the
+    // handle is owned by main.zig and outlives any agent run on it.
+    // Empty string when persistence is disabled (`--no-session`); the
+    // telemetry line then shows `session=`.
+    const session_id: []const u8 = if (session.session_handle) |sh|
+        sh.id[0..sh.id_len]
+    else
+        "";
     try runner.submit(&session.messages, .{
         .allocator = self.allocator,
         .wake_write_fd = self.wake_write_fd,
@@ -953,6 +963,7 @@ fn onUserInputSubmitted(
         .model_spec = spec,
         .registry = self.registry,
         .subagents = if (self.lua_engine) |eng| eng.subagentRegistry() else null,
+        .session_id = session_id,
     });
 }
 

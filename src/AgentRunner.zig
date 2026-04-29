@@ -187,6 +187,12 @@ pub const SpawnDeps = struct {
     /// tool. Null disables delegation (the `task` tool surfaces a
     /// "no TaskContext bound" error when invoked).
     subagents: ?*const subagents_mod.SubagentRegistry = null,
+    /// Stable session identifier surfaced in per-turn `Telemetry`
+    /// timeline lines and artifact files. Borrowed; the caller
+    /// (main.zig for the TUI, the headless harness for
+    /// `--instruction-file`) keeps it alive across the run. Empty
+    /// string is acceptable for tests and `--no-session` runs.
+    session_id: []const u8 = "",
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -247,6 +253,7 @@ pub fn submit(
         deps.skills orelse self.skills,
         if (deps.subagents != null) &self.task_ctx else null,
         &self.turn_in_progress,
+        deps.session_id,
     });
 }
 
@@ -348,6 +355,7 @@ fn threadMain(
     skills: ?*const skills_mod.SkillRegistry,
     task_ctx: ?*const tools.TaskContext,
     turn_in_progress: *std.atomic.Value(bool),
+    session_id: []const u8,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -385,6 +393,7 @@ fn threadMain(
         skills,
         turn_in_progress,
         model_spec,
+        session_id,
     ) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
