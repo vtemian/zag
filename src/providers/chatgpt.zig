@@ -821,6 +821,37 @@ fn handleCompleted(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
     emit.callback.on_event(emit.callback.ctx, .done);
 }
 
+/// Repackage a Codex `response.failed` envelope so the shared error
+/// classifier (which expects `{"error":{...}}` at the root) can read the
+/// inner error object. Returns an allocator-owned JSON string of the form
+/// `{"error":<inner>}`, or null when the envelope doesn't carry the
+/// expected nested shape.
+fn flattenResponseError(allocator: Allocator, raw_data: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        raw_data,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const response_value = parsed.value.object.get("response") orelse return null;
+    if (response_value != .object) return null;
+    const err_value = response_value.object.get("error") orelse return null;
+    if (err_value != .object) return null;
+
+    // Re-serialize the inner error object so the classifier sees a flat
+    // `{"error":{...}}`. The double-pass cost is fine: response.failed is
+    // strictly off the hot path.
+    var out: std.io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"error\":");
+    try std.json.Stringify.value(err_value, .{}, &out.writer);
+    try out.writer.writeAll("}");
+    return try out.toOwnedSlice();
+}
+
 fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const u8) !void {
     // A mid-stream `response.failed` is terminal: the provider will not
     // send `response.completed`, so any partially-accumulated blocks are
@@ -828,14 +859,38 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const
     // callback for observers and then return `ProviderResponseFailed` so
     // callers can distinguish this from a successful empty turn.
 
-    // Telemetry sees the full envelope before we lose ownership through
-    // the partial-parse path below. Failure to write the artifact is a
-    // warn, not a fatal: the agent loop must still see ProviderResponseFailed.
+    // Telemetry sees the raw envelope (artifact dump uses it verbatim),
+    // but classification has to feed on a flattened shape because the
+    // classifier expects `{"error":{...}}` at the JSON root and Codex
+    // wraps the error inside `response.error`. We extract the inner
+    // object and classify that. Failure to flatten just falls back to
+    // raw classification, which is fine — the worst case is a `.unknown`
+    // bucket whose user message names the log path.
     if (emit.telemetry) |t| {
         _ = t.onStreamError(.chatgpt_response_failed, raw_data) catch |err| {
             log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
         };
     }
+    const flattened_envelope = flattenResponseError(emit.allocator, raw_data) catch null;
+    defer if (flattened_envelope) |f| emit.allocator.free(f);
+    const for_classify: []const u8 = flattened_envelope orelse raw_data;
+    const class = llm.error_class.classify(0, for_classify, &.{});
+
+    // Surface the classifier output to the UI through `error_detail` so
+    // codex `usage_not_included` / `context_length_exceeded` envelopes
+    // render with the friendly hint. Best-effort: a userMessage failure
+    // just leaves the slot untouched.
+    if (llm.error_class.userMessage(class, emit.allocator)) |detail| {
+        llm.error_detail.set(emit.allocator, detail);
+    } else |err| {
+        log.warn("error_class.userMessage failed: {s}", .{@errorName(err)});
+    }
+
+    // The agent-loop `.err` callback keeps the provider-tagged
+    // "{code}: {message}" string so logs can correlate retries to the
+    // upstream code. The UI gets the friendly text via error_detail
+    // above; the .err string is for observers.
+    emit.stop_reason.* = .end_turn;
 
     const response_value = obj.get("response") orelse {
         emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
@@ -866,13 +921,10 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const
     else
         "";
 
-    // Classify known error codes. Detailed mapping to zag's ProviderError set
-    // happens at the call site; here we just surface the text.
     const text = try std.fmt.allocPrint(emit.allocator, "{s}: {s}", .{ code, message });
     defer emit.allocator.free(text);
 
     emit.callback.on_event(emit.callback.ctx, .{ .err = text });
-    emit.stop_reason.* = .end_turn;
     return error.ProviderResponseFailed;
 }
 
@@ -1343,6 +1395,11 @@ test "chatgpt SSE: response.failed emits err with code and message" {
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
 
+    // handleFailed populates error_detail via the classifier; drain prior
+    // values and reclaim what we wrote so testing.allocator stays leak-free.
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
+
     // `response.failed` now terminates dispatch with ProviderResponseFailed;
     // the `.err` callback still fires before the error propagates.
     const result = fx.run(allocator, &.{
@@ -1365,6 +1422,9 @@ test "chatgpt SSE: response.failed returns error to caller" {
     const allocator = std.testing.allocator;
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
+
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
 
     // Accumulate a text delta first so we also exercise the outer cleanup
     // path that frees partial blocks on the error return.
@@ -2240,6 +2300,10 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
     defer fx.deinit(allocator);
     fx.telemetry = t;
 
+    // Drain any error_detail set by prior tests so leak detection here
+    // sees only what this test produces.
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+
     const envelope = "{\"response\":{\"id\":\"r_99\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too big\"}}}";
     const result = fx.run(allocator, &.{
         .{ .event_type = "response.failed", .data = envelope },
@@ -2248,6 +2312,12 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
 
     try std.testing.expect(t.had_error);
     try std.testing.expect(t.error_kind != null);
+
+    // The classifier saw the flattened envelope and produced the
+    // context-overflow user message; that's what the UI surfaces.
+    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Context exceeds the model's window") != null);
 
     // The artifact landed alongside the (test) log path.
     const expected = (try file_log.artifactPath(allocator, ".turn-6.stream-error.json")) orelse
@@ -2316,6 +2386,9 @@ test "chatgpt SSE: response.failed without telemetry still terminates with Provi
     const allocator = std.testing.allocator;
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
+
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
 
     // Telemetry is null — confirm the existing error path is unaffected.
     const result = fx.run(allocator, &.{

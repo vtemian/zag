@@ -568,6 +568,39 @@ test "userMessage gateway_html includes status code" {
     try testing.expect(std.mem.indexOf(u8, msg, "502") != null);
 }
 
+test "classify+userMessage end-to-end: codex context_length_exceeded" {
+    // Walk the full pipeline a streaming caller would: a Codex 400 body
+    // with a known error code goes through `classify` and then through
+    // `userMessage`, and the user-visible string mentions the model
+    // window so the agent loop can show actionable guidance.
+    const body = "{\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Input exceeds the context window\"}}";
+    const class = classify(400, body, &.{});
+    const msg = try userMessage(class, testing.allocator);
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "Context exceeds the model's window") != null);
+}
+
+test "classify+userMessage end-to-end: codex usage_not_included" {
+    // ChatGPT plan-limit envelopes (Plus upsell) must surface "ChatGPT
+    // plan" so the user understands they need to upgrade or wait.
+    const body = "{\"type\":\"error\",\"error\":{\"code\":\"usage_not_included\"}}";
+    const class = classify(400, body, &.{});
+    const msg = try userMessage(class, testing.allocator);
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "ChatGPT plan") != null);
+}
+
+test "classify+userMessage end-to-end: unknown 503 names log path" {
+    // A bare 503 with no matching JSON envelope falls into the .unknown
+    // bucket. The user message must include the status code AND point
+    // the user at the artifact log path.
+    const class = classify(503, "Service Unavailable", &.{});
+    const msg = try userMessage(class, testing.allocator);
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "503") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "~/.zag/logs") != null);
+}
+
 test "userMessage invalid_request uses provider message verbatim when present" {
     const msg = try userMessage(
         .{ .invalid_request = .{ .provider_message = "field 'foo' is required" } },
