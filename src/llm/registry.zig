@@ -147,6 +147,16 @@ pub const Endpoint = struct {
         /// thinkingSignature trick: a provider that READ from
         /// `reasoning_content` echoes back to `reasoning_content`.
         echo_field: ?[]const u8 = null,
+
+        /// JSON field name on outgoing Chat Completions requests where the
+        /// runtime `zag.set_thinking_effort` value lands. Null means this
+        /// endpoint does not advertise a reasoning_effort knob; the runtime
+        /// value is dropped silently. Examples: Moonshot/Kimi accept
+        /// "reasoning_effort"; OpenAI's Chat Completions endpoint also
+        /// understands it for some models (gpt-5.x family). Independent of
+        /// the codex wire's nested `reasoning.effort` (see `effort` above)
+        /// because the Responses API has its own placement convention.
+        effort_request_field: ?[]const u8 = null,
     };
 
     /// Per-model rate card: context limits and dollar cost per million tokens.
@@ -252,6 +262,12 @@ pub const Endpoint = struct {
             null;
         errdefer if (reasoning_echo_field) |s| allocator.free(s);
 
+        const reasoning_effort_request_field: ?[]const u8 = if (self.reasoning.effort_request_field) |s|
+            try allocator.dupe(u8, s)
+        else
+            null;
+        errdefer if (reasoning_effort_request_field) |s| allocator.free(s);
+
         return .{
             .name = name,
             .serializer = self.serializer,
@@ -266,6 +282,7 @@ pub const Endpoint = struct {
                 .verbosity = reasoning_verbosity,
                 .response_fields = reasoning_response_fields,
                 .echo_field = reasoning_echo_field,
+                .effort_request_field = reasoning_effort_request_field,
             },
         };
     }
@@ -277,6 +294,7 @@ pub const Endpoint = struct {
         allocator.free(self.reasoning.verbosity);
         freeStringSlice(self.reasoning.response_fields, allocator);
         if (self.reasoning.echo_field) |s| allocator.free(s);
+        if (self.reasoning.effort_request_field) |s| allocator.free(s);
         switch (self.auth) {
             .oauth => |spec| freeOAuthSpec(spec, allocator),
             else => {},
@@ -877,6 +895,34 @@ test "Endpoint.dupe round-trips response_fields and echo_field" {
     try std.testing.expectEqualStrings("reasoning_content", copy.reasoning.echo_field.?);
     // Independent storage: pointers must differ.
     try std.testing.expect(copy.reasoning.response_fields.ptr != original.reasoning.response_fields.ptr);
+}
+
+test "Endpoint.dupe round-trips effort_request_field" {
+    const allocator = std.testing.allocator;
+
+    const original = Endpoint{
+        .name = "moonshot",
+        .serializer = .openai,
+        .url = "https://api.moonshot.ai/v1/chat/completions",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "kimi-k2.6",
+        .models = &.{},
+        .reasoning = .{
+            .effort = "medium",
+            .summary = "auto",
+            .verbosity = "medium",
+            .effort_request_field = "reasoning_effort",
+        },
+    };
+
+    const copy = try original.dupe(allocator);
+    defer copy.free(allocator);
+
+    try std.testing.expect(copy.reasoning.effort_request_field != null);
+    try std.testing.expectEqualStrings("reasoning_effort", copy.reasoning.effort_request_field.?);
+    // Independent storage: pointers must differ.
+    try std.testing.expect(copy.reasoning.effort_request_field.?.ptr != original.reasoning.effort_request_field.?.ptr);
 }
 
 test {
