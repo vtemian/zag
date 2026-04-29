@@ -100,6 +100,10 @@ fn recordEvent(ev: SpanEvent) void {
 /// integer, float, and bool fields; anything else writes the literal
 /// JSON null so the output stays parseable. Used by SpanHandle to write
 /// metadata into the trace ring buffer.
+/// Floats are emitted via {d} which produces "nan"/"inf" for NaN
+/// and Infinity respectively; both are invalid JSON. No current
+/// caller passes floats, but future callers must validate upstream
+/// or risk producing an unparseable trace dump.
 fn formatArgsAsJson(buf: []u8, args: anytype) ![]const u8 {
     var len: usize = 0;
     if (buf.len < 2) return error.NoSpaceLeft;
@@ -369,7 +373,7 @@ pub fn getStats() Stats {
 
     // Collect frame durations from the ring buffer
     var frame_durs: [ring_size]u64 = undefined;
-    var frame_count: usize = 0;
+    var frames_seen: usize = 0;
 
     const events_available = @min(ring_head, ring_size);
     const start_idx = ring_head -| events_available;
@@ -377,26 +381,26 @@ pub fn getStats() Stats {
     for (start_idx..ring_head) |i| {
         const slot = &ring[i % ring_size];
         const sname = slot.name[0..slot.name_len];
-        if (std.mem.eql(u8, sname, "frame") and frame_count < ring_size) {
-            frame_durs[frame_count] = slot.dur_us;
-            frame_count += 1;
+        if (std.mem.eql(u8, sname, "frame") and frames_seen < ring_size) {
+            frame_durs[frames_seen] = slot.dur_us;
+            frames_seen += 1;
         }
     }
 
-    if (frame_count == 0) return zero;
+    if (frames_seen == 0) return zero;
 
     // Sort for percentile computation
-    std.mem.sort(u64, frame_durs[0..frame_count], {}, std.sort.asc(u64));
+    std.mem.sort(u64, frame_durs[0..frames_seen], {}, std.sort.asc(u64));
 
     var total_us: u64 = 0;
     var max_us: u64 = 0;
-    for (frame_durs[0..frame_count]) |dur| {
+    for (frame_durs[0..frames_seen]) |dur| {
         total_us += dur;
         if (dur > max_us) max_us = dur;
     }
 
-    const avg_us = total_us / frame_count;
-    const p99_idx = (frame_count * 99) / 100;
+    const avg_us = total_us / frames_seen;
+    const p99_idx = (frames_seen * 99) / 100;
     const p99_us = frame_durs[p99_idx];
 
     const avg_allocs: f64 = if (total_frame_count > 0)
@@ -405,7 +409,7 @@ pub fn getStats() Stats {
         0;
 
     return .{
-        .frame_count = frame_count,
+        .frame_count = frames_seen,
         .avg_frame_us = avg_us,
         .p99_frame_us = p99_us,
         .max_frame_us = max_us,
@@ -824,4 +828,21 @@ test "ring buffer wraps around" {
     // Oldest events overwritten but no crash
     const slot = &ring[0];
     try std.testing.expectEqualStrings("wrap", slot.name[0..slot.name_len]);
+}
+
+test "formatArgsAsJson handles bool, float, and unsupported-type fallback" {
+    if (!enabled) return;
+    init();
+    var s = span("test_mixed");
+    s.endWithArgs(.{ .ok = true, .ratio = 0.5, .name = "skipped" });
+    const slot = ring[(ring_head - 1) % ring_size];
+    const args_str = slot.args[0..slot.args_len];
+    // Bool emits true/false; float emits a number (zig {d} format
+    // is decimal, exact form may vary between zig versions); string
+    // is unsupported and falls back to null per the helper contract.
+    // Use indexOf instead of full string equality so the float form
+    // can be either "0.5" or "5.0e-1" depending on stdlib.
+    try std.testing.expect(std.mem.indexOf(u8, args_str, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, args_str, "\"name\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, args_str, "\"ratio\":") != null);
 }
