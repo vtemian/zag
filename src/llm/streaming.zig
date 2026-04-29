@@ -194,15 +194,22 @@ pub const StreamingResponse = struct {
             };
             defer if (side_channel_headers.len > 0) freeSideChannelHeaders(allocator, side_channel_headers);
 
-            const response_body: []const u8 = http_mod.httpPostJson(
+            // httpPostJsonRaw returns the (status, body) pair regardless
+            // of HTTP status, so the 4xx envelope we want for telemetry
+            // actually reaches us. raw.status is currently unused but
+            // worth threading into telemetry in slice 4 — the side
+            // channel may return a different status than the streaming
+            // attempt (transient 404 -> 200, for example).
+            const raw = http_mod.httpPostJsonRaw(
                 url,
                 body,
                 side_channel_headers,
                 allocator,
             ) catch |err| blk: {
                 log.warn("streaming: side-channel re-fetch failed: {s}", .{@errorName(err)});
-                break :blk @as([]const u8, "");
+                break :blk http_mod.RawResponse{ .status = 0, .body = "" };
             };
+            const response_body = raw.body;
             const owns_body = response_body.len > 0;
             defer if (owns_body) allocator.free(response_body);
 
