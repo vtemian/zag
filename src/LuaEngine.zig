@@ -4937,18 +4937,6 @@ pub const LuaEngine = struct {
         return try allocator.dupe(u8, borrowed);
     }
 
-    /// Read a headers field from the Lua table at `table_idx`. Accepts two
-    /// shapes:
-    ///   (a) Array of pairs:   { { name = "x", value = "1" }, { name = "y", value = "2" } }
-    ///   (b) Map of strings:   { ["x"] = "1", ["y"] = "2" }
-    ///
-    /// Returns an owned slice of `llm.Endpoint.Header`. An absent or nil
-    /// field yields an empty slice. Order is preserved for form (a);
-    /// iteration order for form (b) is Lua-implementation-defined, so
-    /// callers that need deterministic order must use form (a).
-    ///
-    /// Each `.name` and `.value` is duped onto `allocator`. Caller owns
-    /// both the outer slice and each duped string.
     /// Read a Lua array-of-strings field at `name`. Absent or nil →
     /// empty slice. Each string is duped onto `allocator`. Caller owns
     /// the outer slice and each inner string. Errors when the field is
@@ -4997,6 +4985,18 @@ pub const LuaEngine = struct {
         return try items.toOwnedSlice(allocator);
     }
 
+    /// Read a headers field from the Lua table at `table_idx`. Accepts two
+    /// shapes:
+    ///   (a) Array of pairs:   { { name = "x", value = "1" }, { name = "y", value = "2" } }
+    ///   (b) Map of strings:   { ["x"] = "1", ["y"] = "2" }
+    ///
+    /// Returns an owned slice of `llm.Endpoint.Header`. An absent or nil
+    /// field yields an empty slice. Order is preserved for form (a);
+    /// iteration order for form (b) is Lua-implementation-defined, so
+    /// callers that need deterministic order must use form (a).
+    ///
+    /// Each `.name` and `.value` is duped onto `allocator`. Caller owns
+    /// both the outer slice and each duped string.
     fn readHeaderList(
         lua: *Lua,
         table_idx: i32,
