@@ -4949,6 +4949,54 @@ pub const LuaEngine = struct {
     ///
     /// Each `.name` and `.value` is duped onto `allocator`. Caller owns
     /// both the outer slice and each duped string.
+    /// Read a Lua array-of-strings field at `name`. Absent or nil →
+    /// empty slice. Each string is duped onto `allocator`. Caller owns
+    /// the outer slice and each inner string. Errors when the field is
+    /// present but not an array, or when any entry is not a string.
+    /// Mirrors `readHeaderList`'s array branch but for a flat list.
+    fn readStringArray(
+        lua: *Lua,
+        table_idx: i32,
+        name: [:0]const u8,
+        allocator: Allocator,
+    ) ![][]const u8 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return try allocator.alloc([]const u8, 0);
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider(): field '{s}' must be an array of strings", .{name});
+            return error.LuaError;
+        }
+
+        const inner = lua.absIndex(-1);
+
+        var items: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (items.items) |s| allocator.free(s);
+            items.deinit(allocator);
+        }
+
+        const len = lua.rawLen(inner);
+        for (0..len) |i| {
+            _ = lua.rawGetIndex(inner, @intCast(i + 1));
+            defer lua.pop(1);
+            if (lua.typeOf(-1) != .string) {
+                log.warn("zag.provider(): field '{s}' entry {d} must be a string", .{ name, i + 1 });
+                return error.LuaError;
+            }
+            const borrowed = lua.toString(-1) catch {
+                log.warn("zag.provider(): field '{s}' entry {d} could not be read", .{ name, i + 1 });
+                return error.LuaError;
+            };
+            const owned = try allocator.dupe(u8, borrowed);
+            errdefer allocator.free(owned);
+            try items.append(allocator, owned);
+        }
+
+        return try items.toOwnedSlice(allocator);
+    }
+
     fn readHeaderList(
         lua: *Lua,
         table_idx: i32,
@@ -9349,6 +9397,71 @@ test "zag.provider{}: invalid verbosity surfaces LuaRuntime" {
             \\}
         ),
     );
+}
+
+test "readStringArray parses Lua array of strings" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString(
+        \\return { "reasoning_content", "reasoning", "reasoning_text" }
+    );
+    const top = engine.lua.absIndex(-1);
+    defer engine.lua.pop(1);
+
+    // Read into a fake outer table by faking the outer field with a
+    // direct call into the helper. The helper expects a table_idx
+    // pointing at the OUTER table that contains a field of name `name`,
+    // so wrap once: outer = { fields = {...} }.
+    try engine.lua.doString(
+        \\return { fields = { "reasoning_content", "reasoning", "reasoning_text" } }
+    );
+    defer engine.lua.pop(1);
+    const outer = engine.lua.absIndex(-1);
+
+    const result = try LuaEngine.readStringArray(engine.lua, outer, "fields", allocator);
+    defer {
+        for (result) |s| allocator.free(s);
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("reasoning_content", result[0]);
+    try std.testing.expectEqualStrings("reasoning", result[1]);
+    try std.testing.expectEqualStrings("reasoning_text", result[2]);
+
+    _ = top;
+}
+
+test "readStringArray returns empty slice when field absent" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("return { other = 1 }");
+    defer engine.lua.pop(1);
+    const outer = engine.lua.absIndex(-1);
+
+    const result = try LuaEngine.readStringArray(engine.lua, outer, "fields", allocator);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "readStringArray rejects non-string entry" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("return { fields = { \"ok\", 42 } }");
+    defer engine.lua.pop(1);
+    const outer = engine.lua.absIndex(-1);
+
+    try std.testing.expectError(error.LuaError, LuaEngine.readStringArray(engine.lua, outer, "fields", allocator));
 }
 
 test "TaskHandle metatable is registered at engine init" {
