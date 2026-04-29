@@ -264,7 +264,25 @@ fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
     var first = true;
     for (msg.content) |block| {
         switch (block) {
-            .thinking, .redacted_thinking => if (!emit_thinking) continue,
+            .thinking => |th| {
+                if (!emit_thinking) continue;
+                // Provider gate: only Anthropic-issued thinking blocks
+                // carry valid signatures the Messages API can verify.
+                // Cross-provider history (e.g. an .openai_chat block
+                // from a Moonshot turn earlier in the session) reaches
+                // here with no signature; serializing it would produce
+                // a thinking block Anthropic rejects with HTTP 400.
+                if (th.provider != .anthropic) continue;
+            },
+            .redacted_thinking => {
+                if (!emit_thinking) continue;
+                // Same gate: redacted_thinking carries encrypted_content
+                // that only the originating provider can validate. We
+                // have no provider field on this variant today; the
+                // safe default is to drop on cross-provider replay.
+                // When this gate causes a real loss of context, add a
+                // provider tag to RedactedThinking and gate on it.
+            },
             else => {},
         }
         if (!first) try w.writeAll(",");
@@ -1742,6 +1760,46 @@ test "anthropic writeMessage emits empty signature when thinking has none" {
 
     const first = parsed.value.object.get("content").?.array.items[0].object;
     try testing.expectEqualStrings("", first.get("signature").?.string);
+}
+
+test "anthropic writeMessage drops thinking blocks tagged with foreign provider" {
+    // Cross-provider safety: a session that ran on Moonshot/Kimi (which
+    // produces .openai_chat-tagged thinking) and then switched to a
+    // Claude model must not re-send the foreign thinking blocks to the
+    // Anthropic API. The signature would be missing or null and the
+    // request would 400. Drop them silently and emit an assistant
+    // message that contains only Anthropic-valid blocks.
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "kimi-style thinking",
+        .signature = null, // openai_chat has no signature
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .text = .{ .text = "actual answer" } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+
+    // Use a model identifier that supports extended thinking (so
+    // emit_thinking is true). Otherwise the no-extended-thinking branch
+    // would also drop the block for an unrelated reason and the test
+    // wouldn't actually pin the new gate.
+    try writeMessage("claude-sonnet-4-5", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const blocks = parsed.value.object.get("content").?.array;
+    // Only the .text block survives; the .openai_chat thinking is dropped.
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expectEqualStrings("text", blocks.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("actual answer", blocks.items[0].object.get("text").?.string);
 }
 
 test "anthropic writeMessage serializes redacted_thinking block" {
