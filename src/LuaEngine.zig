@@ -5484,12 +5484,16 @@ pub const LuaEngine = struct {
         const echo_field = try readStringField(lua, table_idx, "reasoning_echo_field", .optional, allocator);
         errdefer if (echo_field) |s| allocator.free(s);
 
+        const effort_request_field = try readStringField(lua, table_idx, "reasoning_effort_field", .optional, allocator);
+        errdefer if (effort_request_field) |s| allocator.free(s);
+
         return .{
             .effort = effort,
             .summary = summary,
             .verbosity = verbosity,
             .response_fields = response_fields,
             .echo_field = echo_field,
+            .effort_request_field = effort_request_field,
         };
     }
 
@@ -9666,6 +9670,48 @@ test "zag.provider reads reasoning_response_fields and reasoning_echo_field" {
     try std.testing.expectEqualStrings("reasoning", ep.reasoning.response_fields[1]);
     try std.testing.expect(ep.reasoning.echo_field != null);
     try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.echo_field.?);
+}
+
+test "zag.provider reads reasoning_effort_field" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider({
+        \\  name = "moonshot",
+        \\  url = "https://api.moonshot.ai/v1/chat/completions",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "kimi-k2.6",
+        \\  models = {{ id = "kimi-k2.6" }},
+        \\  reasoning_effort_field = "reasoning_effort",
+        \\})
+    );
+
+    const ep = engine.providers_registry.find("moonshot") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ep.reasoning.effort_request_field != null);
+    try std.testing.expectEqualStrings("reasoning_effort", ep.reasoning.effort_request_field.?);
+}
+
+test "zag.provider defaults reasoning_effort_field to null" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider({
+        \\  name = "openai-no-effort",
+        \\  url = "https://api.openai.com/v1/chat/completions",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "gpt-4o",
+        \\  models = {{ id = "gpt-4o" }},
+        \\})
+    );
+
+    const ep = engine.providers_registry.find("openai-no-effort") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ep.reasoning.effort_request_field == null);
 }
 
 test "zag.provider defaults reasoning_response_fields to empty and echo_field to null" {
