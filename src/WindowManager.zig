@@ -2040,21 +2040,38 @@ pub fn handlePerfCommand(self: *WindowManager, command: []const u8) void {
 }
 
 /// Format the current performance snapshot and append it as a status node.
+/// Reports two parallel views: frame-level stats (the optional render
+/// path) and tick-level stats (the full main-thread iteration). The tick
+/// view is the one to watch when the UI feels stuck: max_tick_work and
+/// max_drain capture blockage that frame stats miss because the freeze
+/// returns early at the !frame_dirty guard or sits in drain before the
+/// frame span starts.
 fn showPerfStats(self: *WindowManager) void {
     const stats = trace.getStats();
-    var scratch: [512]u8 = undefined;
+    var scratch: [768]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch,
-        \\Performance (last {d} frames):
-        \\  avg frame:       {d:.1}ms
-        \\  p99 frame:       {d:.1}ms
-        \\  max frame:       {d:.1}ms
-        \\  peak memory:     {d:.1}MB
-        \\  avg allocs/frame: {d:.1}
+        \\Performance:
+        \\  frames recorded:   {d}
+        \\  avg frame:         {d:.1}ms
+        \\  p99 frame:         {d:.1}ms
+        \\  max frame:         {d:.1}ms
+        \\  ticks recorded:    {d}
+        \\  avg tick work:     {d:.1}ms
+        \\  max tick work:     {d:.1}ms
+        \\  avg drain:         {d:.1}ms
+        \\  max drain:         {d:.1}ms
+        \\  peak memory:       {d:.1}MB
+        \\  avg allocs/frame:  {d:.1}
     , .{
         stats.frame_count,
         @as(f64, @floatFromInt(stats.avg_frame_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.p99_frame_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.max_frame_us)) / 1000.0,
+        stats.tick_count,
+        @as(f64, @floatFromInt(stats.avg_tick_work_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.max_tick_work_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.avg_drain_us)) / 1000.0,
+        @as(f64, @floatFromInt(stats.max_drain_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
         stats.avg_allocs_per_frame,
     }) catch "Performance: error formatting";
@@ -2116,64 +2133,70 @@ pub fn drainPane(self: *WindowManager, pane: *Pane) void {
 /// If `pane` has a session without a name and enough conversation to summarize,
 /// ask the provider for a 3-5 word title and rename the session.
 /// Best-effort: any failure is logged and swallowed.
+/// Auto-rename a freshly-created session at the end of its first turn.
+/// Pulls the first user-message text out of the conversation history and
+/// derives a name from it deterministically; no LLM round-trip, no main
+/// thread blockage. Skipped when the session already has a name or when
+/// no user message has landed yet.
 fn autoNameSession(self: *WindowManager, pane: Pane) void {
+    _ = self;
     const session = pane.session orelse return;
     const sh = session.session_handle orelse return;
     if (sh.meta.name_len > 0) return;
 
     const inputs = session.sessionSummaryInputs() orelse return;
 
-    const summary = self.generateSessionName(inputs) catch |err| {
-        log.debug("auto-name failed: {}", .{err});
-        return;
-    };
-    defer self.allocator.free(summary);
+    var name_buf: [128]u8 = undefined;
+    const name = deriveSessionName(&name_buf, inputs.user_text);
+    if (name.len == 0) return;
 
-    sh.rename(summary) catch |err| {
+    sh.rename(name) catch |err| {
         log.warn("session rename failed: {}", .{err});
     };
 }
 
-/// Send a minimal LLM request to summarize the first exchange in 3-5 words.
-fn generateSessionName(
-    self: *WindowManager,
-    inputs: ConversationHistory.SessionSummaryInputs,
-) ![]const u8 {
-    const allocator = self.allocator;
+/// Build a session name from the user's first message: take up to five
+/// words separated by single space, stop at sentence-ending punctuation
+/// or newline, collapse runs of whitespace, trim leading/trailing
+/// whitespace, and truncate to fit `buf`. Pure function with no IO so
+/// `autoNameSession` runs in microseconds on the main thread.
+///
+/// Replaces a synchronous LLM round-trip that previously blocked the
+/// orchestrator tick for 5-30 seconds on the first turn of every new
+/// session, freezing pane and mode switches behind it.
+fn deriveSessionName(buf: []u8, user_text: []const u8) []const u8 {
+    const max_words: usize = 5;
 
-    const user_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(user_content);
-    user_content[0] = .{ .text = .{ .text = inputs.user_text } };
+    const State = enum { leading, in_word, between_words };
+    var state: State = .leading;
+    var written: usize = 0;
+    var word_count: usize = 0;
 
-    const assistant_content = try allocator.alloc(types.ContentBlock, 1);
-    errdefer allocator.free(assistant_content);
-    assistant_content[0] = .{ .text = .{ .text = inputs.assistant_text } };
+    for (user_text) |b| {
+        if (b == '\n' or b == '.' or b == '!' or b == '?') break;
 
-    var summary_msgs = [_]types.Message{
-        .{ .role = .user, .content = user_content },
-        .{ .role = .assistant, .content = assistant_content },
-    };
-
-    const req = llm.Request{
-        .system_stable = "Summarize this conversation in 3-5 words. Return only the summary, nothing else.",
-        .messages = &summary_msgs,
-        .tool_definitions = &.{},
-        .allocator = allocator,
-    };
-    const response = try self.provider.provider.call(&req);
-    defer response.deinit(allocator);
-
-    allocator.free(user_content);
-    allocator.free(assistant_content);
-
-    for (response.content) |block| {
-        switch (block) {
-            .text => |t| return try allocator.dupe(u8, t.text),
-            else => {},
+        const is_space = b == ' ' or b == '\t' or b == '\r';
+        if (is_space) {
+            if (state == .in_word) {
+                word_count += 1;
+                if (word_count >= max_words) break;
+                if (written < buf.len) {
+                    buf[written] = ' ';
+                    written += 1;
+                }
+                state = .between_words;
+            }
+            continue;
         }
+
+        if (state != .in_word) state = .in_word;
+        if (written >= buf.len) break;
+        buf[written] = b;
+        written += 1;
     }
 
-    return error.NoResponseText;
+    while (written > 0 and buf[written - 1] == ' ') written -= 1;
+    return buf[0..written];
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,6 +2205,62 @@ fn generateSessionName(
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "deriveSessionName takes up to 5 words from user text" {
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "fix the streaming freeze in compositor please");
+    try std.testing.expectEqualStrings("fix the streaming freeze in", out);
+}
+
+test "deriveSessionName trims leading and trailing whitespace" {
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "   hello   world   ");
+    try std.testing.expectEqualStrings("hello world", out);
+}
+
+test "deriveSessionName stops at sentence-ending punctuation" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("what is", deriveSessionName(&buf, "what is. this thing"));
+    try std.testing.expectEqualStrings("hold on", deriveSessionName(&buf, "hold on! a moment"));
+    try std.testing.expectEqualStrings("really", deriveSessionName(&buf, "really? maybe so"));
+}
+
+test "deriveSessionName stops at the first newline" {
+    // A multi-line first message would otherwise produce a name that
+    // re-flows oddly in the session list. Cut at the first newline so
+    // long pasted prompts contribute only their first line.
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "summary line\nsecond line continues");
+    try std.testing.expectEqualStrings("summary line", out);
+}
+
+test "deriveSessionName collapses runs of whitespace into single spaces" {
+    var buf: [128]u8 = undefined;
+    const out = deriveSessionName(&buf, "hi\t\tthere    friend");
+    try std.testing.expectEqualStrings("hi there friend", out);
+}
+
+test "deriveSessionName returns empty when input has no usable text" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("", deriveSessionName(&buf, ""));
+    try std.testing.expectEqualStrings("", deriveSessionName(&buf, "   \n\t  "));
+    try std.testing.expectEqualStrings("", deriveSessionName(&buf, ".!?"));
+}
+
+test "deriveSessionName preserves a single short word" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("hello", deriveSessionName(&buf, "hello"));
+}
+
+test "deriveSessionName truncates to fit caller buffer" {
+    // Real callers pass Meta.name (128 bytes); make sure a 5-word name
+    // longer than the buffer comes back truncated rather than panicking
+    // or returning an out-of-bounds slice.
+    var buf: [10]u8 = undefined;
+    const out = deriveSessionName(&buf, "supercalifragilistic word two three four");
+    try std.testing.expect(out.len <= buf.len);
+    try std.testing.expectEqualStrings("supercalif", out);
 }
 
 /// Test helper: drop-every-event Sink for tests that construct an
@@ -4524,6 +4603,116 @@ test "zag.pane.set_draft raises on invalid pane handle" {
     engine.lua.pop(1);
 }
 
+test "zag.pane.get_draft round-trips through set_draft" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.pane.set_draft("{s}", "round trip")
+        \\_G.observed = zag.pane.get_draft("{s}")
+    , .{ pane_id, pane_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("observed");
+    defer engine.lua.pop(1);
+    const observed = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("round trip", observed);
+}
+
+test "zag.pane.get_draft returns empty string for an untouched pane" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.observed = zag.pane.get_draft("{s}")
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("observed");
+    defer engine.lua.pop(1);
+    const observed = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("", observed);
+}
+
+test "zag.pane.get_draft reads a float pane's draft" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Symmetry with the set_draft float test: open a focused float, mutate
+    // its draft, then read it back through the float handle. Confirms
+    // paneFromHandle's float path works for reads as well as writes.
+    try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "picker" }
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 2, col = 2,
+        \\  width = 20, height = 6,
+        \\  enter = true,
+        \\})
+        \\zag.pane.set_draft(_h, "float draft")
+        \\_G.observed = zag.pane.get_draft(_h)
+    );
+
+    _ = try f.engine.lua.getGlobal("observed");
+    defer f.engine.lua.pop(1);
+    const observed = try f.engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("float draft", observed);
+}
+
+test "zag.pane.get_draft raises on invalid pane handle" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(f.view.buf());
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const result = engine.lua.doString(
+        \\zag.pane.get_draft("n9999")
+    );
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
 test "zag.pane.replace_draft_range replaces a slice of the draft" {
     const allocator = std.testing.allocator;
     var f: PickerFixture = undefined;
@@ -5183,8 +5372,14 @@ const ModelPickerPluginFixture = struct {
             .command_registry = &self.engine.command_registry,
         };
 
-        try self.wm.attachLayoutRegistry();
+        // setRoot before attachLayoutRegistry so the registry's root_pane
+        // handle backfill at attach time finds a real root to walk.
+        // Reversing the order leaves root_pane.handle nil, which silently
+        // breaks PaneDraftChange dispatch (the hook fires with a missing
+        // pane handle). Production wires them in this order at main.zig
+        // already; the fixture must match.
         try self.layout.setRoot(self.view.buf());
+        try self.wm.attachLayoutRegistry();
         self.layout.recalculate(self.screen.width, self.screen.height);
 
         self.engine.window_manager = self.wm;
@@ -5207,7 +5402,7 @@ const ModelPickerPluginFixture = struct {
     }
 };
 
-test "/model plugin opens a centered float with a scratch buffer" {
+test "/model plugin opens a centered-modal popup-list float" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -5225,29 +5420,29 @@ test "/model plugin opens a centered float with a scratch buffer" {
     // The picker is a float now; the tile tree is unchanged.
     try std.testing.expectEqual(leaf_count_before, countLeaves(f.layout.root));
     try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
-    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_floats.items.len);
 
-    // The float's buffer must be a scratch buffer (the sole entry in
-    // `wm.buffer_registry.slots`).
+    // popup.list opens its float with `focusable = false` / `enter =
+    // false`, so focus stays on the underlying pane and no `extra_floats`
+    // pane entry is required for the picker to function. The float's
+    // backing scratch buffer is the sole BufferRegistry entry.
+    try std.testing.expectEqual(@as(?NodeRegistry.Handle, null), f.layout.focused_float);
     try std.testing.expectEqual(@as(usize, 1), f.wm.buffer_registry.slots.items.len);
     const scratch_slot = f.wm.buffer_registry.slots.items[0];
     try std.testing.expect(scratch_slot.entry != null);
     try std.testing.expect(scratch_slot.entry.? == .scratch);
 
-    // Float owns focus so its buffer-scoped keymaps fire.
-    try std.testing.expect(f.layout.focused_float != null);
-
-    // And a buffer-scoped keymap binding for <CR> should now exist.
-    const scratch_buffer = scratch_slot.entry.?.scratch;
+    // Up/Down/<CR>/<Esc> are registered as global normal-mode keymaps
+    // so they fire while focus stays on the underlying pane. Buffer-
+    // scoping them to the popup's scratch buffer would be inert.
     const hit = f.engine.keymap_registry.lookup(
         .normal,
         .{ .key = .enter, .modifiers = .{} },
-        scratch_buffer.buf().getId(),
+        null,
     ) orelse return error.TestExpectedKeymap;
     try std.testing.expect(hit == .lua_callback);
 }
 
-test "/model plugin commit fires set_model for the cursor row" {
+test "/model plugin commit fires set_model for the default selection" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -5257,20 +5452,56 @@ test "/model plugin commit fires set_model for the cursor row" {
         return error.TestExpectedCommand;
     f.engine.invokeCallback(cmd.lua_callback);
 
-    // Move cursor to row 2 (the second model entry, provA/a2) and fire
-    // the buffer-scoped <CR> binding; the callback should swap the
-    // focused pane's model to "provA/a2" via `zag.pane.set_model`.
-    const scratch_slot = f.wm.buffer_registry.slots.items[0];
-    const scratch_buffer = scratch_slot.entry.?.scratch;
-    scratch_buffer.cursor_row = 1; // 0-based; entries[2] in Lua = row 2
-
+    // popup.list starts with `selection_index = 1`, so firing the global
+    // <CR> binding without a preceding <Down> commits the FIRST item
+    // (provA/a1) — the same model the fixture starts with, so the swap
+    // is a no-op. We assert that the model_picker's `on_commit` ran by
+    // checking the override side-effect: set_model writes a fresh
+    // ProviderResult into root_pane.provider.
     const hit = f.engine.keymap_registry.lookup(
         .normal,
         .{ .key = .enter, .modifiers = .{} },
-        scratch_buffer.buf().getId(),
+        null,
     ) orelse return error.TestExpectedKeymap;
     try std.testing.expect(hit == .lua_callback);
     f.engine.invokeCallback(hit.lua_callback);
+
+    const override = f.wm.root_pane.provider orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("provA/a1", override.model_id);
+}
+
+test "/model plugin selects the second model after <Down> + <CR>" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    f.engine.invokeCallback(cmd.lua_callback);
+
+    // Fire the global <Down> binding once: routes through
+    // `popup.invoke_key("<Down>")` and bumps the popup's selection from
+    // 1 to 2. Then fire <CR> to commit; on_commit should swap the
+    // focused pane's model to the SECOND item (provA/a2). This test
+    // exercises the popup.list-specific Up/Down navigation path the
+    // old direct-cursor-row picker did not have.
+    const down_hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .down, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(down_hit == .lua_callback);
+    f.engine.invokeCallback(down_hit.lua_callback);
+
+    const cr_hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .enter, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(cr_hit == .lua_callback);
+    f.engine.invokeCallback(cr_hit.lua_callback);
 
     const override = f.wm.root_pane.provider orelse
         return error.TestUnexpectedResult;
@@ -5430,12 +5661,19 @@ test "zag.layout.tree returns floats and focused_float fields" {
     try f.init(allocator);
     defer f.deinit();
 
-    // Open the picker so a float exists to surface in zag.layout.tree.
-    const cmd = f.engine.command_registry.lookup("/model") orelse
-        return error.TestExpectedCommand;
-    f.engine.invokeCallback(cmd.lua_callback);
-
+    // Open a focused float directly via `zag.layout.float`. The /model
+    // picker can no longer be used here because it now opens a non-
+    // focusable popup-list float (focusable = false / enter = false), so
+    // `focused_float` would stay nil — defeating the whole point of the
+    // assertion below.
     try f.engine.lua.doString(
+        \\_buf = zag.buffer.create { kind = "scratch", name = "tree-test" }
+        \\_h = zag.layout.float(_buf, {
+        \\  relative = "editor",
+        \\  row = 2, col = 2,
+        \\  width = 20, height = 6,
+        \\  enter = true,
+        \\})
         \\_t = zag.layout.tree()
         \\_floats_kind = type(_t.floats)
         \\_floats_n = #_t.floats
@@ -5752,11 +5990,7 @@ test "zag.popup.list.open creates a float, populates the buffer, and selects row
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5806,11 +6040,7 @@ test "zag.popup.list down arrow advances selection and clamps at the end" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5853,11 +6083,7 @@ test "zag.popup.list re-narrows on PaneDraftChange and resets selection" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5915,11 +6141,7 @@ test "zag.popup.list commit replaces the trigger range with item.word" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5956,11 +6178,7 @@ test "zag.popup.list cancel fires on_cancel, leaves draft unchanged, closes floa
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -5996,11 +6214,7 @@ test "zag.popup.list.close tears down hook, buffer, and float" {
     try f.init(allocator);
     defer f.deinit();
 
-    // ModelPickerPluginFixture calls attachLayoutRegistry before setRoot,
-    // which leaves root_pane.handle nil. Patch it here so PaneDraftChange
-    // fires with a usable pane handle.
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
-    f.wm.root_pane.handle = root_handle;
     const root_id = try NodeRegistry.formatId(allocator, root_handle);
     defer allocator.free(root_id);
 
@@ -6050,4 +6264,283 @@ test "zag.popup.list.close tears down hook, buffer, and float" {
     _ = try f.engine.lua.getGlobal("after_second_close");
     try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
     f.engine.lua.pop(1);
+}
+
+test "zag.popup.list.open forwards placement opts to zag.layout.float" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Open the popup with editor-relative placement and explicit
+    // row/col/min/max bounds. The helper must thread these straight to
+    // `zag.layout.float`; the resulting FloatNode's config records the
+    // anchor and offsets so we can assert them off `Layout.floats`.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  relative = "editor",
+        \\  row = 5,
+        \\  col = 10,
+        \\  min_width = 30,
+        \\  max_width = 60,
+        \\  min_height = 4,
+        \\  max_height = 12,
+        \\  border = "rounded",
+        \\  title = "Picker",
+        \\}})
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
+    const node = f.layout.floats.items[0];
+    try std.testing.expectEqual(Layout.FloatAnchor.editor, node.config.relative);
+    try std.testing.expectEqual(@as(i32, 5), node.config.row_offset);
+    try std.testing.expectEqual(@as(i32, 10), node.config.col_offset);
+    try std.testing.expectEqual(@as(?u16, 30), node.config.min_width);
+    try std.testing.expectEqual(@as(?u16, 60), node.config.max_width);
+    try std.testing.expectEqual(@as(?u16, 4), node.config.min_height);
+    try std.testing.expectEqual(@as(?u16, 12), node.config.max_height);
+    try std.testing.expect(node.config.title != null);
+    try std.testing.expectEqualStrings("Picker", node.config.title.?);
+
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+}
+
+test "zag.popup.list.open defaults to cursor anchor when placement opts are omitted" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // No placement opts: the helper must preserve the original
+    // cursor-anchored autocomplete UX (relative=cursor, row=1, col=0).
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\}})
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
+    const node = f.layout.floats.items[0];
+    try std.testing.expectEqual(Layout.FloatAnchor.cursor, node.config.relative);
+    try std.testing.expectEqual(@as(i32, 1), node.config.row_offset);
+    try std.testing.expectEqual(@as(i32, 0), node.config.col_offset);
+
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+}
+
+test "zag.popup.list.is_closed reports lifecycle accurately" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Lifecycle: false on open, true after close, true after a second
+    // close (idempotent). Also assert is_closed(nil) returns true so
+    // route() callers can short-circuit cleanly on a stale handle.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\}})
+        \\_G.before_close = popup.is_closed(_G.handle)
+        \\popup.close(_G.handle)
+        \\_G.after_close = popup.is_closed(_G.handle)
+        \\popup.close(_G.handle)
+        \\_G.after_second_close = popup.is_closed(_G.handle)
+        \\_G.nil_is_closed = popup.is_closed(nil)
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before_close");
+    try std.testing.expect(!f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_close");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_second_close");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("nil_is_closed");
+    try std.testing.expect(f.engine.lua.toBoolean(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list aligns columns by display cells across mixed CJK/ASCII items" {
+    // Regression: `format_columns` previously padded with `string.format`
+    // %-Ns, which counts BYTES, so a CJK row (3 bytes per ideograph,
+    // 2 cells of display width) under-padded relative to ASCII rows.
+    // After the cell-aware rewrite, every line produces the same total
+    // display width when measured through `zag.width.cells`.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Pure Lua exercise of `popup.format_columns`; no pane / float /
+    // hook setup needed. The fixture is here just to give us a live
+    // LuaEngine with `zag.width.cells` registered.
+    try f.engine.lua.doString(
+        \\local popup = require("zag.popup.list")
+        \\local items = {
+        \\  { word = "hello", abbr = "hello", kind = "fn", menu = "ascii" },
+        \\  { word = "中文",  abbr = "中文",  kind = "中",  menu = "cjk"   },
+        \\  { word = "smile", abbr = "😀",   kind = "x",  menu = "emoji" },
+        \\}
+        \\local lines = popup.format_columns(items)
+        \\_G.line_count = #lines
+        \\_G.w0 = zag.width.cells(lines[1])
+        \\_G.w1 = zag.width.cells(lines[2])
+        \\_G.w2 = zag.width.cells(lines[3])
+    );
+
+    _ = try f.engine.lua.getGlobal("line_count");
+    try std.testing.expectEqual(@as(i64, 3), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("w0");
+    const w0 = try f.engine.lua.toInteger(-1);
+    f.engine.lua.pop(1);
+    _ = try f.engine.lua.getGlobal("w1");
+    const w1 = try f.engine.lua.toInteger(-1);
+    f.engine.lua.pop(1);
+    _ = try f.engine.lua.getGlobal("w2");
+    const w2 = try f.engine.lua.toInteger(-1);
+    f.engine.lua.pop(1);
+
+    // Trailing `menu` text differs in length per row, so the totals
+    // aren't identical. The invariant: the *prefix* (abbr + 2 spaces +
+    // kind + 2 spaces) lands at the same display column on every row.
+    // We verify by asserting each line's measured width matches the
+    // expected sum:  max(abbr_cells) + 2 + max(kind_cells) + 2 + len(menu_cells).
+    // abbr cells: hello=5, 中文=4, 😀=2  -> max 5
+    // kind cells: fn=2,    中=2,    x=1   -> max 2
+    // menu cells: ascii=5, cjk=3, emoji=5
+    try std.testing.expectEqual(@as(i64, 5 + 2 + 2 + 2 + 5), w0);
+    try std.testing.expectEqual(@as(i64, 5 + 2 + 2 + 2 + 3), w1);
+    try std.testing.expectEqual(@as(i64, 5 + 2 + 2 + 2 + 5), w2);
+}
+
+test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-keystroke budget" {
+    // Success criterion from the popup-list plan: a cursor-anchored
+    // float that follows the input cursor must add no measurable
+    // per-keystroke latency on a benchmark plugin that registers a
+    // PaneDraftChange hook. This probe stands the popup helper up over
+    // the root pane, drives 100 keystrokes through `Pane.appendToDraft`
+    // (which fires the hook + re-renders the popup buffer + triggers
+    // size-to-content recalculation), and asserts the total wall clock
+    // stays under a generous budget.
+    //
+    // 5 ms per keystroke is the ceiling: at 100 Hz typing the loop has
+    // 10 ms per event and we want clear headroom. Debug builds run hot
+    // (Lua hooks bounce through the dispatcher; the layout recalculates
+    // the float bounds each frame); the budget is a sanity floor, not
+    // a tight bound.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Plumb the compositor's frame arena into the layout so
+    // `measureLongestLine` lands in its fast path on every recalc.
+    // Production wires this in EventOrchestrator.runFrame; the test
+    // fixture skips that drain path, so we do it here once at setup.
+    f.layout.frame_allocator = f.compositor.frame_arena.allocator();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    // Open the popup with the cursor-anchored placement opts the
+    // autocomplete UX uses (size-to-content via min_width/max_width,
+    // which routes through measureLongestLine on every render). The
+    // items() callback returns a small filter result so the popup
+    // re-renders on every keystroke without exploding into a runaway
+    // list.
+    const open_script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\local source = {{}}
+        \\for i = 1, 16 do
+        \\  source[i] = {{ word = "item_" .. i, abbr = "item_" .. i, kind = "fn" }}
+        \\end
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  trigger = {{ from = 0, to = 0 }},
+        \\  items = function(query)
+        \\    local out = {{}}
+        \\    for _, item in ipairs(source) do
+        \\      if query == "" or string.sub(item.word, 1, #query) == query then
+        \\        out[#out + 1] = item
+        \\      end
+        \\    end
+        \\    return out
+        \\  end,
+        \\  min_width = 12,
+        \\  max_width = 30,
+        \\  min_height = 1,
+        \\  max_height = 8,
+        \\}})
+    , .{root_id}, 0);
+    defer allocator.free(open_script);
+    try f.engine.lua.doString(open_script);
+
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        // Cycle through printable ASCII so each keystroke produces a
+        // distinct draft and the popup actually re-renders rather than
+        // short-circuiting on a no-op rewrite.
+        const ch: u8 = @intCast('a' + (i % 26));
+        f.wm.root_pane.appendToDraft(ch);
+    }
+    const elapsed_ns = timer.read();
+
+    // Tear the popup down before any assert that could fail the test
+    // and skip the cleanup. Test allocator catches leaks regardless,
+    // but explicit close keeps the fixture deinit walk simple.
+    try f.engine.lua.doString(
+        \\require("zag.popup.list").close(_G.handle)
+    );
+
+    // 500 ms ceiling for 100 keystrokes. Debug builds with Lua hooks
+    // are nowhere near this in practice (single-digit ms total);
+    // emitting the actual elapsed in the failure message makes a
+    // future regression easy to spot.
+    const budget_ns: u64 = 500 * std.time.ns_per_ms;
+    if (elapsed_ns >= budget_ns) {
+        std.log.warn(
+            "popup-list 100 keystrokes took {d} ns (budget {d} ns)",
+            .{ elapsed_ns, budget_ns },
+        );
+        return error.TestPopupListTooSlow;
+    }
 }

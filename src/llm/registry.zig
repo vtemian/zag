@@ -131,6 +131,22 @@ pub const Endpoint = struct {
         /// Output verbosity tier passed in `text.verbosity`. Codex
         /// accepts `low`, `medium`, `high`.
         verbosity: []const u8 = "medium",
+
+        /// Field names where chat-completions providers ship reasoning
+        /// text on non-streaming response messages and on streaming
+        /// deltas. Walked in declaration order; the first non-empty
+        /// match wins. Empty slice (default) means the chat-completions
+        /// serializer keeps its historical behaviour of dropping
+        /// thinking blocks. Examples: Moonshot/Kimi → `{"reasoning_content"}`;
+        /// llama.cpp / gpt-oss accept `"reasoning"` or `"reasoning_text"`.
+        response_fields: []const []const u8 = &.{},
+
+        /// Sibling field on outgoing assistant messages where the
+        /// chat-completions serializer writes back the concatenated
+        /// thinking text. `null` means do not echo. Mirrors pi-mono's
+        /// thinkingSignature trick: a provider that READ from
+        /// `reasoning_content` echoes back to `reasoning_content`.
+        echo_field: ?[]const u8 = null,
     };
 
     /// Per-model rate card: context limits and dollar cost per million tokens.
@@ -227,6 +243,15 @@ pub const Endpoint = struct {
         const reasoning_verbosity = try allocator.dupe(u8, self.reasoning.verbosity);
         errdefer allocator.free(reasoning_verbosity);
 
+        const reasoning_response_fields = try dupeStringSlice(self.reasoning.response_fields, allocator);
+        errdefer freeStringSlice(reasoning_response_fields, allocator);
+
+        const reasoning_echo_field: ?[]const u8 = if (self.reasoning.echo_field) |s|
+            try allocator.dupe(u8, s)
+        else
+            null;
+        errdefer if (reasoning_echo_field) |s| allocator.free(s);
+
         return .{
             .name = name,
             .serializer = self.serializer,
@@ -239,6 +264,8 @@ pub const Endpoint = struct {
                 .effort = reasoning_effort,
                 .summary = reasoning_summary,
                 .verbosity = reasoning_verbosity,
+                .response_fields = reasoning_response_fields,
+                .echo_field = reasoning_echo_field,
             },
         };
     }
@@ -248,6 +275,8 @@ pub const Endpoint = struct {
         allocator.free(self.reasoning.effort);
         allocator.free(self.reasoning.summary);
         allocator.free(self.reasoning.verbosity);
+        freeStringSlice(self.reasoning.response_fields, allocator);
+        if (self.reasoning.echo_field) |s| allocator.free(s);
         switch (self.auth) {
             .oauth => |spec| freeOAuthSpec(spec, allocator),
             else => {},
@@ -267,6 +296,35 @@ pub const Endpoint = struct {
         allocator.free(self.name);
     }
 };
+
+/// Deep-copy a slice of borrowed strings onto `allocator`. Pair with
+/// `freeStringSlice`. Used by `Endpoint.dupe` for variable-length
+/// string lists (e.g. `ReasoningConfig.response_fields`). Errdefer
+/// chain unwinds partial state if any inner allocation fails.
+pub fn dupeStringSlice(
+    items: []const []const u8,
+    allocator: Allocator,
+) ![][]const u8 {
+    const out = try allocator.alloc([]const u8, items.len);
+    errdefer allocator.free(out);
+
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |s| allocator.free(s);
+
+    for (items, 0..) |item, i| {
+        out[i] = try allocator.dupe(u8, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+/// Free a slice produced by `dupeStringSlice`. Pairs the inner-string
+/// frees with the outer slice free in a single call so callers do not
+/// have to interleave the two.
+pub fn freeStringSlice(items: []const []const u8, allocator: Allocator) void {
+    for (items) |s| allocator.free(s);
+    allocator.free(items);
+}
 
 /// Deep-copy every string / slice in an `OAuthSpec` onto `allocator`.
 /// Paired with `freeOAuthSpec`. Uses `errdefer` to unwind partial state if
@@ -772,6 +830,53 @@ test "ModelRate dupe round trips label and recommended" {
     try std.testing.expectEqual(true, duped.models[0].recommended);
     try std.testing.expectEqual(@as(?[]const u8, null), duped.models[1].label);
     try std.testing.expectEqual(false, duped.models[1].recommended);
+}
+
+test "dupeStringSlice + freeStringSlice round-trip independent copy" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "reasoning_content", "reasoning", "reasoning_text" };
+    const duped = try dupeStringSlice(&original, allocator);
+    defer freeStringSlice(duped, allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), duped.len);
+    for (original, duped) |o, d| {
+        try std.testing.expectEqualStrings(o, d);
+        // Independent storage: pointers must differ.
+        try std.testing.expect(o.ptr != d.ptr);
+    }
+}
+
+test "Endpoint.dupe round-trips response_fields and echo_field" {
+    const allocator = std.testing.allocator;
+
+    const fields = [_][]const u8{ "reasoning_content", "reasoning" };
+    const original = Endpoint{
+        .name = "moonshot",
+        .serializer = .openai,
+        .url = "https://api.moonshot.ai/v1/chat/completions",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "kimi-k2.6",
+        .models = &.{},
+        .reasoning = .{
+            .effort = "medium",
+            .summary = "auto",
+            .verbosity = "medium",
+            .response_fields = &fields,
+            .echo_field = "reasoning_content",
+        },
+    };
+
+    const copy = try original.dupe(allocator);
+    defer copy.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), copy.reasoning.response_fields.len);
+    try std.testing.expectEqualStrings("reasoning_content", copy.reasoning.response_fields[0]);
+    try std.testing.expectEqualStrings("reasoning", copy.reasoning.response_fields[1]);
+    try std.testing.expect(copy.reasoning.echo_field != null);
+    try std.testing.expectEqualStrings("reasoning_content", copy.reasoning.echo_field.?);
+    // Independent storage: pointers must differ.
+    try std.testing.expect(copy.reasoning.response_fields.ptr != original.reasoning.response_fields.ptr);
 }
 
 test {

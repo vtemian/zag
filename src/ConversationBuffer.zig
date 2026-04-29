@@ -98,6 +98,16 @@ pub fn deinit(self: *ConversationBuffer) void {
 /// check against the live tree because rows are computed lazily from
 /// the renderer; setting an out-of-range row simply has no observable
 /// effect until that row exists.
+///
+/// Overrides are NOT invalidated when the conversation tree mutates
+/// structurally. If a node is appended above an already-styled row,
+/// the override stays keyed to the old row index and silently drifts
+/// to the wrong line. Callers that hold overrides across tree edits
+/// must clear them explicitly (`clearRowStyle` per row, or rebuild
+/// the set after the mutation). Auto-invalidation tied to
+/// `tree.generation` is a viable follow-up once a real consumer
+/// shows up; today the map is symmetry-only with `ScratchBuffer.row_styles`
+/// and has no live writer to break.
 pub fn setRowStyle(self: *ConversationBuffer, row: u32, slot: Theme.HighlightSlot) !void {
     try self.row_styles.put(self.allocator, row, slot);
 }

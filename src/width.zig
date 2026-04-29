@@ -576,3 +576,53 @@ test "wrappedRowCountMulti: over-wide cluster across span boundary stops countin
     const parts = [_][]const u8{ "a", "漢" };
     try std.testing.expectEqual(@as(u32, 1), wrappedRowCountMulti(&parts, 1));
 }
+
+/// Sum of cluster widths for `text` in terminal cells.
+///
+/// Walks `nextCluster` to handle ZWJ sequences, skin-tone modifiers,
+/// VS-16, combining marks, and regional-indicator flag pairs the same
+/// way the renderer does. ASCII-only callers pay one branch per byte;
+/// the unicode iterator's overhead is concentrated in non-ASCII runs.
+///
+/// Used by Lua plugins (`zag.width.cells`) for column alignment when
+/// `#str` (byte length) would mis-align CJK/emoji content.
+pub fn displayWidth(text: []const u8) usize {
+    var total: usize = 0;
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    while (nextCluster(&iter)) |cluster| {
+        total += cluster.width;
+    }
+    return total;
+}
+
+test "displayWidth: empty string is zero" {
+    try std.testing.expectEqual(@as(usize, 0), displayWidth(""));
+}
+
+test "displayWidth: ASCII counts one per byte" {
+    try std.testing.expectEqual(@as(usize, 5), displayWidth("hello"));
+}
+
+test "displayWidth: CJK counts two cells per ideograph" {
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("中文"));
+}
+
+test "displayWidth: emoji counts two cells" {
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("😀"));
+}
+
+test "displayWidth: ZWJ family is one cluster of width 2" {
+    // "👨‍👩‍👧" - man + ZWJ + woman + ZWJ + girl
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("👨‍👩‍👧"));
+}
+
+test "displayWidth: combining mark contributes zero" {
+    // "e" + combining acute (U+0301) -> width 1.
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("e\u{0301}"));
+}
+
+test "displayWidth: mixed ASCII and CJK sums correctly" {
+    // "hi 中" -> 1+1+1+2 = 5
+    try std.testing.expectEqual(@as(usize, 5), displayWidth("hi 中"));
+}

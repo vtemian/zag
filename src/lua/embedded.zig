@@ -24,6 +24,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.providers.openai-oauth", .code = @embedFile("zag/providers/openai-oauth.lua") },
     .{ .name = "zag.providers.openrouter", .code = @embedFile("zag/providers/openrouter.lua") },
     .{ .name = "zag.providers.groq", .code = @embedFile("zag/providers/groq.lua") },
+    .{ .name = "zag.providers.moonshot", .code = @embedFile("zag/providers/moonshot.lua") },
     .{ .name = "zag.providers.ollama", .code = @embedFile("zag/providers/ollama.lua") },
     .{ .name = "zag.builtin.model_picker", .code = @embedFile("zag/builtin/model_picker.lua") },
     .{ .name = "zag.diagrams", .code = @embedFile("zag/diagrams.lua") },
@@ -54,7 +55,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 24), entries.len);
+    try std.testing.expectEqual(@as(usize, 25), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {

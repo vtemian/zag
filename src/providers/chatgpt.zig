@@ -715,7 +715,10 @@ fn handleReasoningDelta(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
         try emit.blocks.append(emit.allocator, seeded);
     }
 
-    emit.callback.on_event(emit.callback.ctx, .{ .thinking_delta = .{ .text = delta } });
+    emit.callback.on_event(emit.callback.ctx, .{ .thinking_delta = .{
+        .text = delta,
+        .provider = .openai_responses,
+    } });
 }
 
 fn findThinkingBlock(
