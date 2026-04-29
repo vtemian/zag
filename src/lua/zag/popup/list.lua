@@ -40,6 +40,19 @@
 --                              -- with item.word via
 --                              -- zag.pane.replace_draft_range.
 --       on_cancel,             -- optional fn() on Esc / C-E.
+--                              -- Fires only when the user dismisses
+--                              -- the popup without committing.
+--       on_close,              -- optional fn() that fires whenever the
+--                              -- popup transitions to closed, regardless
+--                              -- of trigger (commit, cancel, OR an
+--                              -- external popup.close call). Runs after
+--                              -- teardown (float closed, hook removed,
+--                              -- buffer freed). Idempotent: fires at
+--                              -- most once per popup. Use this for
+--                              -- proactive cleanup of resources owned
+--                              -- by the popup's host (e.g. global
+--                              -- keymaps the host registered to route
+--                              -- keys into the popup).
 --       initial_query,         -- optional string; bypasses the
 --                              -- "read-back from draft" step (which
 --                              -- would require a Lua-side draft
@@ -318,6 +331,16 @@ local function close_internal(state)
         pcall(zag.buffer.delete, state.buf)
         state.buf = nil
     end
+
+    -- Fired AFTER teardown so on_close handlers see the popup in a
+    -- fully-closed state (e.g. the host's `popup.is_closed(handle)`
+    -- check returns true). Wrapped in pcall so a faulty handler can't
+    -- leave the popup half-torn-down. The `state.closed` guard above
+    -- makes on_close idempotent: a subsequent `popup.close` is a no-op.
+    if state.on_close then
+        pcall(state.on_close)
+        state.on_close = nil
+    end
 end
 
 -- Build the on_key filter closure for the float. Returns a function
@@ -417,6 +440,7 @@ function M.open(opts)
         on_select = opts.on_select,
         on_commit = opts.on_commit,
         on_cancel = opts.on_cancel,
+        on_close = opts.on_close,
         keys = keys,
         buf = buf,
         current_items = current_items,

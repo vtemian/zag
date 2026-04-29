@@ -6310,6 +6310,102 @@ test "zag.popup.list.close tears down hook, buffer, and float" {
     f.engine.lua.pop(1);
 }
 
+test "zag.popup.list on_close fires for external popup.close (proactive cleanup)" {
+    // The host plugin (e.g. /model picker) registers global keymaps to
+    // route keys into a non-focusable popup. If something external
+    // tears the popup down via popup.close, the host needs a uniform
+    // signal to drop those keymaps; otherwise the bindings linger and
+    // route keys into a dead handle. `on_close` provides that signal:
+    // it fires once after teardown regardless of close trigger.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.close_fired = 0
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  on_close = function()
+        \\    _G.close_fired = _G.close_fired + 1
+        \\  end,
+        \\}})
+        \\_G.before_close = _G.close_fired
+        \\popup.close(_G.handle)
+        \\_G.after_first_close = _G.close_fired
+        \\popup.close(_G.handle) -- idempotent: on_close must NOT fire twice
+        \\_G.after_second_close = _G.close_fired
+    , .{root_id}, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("before_close");
+    try std.testing.expectEqual(@as(i64, 0), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_first_close");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("after_second_close");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
+test "zag.popup.list on_close fires once on commit and on cancel" {
+    // Both close paths driven through invoke_key must surface to
+    // on_close. Proves on_close subsumes on_commit / on_cancel as the
+    // unified teardown hook (without replacing them: commit-specific
+    // logic still belongs in on_commit because on_close runs *after*
+    // teardown, when the popup state is gone).
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local popup = require("zag.popup.list")
+        \\_G.close_fired = 0
+        \\_G.commit_fired = 0
+        \\_G.handle = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  on_commit = function() _G.commit_fired = _G.commit_fired + 1 end,
+        \\  on_close = function() _G.close_fired = _G.close_fired + 1 end,
+        \\}})
+        \\popup.invoke_key(_G.handle, "<CR>")
+        \\_G.commit_close = _G.close_fired
+        \\
+        \\_G.handle2 = popup.open({{
+        \\  pane = "{s}",
+        \\  items = function() return {{ {{ word = "alpha" }} }} end,
+        \\  on_close = function() _G.close_fired = _G.close_fired + 1 end,
+        \\}})
+        \\popup.invoke_key(_G.handle2, "<Esc>")
+        \\_G.cancel_close = _G.close_fired
+    , .{ root_id, root_id }, 0);
+    defer allocator.free(script);
+    try f.engine.lua.doString(script);
+
+    _ = try f.engine.lua.getGlobal("commit_close");
+    try std.testing.expectEqual(@as(i64, 1), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+
+    _ = try f.engine.lua.getGlobal("cancel_close");
+    try std.testing.expectEqual(@as(i64, 2), try f.engine.lua.toInteger(-1));
+    f.engine.lua.pop(1);
+}
+
 test "zag.popup.list.open forwards placement opts to zag.layout.float" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
