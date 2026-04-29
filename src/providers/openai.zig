@@ -1271,6 +1271,69 @@ test "parseSseStream accumulates reasoning_content into a thinking block" {
     try std.testing.expectEqualStrings("hello", resp.content[1].text.text);
 }
 
+test "parseSseStream accumulates tool_call arguments across multiple delta events" {
+    // Regression: a Kimi K2.6 run produced JSONL with corrupted tool
+    // inputs (chars dropped at chunk boundaries). The investigation
+    // pointed at the borrowed args.string lifetime through parseFromSlice;
+    // this test pins the multi-chunk accumulation contract so a future
+    // fix (defensive dupe, separate buffer, etc.) can be validated and
+    // a regression cannot pass silently.
+    const allocator = std.testing.allocator;
+
+    // Three SSE events for the same tool_call (index 0). The arguments
+    // field is split across two events, then a finish_reason event closes
+    // the stream. The model is `read` with input `{"path": "test.txt"}`.
+    const sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_001\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\": \\\"test.txt\\\"}\"}}]}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\"}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fake = std.Io.Reader.fixed(sse_body);
+
+    var sr: llm.streaming.StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var sink: u8 = 0;
+    const callback: llm.StreamCallback = .{
+        .ctx = @ptrCast(&sink),
+        .on_event = &noopStreamCallback,
+    };
+
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel);
+    defer response.deinit(allocator);
+
+    // Should have exactly one tool_use block with the full argument
+    // string reassembled from both chunks. No characters dropped.
+    var tool_use_count: usize = 0;
+    for (response.content) |block| {
+        if (block == .tool_use) {
+            tool_use_count += 1;
+            try std.testing.expectEqualStrings("call_001", block.tool_use.id);
+            try std.testing.expectEqualStrings("read", block.tool_use.name);
+            try std.testing.expectEqualStrings(
+                "{\"path\": \"test.txt\"}",
+                block.tool_use.input_raw,
+            );
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), tool_use_count);
+}
+
 test "openai writeMessage emits tool role for tool_result" {
     const allocator = std.testing.allocator;
 
