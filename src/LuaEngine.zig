@@ -4715,7 +4715,8 @@ pub const LuaEngine = struct {
             else => {},
         };
         lua.pushInteger(@intCast(result.id));
-        return 1;
+        pushDisplacedSpec(lua, mode, spec, null, result.displaced);
+        return 2;
     }
 
     fn zagKeymapTableFormInner(lua: *Lua) !i32 {
@@ -4827,7 +4828,8 @@ pub const LuaEngine = struct {
                 else => {},
             };
             lua.pushInteger(@intCast(result.id));
-            return 1;
+            pushDisplacedSpec(lua, mode, spec, buffer_id, result.displaced);
+            return 2;
         }
 
         // fn form: stash the Lua function in the registry and store the
@@ -4851,7 +4853,8 @@ pub const LuaEngine = struct {
             else => {},
         };
         lua.pushInteger(@intCast(result.id));
-        return 1;
+        pushDisplacedSpec(lua, mode, spec, buffer_id, result.displaced);
+        return 2;
     }
 
     /// Zig function backing `zag.keymap_remove(id)`.
@@ -4897,6 +4900,67 @@ pub const LuaEngine = struct {
         if (std.mem.eql(u8, name, "normal")) return .normal;
         if (std.mem.eql(u8, name, "insert")) return .insert;
         return null;
+    }
+
+    fn modeName(mode: Keymap.Mode) []const u8 {
+        return switch (mode) {
+            .normal => "normal",
+            .insert => "insert",
+        };
+    }
+
+    /// Push the second return value of `zag.keymap{...}` onto the Lua
+    /// stack: a `displaced_spec` table `{mode, key, action}` describing
+    /// the prior binding so a caller can pass it back through
+    /// `zag.keymap{...}` to restore the override on cleanup, or `nil`
+    /// when restoration is not possible. Restoration is unsupported
+    /// in three cases, all surfaced as a `nil` second return:
+    ///   * No prior binding existed (`displaced == null`).
+    ///   * The displaced action was `.lua_callback` — the wrapper
+    ///     already released the registry ref, so a plugin cannot
+    ///     re-register a Lua callback it did not own.
+    ///   * The displaced binding was buffer-scoped. The registry
+    ///     stores the buffer's `getId()` value; reconstructing the
+    ///     `b<id>` Handle the wrapper accepts would require an
+    ///     id->Handle reverse lookup that doesn't exist today.
+    /// The picker only registers global bindings whose displaced
+    /// targets are built-in actions, so it never trips the latter
+    /// two limitations. Allocates no heap memory; the key string is
+    /// formatted into a stack buffer and copied into the Lua VM by
+    /// `pushString`.
+    fn pushDisplacedSpec(
+        lua: *Lua,
+        mode: Keymap.Mode,
+        spec: Keymap.KeySpec,
+        buffer_id: ?u32,
+        displaced: ?Keymap.Action,
+    ) void {
+        const prev = displaced orelse {
+            lua.pushNil();
+            return;
+        };
+        const action_name = Keymap.actionName(prev) orelse {
+            lua.pushNil();
+            return;
+        };
+        if (buffer_id != null) {
+            lua.pushNil();
+            return;
+        }
+
+        var key_buf: [32]u8 = undefined;
+        const key_text = Keymap.formatKeySpec(&key_buf, .{
+            .key = spec.key,
+            .modifiers = spec.modifiers,
+        });
+
+        lua.newTable();
+        _ = lua.pushString(modeName(mode));
+        lua.setField(-2, "mode");
+        _ = lua.pushString(key_text);
+        lua.setField(-2, "key");
+        _ = lua.pushString(action_name);
+        lua.setField(-2, "action");
     }
 
     fn keymapEnginePointer(lua: *Lua) !*LuaEngine {
@@ -8930,6 +8994,88 @@ test "zag.keymap returns an integer id" {
     try std.testing.expect(id_pos > 0);
     try std.testing.expect(id_tbl > id_pos);
     try std.testing.expect(id_fn > id_tbl);
+}
+
+test "zag.keymap returns (id, displaced_spec) so callers can restore overrides" {
+    // Plugins that overwrite default bindings (e.g. the /model picker
+    // routing j/k into a popup) need to put the user's defaults back
+    // when they tear down. The wrapper hands them a re-registerable
+    // table describing the displaced binding for that purpose.
+    //
+    // Three shapes are exercised:
+    //   1. Fresh insert (no prior binding) -> displaced is nil.
+    //   2. Overwrite of a built-in -> displaced is a table the caller
+    //      can pass straight back to `zag.keymap{...}`.
+    //   3. Overwrite where the new action is a fn (Lua callback) ->
+    //      displaced still describes the prior built-in by name.
+    //
+    // All assertions run inside the Lua script because the Zig-side
+    // `getGlobal` helper raises on a nil global (the fresh-insert
+    // case), and reading the table with positional `getField` from
+    // Zig is noisier than just asserting in Lua. The test only
+    // surfaces a string global on failure, which `getGlobal` handles.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\local function fail(msg) _G.assert_err = msg; error(msg) end
+        \\
+        \\-- 1. Fresh insert -> displaced is nil.
+        \\local id_fresh, disp_fresh = zag.keymap {
+        \\  mode = "normal", key = "<F5>", action = "focus_right",
+        \\}
+        \\if type(id_fresh) ~= "number" then fail("id_fresh not a number") end
+        \\if disp_fresh ~= nil then fail("disp_fresh expected nil") end
+        \\
+        \\-- 2. Overwrite of built-in `j` -> table with action="focus_down".
+        \\local id_over, disp_over = zag.keymap {
+        \\  mode = "normal", key = "j", action = "split_vertical",
+        \\}
+        \\if type(disp_over) ~= "table" then fail("disp_over expected table") end
+        \\if disp_over.mode ~= "normal" then fail("disp_over.mode wrong: " .. tostring(disp_over.mode)) end
+        \\if disp_over.key ~= "j" then fail("disp_over.key wrong: " .. tostring(disp_over.key)) end
+        \\if disp_over.action ~= "focus_down" then fail("disp_over.action wrong: " .. tostring(disp_over.action)) end
+        \\if disp_over.buffer ~= nil then fail("disp_over.buffer expected nil for global binding") end
+        \\
+        \\-- 3. Overwrite via fn payload still surfaces the prior built-in.
+        \\local id_fn, disp_fn = zag.keymap {
+        \\  mode = "normal", key = "k", fn = function() end,
+        \\}
+        \\if type(disp_fn) ~= "table" then fail("disp_fn expected table") end
+        \\if disp_fn.action ~= "focus_up" then fail("disp_fn.action wrong: " .. tostring(disp_fn.action)) end
+        \\
+        \\_G.assert_ok = "ok"
+    );
+
+    _ = try engine.lua.getGlobal("assert_ok");
+    try std.testing.expectEqualStrings("ok", try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "zag.keymap displaced_spec round-trips: passing it back restores the binding" {
+    // The picker's contract: capture displaced, then on cleanup call
+    // `zag.keymap_remove(id)` followed by `zag.keymap(displaced)`.
+    // Verify the spec is shaped so that round-trip lands the original
+    // built-in action in the registry (matched by enum tag, since
+    // built-in variants are payload-less).
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\local id, displaced = zag.keymap { mode = "normal", key = "j", fn = function() end }
+        \\zag.keymap_remove(id)
+        \\assert(displaced ~= nil, "expected displaced spec for j override")
+        \\zag.keymap(displaced)
+    );
+
+    const ev_j: input.KeyEvent = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
+    const restored = engine.keymapRegistry().lookup(.normal, ev_j, null) orelse
+        return error.TestExpectedKeymap;
+    try std.testing.expect(restored == .focus_down);
 }
 
 test "zag.keymap_remove unregisters a binding so the key no longer fires" {

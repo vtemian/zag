@@ -5512,12 +5512,20 @@ test "/model plugin selects the second model after <Down> + <CR>" {
 }
 
 test "/model plugin removes its routed keymaps when the popup closes" {
-    // The picker registers four global normal-mode keymaps (`<Up>`,
-    // `<Down>`, `<CR>`, `<Esc>`) routed into the popup. After the
-    // popup closes (via commit or cancel) those bindings must be
-    // unregistered: leaving them around leaks both the Lua callback
-    // ref and a binding that fires for any future <CR>/<Esc>/<Up>/<Down>
-    // until the next `/model` invocation overwrites it.
+    // The picker registers nine global normal-mode keymaps routing
+    // into the popup. After the popup closes (via commit or cancel)
+    // those bindings must be unregistered: leaving them around leaks
+    // both the Lua callback ref and a binding that fires for any
+    // future keystroke until the next `/model` invocation overwrites
+    // it.
+    //
+    // Three of the nine keys (`j`, `k`, `q`) collide with the
+    // built-in defaults `focus_down`, `focus_up`, `close_window`.
+    // Registering an existing (mode, spec) overwrites the action
+    // in-place — same id, same slot — so opening the picker grows
+    // the registry by SIX (the six fresh keys), not nine. Closing
+    // the picker removes those six AND re-registers the three
+    // displaced built-ins, landing us back at the pre-open baseline.
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -5529,8 +5537,10 @@ test "/model plugin removes its routed keymaps when the popup closes" {
         return error.TestExpectedCommand;
     f.engine.invokeCallback(cmd.lua_callback);
 
+    // Six fresh inserts (<Up>, <Down>, <C-P>, <C-N>, <CR>, <Esc>)
+    // plus three in-place overwrites (j, k, q) = +6 net.
     try std.testing.expectEqual(
-        baseline_bindings + 4,
+        baseline_bindings + 6,
         f.engine.keymap_registry.bindings.items.len,
     );
 
@@ -5544,12 +5554,83 @@ test "/model plugin removes its routed keymaps when the popup closes" {
     try std.testing.expect(esc_hit == .lua_callback);
     f.engine.invokeCallback(esc_hit.lua_callback);
 
-    // Registry size is back to the pre-open baseline; none of the four
+    // Registry size is back to the pre-open baseline; none of the
     // bindings linger.
     try std.testing.expectEqual(
         baseline_bindings,
         f.engine.keymap_registry.bindings.items.len,
     );
+}
+
+test "/model plugin restores displaced built-in bindings on close" {
+    // The picker overwrites the user's default `j`, `k`, `q` bindings
+    // while it is open, then must restore them on close. Without the
+    // restore, opening `/model` once silently breaks `j`/`k` window
+    // navigation for the rest of the process lifetime — a real bug
+    // shipped in the cursor-anchored picker change before the
+    // displaced-spec return was added to `zag.keymap`. This test
+    // pins the regression: open the picker, watch `j` route to a
+    // Lua callback (the picker), close it, and assert `j` is back
+    // to the built-in `.focus_down` action.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const ev_j: input.KeyEvent = .{ .key = .{ .char = 'j' }, .modifiers = .{} };
+    const ev_k: input.KeyEvent = .{ .key = .{ .char = 'k' }, .modifiers = .{} };
+    const ev_q: input.KeyEvent = .{ .key = .{ .char = 'q' }, .modifiers = .{} };
+
+    // Snapshot the defaults loaded by `Registry.loadDefaults`.
+    const before_j = f.engine.keymap_registry.lookup(.normal, ev_j, null) orelse
+        return error.TestExpectedKeymap;
+    const before_k = f.engine.keymap_registry.lookup(.normal, ev_k, null) orelse
+        return error.TestExpectedKeymap;
+    const before_q = f.engine.keymap_registry.lookup(.normal, ev_q, null) orelse
+        return error.TestExpectedKeymap;
+    try std.testing.expect(before_j == .focus_down);
+    try std.testing.expect(before_k == .focus_up);
+    try std.testing.expect(before_q == .close_window);
+
+    // Open the picker.
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    f.engine.invokeCallback(cmd.lua_callback);
+
+    // While open, those keys route into the picker (lua_callback).
+    const open_j = f.engine.keymap_registry.lookup(.normal, ev_j, null) orelse
+        return error.TestExpectedKeymap;
+    const open_k = f.engine.keymap_registry.lookup(.normal, ev_k, null) orelse
+        return error.TestExpectedKeymap;
+    const open_q = f.engine.keymap_registry.lookup(.normal, ev_q, null) orelse
+        return error.TestExpectedKeymap;
+    try std.testing.expect(open_j == .lua_callback);
+    try std.testing.expect(open_k == .lua_callback);
+    try std.testing.expect(open_q == .lua_callback);
+
+    // Close via <Esc> (drives on_close -> cleanup, which removes the
+    // picker bindings AND re-registers the displaced defaults).
+    const esc_hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .escape, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(esc_hit == .lua_callback);
+    f.engine.invokeCallback(esc_hit.lua_callback);
+
+    // The defaults are back, by tag. Restoration goes through the
+    // string round-trip Keymap.actionName -> parseActionName, so
+    // identity is per-tag rather than per-payload (the .focus_down
+    // variant is payload-less, so the values are equal too).
+    const after_j = f.engine.keymap_registry.lookup(.normal, ev_j, null) orelse
+        return error.TestExpectedKeymap;
+    const after_k = f.engine.keymap_registry.lookup(.normal, ev_k, null) orelse
+        return error.TestExpectedKeymap;
+    const after_q = f.engine.keymap_registry.lookup(.normal, ev_q, null) orelse
+        return error.TestExpectedKeymap;
+    try std.testing.expect(after_j == .focus_down);
+    try std.testing.expect(after_k == .focus_up);
+    try std.testing.expect(after_q == .close_window);
 }
 
 /// Count every leaf node reachable from `root`. Used by the picker

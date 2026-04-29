@@ -1,16 +1,16 @@
 -- Builtin /model picker built on top of `zag.popup.list`.
 --
 -- Behaviour:
---   * `/model` opens a centered-modal list popup anchored to the
---     editor (NOT to the cursor). Geometry mirrors the original
---     floating-panes picker: editor-relative, row=2/col=4 with
---     min_width=40 / max_width=70 / min_height=6 / max_height=18 so
---     the float shrinks on small terminals and never overflows on a
---     default 80x24.
+--   * `/model` opens a list popup anchored at the input cursor (one
+--     line below where the user typed `/model`). Width sizes to content
+--     between 30 and 60 cells; height between 1 and 10 rows. Vim
+--     popup-completion shape — non-focusable, lives in response to
+--     typing, dismisses cleanly on Enter or Esc.
 --   * The popup renders one row per registered provider/model pair; the
 --     current model is marked with `kind = "*"` and `menu = "(current)"`.
---   * Up/Down move the selection. Enter swaps the focused pane's model
---     and closes the popup. Esc closes without changing anything.
+--   * j/k or Up/Down or C-N/C-P move the selection. Enter swaps the
+--     focused pane's model and closes the popup. Esc or q closes
+--     without changing anything.
 --
 -- Why this shape (vs the old direct-scratch-buffer picker):
 --   The old picker opened a focusable centered float and registered
@@ -18,14 +18,9 @@
 --   `popup.list` deliberately keeps the underlying pane focused
 --   (`focusable = false`/`enter = false` are baked in slice 4) so the
 --   helper matches Vim's popup-completion semantics. To keep the
---   `/model` UX intact we route Up/Down/Enter/Esc into the popup via
+--   `/model` UX intact we route navigation keys into the popup via
 --   `popup.invoke_key`, which is the supported integration path the
 --   helper exposes for non-focusable popups.
---
--- A future (Option-1) variant would have `/model` show a typing-driven
--- popup over the slash text in the draft, narrowing as the user types.
--- That is a UX redesign, not a primitive swap, and is intentionally
--- out of scope for this slice.
 
 local function build_items()
     local tree = zag.layout.tree()
@@ -62,21 +57,36 @@ local function open()
     local popup = require("zag.popup.list")
 
     local handle
-    local keymap_ids = {}
+    -- Each entry is `{ id = <int>, displaced = <table or nil> }`. The
+    -- `displaced` field is the second return from `zag.keymap{...}`,
+    -- which describes a built-in binding our registration overwrote
+    -- (e.g. `j -> focus_down`). On cleanup we remove our binding AND
+    -- re-register the displaced spec so the user's defaults survive
+    -- the picker's lifetime. Missing this restore step silently
+    -- erases `j`/`k`/`q` from the global keymap until the next time
+    -- something rebinds them.
+    local keymap_entries = {}
     local cleaned_up = false
     local function cleanup()
         if cleaned_up then
             return
         end
         cleaned_up = true
-        for _, id in ipairs(keymap_ids) do
+        for _, entry in ipairs(keymap_entries) do
             -- Best-effort: a partial-failure path here must not block
             -- the close flow. `keymap_remove` raises on unknown ids,
             -- which would happen if the same id was already removed
             -- (e.g. by a duplicate close path).
-            pcall(zag.keymap_remove, id)
+            pcall(zag.keymap_remove, entry.id)
+            if entry.displaced then
+                -- Re-register the original built-in so a user's
+                -- default `j -> focus_down` (etc.) is restored after
+                -- the picker comes down. pcall keeps a malformed
+                -- restore from blocking the rest of cleanup.
+                pcall(zag.keymap, entry.displaced)
+            end
         end
-        keymap_ids = {}
+        keymap_entries = {}
         zag.mode.set(prev_mode)
     end
 
@@ -97,16 +107,16 @@ local function open()
         -- the popup is closed by code that doesn't go through one of
         -- our route() bindings.
         on_close = cleanup,
-        -- Centered-modal placement: editor-relative, size-to-content
-        -- inside min/max bounds so the picker shrinks on small
-        -- terminals and never overflows the default 80x24 chrome.
-        relative = "editor",
-        row = 2,
-        col = 4,
-        min_width = 40,
-        max_width = 70,
-        min_height = 6,
-        max_height = 18,
+        -- Cursor-anchored placement (popup-completion shape). One line
+        -- below the input cursor, aligned to the cursor column. Size
+        -- shrinks to fit content inside min/max bounds.
+        relative = "cursor",
+        row = 1,
+        col = 0,
+        min_width = 30,
+        max_width = 60,
+        min_height = 1,
+        max_height = 10,
         border = "rounded",
         title = "Models",
     })
@@ -117,12 +127,16 @@ local function open()
     -- false); a global normal-mode binding lets the keys fire from any
     -- focused buffer while the picker is up.
     --
-    -- Each binding's id is captured into `keymap_ids` so `cleanup()`
-    -- can `zag.keymap_remove` it. We don't manually call cleanup()
-    -- from route() because `on_close = cleanup` on the popup handles
-    -- every close path uniformly. The `popup.is_closed(handle)` guard
-    -- stays as defense-in-depth: it avoids forwarding into a dead
-    -- handle (which `invoke_key` would error on).
+    -- Each binding's id and (optional) displaced spec are captured
+    -- into `keymap_entries` so `cleanup()` can `zag.keymap_remove` it
+    -- AND re-register the original built-in we overwrote (`j`, `k`,
+    -- `q` collide with the default `focus_down`/`focus_up`/
+    -- `close_window` bindings — restoring them is mandatory). We
+    -- don't manually call cleanup() from route() because `on_close
+    -- = cleanup` on the popup handles every close path uniformly.
+    -- The `popup.is_closed(handle)` guard stays as defense-in-depth:
+    -- it avoids forwarding into a dead handle (which `invoke_key`
+    -- would error on).
     --
     -- `popup.invoke_key` runs the popup's selection state machine,
     -- which calls user-supplied on_commit / on_cancel. Wrapping it in
@@ -152,10 +166,25 @@ local function open()
         end
     end
 
-    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<Up>",   fn = route("<Up>") })
-    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<Down>", fn = route("<Down>") })
-    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<CR>",   fn = route("<CR>") })
-    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<Esc>",  fn = route("<Esc>") })
+    -- Vim popup-completion vocabulary: j/k for line motion, C-N/C-P
+    -- for next/prev, Up/Down as modern equivalents. q joins Esc as a
+    -- familiar dismissal key. `bind` captures both returns from
+    -- `zag.keymap{...}`: the binding id (for keymap_remove on close)
+    -- and an optional `displaced` spec describing a default we
+    -- overwrote (j/k/q collide with focus_down/focus_up/close_window).
+    local function bind(spec)
+        local id, displaced = zag.keymap(spec)
+        table.insert(keymap_entries, { id = id, displaced = displaced })
+    end
+    bind { mode = "normal", key = "<Up>",   fn = route("<Up>") }
+    bind { mode = "normal", key = "<Down>", fn = route("<Down>") }
+    bind { mode = "normal", key = "k",      fn = route("<Up>") }
+    bind { mode = "normal", key = "j",      fn = route("<Down>") }
+    bind { mode = "normal", key = "<C-P>",  fn = route("<Up>") }
+    bind { mode = "normal", key = "<C-N>",  fn = route("<Down>") }
+    bind { mode = "normal", key = "<CR>",   fn = route("<CR>") }
+    bind { mode = "normal", key = "<Esc>",  fn = route("<Esc>") }
+    bind { mode = "normal", key = "q",      fn = route("<Esc>") }
 end
 
 zag.command { name = "model", fn = open }
