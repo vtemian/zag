@@ -276,7 +276,6 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
 
 /// Parses a raw JSON response from OpenAI's Chat Completions API into a typed LlmResponse.
 fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningConfig, allocator: Allocator) !types.LlmResponse {
-    _ = reasoning; // Wired in Task 8 for the response_fields scrape.
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -313,6 +312,20 @@ fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningCo
 
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
+
+    // Reasoning content: walk the configured response_fields over the
+    // assistant message and accumulate the first non-empty match into
+    // a thinking block tagged .openai_chat. Inserted ahead of the
+    // text/tool_use branches so the resulting block order matches the
+    // model's intent (thinking precedes the visible response). Empty
+    // response_fields => no scrape (historical behaviour).
+    for (reasoning.response_fields) |field| {
+        const v = message.object.get(field) orelse continue;
+        if (v != .string) continue;
+        if (v.string.len == 0) continue;
+        try builder.addThinking(v.string, null, .openai_chat, allocator);
+        break;
+    }
 
     if (message.object.get("content")) |content| {
         if (content == .string) {
@@ -810,6 +823,64 @@ test "parseResponse parses text alongside tool_calls" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parseResponse scrapes reasoning_content into a thinking block tagged .openai_chat" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "choices": [{
+        \\    "message": {
+        \\      "role": "assistant",
+        \\      "content": "let me think",
+        \\      "reasoning_content": "step 1: read file. step 2: summarize."
+        \\    },
+        \\    "finish_reason": "stop"
+        \\  }],
+        \\  "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        \\}
+    ;
+    const reasoning: llm.Endpoint.ReasoningConfig = .{
+        .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
+    };
+
+    const resp = try parseResponse(json, reasoning, allocator);
+    defer resp.deinit(allocator);
+
+    // thinking block must precede text block in the content slice.
+    try std.testing.expect(resp.content.len >= 2);
+    try std.testing.expect(resp.content[0] == .thinking);
+    try std.testing.expect(resp.content[0].thinking.provider == .openai_chat);
+    try std.testing.expectEqualStrings(
+        "step 1: read file. step 2: summarize.",
+        resp.content[0].thinking.text,
+    );
+    try std.testing.expect(resp.content[1] == .text);
+    try std.testing.expectEqualStrings("let me think", resp.content[1].text.text);
+}
+
+test "parseResponse skips reasoning when response_fields is empty" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "choices": [{
+        \\    "message": {
+        \\      "role": "assistant",
+        \\      "content": "hi",
+        \\      "reasoning_content": "I should not be parsed"
+        \\    },
+        \\    "finish_reason": "stop"
+        \\  }],
+        \\  "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        \\}
+    ;
+    const resp = try parseResponse(json, .{}, allocator);
+    defer resp.deinit(allocator);
+
+    // Only the text block should appear; thinking must be dropped when
+    // the endpoint did not opt in via response_fields.
+    try std.testing.expectEqual(@as(usize, 1), resp.content.len);
+    try std.testing.expect(resp.content[0] == .text);
 }
 
 test "openai body places system as first message" {
