@@ -62,12 +62,21 @@ local function open()
     local popup = require("zag.popup.list")
 
     local handle
-    local mode_restored = false
-    local function restore_mode()
-        if mode_restored then
+    local keymap_ids = {}
+    local cleaned_up = false
+    local function cleanup()
+        if cleaned_up then
             return
         end
-        mode_restored = true
+        cleaned_up = true
+        for _, id in ipairs(keymap_ids) do
+            -- Best-effort: a partial-failure path here must not block
+            -- the close flow. `keymap_remove` raises on unknown ids,
+            -- which would happen if the same id was already removed
+            -- (e.g. by a duplicate close path).
+            pcall(zag.keymap_remove, id)
+        end
+        keymap_ids = {}
         zag.mode.set(prev_mode)
     end
 
@@ -102,30 +111,29 @@ local function open()
     -- false); a global normal-mode binding lets the keys fire from any
     -- focused buffer while the picker is up.
     --
-    -- Caveat: `zag.keymap` has no remove API, so these bindings linger
-    -- after the popup closes. The route() closures detect a closed
-    -- popup via `popup.is_closed(handle)` and become no-ops; the next
-    -- `/model` invocation re-registers them with a fresh handle.
-    -- Filed as a follow-up: a `zag.keymap_remove` (or buffer-scoping
-    -- against the focused tile's underlying buffer id) would let the
-    -- picker self-clean.
+    -- Each binding's id is captured into `keymap_ids` so `cleanup()`
+    -- can `zag.keymap_remove` it after the popup closes (commit or
+    -- cancel). The `popup.is_closed(handle)` short-circuit inside
+    -- `route` is kept as defense-in-depth: if a future code path closes
+    -- the popup without going through cleanup() we still no-op
+    -- gracefully instead of forwarding the key into a dead handle.
     local function route(key)
         return function()
             if popup.is_closed(handle) then
-                restore_mode()
+                cleanup()
                 return
             end
             popup.invoke_key(handle, key)
             if popup.is_closed(handle) then
-                restore_mode()
+                cleanup()
             end
         end
     end
 
-    zag.keymap { mode = "normal", key = "<Up>",   fn = route("<Up>") }
-    zag.keymap { mode = "normal", key = "<Down>", fn = route("<Down>") }
-    zag.keymap { mode = "normal", key = "<CR>",   fn = route("<CR>") }
-    zag.keymap { mode = "normal", key = "<Esc>",  fn = route("<Esc>") }
+    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<Up>",   fn = route("<Up>") })
+    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<Down>", fn = route("<Down>") })
+    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<CR>",   fn = route("<CR>") })
+    table.insert(keymap_ids, zag.keymap { mode = "normal", key = "<Esc>",  fn = route("<Esc>") })
 end
 
 zag.command { name = "model", fn = open }
