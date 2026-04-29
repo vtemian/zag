@@ -214,9 +214,22 @@ fn writeToolCall(writer: anytype, allocator: std.mem.Allocator, call: ToolCall) 
     try writeStringField(writer, "tool_call_id", call.tool_call_id, true);
     try writeStringField(writer, "function_name", call.function_name, false);
     try writer.writeAll(",\"arguments\":");
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{});
-    defer parsed.deinit();
-    try std.json.Stringify.value(parsed.value, .{}, writer);
+
+    // Attempt to parse and re-stringify so the trajectory normalizes
+    // whitespace/escaping. On parse failure (e.g. Kimi/Moonshot streams
+    // sometimes ship mangled bytes), preserve the raw input under a
+    // sentinel key instead of crashing the whole serialization. The
+    // eval harness can detect _malformed_arguments_raw and surface
+    // the call as broken without losing the rest of the trajectory.
+    if (std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{})) |parsed| {
+        defer parsed.deinit();
+        try std.json.Stringify.value(parsed.value, .{}, writer);
+    } else |_| {
+        try writer.writeAll("{\"_malformed_arguments_raw\":");
+        try std.json.Stringify.value(call.arguments_json, .{}, writer);
+        try writer.writeByte('}');
+    }
+
     try writer.writeByte('}');
 }
 
@@ -958,6 +971,45 @@ test "serialize emits reasoning_content when populated" {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
+}
+
+test "writeToolCall handles malformed arguments_json without crashing" {
+    // Regression: live Kimi K2.6 runs occasionally produce tool_call
+    // arguments with corrupted JSON (Moonshot's SSE streams sometimes
+    // ship mangled bytes; the in-process accumulator round-trips them
+    // verbatim per the test in providers/openai.zig). Trajectory.zig
+    // used to crash the whole headless run on the first such call.
+    // Now it emits a sentinel object that preserves the raw bytes so
+    // the eval harness can flag the call as malformed without losing
+    // the trajectory.
+    const allocator = std.testing.allocator;
+
+    const call = ToolCall{
+        .tool_call_id = "call_001",
+        .function_name = "read",
+        .arguments_json = "{\"path\":src/main.zig\"}", // missing quote before src
+    };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeToolCall(&out.writer, allocator, call);
+
+    // Result must parse as JSON (no crash).
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("call_001", root.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings("read", root.get("function_name").?.string);
+
+    // arguments must be a JSON object (not the parsed-and-restringified
+    // form, since parsing failed) carrying the raw bytes verbatim.
+    const args = root.get("arguments").?.object;
+    try std.testing.expectEqualStrings(
+        "{\"path\":src/main.zig\"}",
+        args.get("_malformed_arguments_raw").?.string,
+    );
 }
 
 test {
