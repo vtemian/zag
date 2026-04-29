@@ -406,7 +406,6 @@ fn parseSseStream(
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
 ) !types.LlmResponse {
-    _ = reasoning; // Wired in Task 10 for streaming reasoning accumulation.
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
@@ -414,6 +413,9 @@ fn parseSseStream(
 
     var text_content: std.ArrayList(u8) = .empty;
     defer text_content.deinit(allocator);
+
+    var thinking_content: std.ArrayList(u8) = .empty;
+    defer thinking_content.deinit(allocator);
 
     var tool_calls: std.ArrayList(StreamingToolCall) = .empty;
     defer {
@@ -477,6 +479,18 @@ fn parseSseStream(
                 }
             }
 
+            // Reasoning text on streaming deltas: walk configured field
+            // names and accumulate the first non-empty match. Mirrors
+            // the non-streaming scrape in parseResponse.
+            for (reasoning.response_fields) |field| {
+                const v = delta.object.get(field) orelse continue;
+                if (v != .string) continue;
+                if (v.string.len == 0) continue;
+                try thinking_content.appendSlice(allocator, v.string);
+                callback.on_event(callback.ctx, .{ .thinking_delta = .{ .text = v.string } });
+                break;
+            }
+
             if (delta.object.get("tool_calls")) |tc| {
                 for (tc.array.items) |tc_item| {
                     const index_raw = tc_item.object.get("index") orelse continue;
@@ -522,6 +536,12 @@ fn parseSseStream(
     // Assemble final LlmResponse
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
+
+    // Thinking precedes text/tool_use so block order matches the
+    // model's intent (thinking is the prelude, not an afterthought).
+    if (thinking_content.items.len > 0) {
+        try builder.addThinking(thinking_content.items, null, .openai_chat, allocator);
+    }
 
     if (text_content.items.len > 0) {
         try builder.addText(text_content.items, allocator);
@@ -1128,6 +1148,91 @@ test "parseSseStream captures usage and cached_tokens from final chunk" {
     try std.testing.expectEqual(@as(u32, 3), response.output_tokens);
     try std.testing.expectEqual(@as(u32, 4), response.cache_read_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.cache_creation_tokens);
+}
+
+test "parseSseStream accumulates reasoning_content into a thinking block" {
+    const allocator = std.testing.allocator;
+
+    // Two reasoning_content delta chunks, then a content delta, then a final
+    // chunk with finish_reason. Mirrors how Moonshot/Kimi K2 streams a
+    // tool-less reply: thinking first, then visible answer.
+    const sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step 1\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" then step 2\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fake = std.Io.Reader.fixed(sse_body);
+
+    var sr: llm.streaming.StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    const Recorder = struct {
+        thinking_chunks: std.ArrayList([]const u8) = .empty,
+        text_chunks: std.ArrayList([]const u8) = .empty,
+        allocator: Allocator,
+
+        fn callback(ctx: *anyopaque, ev: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .thinking_delta => |t| {
+                    const owned = self.allocator.dupe(u8, t.text) catch return;
+                    self.thinking_chunks.append(self.allocator, owned) catch self.allocator.free(owned);
+                },
+                .text_delta => |t| {
+                    const owned = self.allocator.dupe(u8, t) catch return;
+                    self.text_chunks.append(self.allocator, owned) catch self.allocator.free(owned);
+                },
+                else => {},
+            }
+        }
+    };
+    var rec = Recorder{ .allocator = allocator };
+    defer {
+        for (rec.thinking_chunks.items) |c| allocator.free(c);
+        for (rec.text_chunks.items) |c| allocator.free(c);
+        rec.thinking_chunks.deinit(allocator);
+        rec.text_chunks.deinit(allocator);
+    }
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const cb: llm.StreamCallback = .{ .ctx = &rec, .on_event = Recorder.callback };
+    const reasoning: llm.Endpoint.ReasoningConfig = .{
+        .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
+    };
+
+    const resp = try parseSseStream(&sr, reasoning, allocator, cb, &cancel);
+    defer resp.deinit(allocator);
+
+    // Two thinking_delta events, then one text_delta event.
+    try std.testing.expectEqual(@as(usize, 2), rec.thinking_chunks.items.len);
+    try std.testing.expectEqualStrings("step 1", rec.thinking_chunks.items[0]);
+    try std.testing.expectEqualStrings(" then step 2", rec.thinking_chunks.items[1]);
+
+    // Final response: thinking precedes text in content order.
+    try std.testing.expect(resp.content.len >= 2);
+    try std.testing.expect(resp.content[0] == .thinking);
+    try std.testing.expectEqualStrings(
+        "step 1 then step 2",
+        resp.content[0].thinking.text,
+    );
+    try std.testing.expect(resp.content[1] == .text);
+    try std.testing.expectEqualStrings("hello", resp.content[1].text.text);
 }
 
 test "openai writeMessage emits tool role for tool_result" {
