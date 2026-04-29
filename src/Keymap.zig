@@ -56,6 +56,29 @@ pub fn parseActionName(name: []const u8) ?Action {
     return null;
 }
 
+/// Inverse of `parseActionName`: render a built-in Action variant to
+/// its Lua-facing string name. Returns null for `.lua_callback`, which
+/// has no string representation (the Lua wrapper owns the registry ref
+/// behind it; a plugin cannot re-register a Lua callback it didn't
+/// create). Used by the `zag.keymap` wrapper to emit a `displaced_spec`
+/// table that callers can pass back through `zag.keymap{...}` to
+/// restore an overwritten built-in binding.
+pub fn actionName(action: Action) ?[]const u8 {
+    return switch (action) {
+        .focus_left => "focus_left",
+        .focus_down => "focus_down",
+        .focus_up => "focus_up",
+        .focus_right => "focus_right",
+        .split_vertical => "split_vertical",
+        .split_horizontal => "split_horizontal",
+        .close_window => "close_window",
+        .resize => "resize",
+        .enter_insert_mode => "enter_insert_mode",
+        .enter_normal_mode => "enter_normal_mode",
+        .lua_callback => null,
+    };
+}
+
 /// A specification of a keystroke: a Key variant + modifier flags.
 /// Matches the shape emitted by input.Parser for real keypresses.
 pub const KeySpec = struct {
@@ -495,6 +518,28 @@ test "loadDefaults installs the nine built-in bindings" {
 
 test "parseActionName recognizes resize" {
     try std.testing.expect(parseActionName("resize").? == .resize);
+}
+
+test "actionName round-trips through parseActionName for every built-in" {
+    // Every built-in Action variant must stringify to a name that
+    // parseActionName recognizes; otherwise `zag.keymap` can't emit a
+    // displaced_spec table that a caller can pass back to restore the
+    // overwritten binding.
+    const variants = [_]Action{
+        .focus_left,        .focus_down,     .focus_up,
+        .focus_right,       .split_vertical, .split_horizontal,
+        .close_window,      .resize,         .enter_insert_mode,
+        .enter_normal_mode,
+    };
+    for (variants) |a| {
+        const name = actionName(a) orelse return error.TestExpected;
+        const round = parseActionName(name) orelse return error.TestExpected;
+        try std.testing.expect(std.meta.activeTag(round) == std.meta.activeTag(a));
+    }
+}
+
+test "actionName returns null for lua_callback" {
+    try std.testing.expectEqual(@as(?[]const u8, null), actionName(.{ .lua_callback = 7 }));
 }
 
 test "registry lookup prefers buffer-local binding over global" {
