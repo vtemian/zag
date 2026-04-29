@@ -506,21 +506,33 @@ fn parseSseStream(
 ///
 /// Envelope shape per Anthropic docs:
 ///   {"type":"error","error":{"type":"overloaded_error","message":"..."}}
+///
+/// The user-facing `error_detail` flows through `error_class.userMessage`,
+/// so an Anthropic overload that mentions `prompt is too long` surfaces as
+/// "Context exceeds the model's window — consider compacting." instead of
+/// a raw provider envelope. The agent-loop `.err` callback still receives
+/// a provider-tagged string so logs can correlate retries to the upstream.
 fn handleStreamErrorEvent(
     callback: llm.StreamCallback,
     telemetry: ?*llm.telemetry.Telemetry,
     data: []const u8,
     allocator: Allocator,
 ) !void {
-    if (telemetry) |t| {
-        _ = t.onStreamError(.anthropic_error, data) catch |err| {
+    // Telemetry classifies and dumps the artifact. When telemetry is
+    // absent (mostly tests), classify directly so the user-facing string
+    // still benefits from the structured message.
+    const class: llm.error_class.ErrorClass = if (telemetry) |t|
+        t.onStreamError(.anthropic_error, data) catch |err| blk: {
             log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
-        };
-    }
+            break :blk llm.error_class.classify(0, data, &.{});
+        }
+    else
+        llm.error_class.classify(0, data, &.{});
 
-    // Best-effort parse for the human-readable bits. We never fail the
-    // outer error path on a malformed envelope; we just fall back to the
-    // raw bytes so something useful still reaches the user.
+    // The agent-loop `.err` callback keeps the provider-tagged string so
+    // logs and replays can distinguish anthropic stream errors from
+    // generic transport failures. Best-effort parse — we never fail the
+    // outer error path on a malformed envelope.
     var parsed_kind: []const u8 = "error";
     var parsed_message: []const u8 = data;
 
@@ -546,13 +558,15 @@ fn handleStreamErrorEvent(
         "anthropic stream error: {s}: {s}",
         .{ parsed_kind, parsed_message },
     );
+    defer allocator.free(text);
     callback.on_event(callback.ctx, .{ .err = text });
 
-    // Hand ownership of `text` to the error_detail slot. It's freed by
-    // the next `error_detail.set` or `error_detail.clear` call.
-    const detail = try allocator.dupe(u8, text);
+    // The UI-bound detail goes through the classifier so codex-equivalent
+    // overflows render with the friendly text. On classification failure
+    // fall back to the provider-tagged string we already have on hand.
+    const detail = llm.error_class.userMessage(class, allocator) catch
+        try allocator.dupe(u8, text);
     llm.error_detail.set(allocator, detail);
-    allocator.free(text);
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.
@@ -1900,10 +1914,13 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     const stat = try std.fs.cwd().statFile(expected);
     try std.testing.expect(stat.size > 0);
 
-    // error_detail got populated for the agent error formatter.
+    // error_detail got populated for the agent error formatter. The UI
+    // detail flows through `error_class.userMessage` now, so for an
+    // unclassified envelope it falls into the `.unknown` bucket whose
+    // user message names the log path.
     const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
     defer allocator.free(detail);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "overloaded_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Check ~/.zag/logs") != null);
 }
 
 test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
@@ -1922,10 +1939,13 @@ test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
 
     if (llm.error_detail.take()) |prev| allocator.free(prev);
 
-    const envelope = "{\"error\":{\"message\":\"boom\"}}";
+    // Use a context-overflow envelope so the classifier produces a
+    // friendly user message we can assert against. A bare "boom" body
+    // would route to `.unknown` whose message names ~/.zag/logs.
+    const envelope = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"prompt is too long\"}}";
     try handleStreamErrorEvent(callback, null, envelope, allocator);
 
     const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
     defer allocator.free(detail);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "boom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Context exceeds the model's window") != null);
 }
