@@ -298,10 +298,17 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
 
 /// Emit `,"<echo_field>":"<concatenated thinking text>"` on the
 /// outgoing assistant object when the endpoint opted into reasoning
-/// echo AND the message carries one or more thinking blocks tagged
-/// `.openai_chat`. No-op otherwise. Tagged-by-provider gating prevents
-/// Anthropic blocks from leaking into the openai-chat wire if a session
-/// crosses providers.
+/// echo. The endpoint's `echo_field` declaration is the opt-in
+/// signal; if a Lua provider author set it, they want their
+/// thinking to round-trip on this wire.
+///
+/// All thinking blocks contribute their text regardless of provider
+/// tag. Cross-provider sessions (e.g. Anthropic mid-session, then
+/// switch back to Moonshot) thus carry the foreign wire's reasoning
+/// across as raw text. The alternative — strictly tagging by
+/// `.openai_chat` — silently dropped legitimate context whenever a
+/// future ThinkingProvider variant landed and Lua plugins had no
+/// way to fix it without a Zig change.
 fn writeThinkingEcho(
     msg: types.Message,
     reasoning: llm.Endpoint.ReasoningConfig,
@@ -310,7 +317,7 @@ fn writeThinkingEcho(
     const echo = reasoning.echo_field orelse return;
     var has_thinking = false;
     for (msg.content) |block| {
-        if (block == .thinking and block.thinking.provider == .openai_chat) {
+        if (block == .thinking) {
             has_thinking = true;
             break;
         }
@@ -321,7 +328,7 @@ fn writeThinkingEcho(
     try types.writeJsonStringContents(w, echo);
     try w.writeAll("\":\"");
     for (msg.content) |block| {
-        if (block == .thinking and block.thinking.provider == .openai_chat) {
+        if (block == .thinking) {
             try types.writeJsonStringContents(w, block.thinking.text);
         }
     }
@@ -1551,8 +1558,14 @@ test "openai writeMessage skips echo when echo_field is null" {
     try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
 }
 
-test "openai writeMessage skips echo when assistant has no .openai_chat thinking" {
-    // anthropic-tagged thinking must NOT leak into an openai-chat wire.
+test "openai writeMessage echoes thinking from any provider tag when echo_field is set" {
+    // The endpoint's echo_field declaration is the opt-in signal.
+    // Cross-provider history (e.g. an .anthropic-tagged block
+    // surfacing through openai.zig because the active wire is now
+    // Moonshot) must round-trip the reasoning text rather than
+    // drop it silently. Strict `.openai_chat`-only gating used to
+    // hide foreign reasoning from the request and made future wire
+    // additions painful.
     const allocator = std.testing.allocator;
 
     const content = try allocator.alloc(types.ContentBlock, 2);
@@ -1578,7 +1591,11 @@ test "openai writeMessage skips echo when assistant has no .openai_chat thinking
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
+    try std.testing.expect(parsed.value.object.get("reasoning_content") != null);
+    try std.testing.expectEqualStrings(
+        "anthropic-style thinking",
+        parsed.value.object.get("reasoning_content").?.string,
+    );
 }
 
 test "openai writeMessage echoes thinking on plain-text assistant messages" {
