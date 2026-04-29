@@ -319,10 +319,11 @@ fn writeMessageItem(role: types.Role, text: []const u8, w: anytype) !void {
 /// Emit a `{"type":"function_call","call_id":"...","name":"...","arguments":"<json string>"}` item.
 /// `arguments` is a JSON-encoded *string* containing the tool input, not an object.
 fn writeFunctionCallItem(tu: types.ContentBlock.ToolUse, w: anytype) !void {
-    try w.writeAll("{\"type\":\"function_call\",");
-    try w.print("\"call_id\":\"{s}\",", .{tu.id});
-    try w.print("\"name\":\"{s}\",", .{tu.name});
-    try w.writeAll("\"arguments\":");
+    try w.writeAll("{\"type\":\"function_call\",\"call_id\":");
+    try std.json.Stringify.value(tu.id, .{}, w);
+    try w.writeAll(",\"name\":");
+    try std.json.Stringify.value(tu.name, .{}, w);
+    try w.writeAll(",\"arguments\":");
     try std.json.Stringify.value(tu.input_raw, .{}, w);
     try w.writeAll("}");
 }
@@ -330,9 +331,9 @@ fn writeFunctionCallItem(tu: types.ContentBlock.ToolUse, w: anytype) !void {
 /// Emit a `{"type":"function_call_output","call_id":"...","output":"..."}` item.
 // Responses API has no is_error; error state is conveyed via output text.
 fn writeFunctionCallOutputItem(tr: types.ContentBlock.ToolResultBlock, w: anytype) !void {
-    try w.writeAll("{\"type\":\"function_call_output\",");
-    try w.print("\"call_id\":\"{s}\",", .{tr.tool_use_id});
-    try w.writeAll("\"output\":");
+    try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
+    try std.json.Stringify.value(tr.tool_use_id, .{}, w);
+    try w.writeAll(",\"output\":");
     try std.json.Stringify.value(tr.content, .{}, w);
     try w.writeAll("}");
 }
@@ -2401,4 +2402,45 @@ test "chatgpt SSE: response.failed without telemetry still terminates with Provi
         },
     });
     try std.testing.expectError(error.ProviderResponseFailed, result);
+}
+
+test "chatgpt writeFunctionCallItem escapes tu.id and tu.name" {
+    const allocator = std.testing.allocator;
+
+    const tu: types.ContentBlock.ToolUse = .{
+        .id = "id\"with\\quote",
+        .name = "name\"with\\quote",
+        .input_raw = "{}",
+    };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeFunctionCallItem(tu, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("id\"with\\quote", parsed.value.object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("name\"with\\quote", parsed.value.object.get("name").?.string);
+}
+
+test "chatgpt writeFunctionCallOutputItem escapes tr.tool_use_id" {
+    const allocator = std.testing.allocator;
+
+    const tr: types.ContentBlock.ToolResultBlock = .{
+        .tool_use_id = "result_id\"with\\quote",
+        .content = "ok",
+        .is_error = false,
+    };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeFunctionCallOutputItem(tr, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("result_id\"with\\quote", parsed.value.object.get("call_id").?.string);
 }
