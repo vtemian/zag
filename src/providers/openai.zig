@@ -170,7 +170,6 @@ fn writeMessagesWithSystem(system: []const u8, msgs: []const types.Message, reas
 }
 
 fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: anytype) !void {
-    _ = reasoning; // Wired in Task 9 for the echo path.
     var has_text = false;
     var has_tool_use = false;
     var has_tool_result = false;
@@ -180,7 +179,7 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
             .text => has_text = true,
             .tool_use => has_tool_use = true,
             .tool_result => has_tool_result = true,
-            .thinking, .redacted_thinking => {}, // Chat Completions has no reasoning field; stripped upstream
+            .thinking, .redacted_thinking => {}, // handled via echo_field below; never inline content blocks
         }
     }
 
@@ -218,6 +217,8 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
         } else {
             try w.writeAll(",\"content\":null");
         }
+
+        try writeThinkingEcho(msg, reasoning, w);
 
         try w.writeAll(",\"tool_calls\":[");
         var tc_idx: usize = 0;
@@ -271,7 +272,41 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
         try w.writeAll("\"");
     }
 
+    try writeThinkingEcho(msg, reasoning, w);
+
     try w.writeAll("}");
+}
+
+/// Emit `,"<echo_field>":"<concatenated thinking text>"` on the
+/// outgoing assistant object when the endpoint opted into reasoning
+/// echo AND the message carries one or more thinking blocks tagged
+/// `.openai_chat`. No-op otherwise. Tagged-by-provider gating prevents
+/// Anthropic blocks from leaking into the openai-chat wire if a session
+/// crosses providers.
+fn writeThinkingEcho(
+    msg: types.Message,
+    reasoning: llm.Endpoint.ReasoningConfig,
+    w: anytype,
+) !void {
+    const echo = reasoning.echo_field orelse return;
+    var has_thinking = false;
+    for (msg.content) |block| {
+        if (block == .thinking and block.thinking.provider == .openai_chat) {
+            has_thinking = true;
+            break;
+        }
+    }
+    if (!has_thinking) return;
+
+    try w.writeAll(",\"");
+    try w.writeAll(echo);
+    try w.writeAll("\":\"");
+    for (msg.content) |block| {
+        if (block == .thinking and block.thinking.provider == .openai_chat) {
+            try types.writeJsonStringContents(w, block.thinking.text);
+        }
+    }
+    try w.writeAll("\"");
 }
 
 /// Parses a raw JSON response from OpenAI's Chat Completions API into a typed LlmResponse.
@@ -1154,4 +1189,100 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
     defer allocator.free(single_body);
 
     try std.testing.expectEqualStrings(single_body, split_body);
+}
+
+test "openai writeMessage echoes thinking text via echo_field on tool_use messages" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "step 1: read CLAUDE.md",
+        .signature = null,
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{\"path\":\"CLAUDE.md\"}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    try std.testing.expect(root.get("reasoning_content") != null);
+    try std.testing.expectEqualStrings(
+        "step 1: read CLAUDE.md",
+        root.get("reasoning_content").?.string,
+    );
+    // tool_calls still present.
+    try std.testing.expectEqual(@as(usize, 1), root.get("tool_calls").?.array.items.len);
+}
+
+test "openai writeMessage skips echo when echo_field is null" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "should not appear",
+        .signature = null,
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{}, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
+}
+
+test "openai writeMessage skips echo when assistant has no .openai_chat thinking" {
+    // anthropic-tagged thinking must NOT leak into an openai-chat wire.
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "anthropic-style thinking",
+        .signature = "sig",
+        .provider = .anthropic,
+        .id = null,
+    } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
 }
