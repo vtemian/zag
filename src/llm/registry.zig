@@ -284,6 +284,35 @@ pub const Endpoint = struct {
     }
 };
 
+/// Deep-copy a slice of borrowed strings onto `allocator`. Pair with
+/// `freeStringSlice`. Used by `Endpoint.dupe` for variable-length
+/// string lists (e.g. `ReasoningConfig.response_fields`). Errdefer
+/// chain unwinds partial state if any inner allocation fails.
+pub fn dupeStringSlice(
+    items: []const []const u8,
+    allocator: Allocator,
+) ![][]const u8 {
+    const out = try allocator.alloc([]const u8, items.len);
+    errdefer allocator.free(out);
+
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |s| allocator.free(s);
+
+    for (items, 0..) |item, i| {
+        out[i] = try allocator.dupe(u8, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+/// Free a slice produced by `dupeStringSlice`. Pairs the inner-string
+/// frees with the outer slice free in a single call so callers do not
+/// have to interleave the two.
+pub fn freeStringSlice(items: []const []const u8, allocator: Allocator) void {
+    for (items) |s| allocator.free(s);
+    allocator.free(items);
+}
+
 /// Deep-copy every string / slice in an `OAuthSpec` onto `allocator`.
 /// Paired with `freeOAuthSpec`. Uses `errdefer` to unwind partial state if
 /// any inner allocation fails, so a failed dupe never leaks.
@@ -788,6 +817,20 @@ test "ModelRate dupe round trips label and recommended" {
     try std.testing.expectEqual(true, duped.models[0].recommended);
     try std.testing.expectEqual(@as(?[]const u8, null), duped.models[1].label);
     try std.testing.expectEqual(false, duped.models[1].recommended);
+}
+
+test "dupeStringSlice + freeStringSlice round-trip independent copy" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "reasoning_content", "reasoning", "reasoning_text" };
+    const duped = try dupeStringSlice(&original, allocator);
+    defer freeStringSlice(duped, allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), duped.len);
+    for (original, duped) |o, d| {
+        try std.testing.expectEqualStrings(o, d);
+        // Independent storage: pointers must differ.
+        try std.testing.expect(o.ptr != d.ptr);
+    }
 }
 
 test {
