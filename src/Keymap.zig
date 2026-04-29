@@ -247,27 +247,40 @@ pub const Registry = struct {
         self.bindings.deinit(self.allocator);
     }
 
+    /// Outcome of `Registry.register`. `id` is the stable handle for the
+    /// binding (newly minted on a fresh insert, reused on overwrite).
+    /// `displaced` carries the prior action when overwriting so the
+    /// caller can release any resources it owned (chiefly the Lua
+    /// registry ref behind `.lua_callback`); it is null on fresh
+    /// inserts. Mirrors `CommandRegistry.registerLua`.
+    pub const RegisterResult = struct {
+        id: u32,
+        displaced: ?Action,
+    };
+
     /// Register (or overwrite) a binding. If a binding already exists
     /// for (mode, spec, buffer_id) its action is replaced so user config
     /// can remap defaults without duplicating entries. Scope is part of
     /// the identity: a global `j` and a buffer-local `j` coexist.
     ///
-    /// Returns the binding's stable id. Re-registering an existing
-    /// (mode, spec, buffer_id) overwrites the action in place and
-    /// returns the EXISTING id — not a fresh one. Callers that want a
-    /// guaranteed new id (so they can remove just their entry) must
-    /// either pick a unique key or pair register with `unregister`.
+    /// Returns the binding's stable id alongside the displaced `Action`
+    /// when an existing entry was overwritten. Callers that bind
+    /// `.lua_callback` payloads MUST inspect `displaced` and unref the
+    /// prior callback themselves; the registry never touches the Lua
+    /// VM. Re-registering an existing (mode, spec, buffer_id) reuses
+    /// the EXISTING id — not a fresh one.
     pub fn register(
         self: *Registry,
         mode: Mode,
         spec: KeySpec,
         buffer_id: ?u32,
         action: Action,
-    ) !u32 {
+    ) !RegisterResult {
         for (self.bindings.items) |*b| {
             if (b.mode == mode and b.spec.eql(spec) and scopeEq(b.buffer_id, buffer_id)) {
+                const displaced = b.action;
                 b.action = action;
-                return b.id;
+                return .{ .id = b.id, .displaced = displaced };
             }
         }
         const id = self.next_id;
@@ -276,7 +289,7 @@ pub const Registry = struct {
             self.allocator,
             .{ .id = id, .mode = mode, .spec = spec, .buffer_id = buffer_id, .action = action },
         );
-        return id;
+        return .{ .id = id, .displaced = null };
     }
 
     /// Remove a binding by id. Returns the removed `Action` so the
@@ -536,8 +549,8 @@ test "Registry register returns a stable id; unregister removes by id" {
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    const id1 = try r.register(.normal, try parseKeySpec("a"), null, .focus_left);
-    const id2 = try r.register(.normal, try parseKeySpec("b"), null, .focus_right);
+    const id1 = (try r.register(.normal, try parseKeySpec("a"), null, .focus_left)).id;
+    const id2 = (try r.register(.normal, try parseKeySpec("b"), null, .focus_right)).id;
     try std.testing.expect(id1 != id2);
 
     const removed = try r.unregister(id1);
@@ -551,7 +564,7 @@ test "Registry register returns a stable id; unregister removes by id" {
     try std.testing.expect(r.lookup(.normal, ev_b, null).? == .focus_right);
 
     // A subsequent register mints a fresh id (monotonic, not recycled).
-    const id3 = try r.register(.normal, try parseKeySpec("c"), null, .focus_up);
+    const id3 = (try r.register(.normal, try parseKeySpec("c"), null, .focus_up)).id;
     try std.testing.expect(id3 != id1);
     try std.testing.expect(id3 != id2);
 }
@@ -560,7 +573,7 @@ test "Registry unregister returns the lua_callback action so the caller can unre
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    const id = try r.register(.normal, try parseKeySpec("x"), null, .{ .lua_callback = 42 });
+    const id = (try r.register(.normal, try parseKeySpec("x"), null, .{ .lua_callback = 42 })).id;
     const removed = try r.unregister(id);
     try std.testing.expect(removed == .lua_callback);
     try std.testing.expectEqual(@as(i32, 42), removed.lua_callback);
@@ -578,10 +591,36 @@ test "Registry register overwrite returns the existing id" {
     defer r.deinit();
 
     const spec = try parseKeySpec("q");
-    const id1 = try r.register(.normal, spec, null, .close_window);
-    const id2 = try r.register(.normal, spec, null, .enter_insert_mode);
-    try std.testing.expectEqual(id1, id2);
+    const first = try r.register(.normal, spec, null, .close_window);
+    try std.testing.expectEqual(@as(?Action, null), first.displaced);
+    const second = try r.register(.normal, spec, null, .enter_insert_mode);
+    try std.testing.expectEqual(first.id, second.id);
     try std.testing.expectEqual(@as(usize, 1), r.bindings.items.len);
+}
+
+test "Registry register replacing a lua_callback returns the displaced action for unref" {
+    // Re-binding the same (mode, spec, buffer_id) overwrites in place.
+    // When the prior action was a `.lua_callback`, the registry must
+    // surface its ref back to the caller so the Lua engine can release
+    // it; otherwise the ref leaks until process teardown sweeps it up.
+    var r = Keymap.Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const spec = try parseKeySpec("<CR>");
+    const first = try r.register(.insert, spec, null, .{ .lua_callback = 100 });
+    try std.testing.expectEqual(@as(?Action, null), first.displaced);
+
+    const second = try r.register(.insert, spec, null, .{ .lua_callback = 200 });
+    try std.testing.expectEqual(first.id, second.id);
+    try std.testing.expect(second.displaced != null);
+    try std.testing.expect(second.displaced.? == .lua_callback);
+    try std.testing.expectEqual(@as(i32, 100), second.displaced.?.lua_callback);
+
+    // The live binding now points at the new ref.
+    const live = r.lookup(.insert, .{ .key = .enter, .modifiers = .{} }, null) orelse
+        return error.TestExpected;
+    try std.testing.expect(live == .lua_callback);
+    try std.testing.expectEqual(@as(i32, 200), live.lua_callback);
 }
 
 test "registry lookup skips Pass 1 entirely when focused_buffer_id is null" {

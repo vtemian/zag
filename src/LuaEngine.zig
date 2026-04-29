@@ -4699,8 +4699,12 @@ pub const LuaEngine = struct {
         };
 
         const engine = try keymapEnginePointer(lua);
-        const id = try engine.keymap_registry.register(mode, spec, null, action);
-        lua.pushInteger(@intCast(id));
+        const result = try engine.keymap_registry.register(mode, spec, null, action);
+        if (result.displaced) |prev| switch (prev) {
+            .lua_callback => |old_ref| lua.unref(zlua.registry_index, old_ref),
+            else => {},
+        };
+        lua.pushInteger(@intCast(result.id));
         return 1;
     }
 
@@ -4807,8 +4811,12 @@ pub const LuaEngine = struct {
                 return error.LuaError;
             };
             lua.pop(1);
-            const id = try engine.keymap_registry.register(mode, spec, buffer_id, action);
-            lua.pushInteger(@intCast(id));
+            const result = try engine.keymap_registry.register(mode, spec, buffer_id, action);
+            if (result.displaced) |prev| switch (prev) {
+                .lua_callback => |old_ref| lua.unref(zlua.registry_index, old_ref),
+                else => {},
+            };
+            lua.pushInteger(@intCast(result.id));
             return 1;
         }
 
@@ -4823,8 +4831,16 @@ pub const LuaEngine = struct {
         }
         const cb_ref = try lua.ref(zlua.registry_index);
         errdefer lua.unref(zlua.registry_index, cb_ref);
-        const id = try engine.keymap_registry.register(mode, spec, buffer_id, .{ .lua_callback = cb_ref });
-        lua.pushInteger(@intCast(id));
+        const result = try engine.keymap_registry.register(mode, spec, buffer_id, .{ .lua_callback = cb_ref });
+        // When overwriting an existing binding whose action was a Lua
+        // callback, the prior ref is now orphaned: unref it so the
+        // registry slot becomes eligible for collection. Built-in
+        // actions don't own anything that needs releasing.
+        if (result.displaced) |prev| switch (prev) {
+            .lua_callback => |old_ref| lua.unref(zlua.registry_index, old_ref),
+            else => {},
+        };
+        lua.pushInteger(@intCast(result.id));
         return 1;
     }
 
@@ -8885,6 +8901,69 @@ test "zag.keymap_remove unregisters a binding so the key no longer fires" {
         @as(?Keymap.Action, null),
         engine.keymapRegistry().lookup(.normal, ev, null),
     );
+}
+
+test "zag.keymap rebinding a fn binding unrefs the prior callback" {
+    // Reviewer-flagged leak: when the same (mode, spec, buffer_id) is
+    // registered twice with `fn = ...`, the FIRST `cb_ref` was never
+    // released. Process-lifetime cleanup in `deinit` swept survivors,
+    // but a long-running session that rebinds keys (config reload,
+    // plugin re-init) accumulated dead refs until exit. The fix
+    // surfaces the displaced action through `Registry.RegisterResult`
+    // so this wrapper can unref the prior callback inline.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Bind once: the table form stashes `fn1` in the Lua registry as
+    // `cb_ref_1` and stores it in a `.lua_callback` action.
+    try engine.lua.doString(
+        \\zag.keymap {
+        \\  mode = "normal",
+        \\  key = "<C-x>",
+        \\  fn = function() _G.who = "fn1" end,
+        \\}
+    );
+
+    const ev: input.KeyEvent = .{ .key = .{ .char = 'x' }, .modifiers = .{ .ctrl = true } };
+    const first_hit = engine.keymapRegistry().lookup(.normal, ev, null) orelse
+        return error.TestExpectedKeymap;
+    try std.testing.expect(first_hit == .lua_callback);
+    const ref_one = first_hit.lua_callback;
+
+    // Re-bind: previously the old `cb_ref_1` was orphaned because
+    // `Registry.register` swallowed the displaced action; now the
+    // Lua-side wrapper consumes `RegisterResult.displaced` and unrefs
+    // it before the new id is returned.
+    try engine.lua.doString(
+        \\zag.keymap {
+        \\  mode = "normal",
+        \\  key = "<C-x>",
+        \\  fn = function() _G.who = "fn2" end,
+        \\}
+    );
+
+    const second_hit = engine.keymapRegistry().lookup(.normal, ev, null) orelse
+        return error.TestExpectedKeymap;
+    try std.testing.expect(second_hit == .lua_callback);
+    // Overwrite path: same id, fresh callback ref.
+    try std.testing.expect(second_hit.lua_callback != ref_one);
+
+    // Direct proof the old ref is gone: unref'd slots are recycled by
+    // the Lua registry's freelist, so `rawGetIndex(registry, ref_one)`
+    // no longer pushes a function. Before the fix it would still hold
+    // `fn1`. After the fix it pushes nil or a freelist link integer.
+    _ = engine.lua.rawGetIndex(zlua.registry_index, ref_one);
+    try std.testing.expect(!engine.lua.isFunction(-1));
+    engine.lua.pop(1);
+
+    // Sanity check: invoking the live binding fires the NEW function.
+    engine.invokeCallback(second_hit.lua_callback);
+    _ = try engine.lua.getGlobal("who");
+    const who = try engine.lua.toString(-1);
+    try std.testing.expectEqualStrings("fn2", who);
+    engine.lua.pop(1);
 }
 
 test "zag.keymap_remove on an unknown id raises a Lua error" {
