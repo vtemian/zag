@@ -2142,7 +2142,6 @@ fn autoNameSession(self: *WindowManager, pane: Pane) void {
     _ = self;
     const session = pane.session orelse return;
     const sh = session.session_handle orelse return;
-    if (sh.meta.name_len > 0) return;
 
     const inputs = session.sessionSummaryInputs() orelse return;
 
@@ -2150,7 +2149,11 @@ fn autoNameSession(self: *WindowManager, pane: Pane) void {
     const name = deriveSessionName(&name_buf, inputs.user_text);
     if (name.len == 0) return;
 
-    sh.rename(name) catch |err| {
+    // renameIfUnnamed atomically checks meta.name_len under the
+    // append_mutex and bails if a concurrent rename already set a
+    // name. Closes the TOCTOU window the previous read-then-rename
+    // pattern left open.
+    _ = sh.renameIfUnnamed(name) catch |err| {
         log.warn("session rename failed: {}", .{err});
     };
 }

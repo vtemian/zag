@@ -531,6 +531,34 @@ pub const SessionHandle = struct {
         }) catch |err| log.warn("session_rename audit entry failed: {s}", .{@errorName(err)});
     }
 
+    /// Rename the session iff it has no name yet. Returns `true` when
+    /// the rename landed, `false` when the meta already had a name and
+    /// the call was a no-op. Closes the TOCTOU window between
+    /// `meta.name_len` checks and `rename()` calls. Used by
+    /// WindowManager.autoNameSession to avoid clobbering a manual
+    /// /rename that lands between the heuristic and the persist.
+    pub fn renameIfUnnamed(self: *SessionHandle, new_name: []const u8) !bool {
+        self.append_mutex.lock();
+        defer self.append_mutex.unlock();
+
+        if (self.meta.name_len > 0) return false;
+
+        const name_len: u8 = @intCast(@min(new_name.len, self.meta.name.len));
+        @memcpy(self.meta.name[0..name_len], new_name[0..name_len]);
+        self.meta.name_len = name_len;
+        self.meta.updated = std.time.milliTimestamp();
+
+        try self.updateMeta();
+
+        _ = self.appendEntryLocked(.{
+            .entry_type = .session_rename,
+            .content = new_name,
+            .timestamp = self.meta.updated,
+        }) catch |err| log.warn("session_rename audit entry failed: {s}", .{@errorName(err)});
+
+        return true;
+    }
+
     /// Close the JSONL file handle. Performs a final fsync to durably
     /// persist any streaming-delta entries (assistant_text, thinking)
     /// that were appended since the last non-delta barrier. The error
@@ -1666,6 +1694,37 @@ test "appendEntry does not fsync per streaming-delta entry; non-delta entries do
     });
     try std.testing.expectEqual(baseline_fsyncs + 1, handle.fsync_count);
     try std.testing.expectEqual(baseline_meta_writes + 1, handle.meta_write_count);
+}
+
+test "renameIfUnnamed only renames when meta has no name yet" {
+    // Regression: WindowManager.autoNameSession used to read meta.name_len
+    // outside append_mutex and then call rename, leaving a TOCTOU window
+    // where a concurrent /rename or plugin write could be silently
+    // overwritten by the auto-name heuristic. renameIfUnnamed takes the
+    // mutex once and bails atomically if the slot is taken.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    // Empty session, no name yet: first call wins.
+    const first_applied = try handle.renameIfUnnamed("first turn");
+    try std.testing.expect(first_applied);
+    try std.testing.expectEqualStrings("first turn", handle.meta.name[0..handle.meta.name_len]);
+
+    // Second call must NOT clobber the existing name.
+    const second_applied = try handle.renameIfUnnamed("auto-derived");
+    try std.testing.expect(!second_applied);
+    try std.testing.expectEqualStrings("first turn", handle.meta.name[0..handle.meta.name_len]);
 }
 
 test "appendEntry persists tool_result content larger than 8 KiB" {
