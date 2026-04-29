@@ -543,6 +543,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "hook_del");
         lua.pushFunction(zlua.wrap(zagKeymapFn));
         lua.setField(-2, "keymap");
+        lua.pushFunction(zlua.wrap(zagKeymapRemoveFn));
+        lua.setField(-2, "keymap_remove");
         lua.pushFunction(zlua.wrap(zagCommandFn));
         lua.setField(-2, "command");
         lua.pushFunction(zlua.wrap(zagSetEscapeTimeoutMsFn));
@@ -4697,8 +4699,9 @@ pub const LuaEngine = struct {
         };
 
         const engine = try keymapEnginePointer(lua);
-        try engine.keymap_registry.register(mode, spec, null, action);
-        return 0;
+        const id = try engine.keymap_registry.register(mode, spec, null, action);
+        lua.pushInteger(@intCast(id));
+        return 1;
     }
 
     fn zagKeymapTableFormInner(lua: *Lua) !i32 {
@@ -4804,8 +4807,9 @@ pub const LuaEngine = struct {
                 return error.LuaError;
             };
             lua.pop(1);
-            try engine.keymap_registry.register(mode, spec, buffer_id, action);
-            return 0;
+            const id = try engine.keymap_registry.register(mode, spec, buffer_id, action);
+            lua.pushInteger(@intCast(id));
+            return 1;
         }
 
         // fn form: stash the Lua function in the registry and store the
@@ -4819,7 +4823,45 @@ pub const LuaEngine = struct {
         }
         const cb_ref = try lua.ref(zlua.registry_index);
         errdefer lua.unref(zlua.registry_index, cb_ref);
-        try engine.keymap_registry.register(mode, spec, buffer_id, .{ .lua_callback = cb_ref });
+        const id = try engine.keymap_registry.register(mode, spec, buffer_id, .{ .lua_callback = cb_ref });
+        lua.pushInteger(@intCast(id));
+        return 1;
+    }
+
+    /// Zig function backing `zag.keymap_remove(id)`.
+    /// Removes the binding minted by a prior `zag.keymap{...}` call and
+    /// unrefs its `.lua_callback` ref (if any) so the registered Lua
+    /// function becomes eligible for collection. Mirrors `zag.hook_del`.
+    /// Raises a Lua error if `id` is not a positive integer or names no
+    /// live binding.
+    fn zagKeymapRemoveFn(lua: *Lua) !i32 {
+        return zagKeymapRemoveFnInner(lua) catch |err| {
+            log.warn("zag.keymap_remove() failed: {}", .{err});
+            return err;
+        };
+    }
+
+    fn zagKeymapRemoveFnInner(lua: *Lua) !i32 {
+        const raw = lua.toInteger(1) catch {
+            log.warn("zag.keymap_remove(): first argument must be a keymap id integer", .{});
+            return error.LuaError;
+        };
+        if (raw <= 0) {
+            log.warn("zag.keymap_remove(): id must be positive, got {d}", .{raw});
+            return error.LuaError;
+        }
+        const id: u32 = @intCast(raw);
+        const engine = try keymapEnginePointer(lua);
+        const removed = engine.keymap_registry.unregister(id) catch |err| switch (err) {
+            error.NotFound => {
+                log.warn("zag.keymap_remove(): no keymap binding with id {d}", .{id});
+                return error.LuaError;
+            },
+        };
+        switch (removed) {
+            .lua_callback => |ref| engine.lua.unref(zlua.registry_index, ref),
+            else => {},
+        }
         return 0;
     }
 
@@ -8782,6 +8824,91 @@ test "zag.keymap table form with buffer scope only fires for that buffer" {
             buffer_id +% 1,
         ) == null,
     );
+}
+
+test "zag.keymap returns an integer id" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.id_pos = zag.keymap("normal", "w", "focus_right")
+        \\_G.id_tbl = zag.keymap { mode = "normal", key = "<C-q>", action = "close_window" }
+        \\_G.id_fn  = zag.keymap { mode = "normal", key = "<CR>", fn = function() end }
+    );
+
+    _ = try engine.lua.getGlobal("id_pos");
+    const id_pos = try engine.lua.toInteger(-1);
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("id_tbl");
+    const id_tbl = try engine.lua.toInteger(-1);
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("id_fn");
+    const id_fn = try engine.lua.toInteger(-1);
+    engine.lua.pop(1);
+
+    try std.testing.expect(id_pos > 0);
+    try std.testing.expect(id_tbl > id_pos);
+    try std.testing.expect(id_fn > id_tbl);
+}
+
+test "zag.keymap_remove unregisters a binding so the key no longer fires" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\_G.fired = 0
+        \\_G.id = zag.keymap {
+        \\  mode = "normal",
+        \\  key = "<F5>",
+        \\  fn = function() _G.fired = _G.fired + 1 end,
+        \\}
+    );
+
+    const ev: input.KeyEvent = .{ .key = .{ .function = 5 }, .modifiers = .{} };
+    const hit = engine.keymapRegistry().lookup(.normal, ev, null) orelse
+        return error.TestExpectedKeymap;
+    engine.invokeCallback(hit.lua_callback);
+
+    _ = try engine.lua.getGlobal("fired");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    try engine.lua.doString("zag.keymap_remove(_G.id)");
+
+    // Lookup returns null after removal. The orchestrator routes through
+    // `lookup` on every key, so a null hit means the binding is dead.
+    try std.testing.expectEqual(
+        @as(?Keymap.Action, null),
+        engine.keymapRegistry().lookup(.normal, ev, null),
+    );
+}
+
+test "zag.keymap_remove on an unknown id raises a Lua error" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString("zag.keymap_remove(99999)");
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "zag.keymap_remove on a non-positive id raises a Lua error" {
+    std.testing.log_level = .err;
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const result = engine.lua.doString("zag.keymap_remove(0)");
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
 }
 
 test "zag.keymap table form rejects both fn and action" {
