@@ -5403,16 +5403,34 @@ pub const LuaEngine = struct {
             _ = try requireOneOf(s, &[_][]const u8{ "low", "medium", "high" }, "verbosity");
         }
 
-        // Promote unset fields to a heap copy of the static default so the
-        // caller's `Endpoint.free` can blindly free all three slots.
         const defaults: llm.Endpoint.ReasoningConfig = .{};
         const effort = effort_in orelse try allocator.dupe(u8, defaults.effort);
         errdefer if (effort_in == null) allocator.free(effort);
         const summary = summary_in orelse try allocator.dupe(u8, defaults.summary);
         errdefer if (summary_in == null) allocator.free(summary);
         const verbosity = verbosity_in orelse try allocator.dupe(u8, defaults.verbosity);
+        errdefer if (verbosity_in == null) allocator.free(verbosity);
 
-        return .{ .effort = effort, .summary = summary, .verbosity = verbosity };
+        // Chat-completions reasoning round-trip. Both fields default to
+        // unset (no response scrape, no echo) so existing endpoints
+        // are byte-for-byte unchanged. Order matches the static
+        // `defaults` field declaration in `Endpoint.ReasoningConfig`.
+        const response_fields = try readStringArray(lua, table_idx, "reasoning_response_fields", allocator);
+        errdefer {
+            for (response_fields) |s| allocator.free(s);
+            allocator.free(response_fields);
+        }
+
+        const echo_field = try readStringField(lua, table_idx, "reasoning_echo_field", .optional, allocator);
+        errdefer if (echo_field) |s| allocator.free(s);
+
+        return .{
+            .effort = effort,
+            .summary = summary,
+            .verbosity = verbosity,
+            .response_fields = response_fields,
+            .echo_field = echo_field,
+        };
     }
 
     /// Read a nullable float. Nil/absent → `null`. Number → that value.
@@ -9397,6 +9415,53 @@ test "zag.provider{}: invalid verbosity surfaces LuaRuntime" {
             \\}
         ),
     );
+}
+
+test "zag.provider reads reasoning_response_fields and reasoning_echo_field" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider({
+        \\  name = "moonshot",
+        \\  url = "https://api.moonshot.ai/v1/chat/completions",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "kimi-k2.6",
+        \\  models = {{ id = "kimi-k2.6" }},
+        \\  reasoning_response_fields = { "reasoning_content", "reasoning" },
+        \\  reasoning_echo_field = "reasoning_content",
+        \\})
+    );
+
+    const ep = engine.providers_registry.find("moonshot") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), ep.reasoning.response_fields.len);
+    try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.response_fields[0]);
+    try std.testing.expectEqualStrings("reasoning", ep.reasoning.response_fields[1]);
+    try std.testing.expect(ep.reasoning.echo_field != null);
+    try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.echo_field.?);
+}
+
+test "zag.provider defaults reasoning_response_fields to empty and echo_field to null" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider({
+        \\  name = "openai-default",
+        \\  url = "https://api.openai.com/v1/chat/completions",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "gpt-4o",
+        \\  models = {{ id = "gpt-4o" }},
+        \\})
+    );
+
+    const ep = engine.providers_registry.find("openai-default") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), ep.reasoning.response_fields.len);
+    try std.testing.expect(ep.reasoning.echo_field == null);
 }
 
 test "readStringArray parses Lua array of strings" {
