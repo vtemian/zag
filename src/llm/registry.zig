@@ -131,6 +131,22 @@ pub const Endpoint = struct {
         /// Output verbosity tier passed in `text.verbosity`. Codex
         /// accepts `low`, `medium`, `high`.
         verbosity: []const u8 = "medium",
+
+        /// Field names where chat-completions providers ship reasoning
+        /// text on non-streaming response messages and on streaming
+        /// deltas. Walked in declaration order; the first non-empty
+        /// match wins. Empty slice (default) means the chat-completions
+        /// serializer keeps its historical behaviour of dropping
+        /// thinking blocks. Examples: Moonshot/Kimi → `{"reasoning_content"}`;
+        /// llama.cpp / gpt-oss accept `"reasoning"` or `"reasoning_text"`.
+        response_fields: []const []const u8 = &.{},
+
+        /// Sibling field on outgoing assistant messages where the
+        /// chat-completions serializer writes back the concatenated
+        /// thinking text. `null` means do not echo. Mirrors pi-mono's
+        /// thinkingSignature trick: a provider that READ from
+        /// `reasoning_content` echoes back to `reasoning_content`.
+        echo_field: ?[]const u8 = null,
     };
 
     /// Per-model rate card: context limits and dollar cost per million tokens.
