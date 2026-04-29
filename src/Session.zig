@@ -496,6 +496,9 @@ pub const SessionHandle = struct {
             else => false,
         };
         if (!is_streaming_delta) {
+            // On macOS APFS, std.fs.File.sync() routes to F_FULLFSYNC, which is
+            // the strict barrier covering all dirty pages for the fd. A stdlib
+            // regression to plain fsync(2) would weaken power-loss semantics.
             try self.file.sync();
             self.fsync_count += 1;
             self.updateMeta() catch |e| {
@@ -569,6 +572,8 @@ pub const SessionHandle = struct {
     /// that were appended since the last non-delta barrier. The error
     /// is logged rather than propagated because the caller is shutting
     /// the session down anyway and has no recovery path.
+    /// Bypass paths (panic, SIGINT, OOM during deinit) skip this barrier;
+    /// the trade-off documented in commit 2c3feb8 still applies.
     pub fn close(self: *SessionHandle) void {
         self.file.sync() catch |e| {
             log.warn("session close: final fsync failed: {}", .{e});
@@ -743,10 +748,11 @@ fn generateId(buf: *[32]u8) u8 {
     return 32;
 }
 
-/// Serialize an Entry to a JSON line in a stack buffer. Takes a pointer
-/// because the serializer fabricates a fresh ULID into `entry.id` when
-/// the caller left it as the zero sentinel, so the caller can read the
-/// generated id back after the call returns.
+/// Serialize an Entry into a caller-provided ArrayList grown via the
+/// supplied allocator. Takes a pointer because the serializer fabricates
+/// a fresh ULID into `entry.id` when the caller left it as the zero
+/// sentinel, so the caller can read the generated id back after the call
+/// returns.
 fn serializeEntry(entry: *Entry, out: *std.ArrayList(u8), allocator: Allocator) !void {
     if (isZeroUlid(entry.id)) {
         entry.id = ulid.generate(std.crypto.random);
