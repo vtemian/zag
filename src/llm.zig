@@ -17,6 +17,8 @@ pub const Trajectory = @import("Trajectory.zig");
 pub const streaming = @import("llm/streaming.zig");
 pub const http = @import("llm/http.zig");
 pub const error_detail = @import("llm/error_detail.zig");
+pub const error_class = @import("llm/error_class.zig");
+pub const telemetry = @import("llm/telemetry.zig");
 const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
@@ -229,6 +231,12 @@ pub const StreamRequest = struct {
     cancel: *std.atomic.Value(bool),
     /// Optional extended-thinking override. See `Request.thinking`.
     thinking: ?ThinkingConfig = null,
+    /// Optional per-turn observability handle. When non-null, providers
+    /// pass it through to `streaming.create` so the telemetry hooks fire
+    /// for status capture, error artifacts, and timeline emission. Owned
+    /// by the agent loop (one `Telemetry` per while-loop iteration);
+    /// providers and `streaming.create` only borrow.
+    telemetry: ?*telemetry.Telemetry = null,
 
     /// Join the stable and volatile halves. See `Request.joinedSystem`.
     pub fn joinedSystem(self: *const StreamRequest, allocator: Allocator) ![]u8 {
