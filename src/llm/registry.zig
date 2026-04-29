@@ -243,6 +243,15 @@ pub const Endpoint = struct {
         const reasoning_verbosity = try allocator.dupe(u8, self.reasoning.verbosity);
         errdefer allocator.free(reasoning_verbosity);
 
+        const reasoning_response_fields = try dupeStringSlice(self.reasoning.response_fields, allocator);
+        errdefer freeStringSlice(reasoning_response_fields, allocator);
+
+        const reasoning_echo_field: ?[]const u8 = if (self.reasoning.echo_field) |s|
+            try allocator.dupe(u8, s)
+        else
+            null;
+        errdefer if (reasoning_echo_field) |s| allocator.free(s);
+
         return .{
             .name = name,
             .serializer = self.serializer,
@@ -255,6 +264,8 @@ pub const Endpoint = struct {
                 .effort = reasoning_effort,
                 .summary = reasoning_summary,
                 .verbosity = reasoning_verbosity,
+                .response_fields = reasoning_response_fields,
+                .echo_field = reasoning_echo_field,
             },
         };
     }
@@ -264,6 +275,8 @@ pub const Endpoint = struct {
         allocator.free(self.reasoning.effort);
         allocator.free(self.reasoning.summary);
         allocator.free(self.reasoning.verbosity);
+        freeStringSlice(self.reasoning.response_fields, allocator);
+        if (self.reasoning.echo_field) |s| allocator.free(s);
         switch (self.auth) {
             .oauth => |spec| freeOAuthSpec(spec, allocator),
             else => {},
@@ -831,6 +844,39 @@ test "dupeStringSlice + freeStringSlice round-trip independent copy" {
         // Independent storage: pointers must differ.
         try std.testing.expect(o.ptr != d.ptr);
     }
+}
+
+test "Endpoint.dupe round-trips response_fields and echo_field" {
+    const allocator = std.testing.allocator;
+
+    const fields = [_][]const u8{ "reasoning_content", "reasoning" };
+    const original = Endpoint{
+        .name = "moonshot",
+        .serializer = .openai,
+        .url = "https://api.moonshot.ai/v1/chat/completions",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "kimi-k2.6",
+        .models = &.{},
+        .reasoning = .{
+            .effort = "medium",
+            .summary = "auto",
+            .verbosity = "medium",
+            .response_fields = &fields,
+            .echo_field = "reasoning_content",
+        },
+    };
+
+    const copy = try original.dupe(allocator);
+    defer copy.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), copy.reasoning.response_fields.len);
+    try std.testing.expectEqualStrings("reasoning_content", copy.reasoning.response_fields[0]);
+    try std.testing.expectEqualStrings("reasoning", copy.reasoning.response_fields[1]);
+    try std.testing.expect(copy.reasoning.echo_field != null);
+    try std.testing.expectEqualStrings("reasoning_content", copy.reasoning.echo_field.?);
+    // Independent storage: pointers must differ.
+    try std.testing.expect(copy.reasoning.response_fields.ptr != original.reasoning.response_fields.ptr);
 }
 
 test {
