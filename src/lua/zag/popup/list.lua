@@ -48,13 +48,29 @@
 --                              -- Defaults to "".
 --       keys,                  -- optional override of the default
 --                              -- key bindings (see DEFAULT_KEYS).
---       max_height,            -- popup max rows (default 10).
+--
+--       -- Placement opts (all optional; defaults reproduce the
+--       -- cursor-anchored autocomplete UX). Forwarded straight to
+--       -- `zag.layout.float`.
+--       relative,              -- "cursor" | "editor" | "win"
+--                              -- (default "cursor").
+--       row,                   -- integer offset (default 1).
+--       col,                   -- integer offset (default 0).
+--       corner,                -- "NW" | "NE" | "SW" | "SE"
+--                              -- (default "NW").
+--       min_width,             -- popup min columns (default 10).
 --       max_width,             -- popup max columns (default 50).
+--       min_height,            -- popup min rows (default 1).
+--       max_height,            -- popup max rows (default 10).
 --       border,                -- "rounded" | "square" | "none"
 --                              -- (default "rounded").
+--       title,                 -- optional border title string.
 --   })
 --
 --   popup.close(handle)
+--   popup.is_closed(handle)
+--   popup.invoke_key(handle, key)
+--   popup.format_columns(items, widths?)
 --
 -- Default key bindings mirror Vim's popupmenu-keys:
 --
@@ -117,6 +133,30 @@ local function contains(haystack, needle)
     return false
 end
 
+-- Cell-width measurement. Prefer the host-provided primitive
+-- (`zag.width.cells`), which walks grapheme clusters and respects East
+-- Asian Width / emoji rules. Tests run this module against a Lua VM
+-- without the host bindings, so fall back to `#str` (byte length) when
+-- the primitive is missing - good enough for ASCII content, which is
+-- the only case the pure-Lua test fixtures exercise.
+local function cells(str)
+    if zag and zag.width and zag.width.cells then
+        return zag.width.cells(str)
+    end
+    return #str
+end
+
+-- Right-pad `str` with spaces to `target` cells. `string.format("%-Ns", str)`
+-- pads to BYTES, which under-pads any string containing wide clusters
+-- (CJK / emoji). We measure cells, then append the diff in spaces.
+local function pad_cells(str, target)
+    local w = cells(str)
+    if w >= target then
+        return str
+    end
+    return str .. string.rep(" ", target - w)
+end
+
 -- Format a single item into a display string. Falls back to item.word
 -- when abbr/kind/menu are absent.
 local function default_format_item(item, widths)
@@ -124,25 +164,26 @@ local function default_format_item(item, widths)
     local kind = item.kind or ""
     local menu = item.menu or ""
     if widths then
-        return string.format(
-            "%-" .. widths.abbr .. "s  %-" .. widths.kind .. "s  %s",
-            abbr,
-            kind,
-            menu
-        )
+        return pad_cells(abbr, widths.abbr)
+            .. "  "
+            .. pad_cells(kind, widths.kind)
+            .. "  "
+            .. menu
     end
     if kind == "" and menu == "" then
         return abbr
     end
-    return string.format("%s  %s  %s", abbr, kind, menu)
+    return abbr .. "  " .. kind .. "  " .. menu
 end
 
--- Compute reasonable column widths from a list of items.
+-- Compute reasonable column widths from a list of items. Widths are in
+-- terminal cells, not bytes, so a CJK-heavy completion list aligns
+-- correctly when rendered.
 local function compute_widths(items)
     local w = { abbr = 1, kind = 1 }
     for _, item in ipairs(items) do
-        local a = #(item.abbr or item.word or "")
-        local k = #(item.kind or "")
+        local a = cells(item.abbr or item.word or "")
+        local k = cells(item.kind or "")
         if a > w.abbr then
             w.abbr = a
         end
@@ -391,18 +432,22 @@ function M.open(opts)
     render(state)
 
     local float_opts = {
-        relative = "cursor",
-        row = 1,
-        col = 0,
-        min_width = 10,
+        relative = opts.relative or "cursor",
+        row = opts.row or 1,
+        col = opts.col or 0,
+        corner = opts.corner or "NW",
+        min_width = opts.min_width or 10,
         max_width = opts.max_width or 50,
-        min_height = 1,
+        min_height = opts.min_height or 1,
         max_height = opts.max_height or 10,
         border = opts.border or "rounded",
         focusable = false,
         enter = false,
         on_key = build_on_key(state),
     }
+    if opts.title then
+        float_opts.title = opts.title
+    end
     state.float_handle = zag.layout.float(buf, float_opts)
 
     state.draft_hook_id = zag.hook(
@@ -452,6 +497,15 @@ function M._state(handle)
         return nil
     end
     return handle._state
+end
+
+-- Public: returns true if the popup has been torn down (via commit,
+-- cancel, or popup.close), false otherwise. Stable surface for plugins
+-- that synthesize keys via popup.invoke_key and need to detect when
+-- the popup self-closed (e.g. <CR> commit, <Esc> cancel).
+function M.is_closed(handle)
+    local state = M._state(handle)
+    return state == nil or state.closed == true
 end
 
 return M

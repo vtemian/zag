@@ -671,7 +671,10 @@ pub fn processSseEvent(
                         try current.thinking.text.appendSlice(allocator, text);
                     }
                 }
-                callback.on_event(callback.ctx, .{ .thinking_delta = .{ .text = text } });
+                callback.on_event(callback.ctx, .{ .thinking_delta = .{
+                    .text = text,
+                    .provider = .anthropic,
+                } });
             } else if (std.mem.eql(u8, delta_type, "signature_delta")) {
                 // Anthropic emits a single `signature_delta` per thinking
                 // block as a full replacement, not an append. Drop any

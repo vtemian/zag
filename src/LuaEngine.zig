@@ -27,6 +27,7 @@ const Instruction = @import("Instruction.zig");
 const Reminder = @import("Reminder.zig");
 const WindowManager = @import("WindowManager.zig");
 const agent_events = @import("agent_events.zig");
+const width = @import("width.zig");
 const Allocator = std.mem.Allocator;
 const Lua = zlua.Lua;
 const log = std.log.scoped(.lua);
@@ -656,6 +657,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "current_model");
         lua.pushFunction(zlua.wrap(zagPaneSetDraftFn));
         lua.setField(-2, "set_draft");
+        lua.pushFunction(zlua.wrap(zagPaneGetDraftFn));
+        lua.setField(-2, "get_draft");
         lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
         lua.setField(-2, "replace_draft_range");
         lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
@@ -790,6 +793,15 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
         lua.setField(-2, "strategy");
         lua.setField(-2, "compact"); // zag.compact = compact_table; [zag_table]
+
+        // zag.width; grapheme-aware terminal-cell width measurement. Plugins
+        // doing column alignment (e.g. popup-completion menus with mixed
+        // ASCII/CJK/emoji content) must call `cells(s)` instead of `#s` so
+        // wide and zero-width clusters don't skew the layout.
+        lua.newTable(); // [zag_table, width_table]
+        lua.pushFunction(zlua.wrap(zagWidthCellsFn));
+        lua.setField(-2, "cells");
+        lua.setField(-2, "width"); // zag.width = width_table; [zag_table]
 
         lua.setGlobal("zag");
     }
@@ -2536,6 +2548,20 @@ pub const LuaEngine = struct {
     ///
     /// Raises a Lua error on unterminated frontmatter or allocator
     /// failure; both are caller-fixable and should surface loudly.
+    /// `zag.width.cells(s)`: return the terminal-cell display width of
+    /// `s`, with grapheme-cluster awareness (CJK is 2, emoji is 2, ZWJ
+    /// sequences and combining marks are absorbed). Falls back to byte
+    /// length for invalid UTF-8 — the iterator runs over `Utf8View.initUnchecked`,
+    /// so callers passing arbitrary bytes get a "best effort" width
+    /// rather than a Lua error. Lua plugins use this in place of `#s`
+    /// when laying out columns over user-supplied content.
+    fn zagWidthCellsFn(lua: *Lua) i32 {
+        const text = lua.checkString(1);
+        const cells = width.displayWidth(text);
+        lua.pushInteger(@intCast(cells));
+        return 1;
+    }
+
     fn zagParseFrontmatterFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         const src = lua.checkString(1);
@@ -3504,6 +3530,26 @@ pub const LuaEngine = struct {
         };
         pane.setDraft(text);
         return 0;
+    }
+
+    /// `zag.pane.get_draft(pane_id)`: return the current in-progress draft of
+    /// `pane_id` as a Lua string. Returns `""` for a pane that has never been
+    /// typed into. Pairs with `zag.pane.set_draft` so autocomplete plugins
+    /// can read the live draft without the orchestrator having to thread it
+    /// through as an explicit argument.
+    fn zagPaneGetDraftFn(lua: *Lua) i32 {
+        const engine = getEngineFromState(lua);
+        const wm = engine.window_manager orelse {
+            lua.raiseErrorStr("zag.pane.get_draft: no window manager bound", .{});
+        };
+        const handle = requireLayoutHandle(lua, 1, "zag.pane.get_draft");
+        const pane = wm.paneFromHandle(handle) catch |err| {
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.pane.get_draft: {s}", .{@errorName(err)}) catch "zag.pane.get_draft failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        _ = lua.pushString(pane.getDraft());
+        return 1;
     }
 
     /// `zag.pane.replace_draft_range(pane_id, from_byte, to_byte, replacement)`:
@@ -4891,6 +4937,54 @@ pub const LuaEngine = struct {
         return try allocator.dupe(u8, borrowed);
     }
 
+    /// Read a Lua array-of-strings field at `name`. Absent or nil →
+    /// empty slice. Each string is duped onto `allocator`. Caller owns
+    /// the outer slice and each inner string. Errors when the field is
+    /// present but not an array, or when any entry is not a string.
+    /// Mirrors `readHeaderList`'s array branch but for a flat list.
+    fn readStringArray(
+        lua: *Lua,
+        table_idx: i32,
+        name: [:0]const u8,
+        allocator: Allocator,
+    ) ![][]const u8 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) return try allocator.alloc([]const u8, 0);
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider(): field '{s}' must be an array of strings", .{name});
+            return error.LuaError;
+        }
+
+        const inner = lua.absIndex(-1);
+
+        var items: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (items.items) |s| allocator.free(s);
+            items.deinit(allocator);
+        }
+
+        const len = lua.rawLen(inner);
+        for (0..len) |i| {
+            _ = lua.rawGetIndex(inner, @intCast(i + 1));
+            defer lua.pop(1);
+            if (lua.typeOf(-1) != .string) {
+                log.warn("zag.provider(): field '{s}' entry {d} must be a string", .{ name, i + 1 });
+                return error.LuaError;
+            }
+            const borrowed = lua.toString(-1) catch {
+                log.warn("zag.provider(): field '{s}' entry {d} could not be read", .{ name, i + 1 });
+                return error.LuaError;
+            };
+            const owned = try allocator.dupe(u8, borrowed);
+            errdefer allocator.free(owned);
+            try items.append(allocator, owned);
+        }
+
+        return try items.toOwnedSlice(allocator);
+    }
+
     /// Read a headers field from the Lua table at `table_idx`. Accepts two
     /// shapes:
     ///   (a) Array of pairs:   { { name = "x", value = "1" }, { name = "y", value = "2" } }
@@ -5309,16 +5403,34 @@ pub const LuaEngine = struct {
             _ = try requireOneOf(s, &[_][]const u8{ "low", "medium", "high" }, "verbosity");
         }
 
-        // Promote unset fields to a heap copy of the static default so the
-        // caller's `Endpoint.free` can blindly free all three slots.
         const defaults: llm.Endpoint.ReasoningConfig = .{};
         const effort = effort_in orelse try allocator.dupe(u8, defaults.effort);
         errdefer if (effort_in == null) allocator.free(effort);
         const summary = summary_in orelse try allocator.dupe(u8, defaults.summary);
         errdefer if (summary_in == null) allocator.free(summary);
         const verbosity = verbosity_in orelse try allocator.dupe(u8, defaults.verbosity);
+        errdefer if (verbosity_in == null) allocator.free(verbosity);
 
-        return .{ .effort = effort, .summary = summary, .verbosity = verbosity };
+        // Chat-completions reasoning round-trip. Both fields default to
+        // unset (no response scrape, no echo) so existing endpoints
+        // are byte-for-byte unchanged. Order matches the static
+        // `defaults` field declaration in `Endpoint.ReasoningConfig`.
+        const response_fields = try readStringArray(lua, table_idx, "reasoning_response_fields", allocator);
+        errdefer {
+            for (response_fields) |s| allocator.free(s);
+            allocator.free(response_fields);
+        }
+
+        const echo_field = try readStringField(lua, table_idx, "reasoning_echo_field", .optional, allocator);
+        errdefer if (echo_field) |s| allocator.free(s);
+
+        return .{
+            .effort = effort,
+            .summary = summary,
+            .verbosity = verbosity,
+            .response_fields = response_fields,
+            .echo_field = echo_field,
+        };
     }
 
     /// Read a nullable float. Nil/absent → `null`. Number → that value.
@@ -9303,6 +9415,118 @@ test "zag.provider{}: invalid verbosity surfaces LuaRuntime" {
             \\}
         ),
     );
+}
+
+test "zag.provider reads reasoning_response_fields and reasoning_echo_field" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider({
+        \\  name = "moonshot",
+        \\  url = "https://api.moonshot.ai/v1/chat/completions",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "kimi-k2.6",
+        \\  models = {{ id = "kimi-k2.6" }},
+        \\  reasoning_response_fields = { "reasoning_content", "reasoning" },
+        \\  reasoning_echo_field = "reasoning_content",
+        \\})
+    );
+
+    const ep = engine.providers_registry.find("moonshot") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), ep.reasoning.response_fields.len);
+    try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.response_fields[0]);
+    try std.testing.expectEqualStrings("reasoning", ep.reasoning.response_fields[1]);
+    try std.testing.expect(ep.reasoning.echo_field != null);
+    try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.echo_field.?);
+}
+
+test "zag.provider defaults reasoning_response_fields to empty and echo_field to null" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider({
+        \\  name = "openai-default",
+        \\  url = "https://api.openai.com/v1/chat/completions",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "gpt-4o",
+        \\  models = {{ id = "gpt-4o" }},
+        \\})
+    );
+
+    const ep = engine.providers_registry.find("openai-default") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), ep.reasoning.response_fields.len);
+    try std.testing.expect(ep.reasoning.echo_field == null);
+}
+
+test "readStringArray parses Lua array of strings" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString(
+        \\return { "reasoning_content", "reasoning", "reasoning_text" }
+    );
+    const top = engine.lua.absIndex(-1);
+    defer engine.lua.pop(1);
+
+    // Read into a fake outer table by faking the outer field with a
+    // direct call into the helper. The helper expects a table_idx
+    // pointing at the OUTER table that contains a field of name `name`,
+    // so wrap once: outer = { fields = {...} }.
+    try engine.lua.doString(
+        \\return { fields = { "reasoning_content", "reasoning", "reasoning_text" } }
+    );
+    defer engine.lua.pop(1);
+    const outer = engine.lua.absIndex(-1);
+
+    const result = try LuaEngine.readStringArray(engine.lua, outer, "fields", allocator);
+    defer {
+        for (result) |s| allocator.free(s);
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("reasoning_content", result[0]);
+    try std.testing.expectEqualStrings("reasoning", result[1]);
+    try std.testing.expectEqualStrings("reasoning_text", result[2]);
+
+    _ = top;
+}
+
+test "readStringArray returns empty slice when field absent" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("return { other = 1 }");
+    defer engine.lua.pop(1);
+    const outer = engine.lua.absIndex(-1);
+
+    const result = try LuaEngine.readStringArray(engine.lua, outer, "fields", allocator);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "readStringArray rejects non-string entry" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.lua.doString("return { fields = { \"ok\", 42 } }");
+    defer engine.lua.pop(1);
+    const outer = engine.lua.absIndex(-1);
+
+    try std.testing.expectError(error.LuaError, LuaEngine.readStringArray(engine.lua, outer, "fields", allocator));
 }
 
 test "TaskHandle metatable is registered at engine init" {

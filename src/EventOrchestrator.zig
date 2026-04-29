@@ -284,6 +284,15 @@ fn tick(
     const poll_timeout: i32 = parser.pollTimeoutMs(std.time.milliTimestamp()) orelse -1;
     _ = posix.poll(&fds, poll_timeout) catch {};
 
+    // Time the rest of the tick so a multi-second main-thread blockage
+    // (per-event hook callback, persist IO, lock wait, runaway Lua) is
+    // visible in /perf as max_tick_work_us. The frame span only covers
+    // the optional render path inside the tick, so without this block
+    // a freeze that returns early at the !frame_dirty guard, or one
+    // sitting in drain, would not show up anywhere.
+    const tick_work_t0 = trace.nowUs();
+    defer trace.recordTickWork(trace.nowUs() -| tick_work_t0);
+
     // Drain stale wake bytes so one wake equals one frame regardless of how
     // many events were pushed between polls.
     if (fds[1].revents & posix.POLL.IN != 0) {
@@ -330,16 +339,30 @@ fn tick(
     // completions. Holding that would require a fixed-point loop (pump →
     // drain → repeat until both empty); file a follow-up if a real plugin
     // scenario needs it.
-    if (self.lua_engine) |eng| {
-        pumpLuaCompletions(eng);
-    }
+    //
+    // The drain block is timed independently of the outer tick so /perf
+    // can answer "how much of the freeze was drain?". Per-event handlers
+    // (persist IO, sink push, hook fires) all land here, so a long
+    // max_drain_us narrows the suspect set immediately.
+    {
+        const drain_t0 = trace.nowUs();
+        var drain_span = trace.span("drain");
+        defer {
+            drain_span.end();
+            trace.recordDrain(trace.nowUs() -| drain_t0);
+        }
 
-    // Drain agent events from every pane. AgentRunner.drainEvents calls
-    // dispatchHookRequests first thing, which is the sole owner of hook
-    // dispatch at the tick boundary.
-    self.window_manager.drainPane(&self.window_manager.root_pane);
-    for (self.window_manager.extra_panes.items) |*entry| {
-        self.window_manager.drainPane(&entry.pane);
+        if (self.lua_engine) |eng| {
+            pumpLuaCompletions(eng);
+        }
+
+        // Drain agent events from every pane. AgentRunner.drainEvents calls
+        // dispatchHookRequests first thing, which is the sole owner of hook
+        // dispatch at the tick boundary.
+        self.window_manager.drainPane(&self.window_manager.root_pane);
+        for (self.window_manager.extra_panes.items) |*entry| {
+            self.window_manager.drainPane(&entry.pane);
+        }
     }
 
     // Auto-close sweep: walk floats once per tick and close any whose

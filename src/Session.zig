@@ -403,6 +403,16 @@ pub const SessionHandle = struct {
     meta: Meta,
     /// Allocator for temporary buffers.
     allocator: Allocator,
+    /// Cumulative fsync invocations on `file`. Used by tests to verify
+    /// that streaming-delta entry types (assistant_text, thinking) skip
+    /// the per-entry fsync that previously blocked the main-thread event
+    /// drain in 5-15ms of disk IO per chunk. Incremented in
+    /// `appendEntryLocked` and `close`.
+    fsync_count: u64 = 0,
+    /// Cumulative writes to the companion `.meta.json` file via
+    /// `updateMeta`. Tracked alongside `fsync_count` so tests can pin
+    /// down which boundary skips the temp-plus-rename meta write.
+    meta_write_count: u64 = 0,
     /// Serializes mutations to `file` and `meta`. The task tool dispatches
     /// `appendEntry` from the parent's tool-execution thread while the main
     /// thread persists agent events from the same handle, so concurrent
@@ -458,22 +468,41 @@ pub const SessionHandle = struct {
             log.err("failed to write newline: {}", .{e});
             return e;
         };
-        // Flush and fsync propagate errors to the caller so the UI can
-        // warn the user that persistence has broken. Logging happens at
-        // the call site (e.g. AgentRunner) rather than here to avoid
-        // double-logging and to keep test output pristine when a test
-        // exercises the error path.
+        // Always drain the writer's 256-byte scratch into the file. The
+        // writeStreaming buffer is on this stack frame, so without flush
+        // any sub-256-byte entry would lose its bytes when the function
+        // returns. flush() is a single write() syscall (~µs); the slow
+        // step is the durability barrier (sync + temp-rename meta) that
+        // streaming-delta entries skip below.
         try w.interface.flush();
-        // Force the write to disk so a power-loss or disk-full crash
-        // cannot leave the UI showing text that is not durable.
-        try self.file.sync();
 
         self.meta.message_count += 1;
         self.meta.updated = entry.timestamp;
 
-        self.updateMeta() catch |e| {
-            log.warn("failed to update meta after append: {}", .{e});
+        // Streaming-delta entry types arrive at provider-chunk rate (often
+        // >100Hz) during agent responses, and `drainEvents` runs on the
+        // orchestrator main thread. Per-entry fsync (5-15ms on APFS) and
+        // a temp-plus-rename of `.meta.json` would block the main thread
+        // long enough to freeze pane and mode switches mid-stream. Defer
+        // durability to natural boundaries: any non-delta entry
+        // (tool_call, tool_result, err, user_message, session_*) acts as
+        // the barrier that covers the buffered deltas, and `close()`
+        // does a final fsync on graceful shutdown for the trailing
+        // batch. Power-loss between deltas loses at most one in-flight
+        // assistant message, which is the trade-off the call site
+        // (AgentRunner) chose explicitly.
+        const is_streaming_delta = switch (entry.entry_type) {
+            .assistant_text, .thinking => true,
+            else => false,
         };
+        if (!is_streaming_delta) {
+            try self.file.sync();
+            self.fsync_count += 1;
+            self.updateMeta() catch |e| {
+                log.warn("failed to update meta after append: {}", .{e});
+            };
+            self.meta_write_count += 1;
+        }
 
         return entry_mut.id;
     }
@@ -502,8 +531,16 @@ pub const SessionHandle = struct {
         }) catch |err| log.warn("session_rename audit entry failed: {s}", .{@errorName(err)});
     }
 
-    /// Close the JSONL file handle.
+    /// Close the JSONL file handle. Performs a final fsync to durably
+    /// persist any streaming-delta entries (assistant_text, thinking)
+    /// that were appended since the last non-delta barrier. The error
+    /// is logged rather than propagated because the caller is shutting
+    /// the session down anyway and has no recovery path.
     pub fn close(self: *SessionHandle) void {
+        self.file.sync() catch |e| {
+            log.warn("session close: final fsync failed: {}", .{e});
+        };
+        self.fsync_count += 1;
         self.file.close();
     }
 
@@ -1566,6 +1603,116 @@ fn restoreCwd(abs_path: []const u8) void {
     var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
     defer dir.close();
     dir.setAsCwd() catch {};
+}
+
+test "appendEntry does not fsync per streaming-delta entry; non-delta entries do" {
+    // Regression: every `text_delta` and `thinking_delta` agent event
+    // ran through `Session.appendEntry`, which fsync'd the JSONL file
+    // and rewrote `.meta.json` via temp+rename. The drain phase runs on
+    // the orchestrator main thread, so a 200-chunk streamed response
+    // blocked the UI for hundreds of ms in cumulative disk IO and the
+    // user could not switch panes or modes mid-stream.
+    //
+    // The fix: skip flush()'s sync()+updateMeta() call for entry types
+    // .assistant_text and .thinking; rely on the next non-delta entry
+    // (tool_call, tool_result, err, user_message) or `close()` to do the
+    // durability barrier that covers the buffered deltas.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    // createSession itself appends a session_start row, which is a
+    // non-delta type and should fsync. Snapshot the counter so the test
+    // measures only what `appendEntry` does after construction.
+    const baseline_fsyncs = handle.fsync_count;
+    const baseline_meta_writes = handle.meta_write_count;
+
+    // 100 streaming-delta entries: assistant_text and thinking are the
+    // two entry types the agent emits per LLM chunk. Neither should
+    // fsync nor rewrite meta.json.
+    for (0..50) |i| {
+        _ = try handle.appendEntry(.{
+            .entry_type = .assistant_text,
+            .content = "tok",
+            .timestamp = @intCast(i),
+        });
+    }
+    for (0..50) |i| {
+        _ = try handle.appendEntry(.{
+            .entry_type = .thinking,
+            .content = "think",
+            .timestamp = @intCast(100 + i),
+        });
+    }
+    try std.testing.expectEqual(baseline_fsyncs, handle.fsync_count);
+    try std.testing.expectEqual(baseline_meta_writes, handle.meta_write_count);
+
+    // A non-delta entry crosses the durability barrier and flushes the
+    // 100 buffered deltas with a single fsync + meta write.
+    _ = try handle.appendEntry(.{
+        .entry_type = .tool_result,
+        .content = "ok",
+        .timestamp = 200,
+    });
+    try std.testing.expectEqual(baseline_fsyncs + 1, handle.fsync_count);
+    try std.testing.expectEqual(baseline_meta_writes + 1, handle.meta_write_count);
+}
+
+test "appendEntry persists tool_result content larger than 8 KiB" {
+    // Regression: appendEntryLocked previously serialized into a fixed
+    // 8 KiB stack buffer, so tool_result entries carrying multi-KB
+    // payloads (file reads, bash output, subagent transcripts) hit
+    // NoSpaceLeft inside serializeEntry and were silently dropped from
+    // the JSONL session log.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    const big = try allocator.alloc(u8, 16 * 1024);
+    defer allocator.free(big);
+    @memset(big, 'x');
+
+    _ = try handle.appendEntry(.{
+        .entry_type = .tool_result,
+        .content = big,
+        .timestamp = 42,
+    });
+    handle.close();
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    var found: ?Entry = null;
+    for (loaded) |e| {
+        if (e.entry_type == .tool_result) found = e;
+    }
+    try std.testing.expect(found != null);
+    try std.testing.expectEqual(big.len, found.?.content.len);
+    for (found.?.content) |c| try std.testing.expectEqual(@as(u8, 'x'), c);
 }
 
 test "appendEntry appends without clobbering previous rows" {

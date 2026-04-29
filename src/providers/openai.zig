@@ -52,7 +52,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
+        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -61,7 +61,7 @@ pub const OpenAiSerializer = struct {
         const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
         defer req.allocator.free(response_bytes);
 
-        return parseResponse(response_bytes, req.allocator);
+        return parseResponse(response_bytes, self.endpoint.reasoning, req.allocator);
     }
 
     fn callStreamingImpl(
@@ -79,7 +79,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, req.allocator);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -88,7 +88,7 @@ pub const OpenAiSerializer = struct {
         const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.telemetry, req.allocator);
         defer stream.destroy();
 
-        return parseSseStream(stream, req.allocator, req.callback, req.cancel);
+        return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel);
     }
 };
 
@@ -97,9 +97,10 @@ fn buildRequestBody(
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, reasoning, allocator);
 }
 
 fn buildStreamingRequestBody(
@@ -107,9 +108,10 @@ fn buildStreamingRequestBody(
     system_prompt: []const u8,
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, reasoning, allocator);
 }
 
 fn serializeRequest(
@@ -119,6 +121,7 @@ fn serializeRequest(
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
     max_tokens: u32,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -130,7 +133,7 @@ fn serializeRequest(
     try w.print("\"max_tokens\":{d},", .{max_tokens});
     if (stream) try w.writeAll("\"stream\":true,\"stream_options\":{\"include_usage\":true},");
 
-    try writeMessagesWithSystem(system_prompt, messages, w);
+    try writeMessagesWithSystem(system_prompt, messages, reasoning, w);
 
     if (tool_definitions.len > 0) {
         try w.writeAll(",");
@@ -154,19 +157,19 @@ fn writeToolDefinitions(defs: []const types.ToolDefinition, w: anytype) !void {
     try w.writeAll("]");
 }
 
-fn writeMessagesWithSystem(system: []const u8, msgs: []const types.Message, w: anytype) !void {
+fn writeMessagesWithSystem(system: []const u8, msgs: []const types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: anytype) !void {
     try w.writeAll("\"messages\":[");
     try w.writeAll("{\"role\":\"system\",\"content\":");
     try std.json.Stringify.value(system, .{}, w);
     try w.writeAll("}");
     for (msgs) |msg| {
         try w.writeAll(",");
-        try writeMessage(msg, w);
+        try writeMessage(msg, reasoning, w);
     }
     try w.writeAll("]");
 }
 
-fn writeMessage(msg: types.Message, w: anytype) !void {
+fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: anytype) !void {
     var has_text = false;
     var has_tool_use = false;
     var has_tool_result = false;
@@ -176,7 +179,7 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
             .text => has_text = true,
             .tool_use => has_tool_use = true,
             .tool_result => has_tool_result = true,
-            .thinking, .redacted_thinking => {}, // Chat Completions has no reasoning field; stripped upstream
+            .thinking, .redacted_thinking => {}, // handled via echo_field below; never inline content blocks
         }
     }
 
@@ -215,16 +218,28 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
             try w.writeAll(",\"content\":null");
         }
 
+        try writeThinkingEcho(msg, reasoning, w);
+
         try w.writeAll(",\"tool_calls\":[");
         var tc_idx: usize = 0;
         for (msg.content) |block| {
             switch (block) {
                 .tool_use => |tu| {
                     if (tc_idx > 0) try w.writeAll(",");
+                    // OpenAI spec wires `function.arguments` as a JSON-
+                    // encoded string, NOT an inline object. Real
+                    // openai.com accepts either form, but strict
+                    // providers (Moonshot/Kimi K2) reject the inline
+                    // object with "invalid character '/' after object
+                    // key" once the agent echoes a prior tool_use back
+                    // in its second turn. Use Stringify.value to wrap
+                    // and escape input_raw verbatim.
                     try w.print(
-                        "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
-                        .{ tu.id, tu.name, tu.input_raw },
+                        "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":",
+                        .{ tu.id, tu.name },
                     );
+                    try std.json.Stringify.value(tu.input_raw, .{}, w);
+                    try w.writeAll("}}");
                     tc_idx += 1;
                 },
                 else => {},
@@ -257,11 +272,45 @@ fn writeMessage(msg: types.Message, w: anytype) !void {
         try w.writeAll("\"");
     }
 
+    try writeThinkingEcho(msg, reasoning, w);
+
     try w.writeAll("}");
 }
 
+/// Emit `,"<echo_field>":"<concatenated thinking text>"` on the
+/// outgoing assistant object when the endpoint opted into reasoning
+/// echo AND the message carries one or more thinking blocks tagged
+/// `.openai_chat`. No-op otherwise. Tagged-by-provider gating prevents
+/// Anthropic blocks from leaking into the openai-chat wire if a session
+/// crosses providers.
+fn writeThinkingEcho(
+    msg: types.Message,
+    reasoning: llm.Endpoint.ReasoningConfig,
+    w: anytype,
+) !void {
+    const echo = reasoning.echo_field orelse return;
+    var has_thinking = false;
+    for (msg.content) |block| {
+        if (block == .thinking and block.thinking.provider == .openai_chat) {
+            has_thinking = true;
+            break;
+        }
+    }
+    if (!has_thinking) return;
+
+    try w.writeAll(",\"");
+    try types.writeJsonStringContents(w, echo);
+    try w.writeAll("\":\"");
+    for (msg.content) |block| {
+        if (block == .thinking and block.thinking.provider == .openai_chat) {
+            try types.writeJsonStringContents(w, block.thinking.text);
+        }
+    }
+    try w.writeAll("\"");
+}
+
 /// Parses a raw JSON response from OpenAI's Chat Completions API into a typed LlmResponse.
-fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmResponse {
+fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningConfig, allocator: Allocator) !types.LlmResponse {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -298,6 +347,20 @@ fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmRes
 
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
+
+    // Reasoning content: walk the configured response_fields over the
+    // assistant message and accumulate the first non-empty match into
+    // a thinking block tagged .openai_chat. Inserted ahead of the
+    // text/tool_use branches so the resulting block order matches the
+    // model's intent (thinking precedes the visible response). Empty
+    // response_fields => no scrape (historical behaviour).
+    for (reasoning.response_fields) |field| {
+        const v = message.object.get(field) orelse continue;
+        if (v != .string) continue;
+        if (v.string.len == 0) continue;
+        try builder.addThinking(v.string, null, .openai_chat, allocator);
+        break;
+    }
 
     if (message.object.get("content")) |content| {
         if (content == .string) {
@@ -338,6 +401,7 @@ const StreamingToolCall = struct {
 /// the final LlmResponse.
 fn parseSseStream(
     stream: *llm.streaming.StreamingResponse,
+    reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
@@ -349,6 +413,9 @@ fn parseSseStream(
 
     var text_content: std.ArrayList(u8) = .empty;
     defer text_content.deinit(allocator);
+
+    var thinking_content: std.ArrayList(u8) = .empty;
+    defer thinking_content.deinit(allocator);
 
     var tool_calls: std.ArrayList(StreamingToolCall) = .empty;
     defer {
@@ -412,6 +479,21 @@ fn parseSseStream(
                 }
             }
 
+            // Reasoning text on streaming deltas: walk configured field
+            // names and accumulate the first non-empty match. Mirrors
+            // the non-streaming scrape in parseResponse.
+            for (reasoning.response_fields) |field| {
+                const v = delta.object.get(field) orelse continue;
+                if (v != .string) continue;
+                if (v.string.len == 0) continue;
+                try thinking_content.appendSlice(allocator, v.string);
+                callback.on_event(callback.ctx, .{ .thinking_delta = .{
+                    .text = v.string,
+                    .provider = .openai_chat,
+                } });
+                break;
+            }
+
             if (delta.object.get("tool_calls")) |tc| {
                 for (tc.array.items) |tc_item| {
                     const index_raw = tc_item.object.get("index") orelse continue;
@@ -458,6 +540,12 @@ fn parseSseStream(
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
 
+    // Thinking precedes text/tool_use so block order matches the
+    // model's intent (thinking is the prelude, not an afterthought).
+    if (thinking_content.items.len > 0) {
+        try builder.addThinking(thinking_content.items, null, .openai_chat, allocator);
+    }
+
     if (text_content.items.len > 0) {
         try builder.addText(text_content.items, allocator);
     }
@@ -497,7 +585,7 @@ test "buildRequestBody produces valid JSON with system as first message" {
         },
     };
 
-    const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -526,7 +614,7 @@ test "buildRequestBody formats tools with function wrapper" {
         },
     };
 
-    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -552,7 +640,7 @@ test "buildRequestBody omits tools when none provided" {
     const messages = [_]types.Message{};
     const tool_defs = [_]types.ToolDefinition{};
 
-    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, allocator);
+    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -566,7 +654,7 @@ test "buildStreamingRequestBody includes stream:true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, allocator);
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -580,7 +668,7 @@ test "buildStreamingRequestBody sets stream_options.include_usage=true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, allocator);
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, allocator);
     defer allocator.free(body);
 
     // Raw-substring check pins the on-the-wire JSON shape: OpenAI only emits
@@ -618,7 +706,7 @@ test "parseResponse parses text-only response" {
         \\}
     ;
 
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), response.content.len);
@@ -665,7 +753,7 @@ test "parseResponse parses tool_calls response" {
         \\}
     ;
 
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), response.content.len);
@@ -686,28 +774,28 @@ test "parseResponse maps finish_reason correctly" {
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.end_turn, r.stop_reason);
     }
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.max_tokens, r.stop_reason);
     }
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.tool_use, r.stop_reason);
     }
 
     {
         const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"something_new\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-        const r = try parseResponse(json, allocator);
+        const r = try parseResponse(json, .{}, allocator);
         defer r.deinit(allocator);
         try std.testing.expectEqual(.end_turn, r.stop_reason);
     }
@@ -716,7 +804,7 @@ test "parseResponse maps finish_reason correctly" {
 test "parseResponse handles missing usage gracefully" {
     const allocator = std.testing.allocator;
     const json = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
@@ -729,7 +817,7 @@ test "parseResponse captures cached_tokens from prompt_tokens_details" {
         \\ "usage":{"prompt_tokens":20,"completion_tokens":5,
         \\          "prompt_tokens_details":{"cached_tokens":7}}}
     ;
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 20), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 5), response.output_tokens);
@@ -739,14 +827,14 @@ test "parseResponse captures cached_tokens from prompt_tokens_details" {
 
 test "parseResponse returns error for malformed JSON" {
     const allocator = std.testing.allocator;
-    const result = parseResponse("not valid json at all", allocator);
+    const result = parseResponse("not valid json at all", .{}, allocator);
     try std.testing.expectError(error.SyntaxError, result);
 }
 
 test "parseResponse returns error for empty choices" {
     const allocator = std.testing.allocator;
     const json = "{\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}";
-    const result = parseResponse(json, allocator);
+    const result = parseResponse(json, .{}, allocator);
     try std.testing.expectError(error.MalformedResponse, result);
 }
 
@@ -776,7 +864,7 @@ test "parseResponse parses text alongside tool_calls" {
         \\}
     ;
 
-    const response = try parseResponse(json, allocator);
+    const response = try parseResponse(json, .{}, allocator);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), response.content.len);
@@ -795,8 +883,66 @@ test "parseResponse parses text alongside tool_calls" {
     }
 }
 
+test "parseResponse scrapes reasoning_content into a thinking block tagged .openai_chat" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "choices": [{
+        \\    "message": {
+        \\      "role": "assistant",
+        \\      "content": "let me think",
+        \\      "reasoning_content": "step 1: read file. step 2: summarize."
+        \\    },
+        \\    "finish_reason": "stop"
+        \\  }],
+        \\  "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        \\}
+    ;
+    const reasoning: llm.Endpoint.ReasoningConfig = .{
+        .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
+    };
+
+    const resp = try parseResponse(json, reasoning, allocator);
+    defer resp.deinit(allocator);
+
+    // thinking block must precede text block in the content slice.
+    try std.testing.expect(resp.content.len >= 2);
+    try std.testing.expect(resp.content[0] == .thinking);
+    try std.testing.expect(resp.content[0].thinking.provider == .openai_chat);
+    try std.testing.expectEqualStrings(
+        "step 1: read file. step 2: summarize.",
+        resp.content[0].thinking.text,
+    );
+    try std.testing.expect(resp.content[1] == .text);
+    try std.testing.expectEqualStrings("let me think", resp.content[1].text.text);
+}
+
+test "parseResponse skips reasoning when response_fields is empty" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "choices": [{
+        \\    "message": {
+        \\      "role": "assistant",
+        \\      "content": "hi",
+        \\      "reasoning_content": "I should not be parsed"
+        \\    },
+        \\    "finish_reason": "stop"
+        \\  }],
+        \\  "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        \\}
+    ;
+    const resp = try parseResponse(json, .{}, allocator);
+    defer resp.deinit(allocator);
+
+    // Only the text block should appear; thinking must be dropped when
+    // the endpoint did not opt in via response_fields.
+    try std.testing.expectEqual(@as(usize, 1), resp.content.len);
+    try std.testing.expect(resp.content[0] == .text);
+}
+
 test "openai body places system as first message" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\",\"content\":\"sys\"") != null);
 }
@@ -806,7 +952,7 @@ test "openai wraps tool as type-function object" {
         .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"function\":{\"name\":\"t\",") != null);
@@ -814,7 +960,7 @@ test "openai wraps tool as type-function object" {
 }
 
 test "openai omits tools field when none are provided" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -823,9 +969,48 @@ test "openai omits tools field when none are provided" {
 }
 
 test "streaming flag is omitted by default" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\"") == null);
+}
+
+test "openai writeMessage encodes tool_use arguments as JSON-encoded string per spec" {
+    // Regression: serializeRequest used to inject input_raw as a raw
+    // JSON object inside `function.arguments`, e.g.
+    //     "arguments":{"path":"/foo"}
+    // OpenAI's spec and strict-mode providers (Moonshot/Kimi K2) want
+    // a JSON-encoded string instead:
+    //     "arguments":"{\"path\":\"/foo\"}"
+    // Real openai.com is lenient and accepts either, which masked the
+    // bug. Moonshot rejects with a misleading "invalid character '/'
+    // after object key" because its parser stops on the second turn
+    // when the agent echoes the prior assistant tool_use back. The
+    // sibling Anthropic wire uses object form on its `input` field
+    // and is unaffected; ChatGPT's Responses wire already emits the
+    // string form (see src/providers/chatgpt.zig).
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{\"path\":\"/tmp/test.txt\"}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{}, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const tc = parsed.value.object.get("tool_calls").?.array;
+    const arguments = tc.items[0].object.get("function").?.object.get("arguments").?;
+    try std.testing.expect(arguments == .string);
+    try std.testing.expectEqualStrings("{\"path\":\"/tmp/test.txt\"}", arguments.string);
 }
 
 test "openai writeMessage flattens tool_use into tool_calls" {
@@ -842,7 +1027,7 @@ test "openai writeMessage flattens tool_use into tool_calls" {
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -880,7 +1065,7 @@ test "openai writeMessage preserves all text blocks when interleaved with tool_u
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -910,7 +1095,7 @@ test "openai writeMessage concatenates multiple pure-text blocks" {
     const msg = types.Message{ .role = .assistant, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -959,13 +1144,98 @@ test "parseSseStream captures usage and cached_tokens from final chunk" {
         .on_event = &noopStreamCallback,
     };
 
-    const response = try parseSseStream(&sr, allocator, callback, &cancel);
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 12), response.input_tokens);
     try std.testing.expectEqual(@as(u32, 3), response.output_tokens);
     try std.testing.expectEqual(@as(u32, 4), response.cache_read_tokens);
     try std.testing.expectEqual(@as(u32, 0), response.cache_creation_tokens);
+}
+
+test "parseSseStream accumulates reasoning_content into a thinking block" {
+    const allocator = std.testing.allocator;
+
+    // Two reasoning_content delta chunks, then a content delta, then a final
+    // chunk with finish_reason. Mirrors how Moonshot/Kimi K2 streams a
+    // tool-less reply: thinking first, then visible answer.
+    const sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step 1\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" then step 2\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fake = std.Io.Reader.fixed(sse_body);
+
+    var sr: llm.streaming.StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    const Recorder = struct {
+        thinking_chunks: std.ArrayList([]const u8) = .empty,
+        text_chunks: std.ArrayList([]const u8) = .empty,
+        allocator: Allocator,
+
+        fn callback(ctx: *anyopaque, ev: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .thinking_delta => |t| {
+                    const owned = self.allocator.dupe(u8, t.text) catch return;
+                    self.thinking_chunks.append(self.allocator, owned) catch self.allocator.free(owned);
+                },
+                .text_delta => |t| {
+                    const owned = self.allocator.dupe(u8, t) catch return;
+                    self.text_chunks.append(self.allocator, owned) catch self.allocator.free(owned);
+                },
+                else => {},
+            }
+        }
+    };
+    var rec = Recorder{ .allocator = allocator };
+    defer {
+        for (rec.thinking_chunks.items) |c| allocator.free(c);
+        for (rec.text_chunks.items) |c| allocator.free(c);
+        rec.thinking_chunks.deinit(allocator);
+        rec.text_chunks.deinit(allocator);
+    }
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const cb: llm.StreamCallback = .{ .ctx = &rec, .on_event = Recorder.callback };
+    const reasoning: llm.Endpoint.ReasoningConfig = .{
+        .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
+    };
+
+    const resp = try parseSseStream(&sr, reasoning, allocator, cb, &cancel);
+    defer resp.deinit(allocator);
+
+    // Two thinking_delta events, then one text_delta event.
+    try std.testing.expectEqual(@as(usize, 2), rec.thinking_chunks.items.len);
+    try std.testing.expectEqualStrings("step 1", rec.thinking_chunks.items[0]);
+    try std.testing.expectEqualStrings(" then step 2", rec.thinking_chunks.items[1]);
+
+    // Final response: thinking precedes text in content order.
+    try std.testing.expect(resp.content.len >= 2);
+    try std.testing.expect(resp.content[0] == .thinking);
+    try std.testing.expectEqualStrings(
+        "step 1 then step 2",
+        resp.content[0].thinking.text,
+    );
+    try std.testing.expect(resp.content[1] == .text);
+    try std.testing.expectEqualStrings("hello", resp.content[1].text.text);
 }
 
 test "openai writeMessage emits tool role for tool_result" {
@@ -982,7 +1252,7 @@ test "openai writeMessage emits tool role for tool_result" {
     const msg = types.Message{ .role = .user, .content = content };
 
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(msg, &out.writer);
+    try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
@@ -1013,7 +1283,7 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
     const joined = try split_req.joinedSystem(allocator);
     defer allocator.free(joined);
 
-    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, allocator);
+    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, .{}, allocator);
     defer allocator.free(split_body);
 
     const single_body = try buildRequestBody(
@@ -1021,9 +1291,148 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
         "stable prefix\n\nper-turn suffix",
         &messages,
         &.{},
+        .{},
         allocator,
     );
     defer allocator.free(single_body);
 
     try std.testing.expectEqualStrings(single_body, split_body);
+}
+
+test "openai writeMessage echoes thinking text via echo_field on tool_use messages" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "step 1: read CLAUDE.md",
+        .signature = null,
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{\"path\":\"CLAUDE.md\"}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    try std.testing.expect(root.get("reasoning_content") != null);
+    try std.testing.expectEqualStrings(
+        "step 1: read CLAUDE.md",
+        root.get("reasoning_content").?.string,
+    );
+    // tool_calls still present.
+    try std.testing.expectEqual(@as(usize, 1), root.get("tool_calls").?.array.items.len);
+}
+
+test "openai writeMessage skips echo when echo_field is null" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "should not appear",
+        .signature = null,
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{}, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
+}
+
+test "openai writeMessage skips echo when assistant has no .openai_chat thinking" {
+    // anthropic-tagged thinking must NOT leak into an openai-chat wire.
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "anthropic-style thinking",
+        .signature = "sig",
+        .provider = .anthropic,
+        .id = null,
+    } };
+    content[1] = .{ .tool_use = .{
+        .id = "call_001",
+        .name = "read",
+        .input_raw = "{}",
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.object.get("reasoning_content") == null);
+}
+
+test "openai writeMessage echoes thinking on plain-text assistant messages" {
+    // Coverage gap from b5ebe01: the three sibling tests all use
+    // tool_use messages, exercising only one of writeThinkingEcho's
+    // two call sites. This test asserts the plain-text branch (no
+    // tool_use, no tool_result) also emits the echo before the
+    // closing brace.
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .thinking = .{
+        .text = "thinking through the answer",
+        .signature = null,
+        .provider = .openai_chat,
+        .id = null,
+    } };
+    content[1] = .{ .text = .{ .text = "the answer is 42" } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant", root.get("role").?.string);
+    try std.testing.expect(root.get("reasoning_content") != null);
+    try std.testing.expectEqualStrings(
+        "thinking through the answer",
+        root.get("reasoning_content").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "the answer is 42",
+        root.get("content").?.string,
+    );
+    // No tool_calls in plain-text branch.
+    try std.testing.expect(root.get("tool_calls") == null);
 }
