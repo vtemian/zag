@@ -151,6 +151,13 @@ pub const LuaEngine = struct {
     /// Default model string set via `zag.set_default_model("prov/id")`.
     /// Owned. Null if the user didn't set one; factory falls back to a hardcoded default.
     default_model: ?[]const u8 = null,
+    /// Active reasoning_effort level set by `zag.set_thinking_effort`,
+    /// or null if unset. Read by chat-completions providers that opted
+    /// into the knob via `effort_request_field`. Module-level rather
+    /// than per-pane so the same setting applies across all turns
+    /// within a session; per-pane override is a future PR. Owned by
+    /// the engine's allocator.
+    thinking_effort: ?[]const u8 = null,
     /// Worker pool + completion queue for blocking I/O primitives.
     /// Both have coupled lifetimes (pool writes to queue), so they're
     /// owned together. Null until `initAsync()` runs.
@@ -458,6 +465,7 @@ pub const LuaEngine = struct {
         self.providers_registry.deinit();
         self.subagents.deinit(self.allocator);
         if (self.default_model) |m| self.allocator.free(m);
+        if (self.thinking_effort) |e| self.allocator.free(e);
         // Release every Lua callback ref a keymap binding still holds.
         // Bindings stored as `Action.lua_callback` own a registry slot
         // that would otherwise leak when the VM is torn down.
@@ -551,6 +559,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_escape_timeout_ms");
         lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
         lua.setField(-2, "set_default_model");
+        lua.pushFunction(zlua.wrap(zagSetThinkingEffortFn));
+        lua.setField(-2, "set_thinking_effort");
         lua.pushFunction(zlua.wrap(zagProviderFn));
         lua.setField(-2, "provider");
         lua.pushFunction(zlua.wrap(zagSleepFn));
@@ -4953,6 +4963,53 @@ pub const LuaEngine = struct {
         return 0;
     }
 
+    /// Read accessor for the runtime reasoning_effort level. Providers
+    /// that opted into `effort_request_field` consult this on each call
+    /// to decide whether to inject the knob into the outgoing request.
+    pub fn currentThinkingEffort(self: *LuaEngine) ?[]const u8 {
+        return self.thinking_effort;
+    }
+
+    /// Zig function backing `zag.set_thinking_effort(level)`.
+    /// Accepts one of `"minimal"`, `"low"`, `"medium"`, `"high"`, or
+    /// `nil` to clear the runtime setting. Stored module-level on the
+    /// engine so it survives across turns within a session. Providers
+    /// that didn't opt in via `effort_request_field` see the value but
+    /// drop it silently; this matches pi-mono's "providers carry their
+    /// own quirks" stance and keeps the knob declarative.
+    fn zagSetThinkingEffortFn(lua: *Lua) !i32 {
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.set_thinking_effort(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        // Nil clears the level; pass-through for users who want to
+        // turn the knob off mid-session without restarting.
+        if (lua.typeOf(1) == .nil or lua.typeOf(1) == .none) {
+            if (engine.thinking_effort) |old| engine.allocator.free(old);
+            engine.thinking_effort = null;
+            return 0;
+        }
+
+        if (lua.typeOf(1) != .string) {
+            log.warn("zag.set_thinking_effort(): arg 1 must be a string or nil", .{});
+            return error.LuaError;
+        }
+        const level = lua.toString(1) catch {
+            log.warn("zag.set_thinking_effort(): arg 1 must be a string or nil", .{});
+            return error.LuaError;
+        };
+        _ = try requireOneOf(level, &[_][]const u8{ "minimal", "low", "medium", "high" }, "set_thinking_effort");
+
+        const owned = try engine.allocator.dupe(u8, level);
+        if (engine.thinking_effort) |old| engine.allocator.free(old);
+        engine.thinking_effort = owned;
+        return 0;
+    }
+
     // -- Lua table reader helpers (used by zag.provider, future schema work) ---
 
     /// Required vs optional semantics for `readStringField`. Required mode
@@ -9269,6 +9326,52 @@ test "zag.set_default_model rejects non-string argument" {
         error.LuaRuntime,
         engine.lua.doString("zag.set_default_model(42)"),
     );
+}
+
+test "zag.set_thinking_effort stores the runtime level" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.set_thinking_effort(\"high\")");
+
+    try std.testing.expect(engine.currentThinkingEffort() != null);
+    try std.testing.expectEqualStrings("high", engine.currentThinkingEffort().?);
+}
+
+test "zag.set_thinking_effort accepts nil to clear the runtime level" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.set_thinking_effort("medium")
+        \\zag.set_thinking_effort(nil)
+    );
+    try std.testing.expect(engine.currentThinkingEffort() == null);
+}
+
+test "zag.set_thinking_effort rejects unknown levels" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString("zag.set_thinking_effort(\"extreme\")"),
+    );
+}
+
+test "zag.set_thinking_effort replaces prior value without leaking" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.set_thinking_effort("low")
+        \\zag.set_thinking_effort("high")
+    );
+    try std.testing.expectEqualStrings("high", engine.currentThinkingEffort().?);
 }
 
 test "zag.provider{}: full x_api_key declaration registers the endpoint" {
