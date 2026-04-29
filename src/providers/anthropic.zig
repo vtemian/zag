@@ -294,13 +294,22 @@ fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
                 try w.writeAll("}");
             },
             .tool_use => |tu| {
-                try w.print(
-                    "{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}",
-                    .{ tu.id, tu.name, tu.input_raw },
-                );
+                try w.writeAll("{\"type\":\"tool_use\",\"id\":");
+                try std.json.Stringify.value(tu.id, .{}, w);
+                try w.writeAll(",\"name\":");
+                try std.json.Stringify.value(tu.name, .{}, w);
+                try w.writeAll(",\"input\":");
+                // input_raw is the model's pre-stringified JSON object; the
+                // Anthropic Messages API wants it as a JSON object (not a
+                // string), so we inject it raw. Compare openai.zig where
+                // arguments is a JSON-encoded string per Chat Completions spec.
+                try w.writeAll(tu.input_raw);
+                try w.writeAll("}");
             },
             .tool_result => |tr| {
-                try w.print("{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",", .{tr.tool_use_id});
+                try w.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
+                try std.json.Stringify.value(tr.tool_use_id, .{}, w);
+                try w.writeAll(",");
                 if (tr.is_error) try w.writeAll("\"is_error\":true,");
                 try w.writeAll("\"content\":");
                 try std.json.Stringify.value(tr.content, .{}, w);
@@ -2009,4 +2018,53 @@ test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
     const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
     defer allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "Context exceeds the model's window") != null);
+}
+
+test "anthropic writeMessage escapes tu.id, tu.name, and tr.tool_use_id" {
+    // Defense in depth, mirroring the openai.zig fix in commit f37540b.
+    // Tool ids/names come from the LLM; an upstream that ever sent a
+    // quote or backslash would otherwise break JSON shape via raw {s}
+    // injection.
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .tool_use = .{
+        .id = "id\"with\\quote",
+        .name = "name\"with\\quote",
+        .input_raw = "{}",
+    } };
+    content[1] = .{ .tool_result = .{
+        .tool_use_id = "result_id\"with\\quote",
+        .content = "ok",
+        .is_error = false,
+    } };
+
+    const msg = types.Message{ .role = .assistant, .content = content };
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-5", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    // Round-trip parse confirms JSON shape survived.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const blocks = parsed.value.object.get("content").?.array;
+    // Find the tool_use and tool_result entries by type.
+    var saw_tool_use = false;
+    var saw_tool_result = false;
+    for (blocks.items) |block| {
+        const t = block.object.get("type").?.string;
+        if (std.mem.eql(u8, t, "tool_use")) {
+            saw_tool_use = true;
+            try std.testing.expectEqualStrings("id\"with\\quote", block.object.get("id").?.string);
+            try std.testing.expectEqualStrings("name\"with\\quote", block.object.get("name").?.string);
+        } else if (std.mem.eql(u8, t, "tool_result")) {
+            saw_tool_result = true;
+            try std.testing.expectEqualStrings("result_id\"with\\quote", block.object.get("tool_use_id").?.string);
+        }
+    }
+    try std.testing.expect(saw_tool_use);
+    try std.testing.expect(saw_tool_result);
 }
