@@ -5508,6 +5508,47 @@ test "/model plugin selects the second model after <Down> + <CR>" {
     try std.testing.expectEqualStrings("provA/a2", override.model_id);
 }
 
+test "/model plugin removes its routed keymaps when the popup closes" {
+    // The picker registers four global normal-mode keymaps (`<Up>`,
+    // `<Down>`, `<CR>`, `<Esc>`) routed into the popup. After the
+    // popup closes (via commit or cancel) those bindings must be
+    // unregistered: leaving them around leaks both the Lua callback
+    // ref and a binding that fires for any future <CR>/<Esc>/<Up>/<Down>
+    // until the next `/model` invocation overwrites it.
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    const baseline_bindings = f.engine.keymap_registry.bindings.items.len;
+
+    const cmd = f.engine.command_registry.lookup("/model") orelse
+        return error.TestExpectedCommand;
+    f.engine.invokeCallback(cmd.lua_callback);
+
+    try std.testing.expectEqual(
+        baseline_bindings + 4,
+        f.engine.keymap_registry.bindings.items.len,
+    );
+
+    // Fire <Esc> via the registered route closure; this drives popup
+    // close + cleanup() through the same path real input would.
+    const esc_hit = f.engine.keymap_registry.lookup(
+        .normal,
+        .{ .key = .escape, .modifiers = .{} },
+        null,
+    ) orelse return error.TestExpectedKeymap;
+    try std.testing.expect(esc_hit == .lua_callback);
+    f.engine.invokeCallback(esc_hit.lua_callback);
+
+    // Registry size is back to the pre-open baseline; none of the four
+    // bindings linger.
+    try std.testing.expectEqual(
+        baseline_bindings,
+        f.engine.keymap_registry.bindings.items.len,
+    );
+}
+
 /// Count every leaf node reachable from `root`. Used by the picker
 /// plugin tests to assert that invoking `/model` added exactly one
 /// pane, regardless of how `Layout` happened to position it.
