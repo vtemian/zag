@@ -212,7 +212,7 @@ pub fn runLoopStreaming(
         );
         defer if (filtered_owned) |d| allocator.free(d);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle);
+        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle, lua_engine);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);
         // Snapshot the latest input token count so the next iteration's
@@ -498,12 +498,17 @@ fn callLlm(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
     telemetry_opt: ?*llm.telemetry.Telemetry,
+    lua_engine: ?*LuaEngine.LuaEngine,
 ) !types.LlmResponse {
     var stream_ctx: StreamContext = .{ .queue = queue, .allocator = allocator };
     const callback: llm.StreamCallback = .{
         .ctx = &stream_ctx,
         .on_event = &streamEventToQueue,
     };
+    // Snapshot the runtime reasoning_effort knob once per call so the
+    // streaming path and the non-streaming fallback see the same value
+    // even if Lua mutates it mid-flight.
+    const thinking_effort: ?[]const u8 = if (lua_engine) |eng| eng.currentThinkingEffort() else null;
     const stream_req = llm.StreamRequest{
         .system_stable = system_stable,
         .system_volatile = system_volatile,
@@ -513,6 +518,7 @@ fn callLlm(
         .callback = callback,
         .cancel = cancel,
         .telemetry = telemetry_opt,
+        .thinking_effort = thinking_effort,
     };
 
     return provider.callStreaming(&stream_req) catch |streaming_err| {
@@ -527,6 +533,7 @@ fn callLlm(
             .messages = messages,
             .tool_definitions = tool_defs,
             .allocator = allocator,
+            .thinking_effort = thinking_effort,
         };
         const fallback = try provider.call(&req);
         // If streaming already rendered partial text, discard it so the
@@ -1435,7 +1442,7 @@ test "callLlm threads telemetry handle through StreamRequest into provider" {
     });
     defer handle.deinit();
 
-    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, handle);
+    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, handle, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
@@ -1458,7 +1465,7 @@ test "callLlm leaves StreamRequest.telemetry null when caller passes null" {
     defer capture.deinit();
     const p = capture.provider();
 
-    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null);
+    const response = try callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
