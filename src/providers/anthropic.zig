@@ -1839,12 +1839,14 @@ test "anthropic writeMessage drops thinking blocks tagged with foreign provider"
 
     const content = try allocator.alloc(types.ContentBlock, 2);
     defer allocator.free(content);
-    content[0] = .{ .thinking = .{
-        .text = "kimi-style thinking",
-        .signature = null, // openai_chat has no signature
-        .provider = .openai_chat,
-        .id = null,
-    } };
+    content[0] = .{
+        .thinking = .{
+            .text = "kimi-style thinking",
+            .signature = null, // openai_chat has no signature
+            .provider = .openai_chat,
+            .id = null,
+        },
+    };
     content[1] = .{ .text = .{ .text = "actual answer" } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
@@ -2124,4 +2126,60 @@ test "anthropic writeMessage escapes tu.id, tu.name, and tr.tool_use_id" {
     }
     try std.testing.expect(saw_tool_use);
     try std.testing.expect(saw_tool_result);
+}
+
+test "anthropic writeMessage drops foreign-provider thinking after JSONL replay" {
+    // Cross-provider integration: a session that ran on Moonshot/Kimi
+    // and then switched to a Claude model must not re-send the foreign
+    // thinking blocks. This pins the full path:
+    //   JSONL entry -> rebuildMessages -> writeMessage -> assertion.
+    //
+    // The unit-level FU-8 test feeds writeMessage a hand-constructed
+    // message; this version persists+replays through ConversationHistory
+    // so a regression in `thinking_provider` round-trip OR in the
+    // writeMessage gate would surface here.
+    const allocator = std.testing.allocator;
+    const Session = @import("../Session.zig");
+    const ConversationHistory = @import("../ConversationHistory.zig");
+
+    var ch = ConversationHistory.init(allocator);
+    defer ch.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "what's this project", .timestamp = 0 },
+        // Foreign-provider thinking from when Moonshot/Kimi handled the turn.
+        .{
+            .entry_type = .thinking,
+            .content = "kimi-style reasoning",
+            .signature = null,
+            .thinking_provider = "openai_chat",
+            .timestamp = 1,
+        },
+        .{ .entry_type = .assistant_text, .content = "the answer", .timestamp = 2 },
+    };
+
+    try ch.rebuildMessages(&entries, allocator);
+    try std.testing.expectEqual(@as(usize, 2), ch.messages.items.len);
+    try std.testing.expectEqual(types.Role.assistant, ch.messages.items[1].role);
+    // Sanity: rebuildMessages produced a thinking block tagged .openai_chat.
+    try std.testing.expectEqual(
+        types.ContentBlock.ThinkingProvider.openai_chat,
+        ch.messages.items[1].content[0].thinking.provider,
+    );
+
+    // Now serialize through anthropic.zig with a thinking-supporting
+    // Claude model. The .openai_chat block must NOT survive.
+    var out: std.io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-5", ch.messages.items[1], &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const blocks = parsed.value.object.get("content").?.array;
+    // Only the .text block should survive; the foreign thinking is dropped.
+    try std.testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try std.testing.expectEqualStrings("text", blocks.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("the answer", blocks.items[0].object.get("text").?.string);
 }
