@@ -242,37 +242,43 @@ pub fn main() !void {
     const registry_ptr = registry_view.ptr();
 
     const command_registry_ptr = &lua_engine.command_registry;
-    var provider = llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
-        switch (err) {
-            // No default_model in config.lua: nothing to probe for OAuth-ness.
-            // Fall straight through to the wizard so it can scaffold one.
-            error.NoDefaultModel => {},
-            error.MissingCredential => {
-                // OAuth providers can't be fixed by the api-key wizard; point
-                // the user at `zag --login=<provider>` and exit. We only get
-                // here when default_model is non-null (otherwise the call
-                // returned NoDefaultModel above), so the lookup is meaningful.
-                const spec = llm.parseModelString(default_model.?);
-                if (registry_ptr.find(spec.provider_name)) |ep| {
-                    if (std.meta.activeTag(ep.auth) == .oauth) {
-                        const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
-                        var scratch: [512]u8 = undefined;
-                        const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
-                        _ = stderr_file.write(message) catch {};
-                        return err;
-                    }
-                }
-            },
-            else => return err,
-        }
 
-        break :first_try try auth_wizard.firstRunWizardRetry(
+    // First-run detection: a null default_model means config.lua either
+    // doesn't exist or hasn't called `zag.set_default_model(...)`. Drop
+    // straight into the wizard so it can scaffold a config rather than
+    // probing for credentials we know aren't there.
+    var provider = if (default_model == null)
+        try auth_wizard.firstRunWizardRetry(
             allocator,
             &lua_engine,
             &stdin_reader.interface,
             &stdout_wiz_writer.interface,
-        );
-    };
+        )
+    else
+        llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
+            if (err != error.MissingCredential) return err;
+
+            // OAuth providers can't be fixed by the api-key wizard; point
+            // the user at `zag --login=<provider>` and exit with the
+            // original error.
+            const spec = llm.parseModelString(default_model.?);
+            if (registry_ptr.find(spec.provider_name)) |ep| {
+                if (std.meta.activeTag(ep.auth) == .oauth) {
+                    const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                    var scratch: [512]u8 = undefined;
+                    const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
+                    _ = stderr_file.write(message) catch {};
+                    return err;
+                }
+            }
+
+            break :first_try try auth_wizard.firstRunWizardRetry(
+                allocator,
+                &lua_engine,
+                &stdin_reader.interface,
+                &stdout_wiz_writer.interface,
+            );
+        };
     defer provider.deinit();
 
     var registry = try tools.createDefaultRegistry(allocator);
