@@ -355,7 +355,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
 
     var layout = Layout.init(gpa);
     defer layout.deinit();
-    try layout.setRoot(root_buffer.buf());
+    try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view() });
 
     const auth_path = try auth_wizard.buildAuthPath(gpa);
     defer gpa.free(auth_path);
