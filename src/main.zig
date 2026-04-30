@@ -41,7 +41,14 @@ const stdin_buffer_len: usize = 8256;
 const RegistryView = LuaEngine.RegistryView;
 
 const file_log = @import("file_log.zig");
-pub const std_options: std.Options = .{ .logFn = file_log.handler };
+/// Floor log_level at .debug so the runtime gate in `file_log.handler`
+/// (driven by `ZAG_DEBUG` / `ZAG_LOG_LEVEL`) decides what actually gets
+/// written. Without this, `.debug` calls are stripped at compile time and
+/// no env var can bring them back.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = file_log.handler,
+};
 
 /// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
@@ -102,6 +109,7 @@ pub fn main() !void {
         std.debug.print("zag: file logger disabled ({s})\n", .{@errorName(err)});
     };
     defer file_log.deinit();
+    file_log.configureFromEnv(allocator);
 
     // Parse args first so `zag auth ...` subcommands bypass Lua + provider
     // init entirely. The TUI path picks up `.new_session` / `.resume_*`
