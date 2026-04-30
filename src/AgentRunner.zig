@@ -454,10 +454,139 @@ pub fn submitInput(self: *AgentRunner, text: []const u8) !void {
     self.sink.push(.{ .run_start = .{ .user_text = text } });
 }
 
-/// Pull any hook_request events out of the queue and service them on the
-/// main thread (the only thread allowed to touch Lua). Non-hook events are
-/// compacted back into the ring in their original order. Called before the
-/// normal drain loop so pre-hook vetos round-trip with minimal latency.
+/// Service one round-trip request event end-to-end: invoke the engine
+/// or window-manager handler, populate result/error state, and signal
+/// `req.done` so the parked producer wakes. Returns true when `event`
+/// is a round-trip request (and was serviced); false otherwise.
+///
+/// Called from `dispatchHookRequests` (fast path, under the queue
+/// mutex) and from `handleAgentEvent` (slow path, when a request
+/// slipped through the dispatch/drain race window). The producer parks
+/// on `req.done` regardless of which thread answers, so either site is
+/// safe.
+fn serviceRoundTripEvent(
+    event: agent_events.AgentEvent,
+    engine: ?*LuaEngine,
+    window_manager: ?*WindowManager,
+) bool {
+    switch (event) {
+        .hook_request => |req| {
+            if (engine) |eng| {
+                const veto = eng.fireHook(req.payload) catch |err| blk: {
+                    log.warn("hook dispatch failed: {}", .{err});
+                    break :blk null;
+                };
+                if (veto) |reason| {
+                    req.cancelled = true;
+                    req.cancel_reason = reason;
+                }
+            }
+            // Always signal, even without an engine: the agent thread
+            // is parked on `req.done` and must be released so the
+            // tool call can proceed (or fail) cleanly.
+            req.done.set();
+            return true;
+        },
+        .lua_tool_request => |req| {
+            if (engine) |eng| {
+                if (eng.executeTool(req.tool_name, req.input_raw, req.allocator)) |result| {
+                    req.result_content = result.content;
+                    req.result_is_error = result.is_error;
+                    req.result_owned = result.owned;
+                } else |err| {
+                    req.error_name = @errorName(err);
+                }
+            }
+            req.done.set();
+            return true;
+        },
+        .layout_request => |req| {
+            if (window_manager) |wm| {
+                // wm owns signalling done.
+                wm.handleLayoutRequest(req);
+            } else {
+                // No WM wired yet (test harnesses, headless eval):
+                // release the waiter with an error so the agent thread
+                // doesn't park on done forever.
+                req.is_error = true;
+                req.done.set();
+            }
+            return true;
+        },
+        .prompt_assembly_request => |req| {
+            if (engine) |eng| {
+                if (eng.renderPromptLayers(req.ctx, req.allocator)) |assembled| {
+                    req.result = assembled;
+                } else |err| {
+                    req.error_name = @errorName(err);
+                }
+            } else {
+                // No engine means no Lua layers; the agent thread's
+                // non-Lua fallback path owns assembly in that case.
+                // Surface an error so a misrouted request doesn't
+                // wedge the worker.
+                req.error_name = "no_engine";
+            }
+            req.done.set();
+            return true;
+        },
+        .jit_context_request => |req| {
+            if (engine) |eng| {
+                eng.handleJitContextRequest(req) catch |err| {
+                    req.error_name = @errorName(err);
+                };
+            }
+            // No engine means no handlers can be registered; treat as
+            // a clean miss (result stays null) so the worker proceeds
+            // without an attachment.
+            req.done.set();
+            return true;
+        },
+        .tool_transform_request => |req| {
+            if (engine) |eng| {
+                eng.handleToolTransformRequest(req) catch |err| {
+                    req.error_name = @errorName(err);
+                };
+            }
+            req.done.set();
+            return true;
+        },
+        .tool_gate_request => |req| {
+            if (engine) |eng| {
+                eng.handleToolGateRequest(req) catch |err| {
+                    req.error_name = @errorName(err);
+                };
+            }
+            req.done.set();
+            return true;
+        },
+        .loop_detect_request => |req| {
+            if (engine) |eng| {
+                eng.handleLoopDetectRequest(req) catch |err| {
+                    req.error_name = @errorName(err);
+                };
+            }
+            req.done.set();
+            return true;
+        },
+        .compact_request => |req| {
+            if (engine) |eng| {
+                eng.handleCompactRequest(req) catch |err| {
+                    req.error_name = @errorName(err);
+                };
+            }
+            req.done.set();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Pull round-trip request events out of the queue and service them on
+/// the main thread (the only thread allowed to touch Lua). Non-round-
+/// trip events are compacted back into the ring in their original
+/// order. Called before the normal drain loop so pre-hook vetos
+/// round-trip with minimal latency.
 pub fn dispatchHookRequests(
     queue: *agent_events.EventQueue,
     engine: ?*LuaEngine,
@@ -468,9 +597,10 @@ pub fn dispatchHookRequests(
 
     if (queue.len == 0) return;
 
-    // Walk the ring from head to tail, in-place compacting non-hook events
-    // back into contiguous slots starting at `head`. Hook/tool requests are
-    // fired synchronously and dropped from the ring.
+    // Walk the ring from head to tail, in-place compacting non-round-
+    // trip events back into contiguous slots starting at `head`.
+    // Round-trip requests are fired synchronously and dropped from
+    // the ring.
     const cap = queue.buffer.len;
     var read = queue.head;
     var write = queue.head;
@@ -479,125 +609,10 @@ pub fn dispatchHookRequests(
     while (remaining > 0) : (remaining -= 1) {
         const ev = queue.buffer[read];
         read = (read + 1) % cap;
-        switch (ev) {
-            .hook_request => |req| {
-                if (engine) |eng| {
-                    const veto = eng.fireHook(req.payload) catch |err| blk: {
-                        log.warn("hook dispatch failed: {}", .{err});
-                        break :blk null;
-                    };
-                    if (veto) |reason| {
-                        req.cancelled = true;
-                        req.cancel_reason = reason;
-                    }
-                }
-                // Always signal, even without an engine: the agent thread
-                // is parked on `req.done` and must be released so the
-                // tool call can proceed (or fail) cleanly.
-                req.done.set();
-            },
-            .lua_tool_request => |req| {
-                if (engine) |eng| {
-                    if (eng.executeTool(req.tool_name, req.input_raw, req.allocator)) |result| {
-                        req.result_content = result.content;
-                        req.result_is_error = result.is_error;
-                        req.result_owned = result.owned;
-                    } else |err| {
-                        req.error_name = @errorName(err);
-                    }
-                }
-                // Always signal, even without an engine, so the pushing
-                // thread doesn't block forever.
-                req.done.set();
-            },
-            .layout_request => |req| {
-                if (window_manager) |wm| {
-                    wm.handleLayoutRequest(req);
-                } else {
-                    // No WM wired yet (test harnesses, headless eval):
-                    // release the waiter with an error so the agent thread
-                    // doesn't park on done forever.
-                    req.is_error = true;
-                    req.done.set();
-                }
-            },
-            .prompt_assembly_request => |req| {
-                if (engine) |eng| {
-                    if (eng.renderPromptLayers(req.ctx, req.allocator)) |assembled| {
-                        req.result = assembled;
-                    } else |err| {
-                        req.error_name = @errorName(err);
-                    }
-                } else {
-                    // No engine means no Lua layers; the agent thread's
-                    // non-Lua fallback path owns assembly in that case.
-                    // Surface an error so a misrouted request doesn't
-                    // wedge the worker.
-                    req.error_name = "no_engine";
-                }
-                req.done.set();
-            },
-            .jit_context_request => |req| {
-                if (engine) |eng| {
-                    eng.handleJitContextRequest(req) catch |err| {
-                        req.error_name = @errorName(err);
-                    };
-                }
-                // No engine means no handlers can be registered; treat
-                // as a clean miss (result stays null) so the worker
-                // proceeds without an attachment. Always signal done so
-                // the producer doesn't park forever.
-                req.done.set();
-            },
-            .tool_transform_request => |req| {
-                if (engine) |eng| {
-                    eng.handleToolTransformRequest(req) catch |err| {
-                        req.error_name = @errorName(err);
-                    };
-                }
-                // Same rationale as `jit_context_request`: a missing
-                // engine is a clean miss; always signal done.
-                req.done.set();
-            },
-            .tool_gate_request => |req| {
-                if (engine) |eng| {
-                    eng.handleToolGateRequest(req) catch |err| {
-                        req.error_name = @errorName(err);
-                    };
-                }
-                // No engine means no gate can be registered; clean miss
-                // (result stays null) so the worker proceeds with the
-                // full registry. Always signal done so the producer
-                // doesn't park forever.
-                req.done.set();
-            },
-            .loop_detect_request => |req| {
-                if (engine) |eng| {
-                    eng.handleLoopDetectRequest(req) catch |err| {
-                        req.error_name = @errorName(err);
-                    };
-                }
-                // Same rationale as `tool_gate_request`: a missing
-                // engine is a clean miss (no detector); always signal
-                // done so the producer doesn't park forever.
-                req.done.set();
-            },
-            .compact_request => |req| {
-                if (engine) |eng| {
-                    eng.handleCompactRequest(req) catch |err| {
-                        req.error_name = @errorName(err);
-                    };
-                }
-                // Same rationale as `tool_gate_request`: a missing
-                // engine is a clean miss (no strategy); always signal
-                // done so the producer doesn't park forever.
-                req.done.set();
-            },
-            else => {
-                queue.buffer[write] = ev;
-                write = (write + 1) % cap;
-                kept += 1;
-            },
+        if (!serviceRoundTripEvent(ev, engine, window_manager)) {
+            queue.buffer[write] = ev;
+            write = (write + 1) % cap;
+            kept += 1;
         }
     }
     queue.len = kept;
@@ -735,6 +750,12 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
 /// one is attached. The sink owns all node-correlation state; the
 /// runner just forwards the event payload.
 pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allocator: Allocator) void {
+    // Round-trip requests normally land in `dispatchHookRequests`, but a
+    // request pushed between dispatch and drain can slip into the drain
+    // queue. Service it here on the same terms the dispatch path uses
+    // so the producer wakes with a real result instead of a synthetic
+    // `drained_without_dispatch` failure.
+    if (serviceRoundTripEvent(event, self.lua_engine, self.window_manager)) return;
     self.persistAgentEvent(event);
     switch (event) {
         .text_delta => |text| {
@@ -804,40 +825,19 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             }
             self.sink.push(.{ .error_event = .{ .text = text } });
         },
-        // These round-trip events are normally consumed by
-        // `dispatchHookRequests` before the drain sees them. If one slips
-        // through (e.g. because dispatch ran with a null engine), signal
-        // `done` so the producer in the agent thread doesn't block forever.
-        .hook_request => |req| req.done.set(),
-        .lua_tool_request => |req| req.done.set(),
-        .layout_request => |req| {
-            req.is_error = true;
-            req.done.set();
-        },
-        .prompt_assembly_request => |req| {
-            req.error_name = "drained_without_dispatch";
-            req.done.set();
-        },
-        .jit_context_request => |req| {
-            req.error_name = "drained_without_dispatch";
-            req.done.set();
-        },
-        .tool_transform_request => |req| {
-            req.error_name = "drained_without_dispatch";
-            req.done.set();
-        },
-        .tool_gate_request => |req| {
-            req.error_name = "drained_without_dispatch";
-            req.done.set();
-        },
-        .loop_detect_request => |req| {
-            req.error_name = "drained_without_dispatch";
-            req.done.set();
-        },
-        .compact_request => |req| {
-            req.error_name = "drained_without_dispatch";
-            req.done.set();
-        },
+        // Round-trip request variants are handled by the early
+        // `serviceRoundTripEvent` call at the top of this function; the
+        // switch never reaches them.
+        .hook_request,
+        .lua_tool_request,
+        .layout_request,
+        .prompt_assembly_request,
+        .jit_context_request,
+        .tool_transform_request,
+        .tool_gate_request,
+        .loop_detect_request,
+        .compact_request,
+        => unreachable,
     }
 }
 
