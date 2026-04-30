@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const ScratchBuffer = @import("buffers/scratch.zig");
 const GraphicsBuffer = @import("buffers/graphics.zig");
 const Buffer = @import("Buffer.zig");
+const View = @import("View.zig");
 
 const BufferRegistry = @This();
 
@@ -34,6 +35,13 @@ pub const Entry = union(Kind) {
         return switch (self) {
             .scratch => |p| p.buf(),
             .graphics => |p| p.buf(),
+        };
+    }
+
+    fn asView(self: Entry) View {
+        return switch (self) {
+            .scratch => |p| p.view(),
+            .graphics => |p| p.view(),
         };
     }
 };
@@ -105,6 +113,10 @@ pub fn resolve(self: *const BufferRegistry, handle: Handle) Error!Entry {
 
 pub fn asBuffer(self: *const BufferRegistry, handle: Handle) Error!Buffer {
     return (try self.resolve(handle)).asBuffer();
+}
+
+pub fn asView(self: *const BufferRegistry, handle: Handle) Error!View {
+    return (try self.resolve(handle)).asView();
 }
 
 pub fn remove(self: *BufferRegistry, handle: Handle) (Error || Allocator.Error)!void {

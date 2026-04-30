@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
 const Buffer = @import("Buffer.zig");
+const View = @import("View.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationTree = @import("ConversationTree.zig");
 const EventOrchestrator = @import("EventOrchestrator.zig");
@@ -292,7 +293,21 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
 /// resolved style. Shrinks the rect by 1 cell on each side to leave room
 /// for the pane's frame, then applies padding_h/padding_v from the theme.
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
-    self.drawBufferIntoRect(leaf.buffer, leaf.rect, true);
+    const view = self.viewForBuffer(leaf.buffer) catch return;
+    self.drawBufferIntoRect(leaf.buffer, view, leaf.rect, true);
+}
+
+/// Resolve the View to render `buf` through. Looks up the owning Pane
+/// when an orchestrator is wired; otherwise falls back to a frame-arena
+/// trampoline View that re-dispatches through `Buffer.VTable`. The
+/// trampoline lives in the per-frame arena and survives only this paint;
+/// commit 3 of the view-extraction migrates every paint path onto a
+/// real Pane and the fallback goes away.
+fn viewForBuffer(self: *Compositor, buf: Buffer) !View {
+    if (self.orchestrator) |orch| {
+        if (orch.window_manager.paneFromBuffer(buf)) |pane| return pane.view;
+    }
+    return buf.asView(self.frame_arena.allocator());
 }
 
 /// Render `buf` into `outer`, where `outer` is the chrome-inclusive
@@ -303,6 +318,7 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
 fn drawBufferIntoRect(
     self: *Compositor,
     buf: Buffer,
+    view: View,
     outer: Layout.Rect,
     reserve_prompt_row: bool,
 ) void {
@@ -327,7 +343,7 @@ fn drawBufferIntoRect(
     const content_width: u16 = if (content_max_col > content_x) content_max_col - content_x else 0;
 
     const plan = planScroll(
-        buf,
+        view,
         self.theme,
         self.frame_arena.allocator(),
         self.allocator,
@@ -592,7 +608,7 @@ fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u
 /// transcripts don't jitter at the bottom edge as logical lines straddle the
 /// visible-start boundary.
 fn planScroll(
-    buf: Buffer,
+    view: View,
     theme: *const Theme,
     frame_alloc: Allocator,
     cache_alloc: Allocator,
@@ -600,7 +616,7 @@ fn planScroll(
     visible_rows: u16,
     scroll_rows: u32,
 ) !ScrollPlan {
-    const total_logical = try buf.lineCount();
+    const total_logical = try view.lineCount();
     if (total_logical == 0 or visible_rows == 0 or content_width == 0) {
         return .{
             .total_rows = 0,
@@ -612,7 +628,7 @@ fn planScroll(
         };
     }
 
-    const all = try buf.getVisibleLines(frame_alloc, cache_alloc, theme, 0, total_logical);
+    const all = try view.getVisibleLines(frame_alloc, cache_alloc, theme, 0, total_logical);
 
     var total: u32 = 0;
     for (all.items) |line| {
@@ -1009,7 +1025,8 @@ fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputS
         // ignored by Screen.clearRect itself.
         self.screen.clearRect(rect.y, rect.x, rect.width, rect.height);
 
-        self.drawBufferIntoRect(float.buffer, rect, false);
+        const float_view = self.viewForBuffer(float.buffer) catch continue;
+        self.drawBufferIntoRect(float.buffer, float_view, rect, false);
         self.drawRoundedBox(rect, fd.focused, float.config.title, float.config.border);
 
         // Insert-mode cursor block for the focused float. Floats today
@@ -1976,7 +1993,7 @@ test "planScroll: short content fits, no scroll" {
 
     const theme = Theme.defaultTheme();
     const plan = try planScroll(
-        cb.buf(),
+        cb.view(),
         &theme,
         arena.allocator(),
         allocator,
@@ -2007,7 +2024,7 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
 
     const theme = Theme.defaultTheme();
     const plan = try planScroll(
-        cb.buf(),
+        cb.view(),
         &theme,
         arena.allocator(),
         allocator,
@@ -2040,7 +2057,7 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     // is the first where cum + rows > visible_start_rows, so skip = 8 and
     // leading_skip_rows = 24 - 24 = 0.
     const plan = try planScroll(
-        cb.buf(),
+        cb.view(),
         &theme,
         arena.allocator(),
         allocator,
@@ -2064,7 +2081,7 @@ test "planScroll: scroll past total clamps to zero rows" {
     defer arena.deinit();
 
     const theme = Theme.defaultTheme();
-    const plan = try planScroll(cb.buf(), &theme, arena.allocator(), allocator, 20, 10, 999);
+    const plan = try planScroll(cb.view(), &theme, arena.allocator(), allocator, 20, 10, 999);
     try std.testing.expectEqual(@as(usize, 0), plan.take);
 }
 
@@ -2089,7 +2106,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
 
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 40, .height = 11 };
 
-    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
 
     // Drop a sentinel glyph in the middle of the content rect to mimic a
     // stale render artefact left over from a previous frame.
@@ -2102,7 +2119,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
     // Repaint without changing the buffer. The clear should wipe the
     // sentinel even though no logical line in the buffer ever wrote to
     // that row.
-    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(sentinel_row, sentinel_col).codepoint);
 }
 
@@ -2311,7 +2328,7 @@ test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
     // pane_width=5. Spans ["abcde","f"] fill cols 2..6 then wrap "f" to
     // the next row at col 2.
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
-    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
 
     // First-row content: 'a' at col 2, 'e' at col 6.
     try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(1, 2).codepoint);
@@ -2371,7 +2388,7 @@ test "composite: wrapped continuation lands at content_x, not span tail (Bug B r
     // ' ' would land at col 13 = max_col → wrap. Continuation at content_x=2
     // begins with ' ', then 'f','r','o','m' at cols 2..6.
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 14, .height = 8 };
-    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
 
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 2).codepoint);
     try std.testing.expectEqual(@as(u21, 'w'), screen.getCellConst(1, 8).codepoint);
@@ -2437,7 +2454,7 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     // leading_skip_rows > 0 for this fixture, otherwise we're not actually
     // exercising the mid-line scroll path.
     const probe = try planScroll(
-        cb.buf(),
+        cb.view(),
         &theme,
         compositor.frame_arena.allocator(),
         compositor.allocator,
@@ -2448,7 +2465,7 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     try std.testing.expect(probe.leading_skip_rows > 0);
 
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
-    compositor.drawBufferIntoRect(cb.buf(), outer, true);
+    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
 
     // content_y = outer.y + 1 + padding_v(0) = 1. visible_rows=3, so
     // content rows occupy 1..3. The bottom visible row is row 3, holding
