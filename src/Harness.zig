@@ -20,11 +20,28 @@
 //!    stable/volatile prompt.
 
 const std = @import("std");
+const posix = std.posix;
 const prompt = @import("prompt.zig");
 const types = @import("types.zig");
 const Reminder = @import("Reminder.zig");
+const llm = @import("llm.zig");
+const tools = @import("tools.zig");
+const Trajectory = @import("Trajectory.zig");
+const ConversationBuffer = @import("ConversationBuffer.zig");
+const ConversationHistory = @import("ConversationHistory.zig");
+const AgentRunner = @import("AgentRunner.zig");
+const Layout = @import("Layout.zig");
+const LuaEngine = @import("LuaEngine.zig").LuaEngine;
+const Session = @import("Session.zig");
+const agent_events = @import("agent_events.zig");
+const BufferSink = @import("sinks/BufferSink.zig").BufferSink;
+const skills_mod = @import("skills.zig");
+const auth_wizard = @import("auth_wizard.zig");
+const cli_args = @import("cli_args.zig");
+const cli_auth = @import("cli_auth.zig");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.harness);
 
 /// Return a new `messages` slice where `.thinking` and `.redacted_thinking`
 /// blocks are removed from every assistant message strictly before the
@@ -283,6 +300,432 @@ fn findLastTopLevelUserIndex(items: []const types.Message) ?usize {
         if (msg.role == .user and !isToolResultOnly(msg.content)) return i - 1;
     }
     return null;
+}
+
+// -- Headless eval entry point ----------------------------------------------
+
+/// Inputs threaded into `runWithProvider` after every subsystem has been
+/// constructed. Splitting construction from execution keeps the outer entry
+/// point testable without mocking the Lua provider factory.
+pub const HeadlessDeps = struct {
+    mode: cli_args.HeadlessMode,
+    gpa: Allocator,
+    provider: *llm.Provider,
+    model_id: []const u8,
+    registry: *const tools.Registry,
+    /// Endpoint registry (`provider/model` rate cards). Borrowed from the
+    /// `ProviderResult` in the caller; not owned here. Passed to
+    /// `llm.cost.estimateCost` for per-turn cost estimation.
+    endpoint_registry: *const llm.Registry,
+    lua_engine: ?*LuaEngine,
+    runner: *AgentRunner,
+    session: *ConversationHistory,
+    wake_read_fd: posix.fd_t,
+    wake_write_fd: posix.fd_t,
+    session_id: []const u8,
+};
+
+/// Headless entry point: wires every subsystem the agent loop needs, then
+/// hands control to `runWithProvider`. TUI subsystems (Terminal, Screen,
+/// Compositor, EventOrchestrator) are intentionally never constructed.
+pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
+    var root_session = ConversationHistory.init(gpa);
+    defer root_session.deinit();
+
+    var root_buffer = try ConversationBuffer.init(gpa, 0, "session");
+    defer root_buffer.deinit();
+
+    // BufferSink owns the node-correlation state that used to live on the
+    // runner. Its lifetime matches main's defer chain, so it stays on the
+    // stack rather than in a heap slot.
+    var root_buffer_sink = BufferSink.init(gpa, &root_buffer);
+    defer root_buffer_sink.deinit();
+
+    var root_runner = AgentRunner.init(gpa, root_buffer_sink.sink(), &root_session);
+    defer root_runner.deinit();
+
+    const wake_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const wake_read = wake_fds[0];
+    const wake_write = wake_fds[1];
+    defer {
+        posix.close(wake_read);
+        posix.close(wake_write);
+    }
+    root_runner.wake_fd = wake_write;
+
+    var layout = Layout.init(gpa);
+    defer layout.deinit();
+    try layout.setRoot(root_buffer.buf());
+
+    var lua_engine: ?LuaEngine = LuaEngine.init(gpa) catch |err| blk: {
+        log.warn("lua init failed, plugins disabled: {}", .{err});
+        break :blk null;
+    };
+    defer if (lua_engine) |*eng| eng.deinit();
+
+    if (lua_engine) |*eng| {
+        // Builtins (zag.builtin.*) register their slash commands before
+        // config.lua runs so a user override via `zag.command{name="..."}`
+        // shadows the default; the command registry's last-write-wins
+        // semantics deliver that outcome without extra plumbing here.
+        eng.loadBuiltinPlugins();
+        eng.loadUserConfig();
+        if (eng.providers_registry.endpoints.items.len == 0) {
+            log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
+            _ = eng.bootstrapStdlibProviders();
+        }
+    }
+
+    const auth_path = try auth_wizard.buildAuthPath(gpa);
+    defer gpa.free(auth_path);
+
+    // Discover skills before the agent loop assembles its system prompt:
+    // SKILL.md frontmatter anywhere under `<project>/.zag/skills`,
+    // `<project>/.agents/skills`, or `~/.config/zag/skills` becomes an entry
+    // in the `<available_skills>` block.
+    var skills_registry = skills_mod.SkillRegistry.discoverFromDefaults(gpa);
+    defer skills_registry.deinit(gpa);
+    root_runner.skills = &skills_registry;
+
+    const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
+    // If the Lua engine failed to boot, fall back to an empty registry.
+    // `createProviderFromLuaConfig` will surface UnknownProvider, which the
+    // caller routes to the "no credentials" hint.
+    var registry_view = LuaEngine.RegistryView.init(gpa, if (lua_engine) |*eng| eng else null);
+    defer registry_view.deinit();
+    const registry_ptr = registry_view.ptr();
+
+    var provider = llm.createProviderFromLuaConfig(registry_ptr, default_model, auth_path, gpa) catch |err| {
+        if (err == error.MissingCredential) {
+            const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+            const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
+            var scratch: [512]u8 = undefined;
+            const message = cli_auth.formatMissingCredentialHint(&scratch, model_id, registry_ptr);
+            _ = stderr_file.write(message) catch {};
+        }
+        return err;
+    };
+    defer provider.deinit();
+
+    var registry = try tools.createDefaultRegistry(gpa);
+    defer registry.deinit();
+
+    if (lua_engine) |*eng| {
+        root_runner.lua_engine = eng;
+        eng.registerTools(&registry) catch |err| {
+            log.warn("failed to register lua tools: {}", .{err});
+        };
+        tools.registerTaskTool(&registry, eng.subagentRegistry()) catch |err| {
+            log.warn("failed to register task tool: {}", .{err});
+        };
+    }
+
+    var session_mgr = if (!mode.no_session)
+        Session.SessionManager.init(gpa) catch |err| blk: {
+            log.warn("session init failed, persistence disabled: {}", .{err});
+            break :blk null;
+        }
+    else
+        null;
+
+    var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(null, provider.model_id) else null;
+    defer if (session_handle) |*sh| sh.close();
+
+    if (session_handle) |*sh| root_session.attachSession(sh);
+
+    // Derive a stable session id for the trajectory. Falls back to a
+    // timestamp-based synthetic id when --no-session suppresses persistence.
+    var synth_id_buf: [32]u8 = undefined;
+    const session_id: []const u8 = if (session_handle) |*sh|
+        sh.id[0..sh.id_len]
+    else
+        std.fmt.bufPrint(&synth_id_buf, "headless-{d}", .{std.time.milliTimestamp()}) catch "headless";
+
+    if (lua_engine) |*eng| {
+        eng.initAsync(4, 256) catch |err| {
+            log.warn("lua async runtime init failed: {}", .{err});
+        };
+        if (eng.async_runtime) |rt| rt.completions.wake_fd = wake_write;
+    }
+    defer if (lua_engine) |*eng| eng.deinitAsync();
+
+    try runWithProvider(.{
+        .mode = mode,
+        .gpa = gpa,
+        .provider = &provider.provider,
+        .model_id = provider.model_id,
+        .registry = &registry,
+        .endpoint_registry = &provider.registry,
+        .lua_engine = if (lua_engine) |*eng| eng else null,
+        .runner = &root_runner,
+        .session = &root_session,
+        .wake_read_fd = wake_read,
+        .wake_write_fd = wake_write,
+        .session_id = session_id,
+    });
+}
+
+/// Execute a single-shot headless agent run: read the instruction, submit a
+/// user turn, drain agent events while servicing Lua hooks, then serialize
+/// the captured transcript as ATIF-v1.2 JSON to `mode.trajectory_out`.
+/// Assumes every subsystem in `deps` has already been initialized.
+fn runWithProvider(deps: HeadlessDeps) !void {
+    const gpa = deps.gpa;
+
+    const instruction = try std.fs.cwd().readFileAlloc(gpa, deps.mode.instruction_file, 1 << 20);
+    defer gpa.free(instruction);
+
+    // Reproduce the agent loop's prompt assembly so the captured trajectory's
+    // `system_prompt` field matches what the LLM saw on the wire. The headless
+    // run never streams the assembled value through its own `LayerContext`;
+    // we just need the joined string for ATIF.
+    const tool_defs = try deps.registry.definitions(gpa);
+    defer gpa.free(tool_defs);
+
+    var prompt_registry = try defaultRegistry(gpa);
+    defer prompt_registry.deinit(gpa);
+
+    var env_snapshot = try prompt.EnvSnapshot.capture(gpa);
+    defer env_snapshot.deinit();
+
+    const layer_ctx: prompt.LayerContext = .{
+        .model = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id),
+        .cwd = env_snapshot.cwd,
+        .worktree = env_snapshot.worktree,
+        .agent_name = "zag",
+        .date_iso = env_snapshot.date_iso,
+        .is_git_repo = env_snapshot.is_git_repo,
+        .platform = @tagName(@import("builtin").target.os.tag),
+        .tools = tool_defs,
+        .skills = deps.runner.skills,
+    };
+
+    var assembled = try assembleSystem(&prompt_registry, &layer_ctx, gpa);
+    defer assembled.deinit();
+
+    const system_prompt = try llm.joinSystemParts(assembled.stable, assembled.@"volatile", gpa);
+    defer gpa.free(system_prompt);
+
+    try deps.runner.submitInput(instruction);
+
+    var capture = Trajectory.Capture.init(gpa);
+    defer capture.deinit();
+
+    const started_at = std.time.milliTimestamp();
+    try capture.beginTurn(started_at);
+
+    const spec = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id);
+    try deps.runner.submit(&deps.session.messages, .{
+        .allocator = gpa,
+        .wake_write_fd = deps.wake_write_fd,
+        .lua_engine = deps.lua_engine,
+        .provider = deps.provider.*,
+        .model_spec = spec,
+        .registry = deps.registry,
+        .subagents = if (deps.lua_engine) |eng| eng.subagentRegistry() else null,
+        .session_id = deps.session_id,
+    });
+
+    // Synthetic ids for tool_start events without a provider-assigned call_id
+    // (streaming previews). FIFO-correlated with tool_result events that also
+    // lack an id.
+    var synth_counter: u32 = 0;
+    var pending_synth: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (pending_synth.items) |id| gpa.free(id);
+        pending_synth.deinit(gpa);
+    }
+
+    var pending_usage: ?llm.Usage = null;
+    var agent_err: ?[]const u8 = null;
+    defer if (agent_err) |e| gpa.free(e);
+
+    var done = false;
+    while (!done) {
+        AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine, deps.runner.window_manager);
+
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const count = deps.runner.event_queue.drain(&drain_buf);
+
+        if (count == 0) {
+            var wake_buf: [64]u8 = undefined;
+            _ = posix.read(deps.wake_read_fd, &wake_buf) catch {};
+            continue;
+        }
+
+        // `drain()` advances the queue head for the whole batch in one shot,
+        // so breaking out of this loop on `.done` or `.err` would orphan any
+        // events that follow in the same `drain_buf` slice. Free the tail
+        // explicitly in those arms before breaking.
+        for (drain_buf[0..count], 0..) |ev, idx| {
+            // Persist to JSONL before the trajectory capture takes over.
+            // `persistAgentEvent` borrows the event payload; the per-arm
+            // `defer free` chains below stay correct.
+            deps.runner.persistAgentEvent(ev);
+            switch (ev) {
+                .text_delta => |t| {
+                    defer gpa.free(t);
+                    capture.addTextDelta(t) catch |err| {
+                        log.warn("capture dropped text delta: {s}", .{@errorName(err)});
+                    };
+                },
+                .tool_start => |s| {
+                    defer {
+                        gpa.free(s.name);
+                        if (s.call_id) |id| gpa.free(id);
+                        if (s.input_raw) |raw| gpa.free(raw);
+                    }
+                    const args_json = s.input_raw orelse "{}";
+                    const tool_id = if (s.call_id) |id| id else blk: {
+                        synth_counter += 1;
+                        var buf: [16]u8 = undefined;
+                        const synth = std.fmt.bufPrint(&buf, "t{d}", .{synth_counter}) catch "t?";
+                        const owned = gpa.dupe(u8, synth) catch {
+                            break :blk "t?";
+                        };
+                        pending_synth.append(gpa, owned) catch {
+                            gpa.free(owned);
+                            break :blk "t?";
+                        };
+                        break :blk owned;
+                    };
+                    capture.addToolCall(tool_id, s.name, args_json) catch |err| {
+                        log.warn("capture dropped tool call: {s}", .{@errorName(err)});
+                    };
+                },
+                .tool_result => |r| {
+                    defer {
+                        gpa.free(r.content);
+                        if (r.call_id) |id| gpa.free(id);
+                    }
+                    // FIFO-match null-id results against the oldest outstanding
+                    // synthetic id. Parallel calls without provider ids
+                    // collapse to best-effort correlation. `Capture.addToolResult`
+                    // dupes the id string into its arena, so we free the synth
+                    // owner after the call returns.
+                    var synth_owned: ?[]const u8 = null;
+                    defer if (synth_owned) |id| gpa.free(id);
+                    const tool_id = if (r.call_id) |id| id else blk: {
+                        if (pending_synth.items.len == 0) break :blk "";
+                        const id = pending_synth.orderedRemove(0);
+                        synth_owned = id;
+                        break :blk id;
+                    };
+                    capture.addToolResult(tool_id, r.content, r.is_error) catch |err| {
+                        log.warn("capture dropped tool result: {s}", .{@errorName(err)});
+                    };
+                },
+                .info => |text| {
+                    defer gpa.free(text);
+                    if (Trajectory.parseTokenInfo(text)) |u| {
+                        pending_usage = .{
+                            .input_tokens = u.input,
+                            .output_tokens = u.output,
+                            .cache_creation_tokens = u.cache_creation,
+                            .cache_read_tokens = u.cache_read,
+                        };
+                    }
+                },
+                .done => {
+                    const metrics: Trajectory.TurnMetrics = if (pending_usage) |u| .{
+                        .prompt_tokens = u.input_tokens,
+                        .completion_tokens = u.output_tokens,
+                        .cached_tokens = if (u.cache_read_tokens > 0) u.cache_read_tokens else null,
+                        .cost_usd = llm.cost.estimateCost(deps.endpoint_registry, deps.model_id, u),
+                    } else .{};
+                    capture.endTurn(metrics) catch |err| {
+                        log.warn("capture endTurn failed: {s}", .{@errorName(err)});
+                    };
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
+                    if (deps.runner.agent_thread) |t| t.join();
+                    deps.runner.agent_thread = null;
+                    deps.runner.event_queue.deinit();
+                    deps.runner.queue_active = false;
+                    done = true;
+                    break;
+                },
+                .err => |text| {
+                    agent_err = gpa.dupe(u8, text) catch null;
+                    gpa.free(text);
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
+                    capture.endTurn(.{}) catch {};
+                    if (deps.runner.agent_thread) |t| t.join();
+                    deps.runner.agent_thread = null;
+                    deps.runner.event_queue.deinit();
+                    deps.runner.queue_active = false;
+                    done = true;
+                    break;
+                },
+                .reset_assistant_text => {},
+                .thinking_delta => |td| {
+                    defer gpa.free(td.text);
+                    capture.addThinkingDelta(td.text) catch |err| {
+                        log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
+                    };
+                },
+                .thinking_stop => {
+                    capture.addThinkingStop() catch |err| {
+                        log.warn("capture dropped thinking stop: {s}", .{@errorName(err)});
+                    };
+                },
+                .hook_request => |req| req.done.set(),
+                .lua_tool_request => |req| req.done.set(),
+                .layout_request => |req| {
+                    req.is_error = true;
+                    req.done.set();
+                },
+                .prompt_assembly_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .jit_context_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .tool_transform_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .tool_gate_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .loop_detect_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+                .compact_request => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
+            }
+        }
+    }
+
+    const traj = try capture.build(gpa, .{
+        .session_id = deps.session_id,
+        .agent = .{
+            .name = "zag",
+            .version = "0.1.0",
+            .model_name = deps.model_id,
+        },
+        .system_prompt = system_prompt,
+        .user_instruction = instruction,
+        .model = deps.model_id,
+    });
+    defer Trajectory.freeTrajectory(traj, gpa);
+
+    const file = try std.fs.cwd().createFile(deps.mode.trajectory_out, .{ .truncate = true });
+    defer file.close();
+    var buffer: std.io.Writer.Allocating = .init(gpa);
+    defer buffer.deinit();
+    try Trajectory.serialize(traj, gpa, &buffer.writer);
+    try file.writeAll(buffer.written());
+
+    if (agent_err) |e| {
+        log.err("headless agent error: {s}", .{e});
+        return error.AgentFailed;
+    }
 }
 
 // -- Tests ------------------------------------------------------------------

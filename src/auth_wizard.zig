@@ -18,6 +18,7 @@ const oauth = @import("oauth.zig");
 const llm = @import("llm.zig");
 const auth = @import("auth.zig");
 const embedded = @import("lua/embedded.zig");
+const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 
 const Endpoint = llm.Endpoint;
 
@@ -26,6 +27,48 @@ const Endpoint = llm.Endpoint;
 /// production; tests swap in a stub so the dispatch arm can be exercised
 /// without binding a real loopback listener.
 pub const OAuthRunFn = *const fn (std.mem.Allocator, oauth.LoginOptions) anyerror!void;
+
+/// Bundle of owned path strings returned by `buildPaths`. Both paths are
+/// derived from the same `$HOME` lookup so callers free a pair instead of
+/// three separate strings.
+pub const Paths = struct {
+    auth_path: []u8,
+    config_path: []u8,
+
+    pub fn deinit(self: Paths, allocator: std.mem.Allocator) void {
+        allocator.free(self.auth_path);
+        allocator.free(self.config_path);
+    }
+};
+
+/// Resolve `~/.config/zag/auth.json` and `~/.config/zag/config.lua` against
+/// `$HOME`. Mirrors `LuaEngine.loadUserConfig`'s lookup so the wizard agrees
+/// with the engine on file locations. Propagates any HOME read error.
+pub fn buildPaths(allocator: std.mem.Allocator) !Paths {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+
+    const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home});
+    errdefer allocator.free(auth_path);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/config.lua", .{home});
+    return .{ .auth_path = auth_path, .config_path = config_path };
+}
+
+/// Build the canonical `~/.config/zag/auth.json` path. Caller frees the
+/// returned slice. Falls back to `./.config/zag/auth.json` if HOME is unset
+/// so we don't crash under `env -i`; the login flow surfaces a clearer
+/// error downstream when it tries to persist.
+pub fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => blk: {
+            log.warn("HOME unset; falling back to \".\" for auth.json path", .{});
+            break :blk try allocator.dupe(u8, ".");
+        },
+        else => return err,
+    };
+    defer allocator.free(home_dir);
+    return std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home_dir});
+}
 
 /// Dependencies passed to every wizard entry point. Keeping I/O behind
 /// `std.Io.Reader` / `std.Io.Writer` lets tests feed canned bytes and inspect
@@ -1088,6 +1131,116 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
         try deps.stdout.print("{s} not configured; nothing to remove.\n", .{provider_name});
     }
     try deps.stdout.flush();
+}
+
+/// Handle `createProviderFromEnv` returning `error.MissingCredential` at
+/// first-run: drop into the onboarding wizard when stdin is a TTY, then
+/// reload Lua and retry provider creation once. On a non-TTY or repeated
+/// failure, prints an actionable stderr message and `std.process.exit(1)` so
+/// the user sees only the friendly message, not a Zig error-return trace.
+pub fn firstRunWizardRetry(
+    allocator: std.mem.Allocator,
+    lua_engine: ?*LuaEngine,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !llm.ProviderResult {
+    const default_model: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
+    const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
+    const spec = llm.parseModelString(model_id);
+
+    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+
+    if (!is_tty) {
+        var scratch: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &scratch,
+            "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
+            .{ spec.provider_name, spec.provider_name },
+        ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
+        _ = stderr.write(msg) catch {};
+        std.process.exit(1);
+    }
+
+    const paths = buildPaths(allocator) catch |err| {
+        log.err("first-run wizard: unable to resolve config paths: {}", .{err});
+        return err;
+    };
+    defer paths.deinit(allocator);
+
+    // Scaffold config.lua only when it's truly absent; a user with a pinned
+    // default_model should keep their file untouched.
+    const scaffold = blk: {
+        std.fs.accessAbsolute(paths.config_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk true,
+            else => break :blk false,
+        };
+        break :blk false;
+    };
+
+    // The wizard iterates the engine's provider registry for its picker.
+    // If the engine didn't boot we have nothing to show; fall back to an
+    // empty registry so `runWizard` surfaces `NoProvidersConfigured` rather
+    // than walking an uninitialised slice.
+    var wizard_view = LuaEngine.RegistryView.init(allocator, lua_engine);
+    defer wizard_view.deinit();
+    const wizard_registry = wizard_view.ptr();
+
+    const deps: WizardDeps = .{
+        .allocator = allocator,
+        .stdin = stdin,
+        .stdout = stdout,
+        .is_tty = true,
+        .auth_path = paths.auth_path,
+        .config_path = paths.config_path,
+        .scaffold_config = scaffold,
+        .forced_provider = null,
+        .registry = wizard_registry,
+    };
+
+    const result = runWizard(deps) catch |err| {
+        if (err == error.NonInteractiveFirstRun) {
+            var scratch: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &scratch,
+                "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
+                .{ spec.provider_name, spec.provider_name },
+            ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
+            _ = stderr.write(msg) catch {};
+            std.process.exit(1);
+        }
+        return err;
+    };
+    defer allocator.free(result.provider_name);
+
+    // Reload Lua so a freshly scaffolded config.lua's default_model becomes
+    // visible before the retry. If scaffolding was skipped (config already
+    // present), reload is a no-op in terms of default_model but still safe.
+    if (lua_engine) |eng| {
+        eng.loadUserConfig();
+        if (eng.providers_registry.endpoints.items.len == 0) {
+            _ = eng.bootstrapStdlibProviders();
+        }
+    }
+
+    const new_default: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
+    var retry_view = LuaEngine.RegistryView.init(allocator, lua_engine);
+    defer retry_view.deinit();
+    return llm.createProviderFromEnv(retry_view.ptr(), new_default, allocator) catch |err| {
+        if (err == error.MissingCredential) {
+            const new_model = new_default orelse "anthropic/claude-sonnet-4-20250514";
+            const new_spec = llm.parseModelString(new_model);
+            var scratch: [768]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &scratch,
+                "zag: config.lua sets default model to '{s}', but no credential is configured for provider '{s}'. Edit ~/.config/zag/config.lua to use the provider you just added ('{s}').\n",
+                .{ new_model, new_spec.provider_name, result.provider_name },
+            ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
+            _ = stderr.write(msg) catch {};
+            std.process.exit(1);
+        }
+        return err;
+    };
 }
 
 // -- Tests -------------------------------------------------------------------

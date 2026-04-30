@@ -277,6 +277,33 @@ pub const LuaEngine = struct {
         pub const METATABLE_NAME = "zag.TaskHandle";
     };
 
+    /// Borrowed view of the active provider registry. Callers that may not
+    /// have a `LuaEngine` (engine boot failed, or the path was sandboxed
+    /// before init) hand the optional pointer to `RegistryView.init`; with
+    /// an engine, the source of truth is the engine's `providers_registry`,
+    /// without one, an empty `llm.Registry` is allocated as a fallback so
+    /// downstream code never has to special-case `null`.
+    pub const RegistryView = struct {
+        engine: ?*LuaEngine,
+        fallback: ?llm.Registry,
+
+        pub fn init(allocator: std.mem.Allocator, engine: ?*LuaEngine) RegistryView {
+            return .{
+                .engine = engine,
+                .fallback = if (engine == null) llm.Registry.init(allocator) else null,
+            };
+        }
+
+        pub fn ptr(self: *const RegistryView) *const llm.Registry {
+            if (self.engine) |eng| return &eng.providers_registry;
+            return &self.fallback.?;
+        }
+
+        pub fn deinit(self: *RegistryView) void {
+            if (self.fallback) |*r| r.deinit();
+        }
+    };
+
     /// Create a new LuaEngine. Sets up the VM, installs the `zag.*`
     /// globals, and populates the keymap registry with built-in defaults.
     /// Does NOT load user config; callers invoke `loadUserConfig` for that
@@ -435,6 +462,35 @@ pub const LuaEngine = struct {
                 log.warn("builtin plugin load failed: {s}: {}", .{ entry.name, err });
             };
         }
+    }
+
+    /// Iterate the embedded stdlib manifest and `require(...)` each entry so
+    /// the engine's `providers_registry` ends up populated with every shipped
+    /// provider. Called from main when `config.lua` left the registry empty
+    /// (first run, or a config that explicitly declared zero providers); also
+    /// used by the CLI subcommand paths that need a working provider table
+    /// without a user's config.lua.
+    ///
+    /// Failures on individual modules are logged and skipped; one broken
+    /// stdlib entry must not take down the whole picker. Returns the number
+    /// of modules that loaded successfully.
+    pub fn bootstrapStdlibProviders(self: *LuaEngine) usize {
+        self.storeSelfPointer();
+        var loaded: usize = 0;
+        for (embedded.entries) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "zag.providers.")) continue;
+            var src_buf: [128]u8 = undefined;
+            const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
+                log.warn("stdlib bootstrap: module name too long: {s}", .{entry.name});
+                continue;
+            };
+            self.lua.doString(src) catch |err| {
+                log.warn("stdlib bootstrap: failed to load {s}: {}", .{ entry.name, err });
+                continue;
+            };
+            loaded += 1;
+        }
+        return loaded;
     }
 
     /// Shut down the VM and free all owned tool metadata.
@@ -16012,4 +16068,62 @@ test "zag.loop.default treats a streak reset as a non-event" {
     try engine.handleLoopDetectRequest(&reset);
     try std.testing.expect(reset.result == null);
     try std.testing.expect(reset.error_name == null);
+}
+
+test "bootstrapStdlibProviders populates an empty engine registry" {
+    // First-run scenario: fresh LuaEngine with no config.lua loaded. The
+    // bootstrap helper must `require()` every stdlib module and leave the
+    // registry carrying every provider the embedded manifest advertises.
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
+
+    // Count how many embedded entries are provider stdlib modules; the
+    // loader skips anything outside the `zag.providers.*` prefix
+    // (e.g. the `zag.builtin.*` picker plugins).
+    var expected_providers: usize = 0;
+    for (embedded.entries) |e| {
+        if (std.mem.startsWith(u8, e.name, "zag.providers.")) expected_providers += 1;
+    }
+    const loaded = engine.bootstrapStdlibProviders();
+    try std.testing.expectEqual(expected_providers, loaded);
+    try std.testing.expectEqual(expected_providers, engine.providers_registry.endpoints.items.len);
+
+    // Spot-check: anthropic (api-key) and openai-oauth (oauth) both installed.
+    try std.testing.expect(engine.providers_registry.find("anthropic") != null);
+    const oauth_ep = engine.providers_registry.find("openai-oauth").?;
+    try std.testing.expectEqual(std.meta.Tag(llm.Endpoint.Auth).oauth, std.meta.activeTag(oauth_ep.auth));
+}
+
+test "bootstrap is a no-op when config.lua already populated the registry" {
+    // User with an explicit `require("zag.providers.anthropic")` in their
+    // config.lua: the registry is non-empty, so the bootstrap fallback must
+    // not fire. Hand-seed one endpoint, then assert the main() guard
+    // (`endpoints.items.len == 0`) would leave the registry untouched.
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    const ep: llm.Endpoint = .{
+        .name = "anthropic",
+        .serializer = .anthropic,
+        .url = "https://api.anthropic.com/v1/messages",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "claude-sonnet-4-20250514",
+        .models = &.{},
+    };
+    try engine.providers_registry.add(try ep.dupe(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), engine.providers_registry.endpoints.items.len);
+
+    // Mirror the guard in main(): only load stdlib when the registry is
+    // empty. A pre-populated registry must stay exactly as the user left it.
+    if (engine.providers_registry.endpoints.items.len == 0) {
+        _ = engine.bootstrapStdlibProviders();
+    }
+    try std.testing.expectEqual(@as(usize, 1), engine.providers_registry.endpoints.items.len);
 }
