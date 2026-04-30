@@ -1974,20 +1974,19 @@ fn swapProviderOnPanePtr(
         break :blk true;
     } else false;
 
-    var scratch: [512]u8 = undefined;
-    const msg = if (persisted)
-        std.fmt.bufPrint(
-            &scratch,
+    if (persisted) {
+        self.appendStatusFmt(
+            "model swapped",
             "model -> {s}\n  saved as default in {s}",
             .{ model_string, config_path.? },
-        ) catch "model swapped"
-    else
-        std.fmt.bufPrint(
-            &scratch,
+        );
+    } else {
+        self.appendStatusFmt(
+            "model swapped",
             "model -> {s}\n  Persist with zag.set_default_model(\"{s}\") in config.lua",
             .{ model_string, model_string },
-        ) catch "model swapped";
-    self.appendStatus(msg);
+        );
+    }
 }
 
 /// Derive the `config.lua` path that lives alongside `auth_path`. zag
@@ -2014,6 +2013,21 @@ pub fn appendStatus(self: *WindowManager, text: []const u8) void {
     const view = self.root_pane.view orelse return;
     _ = view.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
+}
+
+/// Format `fmt` with `args` into a stack scratch buffer and route the
+/// result through `appendStatus`. On format overflow falls back to the
+/// literal `fallback` string so a too-long status never blocks a UI
+/// update.
+pub fn appendStatusFmt(
+    self: *WindowManager,
+    comptime fallback: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    var scratch: [1024]u8 = undefined;
+    const text = std.fmt.bufPrint(&scratch, fmt, args) catch fallback;
+    self.appendStatus(text);
 }
 
 /// Return the provider name embedded in `self.provider.model_id`, which
@@ -2048,8 +2062,7 @@ pub fn handlePerfCommand(self: *WindowManager, command: []const u8) void {
 /// frame span starts.
 fn showPerfStats(self: *WindowManager) void {
     const stats = trace.getStats();
-    var scratch: [768]u8 = undefined;
-    const msg = std.fmt.bufPrint(&scratch,
+    self.appendStatusFmt("Performance: error formatting",
         \\Performance:
         \\  frames recorded:   {d}
         \\  avg frame:         {d:.1}ms
@@ -2074,23 +2087,22 @@ fn showPerfStats(self: *WindowManager) void {
         @as(f64, @floatFromInt(stats.max_drain_us)) / 1000.0,
         @as(f64, @floatFromInt(stats.peak_memory_bytes)) / (1024.0 * 1024.0),
         stats.avg_allocs_per_frame,
-    }) catch "Performance: error formatting";
-    self.appendStatus(msg);
+    });
 }
 
 /// Write the current trace events to ./zag-trace.json and report the
 /// event count (or the error) back to the user via appendStatus.
 fn dumpTraceFile(self: *WindowManager) void {
     const count = trace.dump("zag-trace.json") catch |err| {
-        var scratch: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&scratch, "trace dump failed: {s}", .{@errorName(err)}) catch "trace dump failed";
-        self.appendStatus(err_msg);
+        self.appendStatusFmt("trace dump failed", "trace dump failed: {s}", .{@errorName(err)});
         return;
     };
     if (count == 0) return;
-    var scratch: [256]u8 = undefined;
-    const dump_msg = std.fmt.bufPrint(&scratch, "trace written to ./zag-trace.json ({d} events)", .{count}) catch "trace written to ./zag-trace.json";
-    self.appendStatus(dump_msg);
+    self.appendStatusFmt(
+        "trace written to ./zag-trace.json",
+        "trace written to ./zag-trace.json ({d} events)",
+        .{count},
+    );
 }
 
 /// Resolve the live Viewport the pane's buffer is wired to. Root uses
