@@ -16,9 +16,10 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
 
-/// Placeholder identifier published in the `LayerContext.agent_name` field
-/// while the runtime caller (the supervisor / pane) still doesn't supply
-/// a real one. The built-in layers don't read it; PR 3's Lua layers will.
+/// Default identifier published in the `LayerContext.agent_name` field
+/// when the runtime caller (the supervisor / pane) doesn't supply a real
+/// one. Built-in layers don't read it; Lua plugins see it via
+/// `ctx.agent_name`.
 const default_agent_name = "zag";
 
 /// Sentinel `ModelSpec` for callers that don't have a real one (unit tests
@@ -603,7 +604,7 @@ fn collectToolCalls(content: []const types.ContentBlock, allocator: Allocator) !
         switch (block) {
             .tool_use => |tu| try calls.append(allocator, tu),
             .text, .tool_result => {},
-            .thinking, .redacted_thinking => {}, // Task 1.6/1.7 will carry thinking across turns; not a tool call
+            .thinking, .redacted_thinking => {}, // not a tool call; providers carry thinking across turns directly
         }
     }
     return calls.toOwnedSlice(allocator);
@@ -2568,7 +2569,6 @@ test "jit handler returning nil leaves tool result untouched" {
 }
 
 test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" {
-    // End-to-end PR 8 integration test (HE8.5):
     //   1. tmpDir contains AGENTS.md and a nested child file.
     //   2. Engine eager-loads the real `zag.jit.agents_md` module via
     //      `loadBuiltinPlugins` (no stub handler).
@@ -3785,8 +3785,6 @@ test "identical streak counter increments on identical tool input and resets on 
 }
 
 test "HE10.5 integration: eager-loaded zag.loop.default fires reminder via fireLoopDetect" {
-    // End-to-end PR 10 integration test for the loop detector.
-    //
     //   1. `loadBuiltinPlugins` eager-loads `zag.loop.default`, the real
     //      stdlib detector that flags at the 5-call lenient threshold.
     //      No stub handler.
@@ -3872,8 +3870,6 @@ test "HE10.5 integration: eager-loaded zag.loop.default fires reminder via fireL
 }
 
 test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompact" {
-    // End-to-end PR 10 integration test for compaction.
-    //
     //   1. `loadBuiltinPlugins` eager-loads `zag.compact.default`, the
     //      real stdlib strategy that elides every assistant message
     //      strictly before the most recent user message.
