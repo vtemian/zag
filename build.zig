@@ -117,4 +117,22 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // agent_test.zig holds test scaffolding (stub providers, fixture
+    // builders) for the agent loop. Rooted separately so agent.zig keeps
+    // its production focus and doesn't have to import the test module.
+    const agent_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    agent_test_mod.addImport("build_options", build_options.createModule());
+    agent_test_mod.addImport("zlua", zlua_dep.module("zlua"));
+    agent_test_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+
+    const agent_tests = b.addTest(.{
+        .root_module = agent_test_mod,
+    });
+    const run_agent_tests = b.addRunArtifact(agent_tests);
+    test_step.dependOn(&run_agent_tests.step);
 }
