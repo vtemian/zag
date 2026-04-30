@@ -39,7 +39,7 @@ pub const ErrorClass = union(enum) {
     gateway_html: struct { status: u16 },
     unknown: struct { status: u16, snippet: []const u8 },
 
-    pub const AuthReason = enum { missing, expired, gateway_blocked };
+    pub const AuthReason = enum { expired };
 };
 
 /// Substrings that mark an error as a context-window overflow. Matched
@@ -305,9 +305,7 @@ pub fn userMessage(class: ErrorClass, allocator: Allocator) ![]u8 {
             break :blk allocator.dupe(u8, "ChatGPT plan limit reached. Upgrade to Plus or wait for the reset.");
         },
         .auth => |c| switch (c.reason) {
-            .missing => allocator.dupe(u8, "No credentials configured. Run `zag auth login`."),
             .expired => allocator.dupe(u8, "Authentication expired. Run `zag auth login`."),
-            .gateway_blocked => allocator.dupe(u8, "Request blocked by gateway/proxy. Check your network or auth token."),
         },
         .model_not_found => allocator.dupe(u8, "Model not available on this account. Try a different model."),
         .invalid_request => |c| blk: {
@@ -525,9 +523,7 @@ test "userMessage non-empty for every variant" {
         .{ .rate_limit = .{ .retry_after_seconds = null, .plan_type = null } },
         .{ .plan_limit = .{ .reset_at = 1735680000, .plan_type = "free" } },
         .{ .plan_limit = .{ .reset_at = null, .plan_type = null } },
-        .{ .auth = .{ .reason = .missing } },
         .{ .auth = .{ .reason = .expired } },
-        .{ .auth = .{ .reason = .gateway_blocked } },
         .{ .model_not_found = .{ .provider_message = "" } },
         .{ .invalid_request = .{ .provider_message = "" } },
         .{ .invalid_request = .{ .provider_message = "field x missing" } },
