@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("../Buffer.zig");
+const View = @import("../View.zig");
 const Theme = @import("../Theme.zig");
 const Layout = @import("../Layout.zig");
 const input = @import("../input.zig");
@@ -89,6 +90,13 @@ pub fn buf(self: *GraphicsBuffer) Buffer {
     return .{ .ptr = self, .vtable = &vtable };
 }
 
+/// Return the View interface for this GraphicsBuffer. Today every
+/// GraphicsBuffer has exactly one View, backed by the same `*Self`
+/// pointer.
+pub fn view(self: *GraphicsBuffer) View {
+    return .{ .ptr = self, .vtable = &view_vtable };
+}
+
 /// Recover the concrete pointer from a type-erased Buffer.
 pub fn fromBuffer(b: Buffer) *GraphicsBuffer {
     return @ptrCast(@alignCast(b.ptr));
@@ -110,6 +118,51 @@ const vtable: Buffer.VTable = .{
     .onFocus = bufOnFocus,
     .onMouse = bufOnMouse,
 };
+
+const view_vtable: View.VTable = .{
+    .getVisibleLines = viewGetVisibleLines,
+    .lineCount = viewLineCount,
+    .handleKey = viewHandleKey,
+    .onResize = viewOnResize,
+    .onFocus = viewOnFocus,
+    .onMouse = viewOnMouse,
+};
+
+fn viewGetVisibleLines(
+    ptr: *anyopaque,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
+    theme: *const Theme,
+    skip: usize,
+    max_lines: usize,
+) anyerror!std.ArrayList(Theme.StyledLine) {
+    return bufGetVisibleLines(ptr, frame_alloc, cache_alloc, theme, skip, max_lines);
+}
+
+fn viewLineCount(ptr: *anyopaque) anyerror!usize {
+    return bufLineCount(ptr);
+}
+
+fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
+    return @enumFromInt(@intFromEnum(bufHandleKey(ptr, ev)));
+}
+
+fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
+    bufOnResize(ptr, rect);
+}
+
+fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
+    bufOnFocus(ptr, focused);
+}
+
+fn viewOnMouse(
+    ptr: *anyopaque,
+    ev: input.MouseEvent,
+    local_x: u16,
+    local_y: u16,
+) View.HandleResult {
+    return @enumFromInt(@intFromEnum(bufOnMouse(ptr, ev, local_x, local_y)));
+}
 
 fn bufGetVisibleLines(
     ptr: *anyopaque,
@@ -383,6 +436,33 @@ test "setFit(.fill) stretches the image across the full pane" {
     for (spans) |span| {
         try std.testing.expectEqual(@as(u8, 255), span.style.fg.?.rgb.r);
         try std.testing.expectEqual(@as(u8, 255), span.style.bg.?.rgb.r);
+    }
+}
+
+test "GraphicsBuffer.view() matches buf() output" {
+    const gpa = std.testing.allocator;
+    var gb = try GraphicsBuffer.create(gpa, 8, "parity");
+    defer gb.destroy();
+
+    try gb.setPng(&tiny_red_png);
+    gb.view().onResize(.{ .x = 0, .y = 0, .width = 2, .height = 1 });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const theme = Theme.defaultTheme();
+
+    try std.testing.expectEqual(try gb.buf().lineCount(), try gb.view().lineCount());
+
+    var via_buf = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
+    defer via_buf.deinit(arena);
+    var via_view = try gb.view().getVisibleLines(arena, arena, &theme, 0, 10);
+    defer via_view.deinit(arena);
+
+    try std.testing.expectEqual(via_buf.items.len, via_view.items.len);
+    if (via_buf.items.len > 0) {
+        try std.testing.expectEqual(via_buf.items[0].spans.len, via_view.items[0].spans.len);
     }
 }
 

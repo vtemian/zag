@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
+const View = @import("View.zig");
 const Layout = @import("Layout.zig");
 const NodeRenderer = @import("NodeRenderer.zig");
 const NodeLineCache = @import("NodeLineCache.zig");
@@ -430,6 +431,14 @@ pub fn buf(self: *ConversationBuffer) Buffer {
     return .{ .ptr = self, .vtable = &vtable };
 }
 
+/// Return the View interface for this buffer. Today every
+/// ConversationBuffer has exactly one View, backed by the same `*Self`
+/// pointer; future phases may attach additional Views over the same
+/// content.
+pub fn view(self: *ConversationBuffer) View {
+    return .{ .ptr = self, .vtable = &view_vtable };
+}
+
 /// Downcast a Buffer interface back to *ConversationBuffer.
 pub fn fromBuffer(b: Buffer) *ConversationBuffer {
     return @ptrCast(@alignCast(b.ptr));
@@ -451,6 +460,42 @@ const vtable: Buffer.VTable = .{
     .onFocus = bufOnFocus,
     .onMouse = bufOnMouse,
 };
+
+const view_vtable: View.VTable = .{
+    .getVisibleLines = viewGetVisibleLines,
+    .lineCount = viewLineCount,
+    .handleKey = viewHandleKey,
+    .onResize = viewOnResize,
+    .onFocus = viewOnFocus,
+    .onMouse = viewOnMouse,
+};
+
+fn viewGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
+}
+
+fn viewLineCount(ptr: *anyopaque) anyerror!usize {
+    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return self.lineCount();
+}
+
+fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return @enumFromInt(@intFromEnum(self.handleKey(ev)));
+}
+
+fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
+    bufOnResize(ptr, rect);
+}
+
+fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
+    bufOnFocus(ptr, focused);
+}
+
+fn viewOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
+    return @enumFromInt(@intFromEnum(bufOnMouse(ptr, ev, local_x, local_y)));
+}
 
 fn bufGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
@@ -1275,4 +1320,25 @@ test "handleKey passthrough flows through the Buffer vtable" {
     const b = cb.buf();
     const r = b.handleKey(.{ .key = .{ .char = 'Z' }, .modifiers = .{} });
     try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+}
+
+test "View dispatch matches Buffer dispatch" {
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "parity");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello world");
+
+    const theme = Theme.defaultTheme();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const total = try cb.lineCount();
+    var via_buf = try cb.buf().getVisibleLines(arena.allocator(), std.testing.allocator, &theme, 0, total);
+    defer via_buf.deinit(arena.allocator());
+
+    var via_view = try cb.view().getVisibleLines(arena.allocator(), std.testing.allocator, &theme, 0, total);
+    defer via_view.deinit(arena.allocator());
+
+    try std.testing.expectEqual(via_buf.items.len, via_view.items.len);
+    try std.testing.expectEqual(@as(usize, total), try cb.view().lineCount());
 }
