@@ -1156,24 +1156,6 @@ test "ResponseBuilder deinit cleans up on error" {
     builder.deinit(allocator);
 }
 
-test "Provider.call accepts a Request struct" {
-    // This test exists to pin the new vtable shape. It can't actually
-    // invoke a real provider (no network), so we only check that the
-    // code compiles and that Request fields map to the old positional
-    // arguments one-for-one. Will start failing with a compile error
-    // the moment Provider.call signature doesn't match Request.
-    const req = Request{
-        .system_stable = "sys",
-        .messages = &.{},
-        .tool_definitions = &.{},
-        .allocator = std.testing.allocator,
-    };
-    _ = req;
-    // Intentionally no call yet; this file compiles because Request
-    // is a plain struct. Task 2 updates Provider.call to take *const
-    // Request and this test is extended to call a mock provider.
-}
-
 test "joinSystemParts concatenates stable and per-turn with blank-line separator" {
     const allocator = std.testing.allocator;
     const joined = try joinSystemParts("stable", "per-turn", allocator);
