@@ -66,14 +66,14 @@ pub const ChatgptSerializer = struct {
         defer req.allocator.free(system_joined);
         // Runtime override from zag.set_thinking_effort takes precedence
         // over the per-endpoint static config. When unset, the endpoint's
-        // Lua-declared default applies.
+        // Lua-declared default applies. The chat-completions-only fields
+        // (response_fields, echo_field, effort_request_field) are left at
+        // their defaults; the Responses API serializer below only reads
+        // effort, summary, and verbosity.
         const effective_reasoning: llm.Endpoint.ReasoningConfig = if (req.thinking_effort) |level| .{
             .effort = level,
             .summary = self.endpoint.reasoning.summary,
             .verbosity = self.endpoint.reasoning.verbosity,
-            .response_fields = self.endpoint.reasoning.response_fields,
-            .echo_field = self.endpoint.reasoning.echo_field,
-            .effort_request_field = self.endpoint.reasoning.effort_request_field,
         } else self.endpoint.reasoning;
         const body = try buildStreamingRequestBodyWithReasoning(
             self.model,
@@ -115,14 +115,14 @@ pub const ChatgptSerializer = struct {
         defer req.allocator.free(system_joined);
         // Runtime override from zag.set_thinking_effort takes precedence
         // over the per-endpoint static config. When unset, the endpoint's
-        // Lua-declared default applies.
+        // Lua-declared default applies. The chat-completions-only fields
+        // (response_fields, echo_field, effort_request_field) are left at
+        // their defaults; the Responses API serializer below only reads
+        // effort, summary, and verbosity.
         const effective_reasoning: llm.Endpoint.ReasoningConfig = if (req.thinking_effort) |level| .{
             .effort = level,
             .summary = self.endpoint.reasoning.summary,
             .verbosity = self.endpoint.reasoning.verbosity,
-            .response_fields = self.endpoint.reasoning.response_fields,
-            .echo_field = self.endpoint.reasoning.echo_field,
-            .effort_request_field = self.endpoint.reasoning.effort_request_field,
         } else self.endpoint.reasoning;
         const body = try buildStreamingRequestBodyWithReasoning(
             self.model,
