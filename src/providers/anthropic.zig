@@ -618,7 +618,7 @@ fn handleStreamErrorEvent(
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.
-pub fn processSseEvent(
+fn processSseEvent(
     event_type: []const u8,
     data: []const u8,
     allocator: Allocator,
