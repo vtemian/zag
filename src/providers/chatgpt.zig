@@ -64,12 +64,23 @@ pub const ChatgptSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
+        // Runtime override from zag.set_thinking_effort takes precedence
+        // over the per-endpoint static config. When unset, the endpoint's
+        // Lua-declared default applies.
+        const effective_reasoning: llm.Endpoint.ReasoningConfig = if (req.thinking_effort) |level| .{
+            .effort = level,
+            .summary = self.endpoint.reasoning.summary,
+            .verbosity = self.endpoint.reasoning.verbosity,
+            .response_fields = self.endpoint.reasoning.response_fields,
+            .echo_field = self.endpoint.reasoning.echo_field,
+            .effort_request_field = self.endpoint.reasoning.effort_request_field,
+        } else self.endpoint.reasoning;
         const body = try buildStreamingRequestBodyWithReasoning(
             self.model,
             system_joined,
             req.messages,
             req.tool_definitions,
-            self.endpoint.reasoning,
+            effective_reasoning,
             req.allocator,
         );
         defer req.allocator.free(body);
@@ -102,12 +113,23 @@ pub const ChatgptSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
+        // Runtime override from zag.set_thinking_effort takes precedence
+        // over the per-endpoint static config. When unset, the endpoint's
+        // Lua-declared default applies.
+        const effective_reasoning: llm.Endpoint.ReasoningConfig = if (req.thinking_effort) |level| .{
+            .effort = level,
+            .summary = self.endpoint.reasoning.summary,
+            .verbosity = self.endpoint.reasoning.verbosity,
+            .response_fields = self.endpoint.reasoning.response_fields,
+            .echo_field = self.endpoint.reasoning.echo_field,
+            .effort_request_field = self.endpoint.reasoning.effort_request_field,
+        } else self.endpoint.reasoning;
         const body = try buildStreamingRequestBodyWithReasoning(
             self.model,
             system_joined,
             req.messages,
             req.tool_definitions,
-            self.endpoint.reasoning,
+            effective_reasoning,
             req.allocator,
         );
         defer req.allocator.free(body);
@@ -2256,6 +2278,28 @@ test "chatgpt: reasoning override emits effort/summary/verbosity from ReasoningC
     try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"verbosity\":\"low\"}") != null);
     // `include` is not configurable; it must still ride along.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"include\":[\"reasoning.encrypted_content\"]") != null);
+}
+
+test "chatgpt serializeRequest honours Request.thinking_effort over endpoint.reasoning.effort" {
+    // Endpoint default would be "medium"; the runtime-override path in
+    // callImplInner builds a ReasoningConfig with .effort replaced by
+    // req.thinking_effort. This pins the contract that whatever effort
+    // string is passed in via ReasoningConfig lands in the wire body.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBodyWithReasoning(
+        "gpt-5",
+        "system",
+        &messages,
+        &.{},
+        .{ .effort = "high", .summary = "auto", .verbosity = "medium" },
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"summary\":\"auto\"") != null);
 }
 
 test "chatgpt: summary='none' omits the summary key entirely" {

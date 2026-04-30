@@ -121,7 +121,10 @@ pub const Endpoint = struct {
     pub const ReasoningConfig = struct {
         /// Reasoning effort tier passed in `reasoning.effort`. Codex
         /// accepts `minimal`, `low`, `medium`, `high`. Default `"medium"`
-        /// matches the historical Codex CLI hardcode.
+        /// matches the historical Codex CLI hardcode. The chatgpt serializer
+        /// allows `Request.thinking_effort` (from `zag.set_thinking_effort`)
+        /// to override this value per call so the same Lua knob unifies
+        /// effort across all three wires.
         effort: []const u8 = "medium",
         /// Reasoning summary style passed in `reasoning.summary`. Codex
         /// accepts `auto`, `concise`, `detailed`. The sentinel `"none"`
