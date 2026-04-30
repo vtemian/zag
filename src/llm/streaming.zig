@@ -402,9 +402,18 @@ pub const StreamingResponse = struct {
             var chunk: [4096]u8 = undefined;
             const n = self.readChunk(&chunk) catch return error.ApiError;
             if (n == 0) {
-                // End of stream.
-                if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
-                return null;
+                // Two cases produce n == 0: real EOF (body_done was set
+                // by readChunk on EndOfStream), and a 0-byte short read
+                // from the body reader (legal per `stream`'s contract;
+                // see http_stream.zig:386). Only the first means "flush
+                // the partial line and stop"; the second must loop, or
+                // we hand back a truncated line and clear pending_line
+                // on the next call, losing the rest of the line.
+                if (self.body_done) {
+                    if (self.pending_line.items.len > 0) return stripCr(self.pending_line.items);
+                    return null;
+                }
+                continue;
             }
 
             const received = chunk[0..n];
@@ -588,6 +597,89 @@ test "readLine caps pending_line at MAX_SSE_LINE" {
     defer sr.remainder.deinit(allocator);
 
     try std.testing.expectError(error.SseLineTooLong, sr.readLine(null));
+}
+
+/// Reader that delivers `data` as a series of fixed-size chunks, but
+/// returns a 0-byte short read between every chunk before handing the
+/// next one over. Mirrors the stdlib body reader's documented behaviour
+/// (see http_stream.zig:386). Used to pin the regression where
+/// `readLine` mistook a 0-byte short read for EOF and truncated the
+/// in-flight line.
+const ChoppyReader = struct {
+    reader: std.Io.Reader,
+    data: []const u8,
+    position: usize,
+    chunk_size: usize,
+    stall_pending: bool,
+    exhausted: bool,
+
+    fn init(data: []const u8, chunk_size: usize) ChoppyReader {
+        return .{
+            .reader = .{
+                .vtable = &.{ .stream = streamFn },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+            .data = data,
+            .position = 0,
+            .chunk_size = chunk_size,
+            .stall_pending = true,
+            .exhausted = false,
+        };
+    }
+
+    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ChoppyReader = @fieldParentPtr("reader", r);
+        if (self.exhausted) return error.EndOfStream;
+        if (self.stall_pending) {
+            self.stall_pending = false;
+            return 0;
+        }
+        const remaining = self.data[self.position..];
+        if (remaining.len == 0) {
+            self.exhausted = true;
+            return error.EndOfStream;
+        }
+        const want = @min(@min(remaining.len, self.chunk_size), @intFromEnum(limit));
+        const written = try w.write(remaining[0..want]);
+        self.position += written;
+        self.stall_pending = true;
+        return written;
+    }
+};
+
+test "readLine reassembles a line split across reads with a 0-byte short read between chunks" {
+    // Regression: the stdlib body reader can return 0 bytes from
+    // `stream` without `error.EndOfStream` (legal per its contract;
+    // see http_stream.zig:386). `readLine` used to treat that the
+    // same as EOF, returning a truncated `pending_line` and then
+    // clearing it on the next call — losing the rest of the in-flight
+    // line. SSE events arriving across multiple network reads got
+    // truncated mid-payload, which scrambled tool_call argument
+    // accumulation downstream and forced the agent into a tool-error
+    // retry loop. ChoppyReader injects a 0-byte read between every
+    // chunk; the assertion is that the reassembled line is the
+    // complete payload, byte-for-byte.
+    const allocator = std.testing.allocator;
+
+    const payload = "data: {\"command\": \"rg -n title src/\"}";
+    var choppy = ChoppyReader.init(payload ++ "\n", 8);
+
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &choppy.reader,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    const line = (try sr.readLine(null)) orelse return error.TestUnexpectedEof;
+    try std.testing.expectEqualStrings(payload, line);
 }
 
 test "readLine returns Cancelled when the cancel flag is set before a chunk" {
