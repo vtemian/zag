@@ -376,7 +376,7 @@ pub const StreamingResponse = struct {
     /// the TCP stack unblocks (or the OS socket timeout fires). Per-chunk
     /// is adequate in practice because SSE endpoints send keep-alive
     /// comments every few seconds.
-    pub fn readLine(self: *StreamingResponse, cancel: ?*std.atomic.Value(bool)) !?[]const u8 {
+    fn readLine(self: *StreamingResponse, cancel: ?*std.atomic.Value(bool)) !?[]const u8 {
         self.pending_line.clearRetainingCapacity();
 
         // First, consume any leftover bytes from a previous read.
@@ -546,14 +546,14 @@ pub const StreamingResponse = struct {
 
             if (std.mem.startsWith(u8, line, "event: ")) {
                 const val = line["event: ".len..];
-                const copy_len = @min(val.len, event_buf.len);
-                @memcpy(event_buf[0..copy_len], val[0..copy_len]);
-                event_len = copy_len;
+                if (val.len > event_buf.len) return error.SseEventTypeTooLong;
+                @memcpy(event_buf[0..val.len], val);
+                event_len = val.len;
             } else if (std.mem.startsWith(u8, line, "event:")) {
                 const val = line["event:".len..];
-                const copy_len = @min(val.len, event_buf.len);
-                @memcpy(event_buf[0..copy_len], val[0..copy_len]);
-                event_len = copy_len;
+                if (val.len > event_buf.len) return error.SseEventTypeTooLong;
+                @memcpy(event_buf[0..val.len], val);
+                event_len = val.len;
             } else if (std.mem.startsWith(u8, line, "data: ")) {
                 const val = line["data: ".len..];
                 if (event_data.items.len + val.len > MAX_SSE_EVENT_DATA) {
