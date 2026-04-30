@@ -216,10 +216,7 @@ pub fn main() !void {
     var root_buffer_sink = BufferSink.init(allocator, &root_buffer);
     defer root_buffer_sink.deinit();
 
-    var root_runner
-
-
-    = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_session);
+    var root_runner = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_session);
     defer root_runner.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
