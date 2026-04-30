@@ -6758,8 +6758,10 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
     // future regression easy to spot.
     const budget_ns: u64 = 500 * std.time.ns_per_ms;
     if (elapsed_ns >= budget_ns) {
-        std.log.warn(
-            "popup-list 100 keystrokes took {d} ns (budget {d} ns)",
+        // Test diagnostic: bypass std.log so the elapsed time prints even
+        // when the test runner has the log level pinned to .err.
+        std.debug.print(
+            "popup-list 100 keystrokes took {d} ns (budget {d} ns)\n",
             .{ elapsed_ns, budget_ns },
         );
         return error.TestPopupListTooSlow;

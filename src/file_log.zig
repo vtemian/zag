@@ -25,6 +25,17 @@ var log_mutex: std.Thread.Mutex = .{};
 /// fire a log inside the handler; drop the nested call instead of looping.
 threadlocal var in_handler: bool = false;
 
+/// Runtime-configurable minimum level. The compile-time floor in
+/// `std_options.log_level` must be `.debug` for this gate to have anything
+/// to filter. Stored as the underlying enum tag so we can compare with a
+/// single integer load on the hot path.
+var min_level_tag: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(std.log.Level.info));
+/// When set, every accepted log line is also written to fd 2 (stderr) in
+/// addition to the file. Useful with `ZAG_DEBUG=true` for live tailing in
+/// headless runs; the TUI path swaps to the alt-screen so stderr noise
+/// only really shows up after the program exits.
+var mirror_stderr: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 pub const Error = error{NoLogPath};
 
 /// Open the log file at `path` with append semantics. Replaces any
@@ -103,6 +114,12 @@ pub fn handler(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Runtime gate: drop messages below the configured min level. Lower
+    // numeric tag means more severe (`.err = 0`, `.debug = 3`), so we
+    // accept when the message tag is <= the configured tag.
+    const min_tag = min_level_tag.load(.monotonic);
+    if (@intFromEnum(level) > min_tag) return;
+
     const f = log_file orelse return;
     if (in_handler) return;
     in_handler = true;
@@ -121,6 +138,60 @@ pub fn handler(
     log_mutex.lock();
     defer log_mutex.unlock();
     f.writeAll(total) catch {};
+    if (mirror_stderr.load(.monotonic)) {
+        const stderr = std.fs.File{ .handle = posix.STDERR_FILENO };
+        stderr.writeAll(total) catch {};
+    }
+}
+
+/// Configure the runtime log level + stderr mirroring from the environment.
+/// Reads `ZAG_DEBUG` and `ZAG_LOG_LEVEL` once. Safe to call before or after
+/// `init`; calling before just means the first messages are gated correctly.
+///
+/// - `ZAG_DEBUG=true` (or `1`, `yes`, `on`): min level becomes `.debug` and
+///   each line is mirrored to stderr.
+/// - Otherwise `ZAG_LOG_LEVEL=debug|info|warn|err` selects the level.
+/// - Default when neither is set: `.info`.
+pub fn configureFromEnv(alloc: Allocator) void {
+    var level: std.log.Level = .info;
+    var mirror = false;
+
+    if (std.process.getEnvVarOwned(alloc, "ZAG_DEBUG")) |raw| {
+        defer alloc.free(raw);
+        if (parseBool(raw)) {
+            level = .debug;
+            mirror = true;
+        }
+    } else |_| {}
+
+    if (level != .debug) {
+        if (std.process.getEnvVarOwned(alloc, "ZAG_LOG_LEVEL")) |raw| {
+            defer alloc.free(raw);
+            if (parseLevel(raw)) |lvl| level = lvl;
+        } else |_| {}
+    }
+
+    min_level_tag.store(@intFromEnum(level), .monotonic);
+    mirror_stderr.store(mirror, .monotonic);
+}
+
+fn parseBool(raw: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    return std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes") or
+        std.ascii.eqlIgnoreCase(trimmed, "on");
+}
+
+fn parseLevel(raw: []const u8) ?std.log.Level {
+    const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(trimmed, "debug")) return .debug;
+    if (std.ascii.eqlIgnoreCase(trimmed, "info")) return .info;
+    if (std.ascii.eqlIgnoreCase(trimmed, "warn")) return .warn;
+    if (std.ascii.eqlIgnoreCase(trimmed, "warning")) return .warn;
+    if (std.ascii.eqlIgnoreCase(trimmed, "err")) return .err;
+    if (std.ascii.eqlIgnoreCase(trimmed, "error")) return .err;
+    return null;
 }
 
 /// Format the `YYYY-MM-DDTHH:MM:SS.mmmZ [scope] level: ` prefix into `buf`.
@@ -183,7 +254,15 @@ pub fn resolvePath(alloc: Allocator) ![]const u8 {
 
 // -- Tests --------------------------------------------------------------
 
+/// Reset the runtime gate to the default (`.info`, no stderr mirror).
+/// Used by tests to keep state from leaking between cases.
+fn resetRuntimeGate() void {
+    min_level_tag.store(@intFromEnum(std.log.Level.info), .monotonic);
+    mirror_stderr.store(false, .monotonic);
+}
+
 test "initWithPath opens an existing directory and appends" {
+    resetRuntimeGate();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -283,6 +362,84 @@ test "artifactPath returns null when no log path is active" {
     deinit();
     const result = try artifactPath(std.testing.allocator, ".turn-1.req.json");
     try std.testing.expect(result == null);
+}
+
+test "handler drops messages below min level" {
+    resetRuntimeGate();
+    defer resetRuntimeGate();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full_buf, "{s}/gated.log", .{tmp_abs});
+
+    try initWithPath(path);
+    defer deinit();
+
+    // Default min level is .info; debug should be dropped.
+    handler(.debug, .agent, "noisy debug", .{});
+    handler(.info, .agent, "kept info", .{});
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    var contents_buf: [1024]u8 = undefined;
+    const n = try file.readAll(&contents_buf);
+    const contents = contents_buf[0..n];
+
+    try std.testing.expect(std.mem.indexOf(u8, contents, "noisy debug") == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "kept info") != null);
+}
+
+test "raising min level to debug lets debug through" {
+    resetRuntimeGate();
+    defer resetRuntimeGate();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full_buf, "{s}/debug.log", .{tmp_abs});
+
+    try initWithPath(path);
+    defer deinit();
+
+    min_level_tag.store(@intFromEnum(std.log.Level.debug), .monotonic);
+    handler(.debug, .agent, "verbose: {d}", .{42});
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    var contents_buf: [1024]u8 = undefined;
+    const n = try file.readAll(&contents_buf);
+    const contents = contents_buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, contents, "verbose: 42") != null);
+}
+
+test "parseBool accepts common truthy spellings" {
+    try std.testing.expect(parseBool("true"));
+    try std.testing.expect(parseBool("TRUE"));
+    try std.testing.expect(parseBool("1"));
+    try std.testing.expect(parseBool("yes"));
+    try std.testing.expect(parseBool("On"));
+    try std.testing.expect(parseBool("  true  "));
+    try std.testing.expect(!parseBool("false"));
+    try std.testing.expect(!parseBool("0"));
+    try std.testing.expect(!parseBool(""));
+    try std.testing.expect(!parseBool("nope"));
+}
+
+test "parseLevel maps spellings to log.Level" {
+    try std.testing.expectEqual(@as(?std.log.Level, .debug), parseLevel("debug"));
+    try std.testing.expectEqual(@as(?std.log.Level, .info), parseLevel("INFO"));
+    try std.testing.expectEqual(@as(?std.log.Level, .warn), parseLevel("warn"));
+    try std.testing.expectEqual(@as(?std.log.Level, .warn), parseLevel("warning"));
+    try std.testing.expectEqual(@as(?std.log.Level, .err), parseLevel("err"));
+    try std.testing.expectEqual(@as(?std.log.Level, .err), parseLevel("error"));
+    try std.testing.expectEqual(@as(?std.log.Level, null), parseLevel("trace"));
 }
 
 test "resolvePath returns $HOME/.zag/logs/<uuid>.log" {
