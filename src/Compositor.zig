@@ -271,7 +271,7 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
     // Scratch-backed panes have no ConversationBuffer/AgentRunner; the
     // tree cache is a conversation-only concept so there is nothing to
     // sync for them.
-    const view = pane.view orelse return;
+    const view = pane.conversation orelse return;
     const runner = pane.runner orelse return;
 
     var ids_buf: [ConversationTree.DirtyRing.capacity]u32 = undefined;

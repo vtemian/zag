@@ -307,7 +307,7 @@ pub fn main() !void {
 
     const root_pane: EventOrchestrator.Pane = .{
         .buffer = root_buffer.buf(),
-        .view = &root_buffer,
+        .conversation = &root_buffer,
         .session = &root_session,
         .runner = &root_runner,
     };
