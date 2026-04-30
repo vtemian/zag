@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("../Buffer.zig");
+const View = @import("../View.zig");
 const Theme = @import("../Theme.zig");
 const Layout = @import("../Layout.zig");
 const input = @import("../input.zig");
@@ -100,6 +101,10 @@ pub fn buf(self: *ScratchBuffer) Buffer {
     return .{ .ptr = self, .vtable = &vtable };
 }
 
+pub fn view(self: *ScratchBuffer) View {
+    return .{ .ptr = self, .vtable = &view_vtable };
+}
+
 pub fn fromBuffer(b: Buffer) *ScratchBuffer {
     return @ptrCast(@alignCast(b.ptr));
 }
@@ -120,6 +125,51 @@ const vtable: Buffer.VTable = .{
     .onFocus = bufOnFocus,
     .onMouse = bufOnMouse,
 };
+
+const view_vtable: View.VTable = .{
+    .getVisibleLines = viewGetVisibleLines,
+    .lineCount = viewLineCount,
+    .handleKey = viewHandleKey,
+    .onResize = viewOnResize,
+    .onFocus = viewOnFocus,
+    .onMouse = viewOnMouse,
+};
+
+fn viewGetVisibleLines(
+    ptr: *anyopaque,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
+    theme: *const Theme,
+    skip: usize,
+    max_lines: usize,
+) anyerror!std.ArrayList(Theme.StyledLine) {
+    return bufGetVisibleLines(ptr, frame_alloc, cache_alloc, theme, skip, max_lines);
+}
+
+fn viewLineCount(ptr: *anyopaque) anyerror!usize {
+    return bufLineCount(ptr);
+}
+
+fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
+    return @enumFromInt(@intFromEnum(bufHandleKey(ptr, ev)));
+}
+
+fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
+    bufOnResize(ptr, rect);
+}
+
+fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
+    bufOnFocus(ptr, focused);
+}
+
+fn viewOnMouse(
+    ptr: *anyopaque,
+    ev: input.MouseEvent,
+    local_x: u16,
+    local_y: u16,
+) View.HandleResult {
+    return @enumFromInt(@intFromEnum(bufOnMouse(ptr, ev, local_x, local_y)));
+}
 
 fn bufGetVisibleLines(
     ptr: *anyopaque,
@@ -402,6 +452,26 @@ test "setLines clears all row style overrides" {
     for (lines.items) |line| {
         try std.testing.expect(line.row_style == null);
     }
+}
+
+test "ScratchBuffer.view() matches buf() output" {
+    const gpa = std.testing.allocator;
+    var sb = try ScratchBuffer.create(gpa, 7, "parity");
+    defer sb.destroy();
+
+    try sb.setLines(&.{ "alpha", "beta", "gamma" });
+
+    const theme = Theme.defaultTheme();
+
+    const total = try sb.buf().lineCount();
+    try std.testing.expectEqual(total, try sb.view().lineCount());
+
+    var via_buf = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, total);
+    defer Theme.freeStyledLines(&via_buf, gpa);
+    var via_view = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, total);
+    defer Theme.freeStyledLines(&via_view, gpa);
+
+    try std.testing.expectEqual(via_buf.items.len, via_view.items.len);
 }
 
 test {
