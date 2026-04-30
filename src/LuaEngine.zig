@@ -2774,7 +2774,7 @@ pub const LuaEngine = struct {
         // or a string (`"b<u32>"` handle). Anything else raises so the
         // caller sees the failure on the first call, not later when the
         // pane shows up empty.
-        var attached: ?Buffer = null;
+        var attached: ?WindowManager.AttachedSurface = null;
         if (lua.isTable(3)) {
             _ = lua.getField(3, "buffer");
             defer lua.pop(1);
@@ -2790,9 +2790,13 @@ pub const LuaEngine = struct {
                     const buffer_registry = engine.buffer_registry orelse {
                         lua.raiseErrorStr("zag.layout.split: no buffer registry bound", .{});
                     };
-                    attached = buffer_registry.asBuffer(bh) catch {
+                    const resolved_buffer = buffer_registry.asBuffer(bh) catch {
                         lua.raiseErrorStr("zag.layout.split: stale buffer handle", .{});
                     };
+                    const resolved_view = buffer_registry.asView(bh) catch {
+                        lua.raiseErrorStr("zag.layout.split: stale buffer handle", .{});
+                    };
+                    attached = .{ .buffer = resolved_buffer, .view = resolved_view };
                 },
                 .table => {
                     _ = lua.getField(-1, "type");
@@ -2884,6 +2888,9 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.layout.float: no buffer registry bound", .{});
         };
         const buffer = buffer_registry.asBuffer(bh) catch {
+            lua.raiseErrorStr("zag.layout.float: stale buffer handle", .{});
+        };
+        const buffer_view = buffer_registry.asView(bh) catch {
             lua.raiseErrorStr("zag.layout.float: stale buffer handle", .{});
         };
 
@@ -3191,7 +3198,7 @@ pub const LuaEngine = struct {
         const seed_h: u16 = height_opt orelse (min_height orelse 1);
 
         const handle = wm.openFloatPane(
-            buffer,
+            .{ .buffer = buffer, .view = buffer_view },
             .{ .x = 0, .y = 0, .width = seed_w, .height = seed_h },
             .{
                 .border = border_kind,

@@ -685,7 +685,7 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
             // vtable (a plugin-bound keymap or the buffer's handleKey
             // decides what Enter means there).
             const runner = focused.runner orelse {
-                return switch (focused.buffer.handleKey(k)) {
+                return switch (focused.view.handleKey(k)) {
                     .consumed => .redraw,
                     .passthrough => .none,
                 };
@@ -810,7 +810,9 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
 
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        _ = f.buffer.onMouse(ev, local_x, local_y);
+        if (self.window_manager.paneFromFloatHandle(f.handle)) |fp| {
+            _ = fp.view.onMouse(ev, local_x, local_y);
+        }
         return;
     }
 
@@ -823,7 +825,9 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         if (screen_y < rect.y or screen_y >= rect.y + rect.height) continue;
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        _ = node.leaf.buffer.onMouse(ev, local_x, local_y);
+        if (self.window_manager.paneFromBufferPtr(node.leaf.buffer)) |lp| {
+            _ = lp.view.onMouse(ev, local_x, local_y);
+        }
         return;
     }
 }
@@ -1105,6 +1109,7 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
+        .view = view.view(),
         .conversation = &view,
         .session = &session_scratch,
         .runner = &runner,
@@ -1234,6 +1239,7 @@ test "mouse click on a focusable float makes it the focused float" {
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
+        .view = view.view(),
         .conversation = &view,
         .session = &session_scratch,
         .runner = &runner,
@@ -1273,8 +1279,10 @@ test "mouse click on a focusable float makes it the focused float" {
     const bh2 = try wm.buffer_registry.createScratch("top");
     const buf1 = try wm.buffer_registry.asBuffer(bh1);
     const buf2 = try wm.buffer_registry.asBuffer(bh2);
+    const view1 = try wm.buffer_registry.asView(bh1);
+    const view2 = try wm.buffer_registry.asView(bh2);
 
-    _ = try wm.openFloatPane(buf1, .{ .x = 5, .y = 5, .width = 20, .height = 6 }, .{
+    _ = try wm.openFloatPane(.{ .buffer = buf1, .view = view1 }, .{ .x = 5, .y = 5, .width = 20, .height = 6 }, .{
         .relative = .editor,
         .col_offset = 5,
         .row_offset = 5,
@@ -1285,7 +1293,7 @@ test "mouse click on a focusable float makes it the focused float" {
         .focusable = true,
         .mouse = true,
     });
-    const top_handle = try wm.openFloatPane(buf2, .{ .x = 5, .y = 5, .width = 20, .height = 6 }, .{
+    const top_handle = try wm.openFloatPane(.{ .buffer = buf2, .view = view2 }, .{ .x = 5, .y = 5, .width = 20, .height = 6 }, .{
         .relative = .editor,
         .col_offset = 5,
         .row_offset = 5,
@@ -1359,6 +1367,7 @@ test "handleKey routes a printable char to the focused float's pane draft" {
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
+        .view = view.view(),
         .conversation = &view,
         .session = &session_scratch,
         .runner = &runner,
@@ -1398,8 +1407,9 @@ test "handleKey routes a printable char to the focused float's pane draft" {
     // `Pane.handleKey` -> `appendToDraft`.
     const bh = try wm.buffer_registry.createScratch("float-draft");
     const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const scratch_view = try wm.buffer_registry.asView(bh);
     const float_handle = try wm.openFloatPane(
-        scratch_buf,
+        .{ .buffer = scratch_buf, .view = scratch_view },
         .{ .x = 10, .y = 5, .width = 20, .height = 6 },
         .{
             .relative = .editor,
@@ -1490,6 +1500,7 @@ const FloatLifecycleFixture = struct {
 
         const root_pane: WindowManager.Pane = .{
             .buffer = self.conversation.buf(),
+            .view = self.conversation.view(),
             .conversation = &self.conversation,
             .session = &self.session_history,
             .runner = &self.runner,
@@ -1537,7 +1548,8 @@ test "sweepFloatsForAutoClose closes a float whose time has elapsed" {
 
     const bh = try f.wm.buffer_registry.createScratch("toast");
     const buf = try f.wm.buffer_registry.asBuffer(bh);
-    const handle = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    const handle = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
         .relative = .editor,
         .width = 10,
         .height = 4,
@@ -1566,7 +1578,8 @@ test "sweepFloatsForAutoClose closes a moved=any float when the focused draft mu
 
     const bh = try f.wm.buffer_registry.createScratch("popup");
     const buf = try f.wm.buffer_registry.asBuffer(bh);
-    const handle = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    const handle = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
         .relative = .editor,
         .width = 10,
         .height = 4,
@@ -1617,7 +1630,8 @@ test "sweepFloatsForAutoClose with enter=true compares against the originating t
 
     const bh = try f.wm.buffer_registry.createScratch("popup");
     const buf = try f.wm.buffer_registry.asBuffer(bh);
-    const handle = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    const handle = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
         .relative = .editor,
         .width = 10,
         .height = 4,
@@ -1713,7 +1727,7 @@ test "handleKey routes through on_key filter and consumes when callback returns 
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner },
+        .root_pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .session = &session_scratch, .runner = &runner },
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = &engine,
@@ -1741,7 +1755,8 @@ test "handleKey routes through on_key filter and consumes when callback returns 
 
     const bh = try wm.buffer_registry.createScratch("popup");
     const buf = try wm.buffer_registry.asBuffer(bh);
-    const handle = try wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+    const buf_view = try wm.buffer_registry.asView(bh);
+    const handle = try wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
         .relative = .editor,
         .width = 10,
         .height = 4,
@@ -1809,7 +1824,7 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner },
+        .root_pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .session = &session_scratch, .runner = &runner },
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = &engine,
@@ -1834,7 +1849,8 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
 
     const bh = try wm.buffer_registry.createScratch("popup");
     const buf = try wm.buffer_registry.asBuffer(bh);
-    _ = try wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+    const buf_view = try wm.buffer_registry.asView(bh);
+    _ = try wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
         .relative = .editor,
         .width = 10,
         .height = 4,
@@ -1871,7 +1887,8 @@ test "anyPaneDirty walks extra_floats so a float-only mutation triggers a redraw
 
     const bh = try f.wm.buffer_registry.createScratch("popup");
     const buf = try f.wm.buffer_registry.asBuffer(bh);
-    _ = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 20, .height = 4 }, .{
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    _ = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 20, .height = 4 }, .{
         .relative = .editor,
         .width = 20,
         .height = 4,
@@ -1906,7 +1923,8 @@ test "anyPaneDirty stays false when no pane has pending visual changes" {
 
     const bh = try f.wm.buffer_registry.createScratch("popup");
     const buf = try f.wm.buffer_registry.asBuffer(bh);
-    _ = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 20, .height = 4 }, .{
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    _ = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 20, .height = 4 }, .{
         .relative = .editor,
         .width = 20,
         .height = 4,
@@ -1930,7 +1948,8 @@ test "sweepFloatsForAutoClose leaves intact a float whose time has not yet elaps
 
     const bh = try f.wm.buffer_registry.createScratch("toast");
     const buf = try f.wm.buffer_registry.asBuffer(bh);
-    _ = try f.wm.openFloatPane(buf, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    _ = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
         .relative = .editor,
         .width = 10,
         .height = 4,
