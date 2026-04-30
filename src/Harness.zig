@@ -374,12 +374,20 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     const registry_ptr = registry_view.ptr();
 
     var provider = llm.createProviderFromLuaConfig(registry_ptr, default_model, auth_path, gpa) catch |err| {
-        if (err == error.MissingCredential) {
-            const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
-            const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
-            var scratch: [512]u8 = undefined;
-            const message = cli_auth.formatMissingCredentialHint(&scratch, model_id, registry_ptr);
-            _ = stderr_file.write(message) catch {};
+        // Headless can't run the interactive wizard, so a missing default
+        // or credential just exits with a hint pointing at config.lua / auth.
+        const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+        switch (err) {
+            error.NoDefaultModel => {
+                const msg = "zag: no default model configured. Set one in ~/.config/zag/config.lua via `zag.set_default_model(\"provider/model\")`.\n";
+                _ = stderr_file.write(msg) catch {};
+            },
+            error.MissingCredential => {
+                var scratch: [512]u8 = undefined;
+                const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
+                _ = stderr_file.write(message) catch {};
+            },
+            else => {},
         }
         return err;
     };

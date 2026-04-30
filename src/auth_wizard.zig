@@ -1159,14 +1159,17 @@ pub fn firstRunWizardRetry(
     stdout: *std.Io.Writer,
 ) !llm.ProviderResult {
     const default_model: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
-    const model_id = default_model orelse "anthropic/claude-sonnet-4-20250514";
-    const spec = llm.parseModelString(model_id);
 
     const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
     const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
 
     if (!is_tty) {
-        exitNoCredentialsForProvider(stderr, spec.provider_name);
+        if (default_model) |model_id| {
+            const spec = llm.parseModelString(model_id);
+            exitNoCredentialsForProvider(stderr, spec.provider_name);
+        }
+        _ = stderr.write("zag: no config.lua found and stdin is not a TTY; create ~/.config/zag/config.lua with at least one `require(\"zag.providers.*\")` and a `zag.set_default_model(...)` call.\n") catch {};
+        std.process.exit(1);
     }
 
     const paths = buildPaths(allocator) catch |err| {
@@ -1207,7 +1210,16 @@ pub fn firstRunWizardRetry(
 
     const result = runWizard(deps) catch |err| {
         if (err == error.NonInteractiveFirstRun) {
-            exitNoCredentialsForProvider(stderr, spec.provider_name);
+            // `runWizard` only raises this when its `is_tty` flag is false,
+            // and we always pass `true` here, so this is a defensive branch
+            // covering future deps changes. Print a generic hint when there
+            // is no default model to anchor the message to.
+            if (default_model) |model_id| {
+                const spec = llm.parseModelString(model_id);
+                exitNoCredentialsForProvider(stderr, spec.provider_name);
+            }
+            _ = stderr.write("zag: first-run setup needs an interactive terminal.\n") catch {};
+            std.process.exit(1);
         }
         return err;
     };
@@ -1227,19 +1239,31 @@ pub fn firstRunWizardRetry(
     var retry_view = LuaEngine.RegistryView.init(allocator, lua_engine);
     defer retry_view.deinit();
     return llm.createProviderFromEnv(retry_view.ptr(), new_default, allocator) catch |err| {
-        if (err == error.MissingCredential) {
-            const new_model = new_default orelse "anthropic/claude-sonnet-4-20250514";
-            const new_spec = llm.parseModelString(new_model);
-            var scratch: [768]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &scratch,
-                "zag: config.lua sets default model to '{s}', but no credential is configured for provider '{s}'. Edit ~/.config/zag/config.lua to use the provider you just added ('{s}').\n",
-                .{ new_model, new_spec.provider_name, result.provider_name },
-            ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
-            _ = stderr.write(msg) catch {};
-            std.process.exit(1);
+        switch (err) {
+            error.MissingCredential => {
+                // Reachable when the user picked one provider in the picker but
+                // config.lua's default_model points at a different one. After
+                // a successful scaffold, new_default is non-null by construction.
+                const new_model = new_default orelse {
+                    _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug — please report.\n") catch {};
+                    std.process.exit(1);
+                };
+                const new_spec = llm.parseModelString(new_model);
+                var scratch: [768]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &scratch,
+                    "zag: config.lua sets default model to '{s}', but no credential is configured for provider '{s}'. Edit ~/.config/zag/config.lua to use the provider you just added ('{s}').\n",
+                    .{ new_model, new_spec.provider_name, result.provider_name },
+                ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
+                _ = stderr.write(msg) catch {};
+                std.process.exit(1);
+            },
+            error.NoDefaultModel => {
+                _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug — please report.\n") catch {};
+                std.process.exit(1);
+            },
+            else => return err,
         }
-        return err;
     };
 }
 

@@ -470,7 +470,12 @@ pub fn createProviderFromLuaConfig(
     auth_file_path: []const u8,
     allocator: Allocator,
 ) !ProviderResult {
-    const model_id = try allocator.dupe(u8, default_model orelse "anthropic/claude-sonnet-4-20250514");
+    // Lua is the source of truth for the default model: config.lua either
+    // calls `zag.set_default_model(...)` or the first-run wizard scaffolds
+    // a config that does. A null here means neither has happened yet, and
+    // the caller routes that to the wizard rather than picking a provider.
+    const owned_default = default_model orelse return error.NoDefaultModel;
+    const model_id = try allocator.dupe(u8, owned_default);
     errdefer allocator.free(model_id);
 
     var owned_registry = try registry.dupe(allocator);
@@ -949,7 +954,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
     try std.testing.expectEqual(Serializer.openai, result.serializer);
 }
 
-test "createProviderFromLuaConfig uses hardcoded fallback when default_model unset" {
+test "createProviderFromLuaConfig surfaces NoDefaultModel when default_model unset" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -969,12 +974,10 @@ test "createProviderFromLuaConfig uses hardcoded fallback when default_model uns
 
     var registry = try testRegistryWithKnownProviders(allocator);
     defer registry.deinit();
-    var result = try createProviderFromLuaConfig(&registry, null, auth_path, allocator);
-    defer result.deinit();
-
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", result.model_id);
-    try std.testing.expectEqualStrings(auth_path, result.auth_path);
-    try std.testing.expectEqual(Serializer.anthropic, result.serializer);
+    try std.testing.expectError(
+        error.NoDefaultModel,
+        createProviderFromLuaConfig(&registry, null, auth_path, allocator),
+    );
 }
 
 test "createProviderFromLuaConfig returns MissingCredential when provider not in auth.json" {
