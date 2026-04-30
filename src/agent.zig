@@ -1374,7 +1374,6 @@ test "streamEventToQueue drops StreamEvent.done so it does not signal terminal" 
     try std.testing.expectEqual(@as(usize, 0), queue.drain(&buf));
 }
 
-
 test "runLoopStreaming prompt assembly matches the pre-split buildSystemPrompt output" {
     // Locks in that the agent loop's `defaultRegistry` + `assembleSystem`
     // pipeline reproduces today's system prompt byte-for-byte. The
