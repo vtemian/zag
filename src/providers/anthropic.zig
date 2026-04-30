@@ -22,12 +22,33 @@ const default_thinking_budget_tokens: u32 = 4096;
 /// Resolve the thinking parameter for this request. Explicit caller config
 /// wins; when nothing is set, thinking-capable Claude models get the
 /// default budget and older Claudes stay silent.
-fn resolveThinking(model: []const u8, override: ?llm.ThinkingConfig) ?llm.ThinkingConfig {
+fn resolveThinking(
+    model: []const u8,
+    override: ?llm.ThinkingConfig,
+    effort_override: ?[]const u8,
+) ?llm.ThinkingConfig {
     if (override) |cfg| return cfg;
-    if (llm.supportsExtendedThinking(model)) {
-        return .{ .enabled = .{ .budget_tokens = default_thinking_budget_tokens } };
+    if (!llm.supportsExtendedThinking(model)) return null;
+
+    // Runtime effort knob (zag.set_thinking_effort). Overrides the
+    // default budget-based config but yields to an explicit
+    // req.thinking. Anthropic's adaptive enum has only low/medium/high;
+    // "minimal" coerces to .low (Anthropic has no equivalent). Unknown
+    // levels log at warn and fall through to the default budget config
+    // so a typo doesn't silently disable thinking.
+    if (effort_override) |level| {
+        if (std.mem.eql(u8, level, "minimal") or std.mem.eql(u8, level, "low")) {
+            return .{ .adaptive = .{ .effort = .low } };
+        } else if (std.mem.eql(u8, level, "medium")) {
+            return .{ .adaptive = .{ .effort = .medium } };
+        } else if (std.mem.eql(u8, level, "high")) {
+            return .{ .adaptive = .{ .effort = .high } };
+        } else {
+            log.warn("anthropic: unknown thinking_effort '{s}'; falling back to default budget", .{level});
+        }
     }
-    return null;
+
+    return .{ .enabled = .{ .budget_tokens = default_thinking_budget_tokens } };
 }
 
 /// Anthropic serializer state.
@@ -65,7 +86,7 @@ pub const AnthropicSerializer = struct {
     ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
-        const thinking = resolveThinking(self.model, req.thinking);
+        const thinking = resolveThinking(self.model, req.thinking, req.thinking_effort);
         const body = try buildRequestBody(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
@@ -91,7 +112,7 @@ pub const AnthropicSerializer = struct {
     ) !types.LlmResponse {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
-        const thinking = resolveThinking(self.model, req.thinking);
+        const thinking = resolveThinking(self.model, req.thinking, req.thinking_effort);
         const body = try buildStreamingRequestBody(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, thinking, req.allocator);
         defer req.allocator.free(body);
 
@@ -753,6 +774,42 @@ pub fn processSseEvent(
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "anthropic resolveThinking maps thinking_effort to adaptive variant" {
+    // Runtime knob (zag.set_thinking_effort) takes effect when the
+    // model supports extended thinking and req.thinking is not set.
+    const model = "claude-sonnet-4-5";
+    try std.testing.expect(llm.supportsExtendedThinking(model));
+
+    // No effort override + no req.thinking -> default budget config.
+    const default_cfg = resolveThinking(model, null, null).?;
+    try std.testing.expect(default_cfg == .enabled);
+
+    // Effort overrides the default to adaptive.
+    const high_cfg = resolveThinking(model, null, "high").?;
+    try std.testing.expect(high_cfg == .adaptive);
+    try std.testing.expectEqual(llm.ThinkingConfig.Effort.high, high_cfg.adaptive.effort);
+
+    const low_cfg = resolveThinking(model, null, "low").?;
+    try std.testing.expectEqual(llm.ThinkingConfig.Effort.low, low_cfg.adaptive.effort);
+
+    // "minimal" coerces to .low.
+    const minimal_cfg = resolveThinking(model, null, "minimal").?;
+    try std.testing.expectEqual(llm.ThinkingConfig.Effort.low, minimal_cfg.adaptive.effort);
+
+    // Unknown level falls back to the default budget config.
+    const unknown_cfg = resolveThinking(model, null, "ridiculous").?;
+    try std.testing.expect(unknown_cfg == .enabled);
+
+    // Explicit req.thinking dominates the effort knob.
+    const explicit: llm.ThinkingConfig = .{ .enabled = .{ .budget_tokens = 12345 } };
+    const explicit_cfg = resolveThinking(model, explicit, "high").?;
+    try std.testing.expect(explicit_cfg == .enabled);
+    try std.testing.expectEqual(@as(u32, 12345), explicit_cfg.enabled.budget_tokens);
+
+    // Non-thinking model: effort knob is silently dropped.
+    try std.testing.expect(resolveThinking("gpt-4o", null, "high") == null);
 }
 
 test "parseResponse parses text-only response" {
@@ -1627,29 +1684,29 @@ test "serializeRequest emits adaptive thinking and sibling output_config" {
 test "resolveThinking defaults enabled for thinking-capable Claudes" {
     const testing = std.testing;
     // sonnet-4 family supports thinking.
-    const resolved_sonnet = resolveThinking("claude-sonnet-4-20250514", null).?;
+    const resolved_sonnet = resolveThinking("claude-sonnet-4-20250514", null, null).?;
     try testing.expect(resolved_sonnet == .enabled);
     try testing.expectEqual(default_thinking_budget_tokens, resolved_sonnet.enabled.budget_tokens);
 
     // opus-4 family supports thinking.
-    const resolved_opus = resolveThinking("claude-opus-4-20250514", null).?;
+    const resolved_opus = resolveThinking("claude-opus-4-20250514", null, null).?;
     try testing.expect(resolved_opus == .enabled);
 
     // 3-7-sonnet supports thinking.
-    const resolved_37 = resolveThinking("claude-3-7-sonnet-20250219", null).?;
+    const resolved_37 = resolveThinking("claude-3-7-sonnet-20250219", null, null).?;
     try testing.expect(resolved_37 == .enabled);
 }
 
 test "resolveThinking returns null for pre-thinking Claudes" {
     const testing = std.testing;
-    try testing.expect(resolveThinking("claude-3-5-sonnet-20241022", null) == null);
-    try testing.expect(resolveThinking("claude-3-5-haiku-20241022", null) == null);
+    try testing.expect(resolveThinking("claude-3-5-sonnet-20241022", null, null) == null);
+    try testing.expect(resolveThinking("claude-3-5-haiku-20241022", null, null) == null);
 }
 
 test "resolveThinking honors explicit override even when model would default" {
     const testing = std.testing;
     const override: ?llm.ThinkingConfig = .disabled;
-    const resolved = resolveThinking("claude-sonnet-4-20250514", override).?;
+    const resolved = resolveThinking("claude-sonnet-4-20250514", override, null).?;
     try testing.expect(resolved == .disabled);
 }
 
