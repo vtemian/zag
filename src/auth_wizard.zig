@@ -1134,7 +1134,7 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
 }
 
 /// Print an actionable "no credentials, switch to a TTY" hint for `provider_name`
-/// to `stderr` and exit with status 1. Used by `firstRunWizardRetry` from both
+/// to `stderr` and exit with status 1. Used by `runFirstRunWizard` from both
 /// the up-front non-TTY guard and the `error.NonInteractiveFirstRun` retry path.
 fn exitNoCredentialsForProvider(stderr: std.fs.File, provider_name: []const u8) noreturn {
     var scratch: [512]u8 = undefined;
@@ -1147,12 +1147,13 @@ fn exitNoCredentialsForProvider(stderr: std.fs.File, provider_name: []const u8) 
     std.process.exit(1);
 }
 
-/// Handle `createProviderFromEnv` returning `error.MissingCredential` at
-/// first-run: drop into the onboarding wizard when stdin is a TTY, then
-/// reload Lua and retry provider creation once. On a non-TTY or repeated
-/// failure, prints an actionable stderr message and `std.process.exit(1)` so
-/// the user sees only the friendly message, not a Zig error-return trace.
-pub fn firstRunWizardRetry(
+/// Drive the first-run onboarding wizard: scaffold a config.lua if missing,
+/// run the picker, perform the chosen provider's auth flow, reload Lua, and
+/// hand back a ready ProviderResult. Only called when `lua_engine.default_model`
+/// is null (no config or no `zag.set_default_model` call); a user with an
+/// explicit default does not need the picker. Non-TTY callers get a printed
+/// hint and exit instead.
+pub fn runFirstRunWizard(
     allocator: std.mem.Allocator,
     lua_engine: ?*LuaEngine,
     stdin: *std.Io.Reader,

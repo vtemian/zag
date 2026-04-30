@@ -188,8 +188,8 @@ pub fn formatMissingCredentialHint(
     }
     return std.fmt.bufPrint(
         scratch,
-        "zag: no credentials for provider '{s}' in ~/.config/zag/auth.json\n",
-        .{spec.provider_name},
+        "zag: no credentials for provider '{s}'. Run: zag auth login {s}\n",
+        .{ spec.provider_name, spec.provider_name },
     ) catch fallback;
 }
 
@@ -291,7 +291,7 @@ test "formatMissingCredentialHint points api-key providers at auth.json" {
     var scratch: [512]u8 = undefined;
     const msg = formatMissingCredentialHint(&scratch, "openai/gpt-4o", &reg);
     try std.testing.expectEqualStrings(
-        "zag: no credentials for provider 'openai' in ~/.config/zag/auth.json\n",
+        "zag: no credentials for provider 'openai'. Run: zag auth login openai\n",
         msg,
     );
 }
@@ -302,7 +302,7 @@ test "formatMissingCredentialHint falls back to generic message for unknown prov
     var scratch: [512]u8 = undefined;
     const msg = formatMissingCredentialHint(&scratch, "not-a-real-provider/x", &reg);
     try std.testing.expectEqualStrings(
-        "zag: no credentials for provider 'not-a-real-provider' in ~/.config/zag/auth.json\n",
+        "zag: no credentials for provider 'not-a-real-provider'. Run: zag auth login not-a-real-provider\n",
         msg,
     );
 }
@@ -314,7 +314,7 @@ test "formatMissingCredentialHint survives a null registry" {
     var scratch: [512]u8 = undefined;
     const msg = formatMissingCredentialHint(&scratch, "openai/gpt-4o", null);
     try std.testing.expectEqualStrings(
-        "zag: no credentials for provider 'openai' in ~/.config/zag/auth.json\n",
+        "zag: no credentials for provider 'openai'. Run: zag auth login openai\n",
         msg,
     );
 }
