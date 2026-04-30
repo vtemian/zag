@@ -150,7 +150,7 @@ pub const ThinkingConfig = union(enum) {
 /// Report whether a Claude model identifier advertises extended-thinking
 /// support. Substring match, not an exhaustive catalog; the set of
 /// thinking-capable Claude models grows and this function is the one place
-/// to extend when a new family ships. PR 3 moves this decision into Lua.
+/// to extend when a new family ships.
 pub fn supportsExtendedThinking(model_id: []const u8) bool {
     // Claude 4 opus / sonnet families (incl. 4-5 point-releases).
     if (std.mem.indexOf(u8, model_id, "opus-4") != null) return true;
@@ -168,9 +168,9 @@ pub fn supportsExtendedThinking(model_id: []const u8) bool {
 /// emits its own request body.
 pub const Request = struct {
     /// Stable portion of the system prompt. Content that doesn't change
-    /// across turns (identity, tool list, guidelines). PR 5 will let
-    /// Anthropic attach a `cache_control` breakpoint after this segment
-    /// so the prefix stays cache-warm; for now providers simply
+    /// across turns (identity, tool list, guidelines). The Anthropic
+    /// provider attaches `cache_control: {type: "ephemeral"}` after this
+    /// segment so the prefix stays cache-warm; chat-completions providers
     /// concatenate stable + "\n\n" + volatile into a single system field.
     system_stable: []const u8 = "",
     /// Volatile portion of the system prompt. Per-turn content like
@@ -202,8 +202,8 @@ pub const Request = struct {
     /// Join the stable and volatile halves with "\n\n" into a single
     /// owned string. Providers that can only emit one system field
     /// (OpenAI Chat Completions, Responses/ChatGPT) call this; the
-    /// Anthropic path will use the parts directly once PR 5 introduces
-    /// the 2-element `system` array with `cache_control`.
+    /// Anthropic path consumes `system_stable` and `system_volatile`
+    /// directly so it can attach `cache_control` to the stable half.
     ///
     /// If one half is empty the separator is omitted so a purely stable
     /// prompt round-trips byte-for-byte with the pre-split API.
