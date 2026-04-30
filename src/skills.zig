@@ -108,6 +108,34 @@ pub const SkillRegistry = struct {
         return registry;
     }
 
+    /// Convenience over `discover` for the standard zag startup roots:
+    /// `<cwd>/.zag/skills`, `<cwd>/.agents/skills`, and
+    /// `~/.config/zag/skills`. Discovery failures (including a missing
+    /// HOME) collapse to an empty registry with a `warn` log; callers
+    /// simply emit an empty `<available_skills>` block in that case.
+    /// Caller owns the returned registry and must call `deinit(alloc)`.
+    pub fn discoverFromDefaults(alloc: Allocator) SkillRegistry {
+        const home = std.process.getEnvVarOwned(alloc, "HOME") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => alloc.dupe(u8, ".") catch return .{},
+            else => {
+                log.warn("HOME unreadable, skills discovery skipped: {}", .{err});
+                return .{};
+            },
+        };
+        defer alloc.free(home);
+
+        const config_home = std.fmt.allocPrint(alloc, "{s}/.config/zag", .{home}) catch return .{};
+        defer alloc.free(config_home);
+
+        const project_root = std.fs.cwd().realpathAlloc(alloc, ".") catch null;
+        defer if (project_root) |p| alloc.free(p);
+
+        return discover(alloc, config_home, project_root) catch |err| blk: {
+            log.warn("skills discovery failed: {}", .{err});
+            break :blk .{};
+        };
+    }
+
     /// Emit an `<available_skills>` XML block listing every skill. When
     /// the registry is empty, nothing is written: callers can concatenate
     /// the output unconditionally.
