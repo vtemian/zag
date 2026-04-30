@@ -4812,7 +4812,7 @@ pub const LuaEngine = struct {
         // live BufferRegistry and store the resulting `Buffer.getId()`
         // value in `binding.buffer_id` so it matches what
         // `EventOrchestrator` passes to `registry.lookup` at dispatch
-        // time (`focused.view.buf().getId()`). Storing the packed Handle
+        // time (`focused.conversation.buf().getId()`). Storing the packed Handle
         // directly would create two disjoint u32 namespaces and the
         // binding would never fire in production.
         var buffer_id: ?u32 = null;
@@ -12854,7 +12854,7 @@ test "zag.buffer.clear_row_style is a no-op for unset rows" {
 test "zag.buffer + zag.keymap e2e: bound key resolves through BufferRegistry" {
     // End-to-end invariant check for the buffer_id identity fix.
     // `zag.keymap{buffer = h, ...}` stores `Buffer.getId()` as the scope
-    // key; `EventOrchestrator.dispatchKey` passes `focused.view.buf().getId()`
+    // key; `EventOrchestrator.dispatchKey` passes `focused.conversation.buf().getId()`
     // at lookup time. Both must land on the same u32 or buffer-scoped
     // bindings never fire in production.
     const alloc = std.testing.allocator;

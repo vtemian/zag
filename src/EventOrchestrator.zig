@@ -891,10 +891,11 @@ fn onUserInputSubmitted(
     text: []const u8,
 ) !void {
     // The submit pipeline is conversation-only. Callers (the Enter
-    // handler) already unwrap `pane.view`/`pane.runner` before invoking
-    // us, so the orelse here is defensive: if a future call site forgets
-    // the check, we log and noop instead of dereferencing null.
-    const view = pane.view orelse {
+    // handler) already unwrap `pane.conversation`/`pane.runner` before
+    // invoking us, so the orelse here is defensive: if a future call
+    // site forgets the check, we log and noop instead of dereferencing
+    // null.
+    const view = pane.conversation orelse {
         log.warn("onUserInputSubmitted: non-agent pane", .{});
         return;
     };
@@ -1104,7 +1105,7 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
-        .view = &view,
+        .conversation = &view,
         .session = &session_scratch,
         .runner = &runner,
     };
@@ -1233,7 +1234,7 @@ test "mouse click on a focusable float makes it the focused float" {
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
-        .view = &view,
+        .conversation = &view,
         .session = &session_scratch,
         .runner = &runner,
     };
@@ -1358,7 +1359,7 @@ test "handleKey routes a printable char to the focused float's pane draft" {
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
-        .view = &view,
+        .conversation = &view,
         .session = &session_scratch,
         .runner = &runner,
     };
@@ -1459,7 +1460,7 @@ const FloatLifecycleFixture = struct {
     compositor: Compositor,
     layout: Layout,
     session_history: ConversationHistory,
-    view: ConversationBuffer,
+    conversation: ConversationBuffer,
     runner: AgentRunner,
     command_registry: CommandRegistry,
     session_mgr: ?Session.SessionManager,
@@ -1481,15 +1482,15 @@ const FloatLifecycleFixture = struct {
         self.compositor = Compositor.init(&self.screen, allocator, &self.theme);
         self.layout = Layout.init(allocator);
         self.session_history = ConversationHistory.init(allocator);
-        self.view = try ConversationBuffer.init(allocator, 0, "root");
+        self.conversation = try ConversationBuffer.init(allocator, 0, "root");
         self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.session_history);
         self.command_registry = CommandRegistry.init(allocator);
         try self.command_registry.registerBuiltIn("/quit", .quit);
         self.session_mgr = null;
 
         const root_pane: WindowManager.Pane = .{
-            .buffer = self.view.buf(),
-            .view = &self.view,
+            .buffer = self.conversation.buf(),
+            .conversation = &self.conversation,
             .session = &self.session_history,
             .runner = &self.runner,
         };
@@ -1511,7 +1512,7 @@ const FloatLifecycleFixture = struct {
         };
 
         try self.wm.attachLayoutRegistry();
-        try self.layout.setRoot(self.view.buf());
+        try self.layout.setRoot(self.conversation.buf());
         self.layout.recalculate(80, 24);
     }
 
@@ -1520,7 +1521,7 @@ const FloatLifecycleFixture = struct {
         self.allocator.destroy(self.wm);
         self.command_registry.deinit();
         self.runner.deinit();
-        self.view.deinit();
+        self.conversation.deinit();
         self.session_history.deinit();
         self.layout.deinit();
         self.compositor.deinit();
@@ -1712,7 +1713,7 @@ test "handleKey routes through on_key filter and consumes when callback returns 
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner },
+        .root_pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner },
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = &engine,
@@ -1808,7 +1809,7 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner },
+        .root_pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner },
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = &engine,

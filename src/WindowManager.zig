@@ -54,21 +54,23 @@ pub const spinner_chars = "|/-\\";
 /// the compositor renders. Agent panes own the conversation triple;
 /// scratch-backed panes borrow their Buffer from `BufferRegistry` and
 /// leave the trio null. Every read site of `runner`, `session`, or
-/// `view` must tolerate null so scratch panes do not crash code paths
-/// that were originally written for a single pane kind.
+/// `conversation` must tolerate null so scratch panes do not crash code
+/// paths that were originally written for a single pane kind.
 pub const Pane = struct {
     /// Type-erased Buffer rendered for this pane. Always valid. For
-    /// agent panes this matches `view.?.buf()`; for scratch-backed
-    /// panes it is the Buffer borrowed out of `BufferRegistry`.
+    /// agent panes this matches `conversation.?.buf()`; for
+    /// scratch-backed panes it is the Buffer borrowed out of
+    /// `BufferRegistry`.
     buffer: Buffer,
     /// Conversation buffer backing the pane. Non-null for agent panes;
     /// null for scratch-backed panes that borrow a Buffer from the
     /// registry.
-    view: ?*ConversationBuffer,
-    /// Message history and turn state. Non-null exactly when `view` is.
+    conversation: ?*ConversationBuffer,
+    /// Message history and turn state. Non-null exactly when
+    /// `conversation` is.
     session: ?*ConversationHistory,
     /// Agent worker driving LLM calls and tool execution. Non-null
-    /// exactly when `view` is.
+    /// exactly when `conversation` is.
     runner: ?*AgentRunner,
     /// Pane-local model override. `null` means the pane reads the shared
     /// `WindowManager.provider`. Non-null means this pane owns the
@@ -620,7 +622,7 @@ pub fn deinit(self: *WindowManager) void {
             p.deinit();
             self.allocator.destroy(p);
         }
-        if (entry.pane.view) |v| {
+        if (entry.pane.conversation) |v| {
             v.deinit();
             self.allocator.destroy(v);
         }
@@ -680,7 +682,7 @@ pub fn deinit(self: *WindowManager) void {
             p.deinit();
             self.allocator.destroy(p);
         }
-        if (entry.pane.view) |v| {
+        if (entry.pane.conversation) |v| {
             v.deinit();
             self.allocator.destroy(v);
         }
@@ -1317,7 +1319,7 @@ pub fn doSplitWithBuffer(
 
     const pane: Pane = .{
         .buffer = attached,
-        .view = null,
+        .conversation = null,
         .session = null,
         .runner = null,
         .wm = self,
@@ -1415,7 +1417,7 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
 
     const pane: Pane = .{
         .buffer = cb.buf(),
-        .view = cb,
+        .conversation = cb,
         .session = cs,
         .runner = runner,
         .wm = self,
@@ -1444,7 +1446,7 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     // address is independent of `extra_panes` storage, so future
     // splits cannot dangle this pointer.
     const entry = &self.extra_panes.items[self.extra_panes.items.len - 1];
-    if (entry.pane.view) |v| {
+    if (entry.pane.conversation) |v| {
         v.attachViewport(entry.viewport_storage.?);
     }
 
@@ -1580,7 +1582,7 @@ pub fn openFloatPane(
 
     const pane: Pane = .{
         .buffer = buffer,
-        .view = null,
+        .conversation = null,
         .session = null,
         .runner = null,
         .wm = self,
@@ -1696,7 +1698,7 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
             p.deinit();
             self.allocator.destroy(p);
         }
-        if (entry.pane.view) |v| {
+        if (entry.pane.conversation) |v| {
             v.deinit();
             self.allocator.destroy(v);
         }
@@ -1745,7 +1747,7 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
     // pane has no conversation to rehydrate, so bail out loudly. The
     // only caller today is main.zig's `--session=<id>` boot path, which
     // owns a freshly-allocated agent pane.
-    const view = pane.view orelse return error.NotAnAgentPane;
+    const view = pane.conversation orelse return error.NotAnAgentPane;
     const session = pane.session orelse return error.NotAnAgentPane;
 
     const session_id = handle.id[0..handle.id_len];
@@ -2010,7 +2012,7 @@ fn buildConfigPathFromAuth(
 /// propagate status-message errors. Root is always an agent pane; the
 /// null guard here is a belt-and-braces invariant check.
 pub fn appendStatus(self: *WindowManager, text: []const u8) void {
-    const view = self.root_pane.view orelse return;
+    const view = self.root_pane.conversation orelse return;
     _ = view.appendNode(null, .status, text) catch |err|
         log.warn("appendStatus failed: {}", .{err});
 }
@@ -2390,21 +2392,21 @@ test "Pane composes view + session + runner" {
         allocator.destroy(runner);
     }
 
-    const pane: Pane = .{ .buffer = view.buf(), .view = view, .session = session, .runner = runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = view, .session = session, .runner = runner };
 
     // All three objects are reachable through the Pane. The runner holds
     // the session directly; the view lives on the pane.
-    try std.testing.expectEqual(view, pane.view.?);
+    try std.testing.expectEqual(view, pane.conversation.?);
     try std.testing.expectEqual(session, pane.session.?);
     try std.testing.expectEqual(runner, pane.runner.?);
     try std.testing.expectEqual(session, pane.runner.?.session);
-    try std.testing.expectEqualStrings("pane-test", pane.view.?.name);
+    try std.testing.expectEqualStrings("pane-test", pane.conversation.?.name);
 }
 
 test "Pane draft starts empty and grows via appendToDraft" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     try std.testing.expectEqualStrings("", pane.getDraft());
     pane.appendToDraft('h');
@@ -2415,7 +2417,7 @@ test "Pane draft starts empty and grows via appendToDraft" {
 test "Pane appendToDraft caps at MAX_DRAFT" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     var i: usize = 0;
     while (i < MAX_DRAFT + 10) : (i += 1) pane.appendToDraft('x');
@@ -2425,7 +2427,7 @@ test "Pane appendToDraft caps at MAX_DRAFT" {
 test "Pane deleteBackFromDraft + deleteWordFromDraft" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     for ("hello world") |ch| pane.appendToDraft(ch);
     pane.deleteWordFromDraft();
@@ -2437,7 +2439,7 @@ test "Pane deleteBackFromDraft + deleteWordFromDraft" {
 test "Pane consumeDraft snapshots into dest and clears" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     for ("hi") |ch| pane.appendToDraft(ch);
     var scratch: [MAX_DRAFT]u8 = undefined;
@@ -2449,7 +2451,7 @@ test "Pane consumeDraft snapshots into dest and clears" {
 test "Pane.handleKey appends printable + deletes via backspace + Ctrl+W" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     _ = pane.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
     _ = pane.handleKey(.{ .key = .{ .char = 'b' }, .modifiers = .{} });
@@ -2470,7 +2472,7 @@ test "Pane.handleKey delegates to buffer for buffer-internal chords (Ctrl+R)" {
     // draft.
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     const r = pane.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
     try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
@@ -2480,7 +2482,7 @@ test "Pane.handleKey delegates to buffer for buffer-internal chords (Ctrl+R)" {
 test "Pane setDraft replaces the entire draft" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     for ("hello") |ch| pane.appendToDraft(ch);
     pane.setDraft("world");
@@ -2493,7 +2495,7 @@ test "Pane setDraft replaces the entire draft" {
 test "Pane setDraft truncates input larger than MAX_DRAFT" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     var oversized: [MAX_DRAFT + 32]u8 = undefined;
     @memset(&oversized, 'x');
@@ -2506,7 +2508,7 @@ test "Pane setDraft truncates input larger than MAX_DRAFT" {
 test "Pane replaceDraftRange replaces a word in the middle" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     pane.setDraft("foo bar baz");
     try pane.replaceDraftRange(4, 7, "qux");
@@ -2516,7 +2518,7 @@ test "Pane replaceDraftRange replaces a word in the middle" {
 test "Pane replaceDraftRange treats from == to as insertion" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     pane.setDraft("hello world");
     try pane.replaceDraftRange(5, 5, "_INS_");
@@ -2529,7 +2531,7 @@ test "Pane replaceDraftRange shifts trailing bytes right when replacement grows"
     // they were copied; the implementation must walk the tail backward.
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     pane.setDraft("abXYef");
     try pane.replaceDraftRange(2, 4, "QQQQ");
@@ -2539,7 +2541,7 @@ test "Pane replaceDraftRange shifts trailing bytes right when replacement grows"
 test "Pane replaceDraftRange shifts trailing bytes left when replacement shrinks" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     pane.setDraft("abXXXXef");
     try pane.replaceDraftRange(2, 6, "Q");
@@ -2549,7 +2551,7 @@ test "Pane replaceDraftRange shifts trailing bytes left when replacement shrinks
 test "Pane replaceDraftRange rejects from > to" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     pane.setDraft("abcdef");
     try std.testing.expectError(error.InvalidRange, pane.replaceDraftRange(4, 2, "x"));
@@ -2560,7 +2562,7 @@ test "Pane replaceDraftRange rejects from > to" {
 test "Pane replaceDraftRange rejects to past draft_len" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     pane.setDraft("abc");
     try std.testing.expectError(error.InvalidRange, pane.replaceDraftRange(0, 99, "x"));
@@ -2570,7 +2572,7 @@ test "Pane replaceDraftRange rejects to past draft_len" {
 test "Pane replaceDraftRange rejects overflow past MAX_DRAFT" {
     var view = try ConversationBuffer.init(std.testing.allocator, 0, "p");
     defer view.deinit();
-    var pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = null, .runner = null };
+    var pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = null, .runner = null };
 
     // Fill the draft to MAX_DRAFT - 1, then try to insert 8 bytes —
     // the resulting length would exceed MAX_DRAFT, so the op must
@@ -2597,7 +2599,7 @@ test "extra pane viewport is attached to its buffer" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const root_pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2625,7 +2627,7 @@ test "extra pane viewport is attached to its buffer" {
     _ = created;
 
     const entry = &wm.extra_panes.items[wm.extra_panes.items.len - 1];
-    const cb = entry.pane.view.?;
+    const cb = entry.pane.conversation.?;
 
     // The buffer now routes display-state through the heap-allocated
     // Viewport that the PaneEntry owns via `viewport_storage`.
@@ -2653,7 +2655,7 @@ test "multiple splits maintain stable viewport pointers" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const root_pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2681,7 +2683,7 @@ test "multiple splits maintain stable viewport pointers" {
     // to and the storage slot the PaneEntry owns. They must match.
     _ = try wm.createSplitPane();
     const pane1_storage = wm.extra_panes.items[0].viewport_storage;
-    const pane1_attached_vp = wm.extra_panes.items[0].pane.view.?.viewport;
+    const pane1_attached_vp = wm.extra_panes.items[0].pane.conversation.?.viewport;
     try std.testing.expectEqual(pane1_storage, pane1_attached_vp);
 
     // Second split may relocate `extra_panes.items`. Confirms the heap
@@ -2689,7 +2691,7 @@ test "multiple splits maintain stable viewport pointers" {
     // extra_panes' items array reallocates on the second split, so the
     // captured value still matches what the entry now holds.
     _ = try wm.createSplitPane();
-    try std.testing.expectEqual(pane1_storage, wm.extra_panes.items[0].pane.view.?.viewport);
+    try std.testing.expectEqual(pane1_storage, wm.extra_panes.items[0].pane.conversation.?.viewport);
     try std.testing.expectEqual(pane1_storage, pane1_attached_vp);
 }
 
@@ -2709,7 +2711,7 @@ test "drainPane snaps the heap viewport on extra panes" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const root_pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2784,7 +2786,7 @@ test "WindowManager exposes a NodeRegistry" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -2834,7 +2836,7 @@ test "focus by handle updates focused leaf" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -2893,7 +2895,7 @@ test "focus by handle rejects stale id" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -2939,7 +2941,7 @@ test "splitById creates a new leaf and returns its handle" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3000,7 +3002,7 @@ test "closeById removes a leaf and keeps the sibling" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3058,7 +3060,7 @@ test "closeById rejects the caller's own pane" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -3118,7 +3120,7 @@ test "closeById routes float handles to closeFloatById" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3182,7 +3184,7 @@ test "resizeById applies ratio to parent split" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3249,7 +3251,7 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3305,7 +3307,7 @@ test "handleLayoutRequest rejects invalid id with error outcome" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -3361,7 +3363,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3429,7 +3431,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     const scratch_pane = wm.extra_panes.items[0].pane;
     try std.testing.expectEqual(@as(?*AgentRunner, null), scratch_pane.runner);
     try std.testing.expectEqual(@as(?*ConversationHistory, null), scratch_pane.session);
-    try std.testing.expectEqual(@as(?*ConversationBuffer, null), scratch_pane.view);
+    try std.testing.expectEqual(@as(?*ConversationBuffer, null), scratch_pane.conversation);
     try std.testing.expectEqual(scratch_buf.ptr, scratch_pane.buffer.ptr);
 }
 
@@ -3445,7 +3447,7 @@ test "handleLayoutRequest split rejects stale buffer handle" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -3511,7 +3513,7 @@ test "describe emits parseable node map" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3574,7 +3576,7 @@ test "executeAction focus_left goes through handle path" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3640,7 +3642,7 @@ test "executeAction lua_callback runs the Lua function via the engine" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3695,7 +3697,7 @@ test "executeAction lua_callback without an engine is a no-op" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3748,7 +3750,7 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3829,7 +3831,7 @@ test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form wo
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3903,7 +3905,7 @@ test "zag.layout.split rejects a malformed buffer handle string" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -3965,7 +3967,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -4083,7 +4085,7 @@ test "readPaneById returns rendered text with metadata" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
 
@@ -4187,7 +4189,7 @@ test "restorePane rebuilds both tree and messages" {
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &scb);
     defer runner.deinit();
 
-    const pane: Pane = .{ .buffer = cb.buf(), .view = &cb, .session = &scb, .runner = &runner };
+    const pane: Pane = .{ .buffer = cb.buf(), .conversation = &cb, .session = &scb, .runner = &runner };
     try restorePane(pane, &handle, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
@@ -4210,7 +4212,7 @@ const PickerFixture = struct {
     registry: llm.Registry,
     provider: llm.ProviderResult,
     session: ConversationHistory,
-    view: ConversationBuffer,
+    conversation: ConversationBuffer,
     runner: AgentRunner,
     layout: Layout,
     command_registry: CommandRegistry,
@@ -4221,7 +4223,7 @@ const PickerFixture = struct {
         self.command_registry.deinit();
         self.layout.deinit();
         self.runner.deinit();
-        self.view.deinit();
+        self.conversation.deinit();
         self.session.deinit();
         self.provider.deinit();
         self.registry.deinit();
@@ -4273,7 +4275,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
     f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", "/tmp/zag_test_unused_credentials", allocator);
 
     f.session = ConversationHistory.init(allocator);
-    f.view = try ConversationBuffer.init(allocator, 0, "root");
+    f.conversation = try ConversationBuffer.init(allocator, 0, "root");
     f.runner = AgentRunner.init(allocator, TestNullSink.sink(), &f.session);
     f.layout = Layout.init(allocator);
 
@@ -4283,7 +4285,7 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
         .screen = undefined,
         .layout = &f.layout,
         .compositor = undefined,
-        .root_pane = .{ .buffer = f.view.buf(), .view = &f.view, .session = &f.session, .runner = &f.runner },
+        .root_pane = .{ .buffer = f.conversation.buf(), .conversation = &f.conversation, .session = &f.session, .runner = &f.runner },
         .provider = &f.provider,
         .registry = &f.registry,
         .session_mgr = undefined,
@@ -4424,7 +4426,7 @@ test "swapProviderForPane targets the pane identified by handle" {
     // bookkeeping by default (the swapProvider tests above work through
     // the root fallback), but handle-based swaps require the registry.
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
 
     try f.wm.swapProviderForPane(root_handle, "provB", "b2");
@@ -4443,7 +4445,7 @@ test "zag.pane.set_model swaps via the Lua surface" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4472,7 +4474,7 @@ test "zag.pane.current_model returns the resolved model string" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4514,7 +4516,7 @@ test "zag.pane.set_draft writes through to the pane's draft" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4571,7 +4573,7 @@ test "zag.pane.set_draft truncates input larger than MAX_DRAFT" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4602,7 +4604,7 @@ test "zag.pane.set_draft raises on invalid pane handle" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4625,7 +4627,7 @@ test "zag.pane.get_draft round-trips through set_draft" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4656,7 +4658,7 @@ test "zag.pane.get_draft returns empty string for an untouched pane" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4714,7 +4716,7 @@ test "zag.pane.get_draft raises on invalid pane handle" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4735,7 +4737,7 @@ test "zag.pane.replace_draft_range replaces a slice of the draft" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4765,7 +4767,7 @@ test "zag.pane.replace_draft_range raises with helpful message on invalid range"
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4807,7 +4809,7 @@ test "zag.pane.replace_draft_range raises with helpful message on overflow" {
     defer f.deinit();
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4849,7 +4851,7 @@ test "PaneDraftChange fires on root pane draft mutation" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -4897,7 +4899,7 @@ test "PaneDraftChange does not fire for non-matching pane handle" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -4928,7 +4930,7 @@ test "PaneDraftChange rewrite return value replaces the draft" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -4957,7 +4959,7 @@ test "PaneDraftChange recursion guard blocks reentrant set_draft from hook" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5007,7 +5009,7 @@ test "PaneDraftChange fires on float draft via zag.pane.set_draft" {
     f.wm.screen = &screen;
     f.wm.compositor = &compositor;
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
     f.wm.layout.recalculate(screen.width, screen.height);
 
@@ -5057,7 +5059,7 @@ test "PaneDraftChange does not fire when appendPaste is called with empty data" 
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5089,7 +5091,7 @@ test "PaneDraftChange does not fire when appendPaste has no room in the draft" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5125,7 +5127,7 @@ test "PaneDraftChange does not fire when setDraft is called with current draft t
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5166,7 +5168,7 @@ test "PaneDraftChange does not fire on consumeDraft" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5205,7 +5207,7 @@ test "PaneDraftChange hook ref cleanup leaves no leaks on engine deinit" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    try f.layout.setRoot(f.view.buf());
+    try f.layout.setRoot(f.conversation.buf());
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5296,7 +5298,7 @@ const ModelPickerPluginFixture = struct {
     registry: llm.Registry,
     provider: llm.ProviderResult,
     session: ConversationHistory,
-    view: ConversationBuffer,
+    conversation: ConversationBuffer,
     runner: AgentRunner,
     layout: Layout,
     screen: Screen,
@@ -5335,8 +5337,8 @@ const ModelPickerPluginFixture = struct {
 
         self.session = ConversationHistory.init(allocator);
         errdefer self.session.deinit();
-        self.view = try ConversationBuffer.init(allocator, 0, "root");
-        errdefer self.view.deinit();
+        self.conversation = try ConversationBuffer.init(allocator, 0, "root");
+        errdefer self.conversation.deinit();
         self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.session);
         errdefer self.runner.deinit();
 
@@ -5376,7 +5378,7 @@ const ModelPickerPluginFixture = struct {
             .screen = &self.screen,
             .layout = &self.layout,
             .compositor = &self.compositor,
-            .root_pane = .{ .buffer = self.view.buf(), .view = &self.view, .session = &self.session, .runner = &self.runner },
+            .root_pane = .{ .buffer = self.conversation.buf(), .conversation = &self.conversation, .session = &self.session, .runner = &self.runner },
             .provider = &self.provider,
             .registry = &self.engine.providers_registry,
             .session_mgr = undefined,
@@ -5393,7 +5395,7 @@ const ModelPickerPluginFixture = struct {
         // breaks PaneDraftChange dispatch (the hook fires with a missing
         // pane handle). Production wires them in this order at main.zig
         // already; the fixture must match.
-        try self.layout.setRoot(self.view.buf());
+        try self.layout.setRoot(self.conversation.buf());
         try self.wm.attachLayoutRegistry();
         self.layout.recalculate(self.screen.width, self.screen.height);
 
@@ -5410,7 +5412,7 @@ const ModelPickerPluginFixture = struct {
         self.compositor.deinit();
         self.screen.deinit();
         self.runner.deinit();
-        self.view.deinit();
+        self.conversation.deinit();
         self.session.deinit();
         self.provider.deinit();
         self.registry.deinit();
@@ -5675,7 +5677,7 @@ test "openFloatPane allocates, registers, and is reachable via paneFromFloatHand
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const root_pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
     var command_registry = try testCommandRegistry(allocator);
@@ -5752,7 +5754,7 @@ test "deinit tears down extra_floats with no leaks" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const root_pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
     var command_registry = try testCommandRegistry(allocator);
@@ -5960,7 +5962,7 @@ test "describe surfaces floats array and focused_float" {
     defer view.deinit();
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
     defer runner.deinit();
-    const root_pane: Pane = .{ .buffer = view.buf(), .view = &view, .session = &session_scratch, .runner = &runner };
+    const root_pane: Pane = .{ .buffer = view.buf(), .conversation = &view, .session = &session_scratch, .runner = &runner };
 
     var session_mgr: ?Session.SessionManager = null;
     var command_registry = try testCommandRegistry(allocator);
