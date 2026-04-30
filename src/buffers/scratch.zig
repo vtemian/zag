@@ -110,20 +110,14 @@ pub fn fromBuffer(b: Buffer) *ScratchBuffer {
 }
 
 const vtable: Buffer.VTable = .{
-    .getVisibleLines = bufGetVisibleLines,
     .getName = bufGetName,
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
     .getLastTotalRows = bufGetLastTotalRows,
     .setLastTotalRows = bufSetLastTotalRows,
-    .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
-    .handleKey = bufHandleKey,
-    .onResize = bufOnResize,
-    .onFocus = bufOnFocus,
-    .onMouse = bufOnMouse,
 };
 
 const view_vtable: View.VTable = .{
@@ -143,23 +137,28 @@ fn viewGetVisibleLines(
     skip: usize,
     max_lines: usize,
 ) anyerror!std.ArrayList(Theme.StyledLine) {
-    return bufGetVisibleLines(ptr, frame_alloc, cache_alloc, theme, skip, max_lines);
+    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
+    return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
 fn viewLineCount(ptr: *anyopaque) anyerror!usize {
-    return bufLineCount(ptr);
+    const self: *const ScratchBuffer = @ptrCast(@alignCast(ptr));
+    return self.lineCount();
 }
 
 fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
-    return @enumFromInt(@intFromEnum(bufHandleKey(ptr, ev)));
+    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
+    return self.handleKey(ev);
 }
 
 fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    bufOnResize(ptr, rect);
+    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
+    self.onResize(rect);
 }
 
 fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
-    bufOnFocus(ptr, focused);
+    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
+    self.onFocus(focused);
 }
 
 fn viewOnMouse(
@@ -168,11 +167,12 @@ fn viewOnMouse(
     local_x: u16,
     local_y: u16,
 ) View.HandleResult {
-    return @enumFromInt(@intFromEnum(bufOnMouse(ptr, ev, local_x, local_y)));
+    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
+    return self.onMouse(ev, local_x, local_y);
 }
 
-fn bufGetVisibleLines(
-    ptr: *anyopaque,
+pub fn getVisibleLines(
+    self: *const ScratchBuffer,
     frame_alloc: Allocator,
     cache_alloc: Allocator,
     theme: *const Theme,
@@ -180,7 +180,6 @@ fn bufGetVisibleLines(
     max_lines: usize,
 ) anyerror!std.ArrayList(Theme.StyledLine) {
     _ = cache_alloc;
-    const self: *const ScratchBuffer = @ptrCast(@alignCast(ptr));
 
     var out: std.ArrayList(Theme.StyledLine) = .empty;
     errdefer Theme.freeStyledLines(&out, frame_alloc);
@@ -232,8 +231,7 @@ fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
     _ = total;
 }
 
-fn bufLineCount(ptr: *anyopaque) anyerror!usize {
-    const self: *const ScratchBuffer = @ptrCast(@alignCast(ptr));
+pub fn lineCount(self: *const ScratchBuffer) anyerror!usize {
     return self.lines.items.len;
 }
 
@@ -247,8 +245,7 @@ fn bufClearDirty(ptr: *anyopaque) void {
     self.dirty = false;
 }
 
-fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
-    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
+pub fn handleKey(self: *ScratchBuffer, ev: input.KeyEvent) View.HandleResult {
     const count = self.lines.items.len;
     if (count == 0) return .passthrough;
 
@@ -290,23 +287,23 @@ fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
     }
 }
 
-fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    _ = ptr;
+pub fn onResize(self: *ScratchBuffer, rect: Layout.Rect) void {
+    _ = self;
     _ = rect;
 }
 
-fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
-    _ = ptr;
+pub fn onFocus(self: *ScratchBuffer, focused: bool) void {
+    _ = self;
     _ = focused;
 }
 
-fn bufOnMouse(
-    ptr: *anyopaque,
+pub fn onMouse(
+    self: *ScratchBuffer,
     ev: input.MouseEvent,
     local_x: u16,
     local_y: u16,
-) Buffer.HandleResult {
-    _ = ptr;
+) View.HandleResult {
+    _ = self;
     _ = ev;
     _ = local_x;
     _ = local_y;
@@ -362,16 +359,16 @@ test "handleKey j moves down, k moves up, stops at edges" {
     try sb.setLines(&.{ "a", "b", "c" });
 
     try std.testing.expectEqual(
-        Buffer.HandleResult.consumed,
-        sb.buf().handleKey(.{ .key = .{ .char = 'j' }, .modifiers = .{} }),
+        View.HandleResult.consumed,
+        sb.view().handleKey(.{ .key = .{ .char = 'j' }, .modifiers = .{} }),
     );
     try std.testing.expectEqual(@as(u32, 1), sb.cursor_row);
 
-    _ = sb.buf().handleKey(.{ .key = .{ .char = 'j' }, .modifiers = .{} });
-    _ = sb.buf().handleKey(.{ .key = .{ .char = 'j' }, .modifiers = .{} });
+    _ = sb.view().handleKey(.{ .key = .{ .char = 'j' }, .modifiers = .{} });
+    _ = sb.view().handleKey(.{ .key = .{ .char = 'j' }, .modifiers = .{} });
     try std.testing.expectEqual(@as(u32, 2), sb.cursor_row);
 
-    _ = sb.buf().handleKey(.{ .key = .{ .char = 'k' }, .modifiers = .{} });
+    _ = sb.view().handleKey(.{ .key = .{ .char = 'k' }, .modifiers = .{} });
     try std.testing.expectEqual(@as(u32, 1), sb.cursor_row);
 }
 
@@ -391,7 +388,7 @@ test "getVisibleLines returns styled lines with cursor highlighted" {
     try sb.setLines(&.{ "one", "two" });
     sb.cursor_row = 1;
     const theme = Theme.defaultTheme();
-    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    var lines = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, 10);
     defer Theme.freeStyledLines(&lines, gpa);
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     // second line should carry the cursor style; the exact style depends
@@ -406,7 +403,7 @@ test "setRowStyle stamps row_style on the rendered StyledLine" {
     try sb.setLines(&.{ "alpha", "beta", "gamma" });
     try sb.setRowStyle(1, .selection);
     const theme = Theme.defaultTheme();
-    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    var lines = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, 10);
     defer Theme.freeStyledLines(&lines, gpa);
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), lines.items[0].row_style);
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[1].row_style);
@@ -431,7 +428,7 @@ test "clearRowStyle removes the override and is a no-op for unset rows" {
     sb.clearRowStyle(1);
     sb.clearRowStyle(2); // never set; must not raise
     const theme = Theme.defaultTheme();
-    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    var lines = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, 10);
     defer Theme.freeStyledLines(&lines, gpa);
     for (lines.items) |line| {
         try std.testing.expect(line.row_style == null);
@@ -447,31 +444,27 @@ test "setLines clears all row style overrides" {
     try sb.setRowStyle(2, .err);
     try sb.setLines(&.{ "x", "y", "z" });
     const theme = Theme.defaultTheme();
-    var lines = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    var lines = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, 10);
     defer Theme.freeStyledLines(&lines, gpa);
     for (lines.items) |line| {
         try std.testing.expect(line.row_style == null);
     }
 }
 
-test "ScratchBuffer.view() matches buf() output" {
+test "ScratchBuffer.view() exposes lineCount and getVisibleLines" {
     const gpa = std.testing.allocator;
-    var sb = try ScratchBuffer.create(gpa, 7, "parity");
+    var sb = try ScratchBuffer.create(gpa, 7, "view");
     defer sb.destroy();
 
     try sb.setLines(&.{ "alpha", "beta", "gamma" });
 
     const theme = Theme.defaultTheme();
 
-    const total = try sb.buf().lineCount();
-    try std.testing.expectEqual(total, try sb.view().lineCount());
+    try std.testing.expectEqual(@as(usize, 3), try sb.view().lineCount());
 
-    var via_buf = try sb.buf().getVisibleLines(gpa, gpa, &theme, 0, total);
-    defer Theme.freeStyledLines(&via_buf, gpa);
-    var via_view = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, total);
-    defer Theme.freeStyledLines(&via_view, gpa);
-
-    try std.testing.expectEqual(via_buf.items.len, via_view.items.len);
+    var lines = try sb.view().getVisibleLines(gpa, gpa, &theme, 0, 10);
+    defer Theme.freeStyledLines(&lines, gpa);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
 }
 
 test {

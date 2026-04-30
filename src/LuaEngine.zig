@@ -12745,7 +12745,7 @@ test "zag.buffer.set_row_style happy path stamps row_style on rendered line" {
     const sb = entry.scratch;
 
     const theme = Theme.defaultTheme();
-    var lines = try sb.buf().getVisibleLines(alloc, alloc, &theme, 0, 10);
+    var lines = try sb.view().getVisibleLines(alloc, alloc, &theme, 0, 10);
     defer Theme.freeStyledLines(&lines, alloc);
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[1].row_style);
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), lines.items[0].row_style);
