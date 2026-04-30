@@ -45,6 +45,10 @@ pub const ProviderError = std.mem.Allocator.Error || CancelError || error{
     SseLineTooLong,
     /// Accumulated SSE event data exceeded `streaming.MAX_SSE_EVENT_DATA`.
     SseEventDataTooLarge,
+    /// An SSE event-type field was longer than the per-call event_buf
+    /// (currently 128 bytes). Returning rather than truncating prevents
+    /// silently re-routing a long event to the wrong handler downstream.
+    SseEventTypeTooLong,
     /// Provider signalled a mid-stream failure (e.g. Responses API
     /// `response.failed` event) and the turn cannot be assembled.
     ProviderResponseFailed,
@@ -80,6 +84,7 @@ pub fn mapProviderError(err: anyerror) ProviderError {
         error.MissingApiKey => error.MissingApiKey,
         error.SseLineTooLong => error.SseLineTooLong,
         error.SseEventDataTooLarge => error.SseEventDataTooLarge,
+        error.SseEventTypeTooLong => error.SseEventTypeTooLong,
         error.Cancelled => error.Cancelled,
         error.ProviderResponseFailed => error.ProviderResponseFailed,
         error.NotLoggedIn => error.NotLoggedIn,
