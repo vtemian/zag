@@ -1133,6 +1133,20 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
     try deps.stdout.flush();
 }
 
+/// Print an actionable "no credentials, switch to a TTY" hint for `provider_name`
+/// to `stderr` and exit with status 1. Used by `firstRunWizardRetry` from both
+/// the up-front non-TTY guard and the `error.NonInteractiveFirstRun` retry path.
+fn exitNoCredentialsForProvider(stderr: std.fs.File, provider_name: []const u8) noreturn {
+    var scratch: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &scratch,
+        "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
+        .{ provider_name, provider_name },
+    ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
+    _ = stderr.write(msg) catch {};
+    std.process.exit(1);
+}
+
 /// Handle `createProviderFromEnv` returning `error.MissingCredential` at
 /// first-run: drop into the onboarding wizard when stdin is a TTY, then
 /// reload Lua and retry provider creation once. On a non-TTY or repeated
@@ -1152,14 +1166,7 @@ pub fn firstRunWizardRetry(
     const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
 
     if (!is_tty) {
-        var scratch: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &scratch,
-            "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
-            .{ spec.provider_name, spec.provider_name },
-        ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
-        _ = stderr.write(msg) catch {};
-        std.process.exit(1);
+        exitNoCredentialsForProvider(stderr, spec.provider_name);
     }
 
     const paths = buildPaths(allocator) catch |err| {
@@ -1200,14 +1207,7 @@ pub fn firstRunWizardRetry(
 
     const result = runWizard(deps) catch |err| {
         if (err == error.NonInteractiveFirstRun) {
-            var scratch: [512]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &scratch,
-                "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
-                .{ spec.provider_name, spec.provider_name },
-            ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
-            _ = stderr.write(msg) catch {};
-            std.process.exit(1);
+            exitNoCredentialsForProvider(stderr, spec.provider_name);
         }
         return err;
     };

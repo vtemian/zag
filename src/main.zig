@@ -56,6 +56,20 @@ fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
     _ = try view.appendNode(null, .status, text);
 }
 
+/// Format `fmt` with `args` into a stack scratch buffer and append the
+/// resulting line to `view`. On format overflow falls back to the literal
+/// `fallback` string so a too-long status never aborts startup.
+fn appendStatusLineFmt(
+    view: *ConversationBuffer,
+    comptime fallback: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    var scratch: [1024]u8 = undefined;
+    const text = std.fmt.bufPrint(&scratch, fmt, args) catch fallback;
+    try appendStatusLine(view, text);
+}
+
 /// Set a file descriptor to non-blocking mode.
 fn setNonBlocking(fd: posix.fd_t) !void {
     const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
@@ -69,27 +83,24 @@ fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
 
     if (resume_id == null) {
-        var scratch: [512]u8 = undefined;
-        const welcome = std.fmt.bufPrint(&scratch,
+        try appendStatusLineFmt(view, "Welcome to zag",
             \\Welcome to zag - a composable agent environment
             \\model: {s}
             \\cwd: {s}
             \\
             \\Type a message and press Enter. Ctrl+C or /quit to exit.
             \\Esc = normal mode, i = insert mode. In normal: h/j/k/l focus, v/s split, q close. /model to show model.
-        , .{ model_id, cwd }) catch "Welcome to zag";
-        try appendStatusLine(view, welcome);
+        , .{ model_id, cwd });
         return;
     }
 
     if (session_handle) |sh| {
-        var scratch: [256]u8 = undefined;
-        const resume_msg = std.fmt.bufPrint(
-            &scratch,
+        try appendStatusLineFmt(
+            view,
+            "Resumed session",
             "Resumed session {s} ({d} messages)",
             .{ sh.id[0..sh.id_len], sh.meta.message_count },
-        ) catch "Resumed session";
-        try appendStatusLine(view, resume_msg);
+        );
         try appendStatusLine(view, "");
     }
 }
