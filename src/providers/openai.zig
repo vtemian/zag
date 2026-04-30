@@ -453,10 +453,16 @@ fn parseSseStream(
     var sse_data: std.ArrayList(u8) = .empty;
     defer sse_data.deinit(allocator);
 
+    const debug_sse = std.posix.getenv("ZAG_DEBUG_SSE_DUMP") != null;
+
     while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
+        if (debug_sse) log.warn("[sse-raw] {s}", .{sse.data});
         if (std.mem.eql(u8, sse.data, "[DONE]")) break;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, sse.data, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, sse.data, .{}) catch |err| {
+            if (debug_sse) log.warn("[sse-parse-fail err={s}] {s}", .{ @errorName(err), sse.data });
+            continue;
+        };
         defer parsed.deinit();
         const obj = parsed.value.object;
 
