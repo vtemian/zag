@@ -171,11 +171,37 @@ pub fn main() !void {
         else => {},
     }
 
+    // Lua engine is the single source of truth for providers, default model,
+    // and slash commands. Init it once here so both TUI and headless paths
+    // share the same boot; a failure means there is no working configuration,
+    // so exit with the underlying error rather than limping along.
+    var lua_engine = LuaEngine.init(allocator) catch |err| {
+        log.err("lua init failed: {}", .{err});
+        return err;
+    };
+    defer lua_engine.deinit();
+
+    // Builtins (zag.builtin.*) register their slash commands before
+    // config.lua runs so a user override via `zag.command{name="..."}`
+    // shadows the default; the command registry's last-write-wins
+    // semantics deliver that outcome without extra plumbing.
+    lua_engine.loadBuiltinPlugins();
+    lua_engine.loadUserConfig();
+    // If the user has no config.lua (or declared zero providers), the
+    // registry is empty and nothing would work. Load the embedded stdlib
+    // so first-run users still have the well-known providers available
+    // to the picker and the factory. A user who later pins their set via
+    // explicit `require(...)` calls in config.lua populates the registry
+    // before this check fires, so the fallback stays dormant.
+    if (lua_engine.providers_registry.endpoints.items.len == 0) {
+        log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
+        _ = lua_engine.bootstrapStdlibProviders();
+    }
+
     // Headless mode exits the process after writing its trajectory; do it
-    // before any TUI subsystem comes up. `Harness.run` performs its own Lua
-    // init and provider construction.
+    // before any TUI subsystem comes up.
     if (startup_mode == .headless) {
-        return Harness.run(startup_mode.headless, allocator);
+        return Harness.run(startup_mode.headless, allocator, &lua_engine);
     }
 
     var root_session = ConversationHistory.init(allocator);
@@ -210,57 +236,12 @@ pub fn main() !void {
     defer layout.deinit();
     try layout.setRoot(root_buffer.buf());
 
-    // Lua engine comes up first so `loadUserConfig` can populate
-    // `default_model` and `providers_registry` before the provider factory
-    // reads them. The engine owns its keymap registry; keymap overrides in
-    // config.lua land there directly. Input-parser wiring and tool
-    // registration happen after the orchestrator is built because those
-    // state lives on it.
-    var lua_engine: ?LuaEngine = LuaEngine.init(allocator) catch |err| blk: {
-        log.warn("lua init failed, plugins disabled: {}", .{err});
-        break :blk null;
-    };
-    defer if (lua_engine) |*eng| eng.deinit();
-
-    if (lua_engine) |*eng| {
-        // Builtins (zag.builtin.*) register their slash commands before
-        // config.lua runs so a user override via `zag.command{name="..."}`
-        // shadows the default; the command registry's last-write-wins
-        // semantics deliver that outcome without extra plumbing.
-        eng.loadBuiltinPlugins();
-        eng.loadUserConfig();
-        // If the user has no config.lua (or declared zero providers), the
-        // registry is empty and nothing would work. Load the embedded stdlib
-        // so first-run users still have the well-known providers available
-        // to the picker and the factory. A user who later pins their set via
-        // explicit `require(...)` calls in config.lua populates the registry
-        // before this check fires, so the fallback stays dormant.
-        if (eng.providers_registry.endpoints.items.len == 0) {
-            log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
-            _ = eng.bootstrapStdlibProviders();
-        }
-    }
-
-    const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    var registry_view = RegistryView.init(allocator, if (lua_engine) |*eng| eng else null);
+    const default_model: ?[]const u8 = lua_engine.default_model;
+    var registry_view = RegistryView.init(allocator, &lua_engine);
     defer registry_view.deinit();
     const registry_ptr = registry_view.ptr();
 
-    // Same engine-less fallback for the slash-command registry that the
-    // window manager borrows. With Lua up, the engine owns the registry
-    // and `LuaEngine.init` seeds built-ins; without Lua, we hand the
-    // manager an empty registry seeded inline so degraded-mode dispatch
-    // still has a stable pointer.
-    var fallback_command_registry: ?@import("CommandRegistry.zig") = if (lua_engine == null) blk: {
-        var r = @import("CommandRegistry.zig").init(allocator);
-        try r.registerBuiltIn("/quit", .quit);
-        try r.registerBuiltIn("/q", .quit);
-        try r.registerBuiltIn("/perf", .perf);
-        try r.registerBuiltIn("/perf-dump", .perf_dump);
-        break :blk r;
-    } else null;
-    defer if (fallback_command_registry) |*r| r.deinit();
-    const command_registry_ptr = if (lua_engine) |*eng| &eng.command_registry else &fallback_command_registry.?;
+    const command_registry_ptr = &lua_engine.command_registry;
     var provider = llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
         if (err != error.MissingCredential) return err;
 
@@ -280,7 +261,7 @@ pub fn main() !void {
 
         break :first_try try auth_wizard.firstRunWizardRetry(
             allocator,
-            if (lua_engine) |*eng| eng else null,
+            &lua_engine,
             &stdin_reader.interface,
             &stdout_wiz_writer.interface,
         );
@@ -293,9 +274,7 @@ pub fn main() !void {
     // Wire the lua engine into the root runner so the main-thread drain loop
     // can service `hook_request` / `lua_tool_request` events pushed by the
     // agent. Extra split panes inherit this wiring from the orchestrator.
-    if (lua_engine) |*eng| {
-        root_runner.lua_engine = eng;
-    }
+    root_runner.lua_engine = &lua_engine;
 
     var session_mgr = Session.SessionManager.init(allocator) catch |err| blk: {
         log.warn("session init failed, persistence disabled: {}", .{err});
@@ -380,7 +359,7 @@ pub fn main() !void {
         .registry = &registry,
         .endpoint_registry = registry_ptr,
         .session_mgr = &session_mgr,
-        .lua_engine = if (lua_engine) |*eng| eng else null,
+        .lua_engine = &lua_engine,
         .command_registry = command_registry_ptr,
         .stdout_file = stdout_file,
         .wake_read_fd = wake_read,
@@ -414,10 +393,8 @@ pub fn main() !void {
     // Lua bindings (zag.layout.*, zag.pane.*) call the window manager
     // directly on the main thread. Wire after orchestrator construction
     // so the pointer is stable for the lifetime of the engine.
-    if (lua_engine) |*eng| {
-        eng.window_manager = &orchestrator.window_manager;
-        eng.buffer_registry = &orchestrator.window_manager.buffer_registry;
-    }
+    lua_engine.window_manager = &orchestrator.window_manager;
+    lua_engine.buffer_registry = &orchestrator.window_manager.buffer_registry;
 
     // Publish the root leaf's packed handle on the root runner so the
     // agent thread can mirror it into `tools.current_caller_pane_id`
@@ -434,17 +411,15 @@ pub fn main() !void {
     // Register any Lua-declared tools into the dispatch registry. Config.lua
     // already ran before provider creation, so the keymap overrides,
     // default_model, and escape-timeout are all live by this point.
-    if (lua_engine) |*eng| {
-        eng.registerTools(&registry) catch |err| {
-            log.warn("failed to register lua tools: {}", .{err});
-        };
-        // Advertise the built-in `task` tool only when the user
-        // declared at least one subagent. A no-op registry would
-        // emit a tool the model cannot usefully call.
-        tools.registerTaskTool(&registry, eng.subagentRegistry()) catch |err| {
-            log.warn("failed to register task tool: {}", .{err});
-        };
-    }
+    lua_engine.registerTools(&registry) catch |err| {
+        log.warn("failed to register lua tools: {}", .{err});
+    };
+    // Advertise the built-in `task` tool only when the user
+    // declared at least one subagent. A no-op registry would
+    // emit a tool the model cannot usefully call.
+    tools.registerTaskTool(&registry, lua_engine.subagentRegistry()) catch |err| {
+        log.warn("failed to register task tool: {}", .{err});
+    };
 
     // Bring up the Lua async runtime (worker pool, completion queue, root
     // scope). Deferred teardown runs before `eng.deinit()` thanks to LIFO
@@ -452,18 +427,16 @@ pub fn main() !void {
     // state (and the allocator it shares) goes away. `deinitAsync` tolerates
     // an unsuccessful `initAsync` (nil async_runtime, empty tasks map), so the
     // defer is unconditional.
-    if (lua_engine) |*eng| {
-        eng.initAsync(4, 256) catch |err| {
-            log.warn("lua async runtime init failed: {}", .{err});
-        };
-        // Share the orchestrator's wake pipe so Lua workers wake the main
-        // loop the same way agent-event pushes do. initAsync runs after
-        // orchestrator construction, so `wakeWriteFd()` is valid here; if
-        // initAsync failed above, `async_runtime` is null and the assignment
-        // is a no-op.
-        if (eng.async_runtime) |rt| rt.completions.wake_fd = orchestrator.wakeWriteFd();
-    }
-    defer if (lua_engine) |*eng| eng.deinitAsync();
+    lua_engine.initAsync(4, 256) catch |err| {
+        log.warn("lua async runtime init failed: {}", .{err});
+    };
+    // Share the orchestrator's wake pipe so Lua workers wake the main
+    // loop the same way agent-event pushes do. initAsync runs after
+    // orchestrator construction, so `wakeWriteFd()` is valid here; if
+    // initAsync failed above, `async_runtime` is null and the assignment
+    // is a no-op.
+    if (lua_engine.async_runtime) |rt| rt.completions.wake_fd = orchestrator.wakeWriteFd();
+    defer lua_engine.deinitAsync();
 
     try orchestrator.run();
 

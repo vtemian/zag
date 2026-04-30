@@ -328,7 +328,7 @@ pub const HeadlessDeps = struct {
 /// Headless entry point: wires every subsystem the agent loop needs, then
 /// hands control to `runWithProvider`. TUI subsystems (Terminal, Screen,
 /// Compositor, EventOrchestrator) are intentionally never constructed.
-pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
+pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) !void {
     var root_session = ConversationHistory.init(gpa);
     defer root_session.deinit();
 
@@ -357,25 +357,6 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
     defer layout.deinit();
     try layout.setRoot(root_buffer.buf());
 
-    var lua_engine: ?LuaEngine = LuaEngine.init(gpa) catch |err| blk: {
-        log.warn("lua init failed, plugins disabled: {}", .{err});
-        break :blk null;
-    };
-    defer if (lua_engine) |*eng| eng.deinit();
-
-    if (lua_engine) |*eng| {
-        // Builtins (zag.builtin.*) register their slash commands before
-        // config.lua runs so a user override via `zag.command{name="..."}`
-        // shadows the default; the command registry's last-write-wins
-        // semantics deliver that outcome without extra plumbing here.
-        eng.loadBuiltinPlugins();
-        eng.loadUserConfig();
-        if (eng.providers_registry.endpoints.items.len == 0) {
-            log.info("no providers declared in config.lua; loading stdlib (require zag.providers.*)", .{});
-            _ = eng.bootstrapStdlibProviders();
-        }
-    }
-
     const auth_path = try auth_wizard.buildAuthPath(gpa);
     defer gpa.free(auth_path);
 
@@ -387,11 +368,8 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
     defer skills_registry.deinit(gpa);
     root_runner.skills = &skills_registry;
 
-    const default_model: ?[]const u8 = if (lua_engine) |*eng| eng.default_model else null;
-    // If the Lua engine failed to boot, fall back to an empty registry.
-    // `createProviderFromLuaConfig` will surface UnknownProvider, which the
-    // caller routes to the "no credentials" hint.
-    var registry_view = LuaEngine.RegistryView.init(gpa, if (lua_engine) |*eng| eng else null);
+    const default_model: ?[]const u8 = lua_engine.default_model;
+    var registry_view = LuaEngine.RegistryView.init(gpa, lua_engine);
     defer registry_view.deinit();
     const registry_ptr = registry_view.ptr();
 
@@ -410,15 +388,13 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
     var registry = try tools.createDefaultRegistry(gpa);
     defer registry.deinit();
 
-    if (lua_engine) |*eng| {
-        root_runner.lua_engine = eng;
-        eng.registerTools(&registry) catch |err| {
-            log.warn("failed to register lua tools: {}", .{err});
-        };
-        tools.registerTaskTool(&registry, eng.subagentRegistry()) catch |err| {
-            log.warn("failed to register task tool: {}", .{err});
-        };
-    }
+    root_runner.lua_engine = lua_engine;
+    lua_engine.registerTools(&registry) catch |err| {
+        log.warn("failed to register lua tools: {}", .{err});
+    };
+    tools.registerTaskTool(&registry, lua_engine.subagentRegistry()) catch |err| {
+        log.warn("failed to register task tool: {}", .{err});
+    };
 
     var session_mgr = if (!mode.no_session)
         Session.SessionManager.init(gpa) catch |err| blk: {
@@ -441,13 +417,11 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
     else
         std.fmt.bufPrint(&synth_id_buf, "headless-{d}", .{std.time.milliTimestamp()}) catch "headless";
 
-    if (lua_engine) |*eng| {
-        eng.initAsync(4, 256) catch |err| {
-            log.warn("lua async runtime init failed: {}", .{err});
-        };
-        if (eng.async_runtime) |rt| rt.completions.wake_fd = wake_write;
-    }
-    defer if (lua_engine) |*eng| eng.deinitAsync();
+    lua_engine.initAsync(4, 256) catch |err| {
+        log.warn("lua async runtime init failed: {}", .{err});
+    };
+    if (lua_engine.async_runtime) |rt| rt.completions.wake_fd = wake_write;
+    defer lua_engine.deinitAsync();
 
     try runWithProvider(.{
         .mode = mode,
@@ -456,7 +430,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator) !void {
         .model_id = provider.model_id,
         .registry = &registry,
         .endpoint_registry = &provider.registry,
-        .lua_engine = if (lua_engine) |*eng| eng else null,
+        .lua_engine = lua_engine,
         .runner = &root_runner,
         .session = &root_session,
         .wake_read_fd = wake_read,
