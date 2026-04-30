@@ -293,21 +293,7 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
 /// resolved style. Shrinks the rect by 1 cell on each side to leave room
 /// for the pane's frame, then applies padding_h/padding_v from the theme.
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
-    const view = self.viewForBuffer(leaf.buffer) catch return;
-    self.drawBufferIntoRect(leaf.buffer, view, leaf.rect, true);
-}
-
-/// Resolve the View to render `buf` through. Looks up the owning Pane
-/// when an orchestrator is wired; otherwise falls back to a frame-arena
-/// trampoline View that re-dispatches through `Buffer.VTable`. The
-/// trampoline lives in the per-frame arena and survives only this paint;
-/// commit 3 of the view-extraction migrates every paint path onto a
-/// real Pane and the fallback goes away.
-fn viewForBuffer(self: *Compositor, buf: Buffer) !View {
-    if (self.orchestrator) |orch| {
-        if (orch.window_manager.paneFromBuffer(buf)) |pane| return pane.view;
-    }
-    return buf.asView(self.frame_arena.allocator());
+    self.drawBufferIntoRect(leaf.buffer, leaf.view, leaf.rect, true);
 }
 
 /// Render `buf` into `outer`, where `outer` is the chrome-inclusive
@@ -1025,8 +1011,7 @@ fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputS
         // ignored by Screen.clearRect itself.
         self.screen.clearRect(rect.y, rect.x, rect.width, rect.height);
 
-        const float_view = self.viewForBuffer(float.buffer) catch continue;
-        self.drawBufferIntoRect(float.buffer, float_view, rect, false);
+        self.drawBufferIntoRect(float.buffer, float.view, rect, false);
         self.drawRoundedBox(rect, fd.focused, float.config.title, float.config.border);
 
         // Insert-mode cursor block for the focused float. Floats today
@@ -1200,7 +1185,7 @@ test "row_style override paints background bar without overwriting span fg" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(sb.buf());
+    try layout.setRoot(.{ .buffer = sb.buf(), .view = sb.view() });
     layout.recalculate(30, 8);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1252,7 +1237,7 @@ test "composite writes buffer content at leaf rect with padding" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 10);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1280,7 +1265,7 @@ test "composite draws status line on last row" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 10);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1319,7 +1304,7 @@ test "composite skips clean buffer leaves" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 10);
 
     // First composite: buffer is dirty, content should appear
@@ -1354,7 +1339,7 @@ test "drawStatusLine paints the mode indicator at column 0" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 10);
 
     const focused = layout.focused orelse layout.root.?;
@@ -1376,7 +1361,7 @@ test "status row in normal mode shows mode label and buffer name only" {
     defer cb.deinit();
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(80, 10);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .normal });
@@ -1403,7 +1388,7 @@ test "composite draws rounded frame around a single pane" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(20, 6);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1435,9 +1420,9 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb1.buf());
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
     layout.recalculate(40, 8);
-    try layout.splitVertical(0.5, cb2.buf());
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
     layout.recalculate(40, 8);
     // Focus followed the split to the right pane; walk back so this test
     // can check the focused/unfocused contrast on the left/right pair.
@@ -1471,9 +1456,9 @@ test "focused pane title has inverse style, unfocused is plain" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb1.buf());
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
     layout.recalculate(40, 8);
-    try layout.splitVertical(0.5, cb2.buf());
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
     layout.recalculate(40, 8);
     // Focus followed the split; refocus left so `a` is the focused pane.
     layout.focusDirection(.left);
@@ -1518,7 +1503,7 @@ test "title is suppressed when pane width is below 6" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(5, 6);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1551,7 +1536,7 @@ test "long titles are truncated with ellipsis" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(12, 6);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1579,7 +1564,7 @@ test "focused pane renders its draft with a block cursor at end" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 8);
 
     const drafts = [_]Compositor.LeafDraft{
@@ -1616,7 +1601,7 @@ test "cursor bg does not bleed across keystrokes" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 8);
 
     const leaf = &layout.root.?.leaf;
@@ -1659,9 +1644,9 @@ test "unfocused pane shows its draft without a cursor block" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb1.buf());
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
     layout.recalculate(40, 8);
-    try layout.splitVertical(0.5, cb2.buf());
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
     layout.recalculate(40, 8);
     // Focus followed the split to the right pane; refocus left so the right
     // pane (cb2) is the unfocused one whose prompt row we inspect below.
@@ -1702,7 +1687,7 @@ test "normal mode does not paint a block cursor in the focused pane" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 8);
 
     const drafts = [_]Compositor.LeafDraft{
@@ -1735,7 +1720,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 6);
 
     const input: Compositor.InputState = .{ .mode = .normal };
@@ -1776,7 +1761,7 @@ test "composite twice produces identical screen content" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(40, 10);
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
@@ -1817,11 +1802,11 @@ test "drawFloats renders content and rounded border in supplied rect" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(root_cb.buf());
+    try layout.setRoot(.{ .buffer = root_cb.buf(), .view = root_cb.view() });
     layout.recalculate(40, 12);
 
     const rect: Layout.Rect = .{ .x = 8, .y = 2, .width = 20, .height = 6 };
-    const handle = try layout.addFloat(float_cb.buf(), rect, .{ .border = .rounded, .title = "Models" });
+    const handle = try layout.addFloat(.{ .buffer = float_cb.buf(), .view = float_cb.view() }, rect, .{ .border = .rounded, .title = "Models" });
     _ = handle;
 
     const float_drafts = [_]Compositor.FloatDraft{
@@ -1870,12 +1855,12 @@ test "scratch leaf still renders correctly with a float overhead" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(root_cb.buf());
+    try layout.setRoot(.{ .buffer = root_cb.buf(), .view = root_cb.view() });
     layout.recalculate(40, 12);
 
     // Float in the lower-right; the tile content at (1, 1+pad_h+2)
     // must still resolve to 'h' from the user message.
-    _ = try layout.addFloat(float_cb.buf(), .{ .x = 20, .y = 4, .width = 18, .height = 6 }, .{});
+    _ = try layout.addFloat(.{ .buffer = float_cb.buf(), .view = float_cb.view() }, .{ .x = 20, .y = 4, .width = 18, .height = 6 }, .{});
 
     const float_drafts = [_]Compositor.FloatDraft{
         .{ .float = layout.floats.items[0] },
@@ -1902,11 +1887,11 @@ test "focused float draws with the focused border highlight" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(root_cb.buf());
+    try layout.setRoot(.{ .buffer = root_cb.buf(), .view = root_cb.view() });
     layout.recalculate(40, 12);
 
     const rect: Layout.Rect = .{ .x = 6, .y = 2, .width = 20, .height = 6 };
-    _ = try layout.addFloat(float_cb.buf(), rect, .{ .border = .rounded, .title = "f" });
+    _ = try layout.addFloat(.{ .buffer = float_cb.buf(), .view = float_cb.view() }, rect, .{ .border = .rounded, .title = "f" });
 
     const float_drafts = [_]Compositor.FloatDraft{
         .{ .float = layout.floats.items[0], .draft = "", .focused = true },
@@ -1933,11 +1918,11 @@ test "non-focused float draws with the plain border highlight" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(root_cb.buf());
+    try layout.setRoot(.{ .buffer = root_cb.buf(), .view = root_cb.view() });
     layout.recalculate(40, 12);
 
     const rect: Layout.Rect = .{ .x = 6, .y = 2, .width = 20, .height = 6 };
-    _ = try layout.addFloat(float_cb.buf(), rect, .{ .border = .rounded, .title = "f" });
+    _ = try layout.addFloat(.{ .buffer = float_cb.buf(), .view = float_cb.view() }, rect, .{ .border = .rounded, .title = "f" });
 
     const float_drafts = [_]Compositor.FloatDraft{
         .{ .float = layout.floats.items[0], .draft = "", .focused = false },
@@ -1961,7 +1946,7 @@ test "tiny pane (height 3) skips the prompt reservation" {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(cb.buf());
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
     layout.recalculate(20, 4);
     // Pane rect = 20x3 (4 rows - 1 for status). Too small for a prompt row,
     // so the composite must not crash and must not draw a prompt glyph.

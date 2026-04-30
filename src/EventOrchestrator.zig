@@ -1143,7 +1143,7 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     defer wm.deinit();
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(view.buf());
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
     layout.recalculate(screen.width, screen.height);
 
     // Seed a scratch buffer with two lines so we can later read back the
@@ -1269,7 +1269,7 @@ test "mouse click on a focusable float makes it the focused float" {
     defer wm.deinit();
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(view.buf());
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
     layout.recalculate(80, 24);
 
     // Two floats: a low-z one in the NW, a high-z one (50) overlapping
@@ -1398,7 +1398,7 @@ test "handleKey routes a printable char to the focused float's pane draft" {
     defer wm.deinit();
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(view.buf());
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
     layout.recalculate(80, 24);
 
     // Open a focusable float with `enter = true` so it becomes the
@@ -1523,7 +1523,7 @@ const FloatLifecycleFixture = struct {
         };
 
         try self.wm.attachLayoutRegistry();
-        try self.layout.setRoot(self.conversation.buf());
+        try self.layout.setRoot(.{ .buffer = self.conversation.buf(), .view = self.conversation.view() });
         self.layout.recalculate(80, 24);
     }
 
@@ -1739,7 +1739,7 @@ test "handleKey routes through on_key filter and consumes when callback returns 
     defer wm.deinit();
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(view.buf());
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
     layout.recalculate(80, 24);
     engine.window_manager = wm;
     engine.buffer_registry = &wm.buffer_registry;
@@ -1836,7 +1836,7 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
     defer wm.deinit();
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(view.buf());
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
     layout.recalculate(80, 24);
     engine.window_manager = wm;
     engine.buffer_registry = &wm.buffer_registry;

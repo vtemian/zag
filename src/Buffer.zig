@@ -9,7 +9,6 @@ const Allocator = std.mem.Allocator;
 const Theme = @import("Theme.zig");
 const Layout = @import("Layout.zig");
 const input = @import("input.zig");
-const View = @import("View.zig");
 
 const Buffer = @This();
 
@@ -171,56 +170,6 @@ pub fn onFocus(self: Buffer, focused: bool) void {
 /// Dispatch a mouse event to the buffer with pane-local coordinates.
 pub fn onMouse(self: Buffer, ev: input.MouseEvent, local_x: u16, local_y: u16) HandleResult {
     return self.vtable.onMouse(self.ptr, ev, local_x, local_y);
-}
-
-/// Allocate a transitional View that re-dispatches through this Buffer's
-/// vtable's view-flavored slots. Used by Compositor call sites that
-/// don't (yet) have a Pane to look up the concrete buffer's bespoke
-/// `view()` (test fixtures without an orchestrator, floats not yet
-/// registered as a Pane). The shim heap-allocates a Buffer mirror in
-/// `alloc` so its vtable pointer survives the call; pass a per-frame
-/// arena. Commit 3 of the View extraction drops the view-flavored slots
-/// from `Buffer.VTable` and at that point this helper goes too — its
-/// callers must either obtain a real `View` from a Pane or wire one
-/// onto `Layout.LayoutNode.Leaf` itself.
-pub fn asView(self: Buffer, alloc: Allocator) Allocator.Error!View {
-    const Mirror = struct {
-        fn vGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
-            const buf: *Buffer = @ptrCast(@alignCast(ptr));
-            return buf.vtable.getVisibleLines(buf.ptr, frame_alloc, cache_alloc, theme, skip, max_lines);
-        }
-        fn vLineCount(ptr: *anyopaque) anyerror!usize {
-            const buf: *Buffer = @ptrCast(@alignCast(ptr));
-            return buf.vtable.lineCount(buf.ptr);
-        }
-        fn vHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
-            const buf: *Buffer = @ptrCast(@alignCast(ptr));
-            return @enumFromInt(@intFromEnum(buf.vtable.handleKey(buf.ptr, ev)));
-        }
-        fn vOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-            const buf: *Buffer = @ptrCast(@alignCast(ptr));
-            buf.vtable.onResize(buf.ptr, rect);
-        }
-        fn vOnFocus(ptr: *anyopaque, focused: bool) void {
-            const buf: *Buffer = @ptrCast(@alignCast(ptr));
-            buf.vtable.onFocus(buf.ptr, focused);
-        }
-        fn vOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
-            const buf: *Buffer = @ptrCast(@alignCast(ptr));
-            return @enumFromInt(@intFromEnum(buf.vtable.onMouse(buf.ptr, ev, local_x, local_y)));
-        }
-        const vt: View.VTable = .{
-            .getVisibleLines = vGetVisibleLines,
-            .lineCount = vLineCount,
-            .handleKey = vHandleKey,
-            .onResize = vOnResize,
-            .onFocus = vOnFocus,
-            .onMouse = vOnMouse,
-        };
-    };
-    const mirror = try alloc.create(Buffer);
-    mirror.* = self;
-    return .{ .ptr = mirror, .vtable = &Mirror.vt };
 }
 
 // -- Tests -------------------------------------------------------------------

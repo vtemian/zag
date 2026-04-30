@@ -234,7 +234,7 @@ pub fn main() !void {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(root_buffer.buf());
+    try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view() });
 
     const default_model: ?[]const u8 = lua_engine.default_model;
     var registry_view = RegistryView.init(allocator, &lua_engine);
