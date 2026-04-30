@@ -216,7 +216,10 @@ pub fn main() !void {
     var root_buffer_sink = BufferSink.init(allocator, &root_buffer);
     defer root_buffer_sink.deinit();
 
-    var root_runner = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_session);
+    var root_runner
+
+
+    = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_session);
     defer root_runner.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
@@ -246,38 +249,27 @@ pub fn main() !void {
     // First-run detection: a null default_model means config.lua either
     // doesn't exist or hasn't called `zag.set_default_model(...)`. Drop
     // straight into the wizard so it can scaffold a config rather than
-    // probing for credentials we know aren't there.
+    // probing for credentials we know aren't there. With a default_model
+    // set the user has already picked a provider, so MissingCredential
+    // turns into an actionable hint pointing at the matching login command
+    // for that provider's auth type — re-running the picker would either
+    // confuse the user or overwrite their explicit choice.
     var provider = if (default_model == null)
-        try auth_wizard.firstRunWizardRetry(
+        try auth_wizard.runFirstRunWizard(
             allocator,
             &lua_engine,
             &stdin_reader.interface,
             &stdout_wiz_writer.interface,
         )
     else
-        llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| first_try: {
-            if (err != error.MissingCredential) return err;
-
-            // OAuth providers can't be fixed by the api-key wizard; point
-            // the user at `zag --login=<provider>` and exit with the
-            // original error.
-            const spec = llm.parseModelString(default_model.?);
-            if (registry_ptr.find(spec.provider_name)) |ep| {
-                if (std.meta.activeTag(ep.auth) == .oauth) {
-                    const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
-                    var scratch: [512]u8 = undefined;
-                    const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
-                    _ = stderr_file.write(message) catch {};
-                    return err;
-                }
+        llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| {
+            if (err == error.MissingCredential) {
+                const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                var scratch: [512]u8 = undefined;
+                const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
+                _ = stderr_file.write(message) catch {};
             }
-
-            break :first_try try auth_wizard.firstRunWizardRetry(
-                allocator,
-                &lua_engine,
-                &stdin_reader.interface,
-                &stdout_wiz_writer.interface,
-            );
+            return err;
         };
     defer provider.deinit();
 
