@@ -357,7 +357,7 @@ pub const Pane = struct {
     /// then draft editing on this pane. Used by EventOrchestrator's
     /// fall-through arm. Enter / page-nav / Ctrl+C stay on the
     /// orchestrator because they touch submit/scroll/quit, not draft.
-    pub fn handleKey(self: *Pane, ev: input.KeyEvent) Buffer.HandleResult {
+    pub fn handleKey(self: *Pane, ev: input.KeyEvent) View.HandleResult {
         const view_result = self.view.handleKey(ev);
         if (view_result == .consumed) return .consumed;
 
@@ -2503,7 +2503,7 @@ test "Pane.handleKey delegates to buffer for buffer-internal chords (Ctrl+R)" {
     var pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .session = null, .runner = null };
 
     const r = pane.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqual(View.HandleResult.consumed, r);
     try std.testing.expectEqualStrings("", pane.getDraft());
 }
 

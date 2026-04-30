@@ -445,20 +445,14 @@ pub fn fromBuffer(b: Buffer) *ConversationBuffer {
 }
 
 const vtable: Buffer.VTable = .{
-    .getVisibleLines = bufGetVisibleLines,
     .getName = bufGetName,
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
     .getLastTotalRows = bufGetLastTotalRows,
     .setLastTotalRows = bufSetLastTotalRows,
-    .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
-    .handleKey = bufHandleKey,
-    .onResize = bufOnResize,
-    .onFocus = bufOnFocus,
-    .onMouse = bufOnMouse,
 };
 
 const view_vtable: View.VTable = .{
@@ -482,24 +476,22 @@ fn viewLineCount(ptr: *anyopaque) anyerror!usize {
 
 fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return @enumFromInt(@intFromEnum(self.handleKey(ev)));
+    return self.handleKey(ev);
 }
 
 fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    bufOnResize(ptr, rect);
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    self.onResize(rect);
 }
 
 fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
-    bufOnFocus(ptr, focused);
+    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    self.onFocus(focused);
 }
 
 fn viewOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
-    return @enumFromInt(@intFromEnum(bufOnMouse(ptr, ev, local_x, local_y)));
-}
-
-fn bufGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
+    return self.onMouse(ev, local_x, local_y);
 }
 
 fn bufGetName(ptr: *anyopaque) []const u8 {
@@ -532,11 +524,6 @@ fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
     if (self.viewport) |v| v.last_total_rows = total;
 }
 
-fn bufLineCount(ptr: *anyopaque) anyerror!usize {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.lineCount();
-}
-
 fn bufIsDirty(ptr: *anyopaque) bool {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
     return if (self.viewport) |v| v.isDirty(self.tree.currentGeneration()) else false;
@@ -553,7 +540,7 @@ fn bufClearDirty(ptr: *anyopaque) void {
 /// foldable node (thinking, thinking_redacted, tool_call); everything
 /// else passes through and `Pane.handleKey` decides whether to land it
 /// in the draft or drop it.
-pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleResult {
+pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) View.HandleResult {
     if (ev.modifiers.ctrl) {
         switch (ev.key) {
             .char => |ch| {
@@ -568,18 +555,12 @@ pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) Buffer.HandleRes
     return .passthrough;
 }
 
-fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return self.handleKey(ev);
-}
-
-fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+pub fn onResize(self: *ConversationBuffer, rect: Layout.Rect) void {
     if (self.viewport) |v| v.onResize(rect);
 }
 
-fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
-    _ = ptr;
+pub fn onFocus(self: *ConversationBuffer, focused: bool) void {
+    _ = self;
     _ = focused;
 }
 
@@ -588,10 +569,9 @@ fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
 /// `-3` on wheel events.
 const wheel_scroll_step: u32 = 3;
 
-fn bufOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) Buffer.HandleResult {
+pub fn onMouse(self: *ConversationBuffer, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
     _ = local_x;
     _ = local_y;
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     const viewport = self.viewport orelse return .passthrough;
     switch (ev.kind) {
         .wheel_up => {
@@ -781,9 +761,9 @@ test "buffer interface returns line count" {
     _ = try cb.appendNode(null, .separator, "");
     _ = try cb.appendNode(null, .user_message, "line1\nline2");
 
-    const b = cb.buf();
+    const v = cb.view();
     // user_message "hello" = 1 line, separator = 1 line, user_message "line1\nline2" = 2 lines
-    const count = try b.lineCount();
+    const count = try v.lineCount();
     try std.testing.expectEqual(@as(usize, 4), count);
 }
 
@@ -1015,8 +995,8 @@ test "wheel_up increments scroll_offset (looks at older content)" {
         .kind = .wheel_up,
         .modifiers = input.KeyEvent.no_modifiers,
     };
-    const result = cb.buf().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, result);
+    const result = cb.view().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(View.HandleResult.consumed, result);
     try std.testing.expectEqual(@as(u32, wheel_scroll_step), viewport.scroll_offset);
 }
 
@@ -1037,8 +1017,8 @@ test "wheel_down decrements scroll_offset toward latest content" {
         .kind = .wheel_down,
         .modifiers = input.KeyEvent.no_modifiers,
     };
-    const result = cb.buf().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, result);
+    const result = cb.view().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(View.HandleResult.consumed, result);
     try std.testing.expectEqual(@as(u32, 10 - wheel_scroll_step), viewport.scroll_offset);
 }
 
@@ -1059,7 +1039,7 @@ test "wheel_down clamps at zero" {
         .kind = .wheel_down,
         .modifiers = input.KeyEvent.no_modifiers,
     };
-    _ = cb.buf().onMouse(ev, 0, 0);
+    _ = cb.view().onMouse(ev, 0, 0);
     try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
 }
 
@@ -1085,10 +1065,10 @@ test "wheel_up clamps to last_total_rows -| 1 to avoid overscroll dead zone" {
         .kind = .wheel_up,
         .modifiers = input.KeyEvent.no_modifiers,
     };
-    _ = cb.buf().onMouse(ev, 0, 0);
+    _ = cb.view().onMouse(ev, 0, 0);
     try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
 
-    _ = cb.buf().onMouse(ev, 0, 0);
+    _ = cb.view().onMouse(ev, 0, 0);
     try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
 }
 
@@ -1108,7 +1088,7 @@ test "wheel_up with last_total_rows=0 stays at 0 (no paint yet)" {
         .kind = .wheel_up,
         .modifiers = input.KeyEvent.no_modifiers,
     };
-    _ = cb.buf().onMouse(ev, 0, 0);
+    _ = cb.view().onMouse(ev, 0, 0);
     try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
 }
 
@@ -1128,8 +1108,8 @@ test "press/release pass through" {
         .kind = .press,
         .modifiers = input.KeyEvent.no_modifiers,
     };
-    const result = cb.buf().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(Buffer.HandleResult.passthrough, result);
+    const result = cb.view().onMouse(ev, 0, 0);
+    try std.testing.expectEqual(View.HandleResult.passthrough, result);
     try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
 }
 
@@ -1219,7 +1199,7 @@ test "Ctrl-R toggles collapsed on every thinking node" {
     t2.collapsed = true;
 
     const r = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqual(View.HandleResult.consumed, r);
     try std.testing.expect(!t1.collapsed);
     try std.testing.expect(!t2.collapsed);
 
@@ -1251,7 +1231,7 @@ test "Ctrl-R is consumed even with no thinking nodes" {
 
     _ = try cb.appendNode(null, .user_message, "hi");
     const r = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
-    try std.testing.expectEqual(Buffer.HandleResult.consumed, r);
+    try std.testing.expectEqual(View.HandleResult.consumed, r);
 }
 
 test "getVisibleLines reflects collapsed-to-expanded toggle" {
@@ -1282,7 +1262,7 @@ test "handleKey returns passthrough for printable chars (drafts moved to Pane)" 
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+    try std.testing.expectEqual(View.HandleResult.passthrough, r);
 }
 
 test "handleKey returns passthrough for backspace (drafts moved to Pane)" {
@@ -1291,7 +1271,7 @@ test "handleKey returns passthrough for backspace (drafts moved to Pane)" {
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .backspace, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+    try std.testing.expectEqual(View.HandleResult.passthrough, r);
 }
 
 test "handleKey returns passthrough for Enter (orchestrator retains the submit path)" {
@@ -1300,7 +1280,7 @@ test "handleKey returns passthrough for Enter (orchestrator retains the submit p
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .enter, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+    try std.testing.expectEqual(View.HandleResult.passthrough, r);
 }
 
 test "handleKey returns passthrough for unrelated ctrl chords" {
@@ -1309,20 +1289,20 @@ test "handleKey returns passthrough for unrelated ctrl chords" {
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
-    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+    try std.testing.expectEqual(View.HandleResult.passthrough, r);
 }
 
-test "handleKey passthrough flows through the Buffer vtable" {
+test "handleKey passthrough flows through the View vtable" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
 
-    const b = cb.buf();
-    const r = b.handleKey(.{ .key = .{ .char = 'Z' }, .modifiers = .{} });
-    try std.testing.expectEqual(Buffer.HandleResult.passthrough, r);
+    const v = cb.view();
+    const r = v.handleKey(.{ .key = .{ .char = 'Z' }, .modifiers = .{} });
+    try std.testing.expectEqual(View.HandleResult.passthrough, r);
 }
 
-test "View dispatch matches Buffer dispatch" {
+test "View dispatch renders the conversation" {
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "parity");
     defer cb.deinit();
 
@@ -1333,12 +1313,9 @@ test "View dispatch matches Buffer dispatch" {
     defer arena.deinit();
 
     const total = try cb.lineCount();
-    var via_buf = try cb.buf().getVisibleLines(arena.allocator(), std.testing.allocator, &theme, 0, total);
-    defer via_buf.deinit(arena.allocator());
-
     var via_view = try cb.view().getVisibleLines(arena.allocator(), std.testing.allocator, &theme, 0, total);
     defer via_view.deinit(arena.allocator());
 
-    try std.testing.expectEqual(via_buf.items.len, via_view.items.len);
+    try std.testing.expectEqual(@as(usize, total), via_view.items.len);
     try std.testing.expectEqual(@as(usize, total), try cb.view().lineCount());
 }

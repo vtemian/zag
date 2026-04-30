@@ -103,20 +103,14 @@ pub fn fromBuffer(b: Buffer) *GraphicsBuffer {
 }
 
 const vtable: Buffer.VTable = .{
-    .getVisibleLines = bufGetVisibleLines,
     .getName = bufGetName,
     .getId = bufGetId,
     .getScrollOffset = bufGetScrollOffset,
     .setScrollOffset = bufSetScrollOffset,
     .getLastTotalRows = bufGetLastTotalRows,
     .setLastTotalRows = bufSetLastTotalRows,
-    .lineCount = bufLineCount,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
-    .handleKey = bufHandleKey,
-    .onResize = bufOnResize,
-    .onFocus = bufOnFocus,
-    .onMouse = bufOnMouse,
 };
 
 const view_vtable: View.VTable = .{
@@ -136,23 +130,28 @@ fn viewGetVisibleLines(
     skip: usize,
     max_lines: usize,
 ) anyerror!std.ArrayList(Theme.StyledLine) {
-    return bufGetVisibleLines(ptr, frame_alloc, cache_alloc, theme, skip, max_lines);
+    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
 fn viewLineCount(ptr: *anyopaque) anyerror!usize {
-    return bufLineCount(ptr);
+    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    return self.lineCount();
 }
 
 fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
-    return @enumFromInt(@intFromEnum(bufHandleKey(ptr, ev)));
+    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    return self.handleKey(ev);
 }
 
 fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    bufOnResize(ptr, rect);
+    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    self.onResize(rect);
 }
 
 fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
-    bufOnFocus(ptr, focused);
+    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    self.onFocus(focused);
 }
 
 fn viewOnMouse(
@@ -161,11 +160,12 @@ fn viewOnMouse(
     local_x: u16,
     local_y: u16,
 ) View.HandleResult {
-    return @enumFromInt(@intFromEnum(bufOnMouse(ptr, ev, local_x, local_y)));
+    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    return self.onMouse(ev, local_x, local_y);
 }
 
-fn bufGetVisibleLines(
-    ptr: *anyopaque,
+pub fn getVisibleLines(
+    self: *const GraphicsBuffer,
     frame_alloc: Allocator,
     cache_alloc: Allocator,
     theme: *const Theme,
@@ -173,7 +173,6 @@ fn bufGetVisibleLines(
     max_lines: usize,
 ) anyerror!std.ArrayList(Theme.StyledLine) {
     _ = cache_alloc;
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
 
     var out: std.ArrayList(Theme.StyledLine) = .empty;
     errdefer Theme.freeStyledLines(&out, frame_alloc);
@@ -234,8 +233,8 @@ fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
     _ = total;
 }
 
-fn bufLineCount(ptr: *anyopaque) anyerror!usize {
-    _ = ptr;
+pub fn lineCount(self: *const GraphicsBuffer) anyerror!usize {
+    _ = self;
     return 0;
 }
 
@@ -249,14 +248,13 @@ fn bufClearDirty(ptr: *anyopaque) void {
     self.dirty = false;
 }
 
-fn bufHandleKey(ptr: *anyopaque, ev: input.KeyEvent) Buffer.HandleResult {
-    _ = ptr;
+pub fn handleKey(self: *GraphicsBuffer, ev: input.KeyEvent) View.HandleResult {
+    _ = self;
     _ = ev;
     return .passthrough;
 }
 
-fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+pub fn onResize(self: *GraphicsBuffer, rect: Layout.Rect) void {
     if (self.last_render_cols != rect.width or self.last_render_rows != rect.height) {
         self.last_render_cols = rect.width;
         self.last_render_rows = rect.height;
@@ -264,18 +262,18 @@ fn bufOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
     }
 }
 
-fn bufOnFocus(ptr: *anyopaque, focused: bool) void {
-    _ = ptr;
+pub fn onFocus(self: *GraphicsBuffer, focused: bool) void {
+    _ = self;
     _ = focused;
 }
 
-fn bufOnMouse(
-    ptr: *anyopaque,
+pub fn onMouse(
+    self: *GraphicsBuffer,
     ev: input.MouseEvent,
     local_x: u16,
     local_y: u16,
-) Buffer.HandleResult {
-    _ = ptr;
+) View.HandleResult {
+    _ = self;
     _ = ev;
     _ = local_x;
     _ = local_y;
@@ -312,14 +310,14 @@ test "setPng decodes a 1x1 red PNG and getVisibleLines renders one halfblock spa
     try std.testing.expect(gb.image != null);
     try std.testing.expectEqual(@as(u32, 1), gb.image.?.width);
 
-    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 1, .height = 1 });
+    gb.view().onResize(.{ .x = 0, .y = 0, .width = 1, .height = 1 });
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const theme = Theme.defaultTheme();
-    var lines = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
+    var lines = try gb.view().getVisibleLines(arena, arena, &theme, 0, 10);
     defer lines.deinit(arena);
 
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
@@ -367,13 +365,13 @@ test "onResize updates cell grid and marks dirty on change" {
     defer gb.destroy();
     gb.dirty = false;
 
-    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 40, .height = 20 });
+    gb.view().onResize(.{ .x = 0, .y = 0, .width = 40, .height = 20 });
     try std.testing.expectEqual(@as(u16, 40), gb.last_render_cols);
     try std.testing.expectEqual(@as(u16, 20), gb.last_render_rows);
     try std.testing.expect(gb.dirty);
 
     gb.dirty = false;
-    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 40, .height = 20 });
+    gb.view().onResize(.{ .x = 0, .y = 0, .width = 40, .height = 20 });
     try std.testing.expect(!gb.dirty);
 }
 
@@ -392,14 +390,14 @@ test "setFit(.contain) letterboxes a 1x1 image inside a wide pane" {
 
     try gb.setPng(&tiny_red_png);
     gb.setFit(.contain);
-    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 4, .height = 1 });
+    gb.view().onResize(.{ .x = 0, .y = 0, .width = 4, .height = 1 });
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const theme = Theme.defaultTheme();
-    var lines = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
+    var lines = try gb.view().getVisibleLines(arena, arena, &theme, 0, 10);
     defer lines.deinit(arena);
 
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
@@ -420,14 +418,14 @@ test "setFit(.fill) stretches the image across the full pane" {
 
     try gb.setPng(&tiny_red_png);
     gb.setFit(.fill);
-    gb.buf().onResize(.{ .x = 0, .y = 0, .width = 4, .height = 1 });
+    gb.view().onResize(.{ .x = 0, .y = 0, .width = 4, .height = 1 });
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const theme = Theme.defaultTheme();
-    var lines = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
+    var lines = try gb.view().getVisibleLines(arena, arena, &theme, 0, 10);
     defer lines.deinit(arena);
 
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
@@ -439,9 +437,9 @@ test "setFit(.fill) stretches the image across the full pane" {
     }
 }
 
-test "GraphicsBuffer.view() matches buf() output" {
+test "GraphicsBuffer.view() renders a half-block raster" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 8, "parity");
+    var gb = try GraphicsBuffer.create(gpa, 8, "view");
     defer gb.destroy();
 
     try gb.setPng(&tiny_red_png);
@@ -453,17 +451,11 @@ test "GraphicsBuffer.view() matches buf() output" {
 
     const theme = Theme.defaultTheme();
 
-    try std.testing.expectEqual(try gb.buf().lineCount(), try gb.view().lineCount());
+    try std.testing.expectEqual(@as(usize, 0), try gb.view().lineCount());
 
-    var via_buf = try gb.buf().getVisibleLines(arena, arena, &theme, 0, 10);
-    defer via_buf.deinit(arena);
-    var via_view = try gb.view().getVisibleLines(arena, arena, &theme, 0, 10);
-    defer via_view.deinit(arena);
-
-    try std.testing.expectEqual(via_buf.items.len, via_view.items.len);
-    if (via_buf.items.len > 0) {
-        try std.testing.expectEqual(via_buf.items[0].spans.len, via_view.items[0].spans.len);
-    }
+    var lines = try gb.view().getVisibleLines(arena, arena, &theme, 0, 10);
+    defer lines.deinit(arena);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
 }
 
 test {
