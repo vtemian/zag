@@ -111,12 +111,6 @@ pub fn fromBuffer(b: Buffer) *GraphicsBuffer {
 const vtable: Buffer.VTable = .{
     .getName = bufGetName,
     .getId = bufGetId,
-    .getScrollOffset = bufGetScrollOffset,
-    .setScrollOffset = bufSetScrollOffset,
-    .getLastTotalRows = bufGetLastTotalRows,
-    .setLastTotalRows = bufSetLastTotalRows,
-    .isDirty = bufIsDirty,
-    .clearDirty = bufClearDirty,
     .contentVersion = bufContentVersion,
 };
 
@@ -220,39 +214,9 @@ fn bufGetId(ptr: *anyopaque) u32 {
     return self.id;
 }
 
-fn bufGetScrollOffset(ptr: *anyopaque) u32 {
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
-    return self.scroll_offset;
-}
-
-fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
-    self.scroll_offset = offset;
-}
-
-fn bufGetLastTotalRows(ptr: *anyopaque) u32 {
-    _ = ptr;
-    return 0;
-}
-
-fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
-    _ = ptr;
-    _ = total;
-}
-
 pub fn lineCount(self: *const GraphicsBuffer) anyerror!usize {
     _ = self;
     return 0;
-}
-
-fn bufIsDirty(ptr: *anyopaque) bool {
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
-    return self.dirty;
-}
-
-fn bufClearDirty(ptr: *anyopaque) void {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
-    self.dirty = false;
 }
 
 fn bufContentVersion(ptr: *anyopaque) u64 {

@@ -816,8 +816,16 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
 
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        if (self.window_manager.paneFromFloatHandle(f.handle)) |fp| {
-            _ = fp.view.onMouse(ev, local_x, local_y);
+        // Wheel events scroll the float's viewport directly; other
+        // mouse events route through the float's View as before.
+        switch (ev.kind) {
+            .wheel_up => scrollFloatBy(f, .up),
+            .wheel_down => scrollFloatBy(f, .down),
+            else => {
+                if (self.window_manager.paneFromFloatHandle(f.handle)) |fp| {
+                    _ = fp.view.onMouse(ev, local_x, local_y);
+                }
+            },
         }
         return;
     }
@@ -831,8 +839,50 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         if (screen_y < rect.y or screen_y >= rect.y + rect.height) continue;
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        _ = node.leaf.view.onMouse(ev, local_x, local_y);
+        // Wheel events scroll the leaf's viewport directly — the buffer
+        // and view stay stateless about scrolling now that the viewport
+        // lives on the Pane. Other mouse events still dispatch through
+        // the View vtable for buffer-specific handling.
+        switch (ev.kind) {
+            .wheel_up => scrollLeafBy(&node.leaf, .up),
+            .wheel_down => scrollLeafBy(&node.leaf, .down),
+            else => _ = node.leaf.view.onMouse(ev, local_x, local_y),
+        }
         return;
+    }
+}
+
+/// Number of physical rows to scroll per wheel tick. Three is the
+/// conventional terminal-scroll cadence; matches less(1) and most
+/// pagers' `-3` on wheel events.
+const wheel_scroll_step: u32 = 3;
+
+const ScrollDir = enum { up, down };
+
+/// Scroll a leaf's viewport by one wheel-tick in the given direction.
+/// Up looks at older content (increment scroll_offset, clamped against
+/// `last_total_rows -| 1` so the user can't run past the buffer's
+/// head); down moves toward the tail (decrement, saturating at 0).
+fn scrollLeafBy(leaf: *Layout.LayoutNode.Leaf, dir: ScrollDir) void {
+    scrollViewportBy(leaf.viewport, dir);
+}
+
+fn scrollFloatBy(float: *Layout.FloatNode, dir: ScrollDir) void {
+    scrollViewportBy(float.viewport, dir);
+}
+
+fn scrollViewportBy(viewport: *Viewport, dir: ScrollDir) void {
+    switch (dir) {
+        .up => {
+            const next = viewport.scroll_offset +| wheel_scroll_step;
+            const cap = viewport.last_total_rows -| 1;
+            viewport.setScrollOffset(@min(next, cap));
+        },
+        .down => {
+            const cur = viewport.scroll_offset;
+            const next = if (cur > wheel_scroll_step) cur - wheel_scroll_step else 0;
+            viewport.setScrollOffset(next);
+        },
     }
 }
 

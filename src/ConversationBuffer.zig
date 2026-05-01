@@ -14,7 +14,6 @@ const NodeLineCache = @import("NodeLineCache.zig");
 const ConversationTree = @import("ConversationTree.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
-const Viewport = @import("Viewport.zig");
 const input = @import("input.zig");
 
 const ConversationBuffer = @This();
@@ -41,11 +40,6 @@ tree: ConversationTree,
 /// Allocator used for all buffer-owned allocations (name, cache). The
 /// tree holds its own copy of the same allocator.
 allocator: Allocator,
-/// Borrowed pointer to the Pane's display-state bundle. Set via
-/// `attachViewport` after the owning Pane's storage stabilises. When
-/// null (e.g. headless or test setup with no pane), display-state
-/// vtable methods degrade to safe no-ops.
-viewport: ?*Viewport = null,
 /// Internal renderer for converting nodes to styled display lines.
 renderer: NodeRenderer,
 /// Memoized NodeRenderer output, keyed by (node.id, node.content_version).
@@ -117,14 +111,6 @@ pub fn setRowStyle(self: *ConversationBuffer, row: u32, slot: Theme.HighlightSlo
 /// override.
 pub fn clearRowStyle(self: *ConversationBuffer, row: u32) void {
     _ = self.row_styles.remove(row);
-}
-
-/// Attach a borrowed Viewport pointer. The Pane owns the Viewport
-/// storage and must outlive this buffer. Display-state vtable methods
-/// delegate through this pointer; before `attachViewport` runs, those
-/// methods are safe no-ops.
-pub fn attachViewport(self: *ConversationBuffer, viewport: *Viewport) void {
-    self.viewport = viewport;
 }
 
 /// Create a new node and attach it to `parent`. If `parent` is null the node
@@ -447,12 +433,6 @@ pub fn fromBuffer(b: Buffer) *ConversationBuffer {
 const vtable: Buffer.VTable = .{
     .getName = bufGetName,
     .getId = bufGetId,
-    .getScrollOffset = bufGetScrollOffset,
-    .setScrollOffset = bufSetScrollOffset,
-    .getLastTotalRows = bufGetLastTotalRows,
-    .setLastTotalRows = bufSetLastTotalRows,
-    .isDirty = bufIsDirty,
-    .clearDirty = bufClearDirty,
     .contentVersion = bufContentVersion,
 };
 
@@ -505,36 +485,6 @@ fn bufGetId(ptr: *anyopaque) u32 {
     return self.id;
 }
 
-fn bufGetScrollOffset(ptr: *anyopaque) u32 {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return if (self.viewport) |v| v.scroll_offset else 0;
-}
-
-fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    if (self.viewport) |v| v.setScrollOffset(offset);
-}
-
-fn bufGetLastTotalRows(ptr: *anyopaque) u32 {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return if (self.viewport) |v| v.last_total_rows else 0;
-}
-
-fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    if (self.viewport) |v| v.last_total_rows = total;
-}
-
-fn bufIsDirty(ptr: *anyopaque) bool {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
-    return if (self.viewport) |v| v.isDirty(self.tree.currentGeneration()) else false;
-}
-
-fn bufClearDirty(ptr: *anyopaque) void {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
-    if (self.viewport) |v| v.clearDirty(self.tree.currentGeneration());
-}
-
 fn bufContentVersion(ptr: *anyopaque) u64 {
     const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
     return @as(u64, self.tree.currentGeneration());
@@ -562,7 +512,8 @@ pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) View.HandleResul
 }
 
 pub fn onResize(self: *ConversationBuffer, rect: Layout.Rect) void {
-    if (self.viewport) |v| v.onResize(rect);
+    _ = self;
+    _ = rect;
 }
 
 pub fn onFocus(self: *ConversationBuffer, focused: bool) void {
@@ -570,41 +521,17 @@ pub fn onFocus(self: *ConversationBuffer, focused: bool) void {
     _ = focused;
 }
 
-/// Number of physical rows to scroll per wheel tick. Three is the
-/// conventional terminal-scroll cadence; matches less(1) and most pagers'
-/// `-3` on wheel events.
-const wheel_scroll_step: u32 = 3;
-
+/// Mouse handling for ConversationBuffer is a passthrough today: wheel
+/// scroll is owned by `EventOrchestrator.handleMouse` (which mutates
+/// the leaf's viewport directly), and the buffer has no per-cell click
+/// targets. The hook stays defined so the View vtable surface is
+/// symmetric across buffer kinds.
 pub fn onMouse(self: *ConversationBuffer, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
+    _ = self;
+    _ = ev;
     _ = local_x;
     _ = local_y;
-    const viewport = self.viewport orelse return .passthrough;
-    switch (ev.kind) {
-        .wheel_up => {
-            // Wheel-up looks at older content: scroll_offset counts physical
-            // rows back from the tail (set per frame from
-            // `planScroll.total_rows` via `Viewport.last_total_rows`), so
-            // increment (saturating). Then clamp to `last_total_rows -| 1`
-            // so we never cross the top of the buffer into a blank-pane
-            // dead zone (planScroll returns take=0 once scroll >=
-            // total_rows). last_total_rows is set by the Compositor at each
-            // paint and is one frame stale, which is fine for clamping the
-            // *next* user event. When the buffer hasn't been painted yet
-            // (last_total_rows == 0), the saturating subtraction collapses
-            // the cap to 0.
-            const next = viewport.scroll_offset +| wheel_scroll_step;
-            const cap = viewport.last_total_rows -| 1;
-            viewport.setScrollOffset(@min(next, cap));
-            return .consumed;
-        },
-        .wheel_down => {
-            const cur = viewport.scroll_offset;
-            const next = if (cur > wheel_scroll_step) cur - wheel_scroll_step else 0;
-            viewport.setScrollOffset(next);
-            return .consumed;
-        },
-        .press, .release => return .passthrough,
-    }
+    return .passthrough;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -701,22 +628,14 @@ test "readText emits user and assistant turns as plain text" {
     try std.testing.expect(out.total_lines >= 2);
 }
 
-test "buffer interface dispatches correctly" {
+test "buffer interface dispatches name and id" {
     const allocator = std.testing.allocator;
     var cb = try ConversationBuffer.init(allocator, 7, "iface-test");
     defer cb.deinit();
 
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
     const b = cb.buf();
     try std.testing.expectEqualStrings("iface-test", b.getName());
     try std.testing.expectEqual(@as(u32, 7), b.getId());
-    try std.testing.expectEqual(@as(u32, 0), b.getScrollOffset());
-
-    b.setScrollOffset(10);
-    try std.testing.expectEqual(@as(u32, 10), b.getScrollOffset());
-    try std.testing.expectEqual(@as(u32, 10), viewport.scroll_offset);
 }
 
 test "fromBuffer roundtrips correctly" {
@@ -900,223 +819,23 @@ test "clear invalidates line cache" {
     try std.testing.expectEqual(@as(usize, 0), lines2.items.len);
 }
 
-test "buffer starts clean" {
+test "onMouse passes through every event kind (wheel scroll lives in EventOrchestrator)" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var cb = try ConversationBuffer.init(allocator, 0, "mouse-test");
     defer cb.deinit();
 
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    const b = cb.buf();
-    try std.testing.expect(!b.isDirty());
-}
-
-test "appendNode marks buffer dirty" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    _ = try cb.appendNode(null, .user_message, "hello");
-    const b = cb.buf();
-    try std.testing.expect(b.isDirty());
-}
-
-test "clearDirty resets the flag" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    _ = try cb.appendNode(null, .user_message, "hello");
-    var b = cb.buf();
-    try std.testing.expect(b.isDirty());
-
-    b.clearDirty();
-    try std.testing.expect(!b.isDirty());
-}
-
-test "appendToNode marks buffer dirty" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    const node = try cb.appendNode(null, .user_message, "hello");
-    var b = cb.buf();
-    b.clearDirty();
-
-    try cb.appendToNode(node, " world");
-    try std.testing.expect(b.isDirty());
-}
-
-test "setScrollOffset marks dirty only when value changes" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    var b = cb.buf();
-
-    // Setting to same value (0) should not mark dirty
-    b.setScrollOffset(0);
-    try std.testing.expect(!b.isDirty());
-
-    // Setting to different value should mark dirty
-    b.setScrollOffset(5);
-    try std.testing.expect(b.isDirty());
-
-    b.clearDirty();
-
-    // Setting back to 5 should not mark dirty
-    b.setScrollOffset(5);
-    try std.testing.expect(!b.isDirty());
-}
-
-test "wheel_up increments scroll_offset (looks at older content)" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-    // Compositor recorded enough rows that one wheel-up tick stays well
-    // under the cap; the clamp added for Bug D is exercised separately.
-    viewport.last_total_rows = 100;
-
-    const ev = input.MouseEvent{
-        .button = 0,
-        .x = 1,
-        .y = 1,
-        .is_press = true,
-        .kind = .wheel_up,
-        .modifiers = input.KeyEvent.no_modifiers,
-    };
-    const result = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(View.HandleResult.consumed, result);
-    try std.testing.expectEqual(@as(u32, wheel_scroll_step), viewport.scroll_offset);
-}
-
-test "wheel_down decrements scroll_offset toward latest content" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-    viewport.scroll_offset = 10;
-
-    const ev = input.MouseEvent{
-        .button = 0,
-        .x = 1,
-        .y = 1,
-        .is_press = true,
-        .kind = .wheel_down,
-        .modifiers = input.KeyEvent.no_modifiers,
-    };
-    const result = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(View.HandleResult.consumed, result);
-    try std.testing.expectEqual(@as(u32, 10 - wheel_scroll_step), viewport.scroll_offset);
-}
-
-test "wheel_down clamps at zero" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-    viewport.scroll_offset = 1;
-
-    const ev = input.MouseEvent{
-        .button = 0,
-        .x = 1,
-        .y = 1,
-        .is_press = true,
-        .kind = .wheel_down,
-        .modifiers = input.KeyEvent.no_modifiers,
-    };
-    _ = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
-}
-
-test "wheel_up clamps to last_total_rows -| 1 to avoid overscroll dead zone" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    // Compositor recorded total_rows=5 at the last paint; the cap is
-    // therefore 4 (= 5 - 1). Two wheel-ups from offset 4 must stay at 4
-    // rather than running away to 7.
-    viewport.last_total_rows = 5;
-    viewport.scroll_offset = 4;
-
-    const ev = input.MouseEvent{
-        .button = 0,
-        .x = 1,
-        .y = 1,
-        .is_press = true,
-        .kind = .wheel_up,
-        .modifiers = input.KeyEvent.no_modifiers,
-    };
-    _ = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
-
-    _ = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
-}
-
-test "wheel_up with last_total_rows=0 stays at 0 (no paint yet)" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    const ev = input.MouseEvent{
-        .button = 0,
-        .x = 1,
-        .y = 1,
-        .is_press = true,
-        .kind = .wheel_up,
-        .modifiers = input.KeyEvent.no_modifiers,
-    };
-    _ = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
-}
-
-test "press/release pass through" {
-    const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "wheel-test");
-    defer cb.deinit();
-
-    var viewport: Viewport = .{};
-    cb.attachViewport(&viewport);
-
-    const ev = input.MouseEvent{
-        .button = 0,
-        .x = 1,
-        .y = 1,
-        .is_press = true,
-        .kind = .press,
-        .modifiers = input.KeyEvent.no_modifiers,
-    };
-    const result = cb.view().onMouse(ev, 0, 0);
-    try std.testing.expectEqual(View.HandleResult.passthrough, result);
-    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+    const kinds = [_]input.MouseEvent.Kind{ .wheel_up, .wheel_down, .press, .release };
+    for (kinds) |k| {
+        const ev = input.MouseEvent{
+            .button = 0,
+            .x = 1,
+            .y = 1,
+            .is_press = true,
+            .kind = k,
+            .modifiers = input.KeyEvent.no_modifiers,
+        };
+        try std.testing.expectEqual(View.HandleResult.passthrough, cb.view().onMouse(ev, 0, 0));
+    }
 }
 
 test "synthetic id scratch fits maxInt(u32)" {

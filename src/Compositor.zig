@@ -2105,7 +2105,6 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
-    cb.attachViewport(&viewport);
 
     // Two short logical lines so the first paint draws content rows
     // 1..2 (first line at row 1, second at row 2 inside an 11-row leaf).
@@ -2321,7 +2320,6 @@ test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
-    cb.attachViewport(&viewport);
 
     // Swap the default renderer for one that emits exactly the spans we
     // want. Precedent: NodeRenderer "custom override replaces default
@@ -2378,7 +2376,6 @@ test "composite: wrapped continuation lands at content_x, not span tail (Bug B r
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
-    cb.attachViewport(&viewport);
 
     cb.renderer = @import("NodeRenderer.zig").init(allocator);
     defer cb.renderer.deinit();
@@ -2451,7 +2448,6 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
-    cb.attachViewport(&viewport);
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
