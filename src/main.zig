@@ -396,14 +396,10 @@ pub fn main() !void {
 
     // The root Pane was passed by value into EventOrchestrator.init and
     // now lives at a stable address inside orchestrator.window_manager.
-    // Attach the root buffer to the pane-owned Viewport so Buffer vtable
-    // calls (scroll offset, dirty, cached rect) delegate through pane
-    // state rather than the buffer's private fallback. Also rewire the
-    // layout's root leaf to the same address so leaf.viewport-routed
-    // readers (added in commit 2 of the viewport-on-pane refactor) hit
-    // the live pane viewport instead of the placeholder we used during
-    // layout.setRoot, which ran before this address existed.
-    root_buffer.attachViewport(&orchestrator.window_manager.root_pane.viewport);
+    // Rewire the layout's root leaf to that pane's inline viewport so
+    // leaf.viewport-routed readers (Compositor, EventOrchestrator) hit
+    // the live pane viewport instead of the placeholder used during
+    // `layout.setRoot`, which ran before this address existed.
     layout.setRootViewport(&orchestrator.window_manager.root_pane.viewport);
 
     // Lua bindings (zag.layout.*, zag.pane.*) call the window manager

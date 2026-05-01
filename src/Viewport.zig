@@ -1,12 +1,14 @@
 //! Pane-owned display-state bundle.
 //!
-//! Viewport collects the per-pane view state attached to a
-//! ConversationBuffer through `attachViewport`: scroll offset, the dirty
-//! flag, the last tree generation the pane rendered, and a cached layout
-//! rect. Bundling these into one struct lets a Pane own its display state
-//! inline and lets a Buffer remain stateless about presentation. A Buffer
-//! (e.g., ConversationBuffer) borrows a pointer to this struct and
-//! delegates its display-state vtable methods through it.
+//! Viewport collects the per-pane view state owned by each Pane: scroll
+//! offset, the dirty flag, the last buffer content version the pane
+//! rendered, and a cached layout rect. Bundling these into one struct
+//! lets the Pane own its display state inline (Pane.viewport) and lets
+//! Buffers stay stateless about presentation. Compositor and
+//! EventOrchestrator read viewport state directly through
+//! `Layout.LayoutNode.Leaf.viewport` (a borrowed pointer to the Pane's
+//! inline Viewport), pairing it with `Buffer.contentVersion()` for
+//! dirty tracking.
 
 const std = @import("std");
 const Layout = @import("Layout.zig");

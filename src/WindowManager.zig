@@ -417,12 +417,6 @@ pub const PaneEntry = struct {
     /// the runner is freed first (no more sink.push), then the sink
     /// releases its correlation map, then the buffer it borrowed.
     sink_storage: ?*BufferSink = null,
-    /// Legacy slot retained for one more commit so
-    /// `ConversationBuffer.attachViewport` keeps compiling during the
-    /// viewport-on-pane transition; commit 4 deletes both the field and
-    /// the attach mechanism. New entries leave it null and route the
-    /// buffer's viewport through `&entry.pane.viewport` directly.
-    viewport_storage: ?*Viewport = null,
 };
 
 /// Heap allocator for runtime allocations.
@@ -642,10 +636,6 @@ pub fn deinit(self: *WindowManager) void {
             v.deinit();
             self.allocator.destroy(v);
         }
-        // The view's vtable borrowed this Viewport. Free it after
-        // `v.deinit()` so no late vtable call dereferences a freed
-        // pointer. Legacy slot kept for commit 3; commit 4 deletes it.
-        if (entry.viewport_storage) |vp| self.allocator.destroy(vp);
         if (entry.pane.session) |s| {
             s.deinit();
             self.allocator.destroy(s);
@@ -703,7 +693,6 @@ pub fn deinit(self: *WindowManager) void {
             v.deinit();
             self.allocator.destroy(v);
         }
-        if (entry.viewport_storage) |vp| self.allocator.destroy(vp);
         if (entry.pane.session) |s| {
             s.deinit();
             self.allocator.destroy(s);
@@ -1475,13 +1464,6 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     try self.extra_panes.append(self.allocator, entry);
     errdefer _ = self.extra_panes.pop();
 
-    // Wire the buffer's legacy display-state delegation through the
-    // entry's inline viewport. Commit 4 deletes attachViewport entirely;
-    // for now the address matches what `viewportFor` returns.
-    if (entry.pane.conversation) |v| {
-        v.attachViewport(&entry.pane.viewport);
-    }
-
     const sh = self.attachSession(pane);
     entry.session_handle = sh;
 
@@ -1733,7 +1715,6 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
             v.deinit();
             self.allocator.destroy(v);
         }
-        if (entry.viewport_storage) |vp| self.allocator.destroy(vp);
         if (entry.pane.session) |s| {
             s.deinit();
             self.allocator.destroy(s);
@@ -2651,18 +2632,11 @@ test "extra pane viewport is attached to its buffer" {
     _ = created;
 
     const entry = wm.extra_panes.items[wm.extra_panes.items.len - 1];
-    const cb = entry.pane.conversation.?;
 
-    // PaneEntry now lives at a stable heap address, so the buffer's
-    // legacy viewport pointer wires straight at `&entry.pane.viewport`.
-    // Commit 4 will retire `attachViewport` and the field it sets.
-    try std.testing.expectEqual(&entry.pane.viewport, cb.viewport.?);
-
-    // Flipping scroll on the inline viewport must show up through the
-    // buffer's attached pointer, proving the attach actually points at
-    // the same underlying Viewport.
-    entry.pane.viewport.setScrollOffset(7);
-    try std.testing.expectEqual(@as(u32, 7), cb.viewport.?.scroll_offset);
+    // Each PaneEntry lives at a stable heap address, so its inline
+    // viewport pointer is stable too. `viewportFor` collapses to
+    // `&pane.viewport` for both root and extras; verify the round-trip.
+    try std.testing.expectEqual(&entry.pane.viewport, wm.viewportFor(&entry.pane));
 }
 
 test "multiple splits maintain stable viewport pointers" {
@@ -2705,21 +2679,19 @@ test "multiple splits maintain stable viewport pointers" {
     };
     defer wm.deinit();
 
-    // First split: capture the inline viewport pointer on the heap-
-    // allocated PaneEntry and the address the buffer attached to. They
-    // must match.
+    // First split: capture the address of the heap-allocated PaneEntry
+    // and its inline viewport.
     _ = try wm.createSplitPane();
-    const pane1_inline_vp = &wm.extra_panes.items[0].pane.viewport;
-    const pane1_attached_vp = wm.extra_panes.items[0].pane.conversation.?.viewport.?;
-    try std.testing.expectEqual(pane1_inline_vp, pane1_attached_vp);
+    const pane1_entry = wm.extra_panes.items[0];
+    const pane1_inline_vp = &pane1_entry.pane.viewport;
 
-    // Second split may relocate `extra_panes.items`. Because each
-    // PaneEntry is heap-allocated at a stable address, the first pane's
-    // inline `viewport` survives the reallocation: the buffer's
-    // attachment still points at the same Viewport.
+    // Second split may relocate `extra_panes.items` (the ArrayList of
+    // pointers grows). Because each PaneEntry is heap-allocated at a
+    // stable address, the first pane's address (and therefore the
+    // inline `viewport` pointer) must survive the reallocation.
     _ = try wm.createSplitPane();
-    try std.testing.expectEqual(pane1_inline_vp, wm.extra_panes.items[0].pane.conversation.?.viewport.?);
-    try std.testing.expectEqual(pane1_inline_vp, pane1_attached_vp);
+    try std.testing.expectEqual(pane1_entry, wm.extra_panes.items[0]);
+    try std.testing.expectEqual(pane1_inline_vp, &wm.extra_panes.items[0].pane.viewport);
 }
 
 test "drainPane snaps the inline viewport on extra panes" {

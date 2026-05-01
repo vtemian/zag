@@ -121,12 +121,6 @@ pub fn fromBuffer(b: Buffer) *ScratchBuffer {
 const vtable: Buffer.VTable = .{
     .getName = bufGetName,
     .getId = bufGetId,
-    .getScrollOffset = bufGetScrollOffset,
-    .setScrollOffset = bufSetScrollOffset,
-    .getLastTotalRows = bufGetLastTotalRows,
-    .setLastTotalRows = bufSetLastTotalRows,
-    .isDirty = bufIsDirty,
-    .clearDirty = bufClearDirty,
     .contentVersion = bufContentVersion,
 };
 
@@ -220,39 +214,8 @@ fn bufGetId(ptr: *anyopaque) u32 {
     return self.id;
 }
 
-fn bufGetScrollOffset(ptr: *anyopaque) u32 {
-    const self: *const ScratchBuffer = @ptrCast(@alignCast(ptr));
-    return self.scroll_offset;
-}
-
-fn bufSetScrollOffset(ptr: *anyopaque, offset: u32) void {
-    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
-    self.scroll_offset = offset;
-    self.dirty = true;
-}
-
-fn bufGetLastTotalRows(ptr: *anyopaque) u32 {
-    _ = ptr;
-    return 0;
-}
-
-fn bufSetLastTotalRows(ptr: *anyopaque, total: u32) void {
-    _ = ptr;
-    _ = total;
-}
-
 pub fn lineCount(self: *const ScratchBuffer) anyerror!usize {
     return self.lines.items.len;
-}
-
-fn bufIsDirty(ptr: *anyopaque) bool {
-    const self: *const ScratchBuffer = @ptrCast(@alignCast(ptr));
-    return self.dirty;
-}
-
-fn bufClearDirty(ptr: *anyopaque) void {
-    const self: *ScratchBuffer = @ptrCast(@alignCast(ptr));
-    self.dirty = false;
 }
 
 fn bufContentVersion(ptr: *anyopaque) u64 {
