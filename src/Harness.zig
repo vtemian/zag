@@ -31,6 +31,7 @@ const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
+const Viewport = @import("Viewport.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const Session = @import("Session.zig");
 const agent_events = @import("agent_events.zig");
@@ -355,7 +356,13 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
 
     var layout = Layout.init(gpa);
     defer layout.deinit();
-    try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view() });
+    // Headless never builds an orchestrator (see the file-level doc),
+    // so this stack-local viewport is the leaf's permanent backing
+    // store. Nothing reads leaf.viewport in headless mode (no
+    // Compositor, no EventOrchestrator), so the value never matters;
+    // it just keeps the leaf's pointer non-null.
+    var root_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view(), .viewport = &root_viewport });
 
     const auth_path = try auth_wizard.buildAuthPath(gpa);
     defer gpa.free(auth_path);

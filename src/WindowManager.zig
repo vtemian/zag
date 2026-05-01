@@ -1277,7 +1277,11 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
         log.warn("split pane creation failed: {}", .{err});
         return;
     };
-    const surface: Layout.Surface = .{ .buffer = pane.buffer, .view = pane.view };
+    // Resolve the heap viewport `createSplitPane` allocated for this pane.
+    // The PaneEntry owns it; commit 3 of the viewport-on-pane refactor will
+    // collapse this to `&pane.viewport` once PaneEntry storage stabilizes.
+    const split_viewport = self.extra_panes.items[self.extra_panes.items.len - 1].viewport_storage.?;
+    const surface: Layout.Surface = .{ .buffer = pane.buffer, .view = pane.view, .viewport = split_viewport };
     const split = switch (direction) {
         .vertical => self.layout.splitVertical(0.5, surface),
         .horizontal => self.layout.splitHorizontal(0.5, surface),
@@ -1344,14 +1348,26 @@ pub fn doSplitWithBuffer(
         .runner = null,
         .wm = self,
     };
-    try self.extra_panes.append(self.allocator, .{ .pane = pane });
+
+    // Heap-allocate the viewport so the leaf's borrowed pointer survives
+    // any subsequent `extra_panes.append` reallocation. Owned by the
+    // PaneEntry; commit 3 will collapse this to `&pane.viewport` once
+    // PaneEntry lives at a stable address.
+    const viewport = try self.allocator.create(Viewport);
+    errdefer self.allocator.destroy(viewport);
+    viewport.* = .{};
+
+    try self.extra_panes.append(self.allocator, .{
+        .pane = pane,
+        .viewport_storage = viewport,
+    });
     // On any downstream failure undo the append so extra_panes and the
     // live layout stay in sync (no half-registered pane).
     errdefer _ = self.extra_panes.pop();
 
     switch (direction) {
-        .vertical => try self.layout.splitVertical(0.5, .{ .buffer = attached.buffer, .view = attached.view }),
-        .horizontal => try self.layout.splitHorizontal(0.5, .{ .buffer = attached.buffer, .view = attached.view }),
+        .vertical => try self.layout.splitVertical(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = viewport }),
+        .horizontal => try self.layout.splitHorizontal(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = viewport }),
     }
 
     // Stamp the new leaf's stable handle onto the entry's pane so
@@ -1616,7 +1632,7 @@ pub fn openFloatPane(
     });
     errdefer _ = self.extra_floats.pop();
 
-    const handle = try self.layout.addFloat(.{ .buffer = surface.buffer, .view = surface.view }, rect, config);
+    const handle = try self.layout.addFloat(.{ .buffer = surface.buffer, .view = surface.view, .viewport = viewport }, rect, config);
     errdefer self.layout.removeFloat(handle) catch {};
 
     // Stamp the float's stable handle onto the entry's pane so
@@ -2829,9 +2845,10 @@ test "WindowManager exposes a NodeRegistry" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
 
     try std.testing.expect(wm.node_registry.slots.items.len >= 1);
 }
@@ -2881,9 +2898,10 @@ test "focus by handle updates focused leaf" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     wm.doSplit(.vertical);
@@ -2986,9 +3004,10 @@ test "splitById creates a new leaf and returns its handle" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     const root = wm.layout.root.?;
@@ -3047,9 +3066,10 @@ test "closeById removes a leaf and keeps the sibling" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     wm.doSplit(.vertical);
@@ -3103,9 +3123,10 @@ test "closeById rejects the caller's own pane" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
 
     const root_handle = blk: {
         for (wm.node_registry.slots.items, 0..) |slot, i| {
@@ -3165,9 +3186,10 @@ test "closeById routes float handles to closeFloatById" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     const bh = try wm.buffer_registry.createScratch("popup");
@@ -3230,9 +3252,10 @@ test "resizeById applies ratio to parent split" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     wm.doSplit(.vertical);
@@ -3297,9 +3320,10 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     wm.doSplit(.vertical);
@@ -3409,9 +3433,10 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     // Seed the registry with a scratch buffer and use its packed handle
@@ -3491,9 +3516,10 @@ test "handleLayoutRequest split rejects stale buffer handle" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
     var id_buf: [16]u8 = undefined;
@@ -3559,9 +3585,10 @@ test "describe emits parseable node map" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     wm.doSplit(.vertical);
@@ -3622,9 +3649,10 @@ test "executeAction focus_left goes through handle path" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     wm.doSplit(.vertical);
@@ -3688,9 +3716,10 @@ test "executeAction lua_callback runs the Lua function via the engine" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     try wm.executeAction(.{ .lua_callback = ref });
@@ -3743,9 +3772,10 @@ test "executeAction lua_callback without an engine is a no-op" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     try wm.executeAction(.{ .lua_callback = 99 });
@@ -3796,9 +3826,10 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     // Wire the engine's WM + buffer registry references so the Lua
@@ -3877,9 +3908,10 @@ test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form wo
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     engine.window_manager = wm;
@@ -3951,9 +3983,10 @@ test "zag.layout.split rejects a malformed buffer handle string" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     engine.window_manager = wm;
@@ -4013,9 +4046,10 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     // Seed a scratch on the registry. The tool receives the handle as a
@@ -4131,9 +4165,10 @@ test "readPaneById returns rendered text with metadata" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     // Seed the root pane's buffer with a user message so readText has
@@ -4443,13 +4478,14 @@ test "swapProviderForPane targets the pane identified by handle" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     // Wire the node registry and seed the root leaf so the handle path
     // resolves to `&f.wm.root_pane`. The PickerFixture skips this
     // bookkeeping by default (the swapProvider tests above work through
     // the root fallback), but handle-based swaps require the registry.
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     const root_handle = try f.wm.handleForNode(f.layout.root.?);
 
     try f.wm.swapProviderForPane(root_handle, "provB", "b2");
@@ -4466,9 +4502,10 @@ test "zag.pane.set_model swaps via the Lua surface" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4495,9 +4532,10 @@ test "zag.pane.current_model returns the resolved model string" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4537,9 +4575,10 @@ test "zag.pane.set_draft writes through to the pane's draft" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4594,9 +4633,10 @@ test "zag.pane.set_draft truncates input larger than MAX_DRAFT" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4625,9 +4665,10 @@ test "zag.pane.set_draft raises on invalid pane handle" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4648,9 +4689,10 @@ test "zag.pane.get_draft round-trips through set_draft" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4679,9 +4721,10 @@ test "zag.pane.get_draft returns empty string for an untouched pane" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4737,9 +4780,10 @@ test "zag.pane.get_draft raises on invalid pane handle" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4758,9 +4802,10 @@ test "zag.pane.replace_draft_range replaces a slice of the draft" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4788,9 +4833,10 @@ test "zag.pane.replace_draft_range raises with helpful message on invalid range"
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4830,9 +4876,10 @@ test "zag.pane.replace_draft_range raises with helpful message on overflow" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
     try f.wm.attachLayoutRegistry();
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
 
     var engine = try LuaEngine.init(allocator);
     defer engine.deinit();
@@ -4873,8 +4920,9 @@ test "PaneDraftChange fires on root pane draft mutation" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -4921,8 +4969,9 @@ test "PaneDraftChange does not fire for non-matching pane handle" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -4952,8 +5001,9 @@ test "PaneDraftChange rewrite return value replaces the draft" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -4981,8 +5031,9 @@ test "PaneDraftChange recursion guard blocks reentrant set_draft from hook" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5029,10 +5080,11 @@ test "PaneDraftChange fires on float draft via zag.pane.set_draft" {
     var theme = @import("Theme.zig").defaultTheme();
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
+    var test_viewport: Viewport = .{};
     f.wm.screen = &screen;
     f.wm.compositor = &compositor;
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
     f.wm.layout.recalculate(screen.width, screen.height);
 
@@ -5081,8 +5133,9 @@ test "PaneDraftChange does not fire when appendPaste is called with empty data" 
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5113,8 +5166,9 @@ test "PaneDraftChange does not fire when appendPaste has no room in the draft" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5149,8 +5203,9 @@ test "PaneDraftChange does not fire when setDraft is called with current draft t
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5190,8 +5245,9 @@ test "PaneDraftChange does not fire on consumeDraft" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5229,8 +5285,9 @@ test "PaneDraftChange hook ref cleanup leaves no leaks on engine deinit" {
     var f: PickerFixture = undefined;
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
+    var test_viewport: Viewport = .{};
 
-    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view() });
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
     try f.wm.attachLayoutRegistry();
 
     var engine = try LuaEngine.init(allocator);
@@ -5418,7 +5475,7 @@ const ModelPickerPluginFixture = struct {
         // breaks PaneDraftChange dispatch (the hook fires with a missing
         // pane handle). Production wires them in this order at main.zig
         // already; the fixture must match.
-        try self.layout.setRoot(.{ .buffer = self.conversation.buf(), .view = self.conversation.view() });
+        try self.layout.setRoot(.{ .buffer = self.conversation.buf(), .view = self.conversation.view(), .viewport = &self.wm.root_pane.viewport });
         try self.wm.attachLayoutRegistry();
         self.layout.recalculate(self.screen.width, self.screen.height);
 
@@ -5723,9 +5780,10 @@ test "openFloatPane allocates, registers, and is reachable via paneFromFloatHand
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     const bh = try wm.buffer_registry.createScratch("picker");
@@ -5783,6 +5841,7 @@ test "deinit tears down extra_floats with no leaks" {
     var session_mgr: ?Session.SessionManager = null;
     var command_registry = try testCommandRegistry(allocator);
     defer command_registry.deinit();
+    var test_viewport: Viewport = .{};
 
     const wm = try allocator.create(WindowManager);
     defer allocator.destroy(wm);
@@ -5804,7 +5863,7 @@ test "deinit tears down extra_floats with no leaks" {
     // left open exercise the loop in deinit; testing.allocator catches
     // any missed free.
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     const bh1 = try wm.buffer_registry.createScratch("p1");
@@ -6011,9 +6070,10 @@ test "describe surfaces floats array and focused_float" {
         .command_registry = &command_registry,
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     const bh = try wm.buffer_registry.createScratch("picker");

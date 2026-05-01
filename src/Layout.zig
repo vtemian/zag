@@ -12,6 +12,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
+const Viewport = @import("Viewport.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
 
@@ -22,8 +23,14 @@ const Layout = @This();
 /// concrete buffer's `view()` accessor while `buffer` is the
 /// type-erased `buf()` projection used by content-agnostic callers.
 pub const Surface = struct {
+    /// The buffer this pane displays.
     buffer: Buffer,
+    /// The view that renders the buffer.
     view: View,
+    /// Per-pane viewport state owned by the Pane. Layout borrows the
+    /// pointer so leaf-level code (Compositor, recalculateFloats) can
+    /// read scroll/dirty/total-rows without a Pane lookup.
+    viewport: *Viewport,
 };
 
 /// Direction of a window split.
@@ -64,6 +71,11 @@ pub const LayoutNode = union(enum) {
         /// `lineCount`, `getVisibleLines`, etc. from here without
         /// needing to look up the owning Pane.
         view: View,
+        /// Per-pane viewport state. Owned by the Pane (or PaneEntry); the
+        /// leaf borrows the pointer so Compositor and Layout's own
+        /// auto-sizing logic can read scroll/dirty/total-rows without
+        /// looking up a Pane from a buffer.
+        viewport: *Viewport,
         /// Screen rectangle for this pane, computed by recalculate().
         rect: Rect,
     };
@@ -204,6 +216,11 @@ pub const FloatNode = struct {
     /// the compositor when measuring or rendering this float without
     /// having to dispatch through the Buffer vtable.
     view: View,
+    /// Per-pane viewport state. Owned by the Pane (or PaneEntry); the
+    /// float borrows the pointer so Compositor and Layout's own
+    /// auto-sizing logic can read scroll/dirty/total-rows without
+    /// looking up a Pane from a buffer.
+    viewport: *Viewport,
     /// Resolved screen rect. For slice 1 this is set explicitly on
     /// `addFloat`; later slices recompute it each frame from anchor +
     /// size.
@@ -340,6 +357,7 @@ pub fn addFloat(
         .handle = handle,
         .buffer = surface.buffer,
         .view = surface.view,
+        .viewport = surface.viewport,
         .rect = rect,
         .config = stored_config,
         .title_storage = owned_title,
@@ -541,12 +559,25 @@ pub fn setRoot(self: *Layout, surface: Surface) !void {
     leaf.* = .{ .leaf = .{
         .buffer = surface.buffer,
         .view = surface.view,
+        .viewport = surface.viewport,
         .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     } };
     try self.trackRegister(leaf);
 
     self.root = leaf;
     self.focused = leaf;
+}
+
+/// Rewrite the root leaf's viewport pointer to a new stable address.
+/// Used by main and the headless harness to bind the layout's root leaf
+/// to the orchestrator-owned `&root_pane.viewport` after the orchestrator
+/// has been constructed (the pane's address is only stable post-init).
+pub fn setRootViewport(self: *Layout, viewport: *Viewport) void {
+    const root = self.root orelse return;
+    switch (root.*) {
+        .leaf => |*leaf| leaf.viewport = viewport,
+        .split => {},
+    }
 }
 
 /// Split the focused window vertically (left/right).
@@ -1025,6 +1056,7 @@ fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_surfac
     new_leaf.* = .{ .leaf = .{
         .buffer = new_surface.buffer,
         .view = new_surface.view,
+        .viewport = new_surface.viewport,
         .rect = existing_rect,
     } };
     try self.trackRegister(new_leaf);
@@ -1244,8 +1276,9 @@ test "setRoot creates a single leaf" {
 
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport });
 
     try std.testing.expect(layout.root != null);
     try std.testing.expectEqual(layout.root, layout.focused);
@@ -1260,8 +1293,9 @@ test "recalculate sets leaf rect with status row reserved" {
 
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     const leaf = layout.getFocusedLeaf().?;
@@ -1282,14 +1316,15 @@ test "split focuses the new pane" {
     defer cb2.deinit();
     var cb3 = try ConversationBuffer.init(allocator, 2, "bottom");
     defer cb3.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
-    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     try std.testing.expectEqualStrings("right", layout.getFocusedLeaf().?.buffer.getName());
 
-    try layout.splitHorizontal(0.5, .{ .buffer = cb3.buf(), .view = cb3.view() });
+    try layout.splitHorizontal(0.5, .{ .buffer = cb3.buf(), .view = cb3.view(), .viewport = &test_viewport });
     try std.testing.expectEqualStrings("bottom", layout.getFocusedLeaf().?.buffer.getName());
 }
 
@@ -1302,11 +1337,12 @@ test "vertical split divides width evenly" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
-    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     const r = layout.root.?;
@@ -1333,11 +1369,12 @@ test "horizontal split divides height evenly" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
-    try layout.splitHorizontal(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitHorizontal(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     const r = layout.root.?;
@@ -1363,10 +1400,11 @@ test "focus navigation between vertical splits" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "right");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     // The new pane owns focus after split.
@@ -1388,10 +1426,11 @@ test "focus navigation between horizontal splits" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
-    try layout.splitHorizontal(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitHorizontal(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     // The new pane owns focus after split.
@@ -1413,10 +1452,11 @@ test "closeWindow removes focused pane" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "right");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     // Split lands focus on the new right pane.
@@ -1435,8 +1475,9 @@ test "closeWindow is no-op on single leaf" {
 
     var cb = try ConversationBuffer.init(allocator, 0, "only");
     defer cb.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport });
 
     layout.closeWindow();
     try std.testing.expect(layout.root.?.* == .leaf);
@@ -1451,10 +1492,11 @@ test "visibleLeaves returns all leaves" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
-    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.splitVertical(0.5, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
 
     var leaves: [16]*LayoutNode = undefined;
     var count: usize = 0;
@@ -1470,8 +1512,9 @@ test "recalculate with tiny screen is safe" {
 
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport });
 
     layout.recalculate(5, 1);
     layout.recalculate(0, 0);
@@ -1485,8 +1528,9 @@ test "focus direction no-op when no neighbor exists" {
 
     var cb = try ConversationBuffer.init(allocator, 0, "only");
     defer cb.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view() });
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     layout.focusDirection(.right);
@@ -1506,11 +1550,12 @@ test "setRoot replaces existing tree" {
     defer cb1.deinit();
     var cb2 = try ConversationBuffer.init(allocator, 1, "second");
     defer cb2.deinit();
+    var test_viewport: Viewport = .{};
 
-    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view() });
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
     try std.testing.expectEqualStrings("first", layout.root.?.leaf.buffer.getName());
 
-    try layout.setRoot(.{ .buffer = cb2.buf(), .view = cb2.view() });
+    try layout.setRoot(.{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport });
     try std.testing.expectEqualStrings("second", layout.root.?.leaf.buffer.getName());
 }
 
@@ -1524,7 +1569,8 @@ test "registry receives register on setRoot and split" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     try layout.setRoot(dummy_surface);
     try std.testing.expectEqual(@as(usize, 1), registry.slots.items.len);
 
@@ -1542,7 +1588,8 @@ test "registry receives remove on closeWindow" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     try layout.setRoot(dummy_surface);
     try layout.splitVertical(0.5, dummy_surface);
     layout.closeWindow();
@@ -1561,7 +1608,8 @@ test "resizeSplit updates parent ratio" {
     defer layout.deinit();
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     try layout.setRoot(dummy_surface);
     try layout.splitVertical(0.5, dummy_surface);
     try layout.resizeSplit(layout.root.?, 0.3);
@@ -1573,7 +1621,8 @@ test "resizeSplit rejects non-split nodes" {
     defer layout.deinit();
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     try layout.setRoot(dummy_surface);
     try std.testing.expectError(error.NotASplit, layout.resizeSplit(layout.root.?, 0.3));
 }
@@ -1585,7 +1634,8 @@ test "addFloat appends, rectFor resolves, removeFloat frees" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const rect: Rect = .{ .x = 4, .y = 2, .width = 30, .height = 10 };
     const handle = try layout.addFloat(dummy_surface, rect, .{ .title = "Models" });
 
@@ -1613,7 +1663,8 @@ test "addFloat keeps floats sorted ascending by z" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
     const top = try layout.addFloat(dummy_surface, r, .{ .z = 100 });
     const middle = try layout.addFloat(dummy_surface, r, .{ .z = 50 });
@@ -1631,7 +1682,8 @@ test "removeFloat clears focused_float when matching" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const handle = try layout.addFloat(dummy_surface, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{});
     layout.focused_float = handle;
 
@@ -1646,7 +1698,8 @@ test "addFloat reuses the lowest free index after a remove" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
 
     const a = try layout.addFloat(dummy_surface, r, .{});
@@ -1677,6 +1730,7 @@ test "addFloat exhaustion returns an error and never collides with live floats" 
     // visits every slot but we only allocate the floats themselves).
     const slot_count: usize = 0xFFFF - FLOAT_HANDLE_BIT + 1;
     try layout.floats.ensureTotalCapacity(allocator, slot_count);
+    var stub_viewport: Viewport = .{};
     var i: u32 = FLOAT_HANDLE_BIT;
     while (i <= 0xFFFF) : (i += 1) {
         const stub = try allocator.create(FloatNode);
@@ -1684,6 +1738,7 @@ test "addFloat exhaustion returns an error and never collides with live floats" 
             .handle = .{ .index = @intCast(i), .generation = 0 },
             .buffer = .{ .ptr = undefined, .vtable = undefined },
             .view = .{ .ptr = undefined, .vtable = undefined },
+            .viewport = &stub_viewport,
             .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
             .config = .{},
             .title_storage = null,
@@ -1693,7 +1748,8 @@ test "addFloat exhaustion returns an error and never collides with live floats" 
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     try std.testing.expectError(
         error.FloatHandleSpaceExhausted,
         layout.addFloat(dummy_surface, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{}),
@@ -1712,7 +1768,8 @@ test "recalculateFloats positions cursor-anchored float at the focused leaf's pr
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const handle = try layout.addFloat(dummy_surface, .{ .x = 0, .y = 0, .width = 12, .height = 4 }, .{
         .relative = .cursor,
         .corner = .NW,
@@ -1739,7 +1796,8 @@ test "recalculateFloats clamps floats whose rect would extend past the screen" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     // Editor anchor at (0,0,80,23): a 60-wide float with col_offset=50
     // would end at col 110, well past the right edge. Clamp must
     // truncate width so the rect stays inside the editor area.
@@ -1769,13 +1827,14 @@ test "recalculateFloats sizes a float to longest-line bounded by max_width" {
 
     var cb = try ConversationBuffer.init(allocator, 0, "picker");
     defer cb.deinit();
+    var test_viewport: Viewport = .{};
     // Three lines, longest is 14 chars. We bound max_width to 10 so
     // the size-to-content path picks the bound, not the full width.
     _ = try cb.appendNode(null, .user_message, "abc");
     _ = try cb.appendNode(null, .user_message, "abcdefghijklmn");
     _ = try cb.appendNode(null, .user_message, "abcdef");
 
-    const handle = try layout.addFloat(.{ .buffer = cb.buf(), .view = cb.view() }, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
+    const handle = try layout.addFloat(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport }, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
         .relative = .editor,
         .corner = .NW,
         .min_width = 4,
@@ -1803,7 +1862,8 @@ test "floatRaise bumps z and re-orders floats" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
     const a = try layout.addFloat(dummy_surface, r, .{ .z = 25 });
     const b = try layout.addFloat(dummy_surface, r, .{ .z = 50 });
@@ -1829,7 +1889,8 @@ test "floatMove updates rect after recalculate" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     // Open at (5, 5) with explicit size; recalculate so the seed rect
     // matches the resolved anchor + offsets.
     const handle = try layout.addFloat(dummy_surface, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
@@ -1862,7 +1923,8 @@ test "floatsList returns every live float handle" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const r: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
     const a = try layout.addFloat(dummy_surface, r, .{});
     _ = try layout.addFloat(dummy_surface, r, .{});
@@ -1880,7 +1942,8 @@ test "recalculateFloats laststatus anchor places float on the status row" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const handle = try layout.addFloat(dummy_surface, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
         .relative = .laststatus,
         .corner = .NW,
@@ -1902,7 +1965,8 @@ test "recalculateFloats mouse anchor reads layout.mouse_anchor" {
 
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     const handle = try layout.addFloat(dummy_surface, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{
         .relative = .mouse,
         .corner = .NW,
@@ -1920,7 +1984,8 @@ test "resizeSplit clamps ratio to valid open interval" {
     defer layout.deinit();
     const dummy_buf: Buffer = .{ .ptr = undefined, .vtable = undefined };
     const dummy_view: View = .{ .ptr = undefined, .vtable = undefined };
-    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view };
+    var dummy_viewport: Viewport = .{};
+    const dummy_surface: Surface = .{ .buffer = dummy_buf, .view = dummy_view, .viewport = &dummy_viewport };
     try layout.setRoot(dummy_surface);
     try layout.splitVertical(0.5, dummy_surface);
     try std.testing.expectError(error.InvalidRatio, layout.resizeSplit(layout.root.?, 0.0));
