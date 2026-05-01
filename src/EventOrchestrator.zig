@@ -24,6 +24,7 @@ const AgentRunner = @import("AgentRunner.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationHistory = @import("ConversationHistory.zig");
 const Layout = @import("Layout.zig");
+const Viewport = @import("Viewport.zig");
 const Compositor = @import("Compositor.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
 const zlua = @import("zlua");
@@ -1140,8 +1141,9 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     };
     defer wm.deinit();
 
+    var test_viewport: Viewport = .{};
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
     // Seed a scratch buffer with two lines so we can later read back the
@@ -1265,9 +1267,10 @@ test "mouse click on a focusable float makes it the focused float" {
         .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     // Two floats: a low-z one in the NW, a high-z one (50) overlapping
@@ -1394,9 +1397,10 @@ test "handleKey routes a printable char to the focused float's pane draft" {
         .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
 
     // Open a focusable float with `enter = true` so it becomes the
@@ -1521,7 +1525,7 @@ const FloatLifecycleFixture = struct {
         };
 
         try self.wm.attachLayoutRegistry();
-        try self.layout.setRoot(.{ .buffer = self.conversation.buf(), .view = self.conversation.view() });
+        try self.layout.setRoot(.{ .buffer = self.conversation.buf(), .view = self.conversation.view(), .viewport = &self.wm.root_pane.viewport });
         self.layout.recalculate(80, 24);
     }
 
@@ -1735,9 +1739,10 @@ test "handleKey routes through on_key filter and consumes when callback returns 
         .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
     engine.window_manager = wm;
     engine.buffer_registry = &wm.buffer_registry;
@@ -1832,9 +1837,10 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
         .buffer_registry = BufferRegistry.init(allocator),
     };
     defer wm.deinit();
+    var test_viewport: Viewport = .{};
 
     try wm.attachLayoutRegistry();
-    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view() });
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(80, 24);
     engine.window_manager = wm;
     engine.buffer_registry = &wm.buffer_registry;

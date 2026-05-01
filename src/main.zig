@@ -15,6 +15,7 @@ const ConversationBuffer = @import("ConversationBuffer.zig");
 const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
+const Viewport = @import("Viewport.zig");
 const Compositor = @import("Compositor.zig");
 const Theme = @import("Theme.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
@@ -234,7 +235,14 @@ pub fn main() !void {
 
     var layout = Layout.init(allocator);
     defer layout.deinit();
-    try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view() });
+    // Layout needs a Viewport pointer at setRoot time but the live one
+    // lives at `&orchestrator.window_manager.root_pane.viewport`, an
+    // address that doesn't exist yet (the orchestrator is built below).
+    // Pass a stack-local placeholder; the `layout.setRootViewport(...)`
+    // call after orchestrator init rewrites the leaf's viewport pointer
+    // to the final home.
+    var root_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view(), .viewport = &root_viewport });
 
     const default_model: ?[]const u8 = lua_engine.default_model;
     var registry_view = RegistryView.init(allocator, &lua_engine);
@@ -390,8 +398,13 @@ pub fn main() !void {
     // now lives at a stable address inside orchestrator.window_manager.
     // Attach the root buffer to the pane-owned Viewport so Buffer vtable
     // calls (scroll offset, dirty, cached rect) delegate through pane
-    // state rather than the buffer's private fallback.
+    // state rather than the buffer's private fallback. Also rewire the
+    // layout's root leaf to the same address so leaf.viewport-routed
+    // readers (added in commit 2 of the viewport-on-pane refactor) hit
+    // the live pane viewport instead of the placeholder we used during
+    // layout.setRoot, which ran before this address existed.
     root_buffer.attachViewport(&orchestrator.window_manager.root_pane.viewport);
+    layout.setRootViewport(&orchestrator.window_manager.root_pane.viewport);
 
     // Lua bindings (zag.layout.*, zag.pane.*) call the window manager
     // directly on the main thread. Wire after orchestrator construction
