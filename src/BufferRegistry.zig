@@ -192,6 +192,16 @@ test "asBuffer on graphics entry returns a Buffer backed by the GraphicsBuffer" 
     try std.testing.expect(b.vtable != scratch_buf.vtable);
 }
 
+test "asView on graphics entry returns a View backed by the GraphicsBuffer" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createGraphics("viewer");
+    const entry = try r.resolve(h);
+    const v = try r.asView(h);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(entry.graphics)), v.ptr);
+    try std.testing.expectEqual(@as(usize, 0), try v.lineCount());
+}
+
 test "remove on graphics entry destroys the GraphicsBuffer" {
     var r = BufferRegistry.init(std.testing.allocator);
     defer r.deinit();
