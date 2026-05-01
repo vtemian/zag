@@ -2672,9 +2672,10 @@ test "extra pane viewport is attached to its buffer" {
     try std.testing.expectEqual(entry.viewport_storage.?, cb.viewport.?);
 
     // Flipping scroll on the pane's Viewport must reflect through the
-    // Buffer vtable, proving the attach actually wired the delegation.
+    // Buffer's attached viewport, proving the attach actually wired the
+    // delegation.
     entry.viewport_storage.?.setScrollOffset(7);
-    try std.testing.expectEqual(@as(u32, 7), entry.pane.buffer.getScrollOffset());
+    try std.testing.expectEqual(@as(u32, 7), cb.viewport.?.scroll_offset);
 }
 
 test "multiple splits maintain stable viewport pointers" {

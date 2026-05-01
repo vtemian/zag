@@ -253,12 +253,17 @@ fn pumpLuaCompletions(eng: *LuaEngine) void {
 /// compositor would draw so a float-only buffer mutation still triggers
 /// a redraw.
 fn anyPaneDirty(self: *const EventOrchestrator) bool {
-    if (self.window_manager.root_pane.buffer.isDirty()) return true;
+    {
+        const root = &self.window_manager.root_pane;
+        if (root.viewport.isDirty(root.buffer.contentVersion())) return true;
+    }
     for (self.window_manager.extra_panes.items) |entry| {
-        if (entry.pane.buffer.isDirty()) return true;
+        const buf = entry.pane.buffer;
+        if (entry.pane.viewport.isDirty(buf.contentVersion())) return true;
     }
     for (self.window_manager.extra_floats.items) |entry| {
-        if (entry.pane.buffer.isDirty()) return true;
+        const buf = entry.pane.buffer;
+        if (entry.pane.viewport.isDirty(buf.contentVersion())) return true;
     }
     return false;
 }
@@ -721,16 +726,16 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
         .page_up => {
             if (self.window_manager.layout.getFocusedLeaf()) |l| {
                 const half = l.rect.height / 2;
-                const cur = l.buffer.getScrollOffset();
-                l.buffer.setScrollOffset(cur +| if (half > 0) half else 1);
+                const cur = l.viewport.scroll_offset;
+                l.viewport.setScrollOffset(cur +| if (half > 0) half else 1);
             }
             return .redraw;
         },
         .page_down => {
             if (self.window_manager.layout.getFocusedLeaf()) |l| {
                 const half = l.rect.height / 2;
-                const cur = l.buffer.getScrollOffset();
-                l.buffer.setScrollOffset(if (cur > half) cur - half else 0);
+                const cur = l.viewport.scroll_offset;
+                l.viewport.setScrollOffset(if (cur > half) cur - half else 0);
             }
             return .redraw;
         },
@@ -1901,8 +1906,11 @@ test "anyPaneDirty walks extra_floats so a float-only mutation triggers a redraw
 
     // Drain any open-time dirtiness so the next isDirty() reflects only
     // the test mutation. The float's pane lives on extra_floats[0].
-    f.wm.extra_floats.items[0].pane.buffer.clearDirty();
-    try std.testing.expect(!f.wm.extra_floats.items[0].pane.buffer.isDirty());
+    {
+        const float_buf = f.wm.extra_floats.items[0].pane.buffer;
+        f.wm.extra_floats.items[0].pane.viewport.clearDirty(float_buf.contentVersion());
+        try std.testing.expect(!f.wm.extra_floats.items[0].pane.viewport.isDirty(float_buf.contentVersion()));
+    }
 
     // Mutate the float buffer directly via its scratch handle: this is
     // the moral equivalent of `zag.buffer.set_lines(buf, ...)` from a
@@ -1935,8 +1943,14 @@ test "anyPaneDirty stays false when no pane has pending visual changes" {
         .enter = false,
     });
 
-    f.wm.root_pane.buffer.clearDirty();
-    f.wm.extra_floats.items[0].pane.buffer.clearDirty();
+    {
+        const root_buf = f.wm.root_pane.buffer;
+        f.wm.root_pane.viewport.clearDirty(root_buf.contentVersion());
+    }
+    {
+        const float_buf = f.wm.extra_floats.items[0].pane.buffer;
+        f.wm.extra_floats.items[0].pane.viewport.clearDirty(float_buf.contentVersion());
+    }
 
     var orch: EventOrchestrator = undefined;
     orch.window_manager = f.wm.*;

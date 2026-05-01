@@ -453,6 +453,7 @@ const vtable: Buffer.VTable = .{
     .setLastTotalRows = bufSetLastTotalRows,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
+    .contentVersion = bufContentVersion,
 };
 
 const view_vtable: View.VTable = .{
@@ -532,6 +533,11 @@ fn bufIsDirty(ptr: *anyopaque) bool {
 fn bufClearDirty(ptr: *anyopaque) void {
     const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
     if (self.viewport) |v| v.clearDirty(self.tree.currentGeneration());
+}
+
+fn bufContentVersion(ptr: *anyopaque) u64 {
+    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    return @as(u64, self.tree.currentGeneration());
 }
 
 /// Handle a key event the buffer claims as its own. Drafts moved to

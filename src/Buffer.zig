@@ -41,6 +41,11 @@ pub const VTable = struct {
 
     /// Clear the dirty flag after compositing.
     clearDirty: *const fn (ptr: *anyopaque) void,
+
+    /// Monotonically increasing version stamp. Bumps on every content
+    /// mutation. Views and Viewports cache against this value; if it
+    /// matches the previously-seen value, no re-render is required.
+    contentVersion: *const fn (ptr: *anyopaque) u64,
 };
 
 /// Return the buffer's human-readable name.
@@ -82,6 +87,12 @@ pub fn isDirty(self: Buffer) bool {
 /// Clear the dirty flag after compositing the buffer.
 pub fn clearDirty(self: Buffer) void {
     self.vtable.clearDirty(self.ptr);
+}
+
+/// Current content version. Compare against a stored value to decide
+/// whether the buffer's content has changed since the last observation.
+pub fn contentVersion(self: Buffer) u64 {
+    return self.vtable.contentVersion(self.ptr);
 }
 
 // -- Tests -------------------------------------------------------------------

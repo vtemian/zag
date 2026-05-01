@@ -21,6 +21,11 @@ lines: std.ArrayList([]u8),
 cursor_row: u32 = 0,
 scroll_offset: u32 = 0,
 dirty: bool = true,
+/// Monotonically increasing content version. Bumps on every mutation
+/// (line list, row styles, cursor position). Surfaced through
+/// `Buffer.contentVersion` so Viewports can decide when to invalidate
+/// without reaching into ScratchBuffer's internals.
+content_version: u64 = 0,
 /// Sparse map of 0-indexed row -> theme highlight slot, applied as a
 /// row-background override during render. Cleared on `setLines` so
 /// renumbered rows don't carry stale overrides; lifetime ends with
@@ -65,6 +70,7 @@ pub fn setLines(self: *ScratchBuffer, lines: []const []const u8) !void {
     // wipe the map so the caller has to opt back in via setRowStyle.
     self.row_styles.clearRetainingCapacity();
     self.dirty = true;
+    self.content_version += 1;
 }
 
 /// Tag a row with a theme highlight slot. The Compositor resolves
@@ -75,6 +81,7 @@ pub fn setRowStyle(self: *ScratchBuffer, row: u32, slot: Theme.HighlightSlot) !v
     if (row >= self.lines.items.len) return error.RowOutOfRange;
     try self.row_styles.put(self.allocator, row, slot);
     self.dirty = true;
+    self.content_version += 1;
 }
 
 /// Drop a row's highlight override. No-op when the row has no
@@ -82,6 +89,7 @@ pub fn setRowStyle(self: *ScratchBuffer, row: u32, slot: Theme.HighlightSlot) !v
 pub fn clearRowStyle(self: *ScratchBuffer, row: u32) void {
     if (self.row_styles.remove(row)) {
         self.dirty = true;
+        self.content_version += 1;
     }
 }
 
@@ -90,6 +98,7 @@ pub fn appendLine(self: *ScratchBuffer, line: []const u8) !void {
     errdefer self.allocator.free(dup);
     try self.lines.append(self.allocator, dup);
     self.dirty = true;
+    self.content_version += 1;
 }
 
 pub fn currentLine(self: *const ScratchBuffer) ?[]const u8 {
@@ -118,6 +127,7 @@ const vtable: Buffer.VTable = .{
     .setLastTotalRows = bufSetLastTotalRows,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
+    .contentVersion = bufContentVersion,
 };
 
 const view_vtable: View.VTable = .{
@@ -245,6 +255,11 @@ fn bufClearDirty(ptr: *anyopaque) void {
     self.dirty = false;
 }
 
+fn bufContentVersion(ptr: *anyopaque) u64 {
+    const self: *const ScratchBuffer = @ptrCast(@alignCast(ptr));
+    return self.content_version;
+}
+
 pub fn handleKey(self: *ScratchBuffer, ev: input.KeyEvent) View.HandleResult {
     const count = self.lines.items.len;
     if (count == 0) return .passthrough;
@@ -254,21 +269,25 @@ pub fn handleKey(self: *ScratchBuffer, ev: input.KeyEvent) View.HandleResult {
             'j' => {
                 if (self.cursor_row + 1 < count) self.cursor_row += 1;
                 self.dirty = true;
+                self.content_version += 1;
                 return .consumed;
             },
             'k' => {
                 if (self.cursor_row > 0) self.cursor_row -= 1;
                 self.dirty = true;
+                self.content_version += 1;
                 return .consumed;
             },
             'g' => {
                 self.cursor_row = 0;
                 self.dirty = true;
+                self.content_version += 1;
                 return .consumed;
             },
             'G' => {
                 self.cursor_row = @intCast(count - 1);
                 self.dirty = true;
+                self.content_version += 1;
                 return .consumed;
             },
             else => return .passthrough,
@@ -276,11 +295,13 @@ pub fn handleKey(self: *ScratchBuffer, ev: input.KeyEvent) View.HandleResult {
         .down => {
             if (self.cursor_row + 1 < count) self.cursor_row += 1;
             self.dirty = true;
+            self.content_version += 1;
             return .consumed;
         },
         .up => {
             if (self.cursor_row > 0) self.cursor_row -= 1;
             self.dirty = true;
+            self.content_version += 1;
             return .consumed;
         },
         else => return .passthrough,

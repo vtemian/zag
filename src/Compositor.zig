@@ -217,7 +217,7 @@ fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
             self.drawBufferContent(&leaf);
-            leaf.buffer.clearDirty();
+            leaf.viewport.clearDirty(leaf.buffer.contentVersion());
             self.syncTreeSnapshot(leaf.buffer);
         },
         .split => |split| {
@@ -232,7 +232,7 @@ fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
 fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
     switch (node.*) {
         .leaf => |leaf| {
-            if (leaf.buffer.isDirty()) {
+            if (leaf.viewport.isDirty(leaf.buffer.contentVersion())) {
                 // Clear only the interior; the frame survives across
                 // dirty-leaf updates so we don't need to redraw it.
                 // Mirror the prompt-row reservation in drawBufferContent so
@@ -247,7 +247,7 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
                     );
                 }
                 self.drawBufferContent(&leaf);
-                leaf.buffer.clearDirty();
+                leaf.viewport.clearDirty(leaf.buffer.contentVersion());
                 self.syncTreeSnapshot(leaf.buffer);
             }
         },
@@ -294,7 +294,7 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
 /// resolved style. Shrinks the rect by 1 cell on each side to leave room
 /// for the pane's frame, then applies padding_h/padding_v from the theme.
 fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
-    self.drawBufferIntoRect(leaf.buffer, leaf.view, leaf.rect, true);
+    self.drawBufferIntoRect(leaf.view, leaf.viewport, leaf.rect, true);
 }
 
 /// Render `buf` into `outer`, where `outer` is the chrome-inclusive
@@ -304,8 +304,8 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
 /// they do not draw a prompt today.
 fn drawBufferIntoRect(
     self: *Compositor,
-    buf: Buffer,
     view: View,
+    viewport: *Viewport,
     outer: Layout.Rect,
     reserve_prompt_row: bool,
 ) void {
@@ -336,13 +336,13 @@ fn drawBufferIntoRect(
         self.allocator,
         content_width,
         visible_rows,
-        buf.getScrollOffset(),
+        viewport.scroll_offset,
     ) catch return;
 
-    // Publish the projected total back to the buffer so wheel handlers
+    // Publish the projected total back to the viewport so wheel handlers
     // can clamp their next event against it. One frame stale is fine: by
     // the next mouse event the user has already seen this paint.
-    buf.setLastTotalRows(plan.total_rows);
+    viewport.last_total_rows = plan.total_rows;
 
     // After a resize that grows pane width, total_rows shrinks and the
     // saved scroll_offset can land past the new tail. planScroll already
@@ -351,9 +351,9 @@ fn drawBufferIntoRect(
     // down. Clamp here so the next paint pulls visible content.
     if (plan.total_rows > 0) {
         const cap = plan.total_rows -| 1;
-        if (buf.getScrollOffset() > cap) buf.setScrollOffset(cap);
-    } else if (buf.getScrollOffset() != 0) {
-        buf.setScrollOffset(0);
+        if (viewport.scroll_offset > cap) viewport.setScrollOffset(cap);
+    } else if (viewport.scroll_offset != 0) {
+        viewport.setScrollOffset(0);
     }
 
     // Wipe the content rect before redrawing so a frame that emits fewer
@@ -1012,7 +1012,7 @@ fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputS
         // ignored by Screen.clearRect itself.
         self.screen.clearRect(rect.y, rect.x, rect.width, rect.height);
 
-        self.drawBufferIntoRect(float.buffer, float.view, rect, false);
+        self.drawBufferIntoRect(float.view, float.viewport, rect, false);
         self.drawRoundedBox(rect, fd.focused, float.config.title, float.config.border);
 
         // Insert-mode cursor block for the focused float. Floats today
@@ -2114,7 +2114,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
 
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 40, .height = 11 };
 
-    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
 
     // Drop a sentinel glyph in the middle of the content rect to mimic a
     // stale render artefact left over from a previous frame.
@@ -2127,7 +2127,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
     // Repaint without changing the buffer. The clear should wipe the
     // sentinel even though no logical line in the buffer ever wrote to
     // that row.
-    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(sentinel_row, sentinel_col).codepoint);
 }
 
@@ -2336,7 +2336,7 @@ test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
     // pane_width=5. Spans ["abcde","f"] fill cols 2..6 then wrap "f" to
     // the next row at col 2.
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
-    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
 
     // First-row content: 'a' at col 2, 'e' at col 6.
     try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(1, 2).codepoint);
@@ -2396,7 +2396,7 @@ test "composite: wrapped continuation lands at content_x, not span tail (Bug B r
     // ' ' would land at col 13 = max_col → wrap. Continuation at content_x=2
     // begins with ' ', then 'f','r','o','m' at cols 2..6.
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 14, .height = 8 };
-    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
 
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 2).codepoint);
     try std.testing.expectEqual(@as(u21, 'w'), screen.getCellConst(1, 8).codepoint);
@@ -2473,7 +2473,7 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     try std.testing.expect(probe.leading_skip_rows > 0);
 
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
-    compositor.drawBufferIntoRect(cb.buf(), cb.view(), outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
 
     // content_y = outer.y + 1 + padding_v(0) = 1. visible_rows=3, so
     // content rows occupy 1..3. The bottom visible row is row 3, holding

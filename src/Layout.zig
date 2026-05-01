@@ -910,7 +910,7 @@ fn resolveAnchor(
 /// scroll state; return 0 so the caller treats them as "no scroll".
 fn leafScrollOffset(node: *const LayoutNode) i32 {
     return switch (node.*) {
-        .leaf => |leaf| @intCast(@min(leaf.buffer.getScrollOffset(), std.math.maxInt(i32))),
+        .leaf => |leaf| @intCast(@min(leaf.viewport.scroll_offset, std.math.maxInt(i32))),
         .split => 0,
     };
 }
