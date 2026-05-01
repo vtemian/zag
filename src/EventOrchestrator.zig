@@ -366,7 +366,7 @@ fn tick(
         // dispatchHookRequests first thing, which is the sole owner of hook
         // dispatch at the tick boundary.
         self.window_manager.drainPane(&self.window_manager.root_pane);
-        for (self.window_manager.extra_panes.items) |*entry| {
+        for (self.window_manager.extra_panes.items) |entry| {
             self.window_manager.drainPane(&entry.pane);
         }
     }
