@@ -825,9 +825,7 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         if (screen_y < rect.y or screen_y >= rect.y + rect.height) continue;
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        if (self.window_manager.paneFromBufferPtr(node.leaf.buffer)) |lp| {
-            _ = lp.view.onMouse(ev, local_x, local_y);
-        }
+        _ = node.leaf.view.onMouse(ev, local_x, local_y);
         return;
     }
 }

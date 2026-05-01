@@ -740,9 +740,7 @@ fn notifyLeafRects(self: *WindowManager) void {
     var count: usize = 0;
     self.layout.visibleLeaves(&leaves, &count);
     for (leaves[0..count]) |node| {
-        if (self.paneFromBufferPtr(node.leaf.buffer)) |p| {
-            p.view.onResize(node.leaf.rect);
-        }
+        node.leaf.view.onResize(node.leaf.rect);
     }
 }
 
@@ -754,20 +752,16 @@ pub fn doFocus(self: *WindowManager, dir: Layout.FocusDirection) void {
     self.layout.focusDirection(dir);
     self.compositor.layout_dirty = true;
     const next = self.layout.getFocusedLeaf();
-    self.notifyFocusSwap(prev, next);
+    notifyFocusSwap(prev, next);
 }
 
 /// Fire `onFocus(false)` on `prev` and `onFocus(true)` on `next` when the
 /// two are distinct. Extracted so every layout path that moves focus
 /// (navigation, split, close) routes through one place.
-fn notifyFocusSwap(self: *WindowManager, prev: ?*Layout.LayoutNode.Leaf, next: ?*Layout.LayoutNode.Leaf) void {
+fn notifyFocusSwap(prev: ?*Layout.LayoutNode.Leaf, next: ?*Layout.LayoutNode.Leaf) void {
     if (prev == next) return;
-    if (prev) |p| {
-        if (self.paneFromBufferPtr(p.buffer)) |pp| pp.view.onFocus(false);
-    }
-    if (next) |n| {
-        if (self.paneFromBufferPtr(n.buffer)) |np| np.view.onFocus(true);
-    }
+    if (prev) |prev_leaf| prev_leaf.view.onFocus(false);
+    if (next) |next_leaf| next_leaf.view.onFocus(true);
 }
 
 /// Focus the leaf identified by `handle`. Stale or split-pointing handles
@@ -780,7 +774,7 @@ pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     const prev = self.layout.getFocusedLeaf();
     self.layout.focused = node;
     self.compositor.layout_dirty = true;
-    self.notifyFocusSwap(prev, self.layout.getFocusedLeaf());
+    notifyFocusSwap(prev, self.layout.getFocusedLeaf());
 }
 
 /// Split the leaf identified by `handle` and return the handle of the
@@ -1319,7 +1313,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // The new pane is ready to be typed into. Drop back to insert mode so
     // the user can start a conversation without an extra `i` keystroke,
@@ -1374,7 +1368,7 @@ pub fn doSplitWithBuffer(
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // Non-agent panes stay in whatever mode the user was in; there is
     // no draft to type into.
