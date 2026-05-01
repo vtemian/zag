@@ -2032,3 +2032,39 @@ test "sweepFloatsForAutoClose leaves intact a float whose time has not yet elaps
 
     try std.testing.expectEqual(@as(usize, 1), f.layout.floats.items.len);
 }
+
+test "scrollViewportBy up increments scroll_offset toward older content" {
+    var viewport: Viewport = .{};
+    viewport.last_total_rows = 100;
+
+    scrollViewportBy(&viewport, .up);
+    try std.testing.expectEqual(@as(u32, wheel_scroll_step), viewport.scroll_offset);
+}
+
+test "scrollViewportBy down decrements scroll_offset and clamps at 0" {
+    var viewport: Viewport = .{};
+    viewport.last_total_rows = 100;
+    viewport.setScrollOffset(2);
+
+    // 2 - wheel_scroll_step (3) saturates at 0 rather than wrapping.
+    scrollViewportBy(&viewport, .down);
+    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
+
+test "scrollViewportBy up clamps to last_total_rows -| 1" {
+    var viewport: Viewport = .{};
+    viewport.last_total_rows = 5;
+    viewport.setScrollOffset(3);
+
+    // 3 +| 3 = 6, capped at last_total_rows - 1 = 4.
+    scrollViewportBy(&viewport, .up);
+    try std.testing.expectEqual(@as(u32, 4), viewport.scroll_offset);
+}
+
+test "scrollViewportBy up with last_total_rows=0 stays at 0" {
+    var viewport: Viewport = .{};
+    // Default last_total_rows = 0; cap = 0 -| 1 = 0.
+
+    scrollViewportBy(&viewport, .up);
+    try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
