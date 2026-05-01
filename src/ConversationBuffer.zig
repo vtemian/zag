@@ -1044,3 +1044,13 @@ test "View dispatch renders the conversation" {
     try std.testing.expectEqual(@as(usize, total), via_view.items.len);
     try std.testing.expectEqual(@as(usize, total), try cb.view().lineCount());
 }
+
+test "contentVersion advances on appendNode" {
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "ver");
+    defer cb.deinit();
+
+    const before = cb.buf().contentVersion();
+    _ = try cb.appendNode(null, .status, "hello");
+    const after = cb.buf().contentVersion();
+    try std.testing.expect(after > before);
+}

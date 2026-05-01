@@ -435,6 +435,17 @@ test "GraphicsBuffer.view() renders a half-block raster" {
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
 }
 
+test "contentVersion advances on setPng" {
+    const gpa = std.testing.allocator;
+    var gb = try GraphicsBuffer.create(gpa, 9, "ver");
+    defer gb.destroy();
+
+    const before = gb.buf().contentVersion();
+    try gb.setPng(&tiny_red_png);
+    const after = gb.buf().contentVersion();
+    try std.testing.expect(after > before);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

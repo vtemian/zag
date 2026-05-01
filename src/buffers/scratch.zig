@@ -451,6 +451,16 @@ test "ScratchBuffer.view() exposes lineCount and getVisibleLines" {
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
 }
 
+test "contentVersion advances on setLines" {
+    var sb = try ScratchBuffer.create(std.testing.allocator, 7, "ver");
+    defer sb.destroy();
+
+    const before = sb.buf().contentVersion();
+    try sb.setLines(&.{ "alpha", "beta" });
+    const after = sb.buf().contentVersion();
+    try std.testing.expect(after > before);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
