@@ -43,6 +43,10 @@ last_render_rows: u16 = 0,
 /// Unused; scroll math doesn't apply to single-image panes. Kept to
 /// match the Buffer vtable surface.
 scroll_offset: u32 = 0,
+/// Monotonically increasing content version. Bumps on image / fit /
+/// pane-size mutations. Surfaced through `Buffer.contentVersion` so
+/// Viewports can decide when to invalidate.
+content_version: u64 = 0,
 
 /// Allocate a new GraphicsBuffer on the heap. The name is duped so the
 /// caller may free their copy immediately.
@@ -75,6 +79,7 @@ pub fn setPng(self: *GraphicsBuffer, bytes: []const u8) !void {
     self.image = decoded.image;
     self.pixels_owned = decoded.pixels_owned;
     self.dirty = true;
+    self.content_version += 1;
 }
 
 /// Change the fit mode. Only dirties when the value actually moves.
@@ -82,6 +87,7 @@ pub fn setFit(self: *GraphicsBuffer, fit: Fit) void {
     if (self.fit != fit) {
         self.fit = fit;
         self.dirty = true;
+        self.content_version += 1;
     }
 }
 
@@ -111,6 +117,7 @@ const vtable: Buffer.VTable = .{
     .setLastTotalRows = bufSetLastTotalRows,
     .isDirty = bufIsDirty,
     .clearDirty = bufClearDirty,
+    .contentVersion = bufContentVersion,
 };
 
 const view_vtable: View.VTable = .{
@@ -248,6 +255,11 @@ fn bufClearDirty(ptr: *anyopaque) void {
     self.dirty = false;
 }
 
+fn bufContentVersion(ptr: *anyopaque) u64 {
+    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    return self.content_version;
+}
+
 pub fn handleKey(self: *GraphicsBuffer, ev: input.KeyEvent) View.HandleResult {
     _ = self;
     _ = ev;
@@ -259,6 +271,7 @@ pub fn onResize(self: *GraphicsBuffer, rect: Layout.Rect) void {
         self.last_render_cols = rect.width;
         self.last_render_rows = rect.height;
         self.dirty = true;
+        self.content_version += 1;
     }
 }
 

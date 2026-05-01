@@ -16,8 +16,11 @@ const Viewport = @This();
 /// Physical rows scrolled back from the latest content. 0 = anchored to
 /// the buffer's tail.
 scroll_offset: u32 = 0,
-/// Tree generation observed by the pane at its last clean render.
-last_seen_generation: u32 = 0,
+/// Buffer content version observed by the pane at its last clean
+/// render. Matches `Buffer.contentVersion()`'s return type so a
+/// monotonically increasing per-buffer counter compares directly
+/// without a narrowing cast.
+last_seen_generation: u64 = 0,
 /// Set when scroll offset changes between clears; orthogonal to generation drift.
 scroll_dirty: bool = false,
 /// Most recent layout rect the pane was assigned, or null before first
@@ -41,12 +44,12 @@ pub fn markDirty(self: *Viewport) void {
     self.scroll_dirty = true;
 }
 
-pub fn clearDirty(self: *Viewport, current_generation: u32) void {
+pub fn clearDirty(self: *Viewport, current_generation: u64) void {
     self.last_seen_generation = current_generation;
     self.scroll_dirty = false;
 }
 
-pub fn isDirty(self: *const Viewport, current_generation: u32) bool {
+pub fn isDirty(self: *const Viewport, current_generation: u64) bool {
     return current_generation != self.last_seen_generation or self.scroll_dirty;
 }
 
