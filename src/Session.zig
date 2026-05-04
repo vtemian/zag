@@ -135,11 +135,15 @@ pub const Entry = struct {
     /// non-tool entries and on tool entries persisted before this field
     /// existed; replay logic treats null as "fall back to linear pairing".
     tool_use_id: ?[]const u8 = null,
-    /// When non-null, this entry was emitted by a subagent. Equal to
-    /// the subagent's `parent_subagent_id` (its index in the parent
-    /// Conversation's `subagents` list). Null for root-conversation
-    /// events.
-    subagent_id: ?u32 = null,
+    /// When non-null, this entry was emitted by a subagent at the given
+    /// path through the parent's subagent tree. The path is read top-down:
+    /// `path[0]` indexes the root's `subagents`, `path[1]` indexes that
+    /// child's `subagents`, and so on; the deepest index identifies the
+    /// emitting Conversation. Null for root-conversation events.
+    ///
+    /// Legacy JSONL lines that carried a single integer `subagent_id`
+    /// parse as a 1-element path; the writer now always emits an array.
+    subagent_path: ?[]const u32 = null,
 };
 
 /// Return true when `id` is the all-zeros sentinel produced by the
@@ -670,6 +674,7 @@ pub fn freeEntry(entry: Entry, allocator: Allocator) void {
     if (entry.thinking_provider) |tp| allocator.free(tp);
     if (entry.encrypted_data) |ed| allocator.free(ed);
     if (entry.tool_use_id) |id| allocator.free(id);
+    if (entry.subagent_path) |path| allocator.free(path);
 }
 
 /// Outcome of a session's crash-recovery pass. `actual_line_count` is the
@@ -817,8 +822,13 @@ fn serializeEntry(entry: *Entry, out: *std.ArrayList(u8), allocator: Allocator) 
         try writeJsonString(w, id);
     }
 
-    if (entry.subagent_id) |sid| {
-        try w.print(",\"subagent_id\":{d}", .{sid});
+    if (entry.subagent_path) |path| {
+        try w.writeAll(",\"subagent_path\":[");
+        for (path, 0..) |idx, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("{d}", .{idx});
+        }
+        try w.writeAll("]");
     }
 
     try w.print(",\"ts\":{d}", .{entry.timestamp});
@@ -912,11 +922,30 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         else => null,
     } else null;
 
-    var subagent_id: ?u32 = null;
-    if (obj.get("subagent_id")) |v| switch (v) {
+    // Prefer the new array shape; fall back to the legacy single-int
+    // `subagent_id` field by treating it as a 1-element path.
+    var subagent_path: ?[]const u32 = null;
+    if (obj.get("subagent_path")) |v| switch (v) {
+        .array => |arr| {
+            const items = arr.items;
+            const buf = try allocator.alloc(u32, items.len);
+            errdefer allocator.free(buf);
+            for (items, 0..) |elem, i| switch (elem) {
+                .integer => |n| {
+                    if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidSubagentPath;
+                    buf[i] = @intCast(n);
+                },
+                else => return error.InvalidSubagentPath,
+            };
+            subagent_path = buf;
+        },
+        else => {},
+    } else if (obj.get("subagent_id")) |v| switch (v) {
         .integer => |i| {
             if (i >= 0 and i <= std.math.maxInt(u32)) {
-                subagent_id = @intCast(i);
+                const buf = try allocator.alloc(u32, 1);
+                buf[0] = @intCast(i);
+                subagent_path = buf;
             }
         },
         else => {},
@@ -935,7 +964,7 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         .thinking_provider = thinking_provider,
         .encrypted_data = encrypted_data,
         .tool_use_id = tool_use_id,
-        .subagent_id = subagent_id,
+        .subagent_path = subagent_path,
     };
 }
 
@@ -1309,25 +1338,41 @@ test "parseEntry reads new id and parent_id fields" {
     try std.testing.expectEqualSlices(u8, &parent, &parsed.parent_id.?);
 }
 
-test "Entry round-trips subagent_id" {
+test "Entry round-trips subagent_path" {
     const allocator = std.testing.allocator;
 
+    const path_one = [_]u32{7};
     var tagged = Entry{
         .entry_type = .assistant_text,
         .content = "from subagent",
         .timestamp = 11,
-        .subagent_id = 7,
+        .subagent_path = &path_one,
     };
 
     var buf: [8192]u8 = undefined;
     const json = try serializeEntryToBuf(&tagged, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"subagent_id\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"subagent_path\":[7]") != null);
 
     const parsed = try parseEntry(json, allocator);
     defer freeEntry(parsed, allocator);
 
-    try std.testing.expect(parsed.subagent_id != null);
-    try std.testing.expectEqual(@as(u32, 7), parsed.subagent_id.?);
+    try std.testing.expect(parsed.subagent_path != null);
+    try std.testing.expectEqualSlices(u32, &path_one, parsed.subagent_path.?);
+
+    const path_deep = [_]u32{ 0, 1, 2 };
+    var deep_tagged = Entry{
+        .entry_type = .task_message,
+        .content = "from grandchild",
+        .timestamp = 13,
+        .subagent_path = &path_deep,
+    };
+    const json_deep = try serializeEntryToBuf(&deep_tagged, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json_deep, "\"subagent_path\":[0,1,2]") != null);
+
+    const parsed_deep = try parseEntry(json_deep, allocator);
+    defer freeEntry(parsed_deep, allocator);
+    try std.testing.expect(parsed_deep.subagent_path != null);
+    try std.testing.expectEqualSlices(u32, &path_deep, parsed_deep.subagent_path.?);
 
     var untagged = Entry{
         .entry_type = .user_message,
@@ -1335,21 +1380,33 @@ test "Entry round-trips subagent_id" {
         .timestamp = 12,
     };
     const json2 = try serializeEntryToBuf(&untagged, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json2, "\"subagent_path\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json2, "\"subagent_id\"") == null);
 
     const parsed2 = try parseEntry(json2, allocator);
     defer freeEntry(parsed2, allocator);
-    try std.testing.expect(parsed2.subagent_id == null);
+    try std.testing.expect(parsed2.subagent_path == null);
 }
 
-test "parseEntry leaves subagent_id null on legacy lines" {
+test "parseEntry treats legacy subagent_id as a 1-element path" {
+    const allocator = std.testing.allocator;
+    const legacy_line = "{\"type\":\"task_message\",\"content\":\"hi\",\"subagent_id\":5,\"ts\":1}";
+
+    const parsed = try parseEntry(legacy_line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expect(parsed.subagent_path != null);
+    try std.testing.expectEqualSlices(u32, &[_]u32{5}, parsed.subagent_path.?);
+}
+
+test "parseEntry leaves subagent_path null on legacy lines without tag" {
     const allocator = std.testing.allocator;
     const legacy_line = "{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":1}";
 
     const parsed = try parseEntry(legacy_line, allocator);
     defer freeEntry(parsed, allocator);
 
-    try std.testing.expect(parsed.subagent_id == null);
+    try std.testing.expect(parsed.subagent_path == null);
 }
 
 test "parseEntry leaves id as zero when field missing" {
