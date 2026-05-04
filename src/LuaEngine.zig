@@ -3822,6 +3822,14 @@ pub const LuaEngine = struct {
         lua.raiseErrorStr(op_name ++ ": not supported on graphics buffers", .{});
     }
 
+    /// Shared rejection arm for `zag.buffer.*` ops that target scratch or
+    /// graphics buffers but were called on a text buffer. Text buffers
+    /// hold raw byte content (used by ConversationTree nodes) and don't
+    /// expose the line/cursor or pixel surfaces.
+    fn rejectTextBuffer(lua: *Lua, comptime op_name: []const u8) noreturn {
+        lua.raiseErrorStr(op_name ++ ": not supported on text buffers", .{});
+    }
+
     /// `zag.buffer.create{ kind = "scratch", name? = "..." }`: allocate a
     /// new buffer in the live registry and return its handle string.
     /// Only `.scratch` is valid at this point; future kinds add arms to
@@ -3942,6 +3950,7 @@ pub const LuaEngine = struct {
                 };
             },
             .graphics => rejectGraphicsBuffer(lua, "zag.buffer.set_lines"),
+            .text => rejectTextBuffer(lua, "zag.buffer.set_lines"),
         }
         return 0;
     }
@@ -3960,6 +3969,7 @@ pub const LuaEngine = struct {
                 return 1;
             },
             .graphics => rejectGraphicsBuffer(lua, "zag.buffer.get_lines"),
+            .text => rejectTextBuffer(lua, "zag.buffer.get_lines"),
         }
     }
 
@@ -3972,6 +3982,7 @@ pub const LuaEngine = struct {
                 return 1;
             },
             .graphics => rejectGraphicsBuffer(lua, "zag.buffer.line_count"),
+            .text => rejectTextBuffer(lua, "zag.buffer.line_count"),
         }
     }
 
@@ -3989,6 +4000,7 @@ pub const LuaEngine = struct {
                 return 1;
             },
             .graphics => rejectGraphicsBuffer(lua, "zag.buffer.cursor_row"),
+            .text => rejectTextBuffer(lua, "zag.buffer.cursor_row"),
         }
     }
 
@@ -4013,6 +4025,7 @@ pub const LuaEngine = struct {
                 sb.dirty = true;
             },
             .graphics => rejectGraphicsBuffer(lua, "zag.buffer.set_cursor_row"),
+            .text => rejectTextBuffer(lua, "zag.buffer.set_cursor_row"),
         }
         return 0;
     }
@@ -4031,6 +4044,7 @@ pub const LuaEngine = struct {
                 return 1;
             },
             .graphics => rejectGraphicsBuffer(lua, "zag.buffer.current_line"),
+            .text => rejectTextBuffer(lua, "zag.buffer.current_line"),
         }
     }
 
@@ -4081,6 +4095,7 @@ pub const LuaEngine = struct {
                 };
             },
             .scratch => lua.raiseErrorStr("zag.buffer.set_png: handle is not a graphics buffer", .{}),
+            .text => lua.raiseErrorStr("zag.buffer.set_png: handle is not a graphics buffer", .{}),
         }
         return 0;
     }
@@ -4109,6 +4124,7 @@ pub const LuaEngine = struct {
         switch (entry) {
             .graphics => |gb| gb.setFit(fit),
             .scratch => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
+            .text => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
         }
         return 0;
     }
@@ -4150,6 +4166,7 @@ pub const LuaEngine = struct {
                 };
             },
             .graphics => lua.raiseErrorStr("zag.buffer.set_row_style: not supported on graphics buffers (no row addressing)", .{}),
+            .text => rejectTextBuffer(lua, "zag.buffer.set_row_style"),
         }
         return 0;
     }
@@ -4174,6 +4191,7 @@ pub const LuaEngine = struct {
         switch (entry) {
             .scratch => |sb| sb.clearRowStyle(row_zero),
             .graphics => {},
+            .text => {},
         }
         return 0;
     }
