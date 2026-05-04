@@ -569,6 +569,11 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8) !*Conversation {
     errdefer self.tree.removeNode(node);
     node.subagent_index = idx;
     node.subagent_name = try self.allocator.dupe(u8, name);
+    // Type-erased back-pointer so NodeRenderer can resolve the child
+    // by index without ConversationTree pulling in Conversation as a
+    // direct dependency. Cast back to `*const Conversation` at the
+    // single read site in NodeRenderer.subagentStatus.
+    node.subagent_parent = @ptrCast(self);
 
     return child;
 }

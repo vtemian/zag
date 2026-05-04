@@ -9059,7 +9059,7 @@ test "zag.keymap returns an integer id" {
     try engine.lua.doString(
         \\_G.id_pos = zag.keymap("normal", "w", "focus_right")
         \\_G.id_tbl = zag.keymap { mode = "normal", key = "<C-q>", action = "close_window" }
-        \\_G.id_fn  = zag.keymap { mode = "normal", key = "<CR>", fn = function() end }
+        \\_G.id_fn  = zag.keymap { mode = "normal", key = "<C-x>", fn = function() end }
     );
 
     _ = try engine.lua.getGlobal("id_pos");

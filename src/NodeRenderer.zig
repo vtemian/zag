@@ -55,12 +55,28 @@ const Prefixes = struct {
     const subagent_unnamed = "<unnamed>";
 };
 
-/// Status label for a subagent_link node. Phase E commit 1 hard-codes
-/// "ready"; commit 4 refines this to inspect the child Conversation's
-/// tail node and report "running" / "done" / "failed".
+/// Status label for a subagent_link node. Resolves the parent
+/// Conversation through the node's type-erased back-pointer and
+/// inspects the child's tail node to derive the label:
+///
+///   * `ready`   — child has no nodes yet (spawn marker, no turn).
+///   * `running` — child has nodes but the tail isn't an end-state.
+///   * `done`    — child's tail is `assistant_text` (the agent's
+///                 final summary lands as a trailing text node).
+///   * `failed`  — child's tail is `err`.
+///   * `missing` — back-pointer absent or index out of bounds.
 fn subagentStatus(node: *const Node) []const u8 {
-    _ = node;
-    return "ready";
+    const parent_opaque = node.subagent_parent orelse return "missing";
+    const parent: *const Conversation = @ptrCast(@alignCast(parent_opaque));
+    if (node.subagent_index >= parent.subagents.items.len) return "missing";
+    const child = parent.subagents.items[node.subagent_index];
+    if (child.tree.root_children.items.len == 0) return "ready";
+    const tail = child.tree.root_children.items[child.tree.root_children.items.len - 1];
+    return switch (tail.node_type) {
+        .err => "failed",
+        .assistant_text => "done",
+        else => "running",
+    };
 }
 
 /// Pre-baked decimal digit strings for the most common collapsed-tool hint
@@ -887,5 +903,60 @@ test "rendering a collapsed tool_call with a tool_result child does not leak und
         defer allocator.free(hint_text);
         try std.testing.expect(std.mem.indexOf(u8, hint_text, "3 lines hidden") != null);
         call.markDirty();
+    }
+}
+
+test "subagent_link renders status reflecting child Conversation tail node" {
+    const allocator = std.testing.allocator;
+    var parent = try @import("Conversation.zig").init(allocator, 0, "parent");
+    defer parent.deinit();
+
+    const child = try parent.spawnSubagent("codereview");
+    const link = parent.tree.root_children.items[parent.tree.root_children.items.len - 1];
+
+    const theme = Theme.defaultTheme();
+
+    // Empty child tree -> "ready".
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(link, &lines, allocator, &theme, &parent.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("[subagent: codereview] ready", text);
+    }
+
+    // Non-terminal tail (a user_message) -> "running".
+    _ = try child.appendNode(null, .user_message, "do the thing");
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(link, &lines, allocator, &theme, &parent.buffer_registry);
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expect(std.mem.endsWith(u8, text, "running"));
+    }
+
+    // Tail is assistant_text -> "done".
+    _ = try child.appendNode(null, .assistant_text, "looks good");
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(link, &lines, allocator, &theme, &parent.buffer_registry);
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expect(std.mem.endsWith(u8, text, "done"));
+    }
+
+    // Tail is err -> "failed".
+    _ = try child.appendNode(null, .err, "oops");
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(link, &lines, allocator, &theme, &parent.buffer_registry);
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expect(std.mem.endsWith(u8, text, "failed"));
     }
 }

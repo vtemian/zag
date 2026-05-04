@@ -84,6 +84,13 @@ pub const Node = struct {
     /// `node_type == .subagent_link`. Used by NodeRenderer to render
     /// the placeholder line "[subagent: <name>] <status>".
     subagent_name: ?[]const u8 = null,
+    /// Type-erased back-pointer to the parent Conversation that owns
+    /// the `subagents[subagent_index]` slot. Valid only when
+    /// `node_type == .subagent_link`. Stored as `*anyopaque` so
+    /// ConversationTree avoids a circular import on Conversation;
+    /// NodeRenderer casts back to `*const Conversation` to inspect the
+    /// referenced child's tail node when rendering the status label.
+    subagent_parent: ?*const anyopaque = null,
 
     /// Release all memory owned by this node and its descendants. The
     /// buffer-level `NodeLineCache` owns any cached spans keyed by this

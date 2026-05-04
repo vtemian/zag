@@ -414,6 +414,13 @@ pub const PaneEntry = struct {
     /// the runner is freed first (no more sink.push), then the sink
     /// releases its correlation map, then the buffer it borrowed.
     sink_storage: ?*BufferSink = null,
+    /// True when this pane displays a borrowed child Conversation
+    /// (drill-down view spawned via `enterSubagent`). The child is
+    /// owned by its parent's `subagents` list; the WindowManager
+    /// teardown path skips Conversation cleanup for this entry so
+    /// closing the drill-down pane does not free the underlying
+    /// transcript.
+    is_subagent_view: bool = false,
 };
 
 /// Heap allocator for runtime allocations.
@@ -629,9 +636,14 @@ pub fn deinit(self: *WindowManager) void {
             p.deinit();
             self.allocator.destroy(p);
         }
-        if (entry.pane.conversation) |v| {
-            v.deinit();
-            self.allocator.destroy(v);
+        // Drill-down panes borrow their Conversation from the parent's
+        // `subagents` list; the parent's deinit walks that list and
+        // frees each child. Freeing it here would double-free.
+        if (!entry.is_subagent_view) {
+            if (entry.pane.conversation) |v| {
+                v.deinit();
+                self.allocator.destroy(v);
+            }
         }
         self.allocator.destroy(entry);
     }
@@ -682,9 +694,16 @@ pub fn deinit(self: *WindowManager) void {
             p.deinit();
             self.allocator.destroy(p);
         }
-        if (entry.pane.conversation) |v| {
-            v.deinit();
-            self.allocator.destroy(v);
+        // Symmetric with `extra_panes` cleanup: subagent-view panes
+        // borrow their Conversation from the parent's `subagents`
+        // list. Tile drill-down panes are the only producer today,
+        // but the flag check stays here so a future float-mode
+        // drill-down doesn't accidentally double-free.
+        if (!entry.is_subagent_view) {
+            if (entry.pane.conversation) |v| {
+                v.deinit();
+                self.allocator.destroy(v);
+            }
         }
         self.allocator.destroy(entry);
     }
@@ -1214,6 +1233,19 @@ pub fn executeAction(self: *WindowManager, action: Keymap.Action) !void {
         },
         .enter_insert_mode => self.current_mode = .insert,
         .enter_normal_mode => self.current_mode = .normal,
+        .enter_subagent => {
+            // Drill into the focused pane's most recent subagent. The
+            // binding is a no-op on panes without a Conversation or
+            // without subagent_link nodes; the user pressing <CR> in
+            // normal mode on a regular pane should not surface as an
+            // error.
+            const focused = self.getFocusedPanePtr();
+            const conv = focused.conversation orelse return;
+            const link = lastSubagentLink(conv) orelse return;
+            self.enterSubagent(focused, link) catch |err| {
+                log.warn("enterSubagent failed: {}", .{err});
+            };
+        },
         // Dispatch a Lua function registered via `zag.keymap{...}` with
         // a function action. When no Lua engine is attached (standalone
         // tests), the binding silently no-ops; it could not have been
@@ -1450,6 +1482,104 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     entry.session_handle = sh;
 
     return pane;
+}
+
+/// Find the most recent `.subagent_link` node in `conv.tree.root_children`.
+/// Returns null when no subagent links exist. The drill-down keybind
+/// uses this to pick a target without a node-cursor model — once the
+/// renderer grows real cursor state this collapses to "the cursor's
+/// node" and the helper goes away.
+fn lastSubagentLink(conv: *Conversation) ?*Conversation.Node {
+    const items = conv.tree.root_children.items;
+    var i: usize = items.len;
+    while (i > 0) {
+        i -= 1;
+        if (items[i].node_type == .subagent_link) return items[i];
+    }
+    return null;
+}
+
+/// Open a new tile pane displaying the child Conversation referenced by
+/// a `.subagent_link` node. The child is borrowed from
+/// `parent_pane.conversation.subagents`; the new pane is read-only
+/// (no runner, no session handle) and is marked `is_subagent_view`
+/// so closing it leaves the underlying transcript intact.
+///
+/// Errors:
+///   * `error.NotASubagentLink`     — `node.node_type != .subagent_link`.
+///   * `error.NoConversation`       — parent pane has no Conversation.
+///   * `error.StaleSubagentIndex`   — `subagent_index` out of bounds.
+///   * `error.ParentLeafMissing`    — parent pane has no live layout
+///                                     leaf to split (closed pane).
+pub fn enterSubagent(
+    self: *WindowManager,
+    parent_pane: *Pane,
+    node: *Conversation.Node,
+) !void {
+    if (node.node_type != .subagent_link) return error.NotASubagentLink;
+    const parent_conv = parent_pane.conversation orelse return error.NoConversation;
+    if (node.subagent_index >= parent_conv.subagents.items.len) return error.StaleSubagentIndex;
+    const child = parent_conv.subagents.items[node.subagent_index];
+
+    const parent_handle = parent_pane.handle orelse return error.ParentLeafMissing;
+    const parent_node = self.node_registry.resolve(parent_handle) catch return error.ParentLeafMissing;
+    if (parent_node.* != .leaf) return error.ParentLeafMissing;
+
+    // Build the borrowed-Conversation pane shell. The child's buf/view
+    // accessors return interfaces backed by the heap-allocated child;
+    // we do NOT take ownership of the Conversation itself.
+    const pane: Pane = .{
+        .buffer = child.buf(),
+        .view = child.view(),
+        .conversation = child,
+        .runner = null,
+        .wm = self,
+    };
+
+    const entry = try self.allocator.create(PaneEntry);
+    errdefer self.allocator.destroy(entry);
+    entry.* = .{ .pane = pane, .is_subagent_view = true };
+
+    try self.extra_panes.append(self.allocator, entry);
+    errdefer _ = self.extra_panes.pop();
+
+    // Split the parent's leaf so the new pane lives next to its caller.
+    // Mirrors `splitById`'s temporary refocus pattern: doSplitWithBuffer
+    // reads `layout.focused`, so we redirect focus, do the split, and
+    // (because doSplitWithBuffer leaves focus on the new leaf) leave
+    // the layout focus on the freshly-opened drill-down pane.
+    const prev_focus = self.layout.focused;
+    self.layout.focused = parent_node;
+    errdefer self.layout.focused = prev_focus;
+
+    const surface: Layout.Surface = .{
+        .buffer = pane.buffer,
+        .view = pane.view,
+        .viewport = &entry.pane.viewport,
+    };
+    try self.layout.splitVertical(0.5, surface);
+
+    // The freshly-split leaf is now focused. Stamp its handle onto the
+    // entry so draft-change hooks (and any future pane-by-id lookup)
+    // see a non-null id.
+    if (self.layout.focused) |new_leaf| {
+        if (self.handleForNode(new_leaf)) |handle| {
+            entry.pane.handle = handle;
+        } else |err| {
+            log.warn("subagent leaf missing from registry: {}", .{err});
+        }
+    }
+
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+    // Parent is no longer focused; the new leaf is. Fire onFocus
+    // notifications via the same swap helper used by `doSplit`.
+    const parent_leaf: ?*Layout.LayoutNode.Leaf = switch (parent_node.*) {
+        .leaf => &parent_node.leaf,
+        .split => null,
+    };
+    notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
 }
 
 /// Try to create and attach a session to a pane. Returns the handle or
@@ -1692,9 +1822,13 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
             p.deinit();
             self.allocator.destroy(p);
         }
-        if (entry.pane.conversation) |v| {
-            v.deinit();
-            self.allocator.destroy(v);
+        // Skip Conversation cleanup for borrowed drill-down views; the
+        // parent's `subagents` list owns the underlying child.
+        if (!entry.is_subagent_view) {
+            if (entry.pane.conversation) |v| {
+                v.deinit();
+                self.allocator.destroy(v);
+            }
         }
         self.allocator.destroy(entry);
     }
@@ -3548,6 +3682,197 @@ test "executeAction focus_left goes through handle path" {
     const original_right = wm.layout.focused.?;
     try wm.executeAction(.focus_left);
     try std.testing.expect(wm.layout.focused != original_right);
+}
+
+test "enterSubagent opens a borrowed-Conversation pane and WM teardown does not free the child" {
+    const allocator = std.testing.allocator;
+
+    // Full scaffold: enterSubagent splits the layout and updates the
+    // node_registry, so screen/compositor must be live (notifyLeafRects
+    // and recalculate touch them).
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+    // setRoot ran AFTER attachLayoutRegistry, so the root leaf wasn't
+    // present when the registry first walked the tree. Re-walk now so
+    // the root_pane gets its handle stamped — enterSubagent reads it.
+    try wm.attachLayoutRegistry();
+
+    // Spawn a subagent on the root Conversation and grab its link node.
+    const child = try view.spawnSubagent("codereview");
+    const link = view.tree.root_children.items[view.tree.root_children.items.len - 1];
+
+    try wm.enterSubagent(&wm.root_pane, link);
+
+    // A new pane entry exists, marked as a subagent view, pointing at
+    // the borrowed child.
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+    const entry = wm.extra_panes.items[0];
+    try std.testing.expect(entry.is_subagent_view);
+    try std.testing.expectEqual(child, entry.pane.conversation.?);
+    try std.testing.expectEqual(@as(?*AgentRunner, null), entry.pane.runner);
+
+    // Close the drill-down pane via the same primitive `q` (close_window)
+    // routes through. The layout drops the leaf; the PaneEntry stays
+    // tracked until WM.deinit, where the subagent_view branch must skip
+    // Conversation cleanup so the parent's `subagents` list still owns
+    // the only reference.
+    const handle = entry.pane.handle.?;
+    try wm.closeById(handle, null);
+
+    // Parent's subagents list still holds the child pointer; the
+    // matching `view.deinit()` (via the test's `defer`) is what frees
+    // it. wm.deinit (also via defer) runs first and must NOT free it.
+    try std.testing.expectEqual(@as(usize, 1), view.subagents.items.len);
+    try std.testing.expectEqual(child, view.subagents.items[0]);
+}
+
+test "enter_subagent action drills into the focused pane's most recent subagent" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+    // Re-walk after setRoot so the root_pane.handle is stamped.
+    try wm.attachLayoutRegistry();
+
+    const child = try view.spawnSubagent("codereview");
+
+    // No-op when no subagent_link is the cursor target — but the action
+    // is the high-level "drill into latest subagent" so it succeeds.
+    try wm.executeAction(.enter_subagent);
+
+    // Layout focus is on the new leaf; the focused pane's conversation
+    // is the child Conversation borrowed via spawnSubagent.
+    const focused = wm.getFocusedPane();
+    try std.testing.expectEqual(child, focused.conversation.?);
+}
+
+test "enter_subagent action is a no-op on a Conversation without subagent_link nodes" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    // No spawnSubagent call — pressing <CR> in normal mode must not
+    // panic, and must not open a new pane.
+    try wm.executeAction(.enter_subagent);
+    try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
 }
 
 test "executeAction lua_callback runs the Lua function via the engine" {
@@ -5488,13 +5813,14 @@ test "/model plugin removes its routed keymaps when the popup closes" {
     // future keystroke until the next `/model` invocation overwrites
     // it.
     //
-    // Three of the nine keys (`j`, `k`, `q`) collide with the
-    // built-in defaults `focus_down`, `focus_up`, `close_window`.
-    // Registering an existing (mode, spec) overwrites the action
-    // in-place — same id, same slot — so opening the picker grows
-    // the registry by SIX (the six fresh keys), not nine. Closing
-    // the picker removes those six AND re-registers the three
-    // displaced built-ins, landing us back at the pre-open baseline.
+    // Four of the nine keys (`j`, `k`, `q`, `<CR>`) collide with the
+    // built-in defaults `focus_down`, `focus_up`, `close_window`,
+    // `enter_subagent`. Registering an existing (mode, spec)
+    // overwrites the action in-place — same id, same slot — so
+    // opening the picker grows the registry by FIVE (the five
+    // fresh keys), not nine. Closing the picker removes those five
+    // AND re-registers the four displaced built-ins, landing us
+    // back at the pre-open baseline.
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;
     try f.init(allocator);
@@ -5506,10 +5832,10 @@ test "/model plugin removes its routed keymaps when the popup closes" {
         return error.TestExpectedCommand;
     f.engine.invokeCallback(cmd.lua_callback);
 
-    // Six fresh inserts (<Up>, <Down>, <C-P>, <C-N>, <CR>, <Esc>)
-    // plus three in-place overwrites (j, k, q) = +6 net.
+    // Five fresh inserts (<Up>, <Down>, <C-P>, <C-N>, <Esc>) plus
+    // four in-place overwrites (j, k, q, <CR>) = +5 net.
     try std.testing.expectEqual(
-        baseline_bindings + 6,
+        baseline_bindings + 5,
         f.engine.keymap_registry.bindings.items.len,
     );
 
