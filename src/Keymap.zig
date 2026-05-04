@@ -30,6 +30,10 @@ pub const Action = union(enum) {
     resize,
     enter_insert_mode,
     enter_normal_mode,
+    /// Drill into the focused pane's most recent subagent (i.e. the
+    /// last `.subagent_link` node in its Conversation tree). No-op when
+    /// the pane has no Conversation or no subagent links.
+    enter_subagent,
     lua_callback: i32,
 };
 
@@ -49,6 +53,7 @@ pub fn parseActionName(name: []const u8) ?Action {
         .{ "resize", .resize },
         .{ "enter_insert_mode", .enter_insert_mode },
         .{ "enter_normal_mode", .enter_normal_mode },
+        .{ "enter_subagent", .enter_subagent },
     };
     for (table) |e| {
         if (std.mem.eql(u8, e[0], name)) return e[1];
@@ -75,6 +80,7 @@ pub fn actionName(action: Action) ?[]const u8 {
         .resize => "resize",
         .enter_insert_mode => "enter_insert_mode",
         .enter_normal_mode => "enter_normal_mode",
+        .enter_subagent => "enter_subagent",
         .lua_callback => null,
     };
 }
@@ -378,6 +384,9 @@ pub const Registry = struct {
             // Mode transitions.
             .{ .normal, "i", .enter_insert_mode },
             .{ .insert, "<Esc>", .enter_normal_mode },
+            // Drill into the focused pane's most recent subagent. No-op
+            // on panes without a Conversation or without subagent links.
+            .{ .normal, "<CR>", .enter_subagent },
             // Insert-mode line editing (Ctrl-W "delete word", printable
             // chars, Backspace, Enter) is handled inside the focused
             // buffer's `handleKey` (see Conversation.handleKey), not
@@ -409,8 +418,8 @@ test "Mode enum has two variants" {
 }
 
 test "Action union covers the built-in action names plus lua_callback" {
-    // Ten payload-less built-in variants plus `.lua_callback: i32`.
-    try std.testing.expectEqual(@as(usize, 11), @typeInfo(Action).@"union".fields.len);
+    // Eleven payload-less built-in variants plus `.lua_callback: i32`.
+    try std.testing.expectEqual(@as(usize, 12), @typeInfo(Action).@"union".fields.len);
 }
 
 test "parseActionName maps known and rejects unknown" {
