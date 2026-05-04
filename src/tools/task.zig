@@ -13,24 +13,15 @@
 //!     `task_end` audit rows interleave with the parent's JSONL so a
 //!     single-file replay sees the delegation in order.
 //!   * TODO(#5): task_end token+turn metrics; metrics captured in
-//!     `task_end` are limited to the collected text size until the
-//!     child's token usage is threaded back through the Collector.
+//!     `task_end` are limited to the final summary text until the
+//!     child's token usage is threaded back through the runner.
 //!     Tracked at https://github.com/vtemian/zag/issues/5.
-//!   * TODO(#6): forward child streaming events to the parent's sink so
-//!     the UI can render subagent progress live instead of only the
-//!     final tool_result. Tracked at
-//!     https://github.com/vtemian/zag/issues/6.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.task_tool);
 const types = @import("../types.zig");
 const tools = @import("../tools.zig");
-const agent = @import("../agent.zig");
-const agent_events = @import("../agent_events.zig");
-const Sink = @import("../Sink.zig").Sink;
-const SinkEvent = @import("../Sink.zig").Event;
-const Collector = @import("../sinks/Collector.zig").Collector;
 const subagents_types = @import("../subagents.zig");
 const Conversation = @import("../Conversation.zig");
 const Session = @import("../Session.zig");
@@ -293,237 +284,6 @@ fn runChild(
     return .{ .content = owned, .is_error = is_err, .owned = true };
 }
 
-const ChildArgs = struct {
-    messages: *std.ArrayList(types.Message),
-    registry: *const tools.Registry,
-    allocator: Allocator,
-    queue: *agent_events.EventQueue,
-    cancel: *agent_events.CancelFlag,
-    lua_engine: ?*@import("../LuaEngine.zig").LuaEngine,
-    provider: @import("../llm.zig").Provider,
-    provider_name: []const u8,
-    /// Resolved model identity inherited from the parent run so the
-    /// subagent's `runLoopStreaming` drives the per-model prompt pack
-    /// and compact threshold off real values.
-    model_spec: @import("../llm.zig").ModelSpec,
-    /// Parent runner's TaskContext, captured at spawn time. The child
-    /// thread reads `task_depth`, `subagents`, `session_handle`, and the
-    /// rest off this pointer to build its own TaskContext so any nested
-    /// `task(...)` invocation from the subagent finds a bound context
-    /// (depth + 1) instead of a null threadlocal.
-    parent_ctx: *const tools.TaskContext,
-};
-
-/// Construct the TaskContext the child thread should publish, given the
-/// parent's context and the spawn-time arguments. Splitting this out of
-/// `childThreadMain` keeps it testable without spinning up a real
-/// provider or agent thread; the test below pins the depth-increment
-/// invariant that makes the recursion cap reachable in production.
-fn buildChildContext(parent_ctx: *const tools.TaskContext, args: ChildArgs) tools.TaskContext {
-    return .{
-        .allocator = args.allocator,
-        .subagents = parent_ctx.subagents,
-        .provider = args.provider,
-        .provider_name = args.provider_name,
-        .model_spec = args.model_spec,
-        .registry = args.registry,
-        .session_handle = parent_ctx.session_handle,
-        .lua_engine = args.lua_engine,
-        .task_depth = parent_ctx.task_depth + 1,
-        .wake_fd = args.queue.wake_fd,
-        .parent_conv = parent_ctx.parent_conv,
-    };
-}
-
-fn childThreadMain(args: ChildArgs) void {
-    // Republish the Lua request queue on the child thread so Lua-defined
-    // tools dispatched inside the subagent still round-trip to the main
-    // thread correctly.
-    tools.lua_request_queue = args.queue;
-    defer tools.lua_request_queue = null;
-
-    // Republish the TaskContext on the child thread. Without this the
-    // threadlocal `tools.task_context` reads null on the child, so any
-    // nested `task(...)` from the subagent fails with the
-    // "no TaskContext bound" error and the recursion cap is dead code.
-    var child_task_ctx = buildChildContext(args.parent_ctx, args);
-    tools.task_context = &child_task_ctx;
-    defer tools.task_context = null;
-
-    // Subagents accept no mid-turn user input, so the flag is local and
-    // stays unread; pass a stack-allocated cell to satisfy the signature.
-    var turn_in_progress = std.atomic.Value(bool).init(false);
-
-    // Subagents inherit the parent's `provider_name` and `model_id` so
-    // their `runLoopStreaming` drives the same per-model prompt pack as
-    // the parent. The compact threshold is intentionally suppressed
-    // here: the strategy socket is a parent-loop concern, and a child
-    // run that hits its model's ceiling surfaces as a normal `MaxTokens`
-    // stop. Building a fresh spec with `context_window = 0` keeps that
-    // contract while keeping the prompt-pack identity intact.
-    const child_model_spec: @import("../llm.zig").ModelSpec = .{
-        .provider_name = args.model_spec.provider_name,
-        .model_id = args.model_spec.model_id,
-        .context_window = 0,
-    };
-    // Inherit the parent's session_id so subagent telemetry lines stay
-    // grouped under the same session in the timeline log. The parent
-    // owns the SessionHandle; the slice is stable across the child's
-    // run because the handle is held alive by the parent runner.
-    const child_session_id: []const u8 = if (args.parent_ctx.session_handle) |sh|
-        sh.id[0..sh.id_len]
-    else
-        "";
-
-    agent.runLoopStreaming(
-        args.messages,
-        args.registry,
-        args.provider,
-        args.allocator,
-        args.queue,
-        args.cancel,
-        args.lua_engine,
-        null,
-        &turn_in_progress,
-        child_model_spec,
-        child_session_id,
-    ) catch |err| {
-        // Surface the failure as a text message so the parent sees it in
-        // the collected output rather than a silent empty result.
-        const msg = std.fmt.allocPrint(
-            args.allocator,
-            "[subagent error: {s}]",
-            .{@errorName(err)},
-        ) catch {
-            args.queue.tryPush(args.allocator, .done);
-            return;
-        };
-        args.queue.tryPush(args.allocator, .{ .err = msg });
-    };
-    args.queue.tryPush(args.allocator, .done);
-}
-
-fn handleChildEvent(
-    event: agent_events.AgentEvent,
-    collector: *Collector,
-    child_history: *Conversation,
-    allocator: Allocator,
-) void {
-    const sink = collector.sink();
-    switch (event) {
-        .text_delta => |text| {
-            defer allocator.free(text);
-            // Persist as task_message so replay can reconstruct child
-            // assistant text inline with the parent's JSONL.
-            child_history.persistEventInternal(.{
-                .entry_type = .task_message,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| log.warn("task_message persist failed: {}", .{err});
-            sink.push(.{ .assistant_delta = .{ .text = text } });
-        },
-        .reset_assistant_text => sink.push(.assistant_reset),
-        .done => sink.push(.run_end),
-        // The child's thinking is recorded inline so replay can show
-        // subagent reasoning under the delegation scope. Other events
-        // (info, hook round-trips) are still discarded in v1; the parent
-        // sees only the final assistant text via the Collector.
-        .thinking_delta => |td| {
-            defer allocator.free(td.text);
-            const provider_name: []const u8 = switch (td.provider) {
-                .anthropic => "anthropic",
-                .openai_responses => "openai_responses",
-                .openai_chat => "openai_chat",
-                .none => "none",
-            };
-            child_history.persistEventInternal(.{
-                .entry_type = .thinking,
-                .content = td.text,
-                .thinking_provider = provider_name,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| log.warn("child thinking persist failed: {}", .{err});
-        },
-        .thinking_stop => {},
-        .tool_start => |ev| {
-            defer {
-                allocator.free(ev.name);
-                if (ev.input_raw) |raw| allocator.free(raw);
-                if (ev.call_id) |id| allocator.free(id);
-            }
-            child_history.persistEventInternal(.{
-                .entry_type = .task_tool_use,
-                .tool_name = ev.name,
-                .tool_input = ev.input_raw orelse "",
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| log.warn("task_tool_use persist failed: {}", .{err});
-        },
-        .tool_result => |result| {
-            defer {
-                allocator.free(result.content);
-                if (result.call_id) |id| allocator.free(id);
-            }
-            child_history.persistEventInternal(.{
-                .entry_type = .task_tool_result,
-                .content = result.content,
-                .is_error = result.is_error,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |err| log.warn("task_tool_result persist failed: {}", .{err});
-        },
-        .info => |text| allocator.free(text),
-        .err => |text| {
-            defer allocator.free(text);
-            // Surface child errors in the audit log so failures inside a
-            // delegation are not silently dropped. Reuse `.err` since
-            // there's no `task_err` variant; the parent_id chain places
-            // the entry under the delegation scope.
-            child_history.persistEventInternal(.{
-                .entry_type = .err,
-                .content = text,
-                .timestamp = std.time.milliTimestamp(),
-            }) catch |suberr| log.warn("child err persist failed: {}", .{suberr});
-        },
-        // Hook / Lua-tool / layout requests would normally be serviced
-        // by the main thread's drain loop. They can still arrive on the
-        // child's queue if the subagent fires a hook or a Lua tool; in
-        // that case, signal the waiter with a failure so the child
-        // thread doesn't park forever. A full wiring (forwarding them
-        // to the parent's engine) is a follow-up.
-        .hook_request => |req| req.done.set(),
-        .lua_tool_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-        .layout_request => |req| {
-            req.is_error = true;
-            req.done.set();
-        },
-        .prompt_assembly_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-        .jit_context_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-        .tool_transform_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-        .tool_gate_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-        .loop_detect_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-        .compact_request => |req| {
-            req.error_name = "subagent_unsupported";
-            req.done.set();
-        },
-    }
-}
-
 /// Build a fresh Registry that exposes only the tools visible through
 /// `parent.subset(allowlist)`. `runLoopStreaming` needs a concrete
 /// `*const Registry` rather than a `Subset`, so we materialise one here
@@ -717,17 +477,6 @@ test "task hits recursion cap at max depth" {
     try testing.expect(std.mem.indexOf(u8, result.content, "recursion") != null);
 }
 
-test "task with stub provider returns collected text" {
-    // End-to-end coverage wants a stub llm.Provider spun up against a
-    // real EventQueue, a real SubagentRegistry, and the child-thread
-    // drain loop. That surface overlaps with the wider agent-loop
-    // integration tests in agent.zig; a focused rerun here would
-    // duplicate their scaffolding. Skipping keeps the task-tool suite
-    // fast while the full happy path is exercised end-to-end by the
-    // Task 9 smoke runs in docs/plans/archive/2026-04-24-skills-and-subagents-plan.md.
-    return error.SkipZigTest;
-}
-
 test "task_start payload survives prompts longer than 2KB" {
     const allocator = testing.allocator;
     var prompt_buf: [4096]u8 = undefined;
@@ -752,66 +501,6 @@ test "task_start payload escapes JSON special characters in prompt" {
     try testing.expect(std.mem.indexOf(u8, payload, "\\\"hi\\\"") != null);
     try testing.expect(std.mem.indexOf(u8, payload, "\\n") != null);
     try testing.expect(std.mem.indexOf(u8, payload, "\\\\line") != null);
-}
-
-test "buildChildContext increments depth and inherits parent state" {
-    const allocator = testing.allocator;
-
-    var subagent_registry: subagents_mod.SubagentRegistry = .{};
-    defer subagent_registry.deinit(allocator);
-
-    var parent_registry = tools.Registry.init(allocator);
-    defer parent_registry.deinit();
-
-    var child_registry = tools.Registry.init(allocator);
-    defer child_registry.deinit();
-
-    var queue = try agent_events.EventQueue.initBounded(allocator, 8);
-    defer queue.deinit();
-    queue.wake_fd = null;
-
-    var cancel: agent_events.CancelFlag = agent_events.CancelFlag.init(false);
-
-    var child_messages: std.ArrayList(types.Message) = .empty;
-    defer child_messages.deinit(allocator);
-
-    const dummy_provider: @import("../llm.zig").Provider = undefined;
-    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
-    defer parent_conv.deinit();
-    const parent: tools.TaskContext = .{
-        .allocator = allocator,
-        .subagents = &subagent_registry,
-        .provider = dummy_provider,
-        .provider_name = "test",
-        .model_spec = .{ .provider_name = "test", .model_id = "test" },
-        .registry = &parent_registry,
-        .session_handle = null,
-        .lua_engine = null,
-        .task_depth = 7,
-        .wake_fd = null,
-        .parent_conv = &parent_conv,
-    };
-
-    const args: ChildArgs = .{
-        .messages = &child_messages,
-        .registry = &child_registry,
-        .allocator = allocator,
-        .queue = &queue,
-        .cancel = &cancel,
-        .lua_engine = null,
-        .provider = dummy_provider,
-        .provider_name = "test",
-        .model_spec = .{ .provider_name = "test", .model_id = "test" },
-        .parent_ctx = &parent,
-    };
-
-    const child = buildChildContext(&parent, args);
-    try testing.expectEqual(@as(u8, 8), child.task_depth);
-    try testing.expectEqual(parent.subagents, child.subagents);
-    try testing.expectEqual(parent.session_handle, child.session_handle);
-    try testing.expect(child.registry == &child_registry);
-    try testing.expectEqualStrings("test", child.provider_name);
-    try testing.expectEqualStrings("test", child.model_spec.model_id);
 }
 
 fn restoreCwdForTest(abs_path: []const u8) void {
