@@ -48,7 +48,20 @@ const Prefixes = struct {
     /// exists. Static-lifetime literal so the StyledSpan borrowed-text
     /// contract holds without allocation.
     const tool_result_image_placeholder = "[image]";
+    /// Header / suffix tokens for the subagent_link placeholder line.
+    /// The full line reads `[subagent: <name>] <status>`.
+    const subagent_open = "[subagent: ";
+    const subagent_close = "] ";
+    const subagent_unnamed = "<unnamed>";
 };
+
+/// Status label for a subagent_link node. Phase E commit 1 hard-codes
+/// "ready"; commit 4 refines this to inspect the child Conversation's
+/// tail node and report "running" / "done" / "failed".
+fn subagentStatus(node: *const Node) []const u8 {
+    _ = node;
+    return "ready";
+}
 
 /// Pre-baked decimal digit strings for the most common collapsed-tool hint
 /// counts. Static-lifetime entries satisfy the StyledSpan borrowed-text
@@ -246,6 +259,7 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node, registry: *co
             if (content[content.len - 1] == '\n') count -= 1;
             break :blk count;
         },
+        .subagent_link => 1,
     };
 }
 
@@ -406,6 +420,23 @@ fn renderDefault(
         .thinking_redacted => {
             const style = theme.highlights.tool_result;
             try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_redacted, style));
+            return;
+        },
+        .subagent_link => {
+            // Placeholder line: `[subagent: <name>] <status>`. All four
+            // span texts are borrowed: `subagent_open`/`subagent_close`
+            // and `subagentStatus` return static slices, and the name
+            // is owned by the node (freed in `Node.deinit` after the
+            // line cache wipes its entry).
+            const style = theme.highlights.subagent_placeholder;
+            const name = node.subagent_name orelse Prefixes.subagent_unnamed;
+            const status = subagentStatus(node);
+            const spans = try allocator.alloc(StyledSpan, 4);
+            spans[0] = .{ .text = Prefixes.subagent_open, .style = style };
+            spans[1] = .{ .text = name, .style = style };
+            spans[2] = .{ .text = Prefixes.subagent_close, .style = style };
+            spans[3] = .{ .text = status, .style = style };
+            try lines.append(allocator, .{ .spans = spans });
             return;
         },
     }

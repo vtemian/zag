@@ -40,6 +40,12 @@ pub const NodeType = enum {
     /// or OpenAI Responses `encrypted_content`). No human-readable body;
     /// renders as a single "redacted" header regardless of `collapsed`.
     thinking_redacted,
+    /// Reference to a child Conversation spawned via `spawnSubagent`.
+    /// Carries `subagent_index` (slot in the parent's `subagents` list)
+    /// and a duped `subagent_name` for the renderer; the child's full
+    /// transcript lives on the referenced Conversation, not on this
+    /// node.
+    subagent_link,
 };
 
 /// A single node in the buffer tree. Owns its children; textual content
@@ -71,6 +77,14 @@ pub const Node = struct {
     /// this against its stored `Entry.version` to decide hit vs. miss.
     content_version: u32 = 0,
 
+    /// Index into the owning Conversation's `subagents` list. Valid
+    /// only when `node_type == .subagent_link`.
+    subagent_index: u32 = 0,
+    /// Duped agent name. Owned; freed by `deinit`. Valid only when
+    /// `node_type == .subagent_link`. Used by NodeRenderer to render
+    /// the placeholder line "[subagent: <name>] <status>".
+    subagent_name: ?[]const u8 = null,
+
     /// Release all memory owned by this node and its descendants. The
     /// buffer-level `NodeLineCache` owns any cached spans keyed by this
     /// node's id; callers must drop the cache entry (or wipe the whole
@@ -82,6 +96,7 @@ pub const Node = struct {
         }
         self.children.deinit(allocator);
         if (self.custom_tag) |tag| allocator.free(tag);
+        if (self.subagent_name) |name| allocator.free(name);
     }
 
     /// Mark this node's content as changed, invalidating any cache entry
@@ -373,6 +388,19 @@ test "toggleAllFoldableCollapsed is a no-op when no foldable nodes exist" {
     const touched = tree.toggleAllFoldableCollapsed();
     try std.testing.expectEqual(@as(usize, 0), touched);
     try std.testing.expectEqual(gen_before, tree.currentGeneration());
+}
+
+test "Node.subagent_link variant frees subagent_name on deinit" {
+    var tree = ConversationTree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const node = try tree.appendNode(null, .subagent_link);
+    node.subagent_index = 3;
+    node.subagent_name = try std.testing.allocator.dupe(u8, "codereview");
+
+    // tree.deinit walks every node and calls Node.deinit; the
+    // subagent_name slice must be freed there. testing.allocator
+    // catches the leak if it isn't.
 }
 
 test {

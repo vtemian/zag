@@ -152,6 +152,10 @@ pub const Highlights = struct {
     /// `"warning"` slot. Defaults to bold warning-colored fg; themes may
     /// override with a bg or other styling.
     warning: CellStyle,
+    /// Subagent placeholder line (`[subagent: <name>] <status>`).
+    /// Defaults to the same muted look as `status`; themes that want
+    /// to call subagents out distinctly can swap this slot.
+    subagent_placeholder: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.
@@ -355,6 +359,7 @@ pub fn defaultTheme() Theme {
             .selection = .{ .bg = selection_bg, .bold = true },
             .current_line = .{ .bg = current_line_bg },
             .warning = .{ .fg = warning, .bold = true },
+            .subagent_placeholder = .{ .fg = muted },
         },
         .spacing = .{
             .turn_gap = 1,

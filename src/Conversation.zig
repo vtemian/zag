@@ -75,6 +75,20 @@ persist_failed: bool = false,
 /// one explicitly, so events form a linked chain rooted at the first
 /// user message.
 last_persisted_id: ?ulid.Ulid = null,
+/// Children spawned via `spawnSubagent`. Heap-allocated entries so the
+/// child pointers stay stable across resizes; the parent's `deinit`
+/// recursively walks this list, frees each child's tree+registry+name,
+/// and destroys the heap slot.
+subagents: std.ArrayList(*Conversation) = .empty,
+/// Backlink to the parent Conversation, or null for root. Used by
+/// commit 2 so a child's `persistEvent` can delegate through the parent
+/// (and stamp `subagent_id` on the way through). Unset when this
+/// Conversation is the root of its session.
+parent: ?*Conversation = null,
+/// Index into `parent.subagents` for this child. Used by commit 2 to
+/// stamp `Session.Entry.subagent_id` on persisted events. Unused when
+/// `parent` is null.
+parent_subagent_id: u32 = 0,
 
 /// Create a new empty buffer with the given id and name. The buffer
 /// owns the node tree, the inline `BufferRegistry`, and the session
@@ -108,6 +122,16 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !Conversation {
 pub fn deinit(self: *Conversation) void {
     self.cache.deinit();
     self.tree.deinit();
+    // Walk subagents recursively before tearing down our registry; a
+    // child's tree may carry buffer handles into its own registry, but
+    // its parent backlink could still be inspected by render or
+    // persistence helpers triggered during teardown. Freeing children
+    // first matches the cache->tree->subagents ordering invariant.
+    for (self.subagents.items) |child| {
+        child.deinit();
+        self.allocator.destroy(child);
+    }
+    self.subagents.deinit(self.allocator);
     self.buffer_registry.deinit();
     self.row_styles.deinit(self.allocator);
     self.allocator.free(self.name);
@@ -469,6 +493,43 @@ pub fn appendUserNode(self: *Conversation, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
 }
 
+/// Allocate a child Conversation, append it to `subagents`, append a
+/// `.subagent_link` node to the tree referencing the child by its new
+/// index, and return the child pointer. The child's `parent` and
+/// `parent_subagent_id` are wired so commit 2's `persistEvent` will
+/// delegate through the parent's session.
+///
+/// Caller does not own the returned pointer; the parent's `deinit`
+/// frees it.
+pub fn spawnSubagent(self: *Conversation, name: []const u8) !*Conversation {
+    const idx: u32 = @intCast(self.subagents.items.len);
+
+    // Heap-allocate the child slot first so its address is stable for
+    // the parent backlink we wire below.
+    const child = try self.allocator.create(Conversation);
+    errdefer self.allocator.destroy(child);
+
+    child.* = try Conversation.init(self.allocator, idx, name);
+    errdefer child.deinit();
+
+    try self.subagents.append(self.allocator, child);
+    errdefer _ = self.subagents.pop();
+
+    // Wire the parent links before we publish the link node so any
+    // child-side observer (no live writer in commit 1, but a defensive
+    // ordering invariant for commit 2's persistEvent delegation) sees
+    // a fully-formed child.
+    child.parent = self;
+    child.parent_subagent_id = idx;
+
+    const node = try self.tree.appendNode(null, .subagent_link);
+    errdefer self.tree.removeNode(node);
+    node.subagent_index = idx;
+    node.subagent_name = try self.allocator.dupe(u8, name);
+
+    return child;
+}
+
 // -- Session persistence ----------------------------------------------------
 
 /// Attach a session handle for persistence. Does not take ownership of the
@@ -701,6 +762,12 @@ fn projectNode(
         },
         // UI-only and custom nodes are skipped.
         .status, .err, .separator, .custom => {},
+        // Phase E commit 3 projects subagent_link as a tool_use +
+        // tool_result pair so the LLM sees the same wire format as
+        // today's task tool. Until that lands the link node has no
+        // wire-format meaning, so skip it: no production code paths
+        // create subagent_link nodes in commit 1.
+        .subagent_link => {},
     }
 }
 
@@ -1649,4 +1716,33 @@ test "toWireMessages: orphan tool_result pairs against synthesized 'unknown' id"
     try std.testing.expectEqual(@as(usize, 1), tool_msg.content.len);
     try std.testing.expectEqualStrings("unknown", tool_msg.content[0].tool_result.tool_use_id);
     try std.testing.expectEqualStrings("stray", tool_msg.content[0].tool_result.content);
+}
+
+test "spawnSubagent appends child and link node atomically" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    const child = try conv.spawnSubagent("codereview");
+
+    try std.testing.expectEqual(@as(usize, 1), conv.subagents.items.len);
+    try std.testing.expectEqual(child, conv.subagents.items[0]);
+    try std.testing.expectEqual(&conv, child.parent.?);
+    try std.testing.expectEqual(@as(u32, 0), child.parent_subagent_id);
+
+    try std.testing.expectEqual(@as(usize, 1), conv.tree.root_children.items.len);
+    const link_node = conv.tree.root_children.items[0];
+    try std.testing.expectEqual(ConversationTree.NodeType.subagent_link, link_node.node_type);
+    try std.testing.expectEqual(@as(u32, 0), link_node.subagent_index);
+    try std.testing.expectEqualStrings("codereview", link_node.subagent_name.?);
+}
+
+test "deinit walks subagents recursively" {
+    // testing.allocator detects leaks; if the recursion is wrong, the
+    // child's tree/registry/name allocations leak. Nest two levels
+    // deep to exercise recursion past the immediate child.
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    const child = try conv.spawnSubagent("codereview");
+    _ = try child.spawnSubagent("nested");
 }
