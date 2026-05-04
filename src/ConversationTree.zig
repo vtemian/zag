@@ -14,6 +14,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Session = @import("Session.zig");
+const BufferRegistry = @import("BufferRegistry.zig");
+
+/// Handle into the WindowManager's BufferRegistry. Aliased here so
+/// ConversationTree can carry the optional handle on `Node` without
+/// pulling the rest of the registry surface into this module.
+pub const BufferHandle = BufferRegistry.Handle;
 
 const ConversationTree = @This();
 
@@ -45,8 +51,17 @@ pub const Node = struct {
     node_type: NodeType,
     /// Tag for custom-typed nodes (e.g. plugin-defined types).
     custom_tag: ?[]const u8 = null,
-    /// The textual content of this node. Owned by the node.
+    /// The textual content of this node. Owned by the node when
+    /// `buffer_id` is null. Empty (zero-length) when content lives in
+    /// a registry-allocated TextBuffer (see `buffer_id`).
     content: std.ArrayList(u8),
+    /// Optional handle into the WindowManager's BufferRegistry. When
+    /// non-null, this node's textual content lives in a TextBuffer (or
+    /// ImageBuffer for tool_result image nodes) referenced by the
+    /// handle, and `content` is empty. Migration runs across Phase C
+    /// commits 3-7; once every node-type group is migrated, the
+    /// `content` field is removed entirely.
+    buffer_id: ?BufferHandle = null,
     /// Child nodes (e.g. tool_result children of a tool_call).
     children: std.ArrayList(*Node),
     /// Whether this node's children are hidden from rendering.

@@ -2281,8 +2281,10 @@ const test_renderer_split = struct {
         lines: *std.ArrayList(Theme.StyledLine),
         alloc: Allocator,
         theme: *const Theme,
+        registry: ?*@import("BufferRegistry.zig"),
     ) !void {
         _ = theme;
+        _ = registry;
         const content = node.content.items;
         // Find the '|' separator. Span 1 = bytes before, span 2 = bytes after.
         const idx = std.mem.indexOfScalar(u8, content, '|') orelse content.len;

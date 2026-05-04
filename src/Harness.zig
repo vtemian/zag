@@ -28,6 +28,7 @@ const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const Trajectory = @import("Trajectory.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const BufferRegistry = @import("BufferRegistry.zig");
 const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
@@ -335,6 +336,14 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
 
     var root_buffer = try ConversationBuffer.init(gpa, 0, "session");
     defer root_buffer.deinit();
+
+    // Headless mode owns its own minimal BufferRegistry: the
+    // WindowManager isn't built in this path, so there is no shared
+    // registry to borrow from. Sized at zero entries until a node-
+    // creation path triggers an allocation.
+    var harness_registry = BufferRegistry.init(gpa);
+    defer harness_registry.deinit();
+    root_buffer.attachBufferRegistry(&harness_registry);
 
     // BufferSink owns the node-correlation state that used to live on the
     // runner. Its lifetime matches main's defer chain, so it stays on the

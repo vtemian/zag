@@ -387,6 +387,9 @@ pub fn main() !void {
     // `&self.node_registry` is only a stable address now that `orchestrator`
     // sits in its final home. Attach here so Layout starts tracking node
     // create/destroy from this point on and back-registers the existing root.
+    // `attachLayoutRegistry` also wires the WM-owned BufferRegistry into
+    // the root pane's conversation (a borrowed pointer at root_buffer)
+    // so migrated node-creation paths can allocate TextBuffer storage.
     try orchestrator.window_manager.attachLayoutRegistry();
 
     // Wire the window manager pointer into the root runner so the

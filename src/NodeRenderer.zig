@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ConversationBuffer = @import("ConversationBuffer.zig");
+const BufferRegistry = @import("BufferRegistry.zig");
 const Theme = @import("Theme.zig");
 const Node = ConversationBuffer.Node;
 const NodeType = ConversationBuffer.NodeType;
@@ -62,14 +63,37 @@ const digit_overflow_label = "many";
 ///
 /// Appends one or more StyledLines to `lines`. The renderer must uphold
 /// the StyledSpan borrowed-slice contract: span text bytes must outlive
-/// the span (for example, by slicing `node.content.items` or returning
-/// a static string). The caller does not free span text.
+/// the span (for example, by slicing the resolved node bytes or
+/// returning a static string). The caller does not free span text.
+///
+/// Custom renderers receive an optional `*BufferRegistry` so they can
+/// dereference `node.buffer_id` themselves (via `nodeBytes`); when the
+/// node uses inline content the registry pointer is unused.
 pub const RenderFn = *const fn (
     node: *const Node,
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
+    registry: ?*BufferRegistry,
 ) anyerror!void;
+
+/// Resolve the byte slice for a node's textual content. When
+/// `node.buffer_id` is set, dereferences the registry-owned TextBuffer;
+/// otherwise returns the inline `node.content.items`. Returns an empty
+/// slice when the handle resolves to anything other than a TextBuffer
+/// or when the registry is missing despite a non-null handle (the
+/// latter is a wiring bug, but the renderer must remain total).
+///
+/// Caller borrows; the returned slice is valid until the underlying
+/// storage mutates.
+pub fn nodeBytes(node: *const Node, registry: ?*BufferRegistry) []const u8 {
+    if (node.buffer_id) |handle| {
+        const reg = registry orelse return &.{};
+        const tb = reg.asText(handle) catch return &.{};
+        return tb.bytes_view();
+    }
+    return node.content.items;
+}
 
 /// Custom renderer overrides keyed by node type name.
 overrides: std.StringHashMap(RenderFn),
@@ -108,35 +132,40 @@ pub fn register(self: *NodeRenderer, node_type_name: []const u8, render_fn: Rend
 
 /// Render a node into styled display lines. Checks for a custom override first,
 /// then falls back to the built-in default renderer for the node's type.
+///
+/// `registry` is forwarded to the renderer so it can resolve
+/// `node.buffer_id`-backed content. Pass null when the node tree
+/// pre-dates the migration (test-only path).
 pub fn render(
     self: *const NodeRenderer,
     node: *const Node,
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
+    registry: ?*BufferRegistry,
 ) !void {
     // Check for custom override
     if (self.has_overrides) {
         const type_name = @tagName(node.node_type);
         if (self.overrides.get(type_name)) |custom_fn| {
-            return custom_fn(node, lines, allocator, theme);
+            return custom_fn(node, lines, allocator, theme, registry);
         }
     }
 
     // Built-in defaults
-    try renderDefault(node, lines, allocator, theme);
+    try renderDefault(node, lines, allocator, theme, registry);
 }
 
 /// Number of body lines hidden under a collapsed `tool_call` node, counted as
 /// `(newlines + 1)` over the first `tool_result` child's content. Returns 0
 /// when the node is expanded, has no `tool_result` child, or the first child's
 /// content is empty. Capped at the first child to keep this O(1) in node count.
-fn hiddenToolResultLineCount(node: *const Node) usize {
+fn hiddenToolResultLineCount(node: *const Node, registry: ?*BufferRegistry) usize {
     if (!node.collapsed) return 0;
     if (node.node_type != .tool_call) return 0;
     for (node.children.items) |child| {
         if (child.node_type != .tool_result) continue;
-        const content = child.content.items;
+        const content = nodeBytes(child, registry);
         if (content.len == 0) return 0;
         var count: usize = 1;
         for (content) |c| {
@@ -150,21 +179,21 @@ fn hiddenToolResultLineCount(node: *const Node) usize {
 }
 
 /// Return the number of display lines a node produces (without allocating them).
-pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
+pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node, registry: ?*BufferRegistry) usize {
     return switch (node.node_type) {
         .separator => 1,
         .err, .thinking_redacted => 1,
         .tool_call => blk: {
             // Collapsed tool_call with a non-empty tool_result child gets a
             // hint line under the [tool] header announcing the hidden body.
-            if (hiddenToolResultLineCount(node) > 0) break :blk 2;
+            if (hiddenToolResultLineCount(node, registry) > 0) break :blk 2;
             break :blk 1;
         },
         .thinking => blk: {
             // Collapsed thinking nodes render as a single header line; the
             // body is hidden until the user hits Ctrl-R.
             if (node.collapsed) break :blk 1;
-            const content = node.content.items;
+            const content = nodeBytes(node, registry);
             // Expanded form is a header line plus one line per body line.
             if (content.len == 0) break :blk 1;
             var count: usize = 2; // header + first body line
@@ -178,7 +207,7 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node) usize {
             // Count newlines to determine line count.
             // splitAndAppend skips the trailing empty segment after a final '\n',
             // so we subtract 1 when content ends with a newline.
-            const content = node.content.items;
+            const content = nodeBytes(node, registry);
             if (content.len == 0) break :blk 1;
             var count: usize = 1;
             for (content) |c| {
@@ -272,8 +301,9 @@ fn renderDefault(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
+    registry: ?*BufferRegistry,
 ) !void {
-    const content = node.content.items;
+    const content = nodeBytes(node, registry);
 
     switch (node.node_type) {
         .user_message => {
@@ -293,7 +323,7 @@ fn renderDefault(
         .tool_call => {
             const style = theme.highlights.tool_call;
             try lines.append(allocator, try twoSpanLine(allocator, Prefixes.tool_call, style, content, style));
-            const hidden = hiddenToolResultLineCount(node);
+            const hidden = hiddenToolResultLineCount(node, registry);
             if (hidden == 0) return;
             // Static-lifetime digit slice keeps the span's borrowed-text
             // contract intact without an allocation per render.
@@ -370,7 +400,7 @@ test "renderDefault user_message" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
 
     const text = try lines.items[0].toText(allocator);
@@ -396,7 +426,7 @@ test "renderDefault user_message has two spans with user_message style" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const line = lines.items[0];
     try std.testing.expectEqual(@as(usize, 2), line.spans.len);
@@ -425,7 +455,7 @@ test "renderDefault assistant_text" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -452,7 +482,7 @@ test "renderDefault tool_call" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -484,7 +514,7 @@ test "renderDefault tool_result shows full content" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -515,7 +545,7 @@ test "renderDefault tool_result short content not truncated" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -540,7 +570,7 @@ test "renderDefault err" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -568,7 +598,7 @@ test "renderDefault separator" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -595,7 +625,7 @@ test "renderDefault status" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -621,7 +651,7 @@ test "renderDefault custom" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -646,7 +676,7 @@ test "renderDefault multiline assistant_text" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
 
     const t1 = try lines.items[0].toText(allocator);
@@ -673,9 +703,11 @@ test "custom override replaces default renderer" {
             lines: *std.ArrayList(StyledLine),
             alloc: Allocator,
             theme: *const Theme,
+            registry: ?*BufferRegistry,
         ) !void {
             _ = node;
             _ = theme;
+            _ = registry;
             // Static literal satisfies the borrowed-slice contract with no
             // allocation at all.
             const spans = try alloc.alloc(StyledSpan, 1);
@@ -701,7 +733,7 @@ test "custom override replaces default renderer" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderer.render(&node, &lines, allocator, &theme);
+    try renderer.render(&node, &lines, allocator, &theme, null);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -727,7 +759,7 @@ test "renderDefault thinking collapsed emits one header line" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -735,7 +767,7 @@ test "renderDefault thinking collapsed emits one header line" {
     try std.testing.expect(std.mem.startsWith(u8, text, ">"));
 
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(&node));
+    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(&node, null));
 }
 
 test "renderDefault thinking expanded emits header plus body lines" {
@@ -757,7 +789,7 @@ test "renderDefault thinking expanded emits header plus body lines" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
     // header + 3 body lines
     try std.testing.expectEqual(@as(usize, 4), lines.items.len);
 
@@ -770,7 +802,7 @@ test "renderDefault thinking expanded emits header plus body lines" {
     try std.testing.expectEqualStrings("step one", body0);
 
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 4), renderer.lineCountForNode(&node));
+    try std.testing.expectEqual(@as(usize, 4), renderer.lineCountForNode(&node, null));
 }
 
 test "renderDefault thinking_redacted emits a single redacted header" {
@@ -791,7 +823,7 @@ test "renderDefault thinking_redacted emits a single redacted header" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(&node, &lines, allocator, &theme);
+    try renderDefault(&node, &lines, allocator, &theme, null);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -808,7 +840,7 @@ test "lineCountForNode returns 1 for all types" {
         .content = content,
         .children = .empty,
     };
-    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(&node));
+    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(&node, null));
 }
 
 test "lineCountForNode counts hidden tool_result child lines when tool_call is collapsed" {
@@ -824,7 +856,7 @@ test "lineCountForNode counts hidden tool_result child lines when tool_call is c
 
     const renderer = NodeRenderer.initDefault();
     // tool_call collapsed: its own header line plus a hint line that names the hidden body.
-    try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call));
+    try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call, null));
 }
 
 test "rendering a collapsed tool_call with a tool_result child does not leak under testing.allocator" {
@@ -844,7 +876,7 @@ test "rendering a collapsed tool_call with a tool_result child does not leak und
     inline for (0..2) |_| {
         var lines: std.ArrayList(StyledLine) = .empty;
         defer Theme.freeStyledLines(&lines, allocator);
-        try renderDefault(call, &lines, allocator, &theme);
+        try renderDefault(call, &lines, allocator, &theme, null);
         try std.testing.expectEqual(@as(usize, 2), lines.items.len);
         // Confirm the hint line carries the expected count token.
         const hint_text = try lines.items[1].toText(allocator);
