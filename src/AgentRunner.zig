@@ -662,9 +662,21 @@ pub const DrainResult = struct {
     finished: bool = false,
 };
 
-/// Drain pending agent events.
-pub fn drainEvents(self: *AgentRunner, allocator: Allocator) DrainResult {
+/// Drain pending agent events. Frees event-owned payloads through the
+/// per-turn `wire_arena`: the agent thread allocates every payload there
+/// (see `submit`), so freeing through the heap allocator would be
+/// cross-allocator UB. Arena `free` is a no-op; the bytes are reclaimed
+/// when the next `submit` resets the arena. Falls back to `self.allocator`
+/// when `wire_arena` is null (only reachable from tests that scaffold
+/// `agent_thread` and `event_queue` manually without going through
+/// `submit`; those tests push payload-less events like `.done`).
+pub fn drainEvents(self: *AgentRunner) DrainResult {
     if (self.agent_thread == null) return .{};
+
+    const allocator: Allocator = if (self.wire_arena) |*arena|
+        arena.allocator()
+    else
+        self.allocator;
 
     // Split drain into two timed sub-phases so /perf can localize a long
     // drain to either synchronous Lua hook dispatch (jit_context, tool
@@ -1807,7 +1819,7 @@ test "drainEvents joins thread and deinits queue on .done" {
     // Push a done event
     try runner.event_queue.push(.done);
 
-    const result = runner.drainEvents(allocator);
+    const result = runner.drainEvents();
 
     try std.testing.expect(result.finished);
     try std.testing.expect(result.any_drained);

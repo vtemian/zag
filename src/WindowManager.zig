@@ -1887,7 +1887,7 @@ fn swapProviderOnPanePtr(
             var waited_ms: u64 = 0;
             while (runner.isAgentRunning()) : (waited_ms += 1) {
                 if (waited_ms >= timeout_ms) return error.SwapTimeout;
-                _ = runner.drainEvents(self.allocator);
+                _ = runner.drainEvents();
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
@@ -2116,7 +2116,7 @@ pub fn viewportFor(self: *WindowManager, pane: *Pane) *Viewport {
 /// to (extras) rather than the dead inline slot.
 pub fn drainPane(self: *WindowManager, pane: *Pane) void {
     const runner = pane.runner orelse return;
-    const result = runner.drainEvents(self.allocator);
+    const result = runner.drainEvents();
     if (result.any_drained) {
         self.viewportFor(pane).setScrollOffset(0);
     }
