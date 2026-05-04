@@ -140,6 +140,14 @@ pub fn asText(self: *const BufferRegistry, handle: Handle) Error!*TextBuffer {
     };
 }
 
+pub fn asImage(self: *const BufferRegistry, handle: Handle) Error!*ImageBuffer {
+    const entry = try self.resolve(handle);
+    return switch (entry) {
+        .image => |p| p,
+        else => Error.StaleBuffer,
+    };
+}
+
 pub fn remove(self: *BufferRegistry, handle: Handle) (Error || Allocator.Error)!void {
     if (handle.index >= self.slots.items.len) return Error.StaleBuffer;
     const slot = &self.slots.items[handle.index];
