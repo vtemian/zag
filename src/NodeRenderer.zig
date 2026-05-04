@@ -42,6 +42,12 @@ const Prefixes = struct {
     /// Width matches "[tool] " so the hint visually sits under the tool name.
     const tool_collapsed_hint_prefix = "       ";
     const tool_collapsed_hint_suffix = " lines hidden (Ctrl-R to expand)";
+    /// Placeholder for an image-backed tool_result. Inline image
+    /// embedding in the conversation view is a Phase D concern; for now
+    /// we emit a single styled line so the user knows a binary payload
+    /// exists. Static-lifetime literal so the StyledSpan borrowed-text
+    /// contract holds without allocation.
+    const tool_result_image_placeholder = "[image]";
 };
 
 /// Pre-baked decimal digit strings for the most common collapsed-tool hint
@@ -93,6 +99,18 @@ pub fn nodeBytes(node: *const Node, registry: ?*BufferRegistry) []const u8 {
         return tb.bytes_view();
     }
     return node.content.items;
+}
+
+/// Returns true when the node carries a `buffer_id` that resolves to an
+/// ImageBuffer. Used by the tool_result render path to switch from text
+/// rendering to a placeholder line. Returns false for inline-content
+/// nodes, text-backed nodes, and stale handles; the renderer must stay
+/// total in the face of a torn-down buffer.
+fn isImageBacked(node: *const Node, registry: ?*BufferRegistry) bool {
+    const handle = node.buffer_id orelse return false;
+    const reg = registry orelse return false;
+    const entry = reg.resolve(handle) catch return false;
+    return entry == .image;
 }
 
 /// Custom renderer overrides keyed by node type name.
@@ -203,7 +221,21 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node, registry: ?*B
             if (content[content.len - 1] == '\n') count -= 1;
             break :blk count;
         },
-        .user_message, .assistant_text, .tool_result, .status, .custom => blk: {
+        .tool_result => blk: {
+            // Image-backed tool_result renders as a single placeholder line
+            // ("[image WxH]"); inline image embedding in the conversation
+            // view is a Phase D-or-later concern.
+            if (isImageBacked(node, registry)) break :blk 1;
+            const content = nodeBytes(node, registry);
+            if (content.len == 0) break :blk 1;
+            var count: usize = 1;
+            for (content) |c| {
+                if (c == '\n') count += 1;
+            }
+            if (content[content.len - 1] == '\n') count -= 1;
+            break :blk count;
+        },
+        .user_message, .assistant_text, .status, .custom => blk: {
             // Count newlines to determine line count.
             // splitAndAppend skips the trailing empty segment after a final '\n',
             // so we subtract 1 when content ends with a newline.
@@ -337,6 +369,11 @@ fn renderDefault(
             return;
         },
         .tool_result => {
+            if (isImageBacked(node, registry)) {
+                const style = theme.highlights.tool_result;
+                try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.tool_result_image_placeholder, style));
+                return;
+            }
             try splitAndAppendIndented(lines, allocator, content, theme.highlights.tool_result, theme.spacing.indent);
             return;
         },
@@ -857,6 +894,38 @@ test "lineCountForNode counts hidden tool_result child lines when tool_call is c
     const renderer = NodeRenderer.initDefault();
     // tool_call collapsed: its own header line plus a hint line that names the hidden body.
     try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call, null));
+}
+
+test "renderDefault tool_result image-backed emits placeholder line" {
+    const allocator = std.testing.allocator;
+
+    var registry = BufferRegistry.init(allocator);
+    defer registry.deinit();
+
+    var tree = @import("ConversationTree.zig").init(allocator);
+    defer tree.deinit();
+
+    // Drive the typed-buffer path directly: allocate an ImageBuffer in the
+    // registry, stamp its handle on a tool_result node. This mirrors the
+    // shape `ConversationBuffer.appendImageNode` produces without pulling
+    // a full ConversationBuffer into the renderer test.
+    const handle = try registry.createImage("tool_result");
+    const node = try tree.appendNode(null, .tool_result, "");
+    node.buffer_id = handle;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+
+    const text = try lines.items[0].toText(allocator);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("[image]", text);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(node, &registry));
 }
 
 test "rendering a collapsed tool_call with a tool_result child does not leak under testing.allocator" {

@@ -131,9 +131,15 @@ pub fn attachBufferRegistry(self: *ConversationBuffer, registry: *BufferRegistry
 /// Returns true for node types whose content has been migrated to
 /// TextBuffer storage. Grows with each Phase C commit; commit 7 removes
 /// this helper entirely once every type is migrated.
+///
+/// `tool_call` deliberately stays out of this set: its tool name and
+/// JSON input remain on the inline `node.content` path until commit 7
+/// moves them onto typed metadata. `tool_result` joins for text-shaped
+/// results; image-shaped results take the `appendImageNode` path which
+/// allocates an ImageBuffer instead.
 fn isMigratedType(node_type: NodeType) bool {
     return switch (node_type) {
-        .status, .user_message, .custom => true,
+        .status, .user_message, .custom, .tool_result => true,
         else => false,
     };
 }
@@ -162,6 +168,27 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
         // Registry not attached (test-only): fall through to inline content.
     }
     return self.tree.appendNode(parent, node_type, content);
+}
+
+/// Append a tool_result node whose payload is a decoded image. Allocates
+/// an ImageBuffer in the registry, decodes `png_bytes` into it, and stamps
+/// the handle onto `node.buffer_id` so the renderer can dispatch on the
+/// buffer's kind.
+///
+/// Requires an attached BufferRegistry; image-shaped tool results have no
+/// inline-content fallback because `Node.content` is byte-only and the
+/// renderer would have to re-decode on every frame. Returns
+/// `error.NoBufferRegistry` when the registry is missing so test fixtures
+/// fail loudly instead of silently dropping the image.
+pub fn appendImageNode(self: *ConversationBuffer, parent: ?*Node, png_bytes: []const u8) !*Node {
+    const reg = self.buffer_registry orelse return error.NoBufferRegistry;
+    const handle = try reg.createImage(@tagName(NodeType.tool_result));
+    errdefer reg.remove(handle) catch {};
+    const ib = try reg.asImage(handle);
+    try ib.setPng(png_bytes);
+    const node = try self.tree.appendNode(parent, .tool_result, "");
+    node.buffer_id = handle;
+    return node;
 }
 
 /// Walk the tree and return styled display lines for the visible range.
@@ -1190,4 +1217,91 @@ test "appendNode for custom routes through TextBuffer" {
 
     const tb = try registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("payload", tb.bytes_view());
+}
+
+test "appendNode for tool_call leaves buffer_id null and keeps inline content" {
+    var registry = BufferRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
+
+    // tool_call deliberately stays out of `isMigratedType` until commit 7
+    // moves its tool name and JSON input onto typed metadata. Even with
+    // the registry attached, the inline path holds the tool name.
+    const node = try cb.appendNode(null, .tool_call, "bash");
+    try std.testing.expect(node.buffer_id == null);
+    try std.testing.expectEqualStrings("bash", node.content.items);
+}
+
+test "appendNode for tool_result text routes through TextBuffer" {
+    var registry = BufferRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
+
+    const call = try cb.appendNode(null, .tool_call, "bash");
+    const result = try cb.appendNode(call, .tool_result, "ls output here");
+    try std.testing.expect(result.buffer_id != null);
+    try std.testing.expectEqual(@as(usize, 0), result.content.items.len);
+
+    const tb = try registry.asText(result.buffer_id.?);
+    try std.testing.expectEqualStrings("ls output here", tb.bytes_view());
+}
+
+// 1x1 opaque red PNG, mirroring the fixture used in src/buffers/image.zig.
+const tiny_red_png_fixture = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+    0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+};
+
+test "tool_result with image data routes through ImageBuffer" {
+    var registry = BufferRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
+
+    const call = try cb.appendNode(null, .tool_call, "screenshot");
+    const result = try cb.appendImageNode(call, &tiny_red_png_fixture);
+    try std.testing.expectEqual(NodeType.tool_result, result.node_type);
+    try std.testing.expect(result.buffer_id != null);
+
+    const ib = try registry.asImage(result.buffer_id.?);
+    try std.testing.expect(ib.image != null);
+    try std.testing.expectEqual(@as(u32, 1), ib.image.?.width);
+    try std.testing.expectEqual(@as(u32, 1), ib.image.?.height);
+
+    // Renderer falls back to a placeholder line for image-backed
+    // tool_result; full inline rendering is a Phase D-or-later concern.
+    const theme = Theme.defaultTheme();
+    var lines = try cb.getVisibleLines(std.testing.allocator, std.testing.allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines.deinit(std.testing.allocator);
+
+    var saw_placeholder = false;
+    for (lines.items) |line| {
+        const text = try line.toText(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        if (std.mem.indexOf(u8, text, "[image]") != null) {
+            saw_placeholder = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_placeholder);
+}
+
+test "appendImageNode without registry returns NoBufferRegistry" {
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    // No attachBufferRegistry.
+
+    try std.testing.expectError(error.NoBufferRegistry, cb.appendImageNode(null, &tiny_red_png_fixture));
 }
