@@ -134,13 +134,23 @@ pub fn attachBufferRegistry(self: *ConversationBuffer, registry: *BufferRegistry
 ///
 /// `tool_call` deliberately stays out of this set: its tool name and
 /// JSON input remain on the inline `node.content` path until commit 7
-/// moves them onto typed metadata. `tool_result` joins for text-shaped
-/// results; image-shaped results take the `appendImageNode` path which
+/// moves them onto typed metadata. Every other node type routes
+/// through TextBuffer when a registry is attached. Image-shaped
+/// tool_result content takes the `appendImageNode` path which
 /// allocates an ImageBuffer instead.
 fn isMigratedType(node_type: NodeType) bool {
     return switch (node_type) {
-        .status, .user_message, .custom, .tool_result => true,
-        else => false,
+        .status,
+        .user_message,
+        .custom,
+        .tool_result,
+        .assistant_text,
+        .thinking,
+        .thinking_redacted,
+        .err,
+        .separator,
+        => true,
+        .tool_call => false,
     };
 }
 
@@ -1304,4 +1314,23 @@ test "appendImageNode without registry returns NoBufferRegistry" {
     // No attachBufferRegistry.
 
     try std.testing.expectError(error.NoBufferRegistry, cb.appendImageNode(null, &tiny_red_png_fixture));
+}
+
+test "streaming deltas accumulate in assistant_text TextBuffer" {
+    var registry = BufferRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
+
+    const node = try cb.appendNode(null, .assistant_text, "");
+    try std.testing.expect(node.buffer_id != null);
+
+    try cb.appendToNode(node, "Hello");
+    try cb.appendToNode(node, ", ");
+    try cb.appendToNode(node, "world!");
+
+    const tb = try registry.asText(node.buffer_id.?);
+    try std.testing.expectEqualStrings("Hello, world!", tb.bytes_view());
 }
