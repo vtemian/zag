@@ -567,6 +567,16 @@ pub fn attachLayoutRegistry(self: *WindowManager) !void {
             log.warn("root pane handle lookup failed: {}", .{err});
         }
     }
+
+    // Wire the buffer registry into the root pane's conversation so
+    // node-creation paths can allocate per-node TextBuffer storage. The
+    // registry sits on this WindowManager at a stable address now that
+    // `self` lives in its final home (callers of attachLayoutRegistry
+    // already hold that contract). Extra panes are wired in
+    // `createSplitPane`.
+    if (self.root_pane.conversation) |cb| {
+        cb.attachBufferRegistry(&self.buffer_registry);
+    }
 }
 
 fn registerSubtree(registry: *NodeRegistry, node: *Layout.LayoutNode) !void {
@@ -1414,6 +1424,10 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     errdefer self.allocator.destroy(cb);
     cb.* = try ConversationBuffer.init(self.allocator, self.next_buffer_id, name);
     errdefer cb.deinit();
+    // Wire the registry so migrated node types (status today; more in
+    // later Phase C commits) allocate TextBuffer storage rather than
+    // falling back to inline content.
+    cb.attachBufferRegistry(&self.buffer_registry);
 
     // BufferSink is heap-allocated so the PaneEntry can free it during
     // teardown after the runner is joined. Must be built before the
