@@ -4212,8 +4212,11 @@ test "restorePane rebuilds both tree and messages" {
 
     var scb = ConversationHistory.init(allocator);
     defer scb.deinit();
+    var registry = BufferRegistry.init(allocator);
+    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "restored");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var runner = AgentRunner.init(allocator, TestNullSink.sink(), &scb);
     defer runner.deinit();
 

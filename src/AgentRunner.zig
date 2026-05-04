@@ -1882,8 +1882,11 @@ test "current_caller_pane_id threadlocal is per-thread" {
 
 test "node_version_snapshot starts at zero; compositor sync advances it" {
     const allocator = std.testing.allocator;
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "snap");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var history = ConversationHistory.init(allocator);
     defer history.deinit();
     var runner = AgentRunner.init(allocator, NullSink.sink(), &history);

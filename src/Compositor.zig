@@ -259,8 +259,8 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
 }
 
 /// After a leaf repaint, drain the tree's dirty-node ring and invalidate
-/// the corresponding NodeLineCache entries so they don't outlive their
-/// source `Node.content.items`. On overflow (more than
+/// the corresponding NodeLineCache entries so they don't outlive the
+/// registry-owned TextBuffer bytes their spans borrow into. On overflow (more than
 /// `DirtyRing.capacity` mutations since the last drain) we wipe the
 /// whole cache; the next frame will lazily repopulate only the nodes
 /// that end up in the visible range.
@@ -368,8 +368,8 @@ fn drawBufferIntoRect(
     // Slice the materialized list `planScroll` already produced. Avoids a
     // second `getVisibleLines` walk (which would re-render every node
     // through the cache) just to fetch the visible window. Spans and their
-    // text are cache-owned or borrowed into `Node.content.items`; the
-    // ArrayList header and the slice both live on the per-frame arena.
+    // text are cache-owned or borrowed into the registry-owned TextBuffer
+    // bytes; the ArrayList header and the slice both live on the per-frame arena.
     const lines_slice = plan.lines.items[plan.skip .. plan.skip + plan.take];
 
     // Write styled lines to screen, advancing cur_row by the actual number
@@ -1233,8 +1233,11 @@ test "composite writes buffer content at leaf rect with padding" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     _ = try cb.appendNode(null, .user_message, "hello");
 
     var layout = Layout.init(allocator);
@@ -1302,8 +1305,11 @@ test "composite skips clean buffer leaves" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     _ = try cb.appendNode(null, .user_message, "hello");
 
     var layout = Layout.init(allocator);
@@ -1771,8 +1777,11 @@ test "composite twice produces identical screen content" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "twice");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .assistant_text, "**bold** and `code`");
 
@@ -1811,11 +1820,14 @@ test "drawFloats renders content and rounded border in supplied rect" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var root_cb = try ConversationBuffer.init(allocator, 0, "root");
     defer root_cb.deinit();
 
     var float_cb = try ConversationBuffer.init(allocator, 1, "float");
     defer float_cb.deinit();
+    float_cb.attachBufferRegistry(&registry);
     _ = try float_cb.appendNode(null, .user_message, "hello");
 
     var layout = Layout.init(allocator);
@@ -1865,8 +1877,11 @@ test "scratch leaf still renders correctly with a float overhead" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var root_cb = try ConversationBuffer.init(allocator, 0, "root");
     defer root_cb.deinit();
+    root_cb.attachBufferRegistry(&registry);
     _ = try root_cb.appendNode(null, .user_message, "hello");
 
     var float_cb = try ConversationBuffer.init(allocator, 1, "float");
@@ -1991,8 +2006,11 @@ test "tiny pane (height 3) skips the prompt reservation" {
 
 test "planScroll: short content fits, no scroll" {
     const allocator = std.testing.allocator;
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     _ = try cb.appendNode(null, .user_message, "hi");
     _ = try cb.appendNode(null, .assistant_text, "ok");
 
@@ -2021,8 +2039,11 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
     // this test deliberately so the assertion has to be revisited alongside
     // the prefix change.
     const allocator = std.testing.allocator;
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
 
     const long = "a" ** 60;
     _ = try cb.appendNode(null, .user_message, long);
@@ -2045,8 +2066,11 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
 
 test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     const allocator = std.testing.allocator;
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
 
     var i: usize = 0;
     while (i < 10) : (i += 1) {
@@ -2081,8 +2105,11 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
 
 test "planScroll: scroll past total clamps to zero rows" {
     const allocator = std.testing.allocator;
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     _ = try cb.appendNode(null, .user_message, "hi");
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -2102,8 +2129,11 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var viewport: @import("Viewport.zig") = .{};
 
     // Two short logical lines so the first paint draws content rows
@@ -2270,11 +2300,11 @@ test "drawStyledLineWrapped: matches wrappedRowCountMulti on consumed rows" {
 }
 
 // Custom NodeRenderer hook used by the composite-level Bug A/B regression
-// tests below. Emits the exact 2-span shape requested in `node.content` so
-// the test can craft a logical line whose wrap boundary lands at a span
-// seam (Bug A) or in the middle of a non-first span (Bug B). Span text
-// borrows from `node.content.items`, which outlives the rendered line via
-// `NodeLineCache`.
+// tests below. Emits the exact 2-span shape requested in the node's
+// TextBuffer-resolved bytes so the test can craft a logical line whose
+// wrap boundary lands at a span seam (Bug A) or in the middle of a
+// non-first span (Bug B). Span text borrows from the registry-owned
+// TextBuffer bytes, which outlive the rendered line via `NodeLineCache`.
 const test_renderer_split = struct {
     fn renderTwoSpansAtSeparator(
         node: *const ConversationTree.Node,
@@ -2284,8 +2314,7 @@ const test_renderer_split = struct {
         registry: ?*@import("BufferRegistry.zig"),
     ) !void {
         _ = theme;
-        _ = registry;
-        const content = node.content.items;
+        const content = @import("NodeRenderer.zig").nodeBytes(node, registry);
         // Find the '|' separator. Span 1 = bytes before, span 2 = bytes after.
         const idx = std.mem.indexOfScalar(u8, content, '|') orelse content.len;
         const first = content[0..idx];
@@ -2319,8 +2348,11 @@ test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var viewport: @import("Viewport.zig") = .{};
 
     // Swap the default renderer for one that emits exactly the spans we
@@ -2375,8 +2407,11 @@ test "composite: wrapped continuation lands at content_x, not span tail (Bug B r
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var viewport: @import("Viewport.zig") = .{};
 
     cb.renderer = @import("NodeRenderer.zig").init(allocator);
@@ -2447,8 +2482,11 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var viewport: @import("Viewport.zig") = .{};
 
     var i: usize = 0;

@@ -323,11 +323,6 @@ pub fn main() !void {
 
     if (session_handle) |*sh| {
         root_session.attachSession(sh);
-        if (resume_id != null) {
-            EventOrchestrator.restorePane(root_pane, sh, allocator) catch |err| {
-                log.warn("session restore failed: {}", .{err});
-            };
-        }
     }
 
     // -- Enter TUI mode ------------------------------------------------------
@@ -349,8 +344,6 @@ pub fn main() !void {
     };
 
     layout.recalculate(screen.width, screen.height);
-
-    try postStartupBanner(&root_buffer, resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
     // Discover skills before the orchestrator brings up split panes: every
     // pane's system prompt gets the same `<available_skills>` block.
@@ -389,8 +382,21 @@ pub fn main() !void {
     // create/destroy from this point on and back-registers the existing root.
     // `attachLayoutRegistry` also wires the WM-owned BufferRegistry into
     // the root pane's conversation (a borrowed pointer at root_buffer)
-    // so migrated node-creation paths can allocate TextBuffer storage.
+    // so node-creation paths can allocate TextBuffer storage. Every node
+    // creation downstream of this call assumes the registry is live.
     try orchestrator.window_manager.attachLayoutRegistry();
+
+    // Restore prior session content and post the startup banner only
+    // after the registry is wired: both paths call `appendNode`, which
+    // requires a registry for content-bearing node types after Phase C.
+    if (session_handle) |*sh| {
+        if (resume_id != null) {
+            EventOrchestrator.restorePane(root_pane, sh, allocator) catch |err| {
+                log.warn("session restore failed: {}", .{err});
+            };
+        }
+    }
+    try postStartupBanner(&root_buffer, resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
     // Wire the window manager pointer into the root runner so the
     // main-thread drain loop can service `layout_request` round-trips.
@@ -496,12 +502,17 @@ test {
 
 test "appendStatusLine creates a status node on the given view" {
     const allocator = std.testing.allocator;
+    const BufferRegistry = @import("BufferRegistry.zig");
+    var registry = BufferRegistry.init(allocator);
+    defer registry.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "test");
     defer view.deinit();
+    view.attachBufferRegistry(&registry);
 
     try appendStatusLine(&view, "hello world");
 
     try std.testing.expectEqual(@as(usize, 1), view.tree.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.tree.root_children.items[0].node_type);
-    try std.testing.expectEqualStrings("hello world", view.tree.root_children.items[0].content.items);
+    const tb = try registry.asText(view.tree.root_children.items[0].buffer_id.?);
+    try std.testing.expectEqualStrings("hello world", tb.bytes_view());
 }

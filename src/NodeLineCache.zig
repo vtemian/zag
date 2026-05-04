@@ -113,7 +113,6 @@ test "get returns null on miss" {
     const node = Node{
         .id = 42,
         .node_type = .custom,
-        .content = .empty,
         .children = .empty,
         .content_version = 0,
     };
@@ -139,7 +138,6 @@ test "put/get roundtrip with a fake styled line" {
     const node = Node{
         .id = 7,
         .node_type = .custom,
-        .content = .empty,
         .children = .empty,
         .content_version = 1,
     };
@@ -164,7 +162,6 @@ test "get returns null when content_version has advanced past the entry" {
     const node = Node{
         .id = 3,
         .node_type = .custom,
-        .content = .empty,
         .children = .empty,
         .content_version = 2, // advanced past entry.version=1
     };
