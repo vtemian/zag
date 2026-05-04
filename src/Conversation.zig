@@ -184,6 +184,7 @@ pub fn appendNode(self: *Conversation, parent: ?*Node, node_type: NodeType, cont
             self.tree.removeNode(node);
         }
         node.custom_tag = try self.allocator.dupe(u8, content);
+        self.notifyChildChanged();
         return node;
     }
     const handle = try self.buffer_registry.createText(@tagName(node_type));
@@ -192,6 +193,7 @@ pub fn appendNode(self: *Conversation, parent: ?*Node, node_type: NodeType, cont
     try tb.append(content);
     const node = try self.tree.appendNode(parent, node_type);
     node.buffer_id = handle;
+    self.notifyChildChanged();
     return node;
 }
 
@@ -376,6 +378,7 @@ pub fn appendToNode(self: *Conversation, node: *Node, text: []const u8) !void {
     node.markDirty();
     self.tree.generation +%= 1;
     self.tree.dirty_nodes.push(node.id);
+    self.notifyChildChanged();
 }
 
 /// Result of a `readText` call: plain-text view of the visible lines,
@@ -465,7 +468,7 @@ fn routeReplayEntry(
     }
     const idx = path[0];
     while (self.subagents.items.len <= idx) {
-        _ = try self.spawnSubagent("(unknown)");
+        _ = try self.spawnSubagent("(unknown)", "");
     }
     const child = self.subagents.items[idx];
     try child.routeReplayEntry(path[1..], entry);
@@ -561,9 +564,15 @@ pub fn appendUserNode(self: *Conversation, text: []const u8) !*Node {
 /// `parent_subagent_id` are wired so commit 2's `persistEvent` will
 /// delegate through the parent's session.
 ///
+/// `prompt` is the caller's original `prompt` argument (NOT the
+/// composed subagent-system-prefix + prompt that `tools/task.zig`
+/// seeds the child's first user_message with). The link node stashes
+/// a duped copy so `toWireMessages` projects the caller's untouched
+/// prompt as the `task` tool_use input on replay.
+///
 /// Caller does not own the returned pointer; the parent's `deinit`
 /// frees it.
-pub fn spawnSubagent(self: *Conversation, name: []const u8) !*Conversation {
+pub fn spawnSubagent(self: *Conversation, name: []const u8, prompt: []const u8) !*Conversation {
     const idx: u32 = @intCast(self.subagents.items.len);
 
     // Heap-allocate the child slot first so its address is stable for
@@ -588,6 +597,7 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8) !*Conversation {
     errdefer self.tree.removeNode(node);
     node.subagent_index = idx;
     node.subagent_name = try self.allocator.dupe(u8, name);
+    node.subagent_prompt = try self.allocator.dupe(u8, prompt);
     // Type-erased back-pointer so NodeRenderer can resolve the child
     // by index without ConversationTree pulling in Conversation as a
     // direct dependency. Cast back to `*const Conversation` at the
@@ -595,6 +605,32 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8) !*Conversation {
     node.subagent_parent = @ptrCast(self);
 
     return child;
+}
+
+/// Walk parent backlinks from this Conversation up to the root,
+/// marking each ancestor's `.subagent_link` node referencing the
+/// step's child as dirty. The link node's renderer reads through
+/// the type-erased back-pointer to inspect the child's tree tail
+/// (the "[subagent: name] running/done" status line) but the parent's
+/// tree never mutates when the child does, so without this walk
+/// `NodeLineCache` keeps the stale status line forever. The chain
+/// covers nested subagents: a grandchild's mutation invalidates both
+/// the middle's link in the root and the leaf's link in the middle.
+fn notifyChildChanged(self: *Conversation) void {
+    var current: *Conversation = self;
+    while (current.parent) |p| {
+        for (p.tree.root_children.items) |link_node| {
+            if (link_node.node_type == .subagent_link and
+                link_node.subagent_index == current.parent_subagent_id)
+            {
+                link_node.markDirty();
+                p.tree.dirty_nodes.push(link_node.id);
+                p.tree.generation +%= 1;
+                break;
+            }
+        }
+        current = p;
+    }
 }
 
 // -- Session persistence ----------------------------------------------------
@@ -915,8 +951,9 @@ fn buildSubagentTaskInput(
     node: *const ConversationTree.Node,
     child: *const Conversation,
 ) ![]const u8 {
+    _ = child;
     const name = node.subagent_name orelse "unknown";
-    const prompt = childInitialPrompt(child);
+    const prompt = childInitialPrompt(node);
 
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(arena);
@@ -929,11 +966,15 @@ fn buildSubagentTaskInput(
     return list.toOwnedSlice(arena);
 }
 
-fn childInitialPrompt(child: *const Conversation) []const u8 {
-    if (child.tree.root_children.items.len == 0) return "";
-    const first = child.tree.root_children.items[0];
-    if (first.node_type != .user_message) return "";
-    return child.nodeText(first);
+/// Read the original prompt argument stashed on the link node at
+/// `spawnSubagent` time. Returns empty when missing (legacy JSONL
+/// replay leaves the field null because pre-stash sessions never
+/// captured it). Pre-stash callers that built the prompt by walking
+/// the child's first `user_message` saw the subagent system-prefix
+/// concatenated in front of the caller's text, doubling the prompt
+/// on replay.
+fn childInitialPrompt(node: *const ConversationTree.Node) []const u8 {
+    return node.subagent_prompt orelse "";
 }
 
 /// Concatenate all `.assistant_text` nodes in the child's tree into an
@@ -1550,7 +1591,7 @@ test "child Conversation persistEvent stamps subagent_path and routes through pa
     defer conv.deinit();
     conv.attachSession(&handle);
 
-    const child = try conv.spawnSubagent("codereview");
+    const child = try conv.spawnSubagent("codereview", "");
     try child.persistEventInternal(.{
         .entry_type = .task_message,
         .content = "from child",
@@ -1599,7 +1640,7 @@ test "loadFromEntries reconstructs subagents from tagged entries" {
         .content = "do the thing",
         .timestamp = 1,
     });
-    const child = try conv.spawnSubagent("codereview");
+    const child = try conv.spawnSubagent("codereview", "");
     try child.persistEventInternal(.{
         .entry_type = .task_message,
         .content = "child reply",
@@ -1670,8 +1711,8 @@ test "depth-2 subagent_path round-trips through persist + load" {
     var conv = try Conversation.init(allocator, 0, "root");
     conv.attachSession(&handle);
 
-    const middle = try conv.spawnSubagent("middle");
-    const leaf = try middle.spawnSubagent("leaf");
+    const middle = try conv.spawnSubagent("middle", "");
+    const leaf = try middle.spawnSubagent("leaf", "");
     try leaf.persistEventInternal(.{
         .entry_type = .task_message,
         .content = "from grandchild",
@@ -2157,7 +2198,7 @@ test "spawnSubagent appends child and link node atomically" {
     var conv = try Conversation.init(std.testing.allocator, 0, "parent");
     defer conv.deinit();
 
-    const child = try conv.spawnSubagent("codereview");
+    const child = try conv.spawnSubagent("codereview", "");
 
     try std.testing.expectEqual(@as(usize, 1), conv.subagents.items.len);
     try std.testing.expectEqual(child, conv.subagents.items[0]);
@@ -2178,8 +2219,8 @@ test "deinit walks subagents recursively" {
     var conv = try Conversation.init(std.testing.allocator, 0, "parent");
     defer conv.deinit();
 
-    const child = try conv.spawnSubagent("codereview");
-    _ = try child.spawnSubagent("nested");
+    const child = try conv.spawnSubagent("codereview", "");
+    _ = try child.spawnSubagent("nested", "");
 }
 
 test "toWireMessages projects subagent_link as tool_use + tool_result" {
@@ -2190,7 +2231,7 @@ test "toWireMessages projects subagent_link as tool_use + tool_result" {
     defer conv.deinit();
 
     _ = try conv.appendNode(null, .user_message, "do the thing");
-    const child = try conv.spawnSubagent("codereview");
+    const child = try conv.spawnSubagent("codereview", "review please");
     _ = try child.appendNode(null, .user_message, "review please");
     _ = try child.appendNode(null, .assistant_text, "looks good");
 
@@ -2228,7 +2269,7 @@ test "toWireMessages projects errored subagent as tool_result with is_error" {
     defer conv.deinit();
 
     _ = try conv.appendNode(null, .user_message, "do the thing");
-    const child = try conv.spawnSubagent("codereview");
+    const child = try conv.spawnSubagent("codereview", "review please");
     _ = try child.appendNode(null, .user_message, "review please");
     _ = try child.appendNode(null, .err, "boom");
 
@@ -2239,4 +2280,97 @@ test "toWireMessages projects errored subagent as tool_result with is_error" {
     try std.testing.expect(tr == .tool_result);
     try std.testing.expectEqual(true, tr.tool_result.is_error);
     try std.testing.expectEqualStrings("boom", tr.tool_result.content);
+}
+
+test "appendNode in child bumps parent's subagent_link content_version" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    const child = try conv.spawnSubagent("codereview", "");
+    const link_node = conv.tree.root_children.items[0];
+    const before = link_node.content_version;
+    const parent_gen_before = conv.tree.currentGeneration();
+
+    _ = try child.appendNode(null, .assistant_text, "hi");
+
+    try std.testing.expectEqual(before +% 1, link_node.content_version);
+    // Parent's generation also bumped so Compositor short-circuits don't
+    // skip the redraw that NodeLineCache invalidation depends on.
+    try std.testing.expect(conv.tree.currentGeneration() != parent_gen_before);
+}
+
+test "appendToNode in child bumps parent's subagent_link content_version" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    const child = try conv.spawnSubagent("codereview", "");
+    const target = try child.appendNode(null, .assistant_text, "hi");
+    const link_node = conv.tree.root_children.items[0];
+    const before = link_node.content_version;
+
+    try child.appendToNode(target, " there");
+
+    try std.testing.expectEqual(before +% 1, link_node.content_version);
+}
+
+test "appendNode in grandchild bumps both middle and root link nodes" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "root");
+    defer conv.deinit();
+
+    const middle = try conv.spawnSubagent("middle", "");
+    const leaf = try middle.spawnSubagent("leaf", "");
+
+    const root_link = conv.tree.root_children.items[0];
+    const middle_link = middle.tree.root_children.items[0];
+    const root_before = root_link.content_version;
+    const middle_before = middle_link.content_version;
+
+    _ = try leaf.appendNode(null, .assistant_text, "deep");
+
+    // The walk in notifyChildChanged steps from leaf -> middle -> root,
+    // bumping each parent's link node along the way. Both must update,
+    // otherwise the renderer at the corresponding depth keeps a stale
+    // "[subagent: name] running" line cached forever.
+    try std.testing.expectEqual(middle_before +% 1, middle_link.content_version);
+    try std.testing.expectEqual(root_before +% 1, root_link.content_version);
+}
+
+test "spawnSubagent stashes prompt on subagent_link node" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    _ = try conv.spawnSubagent("codereview", "review the diff");
+    const link_node = conv.tree.root_children.items[0];
+
+    try std.testing.expect(link_node.subagent_prompt != null);
+    try std.testing.expectEqualStrings("review the diff", link_node.subagent_prompt.?);
+}
+
+test "toWireMessages projects subagent_prompt directly without system-prefix leak" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    // Mirrors `tools/task.zig`'s runChild: the caller's prompt goes
+    // into spawnSubagent, but the child's first user_message carries
+    // the subagent system-prompt prefix concatenated in front. Pre-fix
+    // childInitialPrompt read from that user_message and leaked the
+    // prefix into the wire format.
+    const original_prompt = "review this";
+    const prefixed_user_msg = "You are codereview. Be thorough.\n\nreview this";
+
+    _ = try conv.appendNode(null, .user_message, "delegate");
+    const child = try conv.spawnSubagent("codereview", original_prompt);
+    _ = try child.appendNode(null, .user_message, prefixed_user_msg);
+    _ = try child.appendNode(null, .assistant_text, "ok");
+
+    const messages = try conv.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+
+    const tool_use_block = messages.items[1].content[messages.items[1].content.len - 1];
+    try std.testing.expect(tool_use_block == .tool_use);
+    try std.testing.expect(std.mem.indexOf(u8, tool_use_block.tool_use.input_raw, "\"prompt\":\"review this\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_use_block.tool_use.input_raw, "You are codereview") == null);
 }

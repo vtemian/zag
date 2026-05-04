@@ -911,7 +911,7 @@ test "subagent_link renders status reflecting child Conversation tail node" {
     var parent = try @import("Conversation.zig").init(allocator, 0, "parent");
     defer parent.deinit();
 
-    const child = try parent.spawnSubagent("codereview");
+    const child = try parent.spawnSubagent("codereview", "");
     const link = parent.tree.root_children.items[parent.tree.root_children.items.len - 1];
 
     const theme = Theme.defaultTheme();
