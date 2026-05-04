@@ -65,6 +65,17 @@ const Prefixes = struct {
 ///                 final summary lands as a trailing text node).
 ///   * `failed`  — child's tail is `err`.
 ///   * `missing` — back-pointer absent or index out of bounds.
+///
+/// Threading policy: this runs on the UI thread during render, but the
+/// parent's agent thread may concurrently be appending into
+/// `child.tree.root_children` from inside `task.zig`'s `runChild`.
+/// Reads of `items.len` and the tail's `node_type` are unsynchronized.
+/// Worst case is a stale length (we miss a freshly-appended tail) or
+/// a torn slice header (rare; non-atomic on resize), which manifests
+/// as a slightly-stale status label that the next render frame fixes.
+/// See the threading-policy note on `Conversation.tree` for the
+/// broader rationale and the future-work options (seqlock /
+/// restrict-drill-in / live event subscription).
 fn subagentStatus(node: *const Node) []const u8 {
     const parent_opaque = node.subagent_parent orelse return "missing";
     const parent: *const Conversation = @ptrCast(@alignCast(parent_opaque));

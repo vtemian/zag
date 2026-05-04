@@ -1505,6 +1505,17 @@ fn lastSubagentLink(conv: *Conversation) ?*Conversation.Node {
 /// (no runner, no session handle) and is marked `is_subagent_view`
 /// so closing it leaves the underlying transcript intact.
 ///
+/// Threading policy: the `subagent_link` node is appended at spawn time,
+/// so the user CAN drill into a still-running subagent. The drill-down
+/// pane renders a snapshot of the child's tree as of the most recent
+/// UI frame; the parent's agent thread continues mutating
+/// `child.tree` from inside `runChild` while the pane is open. The
+/// rendered pane is NOT live (no event subscription on the child's
+/// BufferSink) and reads of `child.tree` are unsynchronized. See the
+/// threading-policy note on `Conversation.tree` for the rationale and
+/// future work (seqlock / restrict-drill-in-until-joined / live event
+/// subscription).
+///
 /// Errors:
 ///   * `error.NotASubagentLink`     — `node.node_type != .subagent_link`.
 ///   * `error.NoConversation`       — parent pane has no Conversation.

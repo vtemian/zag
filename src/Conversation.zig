@@ -39,6 +39,27 @@ name: []const u8,
 /// Semantic node tree, owned by value. Read as `self.tree.root_children`
 /// etc.; the mutation methods on `Conversation` (`appendNode`,
 /// `clear`, ...) delegate through to this tree for backward compat.
+///
+/// Threading policy: the tree is single-thread-mutated. All writes
+/// flow from the agent thread that owns this Conversation's `AgentRunner`
+/// (or, for child Conversations spawned by `task.zig`, the parent's agent
+/// thread while it sits inside `runChild` draining child events into the
+/// child's `BufferSink`). The UI thread reads the tree during rendering
+/// without synchronization. For the parent Conversation that's safe
+/// because the agent thread parks while the orchestrator drains its
+/// queue on the UI thread; for a child Conversation that the user has
+/// drilled into via `WindowManager.enterSubagent` the parent's agent
+/// thread may still be appending nodes while the UI thread renders the
+/// drill-down pane.
+///
+/// We accept torn reads of the slice header on a resizing ArrayList
+/// for the placeholder/status rendering today: the worst case is a
+/// stale length or a tail node read mid-resize, which manifests as a
+/// slightly-out-of-date status line that the next render frame fixes.
+/// A future Phase F (or a live-status feature) should either add a
+/// seqlock around the child's tree, restrict drill-in until the child's
+/// runner has joined, or subscribe the drill-down pane to the child's
+/// BufferSink dirty events for synchronized live updates.
 tree: ConversationTree,
 /// Allocator used for all buffer-owned allocations (name, cache). The
 /// tree holds its own copy of the same allocator.
@@ -79,6 +100,15 @@ last_persisted_id: ?ulid.Ulid = null,
 /// child pointers stay stable across resizes; the parent's `deinit`
 /// recursively walks this list, frees each child's tree+registry+name,
 /// and destroys the heap slot.
+///
+/// Threading policy: child Conversations may be in use by their own
+/// runners (or by the parent's agent thread inside `runChild`) while
+/// the parent renders the `subagent_link` line on the UI thread.
+/// `NodeRenderer.subagentStatus` reads `child.tree.root_children` to
+/// derive the live status string. That read is unsynchronized; the
+/// worst case is a stale or torn status string, which the next render
+/// pass corrects. See the threading-policy note on `tree` above for
+/// the broader rationale.
 subagents: std.ArrayList(*Conversation) = .empty,
 /// Backlink to the parent Conversation, or null for root. Used by
 /// commit 2 so a child's `persistEvent` can delegate through the parent
