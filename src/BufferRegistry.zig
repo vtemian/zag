@@ -10,7 +10,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ScratchBuffer = @import("buffers/scratch.zig");
-const GraphicsBuffer = @import("buffers/graphics.zig");
+const ImageBuffer = @import("buffers/image.zig");
 const TextBuffer = @import("buffers/text.zig");
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
@@ -19,17 +19,17 @@ const BufferRegistry = @This();
 
 pub const Error = error{StaleBuffer};
 
-pub const Kind = enum { scratch, graphics, text };
+pub const Kind = enum { scratch, image, text };
 
 pub const Entry = union(Kind) {
     scratch: *ScratchBuffer,
-    graphics: *GraphicsBuffer,
+    image: *ImageBuffer,
     text: *TextBuffer,
 
     fn destroy(self: Entry) void {
         switch (self) {
             .scratch => |p| p.destroy(),
-            .graphics => |p| p.destroy(),
+            .image => |p| p.destroy(),
             .text => |p| p.destroy(),
         }
     }
@@ -37,7 +37,7 @@ pub const Entry = union(Kind) {
     fn asBuffer(self: Entry) Buffer {
         return switch (self) {
             .scratch => |p| p.buf(),
-            .graphics => |p| p.buf(),
+            .image => |p| p.buf(),
             .text => |p| p.buf(),
         };
     }
@@ -45,7 +45,7 @@ pub const Entry = union(Kind) {
     fn asView(self: Entry) !View {
         return switch (self) {
             .scratch => |p| p.view(),
-            .graphics => |p| p.view(),
+            .image => |p| p.view(),
             .text => error.NoViewForKind,
         };
     }
@@ -90,12 +90,12 @@ pub fn createScratch(self: *BufferRegistry, name: []const u8) !Handle {
     return try self.insert(.{ .scratch = sb });
 }
 
-pub fn createGraphics(self: *BufferRegistry, name: []const u8) !Handle {
+pub fn createImage(self: *BufferRegistry, name: []const u8) !Handle {
     const buffer_id = self.next_buffer_id;
     self.next_buffer_id += 1;
-    const gb = try GraphicsBuffer.create(self.allocator, buffer_id, name);
-    errdefer gb.destroy();
-    return try self.insert(.{ .graphics = gb });
+    const ib = try ImageBuffer.create(self.allocator, buffer_id, name);
+    errdefer ib.destroy();
+    return try self.insert(.{ .image = ib });
 }
 
 pub fn createText(self: *BufferRegistry, name: []const u8) !Handle {
@@ -189,44 +189,44 @@ test "generation bumps on slot reuse" {
     try std.testing.expectError(Error.StaleBuffer, r.resolve(h1));
 }
 
-test "createGraphics returns a resolvable handle" {
+test "createImage returns a resolvable handle" {
     var r = BufferRegistry.init(std.testing.allocator);
     defer r.deinit();
-    const h = try r.createGraphics("viewer");
+    const h = try r.createImage("viewer");
     const entry = try r.resolve(h);
-    try std.testing.expect(entry == .graphics);
+    try std.testing.expect(entry == .image);
 }
 
-test "asBuffer on graphics entry returns a Buffer backed by the GraphicsBuffer" {
+test "asBuffer on image entry returns a Buffer backed by the ImageBuffer" {
     var r = BufferRegistry.init(std.testing.allocator);
     defer r.deinit();
-    const h = try r.createGraphics("viewer");
+    const h = try r.createImage("viewer");
     const entry = try r.resolve(h);
-    const gb = entry.graphics;
+    const ib = entry.image;
     const b = try r.asBuffer(h);
-    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(gb)), b.ptr);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(ib)), b.ptr);
     try std.testing.expectEqualStrings("viewer", b.getName());
-    try std.testing.expectEqual(gb.id, b.getId());
+    try std.testing.expectEqual(ib.id, b.getId());
 
     const scratch_handle = try r.createScratch("other");
     const scratch_buf = try r.asBuffer(scratch_handle);
     try std.testing.expect(b.vtable != scratch_buf.vtable);
 }
 
-test "asView on graphics entry returns a View backed by the GraphicsBuffer" {
+test "asView on image entry returns a View backed by the ImageBuffer" {
     var r = BufferRegistry.init(std.testing.allocator);
     defer r.deinit();
-    const h = try r.createGraphics("viewer");
+    const h = try r.createImage("viewer");
     const entry = try r.resolve(h);
     const v = try r.asView(h);
-    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(entry.graphics)), v.ptr);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(entry.image)), v.ptr);
     try std.testing.expectEqual(@as(usize, 0), try v.lineCount());
 }
 
-test "remove on graphics entry destroys the GraphicsBuffer" {
+test "remove on image entry destroys the ImageBuffer" {
     var r = BufferRegistry.init(std.testing.allocator);
     defer r.deinit();
-    const h = try r.createGraphics("viewer");
+    const h = try r.createImage("viewer");
     try r.remove(h);
     try std.testing.expectError(Error.StaleBuffer, r.resolve(h));
 }
