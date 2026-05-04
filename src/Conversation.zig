@@ -421,59 +421,102 @@ pub fn readText(
 /// been spawned; JSONL entries are always in chronological order so the
 /// most recently seen tool_call is the right parent.
 pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !void {
+    // Per-Conversation last_tool_call chains. The parent and each
+    // subagent each need their own pairing window so a child's
+    // tool_result is never threaded onto the parent's most recent
+    // tool_call (or vice versa). Children are spawned lazily as
+    // tagged entries arrive; the chain heads are tracked in parallel.
     var last_tool_call: ?*Node = null;
+    var child_last_tool_calls: std.ArrayList(?*Node) = .empty;
+    defer child_last_tool_calls.deinit(self.allocator);
+
     for (entries) |entry| {
-        switch (entry.entry_type) {
-            .user_message => _ = try self.appendNode(null, .user_message, entry.content),
-            .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
-            .tool_call => {
-                const node = try self.appendNode(null, .tool_call, entry.tool_name);
-                // Match the live BufferSink path: tool_calls reload collapsed
-                // so prior turns read as compact `[tool] foo` headers, with
-                // Ctrl-R as the opt-in to inspect the body.
-                node.collapsed = true;
-                last_tool_call = node;
-            },
-            .tool_result => {
-                _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
-            },
-            .info => _ = try self.appendNode(null, .status, entry.content),
-            .err => _ = try self.appendNode(null, .err, entry.content),
-            .session_start, .session_rename => {},
-            // `task_start` / `task_end` are audit markers for subagent
-            // delegation. The subagent's own output is persisted inline
-            // as the parent's tool_result, so replaying them as separate
-            // nodes would duplicate content in the buffer view.
-            .task_start, .task_end => {},
-            // Inline subagent events. Render them with the same node
-            // types as their top-level counterparts so the user sees
-            // child activity in the transcript on replay. The
-            // `task_start` / `task_end` markers above still bracket the
-            // delegation in the JSONL stream.
-            .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
-            .task_tool_use => {
-                const node = try self.appendNode(null, .tool_call, entry.tool_name);
-                node.collapsed = true;
-                last_tool_call = node;
-            },
-            .task_tool_result => {
-                _ = try self.appendNode(last_tool_call, .tool_result, entry.content);
-            },
-            .thinking => {
-                const node = try self.appendNode(null, .thinking, entry.content);
-                // Replay has no streaming context; collapse so the
-                // transcript reads cleanly and the user opts into
-                // reasoning content with Ctrl-R.
-                node.collapsed = true;
-            },
-            .thinking_redacted => {
-                const node = try self.appendNode(null, .thinking_redacted, "");
-                node.collapsed = true;
-            },
+        if (entry.subagent_id) |sid| {
+            // Lazily reserve subagent slots up to and including `sid`.
+            // The first tagged entry for a given id triggers the
+            // spawn; the actual agent name is unknown at this point
+            // (the marker entry that carried it may not be the first
+            // tagged entry, in particular when `task_start` itself is
+            // a root-tagged event), so we use a placeholder name and
+            // rely on subsequent task_start markers to refine it.
+            while (self.subagents.items.len <= sid) {
+                _ = try self.spawnSubagent("(unknown)");
+                try child_last_tool_calls.append(self.allocator, null);
+            }
+            // Backfill child_last_tool_calls if subagents was extended
+            // outside this loop (defensive; the lazy spawn above keeps
+            // them in lockstep, but earlier iterations may have grown
+            // the parent's subagents list before we started tracking).
+            while (child_last_tool_calls.items.len < self.subagents.items.len) {
+                try child_last_tool_calls.append(self.allocator, null);
+            }
+            const child = self.subagents.items[sid];
+            try child.handleLoadedEntry(entry, &child_last_tool_calls.items[sid]);
+        } else {
+            try self.handleLoadedEntry(entry, &last_tool_call);
         }
     }
     // Each appendNode already bumped tree.generation, so isDirty() will
     // pick this up on the next compositor pass without a separate flag.
+}
+
+/// Append a single loaded entry to this Conversation's tree, threading
+/// the tool_call/tool_result pairing through `last_tool_call`. Extracted
+/// from `loadFromEntries` so subagent-tagged entries can drive the same
+/// dispatch on a child Conversation.
+fn handleLoadedEntry(
+    self: *Conversation,
+    entry: Session.Entry,
+    last_tool_call: *?*Node,
+) !void {
+    switch (entry.entry_type) {
+        .user_message => _ = try self.appendNode(null, .user_message, entry.content),
+        .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
+        .tool_call => {
+            const node = try self.appendNode(null, .tool_call, entry.tool_name);
+            // Match the live BufferSink path: tool_calls reload collapsed
+            // so prior turns read as compact `[tool] foo` headers, with
+            // Ctrl-R as the opt-in to inspect the body.
+            node.collapsed = true;
+            last_tool_call.* = node;
+        },
+        .tool_result => {
+            _ = try self.appendNode(last_tool_call.*, .tool_result, entry.content);
+        },
+        .info => _ = try self.appendNode(null, .status, entry.content),
+        .err => _ = try self.appendNode(null, .err, entry.content),
+        .session_start, .session_rename => {},
+        // `task_start` / `task_end` are audit markers for subagent
+        // delegation. The subagent's own output is persisted inline
+        // as the parent's tool_result, so replaying them as separate
+        // nodes would duplicate content in the buffer view.
+        .task_start, .task_end => {},
+        // Inline subagent events. Render them with the same node
+        // types as their top-level counterparts so the user sees
+        // child activity in the transcript on replay. The
+        // `task_start` / `task_end` markers above still bracket the
+        // delegation in the JSONL stream.
+        .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
+        .task_tool_use => {
+            const node = try self.appendNode(null, .tool_call, entry.tool_name);
+            node.collapsed = true;
+            last_tool_call.* = node;
+        },
+        .task_tool_result => {
+            _ = try self.appendNode(last_tool_call.*, .tool_result, entry.content);
+        },
+        .thinking => {
+            const node = try self.appendNode(null, .thinking, entry.content);
+            // Replay has no streaming context; collapse so the
+            // transcript reads cleanly and the user opts into
+            // reasoning content with Ctrl-R.
+            node.collapsed = true;
+        },
+        .thinking_redacted => {
+            const node = try self.appendNode(null, .thinking_redacted, "");
+            node.collapsed = true;
+        },
+    }
 }
 
 /// Remove all nodes from the buffer and wipe the cache. The tree's
@@ -560,6 +603,15 @@ pub fn persistEvent(self: *Conversation, entry: Session.Entry) void {
 /// pump) that want to log a more specific message instead of flipping
 /// `persist_failed`.
 pub fn persistEventInternal(self: *Conversation, entry: Session.Entry) !void {
+    if (self.parent) |p| {
+        // Stamp our subagent index on the entry and recurse upward;
+        // the actual SessionHandle.appendEntry happens at the root,
+        // which keeps a single-rooted JSONL with all events tagged.
+        var stamped = entry;
+        stamped.subagent_id = self.parent_subagent_id;
+        return p.persistEventInternal(stamped);
+    }
+
     const sh = self.session_handle orelse return;
     var entry_with_parent = entry;
     if (entry_with_parent.parent_id == null) {
@@ -1310,6 +1362,133 @@ test "loadFromEntries reloads tool_call nodes collapsed" {
     try std.testing.expect(cb.tree.root_children.items[1].collapsed);
     try std.testing.expectEqual(NodeType.tool_call, cb.tree.root_children.items[2].node_type);
     try std.testing.expect(cb.tree.root_children.items[2].collapsed);
+}
+
+// Test helper: best-effort cwd restore. Mirrors `restoreCwd` from
+// Session.zig (private to that file); duplicated here so these tests
+// don't have to reach across modules for a one-liner. Errors are
+// swallowed because a failed restore inside `defer` can't be reported
+// and the tmpDir cleanup still wins.
+fn restoreTestCwd(abs_path: []const u8) void {
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
+    defer dir.close();
+    dir.setAsCwd() catch {};
+}
+
+test "child Conversation persistEvent stamps subagent_id and routes through parent" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreTestCwd(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    var conv = try Conversation.init(allocator, 0, "parent");
+    defer conv.deinit();
+    conv.attachSession(&handle);
+
+    const child = try conv.spawnSubagent("codereview");
+    try child.persistEventInternal(.{
+        .entry_type = .task_message,
+        .content = "from child",
+        .timestamp = 1,
+    });
+
+    // Read the JSONL back via loadEntries and verify the last entry
+    // carries subagent_id == 0 (the child's parent_subagent_id).
+    const session_id = handle.id[0..handle.id_len];
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+    try std.testing.expect(loaded.len >= 1);
+    const last = loaded[loaded.len - 1];
+    try std.testing.expectEqual(Session.EntryType.task_message, last.entry_type);
+    try std.testing.expectEqualStrings("from child", last.content);
+    try std.testing.expect(last.subagent_id != null);
+    try std.testing.expectEqual(@as(u32, 0), last.subagent_id.?);
+}
+
+test "loadFromEntries reconstructs subagents from tagged entries" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreTestCwd(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    // Build a parent + one subagent and persist a few events through
+    // both. The child's persistEventInternal must stamp subagent_id;
+    // the parent's must not.
+    var conv = try Conversation.init(allocator, 0, "parent");
+    conv.attachSession(&handle);
+
+    try conv.persistEventInternal(.{
+        .entry_type = .user_message,
+        .content = "do the thing",
+        .timestamp = 1,
+    });
+    const child = try conv.spawnSubagent("codereview");
+    try child.persistEventInternal(.{
+        .entry_type = .task_message,
+        .content = "child reply",
+        .timestamp = 2,
+    });
+    try conv.persistEventInternal(.{
+        .entry_type = .assistant_text,
+        .content = "wrap up",
+        .timestamp = 3,
+    });
+    conv.deinit();
+
+    // Now reload from disk into a fresh parent Conversation and assert
+    // the subagent slot was lazily reconstructed with the child's
+    // tagged entry routed into its tree.
+    const session_id = handle.id[0..handle.id_len];
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    var replay = try Conversation.init(allocator, 0, "replay");
+    defer replay.deinit();
+    try replay.loadFromEntries(loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), replay.subagents.items.len);
+    const replay_child = replay.subagents.items[0];
+    try std.testing.expectEqual(@as(usize, 1), replay_child.tree.root_children.items.len);
+    try std.testing.expectEqual(NodeType.assistant_text, replay_child.tree.root_children.items[0].node_type);
+    const child_tb = try replay_child.buffer_registry.asText(
+        replay_child.tree.root_children.items[0].buffer_id.?,
+    );
+    try std.testing.expectEqualStrings("child reply", child_tb.bytesView());
+
+    // Parent tree carries: user_message, assistant_text. The
+    // session_start row from createSession has its own entry but
+    // loadFromEntries skips session_start. Note: spawnSubagent appends
+    // a subagent_link node only when the parent itself spawns; on
+    // replay the tagged entries are routed to the child but the
+    // parent's tree only sees its own entries — so no link node is
+    // implicitly added during replay. That's a known gap covered by a
+    // task_start refinement; for commit 2 we only assert the child
+    // routing behaves.
+    try std.testing.expectEqual(NodeType.user_message, replay.tree.root_children.items[0].node_type);
 }
 
 test "Ctrl-R toggles collapsed on every thinking node" {
