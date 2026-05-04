@@ -1,4 +1,4 @@
-//! GraphicsBuffer: a Buffer vtable impl that displays a decoded RGBA
+//! ImageBuffer: a Buffer vtable impl that displays a decoded RGBA
 //! image as half-block truecolor cells. Uses the normal cell pipeline;
 //! no Screen changes needed. Sits under src/buffers/ next to
 //! ScratchBuffer so the two primitives share mental model.
@@ -13,7 +13,7 @@ const input = @import("../input.zig");
 const halfblock = @import("../halfblock.zig");
 const png_decode = @import("../png_decode.zig");
 
-const GraphicsBuffer = @This();
+const ImageBuffer = @This();
 
 /// How the image is mapped into the pane's cell grid. `contain` preserves
 /// aspect ratio and letterboxes the unused axis with theme bg; `fill`
@@ -48,10 +48,10 @@ scroll_offset: u32 = 0,
 /// Viewports can decide when to invalidate.
 content_version: u64 = 0,
 
-/// Allocate a new GraphicsBuffer on the heap. The name is duped so the
+/// Allocate a new ImageBuffer on the heap. The name is duped so the
 /// caller may free their copy immediately.
-pub fn create(allocator: Allocator, id: u32, name: []const u8) !*GraphicsBuffer {
-    const self = try allocator.create(GraphicsBuffer);
+pub fn create(allocator: Allocator, id: u32, name: []const u8) !*ImageBuffer {
+    const self = try allocator.create(ImageBuffer);
     errdefer allocator.destroy(self);
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
@@ -64,7 +64,7 @@ pub fn create(allocator: Allocator, id: u32, name: []const u8) !*GraphicsBuffer 
 }
 
 /// Free all buffer-owned memory and destroy the heap slot.
-pub fn destroy(self: *GraphicsBuffer) void {
+pub fn destroy(self: *ImageBuffer) void {
     if (self.pixels_owned) |pixels| self.allocator.free(pixels);
     self.allocator.free(self.name);
     self.allocator.destroy(self);
@@ -72,7 +72,7 @@ pub fn destroy(self: *GraphicsBuffer) void {
 
 /// Decode `bytes` and adopt the resulting image as the display target.
 /// Any previously held pixel buffer is freed. Marks the buffer dirty.
-pub fn setPng(self: *GraphicsBuffer, bytes: []const u8) !void {
+pub fn setPng(self: *ImageBuffer, bytes: []const u8) !void {
     var decoded = try png_decode.decode(self.allocator, bytes);
     errdefer decoded.deinit(self.allocator);
     if (self.pixels_owned) |old| self.allocator.free(old);
@@ -83,7 +83,7 @@ pub fn setPng(self: *GraphicsBuffer, bytes: []const u8) !void {
 }
 
 /// Change the fit mode. Only dirties when the value actually moves.
-pub fn setFit(self: *GraphicsBuffer, fit: Fit) void {
+pub fn setFit(self: *ImageBuffer, fit: Fit) void {
     if (self.fit != fit) {
         self.fit = fit;
         self.dirty = true;
@@ -91,20 +91,20 @@ pub fn setFit(self: *GraphicsBuffer, fit: Fit) void {
     }
 }
 
-/// Return the type-erased Buffer view for this GraphicsBuffer.
-pub fn buf(self: *GraphicsBuffer) Buffer {
+/// Return the type-erased Buffer view for this ImageBuffer.
+pub fn buf(self: *ImageBuffer) Buffer {
     return .{ .ptr = self, .vtable = &vtable };
 }
 
-/// Return the View interface for this GraphicsBuffer. Today every
-/// GraphicsBuffer has exactly one View, backed by the same `*Self`
+/// Return the View interface for this ImageBuffer. Today every
+/// ImageBuffer has exactly one View, backed by the same `*Self`
 /// pointer.
-pub fn view(self: *GraphicsBuffer) View {
+pub fn view(self: *ImageBuffer) View {
     return .{ .ptr = self, .vtable = &view_vtable };
 }
 
 /// Recover the concrete pointer from a type-erased Buffer.
-pub fn fromBuffer(b: Buffer) *GraphicsBuffer {
+pub fn fromBuffer(b: Buffer) *ImageBuffer {
     return @ptrCast(@alignCast(b.ptr));
 }
 
@@ -131,27 +131,27 @@ fn viewGetVisibleLines(
     skip: usize,
     max_lines: usize,
 ) anyerror!std.ArrayList(Theme.StyledLine) {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
 fn viewLineCount(ptr: *anyopaque) anyerror!usize {
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.lineCount();
 }
 
 fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.handleKey(ev);
 }
 
 fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *ImageBuffer = @ptrCast(@alignCast(ptr));
     self.onResize(rect);
 }
 
 fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *ImageBuffer = @ptrCast(@alignCast(ptr));
     self.onFocus(focused);
 }
 
@@ -161,12 +161,12 @@ fn viewOnMouse(
     local_x: u16,
     local_y: u16,
 ) View.HandleResult {
-    const self: *GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.onMouse(ev, local_x, local_y);
 }
 
 pub fn getVisibleLines(
-    self: *const GraphicsBuffer,
+    self: *const ImageBuffer,
     frame_alloc: Allocator,
     cache_alloc: Allocator,
     theme: *const Theme,
@@ -205,32 +205,32 @@ fn themeBgAsPixel(theme: *const Theme) halfblock.Pixel {
 }
 
 fn bufGetName(ptr: *anyopaque) []const u8 {
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.name;
 }
 
 fn bufGetId(ptr: *anyopaque) u32 {
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.id;
 }
 
-pub fn lineCount(self: *const GraphicsBuffer) anyerror!usize {
+pub fn lineCount(self: *const ImageBuffer) anyerror!usize {
     _ = self;
     return 0;
 }
 
 fn bufContentVersion(ptr: *anyopaque) u64 {
-    const self: *const GraphicsBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const ImageBuffer = @ptrCast(@alignCast(ptr));
     return self.content_version;
 }
 
-pub fn handleKey(self: *GraphicsBuffer, ev: input.KeyEvent) View.HandleResult {
+pub fn handleKey(self: *ImageBuffer, ev: input.KeyEvent) View.HandleResult {
     _ = self;
     _ = ev;
     return .passthrough;
 }
 
-pub fn onResize(self: *GraphicsBuffer, rect: Layout.Rect) void {
+pub fn onResize(self: *ImageBuffer, rect: Layout.Rect) void {
     if (self.last_render_cols != rect.width or self.last_render_rows != rect.height) {
         self.last_render_cols = rect.width;
         self.last_render_rows = rect.height;
@@ -239,13 +239,13 @@ pub fn onResize(self: *GraphicsBuffer, rect: Layout.Rect) void {
     }
 }
 
-pub fn onFocus(self: *GraphicsBuffer, focused: bool) void {
+pub fn onFocus(self: *ImageBuffer, focused: bool) void {
     _ = self;
     _ = focused;
 }
 
 pub fn onMouse(
-    self: *GraphicsBuffer,
+    self: *ImageBuffer,
     ev: input.MouseEvent,
     local_x: u16,
     local_y: u16,
@@ -270,7 +270,7 @@ const tiny_red_png = [_]u8{
 
 test "create / destroy round trip with no image" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 7, "diagram");
+    var gb = try ImageBuffer.create(gpa, 7, "diagram");
     defer gb.destroy();
     try std.testing.expectEqual(@as(u32, 7), gb.id);
     try std.testing.expectEqualStrings("diagram", gb.name);
@@ -280,7 +280,7 @@ test "create / destroy round trip with no image" {
 
 test "setPng decodes a 1x1 red PNG and getVisibleLines renders one halfblock span" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 1, "img");
+    var gb = try ImageBuffer.create(gpa, 1, "img");
     defer gb.destroy();
 
     try gb.setPng(&tiny_red_png);
@@ -307,7 +307,7 @@ test "setPng decodes a 1x1 red PNG and getVisibleLines renders one halfblock spa
 
 test "setPng replaces prior image without leaking" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 2, "img");
+    var gb = try ImageBuffer.create(gpa, 2, "img");
     defer gb.destroy();
 
     try gb.setPng(&tiny_red_png);
@@ -324,7 +324,7 @@ test "setPng replaces prior image without leaking" {
 
 test "setFit changes fit and marks dirty" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 3, "img");
+    var gb = try ImageBuffer.create(gpa, 3, "img");
     defer gb.destroy();
     gb.dirty = false;
     gb.setFit(.fill);
@@ -338,7 +338,7 @@ test "setFit changes fit and marks dirty" {
 
 test "onResize updates cell grid and marks dirty on change" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 4, "img");
+    var gb = try ImageBuffer.create(gpa, 4, "img");
     defer gb.destroy();
     gb.dirty = false;
 
@@ -354,7 +354,7 @@ test "onResize updates cell grid and marks dirty on change" {
 
 test "buf().getId round-trips the id" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 99, "img");
+    var gb = try ImageBuffer.create(gpa, 99, "img");
     defer gb.destroy();
     try std.testing.expectEqual(@as(u32, 99), gb.buf().getId());
     try std.testing.expectEqualStrings("img", gb.buf().getName());
@@ -362,7 +362,7 @@ test "buf().getId round-trips the id" {
 
 test "setFit(.contain) letterboxes a 1x1 image inside a wide pane" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 5, "img");
+    var gb = try ImageBuffer.create(gpa, 5, "img");
     defer gb.destroy();
 
     try gb.setPng(&tiny_red_png);
@@ -390,7 +390,7 @@ test "setFit(.contain) letterboxes a 1x1 image inside a wide pane" {
 
 test "setFit(.fill) stretches the image across the full pane" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 6, "img");
+    var gb = try ImageBuffer.create(gpa, 6, "img");
     defer gb.destroy();
 
     try gb.setPng(&tiny_red_png);
@@ -414,9 +414,9 @@ test "setFit(.fill) stretches the image across the full pane" {
     }
 }
 
-test "GraphicsBuffer.view() renders a half-block raster" {
+test "ImageBuffer.view() renders a half-block raster" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 8, "view");
+    var gb = try ImageBuffer.create(gpa, 8, "view");
     defer gb.destroy();
 
     try gb.setPng(&tiny_red_png);
@@ -437,7 +437,7 @@ test "GraphicsBuffer.view() renders a half-block raster" {
 
 test "contentVersion advances on setPng" {
     const gpa = std.testing.allocator;
-    var gb = try GraphicsBuffer.create(gpa, 9, "ver");
+    var gb = try ImageBuffer.create(gpa, 9, "ver");
     defer gb.destroy();
 
     const before = gb.buf().contentVersion();

@@ -13,7 +13,7 @@ const Keymap = @import("Keymap.zig");
 const Buffer = @import("Buffer.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const ScratchBuffer = @import("buffers/scratch.zig");
-const GraphicsBuffer = @import("buffers/graphics.zig");
+const ImageBuffer = @import("buffers/image.zig");
 const Theme = @import("Theme.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
@@ -3814,16 +3814,16 @@ pub const LuaEngine = struct {
     }
 
     /// Shared rejection arm for `zag.buffer.*` ops that only operate on
-    /// scratch buffers. Graphics buffers expose a different surface (pixel
+    /// scratch buffers. Image buffers expose a different surface (pixel
     /// data, no row addressing) so calling line/cursor APIs on them is a
     /// plugin bug worth surfacing as a Lua error rather than silently
     /// no-oping.
-    fn rejectGraphicsBuffer(lua: *Lua, comptime op_name: []const u8) noreturn {
+    fn rejectImageBuffer(lua: *Lua, comptime op_name: []const u8) noreturn {
         lua.raiseErrorStr(op_name ++ ": not supported on graphics buffers", .{});
     }
 
     /// Shared rejection arm for `zag.buffer.*` ops that target scratch or
-    /// graphics buffers but were called on a text buffer. Text buffers
+    /// image buffers but were called on a text buffer. Text buffers
     /// hold raw byte content (used by ConversationTree nodes) and don't
     /// expose the line/cursor or pixel surfaces.
     fn rejectTextBuffer(lua: *Lua, comptime op_name: []const u8) noreturn {
@@ -3854,11 +3854,11 @@ pub const LuaEngine = struct {
         // slot we release on pop, and the downstream branch compares
         // against it. The enum value carries the decision forward so
         // we don't keep the borrowed slice alive past the pop.
-        const KindTag = enum { scratch, graphics };
+        const KindTag = enum { scratch, image };
         const kind_tag: KindTag = if (std.mem.eql(u8, kind_str, "scratch"))
             .scratch
         else if (std.mem.eql(u8, kind_str, "graphics"))
-            .graphics
+            .image
         else {
             lua.raiseErrorStr("zag.buffer.create: unknown kind (valid kinds: \"scratch\", \"graphics\")", .{});
         };
@@ -3866,7 +3866,7 @@ pub const LuaEngine = struct {
 
         var name_buf: []const u8 = switch (kind_tag) {
             .scratch => "scratch",
-            .graphics => "graphics",
+            .image => "graphics",
         };
         _ = lua.getField(1, "name");
         if (!lua.isNil(-1)) {
@@ -3882,7 +3882,7 @@ pub const LuaEngine = struct {
         // safe.
         const handle_result: anyerror!BufferRegistry.Handle = switch (kind_tag) {
             .scratch => registry.createScratch(name_buf),
-            .graphics => registry.createGraphics(name_buf),
+            .image => registry.createImage(name_buf),
         };
         const handle = handle_result catch |err| {
             var buf: [128]u8 = undefined;
@@ -3949,7 +3949,7 @@ pub const LuaEngine = struct {
                     lua.raiseErrorStr("%s", .{msg.ptr});
                 };
             },
-            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.set_lines"),
+            .image => rejectImageBuffer(lua, "zag.buffer.set_lines"),
             .text => rejectTextBuffer(lua, "zag.buffer.set_lines"),
         }
         return 0;
@@ -3968,7 +3968,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
-            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.get_lines"),
+            .image => rejectImageBuffer(lua, "zag.buffer.get_lines"),
             .text => rejectTextBuffer(lua, "zag.buffer.get_lines"),
         }
     }
@@ -3981,7 +3981,7 @@ pub const LuaEngine = struct {
                 lua.pushInteger(@intCast(sb.lines.items.len));
                 return 1;
             },
-            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.line_count"),
+            .image => rejectImageBuffer(lua, "zag.buffer.line_count"),
             .text => rejectTextBuffer(lua, "zag.buffer.line_count"),
         }
     }
@@ -3999,7 +3999,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
-            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.cursor_row"),
+            .image => rejectImageBuffer(lua, "zag.buffer.cursor_row"),
             .text => rejectTextBuffer(lua, "zag.buffer.cursor_row"),
         }
     }
@@ -4024,7 +4024,7 @@ pub const LuaEngine = struct {
                 sb.cursor_row = if (count == 0) 0 else @min(zero_based, count - 1);
                 sb.dirty = true;
             },
-            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.set_cursor_row"),
+            .image => rejectImageBuffer(lua, "zag.buffer.set_cursor_row"),
             .text => rejectTextBuffer(lua, "zag.buffer.set_cursor_row"),
         }
         return 0;
@@ -4043,7 +4043,7 @@ pub const LuaEngine = struct {
                 }
                 return 1;
             },
-            .graphics => rejectGraphicsBuffer(lua, "zag.buffer.current_line"),
+            .image => rejectImageBuffer(lua, "zag.buffer.current_line"),
             .text => rejectTextBuffer(lua, "zag.buffer.current_line"),
         }
     }
@@ -4074,7 +4074,7 @@ pub const LuaEngine = struct {
     }
 
     /// `zag.buffer.set_png(handle, bytes)`: decode PNG bytes and store
-    /// the RGBA image on the graphics buffer referenced by `handle`.
+    /// the RGBA image on the image buffer referenced by `handle`.
     /// Lua 5.4 strings are 8-bit clean, so the PNG payload passes
     /// through unmangled. Scratch handles raise a Lua error instead of
     /// silently no-oping.
@@ -4087,8 +4087,8 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.buffer.set_png: arg 2 must be a string of PNG bytes", .{});
         };
         switch (entry) {
-            .graphics => |gb| {
-                gb.setPng(bytes) catch |err| {
+            .image => |ib| {
+                ib.setPng(bytes) catch |err| {
                     var buf: [128]u8 = undefined;
                     const msg = std.fmt.bufPrintZ(&buf, "zag.buffer.set_png: {s}", .{@errorName(err)}) catch "zag.buffer.set_png failed";
                     lua.raiseErrorStr("%s", .{msg.ptr});
@@ -4100,7 +4100,7 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// `zag.buffer.set_fit(handle, fit)`: set the graphics buffer's fit
+    /// `zag.buffer.set_fit(handle, fit)`: set the image buffer's fit
     /// policy. `fit` is one of `"contain"`, `"fill"`, `"actual"`. Any
     /// other string raises a Lua error; scratch handles raise a Lua
     /// error.
@@ -4112,7 +4112,7 @@ pub const LuaEngine = struct {
         const fit_str = lua.toString(2) catch {
             lua.raiseErrorStr("zag.buffer.set_fit: arg 2 must be a string", .{});
         };
-        const fit: GraphicsBuffer.Fit = if (std.mem.eql(u8, fit_str, "contain"))
+        const fit: ImageBuffer.Fit = if (std.mem.eql(u8, fit_str, "contain"))
             .contain
         else if (std.mem.eql(u8, fit_str, "fill"))
             .fill
@@ -4122,7 +4122,7 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.buffer.set_fit: fit must be \"contain\", \"fill\", or \"actual\"", .{});
         };
         switch (entry) {
-            .graphics => |gb| gb.setFit(fit),
+            .image => |ib| ib.setFit(fit),
             .scratch => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
             .text => lua.raiseErrorStr("zag.buffer.set_fit: handle is not a graphics buffer", .{}),
         }
@@ -4132,7 +4132,7 @@ pub const LuaEngine = struct {
     /// `zag.buffer.set_row_style(handle, row, slot)`: tag a 1-indexed
     /// row with a theme highlight slot string. The row override paints
     /// across the row's background at render time. Raises on
-    /// out-of-range row, unknown slot, or graphics handles.
+    /// out-of-range row, unknown slot, or image handles.
     fn zagBufferSetRowStyleFn(lua: *Lua) i32 {
         const entry = requireBufferEntry(lua, 1, "zag.buffer.set_row_style");
         if (lua.typeOf(2) != .number) {
@@ -4165,7 +4165,7 @@ pub const LuaEngine = struct {
                     },
                 };
             },
-            .graphics => lua.raiseErrorStr("zag.buffer.set_row_style: not supported on graphics buffers (no row addressing)", .{}),
+            .image => lua.raiseErrorStr("zag.buffer.set_row_style: not supported on graphics buffers (no row addressing)", .{}),
             .text => rejectTextBuffer(lua, "zag.buffer.set_row_style"),
         }
         return 0;
@@ -4173,9 +4173,9 @@ pub const LuaEngine = struct {
 
     /// `zag.buffer.clear_row_style(handle, row)`: drop a row's
     /// highlight override. No-op when the row has no override, and a
-    /// no-op on graphics buffers (which carry no row-style state).
-    /// Cleanup is permissive; only `set_row_style` raises on graphics
-    /// since it expresses an intent that cannot take effect.
+    /// no-op on image buffers (which carry no row-style state).
+    /// Cleanup is permissive; only `set_row_style` raises on image
+    /// buffers since it expresses an intent that cannot take effect.
     fn zagBufferClearRowStyleFn(lua: *Lua) i32 {
         const entry = requireBufferEntry(lua, 1, "zag.buffer.clear_row_style");
         if (lua.typeOf(2) != .number) {
@@ -4190,7 +4190,7 @@ pub const LuaEngine = struct {
         const row_zero: u32 = @intCast(row_lua - 1);
         switch (entry) {
             .scratch => |sb| sb.clearRowStyle(row_zero),
-            .graphics => {},
+            .image => {},
             .text => {},
         }
         return 0;
@@ -12616,7 +12616,7 @@ const tiny_red_png_fixture = [_]u8{
     0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 };
 
-test "zag.buffer.create kind=\"graphics\" returns a resolvable graphics handle" {
+test "zag.buffer.create kind=\"graphics\" returns a resolvable image handle" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
@@ -12634,11 +12634,11 @@ test "zag.buffer.create kind=\"graphics\" returns a resolvable graphics handle" 
     const handle_str = try engine.lua.toString(-1);
     const handle = try BufferRegistry.parseId(handle_str);
     const entry = try buffer_registry.resolve(handle);
-    try std.testing.expect(entry == .graphics);
-    try std.testing.expectEqualStrings("diagram", entry.graphics.name);
+    try std.testing.expect(entry == .image);
+    try std.testing.expectEqualStrings("diagram", entry.image.name);
 }
 
-test "zag.buffer.set_png stores decoded image on a graphics handle" {
+test "zag.buffer.set_png stores decoded image on an image handle" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
@@ -12662,10 +12662,10 @@ test "zag.buffer.set_png stores decoded image on a graphics handle" {
     const handle_str = try engine.lua.toString(-1);
     const handle = try BufferRegistry.parseId(handle_str);
     const entry = try buffer_registry.resolve(handle);
-    try std.testing.expect(entry == .graphics);
-    try std.testing.expect(entry.graphics.image != null);
-    try std.testing.expectEqual(@as(u32, 1), entry.graphics.image.?.width);
-    try std.testing.expectEqual(@as(u32, 1), entry.graphics.image.?.height);
+    try std.testing.expect(entry == .image);
+    try std.testing.expect(entry.image.image != null);
+    try std.testing.expectEqual(@as(u32, 1), entry.image.image.?.width);
+    try std.testing.expectEqual(@as(u32, 1), entry.image.image.?.height);
 }
 
 test "zag.buffer.set_png rejects a scratch handle" {
@@ -12712,7 +12712,7 @@ test "zag.buffer.set_fit parses valid strings and rejects invalid ones" {
     engine.lua.pop(1);
     const handle = try BufferRegistry.parseId(handle_str);
     const entry = try buffer_registry.resolve(handle);
-    try std.testing.expectEqual(GraphicsBuffer.Fit.actual, entry.graphics.fit);
+    try std.testing.expectEqual(ImageBuffer.Fit.actual, entry.image.fit);
 
     const result = engine.lua.doString(
         \\zag.buffer.set_fit(_G.handle, "zoom")

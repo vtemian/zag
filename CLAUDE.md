@@ -201,7 +201,7 @@ src/
   Buffer.zig                runtime-polymorphic buffer interface (ptr+vtable)
   BufferRegistry.zig        buffer id allocator and lookup
   buffers/
-    graphics.zig            graphics buffer (image / pixel surface)
+    image.zig               image buffer (decoded pixels, half-block render)
     scratch.zig             scratch buffer (free-form text)
 
   sinks/
