@@ -133,7 +133,7 @@ pub fn attachBufferRegistry(self: *ConversationBuffer, registry: *BufferRegistry
 /// this helper entirely once every type is migrated.
 fn isMigratedType(node_type: NodeType) bool {
     return switch (node_type) {
-        .status => true,
+        .status, .user_message, .custom => true,
         else => false,
     };
 }
@@ -1158,4 +1158,36 @@ test "appendToNode for status routes through TextBuffer" {
     const tb = try registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello world", tb.bytes_view());
     try std.testing.expectEqual(@as(usize, 0), node.content.items.len);
+}
+
+test "appendNode for user_message routes through TextBuffer" {
+    var registry = BufferRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
+
+    const node = try cb.appendNode(null, .user_message, "hello");
+    try std.testing.expect(node.buffer_id != null);
+    try std.testing.expectEqual(@as(usize, 0), node.content.items.len);
+
+    const tb = try registry.asText(node.buffer_id.?);
+    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+}
+
+test "appendNode for custom routes through TextBuffer" {
+    var registry = BufferRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
+
+    const node = try cb.appendNode(null, .custom, "payload");
+    try std.testing.expect(node.buffer_id != null);
+    try std.testing.expectEqual(@as(usize, 0), node.content.items.len);
+
+    const tb = try registry.asText(node.buffer_id.?);
+    try std.testing.expectEqualStrings("payload", tb.bytes_view());
 }
