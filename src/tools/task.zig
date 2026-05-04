@@ -169,7 +169,7 @@ fn runChild(
     // parent's tree gains a `subagent_link` node referencing the new
     // index.
     const parent_conv = ctx.parent_conv;
-    const child_conv = try parent_conv.spawnSubagent(sa.name);
+    const child_conv = try parent_conv.spawnSubagent(sa.name, prompt);
     // Pre-seed the child's persistence chain off the task_start ULID so
     // the child's first persisted event chains into the delegation scope.
     child_conv.last_persisted_id = task_start_id;

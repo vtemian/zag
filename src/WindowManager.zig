@@ -3737,7 +3737,7 @@ test "enterSubagent opens a borrowed-Conversation pane and WM teardown does not 
     try wm.attachLayoutRegistry();
 
     // Spawn a subagent on the root Conversation and grab its link node.
-    const child = try view.spawnSubagent("codereview");
+    const child = try view.spawnSubagent("codereview", "");
     const link = view.tree.root_children.items[view.tree.root_children.items.len - 1];
 
     try wm.enterSubagent(&wm.root_pane, link);
@@ -3812,7 +3812,7 @@ test "enter_subagent action drills into the focused pane's most recent subagent"
     // Re-walk after setRoot so the root_pane.handle is stamped.
     try wm.attachLayoutRegistry();
 
-    const child = try view.spawnSubagent("codereview");
+    const child = try view.spawnSubagent("codereview", "");
 
     // No-op when no subagent_link is the cursor target — but the action
     // is the high-level "drill into latest subagent" so it succeeds.

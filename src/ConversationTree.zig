@@ -91,6 +91,14 @@ pub const Node = struct {
     /// NodeRenderer casts back to `*const Conversation` to inspect the
     /// referenced child's tail node when rendering the status label.
     subagent_parent: ?*const anyopaque = null,
+    /// Duped copy of the original `prompt` argument passed to
+    /// `Conversation.spawnSubagent`. Owned; freed by `deinit`. Valid
+    /// only when `node_type == .subagent_link`. The wire-format
+    /// projection reads this directly so the LLM sees the caller's
+    /// untouched prompt instead of the child's first user_message,
+    /// which carries the subagent system-prompt prefix that
+    /// `tools/task.zig` prepends.
+    subagent_prompt: ?[]const u8 = null,
 
     /// Release all memory owned by this node and its descendants. The
     /// buffer-level `NodeLineCache` owns any cached spans keyed by this
@@ -104,6 +112,7 @@ pub const Node = struct {
         self.children.deinit(allocator);
         if (self.custom_tag) |tag| allocator.free(tag);
         if (self.subagent_name) |name| allocator.free(name);
+        if (self.subagent_prompt) |p| allocator.free(p);
     }
 
     /// Mark this node's content as changed, invalidating any cache entry
