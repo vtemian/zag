@@ -29,8 +29,11 @@ name: []const u8,
 /// Mutable byte sequence. Owned by this buffer.
 bytes: std.ArrayList(u8),
 /// Monotonically increasing content version. Bumps on every mutation.
-/// Surfaced through `Buffer.contentVersion` so cache observers can
-/// decide when to invalidate.
+/// Surfaced through `Buffer.contentVersion` per the vtable contract;
+/// today it has no in-tree observer (`NodeLineCache` keys on the
+/// node's own `content_version`, which `ConversationBuffer.appendToNode`
+/// bumps in lockstep). Future observers (Lua plugins watching a buffer,
+/// cross-pane shared buffers) read this directly.
 content_version: u64 = 0,
 
 pub fn create(allocator: Allocator, id: u32, name: []const u8) !*TextBuffer {
@@ -82,7 +85,7 @@ pub fn clear(self: *TextBuffer) void {
 
 /// Return a borrowed view of the buffer's bytes. Valid until the next
 /// mutation.
-pub fn bytes_view(self: *const TextBuffer) []const u8 {
+pub fn bytesView(self: *const TextBuffer) []const u8 {
     return self.bytes.items;
 }
 
@@ -138,12 +141,12 @@ test "append writes bytes and bumps version" {
 
     const v0 = tb.content_version;
     try tb.append("hello");
-    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
     try std.testing.expect(tb.content_version != v0);
 
     const v1 = tb.content_version;
     try tb.append(" world");
-    try std.testing.expectEqualStrings("hello world", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello world", tb.bytesView());
     try std.testing.expect(tb.content_version != v1);
 }
 
@@ -153,13 +156,13 @@ test "insert at zero, middle, and end" {
 
     try tb.append("AC");
     try tb.insert(1, "B");
-    try std.testing.expectEqualStrings("ABC", tb.bytes_view());
+    try std.testing.expectEqualStrings("ABC", tb.bytesView());
 
     try tb.insert(0, "<");
-    try std.testing.expectEqualStrings("<ABC", tb.bytes_view());
+    try std.testing.expectEqualStrings("<ABC", tb.bytesView());
 
     try tb.insert(tb.len(), ">");
-    try std.testing.expectEqualStrings("<ABC>", tb.bytes_view());
+    try std.testing.expectEqualStrings("<ABC>", tb.bytesView());
 }
 
 test "delete range" {
@@ -168,10 +171,10 @@ test "delete range" {
 
     try tb.append("hello world");
     tb.delete(.{ .start = 5, .len = 1 }); // drop the space
-    try std.testing.expectEqualStrings("helloworld", tb.bytes_view());
+    try std.testing.expectEqualStrings("helloworld", tb.bytesView());
 
     tb.delete(.{ .start = 0, .len = 5 }); // drop "hello"
-    try std.testing.expectEqualStrings("world", tb.bytes_view());
+    try std.testing.expectEqualStrings("world", tb.bytesView());
 }
 
 test "clear empties the buffer and bumps version" {
