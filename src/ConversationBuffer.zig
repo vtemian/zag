@@ -16,6 +16,8 @@ const BufferRegistry = @import("BufferRegistry.zig");
 const Theme = @import("Theme.zig");
 const Session = @import("Session.zig");
 const input = @import("input.zig");
+const types = @import("types.zig");
+const ulid = @import("ulid.zig");
 
 const ConversationBuffer = @This();
 
@@ -62,11 +64,22 @@ row_styles: std.AutoHashMapUnmanaged(u32, Theme.HighlightSlot) = .empty,
 /// so split panes, subagents, and headless harnesses each get their
 /// own storage scope without the borrowed-pointer wiring step.
 buffer_registry: BufferRegistry,
+/// Open session file for persistence (null if unsaved session).
+session_handle: ?*Session.SessionHandle = null,
+/// Set to true by callers when a persist attempt has failed. The
+/// compositor consults this to surface a status-bar warning; once
+/// tripped it stays true for the remainder of the session.
+persist_failed: bool = false,
+/// Id of the most recently persisted event in this session. Each new
+/// event uses this as its `parent_id` unless the caller already set
+/// one explicitly, so events form a linked chain rooted at the first
+/// user message.
+last_persisted_id: ?ulid.Ulid = null,
 
-/// Create a new empty buffer with the given id and name. The buffer is a
-/// pure view; its LLM messages live on `ConversationHistory` and its
-/// agent-thread coordination lives on `AgentRunner`. Callers compose the
-/// three through `EventOrchestrator.Pane`.
+/// Create a new empty buffer with the given id and name. The buffer
+/// owns the node tree, the inline `BufferRegistry`, and the session
+/// persistence state; its agent-thread coordination lives on
+/// `AgentRunner`. The two compose through `EventOrchestrator.Pane`.
 pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
@@ -83,9 +96,9 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
 }
 
 /// Release all memory owned by this buffer: cache, tree, registry,
-/// name. Messages and the session handle live on `ConversationHistory`;
-/// the agent thread, event queue, and streaming state live on
-/// `AgentRunner`. Neither is owned by the buffer.
+/// name. The agent thread, event queue, and streaming state live on
+/// `AgentRunner` and are not owned by the buffer; the session handle
+/// is borrowed (the WindowManager owns its lifetime).
 ///
 /// Deinit order matters: drain the cache first so entries release their
 /// spans arrays while the borrowed span text (TextBuffer bytes resolved
@@ -454,6 +467,268 @@ pub fn clear(self: *ConversationBuffer) void {
 /// Thin wrapper around `appendNode` used by the runner's submit path.
 pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
+}
+
+// -- Session persistence ----------------------------------------------------
+
+/// Attach a session handle for persistence. Does not take ownership of the
+/// handle: the caller remains responsible for closing it.
+pub fn attachSession(self: *ConversationBuffer, handle: *Session.SessionHandle) void {
+    self.session_handle = handle;
+}
+
+/// Persist an event to the session JSONL file, if a session is attached.
+/// Swallows errors after logging them and flipping `persist_failed`;
+/// production callers all want the same swallow-and-flag behaviour, so
+/// centralising it here removes the repeated boilerplate at every call
+/// site. Tests or callers that need the underlying error should call
+/// `persistEventInternal` directly.
+///
+/// Auto-threads `parent_id` from `last_persisted_id` when the caller
+/// hasn't set one explicitly, and records the persisted id so the next
+/// event in the turn can chain off of it.
+pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
+    self.persistEventInternal(entry) catch |err| {
+        log.err("session persist failed: {}", .{err});
+        self.persist_failed = true;
+    };
+}
+
+/// Error-propagating variant of `persistEvent`. Used by tests that assert
+/// on the failure mode and by callers (e.g. the task tool's child-event
+/// pump) that want to log a more specific message instead of flipping
+/// `persist_failed`.
+pub fn persistEventInternal(self: *ConversationBuffer, entry: Session.Entry) !void {
+    const sh = self.session_handle orelse return;
+    var entry_with_parent = entry;
+    if (entry_with_parent.parent_id == null) {
+        entry_with_parent.parent_id = self.last_persisted_id;
+    }
+    const persisted_id = try sh.appendEntry(entry_with_parent);
+    self.last_persisted_id = persisted_id;
+}
+
+/// Persist a user_message entry with the current timestamp. Convenience
+/// wrapper around `persistEvent` for the submit path; the caller continues
+/// even on persist failure since we have already accepted the message
+/// into the conversation history.
+pub fn persistUserMessage(self: *ConversationBuffer, text: []const u8) void {
+    self.persistEvent(.{
+        .entry_type = .user_message,
+        .content = text,
+        .timestamp = std.time.milliTimestamp(),
+    });
+}
+
+/// Inputs for auto-naming a session: the first user text and the first
+/// assistant text (truncated). Returns null when the session does not yet
+/// have enough content to produce a summary.
+pub const SessionSummaryInputs = struct {
+    user_text: []const u8,
+    assistant_text: []const u8,
+};
+
+/// Extract the first user-text / first-assistant-text pair for session
+/// auto-naming. Returns null if the conversation lacks at least one of
+/// each. The returned slices borrow from registry-owned TextBuffer bytes
+/// and are valid until the next mutation of the corresponding nodes.
+pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInputs {
+    var user_text: ?[]const u8 = null;
+    var assistant_text: ?[]const u8 = null;
+    for (self.tree.root_children.items) |node| {
+        switch (node.node_type) {
+            .user_message => {
+                if (user_text == null) {
+                    user_text = self.nodeText(node);
+                }
+            },
+            .assistant_text => {
+                if (assistant_text == null) {
+                    const text = self.nodeText(node);
+                    if (text.len > 0) assistant_text = text;
+                }
+            },
+            else => {},
+        }
+        if (user_text != null and assistant_text != null) break;
+    }
+    if (user_text == null or assistant_text == null) return null;
+    const a_full = assistant_text.?;
+    return .{
+        .user_text = user_text.?,
+        .assistant_text = a_full[0..@min(a_full.len, 200)],
+    };
+}
+
+// -- Wire-format projection --------------------------------------------------
+
+/// Walk the cursor's branch in-order and project the tree into a list of
+/// LLM wire-format messages. Allocations live in the supplied arena; the
+/// caller drops the arena at the end of the LLM call.
+///
+/// Status, error, and separator nodes are UI-only and not included in the
+/// projection. Synthetic tool_use ids ("synth_N") are minted in walk order
+/// so tool_result blocks can chain back to the most recent tool_call,
+/// matching the contract `ConversationHistory.rebuildMessages` enforced
+/// before Phase D.
+pub fn toWireMessages(
+    self: *const ConversationBuffer,
+    arena: Allocator,
+) !std.ArrayList(types.Message) {
+    var messages: std.ArrayList(types.Message) = .empty;
+    var assistant_blocks: std.ArrayList(types.ContentBlock) = .empty;
+    var tool_result_blocks: std.ArrayList(types.ContentBlock) = .empty;
+
+    var state: ProjectionState = .{
+        .arena = arena,
+        .messages = &messages,
+        .assistant_blocks = &assistant_blocks,
+        .tool_result_blocks = &tool_result_blocks,
+    };
+
+    for (self.tree.root_children.items) |node| {
+        try self.projectNode(&state, node);
+    }
+    try state.flushAssistant();
+    try state.flushToolResult();
+    return messages;
+}
+
+const ProjectionState = struct {
+    arena: Allocator,
+    messages: *std.ArrayList(types.Message),
+    assistant_blocks: *std.ArrayList(types.ContentBlock),
+    tool_result_blocks: *std.ArrayList(types.ContentBlock),
+    /// Synthetic id counter used when no provider call_id is available
+    /// (Phase D parks tool_call metadata on `custom_tag` and does not
+    /// preserve the original id; matches `ConversationHistory.rebuildMessages`).
+    tool_id_counter: u32 = 0,
+    /// Most recently emitted synthetic tool_use id, awaiting a paired
+    /// tool_result. Cleared once consumed.
+    last_tool_use_id: ?[]const u8 = null,
+
+    fn flushAssistant(self: *ProjectionState) !void {
+        if (self.assistant_blocks.items.len == 0) return;
+        const owned = try self.assistant_blocks.toOwnedSlice(self.arena);
+        try self.messages.append(self.arena, .{ .role = .assistant, .content = owned });
+    }
+
+    fn flushToolResult(self: *ProjectionState) !void {
+        if (self.tool_result_blocks.items.len == 0) return;
+        const owned = try self.tool_result_blocks.toOwnedSlice(self.arena);
+        try self.messages.append(self.arena, .{ .role = .user, .content = owned });
+    }
+};
+
+fn projectNode(
+    self: *const ConversationBuffer,
+    state: *ProjectionState,
+    node: *const ConversationTree.Node,
+) !void {
+    switch (node.node_type) {
+        .user_message => {
+            try state.flushAssistant();
+            try state.flushToolResult();
+            const text = self.nodeText(node);
+            const content = try state.arena.alloc(types.ContentBlock, 1);
+            content[0] = .{ .text = .{ .text = try state.arena.dupe(u8, text) } };
+            try state.messages.append(state.arena, .{ .role = .user, .content = content });
+        },
+        .assistant_text => {
+            try state.flushToolResult();
+            const text = self.nodeText(node);
+            try state.assistant_blocks.append(state.arena, .{
+                .text = .{ .text = try state.arena.dupe(u8, text) },
+            });
+        },
+        .tool_call => {
+            try state.flushToolResult();
+            // Phase D parks the tool name on `custom_tag`; original input
+            // JSON is not preserved on the node, so the projection rebuilds
+            // a permissive `{}` payload (matching ConversationHistory.rebuildMessages).
+            const tool_name = node.custom_tag orelse "";
+            var scratch: [32]u8 = undefined;
+            const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{state.tool_id_counter});
+            state.tool_id_counter += 1;
+            const duped_id = try state.arena.dupe(u8, synthetic_id);
+            const duped_name = try state.arena.dupe(u8, tool_name);
+            const duped_input = try state.arena.dupe(u8, "{}");
+            try state.assistant_blocks.append(state.arena, .{ .tool_use = .{
+                .id = duped_id,
+                .name = duped_name,
+                .input_raw = duped_input,
+            } });
+            // Drop any prior unconsumed id and remember the new one for
+            // the next tool_result. Mirrors rebuildMessages's "newest
+            // tool_call wins" pairing, which is the right shape today
+            // because tool_result nodes hang as children of their
+            // tool_call (live BufferSink path) or appear immediately
+            // after them (loadFromEntries path).
+            state.last_tool_use_id = duped_id;
+
+            // tool_result children of this tool_call land in the user
+            // message paired against the synth id we just minted.
+            for (node.children.items) |child| {
+                if (child.node_type == .tool_result) {
+                    try self.projectToolResult(state, child);
+                }
+            }
+        },
+        .tool_result => {
+            // Top-level tool_result (no tool_call parent). Pair against
+            // whatever last_tool_use_id is live; if none is, fall back
+            // to "unknown" the way rebuildMessages did.
+            try self.projectToolResult(state, node);
+        },
+        .thinking => {
+            try state.flushToolResult();
+            const text = self.nodeText(node);
+            try state.assistant_blocks.append(state.arena, .{ .thinking = .{
+                .text = try state.arena.dupe(u8, text),
+                .signature = null,
+                .provider = .none,
+                .id = null,
+            } });
+        },
+        .thinking_redacted => {
+            try state.flushToolResult();
+            // The tree's redacted nodes carry no buffer (or an empty one);
+            // the encrypted blob doesn't survive the round-trip. Emit an
+            // empty payload so role alternation is preserved.
+            try state.assistant_blocks.append(state.arena, .{ .redacted_thinking = .{
+                .data = try state.arena.dupe(u8, ""),
+            } });
+        },
+        // UI-only and custom nodes are skipped.
+        .status, .err, .separator, .custom => {},
+    }
+}
+
+fn projectToolResult(
+    self: *const ConversationBuffer,
+    state: *ProjectionState,
+    node: *const ConversationTree.Node,
+) !void {
+    try state.flushAssistant();
+    const use_id = if (state.last_tool_use_id) |id| blk: {
+        state.last_tool_use_id = null;
+        break :blk id;
+    } else try state.arena.dupe(u8, "unknown");
+    const text = self.nodeText(node);
+    try state.tool_result_blocks.append(state.arena, .{ .tool_result = .{
+        .tool_use_id = use_id,
+        .content = try state.arena.dupe(u8, text),
+        .is_error = false,
+    } });
+}
+
+/// Resolve a node's bytes through the buffer registry. Returns an empty
+/// slice if the node has no buffer (tool_call, redacted thinking) or if
+/// the handle is stale (shouldn't happen in practice).
+fn nodeText(self: *const ConversationBuffer, node: *const ConversationTree.Node) []const u8 {
+    const handle = node.buffer_id orelse return "";
+    const tb = self.buffer_registry.asText(handle) catch return "";
+    return tb.bytesView();
 }
 
 /// Flip `collapsed` on every foldable node (thinking, thinking_redacted,

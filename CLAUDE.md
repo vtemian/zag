@@ -190,8 +190,7 @@ src/
     task.zig                spawn subagent task tool
 
   Session.zig               JSONL session persistence and management
-  ConversationBuffer.zig    conversation buffer (node tree, session, messages)
-  ConversationHistory.zig   linear history view over the conversation tree
+  ConversationBuffer.zig    conversation buffer (tree, registry, persistence, projection)
   ConversationTree.zig      branching node tree (forks, retries, edits)
   NodeRegistry.zig          conversation node id allocator
   NodeRenderer.zig          type-specific node rendering for ConversationBuffer

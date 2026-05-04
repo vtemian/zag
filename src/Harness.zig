@@ -28,7 +28,6 @@ const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const Trajectory = @import("Trajectory.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
@@ -320,7 +319,6 @@ pub const HeadlessDeps = struct {
     endpoint_registry: *const llm.Registry,
     lua_engine: ?*LuaEngine,
     runner: *AgentRunner,
-    session: *ConversationHistory,
     wake_read_fd: posix.fd_t,
     wake_write_fd: posix.fd_t,
     session_id: []const u8,
@@ -330,9 +328,6 @@ pub const HeadlessDeps = struct {
 /// hands control to `runWithProvider`. TUI subsystems (Terminal, Screen,
 /// Compositor, EventOrchestrator) are intentionally never constructed.
 pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) !void {
-    var root_session = ConversationHistory.init(gpa);
-    defer root_session.deinit();
-
     var root_buffer = try ConversationBuffer.init(gpa, 0, "session");
     defer root_buffer.deinit();
 
@@ -342,7 +337,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var root_buffer_sink = BufferSink.init(gpa, &root_buffer);
     defer root_buffer_sink.deinit();
 
-    var root_runner = AgentRunner.init(gpa, root_buffer_sink.sink(), &root_session);
+    var root_runner = AgentRunner.init(gpa, root_buffer_sink.sink(), &root_buffer);
     defer root_runner.deinit();
 
     const wake_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
@@ -422,7 +417,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(null, provider.model_id) else null;
     defer if (session_handle) |*sh| sh.close();
 
-    if (session_handle) |*sh| root_session.attachSession(sh);
+    if (session_handle) |*sh| root_buffer.attachSession(sh);
 
     // Derive a stable session id for the trajectory. Falls back to a
     // timestamp-based synthetic id when --no-session suppresses persistence.
@@ -447,7 +442,6 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
         .endpoint_registry = &provider.registry,
         .lua_engine = lua_engine,
         .runner = &root_runner,
-        .session = &root_session,
         .wake_read_fd = wake_read,
         .wake_write_fd = wake_write,
         .session_id = session_id,
@@ -504,7 +498,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     try capture.beginTurn(started_at);
 
     const spec = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id);
-    try deps.runner.submit(&deps.session.messages, .{
+    try deps.runner.submit(.{
         .allocator = gpa,
         .wake_write_fd = deps.wake_write_fd,
         .lua_engine = deps.lua_engine,
