@@ -85,10 +85,16 @@ subagents: std.ArrayList(*Conversation) = .empty,
 /// (and stamp `subagent_id` on the way through). Unset when this
 /// Conversation is the root of its session.
 parent: ?*Conversation = null,
-/// Index into `parent.subagents` for this child. Used by commit 2 to
-/// stamp `Session.Entry.subagent_id` on persisted events. Unused when
+/// Index into `parent.subagents` for this child. Combined with the
+/// parent backlinks, this yields the top-down path stamped on
+/// `Session.Entry.subagent_path` for persisted events. Unused when
 /// `parent` is null.
 parent_subagent_id: u32 = 0,
+/// Scratch slot used by `loadFromEntries` (and its `routeReplayEntry`
+/// recursion) to thread tool_call/tool_result pairing per Conversation
+/// during replay. Borrows a Node owned by `self.tree`; reset to null
+/// on entry/exit of the load so it never outlives the borrowed tree.
+replay_last_tool_call: ?*Node = null,
 
 /// Create a new empty buffer with the given id and name. The buffer
 /// owns the node tree, the inline `BufferRegistry`, and the session
@@ -421,43 +427,56 @@ pub fn readText(
 /// been spawned; JSONL entries are always in chronological order so the
 /// most recently seen tool_call is the right parent.
 pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !void {
-    // Per-Conversation last_tool_call chains. The parent and each
-    // subagent each need their own pairing window so a child's
-    // tool_result is never threaded onto the parent's most recent
-    // tool_call (or vice versa). Children are spawned lazily as
-    // tagged entries arrive; the chain heads are tracked in parallel.
-    var last_tool_call: ?*Node = null;
-    var child_last_tool_calls: std.ArrayList(?*Node) = .empty;
-    defer child_last_tool_calls.deinit(self.allocator);
+    // Each Conversation along the path (root + every subagent that
+    // ever emits an event) needs its own `last_tool_call` window so
+    // tool_result entries pair with the right tool_call. Threading
+    // that through the recursion is awkward, so we attach the head
+    // directly to the Conversation for the duration of the load and
+    // tear it down at the end.
+    self.replay_last_tool_call = null;
+    defer self.clearReplayChains();
 
     for (entries) |entry| {
-        if (entry.subagent_id) |sid| {
-            // Lazily reserve subagent slots up to and including `sid`.
-            // The first tagged entry for a given id triggers the
-            // spawn; the actual agent name is unknown at this point
-            // (the marker entry that carried it may not be the first
-            // tagged entry, in particular when `task_start` itself is
-            // a root-tagged event), so we use a placeholder name and
-            // rely on subsequent task_start markers to refine it.
-            while (self.subagents.items.len <= sid) {
-                _ = try self.spawnSubagent("(unknown)");
-                try child_last_tool_calls.append(self.allocator, null);
-            }
-            // Backfill child_last_tool_calls if subagents was extended
-            // outside this loop (defensive; the lazy spawn above keeps
-            // them in lockstep, but earlier iterations may have grown
-            // the parent's subagents list before we started tracking).
-            while (child_last_tool_calls.items.len < self.subagents.items.len) {
-                try child_last_tool_calls.append(self.allocator, null);
-            }
-            const child = self.subagents.items[sid];
-            try child.handleLoadedEntry(entry, &child_last_tool_calls.items[sid]);
+        if (entry.subagent_path) |path| {
+            try self.routeReplayEntry(path, entry);
         } else {
-            try self.handleLoadedEntry(entry, &last_tool_call);
+            try self.handleLoadedEntry(entry, &self.replay_last_tool_call);
         }
     }
     // Each appendNode already bumped tree.generation, so isDirty() will
     // pick this up on the next compositor pass without a separate flag.
+}
+
+/// Walk `path` index-by-index, lazily spawning placeholder subagents
+/// when an index outruns the current `subagents` length, then dispatch
+/// the entry into the deepest Conversation's tree using its own
+/// `replay_last_tool_call` chain. Names start as `(unknown)` because
+/// the `task_start` marker that carries the real name is itself a
+/// tagged entry that may not arrive first; subsequent markers refine
+/// it.
+fn routeReplayEntry(
+    self: *Conversation,
+    path: []const u32,
+    entry: Session.Entry,
+) !void {
+    if (path.len == 0) {
+        try self.handleLoadedEntry(entry, &self.replay_last_tool_call);
+        return;
+    }
+    const idx = path[0];
+    while (self.subagents.items.len <= idx) {
+        _ = try self.spawnSubagent("(unknown)");
+    }
+    const child = self.subagents.items[idx];
+    try child.routeReplayEntry(path[1..], entry);
+}
+
+/// Reset `replay_last_tool_call` on this Conversation and every
+/// subagent below it. Recursive so deeply nested replays leave no
+/// dangling pointer behind once the borrowed nodes go out of scope.
+fn clearReplayChains(self: *Conversation) void {
+    self.replay_last_tool_call = null;
+    for (self.subagents.items) |child| child.clearReplayChains();
 }
 
 /// Append a single loaded entry to this Conversation's tree, threading
@@ -607,23 +626,53 @@ pub fn persistEvent(self: *Conversation, entry: Session.Entry) void {
 /// on the failure mode and by callers (e.g. the task tool's child-event
 /// pump) that want to log a more specific message instead of flipping
 /// `persist_failed`.
+///
+/// When invoked on a child Conversation, walk parent backlinks to
+/// build a top-down `subagent_path` ([root_child_idx, ..., leaf_idx])
+/// before delegating to the root's session handle. A previous shape
+/// stamped a single `subagent_id` field at every recursion level,
+/// which silently clobbered the deepest index at depths >= 2 and
+/// routed grandchild events to the wrong subagent slot on replay.
 pub fn persistEventInternal(self: *Conversation, entry: Session.Entry) !void {
-    if (self.parent) |p| {
-        // Stamp our subagent index on the entry and recurse upward;
-        // the actual SessionHandle.appendEntry happens at the root,
-        // which keeps a single-rooted JSONL with all events tagged.
-        var stamped = entry;
-        stamped.subagent_id = self.parent_subagent_id;
-        return p.persistEventInternal(stamped);
+    // `tools/task.zig` advertises `max_task_depth = 8`. The +1 covers
+    // the root-only sentinel and the buffer is small enough to keep on
+    // the stack at every persist call; allocating per event would
+    // multiply against the per-step event volume for no gain.
+    var path_buf: [16]u32 = undefined;
+    var path_len: usize = 0;
+    var node: *Conversation = self;
+    while (node.parent) |parent| {
+        if (path_len >= path_buf.len) return error.SubagentDepthExceeded;
+        path_buf[path_len] = node.parent_subagent_id;
+        path_len += 1;
+        node = parent;
+    }
+    // `node` is now the root; the path was collected leaf-to-root, so
+    // reverse it in place to get the top-down shape that `loadFromEntries`
+    // walks index-by-index.
+    if (path_len > 1) {
+        var i: usize = 0;
+        var j: usize = path_len - 1;
+        while (i < j) : ({
+            i += 1;
+            j -= 1;
+        }) {
+            const tmp = path_buf[i];
+            path_buf[i] = path_buf[j];
+            path_buf[j] = tmp;
+        }
     }
 
-    const sh = self.session_handle orelse return;
+    const sh = node.session_handle orelse return;
     var entry_with_parent = entry;
+    if (path_len > 0) {
+        entry_with_parent.subagent_path = path_buf[0..path_len];
+    }
     if (entry_with_parent.parent_id == null) {
-        entry_with_parent.parent_id = self.last_persisted_id;
+        entry_with_parent.parent_id = node.last_persisted_id;
     }
     const persisted_id = try sh.appendEntry(entry_with_parent);
-    self.last_persisted_id = persisted_id;
+    node.last_persisted_id = persisted_id;
 }
 
 /// Persist a user_message entry with the current timestamp. Convenience
@@ -1482,7 +1531,7 @@ fn restoreTestCwd(abs_path: []const u8) void {
     dir.setAsCwd() catch {};
 }
 
-test "child Conversation persistEvent stamps subagent_id and routes through parent" {
+test "child Conversation persistEvent stamps subagent_path and routes through parent" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1509,7 +1558,7 @@ test "child Conversation persistEvent stamps subagent_id and routes through pare
     });
 
     // Read the JSONL back via loadEntries and verify the last entry
-    // carries subagent_id == 0 (the child's parent_subagent_id).
+    // carries subagent_path == [0] (the child's parent_subagent_id).
     const session_id = handle.id[0..handle.id_len];
     const loaded = try Session.loadEntries(session_id, allocator);
     defer {
@@ -1520,8 +1569,8 @@ test "child Conversation persistEvent stamps subagent_id and routes through pare
     const last = loaded[loaded.len - 1];
     try std.testing.expectEqual(Session.EntryType.task_message, last.entry_type);
     try std.testing.expectEqualStrings("from child", last.content);
-    try std.testing.expect(last.subagent_id != null);
-    try std.testing.expectEqual(@as(u32, 0), last.subagent_id.?);
+    try std.testing.expect(last.subagent_path != null);
+    try std.testing.expectEqualSlices(u32, &[_]u32{0}, last.subagent_path.?);
 }
 
 test "loadFromEntries reconstructs subagents from tagged entries" {
@@ -1540,7 +1589,7 @@ test "loadFromEntries reconstructs subagents from tagged entries" {
     defer handle.close();
 
     // Build a parent + one subagent and persist a few events through
-    // both. The child's persistEventInternal must stamp subagent_id;
+    // both. The child's persistEventInternal must stamp subagent_path;
     // the parent's must not.
     var conv = try Conversation.init(allocator, 0, "parent");
     conv.attachSession(&handle);
@@ -1596,6 +1645,106 @@ test "loadFromEntries reconstructs subagents from tagged entries" {
     // task_start refinement; for commit 2 we only assert the child
     // routing behaves.
     try std.testing.expectEqual(NodeType.user_message, replay.tree.root_children.items[0].node_type);
+}
+
+test "depth-2 subagent_path round-trips through persist + load" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreTestCwd(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    // Root -> middle -> leaf. Persisting from `leaf` must stamp
+    // `subagent_path = [middle_idx, leaf_idx]` so replay routes the
+    // entry into the leaf's tree, not the middle's. The pre-fix code
+    // clobbered the deepest index at every recursion level, so this
+    // test fails on the old single-`subagent_id` shape.
+    var conv = try Conversation.init(allocator, 0, "root");
+    conv.attachSession(&handle);
+
+    const middle = try conv.spawnSubagent("middle");
+    const leaf = try middle.spawnSubagent("leaf");
+    try leaf.persistEventInternal(.{
+        .entry_type = .task_message,
+        .content = "from grandchild",
+        .timestamp = 1,
+    });
+    conv.deinit();
+
+    const session_id = handle.id[0..handle.id_len];
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // The last entry must carry the full top-down path.
+    const last = loaded[loaded.len - 1];
+    try std.testing.expectEqualStrings("from grandchild", last.content);
+    try std.testing.expect(last.subagent_path != null);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 0 }, last.subagent_path.?);
+
+    // Replaying lazily reconstructs both layers and routes the entry
+    // into the grandchild's tree.
+    var replay = try Conversation.init(allocator, 0, "replay");
+    defer replay.deinit();
+    try replay.loadFromEntries(loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), replay.subagents.items.len);
+    const replay_middle = replay.subagents.items[0];
+    try std.testing.expectEqual(@as(usize, 1), replay_middle.subagents.items.len);
+    const replay_leaf = replay_middle.subagents.items[0];
+    try std.testing.expectEqual(@as(usize, 1), replay_leaf.tree.root_children.items.len);
+    try std.testing.expectEqual(NodeType.assistant_text, replay_leaf.tree.root_children.items[0].node_type);
+    const leaf_tb = try replay_leaf.buffer_registry.asText(
+        replay_leaf.tree.root_children.items[0].buffer_id.?,
+    );
+    try std.testing.expectEqualStrings("from grandchild", leaf_tb.bytesView());
+
+    // Middle's tree carries only the subagent_link that spawnSubagent
+    // appended for `leaf`; the leaf's own task_message lives on the
+    // leaf, not on the middle. The pre-fix code routed the entry to
+    // `root.subagents[middle_idx]` (i.e. middle), which would surface
+    // a second node here.
+    try std.testing.expectEqual(@as(usize, 1), replay_middle.tree.root_children.items.len);
+    try std.testing.expectEqual(NodeType.subagent_link, replay_middle.tree.root_children.items[0].node_type);
+}
+
+test "loadFromEntries accepts legacy subagent_id JSONL as 1-element path" {
+    const allocator = std.testing.allocator;
+
+    // Hand-construct a parsed entry as if it came from a JSONL line
+    // with the legacy single-int `subagent_id` field. parseEntry
+    // promotes that into a 1-element path, but covering it explicitly
+    // here pins the loadFromEntries dispatch on the new shape.
+    const path = try allocator.alloc(u32, 1);
+    path[0] = 3;
+
+    var entries = [_]Session.Entry{
+        .{
+            .entry_type = .task_message,
+            .content = "legacy tagged",
+            .timestamp = 1,
+            .subagent_path = path,
+        },
+    };
+    defer allocator.free(path);
+
+    var replay = try Conversation.init(allocator, 0, "replay");
+    defer replay.deinit();
+    try replay.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(@as(usize, 4), replay.subagents.items.len);
+    const target = replay.subagents.items[3];
+    try std.testing.expectEqual(@as(usize, 1), target.tree.root_children.items.len);
 }
 
 test "Ctrl-R toggles collapsed on every thinking node" {
