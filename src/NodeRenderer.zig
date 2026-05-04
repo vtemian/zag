@@ -80,23 +80,21 @@ pub const RenderFn = *const fn (
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
-    registry: ?*BufferRegistry,
+    registry: *const BufferRegistry,
 ) anyerror!void;
 
 /// Resolve the byte slice for a node's textual content via the
 /// registry-owned TextBuffer. Tool_call nodes carry no buffer (their
 /// metadata sits on `custom_tag`); for them, this returns the
 /// custom_tag slice. Returns an empty slice when the handle resolves
-/// to anything other than a TextBuffer or when the registry is
-/// missing despite a non-null handle (a wiring bug, but the renderer
+/// to anything other than a TextBuffer (a wiring bug, but the renderer
 /// must remain total).
 ///
 /// Caller borrows; the returned slice is valid until the underlying
 /// storage mutates.
-pub fn nodeBytes(node: *const Node, registry: ?*BufferRegistry) []const u8 {
+pub fn nodeBytes(node: *const Node, registry: *const BufferRegistry) []const u8 {
     if (node.buffer_id) |handle| {
-        const reg = registry orelse return &.{};
-        const tb = reg.asText(handle) catch return &.{};
+        const tb = registry.asText(handle) catch return &.{};
         return tb.bytesView();
     }
     return node.custom_tag orelse &.{};
@@ -107,10 +105,9 @@ pub fn nodeBytes(node: *const Node, registry: ?*BufferRegistry) []const u8 {
 /// rendering to a placeholder line. Returns false for inline-content
 /// nodes, text-backed nodes, and stale handles; the renderer must stay
 /// total in the face of a torn-down buffer.
-fn isImageBacked(node: *const Node, registry: ?*BufferRegistry) bool {
+fn isImageBacked(node: *const Node, registry: *const BufferRegistry) bool {
     const handle = node.buffer_id orelse return false;
-    const reg = registry orelse return false;
-    const entry = reg.resolve(handle) catch return false;
+    const entry = registry.resolve(handle) catch return false;
     return entry == .image;
 }
 
@@ -161,7 +158,7 @@ pub fn render(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
-    registry: ?*BufferRegistry,
+    registry: *const BufferRegistry,
 ) !void {
     // Check for custom override
     if (self.has_overrides) {
@@ -179,7 +176,7 @@ pub fn render(
 /// `(newlines + 1)` over the first `tool_result` child's content. Returns 0
 /// when the node is expanded, has no `tool_result` child, or the first child's
 /// content is empty. Capped at the first child to keep this O(1) in node count.
-fn hiddenToolResultLineCount(node: *const Node, registry: ?*BufferRegistry) usize {
+fn hiddenToolResultLineCount(node: *const Node, registry: *const BufferRegistry) usize {
     if (!node.collapsed) return 0;
     if (node.node_type != .tool_call) return 0;
     for (node.children.items) |child| {
@@ -198,7 +195,7 @@ fn hiddenToolResultLineCount(node: *const Node, registry: ?*BufferRegistry) usiz
 }
 
 /// Return the number of display lines a node produces (without allocating them).
-pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node, registry: ?*BufferRegistry) usize {
+pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node, registry: *const BufferRegistry) usize {
     return switch (node.node_type) {
         .separator => 1,
         .err, .thinking_redacted => 1,
@@ -334,7 +331,7 @@ fn renderDefault(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
-    registry: ?*BufferRegistry,
+    registry: *const BufferRegistry,
 ) !void {
     const content = nodeBytes(node, registry);
 
@@ -435,11 +432,8 @@ fn appendTestNode(
 
 test "renderDefault user_message" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .user_message, "hello");
 
@@ -447,7 +441,7 @@ test "renderDefault user_message" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
 
     const text = try lines.items[0].toText(allocator);
@@ -457,11 +451,8 @@ test "renderDefault user_message" {
 
 test "renderDefault user_message has two spans with user_message style" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .user_message, "hello");
 
@@ -469,7 +460,7 @@ test "renderDefault user_message has two spans with user_message style" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const line = lines.items[0];
     try std.testing.expectEqual(@as(usize, 2), line.spans.len);
@@ -482,11 +473,8 @@ test "renderDefault user_message has two spans with user_message style" {
 
 test "renderDefault assistant_text" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .assistant_text, "I can help with that");
 
@@ -494,7 +482,7 @@ test "renderDefault assistant_text" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -505,11 +493,8 @@ test "renderDefault assistant_text" {
 
 test "renderDefault tool_call" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .tool_call, "bash");
 
@@ -517,7 +502,7 @@ test "renderDefault tool_call" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -531,11 +516,8 @@ test "renderDefault tool_call" {
 
 test "renderDefault tool_result shows full content" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const long_text = "a" ** 120;
     const node = try appendTestNode(&cb, null, .tool_result, long_text);
@@ -544,7 +526,7 @@ test "renderDefault tool_result shows full content" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -559,11 +541,8 @@ test "renderDefault tool_result shows full content" {
 
 test "renderDefault tool_result short content not truncated" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .tool_result, "ok");
 
@@ -571,7 +550,7 @@ test "renderDefault tool_result short content not truncated" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -580,11 +559,8 @@ test "renderDefault tool_result short content not truncated" {
 
 test "renderDefault err" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .err, "something failed");
 
@@ -592,7 +568,7 @@ test "renderDefault err" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -605,11 +581,8 @@ test "renderDefault err" {
 
 test "renderDefault separator" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .separator, "");
 
@@ -617,7 +590,7 @@ test "renderDefault separator" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -628,11 +601,8 @@ test "renderDefault separator" {
 
 test "renderDefault status" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .status, "tokens: 1500 in, 200 out");
 
@@ -640,7 +610,7 @@ test "renderDefault status" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -650,11 +620,8 @@ test "renderDefault status" {
 
 test "renderDefault custom" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .custom, "plugin output");
 
@@ -662,7 +629,7 @@ test "renderDefault custom" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -671,11 +638,8 @@ test "renderDefault custom" {
 
 test "renderDefault multiline assistant_text" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .assistant_text, "line one\nline two\nline three");
 
@@ -683,7 +647,7 @@ test "renderDefault multiline assistant_text" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
 
     const t1 = try lines.items[0].toText(allocator);
@@ -700,11 +664,8 @@ test "renderDefault multiline assistant_text" {
 
 test "custom override replaces default renderer" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var renderer = NodeRenderer.init(allocator);
     defer renderer.deinit();
@@ -715,7 +676,7 @@ test "custom override replaces default renderer" {
             lines: *std.ArrayList(StyledLine),
             alloc: Allocator,
             theme: *const Theme,
-            registry_arg: ?*BufferRegistry,
+            registry_arg: *const BufferRegistry,
         ) !void {
             _ = node;
             _ = theme;
@@ -736,7 +697,7 @@ test "custom override replaces default renderer" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderer.render(node, &lines, allocator, &theme, &registry);
+    try renderer.render(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -745,11 +706,8 @@ test "custom override replaces default renderer" {
 
 test "renderDefault thinking collapsed emits one header line" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .thinking, "reasoning body\nover two lines");
     node.collapsed = true;
@@ -758,7 +716,7 @@ test "renderDefault thinking collapsed emits one header line" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -766,16 +724,13 @@ test "renderDefault thinking collapsed emits one header line" {
     try std.testing.expect(std.mem.startsWith(u8, text, ">"));
 
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(node, &registry));
+    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(node, &cb.buffer_registry));
 }
 
 test "renderDefault thinking expanded emits header plus body lines" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .thinking, "step one\nstep two\nstep three");
     node.collapsed = false;
@@ -784,7 +739,7 @@ test "renderDefault thinking expanded emits header plus body lines" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
     // header + 3 body lines
     try std.testing.expectEqual(@as(usize, 4), lines.items.len);
 
@@ -797,16 +752,13 @@ test "renderDefault thinking expanded emits header plus body lines" {
     try std.testing.expectEqualStrings("step one", body0);
 
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 4), renderer.lineCountForNode(node, &registry));
+    try std.testing.expectEqual(@as(usize, 4), renderer.lineCountForNode(node, &cb.buffer_registry));
 }
 
 test "renderDefault thinking_redacted emits a single redacted header" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .thinking_redacted, "");
     node.collapsed = true;
@@ -815,7 +767,7 @@ test "renderDefault thinking_redacted emits a single redacted header" {
     var lines: std.ArrayList(StyledLine) = .empty;
     defer Theme.freeStyledLines(&lines, allocator);
 
-    try renderDefault(node, &lines, allocator, &theme, &registry);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
@@ -824,25 +776,19 @@ test "renderDefault thinking_redacted emits a single redacted header" {
 
 test "lineCountForNode returns 1 for separator" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try appendTestNode(&cb, null, .separator, "");
 
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(node, &registry));
+    try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(node, &cb.buffer_registry));
 }
 
 test "lineCountForNode counts hidden tool_result child lines when tool_call is collapsed" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const call = try appendTestNode(&cb, null, .tool_call, "bash");
     _ = try appendTestNode(&cb, call, .tool_result, "line one\nline two\nline three");
@@ -851,7 +797,7 @@ test "lineCountForNode counts hidden tool_result child lines when tool_call is c
 
     const renderer = NodeRenderer.initDefault();
     // tool_call collapsed: its own header line plus a hint line that names the hidden body.
-    try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call, &registry));
+    try std.testing.expectEqual(@as(usize, 2), renderer.lineCountForNode(call, &cb.buffer_registry));
 }
 
 test "renderDefault tool_result image-backed emits placeholder line" {
@@ -888,11 +834,8 @@ test "renderDefault tool_result image-backed emits placeholder line" {
 
 test "rendering a collapsed tool_call with a tool_result child does not leak under testing.allocator" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const call = try cb.appendNode(null, .tool_call, "bash");
     _ = try cb.appendNode(call, .tool_result, "row one\nrow two\nrow three");
@@ -906,7 +849,7 @@ test "rendering a collapsed tool_call with a tool_result child does not leak und
     inline for (0..2) |_| {
         var lines: std.ArrayList(StyledLine) = .empty;
         defer Theme.freeStyledLines(&lines, allocator);
-        try renderDefault(call, &lines, allocator, &theme, &registry);
+        try renderDefault(call, &lines, allocator, &theme, &cb.buffer_registry);
         try std.testing.expectEqual(@as(usize, 2), lines.items.len);
         // Confirm the hint line carries the expected count token.
         const hint_text = try lines.items[1].toText(allocator);

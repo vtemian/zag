@@ -502,17 +502,13 @@ test {
 
 test "appendStatusLine creates a status node on the given view" {
     const allocator = std.testing.allocator;
-    const BufferRegistry = @import("BufferRegistry.zig");
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "test");
     defer view.deinit();
-    view.attachBufferRegistry(&registry);
 
     try appendStatusLine(&view, "hello world");
 
     try std.testing.expectEqual(@as(usize, 1), view.tree.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.tree.root_children.items[0].node_type);
-    const tb = try registry.asText(view.tree.root_children.items[0].buffer_id.?);
+    const tb = try view.buffer_registry.asText(view.tree.root_children.items[0].buffer_id.?);
     try std.testing.expectEqualStrings("hello world", tb.bytesView());
 }
