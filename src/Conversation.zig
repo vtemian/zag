@@ -814,13 +814,115 @@ fn projectNode(
         },
         // UI-only and custom nodes are skipped.
         .status, .err, .separator, .custom => {},
-        // Phase E commit 3 projects subagent_link as a tool_use +
-        // tool_result pair so the LLM sees the same wire format as
-        // today's task tool. Until that lands the link node has no
-        // wire-format meaning, so skip it: no production code paths
-        // create subagent_link nodes in commit 1.
-        .subagent_link => {},
+        // A subagent_link projects as a `task` tool_use in the assistant
+        // turn, followed by the child's final summary as a tool_result
+        // in the next user turn. This keeps the LLM-visible wire format
+        // identical to today's task tool round-trip while the structural
+        // truth lives on the parent's tree as a link to the child
+        // Conversation rather than an inline collected blob.
+        .subagent_link => {
+            try state.flushToolResult();
+            if (node.subagent_index >= self.subagents.items.len) return;
+            const child = self.subagents.items[node.subagent_index];
+
+            const synth_id = try synthesizeSubagentId(state.arena, node.subagent_index);
+            const input_json = try buildSubagentTaskInput(state.arena, node, child);
+            const tool_name = try state.arena.dupe(u8, "task");
+            try state.assistant_blocks.append(state.arena, .{ .tool_use = .{
+                .id = synth_id,
+                .name = tool_name,
+                .input_raw = input_json,
+            } });
+            state.last_tool_use_id = synth_id;
+
+            // Synthesize the paired tool_result immediately so the LLM
+            // sees the round-trip as closed by the time it inspects the
+            // wire. Pair against the synth id we just minted.
+            try state.flushAssistant();
+            const summary = try childFinalSummary(state.arena, child);
+            const is_err = childErrored(child);
+            const paired_id = state.last_tool_use_id orelse synth_id;
+            state.last_tool_use_id = null;
+            try state.tool_result_blocks.append(state.arena, .{ .tool_result = .{
+                .tool_use_id = paired_id,
+                .content = summary,
+                .is_error = is_err,
+            } });
+        },
     }
+}
+
+fn synthesizeSubagentId(arena: Allocator, index: u32) ![]const u8 {
+    return std.fmt.allocPrint(arena, "subagent_{d}", .{index});
+}
+
+fn buildSubagentTaskInput(
+    arena: Allocator,
+    node: *const ConversationTree.Node,
+    child: *const Conversation,
+) ![]const u8 {
+    const name = node.subagent_name orelse "unknown";
+    const prompt = childInitialPrompt(child);
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(arena);
+    const w = list.writer(arena);
+    try w.writeAll("{\"agent\":");
+    try types.writeJsonString(w, name);
+    try w.writeAll(",\"prompt\":");
+    try types.writeJsonString(w, prompt);
+    try w.writeAll("}");
+    return list.toOwnedSlice(arena);
+}
+
+fn childInitialPrompt(child: *const Conversation) []const u8 {
+    if (child.tree.root_children.items.len == 0) return "";
+    const first = child.tree.root_children.items[0];
+    if (first.node_type != .user_message) return "";
+    return child.nodeText(first);
+}
+
+/// Concatenate all `.assistant_text` nodes in the child's tree into an
+/// arena-allocated slice (or return the tail `.err` node's text when
+/// the child errored). Used both by `toWireMessages` to project a
+/// subagent_link as a tool_result, and by the task tool to derive the
+/// summary returned to the parent's LLM and persisted as `task_end`.
+pub fn childFinalSummaryForTask(arena: Allocator, child: *const Conversation) ![]const u8 {
+    return childFinalSummary(arena, child);
+}
+
+/// Whether the child Conversation's tail node is an `.err`. Used to
+/// flag the synthetic tool_result as `is_error` so the LLM sees the
+/// subagent failure on the wire.
+pub fn childErroredForTask(child: *const Conversation) bool {
+    return childErrored(child);
+}
+
+fn childFinalSummary(arena: Allocator, child: *const Conversation) ![]const u8 {
+    if (childErrored(child)) {
+        var last_err: ?*const ConversationTree.Node = null;
+        for (child.tree.root_children.items) |n| {
+            if (n.node_type == .err) last_err = n;
+        }
+        if (last_err) |n| {
+            return try arena.dupe(u8, child.nodeText(n));
+        }
+        return try arena.dupe(u8, "");
+    }
+
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(arena);
+    for (child.tree.root_children.items) |n| {
+        if (n.node_type != .assistant_text) continue;
+        try buffer.appendSlice(arena, child.nodeText(n));
+    }
+    return buffer.toOwnedSlice(arena);
+}
+
+fn childErrored(child: *const Conversation) bool {
+    if (child.tree.root_children.items.len == 0) return false;
+    const tail = child.tree.root_children.items[child.tree.root_children.items.len - 1];
+    return tail.node_type == .err;
 }
 
 fn projectToolResult(
@@ -1924,4 +2026,63 @@ test "deinit walks subagents recursively" {
 
     const child = try conv.spawnSubagent("codereview");
     _ = try child.spawnSubagent("nested");
+}
+
+test "toWireMessages projects subagent_link as tool_use + tool_result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    _ = try conv.appendNode(null, .user_message, "do the thing");
+    const child = try conv.spawnSubagent("codereview");
+    _ = try child.appendNode(null, .user_message, "review please");
+    _ = try child.appendNode(null, .assistant_text, "looks good");
+
+    const messages = try conv.toWireMessages(arena.allocator());
+
+    // Expect: user, assistant (with tool_use), user (with tool_result)
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(types.Role.user, messages.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, messages.items[1].role);
+    try std.testing.expectEqual(types.Role.user, messages.items[2].role);
+
+    // Assistant message contains a tool_use block referencing "task".
+    try std.testing.expect(messages.items[1].content.len >= 1);
+    const tool_use_block = messages.items[1].content[messages.items[1].content.len - 1];
+    try std.testing.expect(tool_use_block == .tool_use);
+    try std.testing.expectEqualStrings("task", tool_use_block.tool_use.name);
+    try std.testing.expectEqualStrings("subagent_0", tool_use_block.tool_use.id);
+    // Input round-trips agent + prompt as JSON.
+    try std.testing.expect(std.mem.indexOf(u8, tool_use_block.tool_use.input_raw, "\"agent\":\"codereview\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_use_block.tool_use.input_raw, "\"prompt\":\"review please\"") != null);
+
+    // Final user message has a tool_result with the child's summary.
+    try std.testing.expectEqual(@as(usize, 1), messages.items[2].content.len);
+    try std.testing.expect(messages.items[2].content[0] == .tool_result);
+    try std.testing.expectEqualStrings("subagent_0", messages.items[2].content[0].tool_result.tool_use_id);
+    try std.testing.expectEqualStrings("looks good", messages.items[2].content[0].tool_result.content);
+    try std.testing.expectEqual(false, messages.items[2].content[0].tool_result.is_error);
+}
+
+test "toWireMessages projects errored subagent as tool_result with is_error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    _ = try conv.appendNode(null, .user_message, "do the thing");
+    const child = try conv.spawnSubagent("codereview");
+    _ = try child.appendNode(null, .user_message, "review please");
+    _ = try child.appendNode(null, .err, "boom");
+
+    const messages = try conv.toWireMessages(arena.allocator());
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    const tr = messages.items[2].content[0];
+    try std.testing.expect(tr == .tool_result);
+    try std.testing.expectEqual(true, tr.tool_result.is_error);
+    try std.testing.expectEqualStrings("boom", tr.tool_result.content);
 }

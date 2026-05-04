@@ -40,6 +40,7 @@ const subagents_mod = @import("subagents.zig");
 const llm = @import("llm.zig");
 const Session = @import("Session.zig");
 const LuaEngine_mod = @import("LuaEngine.zig");
+const Conversation = @import("Conversation.zig");
 
 /// Per-thread context consumed by the `task` tool. Set by AgentRunner
 /// before spawning the agent thread and republished by parallel tool
@@ -85,6 +86,12 @@ pub const TaskContext = struct {
     /// agent thread can wake the main poll() when it produces events
     /// that need to round-trip through Lua.
     wake_fd: ?std.posix.fd_t,
+    /// The parent Conversation that's spawning this subagent. Used by
+    /// the task tool to call `spawnSubagent` so the child's transcript
+    /// lands on the parent's tree as a `subagent_link` node, and so the
+    /// child's `persistEvent` chain delegates through the parent's
+    /// session handle for single-rooted JSONL persistence.
+    parent_conv: *Conversation,
 };
 
 /// Threadlocal slot holding the active `TaskContext` for the current

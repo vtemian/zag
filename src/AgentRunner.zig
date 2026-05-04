@@ -270,6 +270,7 @@ pub fn submit(
             .lua_engine = deps.lua_engine,
             .task_depth = self.task_depth,
             .wake_fd = deps.wake_write_fd,
+            .parent_conv = self.conversation,
         };
     }
 
