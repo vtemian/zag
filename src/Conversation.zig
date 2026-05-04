@@ -21,7 +21,7 @@ const ulid = @import("ulid.zig");
 
 const Conversation = @This();
 
-const log = std.log.scoped(.conversation_buffer);
+const log = std.log.scoped(.conversation);
 
 /// Re-export of the tree's node type enum, so external call sites that
 /// named it `Conversation.NodeType` keep compiling during the
@@ -1509,4 +1509,144 @@ test "streaming deltas accumulate in assistant_text TextBuffer" {
 
     const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("Hello, world!", tb.bytesView());
+}
+
+test "toWireMessages: empty conversation projects to no messages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 0), messages.items.len);
+}
+
+test "toWireMessages: single user_message yields one user message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hello");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(types.Role.user, messages.items[0].role);
+    try std.testing.expectEqual(@as(usize, 1), messages.items[0].content.len);
+    try std.testing.expectEqualStrings("hello", messages.items[0].content[0].text.text);
+}
+
+test "toWireMessages: user + assistant_text yields two messages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "ping");
+    _ = try cb.appendNode(null, .assistant_text, "pong");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(types.Role.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("ping", messages.items[0].content[0].text.text);
+    try std.testing.expectEqual(types.Role.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("pong", messages.items[1].content[0].text.text);
+}
+
+test "toWireMessages: tool_call/tool_result pairing emits assistant tool_use then user tool_result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "run a tool");
+    _ = try cb.appendNode(null, .assistant_text, "calling now");
+    const call = try cb.appendNode(null, .tool_call, "bash");
+    _ = try cb.appendNode(call, .tool_result, "ok");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    // user, assistant (text + tool_use), user (tool_result).
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+
+    try std.testing.expectEqual(types.Role.user, messages.items[0].role);
+
+    const assistant = messages.items[1];
+    try std.testing.expectEqual(types.Role.assistant, assistant.role);
+    try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+    try std.testing.expectEqualStrings("calling now", assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("bash", assistant.content[1].tool_use.name);
+    const synth_id = assistant.content[1].tool_use.id;
+    try std.testing.expectEqualStrings("synth_0", synth_id);
+
+    const tool_msg = messages.items[2];
+    try std.testing.expectEqual(types.Role.user, tool_msg.role);
+    try std.testing.expectEqual(@as(usize, 1), tool_msg.content.len);
+    try std.testing.expectEqualStrings(synth_id, tool_msg.content[0].tool_result.tool_use_id);
+    try std.testing.expectEqualStrings("ok", tool_msg.content[0].tool_result.content);
+}
+
+test "toWireMessages: status nodes are skipped from the projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "hi");
+    _ = try cb.appendNode(null, .status, "thinking...");
+    _ = try cb.appendNode(null, .assistant_text, "hello");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(types.Role.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("hi", messages.items[0].content[0].text.text);
+    try std.testing.expectEqual(types.Role.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("hello", messages.items[1].content[0].text.text);
+}
+
+test "toWireMessages: multi-block assistant coalesces into one message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "ask");
+    _ = try cb.appendNode(null, .assistant_text, "first");
+    _ = try cb.appendNode(null, .thinking, "reasoning");
+    _ = try cb.appendNode(null, .assistant_text, "second");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+
+    const assistant = messages.items[1];
+    try std.testing.expectEqual(types.Role.assistant, assistant.role);
+    try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+    try std.testing.expectEqualStrings("first", assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("reasoning", assistant.content[1].thinking.text);
+    try std.testing.expectEqualStrings("second", assistant.content[2].text.text);
+}
+
+test "toWireMessages: orphan tool_result pairs against synthesized 'unknown' id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "ask");
+    _ = try cb.appendNode(null, .tool_result, "stray");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+
+    const tool_msg = messages.items[1];
+    try std.testing.expectEqual(types.Role.user, tool_msg.role);
+    try std.testing.expectEqual(@as(usize, 1), tool_msg.content.len);
+    try std.testing.expectEqualStrings("unknown", tool_msg.content[0].tool_result.tool_use_id);
+    try std.testing.expectEqualStrings("stray", tool_msg.content[0].tool_result.content);
 }

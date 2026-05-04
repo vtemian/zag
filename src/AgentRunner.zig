@@ -277,7 +277,7 @@ pub fn submit(
         deps.provider,
         &self.wire_messages,
         deps.registry,
-        deps.allocator,
+        wire_alloc,
         &self.event_queue,
         &self.cancel_flag,
         deps.lua_engine,
