@@ -34,6 +34,9 @@ const Collector = @import("../sinks/Collector.zig").Collector;
 const subagents_types = @import("../subagents.zig");
 const Conversation = @import("../Conversation.zig");
 const Session = @import("../Session.zig");
+const AgentRunner = @import("../AgentRunner.zig");
+const BufferSink = @import("../sinks/BufferSink.zig").BufferSink;
+const llm = @import("../llm.zig");
 
 /// Maximum nested `task` invocations on a single runner. Picked to
 /// match the plan's recursion cap; keeps runaway delegation loops from
@@ -144,16 +147,12 @@ fn runChild(
     // Build a fresh one-tool-registry view for the child. `runLoopStreaming`
     // takes a `*const Registry`, not a Subset; the cleanest shim is a new
     // Registry that mirrors only the subset-visible tools from the parent.
-    // The child's dispatch path goes through `registry.execute`, which
-    // consults the copy's tool map directly.
     var child_registry = try buildChildRegistry(allocator, ctx.registry, sa.tools);
     defer child_registry.deinit();
 
     // Persist `task_start` with JSON-encoded inputs so replay tooling can
     // reconstruct what was delegated. Failure is logged but non-fatal; the
-    // subagent still runs. Capture the persisted id so the child's history
-    // can chain its first event off it and so `task_end` can name it as
-    // its parent for symmetric open/close querying.
+    // subagent still runs.
     var task_start_id: ?@import("../ulid.zig").Ulid = null;
     if (ctx.session_handle) |sh| {
         const start_payload = formatStartPayload(allocator, sa.name, prompt) catch |err| blk: {
@@ -173,110 +172,116 @@ fn runChild(
         }
     }
 
-    // The child shares the parent's session_handle (single-file replay)
-    // but maintains its own `last_persisted_id` chain so child events
-    // thread together independently of the parent's chain. Pre-seed the
-    // chain with the `task_start` ULID so the first child event auto-
-    // threads its `parent_id` back to the delegation scope.
-    //
-    // The child uses a full Conversation because that's where the
-    // persistence helpers live after Phase D; the tree and registry
-    // inside it stay empty, so the cost is the inline registry's empty
-    // ArrayLists plus a styled-line cache that nothing ever queries.
-    var child_history = try Conversation.init(allocator, 0, "task-child");
-    defer child_history.deinit();
-    if (ctx.session_handle) |sh| child_history.attachSession(sh);
-    child_history.last_persisted_id = task_start_id;
+    // Spawn a child Conversation under the parent. The child is owned
+    // by the parent's `subagents` list; we do NOT destroy it here. The
+    // parent's `deinit` walks subagents and frees the slot. The
+    // parent's tree gains a `subagent_link` node referencing the new
+    // index.
+    const parent_conv = ctx.parent_conv;
+    const child_conv = try parent_conv.spawnSubagent(sa.name);
+    // Pre-seed the child's persistence chain off the task_start ULID so
+    // the child's first persisted event chains into the delegation scope.
+    child_conv.last_persisted_id = task_start_id;
 
-    // Inject the subagent's system prompt as a prefix on the first user
-    // turn. TODO: thread the prompt through the Harness layer registry as
-    // a dedicated `subagent_system` layer so the child's system prompt
-    // matches the architecture of the default stack.
-    var child_messages: std.ArrayList(types.Message) = .empty;
-    defer {
-        for (child_messages.items) |msg| msg.deinit(allocator);
-        child_messages.deinit(allocator);
-    }
-
+    // Compose the child's first user prompt: subagent system prompt
+    // prefix, blank line, the caller's prompt.
     const initial_text = try std.fmt.allocPrint(
         allocator,
         "{s}\n\n{s}",
         .{ sa.prompt, prompt },
     );
-    {
-        errdefer allocator.free(initial_text);
-        const content = try allocator.alloc(types.ContentBlock, 1);
-        errdefer allocator.free(content);
-        content[0] = .{ .text = .{ .text = initial_text } };
-        try child_messages.append(allocator, .{ .role = .user, .content = content });
-    }
+    defer allocator.free(initial_text);
 
-    // Child event queue and cancel flag. The queue is bounded; the child
-    // producer blocks on backpressure while the caller's drain loop keeps
-    // pulling, same shape as the parent's pipeline.
-    var child_queue = try agent_events.EventQueue.initBounded(ctx.allocator, 256);
-    defer child_queue.deinit();
-    child_queue.wake_fd = ctx.wake_fd;
+    // Wire a BufferSink to the child Conversation. Events from the
+    // child runner flow through here into the child's tree (assistant
+    // text, tool_call/tool_result, thinking, errors). The sink owns
+    // its node-correlation state (call_id map, current assistant node)
+    // and is reset on `.run_end`. Heap-allocated would also work; a
+    // stack instance is fine because runChild is the sole owner and
+    // the runner's thread is joined before this function returns.
+    var child_sink = BufferSink.init(allocator, child_conv);
+    defer child_sink.deinit();
 
-    var child_cancel: agent_events.CancelFlag = agent_events.CancelFlag.init(false);
+    // Construct the child runner. Its wire_arena, event_queue, and
+    // sink are all child-scoped; the agent thread sees a fully
+    // isolated runtime keyed off the child Conversation.
+    var child_runner = AgentRunner.init(allocator, child_sink.sink(), child_conv);
+    defer child_runner.deinit();
+    child_runner.wake_fd = ctx.wake_fd;
+    child_runner.lua_engine = ctx.lua_engine;
+    // No window_manager wired: subagents do not mutate the window
+    // tree. Layout requests get serviced as errors via the round-trip
+    // dispatcher's no-WM branch, which matches the legacy collector
+    // behaviour ("subagent_unsupported" surfaced as is_error to the
+    // child agent thread).
+    child_runner.task_depth = ctx.task_depth + 1;
 
-    var collector = Collector.init(allocator);
-    defer collector.deinit();
+    // Submit the user turn: persists a tagged user_message JSONL entry
+    // (subagent_id stamped via the parent backlink) and pushes
+    // `run_start` to the child sink, which appends a user_message
+    // node to the child's tree. The next `submit` projects the tree
+    // into the wire-format messages the agent thread reads.
+    try child_runner.submitInput(initial_text);
 
-    // Spawn the child agent on its own thread. The current thread (the
-    // tool-execution thread) becomes the drain loop: it pumps events out
-    // of the queue, forwards the text-shaped ones to the Collector, and
-    // waits for `.done` before joining.
-    const child_thread = try std.Thread.spawn(.{}, childThreadMain, .{ChildArgs{
-        .messages = &child_messages,
-        .registry = &child_registry,
+    // Subagents inherit the parent's `provider_name` and `model_id` so
+    // their `runLoopStreaming` drives the same per-model prompt pack as
+    // the parent. The compact threshold is intentionally suppressed
+    // here: the strategy socket is a parent-loop concern, and a child
+    // run that hits its model's ceiling surfaces as a normal `MaxTokens`
+    // stop. Building a fresh spec with `context_window = 0` keeps that
+    // contract while keeping the prompt-pack identity intact.
+    const child_model_spec: llm.ModelSpec = .{
+        .provider_name = ctx.model_spec.provider_name,
+        .model_id = ctx.model_spec.model_id,
+        .context_window = 0,
+    };
+
+    // Inherit the parent's session_id so subagent telemetry lines stay
+    // grouped under the same session in the timeline log.
+    const child_session_id: []const u8 = if (ctx.session_handle) |sh|
+        sh.id[0..sh.id_len]
+    else
+        "";
+
+    try child_runner.submit(.{
         .allocator = ctx.allocator,
-        .queue = &child_queue,
-        .cancel = &child_cancel,
+        .wake_write_fd = ctx.wake_fd orelse 0,
         .lua_engine = ctx.lua_engine,
         .provider = ctx.provider,
-        .provider_name = ctx.provider_name,
-        .model_spec = ctx.model_spec,
-        .parent_ctx = ctx,
-    }});
+        .model_spec = child_model_spec,
+        .registry = &child_registry,
+        .skills = null,
+        .subagents = ctx.subagents,
+        .session_id = child_session_id,
+    });
 
-    // Propagate parent cancel to child: while draining we poll the
-    // parent's cancel flag and set the child's if it flips.
-    var saw_done = false;
-    var buf: [64]agent_events.AgentEvent = undefined;
-    while (!saw_done) {
+    // Drain the child runner's event queue on this thread. The drain
+    // loop services hook/layout/lua_tool round-trips inline (with the
+    // wired engine, or as errors when no engine is present) and pumps
+    // content events through `child_sink` into the child's tree. When
+    // the agent thread's `.done` event arrives the runner joins it
+    // and `drainEvents` returns `.finished = true`.
+    while (true) {
         if (parent_cancel) |pc| {
-            if (pc.load(.acquire)) child_cancel.store(true, .release);
+            if (pc.load(.acquire)) child_runner.cancelAgent();
         }
-        const n = child_queue.drain(&buf);
-        if (n == 0) {
-            std.Thread.sleep(5 * std.time.ns_per_ms);
-            continue;
-        }
-        for (buf[0..n]) |event| {
-            handleChildEvent(event, &collector, &child_history, allocator);
-            if (event == .done) saw_done = true;
-        }
+        const r = child_runner.drainEvents();
+        if (r.finished) break;
+        if (!r.any_drained) std.Thread.sleep(5 * std.time.ns_per_ms);
     }
-    child_thread.join();
 
-    // Drain anything queued after .done (unlikely, but defensive).
-    const tail_n = child_queue.drain(&buf);
-    for (buf[0..tail_n]) |event| handleChildEvent(event, &collector, &child_history, allocator);
-
-    // Take ownership of the collected text. The Collector's ArrayList is
-    // heap-allocated with `allocator`, so we can hand the slice straight
-    // back; `clearRetainingCapacity` detaches it from the Collector's
-    // deinit path.
-    const final = collector.final_text.items;
-    const owned = try allocator.dupe(u8, final);
+    // Derive the final summary from the child's tree. The same helper
+    // backs `toWireMessages` projection of `subagent_link`, so the
+    // tool_result the parent's LLM sees and the JSONL `task_end`
+    // content stay in lockstep.
+    var summary_arena = std.heap.ArenaAllocator.init(allocator);
+    defer summary_arena.deinit();
+    const summary = try Conversation.childFinalSummaryForTask(summary_arena.allocator(), child_conv);
+    const is_err = Conversation.childErroredForTask(child_conv);
+    const owned = try allocator.dupe(u8, summary);
     errdefer allocator.free(owned);
 
     if (ctx.session_handle) |sh| {
-        // Chain task_end to task_start so the open/close pair is a
-        // sibling block in the parent_id tree. If the empty-child case
-        // hit and task_start was never persisted (`null`), leave
-        // parent_id unset; the entry still lands in JSONL order.
         _ = sh.appendEntry(.{
             .entry_type = .task_end,
             .content = owned,
@@ -285,7 +290,7 @@ fn runChild(
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }
 
-    return .{ .content = owned, .is_error = false, .owned = true };
+    return .{ .content = owned, .is_error = is_err, .owned = true };
 }
 
 const ChildArgs = struct {
@@ -326,6 +331,7 @@ fn buildChildContext(parent_ctx: *const tools.TaskContext, args: ChildArgs) tool
         .lua_engine = args.lua_engine,
         .task_depth = parent_ctx.task_depth + 1,
         .wake_fd = args.queue.wake_fd,
+        .parent_conv = parent_ctx.parent_conv,
     };
 }
 
@@ -637,6 +643,8 @@ test "task returns error for unknown agent" {
     // Minimal context: provider and lua_engine can be zeroed; execute()
     // short-circuits before touching them because the lookup fails.
     const dummy_provider: @import("../llm.zig").Provider = undefined;
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
         .subagents = &subagent_registry,
@@ -648,6 +656,7 @@ test "task returns error for unknown agent" {
         .lua_engine = null,
         .task_depth = 0,
         .wake_fd = null,
+        .parent_conv = &parent_conv,
     };
     tools.task_context = &ctx;
     defer tools.task_context = null;
@@ -679,6 +688,8 @@ test "task hits recursion cap at max depth" {
     defer parent_registry.deinit();
 
     const dummy_provider: @import("../llm.zig").Provider = undefined;
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
         .subagents = &subagent_registry,
@@ -690,6 +701,7 @@ test "task hits recursion cap at max depth" {
         .lua_engine = null,
         .task_depth = max_task_depth,
         .wake_fd = null,
+        .parent_conv = &parent_conv,
     };
     tools.task_context = &ctx;
     defer tools.task_context = null;
@@ -764,6 +776,8 @@ test "buildChildContext increments depth and inherits parent state" {
     defer child_messages.deinit(allocator);
 
     const dummy_provider: @import("../llm.zig").Provider = undefined;
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
     const parent: tools.TaskContext = .{
         .allocator = allocator,
         .subagents = &subagent_registry,
@@ -775,6 +789,7 @@ test "buildChildContext increments depth and inherits parent state" {
         .lua_engine = null,
         .task_depth = 7,
         .wake_fd = null,
+        .parent_conv = &parent_conv,
     };
 
     const args: ChildArgs = .{
