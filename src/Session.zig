@@ -135,6 +135,11 @@ pub const Entry = struct {
     /// non-tool entries and on tool entries persisted before this field
     /// existed; replay logic treats null as "fall back to linear pairing".
     tool_use_id: ?[]const u8 = null,
+    /// When non-null, this entry was emitted by a subagent. Equal to
+    /// the subagent's `parent_subagent_id` (its index in the parent
+    /// Conversation's `subagents` list). Null for root-conversation
+    /// events.
+    subagent_id: ?u32 = null,
 };
 
 /// Return true when `id` is the all-zeros sentinel produced by the
@@ -812,6 +817,10 @@ fn serializeEntry(entry: *Entry, out: *std.ArrayList(u8), allocator: Allocator) 
         try writeJsonString(w, id);
     }
 
+    if (entry.subagent_id) |sid| {
+        try w.print(",\"subagent_id\":{d}", .{sid});
+    }
+
     try w.print(",\"ts\":{d}", .{entry.timestamp});
     try w.writeAll("}");
 }
@@ -903,6 +912,16 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         else => null,
     } else null;
 
+    var subagent_id: ?u32 = null;
+    if (obj.get("subagent_id")) |v| switch (v) {
+        .integer => |i| {
+            if (i >= 0 and i <= std.math.maxInt(u32)) {
+                subagent_id = @intCast(i);
+            }
+        },
+        else => {},
+    };
+
     return Entry{
         .entry_type = entry_type,
         .content = content,
@@ -916,6 +935,7 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
         .thinking_provider = thinking_provider,
         .encrypted_data = encrypted_data,
         .tool_use_id = tool_use_id,
+        .subagent_id = subagent_id,
     };
 }
 
@@ -1287,6 +1307,49 @@ test "parseEntry reads new id and parent_id fields" {
     try std.testing.expectEqualSlices(u8, &id, &parsed.id);
     try std.testing.expect(parsed.parent_id != null);
     try std.testing.expectEqualSlices(u8, &parent, &parsed.parent_id.?);
+}
+
+test "Entry round-trips subagent_id" {
+    const allocator = std.testing.allocator;
+
+    var tagged = Entry{
+        .entry_type = .assistant_text,
+        .content = "from subagent",
+        .timestamp = 11,
+        .subagent_id = 7,
+    };
+
+    var buf: [8192]u8 = undefined;
+    const json = try serializeEntryToBuf(&tagged, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"subagent_id\":7") != null);
+
+    const parsed = try parseEntry(json, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expect(parsed.subagent_id != null);
+    try std.testing.expectEqual(@as(u32, 7), parsed.subagent_id.?);
+
+    var untagged = Entry{
+        .entry_type = .user_message,
+        .content = "root",
+        .timestamp = 12,
+    };
+    const json2 = try serializeEntryToBuf(&untagged, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json2, "\"subagent_id\"") == null);
+
+    const parsed2 = try parseEntry(json2, allocator);
+    defer freeEntry(parsed2, allocator);
+    try std.testing.expect(parsed2.subagent_id == null);
+}
+
+test "parseEntry leaves subagent_id null on legacy lines" {
+    const allocator = std.testing.allocator;
+    const legacy_line = "{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":1}";
+
+    const parsed = try parseEntry(legacy_line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expect(parsed.subagent_id == null);
 }
 
 test "parseEntry leaves id as zero when field missing" {
