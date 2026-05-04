@@ -187,10 +187,11 @@ src/
     edit.zig                exact text replacement
     bash.zig                shell command execution (with seatbelt on macOS)
     layout.zig              window-system mutation tool
-    task.zig                spawn subagent task tool
+    task.zig                spawn subagent (child Conversation) via task tool
 
   Session.zig               JSONL session persistence and management
-  Conversation.zig          conversation (tree, registry, persistence, projection)
+  Conversation.zig          conversation (tree, registry, persistence,
+                             projection, child subagents)
   ConversationTree.zig      branching node tree (forks, retries, edits)
   NodeRegistry.zig          conversation node id allocator
   NodeRenderer.zig          type-specific node rendering for Conversation
