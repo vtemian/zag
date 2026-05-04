@@ -11,6 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ScratchBuffer = @import("buffers/scratch.zig");
 const GraphicsBuffer = @import("buffers/graphics.zig");
+const TextBuffer = @import("buffers/text.zig");
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
 
@@ -18,16 +19,18 @@ const BufferRegistry = @This();
 
 pub const Error = error{StaleBuffer};
 
-pub const Kind = enum { scratch, graphics };
+pub const Kind = enum { scratch, graphics, text };
 
 pub const Entry = union(Kind) {
     scratch: *ScratchBuffer,
     graphics: *GraphicsBuffer,
+    text: *TextBuffer,
 
     fn destroy(self: Entry) void {
         switch (self) {
             .scratch => |p| p.destroy(),
             .graphics => |p| p.destroy(),
+            .text => |p| p.destroy(),
         }
     }
 
@@ -35,13 +38,15 @@ pub const Entry = union(Kind) {
         return switch (self) {
             .scratch => |p| p.buf(),
             .graphics => |p| p.buf(),
+            .text => |p| p.buf(),
         };
     }
 
-    fn asView(self: Entry) View {
+    fn asView(self: Entry) !View {
         return switch (self) {
             .scratch => |p| p.view(),
             .graphics => |p| p.view(),
+            .text => error.NoViewForKind,
         };
     }
 };
@@ -93,6 +98,14 @@ pub fn createGraphics(self: *BufferRegistry, name: []const u8) !Handle {
     return try self.insert(.{ .graphics = gb });
 }
 
+pub fn createText(self: *BufferRegistry, name: []const u8) !Handle {
+    const buffer_id = self.next_buffer_id;
+    self.next_buffer_id += 1;
+    const tb = try TextBuffer.create(self.allocator, buffer_id, name);
+    errdefer tb.destroy();
+    return try self.insert(.{ .text = tb });
+}
+
 fn insert(self: *BufferRegistry, entry: Entry) !Handle {
     if (self.free_indices.pop()) |idx| {
         const slot = &self.slots.items[idx];
@@ -115,8 +128,16 @@ pub fn asBuffer(self: *const BufferRegistry, handle: Handle) Error!Buffer {
     return (try self.resolve(handle)).asBuffer();
 }
 
-pub fn asView(self: *const BufferRegistry, handle: Handle) Error!View {
+pub fn asView(self: *const BufferRegistry, handle: Handle) (Error || error{NoViewForKind})!View {
     return (try self.resolve(handle)).asView();
+}
+
+pub fn asText(self: *const BufferRegistry, handle: Handle) Error!*TextBuffer {
+    const entry = try self.resolve(handle);
+    return switch (entry) {
+        .text => |p| p,
+        else => Error.StaleBuffer,
+    };
 }
 
 pub fn remove(self: *BufferRegistry, handle: Handle) (Error || Allocator.Error)!void {
@@ -208,6 +229,40 @@ test "remove on graphics entry destroys the GraphicsBuffer" {
     const h = try r.createGraphics("viewer");
     try r.remove(h);
     try std.testing.expectError(Error.StaleBuffer, r.resolve(h));
+}
+
+test "createText returns a resolvable handle" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createText("body");
+    const entry = try r.resolve(h);
+    try std.testing.expect(entry == .text);
+}
+
+test "asText returns the heap pointer" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createText("body");
+    const tb = try r.asText(h);
+    try std.testing.expectEqualStrings("body", tb.name);
+
+    try tb.append("hello");
+    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+}
+
+test "asView on text entry returns NoViewForKind" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createText("body");
+    try std.testing.expectError(error.NoViewForKind, r.asView(h));
+}
+
+test "remove on text entry destroys the TextBuffer" {
+    var r = BufferRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const h = try r.createText("body");
+    try r.remove(h);
+    try std.testing.expectError(BufferRegistry.Error.StaleBuffer, r.resolve(h));
 }
 
 test "formatId and parseId round trip" {
