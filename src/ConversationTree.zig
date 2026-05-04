@@ -13,7 +13,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Session = @import("Session.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 
 /// Handle into the WindowManager's BufferRegistry. Aliased here so
@@ -43,24 +42,24 @@ pub const NodeType = enum {
     thinking_redacted,
 };
 
-/// A single node in the buffer tree. Owns its content and children.
+/// A single node in the buffer tree. Owns its children; textual content
+/// lives in a registry-allocated TextBuffer (or ImageBuffer for image
+/// tool_result) referenced by `buffer_id`. Tool_call nodes carry their
+/// metadata on `custom_tag` until Phase D introduces a typed metadata
+/// field.
 pub const Node = struct {
     /// Unique identifier within the owning tree.
     id: u32,
     /// Semantic type used by renderers to decide formatting.
     node_type: NodeType,
-    /// Tag for custom-typed nodes (e.g. plugin-defined types).
+    /// Tag for custom-typed nodes (e.g. plugin-defined types). Also
+    /// holds tool_call metadata (tool name) until Phase D's typed
+    /// metadata field replaces it. Owned when set; freed in `deinit`.
     custom_tag: ?[]const u8 = null,
-    /// The textual content of this node. Owned by the node when
-    /// `buffer_id` is null. Empty (zero-length) when content lives in
-    /// a registry-allocated TextBuffer (see `buffer_id`).
-    content: std.ArrayList(u8),
     /// Optional handle into the WindowManager's BufferRegistry. When
-    /// non-null, this node's textual content lives in a TextBuffer (or
-    /// ImageBuffer for tool_result image nodes) referenced by the
-    /// handle, and `content` is empty. Migration runs across Phase C
-    /// commits 3-7; once every node-type group is migrated, the
-    /// `content` field is removed entirely.
+    /// set, this node's content lives in a TextBuffer (or ImageBuffer
+    /// for image tool_result nodes) referenced by the handle. Tool_call
+    /// nodes leave this null and store their metadata on `custom_tag`.
     buffer_id: ?BufferHandle = null,
     /// Child nodes (e.g. tool_result children of a tool_call).
     children: std.ArrayList(*Node),
@@ -82,7 +81,7 @@ pub const Node = struct {
             allocator.destroy(child);
         }
         self.children.deinit(allocator);
-        self.content.deinit(allocator);
+        if (self.custom_tag) |tag| allocator.free(tag);
     }
 
     /// Mark this node's content as changed, invalidating any cache entry
@@ -168,20 +167,17 @@ pub fn deinit(self: *ConversationTree) void {
 }
 
 /// Create a new node and attach it to `parent` (or root if null). The
-/// node's id is unique within the tree. Bumps `generation` and pushes
-/// the new id onto `dirty_nodes`.
-pub fn appendNode(self: *ConversationTree, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
+/// node's id is unique within the tree. The tree itself is content-
+/// storage-agnostic; the caller (typically `ConversationBuffer.appendNode`)
+/// is responsible for stamping `buffer_id` or `custom_tag` afterwards.
+/// Bumps `generation` and pushes the new id onto `dirty_nodes`.
+pub fn appendNode(self: *ConversationTree, parent: ?*Node, node_type: NodeType) !*Node {
     const node = try self.allocator.create(Node);
     errdefer self.allocator.destroy(node);
-
-    var items: std.ArrayList(u8) = .empty;
-    try items.appendSlice(self.allocator, content);
-    errdefer items.deinit(self.allocator);
 
     node.* = .{
         .id = self.next_id,
         .node_type = node_type,
-        .content = items,
         .children = .empty,
         .parent = parent,
     };
@@ -196,16 +192,6 @@ pub fn appendNode(self: *ConversationTree, parent: ?*Node, node_type: NodeType, 
     self.generation +%= 1;
     self.dirty_nodes.push(node.id);
     return node;
-}
-
-/// Append `text` to an existing node's content, advancing its
-/// `content_version` so the cache invalidates on next read. Bumps
-/// `generation` and pushes the node's id onto `dirty_nodes`.
-pub fn appendToNode(self: *ConversationTree, node: *Node, text: []const u8) !void {
-    try node.content.appendSlice(self.allocator, text);
-    node.markDirty();
-    self.generation +%= 1;
-    self.dirty_nodes.push(node.id);
 }
 
 /// Remove `node` from its parent's child list (or from the root list
@@ -255,60 +241,6 @@ pub fn drainDirty(self: *ConversationTree, out: []u32) DrainResult {
     return self.dirty_nodes.drain(out);
 }
 
-/// Deserialize a prior session's JSONL entries into the tree. Clears
-/// first, so this is a full load, not an append.
-///
-/// Mirrors `ConversationBuffer.loadFromEntries`; kept on the buffer for
-/// back-compat (it re-parents `tool_result` to the most-recent
-/// `tool_call` node, which requires a local walker that the tree alone
-/// doesn't provide). Once callers target the tree directly, the buffer
-/// version can become a delegate.
-pub fn loadFromEntriesFlat(self: *ConversationTree, entries: []const Session.Entry) !void {
-    self.clear();
-
-    for (entries) |entry| {
-        const node_type: NodeType = switch (entry.entry_type) {
-            .user_message => .user_message,
-            .assistant_text => .assistant_text,
-            .tool_call => .tool_call,
-            .tool_result => .tool_result,
-            .info => .status,
-            .err => .err,
-            // session_start / session_rename are audit entries, not
-            // visible tree content. task_start / task_end mark the
-            // boundaries of a delegated subagent invocation; the
-            // parent's tool_result already carries the subagent's
-            // output, so rendering task markers as nodes would duplicate.
-            .session_start, .session_rename, .task_start, .task_end => continue,
-            // Inline subagent events render the same as top-level
-            // counterparts; the task_start/task_end markers above still
-            // bracket the delegation in the JSONL stream.
-            .task_message => .assistant_text,
-            .task_tool_use => .tool_call,
-            .task_tool_result => .tool_result,
-            // Thinking entries become dedicated nodes. The redacted
-            // variant surfaces its ciphertext-length marker from
-            // `encrypted_data` rather than `content`.
-            .thinking => .thinking,
-            .thinking_redacted => .thinking_redacted,
-        };
-        // `.thinking_redacted` has no user-visible content; the renderer
-        // prints a fixed header. We still append an empty node so scroll
-        // positions and replay counts line up with the session.
-        const content: []const u8 = switch (entry.entry_type) {
-            .thinking_redacted => "",
-            else => entry.content,
-        };
-        const node = try self.appendNode(null, node_type, content);
-        // Reloaded thinking nodes default collapsed: no streaming context,
-        // so the user should see the compact header first and opt in with
-        // Ctrl-R. Ciphertext blocks have no expanded view either way.
-        if (entry.entry_type == .thinking or entry.entry_type == .thinking_redacted) {
-            node.collapsed = true;
-        }
-    }
-}
-
 /// Toggle `collapsed` on every foldable node (`.thinking`,
 /// `.thinking_redacted`, `.tool_call`) in the tree. Bumps each node's
 /// `content_version` so the NodeLineCache invalidates its entries, and
@@ -346,34 +278,19 @@ test "appendNode assigns monotonic ids and bumps generation" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    const a = try tree.appendNode(null, .user_message, "hello");
-    const b = try tree.appendNode(null, .assistant_text, "hi");
+    const a = try tree.appendNode(null, .user_message);
+    const b = try tree.appendNode(null, .assistant_text);
     try std.testing.expectEqual(@as(u32, 0), a.id);
     try std.testing.expectEqual(@as(u32, 1), b.id);
     try std.testing.expectEqual(@as(u32, 2), tree.currentGeneration());
-}
-
-test "appendToNode advances content_version and generation" {
-    var tree = ConversationTree.init(std.testing.allocator);
-    defer tree.deinit();
-
-    const node = try tree.appendNode(null, .assistant_text, "partial");
-    const gen_before = tree.currentGeneration();
-    const ver_before = node.content_version;
-
-    try tree.appendToNode(node, " more");
-
-    try std.testing.expectEqual(ver_before +% 1, node.content_version);
-    try std.testing.expectEqual(gen_before +% 1, tree.currentGeneration());
-    try std.testing.expectEqualStrings("partial more", node.content.items);
 }
 
 test "drainDirty returns pushed ids and clears the ring" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    const a = try tree.appendNode(null, .user_message, "a");
-    const b = try tree.appendNode(null, .assistant_text, "b");
+    const a = try tree.appendNode(null, .user_message);
+    const b = try tree.appendNode(null, .assistant_text);
 
     var out: [DirtyRing.capacity]u32 = undefined;
     const first = tree.drainDirty(&out);
@@ -396,7 +313,7 @@ test "drainDirty reports overflow when the ring saturates" {
     // ring holds `DirtyRing.capacity` entries before overflow.
     var i: usize = 0;
     while (i < DirtyRing.capacity + 4) : (i += 1) {
-        _ = try tree.appendNode(null, .status, "");
+        _ = try tree.appendNode(null, .status);
     }
 
     var out: [DirtyRing.capacity]u32 = undefined;
@@ -409,8 +326,8 @@ test "clear drops every node and marks the ring overflowed" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    _ = try tree.appendNode(null, .user_message, "a");
-    _ = try tree.appendNode(null, .assistant_text, "b");
+    _ = try tree.appendNode(null, .user_message);
+    _ = try tree.appendNode(null, .assistant_text);
 
     tree.clear();
 
@@ -422,32 +339,14 @@ test "clear drops every node and marks the ring overflowed" {
     try std.testing.expectEqual(true, drained.overflowed);
 }
 
-test "loadFromEntriesFlat surfaces thinking entries as collapsed thinking nodes" {
-    var tree = ConversationTree.init(std.testing.allocator);
-    defer tree.deinit();
-
-    const entries = [_]Session.Entry{
-        .{ .entry_type = .thinking, .content = "let me think...", .timestamp = 0 },
-        .{ .entry_type = .thinking_redacted, .content = "", .encrypted_data = "ENC", .timestamp = 1 },
-    };
-    try tree.loadFromEntriesFlat(&entries);
-
-    try std.testing.expectEqual(@as(usize, 2), tree.root_children.items.len);
-    try std.testing.expectEqual(NodeType.thinking, tree.root_children.items[0].node_type);
-    try std.testing.expect(tree.root_children.items[0].collapsed);
-    try std.testing.expectEqualStrings("let me think...", tree.root_children.items[0].content.items);
-    try std.testing.expectEqual(NodeType.thinking_redacted, tree.root_children.items[1].node_type);
-    try std.testing.expect(tree.root_children.items[1].collapsed);
-}
-
 test "toggleAllFoldableCollapsed flips state and bumps cache version" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    const t1 = try tree.appendNode(null, .thinking, "a");
+    const t1 = try tree.appendNode(null, .thinking);
     t1.collapsed = true;
-    const other = try tree.appendNode(null, .assistant_text, "x");
-    const t2 = try tree.appendNode(null, .thinking, "b");
+    const other = try tree.appendNode(null, .assistant_text);
+    const t2 = try tree.appendNode(null, .thinking);
     t2.collapsed = false;
 
     const ver_before_t1 = t1.content_version;
@@ -468,7 +367,7 @@ test "toggleAllFoldableCollapsed is a no-op when no foldable nodes exist" {
     var tree = ConversationTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    _ = try tree.appendNode(null, .user_message, "hi");
+    _ = try tree.appendNode(null, .user_message);
     const gen_before = tree.currentGeneration();
 
     const touched = tree.toggleAllFoldableCollapsed();

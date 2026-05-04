@@ -1825,8 +1825,11 @@ test "recalculateFloats sizes a float to longest-line bounded by max_width" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
+    var registry = @import("BufferRegistry.zig").init(allocator);
+    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "picker");
     defer cb.deinit();
+    cb.attachBufferRegistry(&registry);
     var test_viewport: Viewport = .{};
     // Three lines, longest is 14 chars. We bound max_width to 10 so
     // the size-to-content path picks the bound, not the full width.
