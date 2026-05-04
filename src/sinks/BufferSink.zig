@@ -211,7 +211,7 @@ test "BufferSink run_start appends a user node" {
     const node = cb.tree.root_children.items[0];
     try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, node.node_type);
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "BufferSink assistant_delta creates then extends" {
@@ -232,7 +232,7 @@ test "BufferSink assistant_delta creates then extends" {
     const node = cb.tree.root_children.items[0];
     try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, node.node_type);
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
     try std.testing.expect(bs.current_assistant_node != null);
 }
 
@@ -281,7 +281,7 @@ test "BufferSink tool_result correlates via call_id" {
     try std.testing.expectEqual(@as(usize, 1), first_tool.children.items.len);
     try std.testing.expectEqual(@as(usize, 0), second_tool.children.items.len);
     const result_tb = try registry.asText(first_tool.children.items[0].buffer_id.?);
-    try std.testing.expectEqualStrings("result-a", result_tb.bytes_view());
+    try std.testing.expectEqualStrings("result-a", result_tb.bytesView());
 
     // "id-a" should have been removed from the pending map; "id-b" still in flight.
     try std.testing.expectEqual(@as(u32, 1), bs.pending_tool_calls.count());
@@ -306,7 +306,7 @@ test "BufferSink tool_result falls back to last_tool_call without call_id" {
     const tool = cb.tree.root_children.items[0];
     try std.testing.expectEqual(@as(usize, 1), tool.children.items.len);
     const result_tb = try registry.asText(tool.children.items[0].buffer_id.?);
-    try std.testing.expectEqualStrings("result", result_tb.bytes_view());
+    try std.testing.expectEqualStrings("result", result_tb.bytesView());
 }
 
 test "BufferSink handles duplicate call_id without leaking the key" {
@@ -452,5 +452,5 @@ test "BufferSink error_event appends an err node" {
     const node = cb.tree.root_children.items[0];
     try std.testing.expectEqual(ConversationBuffer.NodeType.err, node.node_type);
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("boom", tb.bytes_view());
+    try std.testing.expectEqualStrings("boom", tb.bytesView());
 }

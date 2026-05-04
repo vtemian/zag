@@ -514,5 +514,5 @@ test "appendStatusLine creates a status node on the given view" {
     try std.testing.expectEqual(@as(usize, 1), view.tree.root_children.items.len);
     try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.tree.root_children.items[0].node_type);
     const tb = try registry.asText(view.tree.root_children.items[0].buffer_id.?);
-    try std.testing.expectEqualStrings("hello world", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello world", tb.bytesView());
 }

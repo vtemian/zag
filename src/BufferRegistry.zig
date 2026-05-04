@@ -17,7 +17,7 @@ const View = @import("View.zig");
 
 const BufferRegistry = @This();
 
-pub const Error = error{StaleBuffer};
+pub const Error = error{ StaleBuffer, WrongKind };
 
 pub const Kind = enum { scratch, image, text };
 
@@ -136,7 +136,7 @@ pub fn asText(self: *const BufferRegistry, handle: Handle) Error!*TextBuffer {
     const entry = try self.resolve(handle);
     return switch (entry) {
         .text => |p| p,
-        else => Error.StaleBuffer,
+        else => Error.WrongKind,
     };
 }
 
@@ -144,7 +144,7 @@ pub fn asImage(self: *const BufferRegistry, handle: Handle) Error!*ImageBuffer {
     const entry = try self.resolve(handle);
     return switch (entry) {
         .image => |p| p,
-        else => Error.StaleBuffer,
+        else => Error.WrongKind,
     };
 }
 
@@ -255,7 +255,7 @@ test "asText returns the heap pointer" {
     try std.testing.expectEqualStrings("body", tb.name);
 
     try tb.append("hello");
-    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "asView on text entry returns NoViewForKind" {

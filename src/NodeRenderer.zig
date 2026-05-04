@@ -97,7 +97,7 @@ pub fn nodeBytes(node: *const Node, registry: ?*BufferRegistry) []const u8 {
     if (node.buffer_id) |handle| {
         const reg = registry orelse return &.{};
         const tb = reg.asText(handle) catch return &.{};
-        return tb.bytes_view();
+        return tb.bytesView();
     }
     return node.custom_tag orelse &.{};
 }

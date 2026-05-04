@@ -634,8 +634,8 @@ test "appendNode creates root-level nodes" {
     try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
     const tb1 = try registry.asText(n1.buffer_id.?);
     const tb2 = try registry.asText(n2.buffer_id.?);
-    try std.testing.expectEqualStrings("hello", tb1.bytes_view());
-    try std.testing.expectEqualStrings("hi there", tb2.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb1.bytesView());
+    try std.testing.expectEqualStrings("hi there", tb2.bytesView());
 }
 
 test "getVisibleLines returns rendered lines" {
@@ -1000,7 +1000,7 @@ test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes
     try std.testing.expectEqual(NodeType.thinking, cb.tree.root_children.items[1].node_type);
     try std.testing.expect(cb.tree.root_children.items[1].collapsed);
     const tb = try registry.asText(cb.tree.root_children.items[1].buffer_id.?);
-    try std.testing.expectEqualStrings("let me think", tb.bytes_view());
+    try std.testing.expectEqualStrings("let me think", tb.bytesView());
     try std.testing.expectEqual(NodeType.thinking_redacted, cb.tree.root_children.items[2].node_type);
     try std.testing.expect(cb.tree.root_children.items[2].collapsed);
 }
@@ -1196,7 +1196,7 @@ test "appendNode for status routes through TextBuffer" {
     try std.testing.expect(node.buffer_id != null);
 
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "appendNode without registry returns NoBufferRegistry for content nodes" {
@@ -1220,7 +1220,7 @@ test "appendToNode for status routes through TextBuffer" {
     try cb.appendToNode(node, " world");
 
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("hello world", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello world", tb.bytesView());
 }
 
 test "appendNode for user_message routes through TextBuffer" {
@@ -1235,7 +1235,7 @@ test "appendNode for user_message routes through TextBuffer" {
     try std.testing.expect(node.buffer_id != null);
 
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("hello", tb.bytes_view());
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "appendNode for custom routes through TextBuffer" {
@@ -1250,7 +1250,7 @@ test "appendNode for custom routes through TextBuffer" {
     try std.testing.expect(node.buffer_id != null);
 
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("payload", tb.bytes_view());
+    try std.testing.expectEqualStrings("payload", tb.bytesView());
 }
 
 test "appendNode for tool_call leaves buffer_id null and stashes name on custom_tag" {
@@ -1282,7 +1282,7 @@ test "appendNode for tool_result text routes through TextBuffer" {
     try std.testing.expect(result.buffer_id != null);
 
     const tb = try registry.asText(result.buffer_id.?);
-    try std.testing.expectEqualStrings("ls output here", tb.bytes_view());
+    try std.testing.expectEqualStrings("ls output here", tb.bytesView());
 }
 
 // 1x1 opaque red PNG, mirroring the fixture used in src/buffers/image.zig.
@@ -1355,5 +1355,5 @@ test "streaming deltas accumulate in assistant_text TextBuffer" {
     try cb.appendToNode(node, "world!");
 
     const tb = try registry.asText(node.buffer_id.?);
-    try std.testing.expectEqualStrings("Hello, world!", tb.bytes_view());
+    try std.testing.expectEqualStrings("Hello, world!", tb.bytesView());
 }
