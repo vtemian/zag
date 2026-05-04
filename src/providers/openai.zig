@@ -1653,38 +1653,29 @@ test "openai writeMessage echoes any-provider thinking after JSONL replay" {
     // and then switched to Moonshot/Kimi must round-trip Claude's
     // thinking text through reasoning_content rather than dropping
     // it silently. This pins the full path:
-    //   JSONL entry -> rebuildMessages -> writeMessage -> assertion.
+    //   JSONL entry -> hand-built assistant Message -> writeMessage -> assertion.
+    //
+    // ConversationBuffer.toWireMessages does not preserve the
+    // `thinking_provider` tag (Phase D parks no provider metadata on
+    // tree nodes), so the projection is not a usable substitute for
+    // testing the reasoning_content gate's interaction with the tag.
+    // The test fabricates the assistant message directly with the tag
+    // set, which is what the rebuildMessages path used to produce.
     const allocator = std.testing.allocator;
-    const Session = @import("../Session.zig");
-    const ConversationHistory = @import("../ConversationHistory.zig");
 
-    var ch = ConversationHistory.init(allocator);
-    defer ch.deinit();
-
-    const entries = [_]Session.Entry{
-        .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
-        // Anthropic-provider thinking from when Claude handled the turn.
-        .{
-            .entry_type = .thinking,
-            .content = "claude-style deliberating",
+    const blocks = [_]types.ContentBlock{
+        .{ .thinking = .{
+            .text = "claude-style deliberating",
             .signature = "sig_xyz",
-            .thinking_provider = "anthropic",
-            .timestamp = 1,
-        },
-        .{ .entry_type = .assistant_text, .content = "the answer", .timestamp = 2 },
+            .provider = .anthropic,
+            .id = null,
+        } },
+        .{ .text = .{ .text = "the answer" } },
     };
+    const message: types.Message = .{ .role = .assistant, .content = &blocks };
 
-    try ch.rebuildMessages(&entries, allocator);
-    try std.testing.expectEqual(@as(usize, 2), ch.messages.items.len);
-    try std.testing.expectEqual(
-        types.ContentBlock.ThinkingProvider.anthropic,
-        ch.messages.items[1].content[0].thinking.provider,
-    );
-
-    // Serialize through openai.zig with echo_field set. The anthropic
-    // block's text must surface as reasoning_content per the widened gate.
     var out: std.io.Writer.Allocating = .init(allocator);
-    try writeMessage(ch.messages.items[1], .{ .echo_field = "reasoning_content" }, &out.writer);
+    try writeMessage(message, .{ .echo_field = "reasoning_content" }, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 

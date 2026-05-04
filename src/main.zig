@@ -12,7 +12,6 @@ const tools = @import("tools.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationHistory = @import("ConversationHistory.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
@@ -205,9 +204,6 @@ pub fn main() !void {
         return Harness.run(startup_mode.headless, allocator, &lua_engine);
     }
 
-    var root_session = ConversationHistory.init(allocator);
-    defer root_session.deinit();
-
     var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
     defer root_buffer.deinit();
 
@@ -217,7 +213,7 @@ pub fn main() !void {
     var root_buffer_sink = BufferSink.init(allocator, &root_buffer);
     defer root_buffer_sink.deinit();
 
-    var root_runner = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_session);
+    var root_runner = AgentRunner.init(allocator, root_buffer_sink.sink(), &root_buffer);
     defer root_runner.deinit();
 
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
@@ -317,12 +313,11 @@ pub fn main() !void {
         .buffer = root_buffer.buf(),
         .view = root_buffer.view(),
         .conversation = &root_buffer,
-        .session = &root_session,
         .runner = &root_runner,
     };
 
     if (session_handle) |*sh| {
-        root_session.attachSession(sh);
+        root_buffer.attachSession(sh);
     }
 
     // -- Enter TUI mode ------------------------------------------------------

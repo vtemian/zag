@@ -22,7 +22,6 @@ const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const ConversationBuffer = @import("ConversationBuffer.zig");
-const ConversationHistory = @import("ConversationHistory.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
 const Compositor = @import("Compositor.zig");
@@ -961,10 +960,6 @@ fn onUserInputSubmitted(
         log.warn("onUserInputSubmitted: non-agent pane", .{});
         return;
     };
-    const session = pane.session orelse {
-        log.warn("onUserInputSubmitted: non-agent pane", .{});
-        return;
-    };
 
     // Fire UserMessagePre synchronously. Hooks may veto (return cancel) or
     // rewrite the text. `working_text` is the effective text used for the
@@ -1033,11 +1028,11 @@ fn onUserInputSubmitted(
     // handle is owned by main.zig and outlives any agent run on it.
     // Empty string when persistence is disabled (`--no-session`); the
     // telemetry line then shows `session=`.
-    const session_id: []const u8 = if (session.session_handle) |sh|
+    const session_id: []const u8 = if (view.session_handle) |sh|
         sh.id[0..sh.id_len]
     else
         "";
-    try runner.submit(&session.messages, .{
+    try runner.submit(.{
         .allocator = self.allocator,
         .wake_write_fd = self.wake_write_fd,
         .lua_engine = self.lua_engine,
@@ -1147,8 +1142,6 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var session_scratch = ConversationHistory.init(allocator);
-    defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
@@ -1159,13 +1152,12 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
             return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
         }
     };
-    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
         .view = view.view(),
         .conversation = &view,
-        .session = &session_scratch,
         .runner = &runner,
     };
 
@@ -1278,8 +1270,6 @@ test "mouse click on a focusable float makes it the focused float" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var session_scratch = ConversationHistory.init(allocator);
-    defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
@@ -1290,13 +1280,12 @@ test "mouse click on a focusable float makes it the focused float" {
             return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
         }
     };
-    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
         .view = view.view(),
         .conversation = &view,
-        .session = &session_scratch,
         .runner = &runner,
     };
     var session_mgr: ?Session.SessionManager = null;
@@ -1407,8 +1396,6 @@ test "handleKey routes a printable char to the focused float's pane draft" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var session_scratch = ConversationHistory.init(allocator);
-    defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
@@ -1419,13 +1406,12 @@ test "handleKey routes a printable char to the focused float's pane draft" {
             return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
         }
     };
-    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
     defer runner.deinit();
     const root_pane: WindowManager.Pane = .{
         .buffer = view.buf(),
         .view = view.view(),
         .conversation = &view,
-        .session = &session_scratch,
         .runner = &runner,
     };
 
@@ -1526,7 +1512,6 @@ const FloatLifecycleFixture = struct {
     theme: @import("Theme.zig"),
     compositor: Compositor,
     layout: Layout,
-    session_history: ConversationHistory,
     conversation: ConversationBuffer,
     runner: AgentRunner,
     command_registry: CommandRegistry,
@@ -1548,9 +1533,8 @@ const FloatLifecycleFixture = struct {
         self.theme = @import("Theme.zig").defaultTheme();
         self.compositor = Compositor.init(&self.screen, allocator, &self.theme);
         self.layout = Layout.init(allocator);
-        self.session_history = ConversationHistory.init(allocator);
         self.conversation = try ConversationBuffer.init(allocator, 0, "root");
-        self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.session_history);
+        self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.conversation);
         self.command_registry = CommandRegistry.init(allocator);
         try self.command_registry.registerBuiltIn("/quit", .quit);
         self.session_mgr = null;
@@ -1559,7 +1543,6 @@ const FloatLifecycleFixture = struct {
             .buffer = self.conversation.buf(),
             .view = self.conversation.view(),
             .conversation = &self.conversation,
-            .session = &self.session_history,
             .runner = &self.runner,
         };
 
@@ -1590,7 +1573,6 @@ const FloatLifecycleFixture = struct {
         self.command_registry.deinit();
         self.runner.deinit();
         self.conversation.deinit();
-        self.session_history.deinit();
         self.layout.deinit();
         self.compositor.deinit();
         self.screen.deinit();
@@ -1757,8 +1739,6 @@ test "handleKey routes through on_key filter and consumes when callback returns 
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var session_scratch = ConversationHistory.init(allocator);
-    defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
@@ -1769,7 +1749,7 @@ test "handleKey routes through on_key filter and consumes when callback returns 
             return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
         }
     };
-    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
     defer runner.deinit();
 
     var session_mgr: ?Session.SessionManager = null;
@@ -1784,7 +1764,7 @@ test "handleKey routes through on_key filter and consumes when callback returns 
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .session = &session_scratch, .runner = &runner },
+        .root_pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner },
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = &engine,
@@ -1855,8 +1835,6 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var session_scratch = ConversationHistory.init(allocator);
-    defer session_scratch.deinit();
     var view = try ConversationBuffer.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
@@ -1867,7 +1845,7 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
             return .{ .ptr = @constCast(@as(*const anyopaque, &vtable)), .vtable = &vtable };
         }
     };
-    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &session_scratch);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
     defer runner.deinit();
 
     var session_mgr: ?Session.SessionManager = null;
@@ -1882,7 +1860,7 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
         .screen = &screen,
         .layout = &layout,
         .compositor = &compositor,
-        .root_pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .session = &session_scratch, .runner = &runner },
+        .root_pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner },
         .provider = undefined,
         .session_mgr = &session_mgr,
         .lua_engine = &engine,
