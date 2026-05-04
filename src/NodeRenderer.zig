@@ -7,11 +7,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const Theme = @import("Theme.zig");
-const Node = ConversationBuffer.Node;
-const NodeType = ConversationBuffer.NodeType;
+const Node = Conversation.Node;
+const NodeType = Conversation.NodeType;
 const StyledSpan = Theme.StyledSpan;
 const StyledLine = Theme.StyledLine;
 
@@ -417,12 +417,12 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-/// Helper for renderer tests: wire a fresh ConversationBuffer with a
+/// Helper for renderer tests: wire a fresh Conversation with a
 /// registry and append a content node. Caller owns the lifetimes of
 /// the registry and buffer (passed in by pointer); the helper exists
 /// so each test reads less ceremony.
 fn appendTestNode(
-    cb: *@import("ConversationBuffer.zig"),
+    cb: *@import("Conversation.zig"),
     parent: ?*Node,
     node_type: NodeType,
     content: []const u8,
@@ -432,7 +432,7 @@ fn appendTestNode(
 
 test "renderDefault user_message" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .user_message, "hello");
@@ -451,7 +451,7 @@ test "renderDefault user_message" {
 
 test "renderDefault user_message has two spans with user_message style" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .user_message, "hello");
@@ -473,7 +473,7 @@ test "renderDefault user_message has two spans with user_message style" {
 
 test "renderDefault assistant_text" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .assistant_text, "I can help with that");
@@ -493,7 +493,7 @@ test "renderDefault assistant_text" {
 
 test "renderDefault tool_call" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .tool_call, "bash");
@@ -516,7 +516,7 @@ test "renderDefault tool_call" {
 
 test "renderDefault tool_result shows full content" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const long_text = "a" ** 120;
@@ -541,7 +541,7 @@ test "renderDefault tool_result shows full content" {
 
 test "renderDefault tool_result short content not truncated" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .tool_result, "ok");
@@ -559,7 +559,7 @@ test "renderDefault tool_result short content not truncated" {
 
 test "renderDefault err" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .err, "something failed");
@@ -581,7 +581,7 @@ test "renderDefault err" {
 
 test "renderDefault separator" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .separator, "");
@@ -601,7 +601,7 @@ test "renderDefault separator" {
 
 test "renderDefault status" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .status, "tokens: 1500 in, 200 out");
@@ -620,7 +620,7 @@ test "renderDefault status" {
 
 test "renderDefault custom" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .custom, "plugin output");
@@ -638,7 +638,7 @@ test "renderDefault custom" {
 
 test "renderDefault multiline assistant_text" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .assistant_text, "line one\nline two\nline three");
@@ -664,7 +664,7 @@ test "renderDefault multiline assistant_text" {
 
 test "custom override replaces default renderer" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     var renderer = NodeRenderer.init(allocator);
@@ -706,7 +706,7 @@ test "custom override replaces default renderer" {
 
 test "renderDefault thinking collapsed emits one header line" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .thinking, "reasoning body\nover two lines");
@@ -729,7 +729,7 @@ test "renderDefault thinking collapsed emits one header line" {
 
 test "renderDefault thinking expanded emits header plus body lines" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .thinking, "step one\nstep two\nstep three");
@@ -757,7 +757,7 @@ test "renderDefault thinking expanded emits header plus body lines" {
 
 test "renderDefault thinking_redacted emits a single redacted header" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .thinking_redacted, "");
@@ -776,7 +776,7 @@ test "renderDefault thinking_redacted emits a single redacted header" {
 
 test "lineCountForNode returns 1 for separator" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const node = try appendTestNode(&cb, null, .separator, "");
@@ -787,7 +787,7 @@ test "lineCountForNode returns 1 for separator" {
 
 test "lineCountForNode counts hidden tool_result child lines when tool_call is collapsed" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const call = try appendTestNode(&cb, null, .tool_call, "bash");
@@ -811,8 +811,8 @@ test "renderDefault tool_result image-backed emits placeholder line" {
 
     // Drive the typed-buffer path directly: allocate an ImageBuffer in the
     // registry, stamp its handle on a tool_result node. This mirrors the
-    // shape `ConversationBuffer.appendImageNode` produces without pulling
-    // a full ConversationBuffer into the renderer test.
+    // shape `Conversation.appendImageNode` produces without pulling
+    // a full Conversation into the renderer test.
     const handle = try registry.createImage("tool_result");
     const node = try tree.appendNode(null, .tool_result);
     node.buffer_id = handle;
@@ -834,7 +834,7 @@ test "renderDefault tool_result image-backed emits placeholder line" {
 
 test "rendering a collapsed tool_call with a tool_result child does not leak under testing.allocator" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const call = try cb.appendNode(null, .tool_call, "bash");

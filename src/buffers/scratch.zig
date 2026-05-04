@@ -2,7 +2,7 @@
 //! of UTF-8 lines and a cursor row. No insert mode; j/k/arrow keys
 //! move the cursor in normal mode. Lua plugins use this to build
 //! pickers, quick help overlays, and other modal list UIs without
-//! inheriting ConversationBuffer's turn/stream semantics.
+//! inheriting Conversation's turn/stream semantics.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

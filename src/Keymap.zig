@@ -380,7 +380,7 @@ pub const Registry = struct {
             .{ .insert, "<Esc>", .enter_normal_mode },
             // Insert-mode line editing (Ctrl-W "delete word", printable
             // chars, Backspace, Enter) is handled inside the focused
-            // buffer's `handleKey` (see ConversationBuffer.handleKey), not
+            // buffer's `handleKey` (see Conversation.handleKey), not
             // here. Adding Ctrl-U / Ctrl-A / Ctrl-E would belong on the
             // buffer too, so the keymap stays free of line-edit concerns.
         };

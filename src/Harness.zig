@@ -27,7 +27,7 @@ const Reminder = @import("Reminder.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const Trajectory = @import("Trajectory.zig");
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
@@ -328,7 +328,7 @@ pub const HeadlessDeps = struct {
 /// hands control to `runWithProvider`. TUI subsystems (Terminal, Screen,
 /// Compositor, EventOrchestrator) are intentionally never constructed.
 pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) !void {
-    var root_buffer = try ConversationBuffer.init(gpa, 0, "session");
+    var root_buffer = try Conversation.init(gpa, 0, "session");
     defer root_buffer.deinit();
 
     // BufferSink owns the node-correlation state that used to live on the

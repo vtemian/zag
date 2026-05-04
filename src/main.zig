@@ -11,7 +11,7 @@ const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const AgentRunner = @import("AgentRunner.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
@@ -52,7 +52,7 @@ pub const std_options: std.Options = .{
 
 /// Append a plain text line to the given view as a status node. Used for
 /// welcome/resume messages during startup, before EventOrchestrator takes over.
-fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
+fn appendStatusLine(view: *Conversation, text: []const u8) !void {
     _ = try view.appendNode(null, .status, text);
 }
 
@@ -60,7 +60,7 @@ fn appendStatusLine(view: *ConversationBuffer, text: []const u8) !void {
 /// resulting line to `view`. On format overflow falls back to the literal
 /// `fallback` string so a too-long status never aborts startup.
 fn appendStatusLineFmt(
-    view: *ConversationBuffer,
+    view: *Conversation,
     comptime fallback: []const u8,
     comptime fmt: []const u8,
     args: anytype,
@@ -78,7 +78,7 @@ fn setNonBlocking(fd: posix.fd_t) !void {
 }
 
 /// Post the welcome banner or a resume notice to the root buffer.
-fn postStartupBanner(view: *ConversationBuffer, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
+fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
 
@@ -204,7 +204,7 @@ pub fn main() !void {
         return Harness.run(startup_mode.headless, allocator, &lua_engine);
     }
 
-    var root_buffer = try ConversationBuffer.init(allocator, 0, "session");
+    var root_buffer = try Conversation.init(allocator, 0, "session");
     defer root_buffer.deinit();
 
     // BufferSink owns the node-correlation state that used to live on
@@ -468,7 +468,7 @@ pub fn main() !void {
 
 test {
     // Every module in the project is reached transitively via EventOrchestrator
-    // + ConversationBuffer + tools, so refAllDecls covers the whole graph.
+    // + Conversation + tools, so refAllDecls covers the whole graph.
     @import("std").testing.refAllDecls(@This());
     _ = @import("lua/mod.zig");
     _ = @import("auth_wizard.zig");
@@ -497,13 +497,13 @@ test {
 
 test "appendStatusLine creates a status node on the given view" {
     const allocator = std.testing.allocator;
-    var view = try ConversationBuffer.init(allocator, 0, "test");
+    var view = try Conversation.init(allocator, 0, "test");
     defer view.deinit();
 
     try appendStatusLine(&view, "hello world");
 
     try std.testing.expectEqual(@as(usize, 1), view.tree.root_children.items.len);
-    try std.testing.expectEqual(ConversationBuffer.NodeType.status, view.tree.root_children.items[0].node_type);
+    try std.testing.expectEqual(Conversation.NodeType.status, view.tree.root_children.items[0].node_type);
     const tb = try view.buffer_registry.asText(view.tree.root_children.items[0].buffer_id.?);
     try std.testing.expectEqualStrings("hello world", tb.bytesView());
 }

@@ -32,7 +32,7 @@ const Sink = @import("../Sink.zig").Sink;
 const SinkEvent = @import("../Sink.zig").Event;
 const Collector = @import("../sinks/Collector.zig").Collector;
 const subagents_types = @import("../subagents.zig");
-const ConversationBuffer = @import("../ConversationBuffer.zig");
+const Conversation = @import("../Conversation.zig");
 const Session = @import("../Session.zig");
 
 /// Maximum nested `task` invocations on a single runner. Picked to
@@ -179,11 +179,11 @@ fn runChild(
     // chain with the `task_start` ULID so the first child event auto-
     // threads its `parent_id` back to the delegation scope.
     //
-    // The child uses a full ConversationBuffer because that's where the
+    // The child uses a full Conversation because that's where the
     // persistence helpers live after Phase D; the tree and registry
     // inside it stay empty, so the cost is the inline registry's empty
     // ArrayLists plus a styled-line cache that nothing ever queries.
-    var child_history = try ConversationBuffer.init(allocator, 0, "task-child");
+    var child_history = try Conversation.init(allocator, 0, "task-child");
     defer child_history.deinit();
     if (ctx.session_handle) |sh| child_history.attachSession(sh);
     child_history.last_persisted_id = task_start_id;
@@ -400,7 +400,7 @@ fn childThreadMain(args: ChildArgs) void {
 fn handleChildEvent(
     event: agent_events.AgentEvent,
     collector: *Collector,
-    child_history: *ConversationBuffer,
+    child_history: *Conversation,
     allocator: Allocator,
 ) void {
     const sink = collector.sink();
@@ -808,7 +808,7 @@ fn restoreCwdForTest(abs_path: []const u8) void {
 test "child_history pre-seeded with task_start_id chains child events under the delegation" {
     // This is the small-piece sanity check that the design's parent_id
     // chain works the way Step 2 of Task 15 promises: a fresh child
-    // ConversationBuffer whose `last_persisted_id` is set to the
+    // Conversation whose `last_persisted_id` is set to the
     // task_start ULID will auto-thread its first persisted event off
     // task_start, and subsequent events off each other. The full
     // happy-path through `runChild` (provider stub + agent thread) is
@@ -837,7 +837,7 @@ test "child_history pre-seeded with task_start_id chains child events under the 
 
     // Child history shares the same handle but maintains its own chain
     // pre-seeded with the task_start ULID.
-    var child_history = try ConversationBuffer.init(allocator, 0, "task-child");
+    var child_history = try Conversation.init(allocator, 0, "task-child");
     defer child_history.deinit();
     child_history.attachSession(&handle);
     child_history.last_persisted_id = task_start_id;

@@ -2,7 +2,7 @@
 //!
 //! Owns the agent thread, event queue, cancel flag, Lua engine pointer,
 //! and the Sink output channel. Persists turn events to the session via
-//! a borrowed `*ConversationBuffer`. Display mutations flow through
+//! a borrowed `*Conversation`. Display mutations flow through
 //! `sink.push(...)`; the runner no longer touches any view directly.
 //!
 //! `submitInput` is the canonical join point for user turns: it
@@ -15,7 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.agent_runner);
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const agent_events = @import("agent_events.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
@@ -40,7 +40,7 @@ sink: Sink,
 /// Conversation this runner persists into. Borrowed; the orchestrator
 /// owns the lifetime. Carries the node tree, the per-conversation
 /// buffer registry, and the session-handle / persistence state.
-conversation: *ConversationBuffer,
+conversation: *Conversation,
 /// Heap allocator for transient runner state (event payload dups from
 /// the worker thread, last_info scratch, error formatting).
 allocator: Allocator,
@@ -129,7 +129,7 @@ task_ctx: tools.TaskContext = undefined,
 pub fn init(
     allocator: Allocator,
     sink: Sink,
-    conversation: *ConversationBuffer,
+    conversation: *Conversation,
 ) AgentRunner {
     return .{
         .allocator = allocator,
@@ -961,7 +961,7 @@ test "persistAgentEvent is a no-op without an attached session handle" {
     // drain loop (Task 11) and handleAgentEvent both rely on this so a
     // pane created without a session file doesn't trip persist failures.
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
@@ -981,7 +981,7 @@ test "persistAgentEvent is a no-op without an attached session handle" {
 
 test "handleAgentEvent .reset_assistant_text pushes assistant_reset" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -996,7 +996,7 @@ test "handleAgentEvent .reset_assistant_text pushes assistant_reset" {
 
 test "text_delta emits assistant_delta sink event" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1019,7 +1019,7 @@ test "text_delta emits assistant_delta sink event" {
 
 test "handleAgentEvent .tool_start emits a tool_use sink event" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1040,7 +1040,7 @@ test "handleAgentEvent .tool_start emits a tool_use sink event" {
 
 test "thinking_delta emits a thinking_delta sink event" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1064,7 +1064,7 @@ test "thinking_delta emits a thinking_delta sink event" {
 
 test "thinking_stop emits a thinking_stop sink event" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1088,7 +1088,7 @@ test "text_delta after thinking_delta still emits two sink events in order" {
     // so all the runner is responsible for is forwarding the events
     // in sequence. The BufferSink tests pin the node-level behaviour.
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1108,7 +1108,7 @@ test "text_delta after thinking_delta still emits two sink events in order" {
 
 test "tool_start after thinking_delta emits both sink events in order" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1130,7 +1130,7 @@ test "tool_start after thinking_delta emits both sink events in order" {
 
 test "handleAgentEvent .tool_result emits a tool_result sink event" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1153,7 +1153,7 @@ test "handleAgentEvent .tool_result emits a tool_result sink event" {
 
 test "wake_fd default is null" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
@@ -1165,7 +1165,7 @@ test "wake_fd propagates to a freshly initialized EventQueue" {
     // Mirrors the submitInput sequence (init EventQueue, copy wake_fd)
     // without spawning a real agent thread.
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
@@ -1770,7 +1770,7 @@ test "submitInput pushes run_start and persists via conversation" {
     // runner is responsible for: a `run_start` sink event and the
     // persist hook (a no-op here because no session_handle is attached).
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var mock = MockSink.init(allocator);
     defer mock.deinit();
@@ -1789,7 +1789,7 @@ test "submitInput pushes run_start and persists via conversation" {
 
 test "drainEvents joins thread and deinits queue on .done" {
     const allocator = std.testing.allocator;
-    var scb = try ConversationBuffer.init(allocator, 0, "test");
+    var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
     var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
@@ -1918,7 +1918,7 @@ test "current_caller_pane_id threadlocal is per-thread" {
 
 test "node_version_snapshot starts at zero; compositor sync advances it" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "snap");
+    var cb = try Conversation.init(allocator, 0, "snap");
     defer cb.deinit();
     var runner = AgentRunner.init(allocator, NullSink.sink(), &cb);
     defer runner.deinit();

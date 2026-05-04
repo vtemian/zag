@@ -4,7 +4,7 @@
 //! the main thread drains them each frame. A `CancelFlag` lets the main
 //! thread request cooperative cancellation. These types live here (rather
 //! than beside the spawn machinery in `AgentRunner.zig`) so observers -
-//! like `ConversationBuffer` - can reference them without pulling in the
+//! like `Conversation` - can reference them without pulling in the
 //! thread-spawning code.
 
 const std = @import("std");

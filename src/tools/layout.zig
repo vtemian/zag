@@ -295,7 +295,7 @@ const PaneReadInput = struct {
 /// Read the rendered contents of a pane as plain text. Optional
 /// `lines` caps the number of lines returned; optional `offset` skips
 /// leading lines. The main thread walks the pane's buffer via
-/// `ConversationBuffer.readText`.
+/// `Conversation.readText`.
 pub const pane_read_tool: types.Tool = .{
     .definition = .{
         .name = "pane_read",

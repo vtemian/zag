@@ -1336,7 +1336,7 @@ fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
         .done => return,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
-        // Thinking is surfaced as its own AgentRunner/ConversationBuffer
+        // Thinking is surfaced as its own AgentRunner/Conversation
         // node. Task 1.11 will also fan this into the trajectory capture.
         .thinking_delta => |td| blk: {
             const duped = alloc.dupe(u8, td.text) catch return;

@@ -9,7 +9,7 @@
 //! The keymap registry and the persistent input parser both live on the
 //! Lua engine, accessed via `window_manager.keymapRegistry()` and
 //! `window_manager.inputParser()`. Each pane owns its own draft input
-//! (see ConversationBuffer.draft).
+//! (see Conversation.draft).
 
 const std = @import("std");
 const posix = std.posix;
@@ -21,7 +21,7 @@ const input = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const AgentRunner = @import("AgentRunner.zig");
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
 const Compositor = @import("Compositor.zig");
@@ -1142,7 +1142,7 @@ test "handleKey routes Enter to a focused scratch pane without crashing" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var view = try ConversationBuffer.init(allocator, 0, "root");
+    var view = try Conversation.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
         fn pushVT(_: *anyopaque, _: SinkEvent) void {}
@@ -1270,7 +1270,7 @@ test "mouse click on a focusable float makes it the focused float" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var view = try ConversationBuffer.init(allocator, 0, "root");
+    var view = try Conversation.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
         fn pushVT(_: *anyopaque, _: SinkEvent) void {}
@@ -1396,7 +1396,7 @@ test "handleKey routes a printable char to the focused float's pane draft" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var view = try ConversationBuffer.init(allocator, 0, "root");
+    var view = try Conversation.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
         fn pushVT(_: *anyopaque, _: SinkEvent) void {}
@@ -1512,7 +1512,7 @@ const FloatLifecycleFixture = struct {
     theme: @import("Theme.zig"),
     compositor: Compositor,
     layout: Layout,
-    conversation: ConversationBuffer,
+    conversation: Conversation,
     runner: AgentRunner,
     command_registry: CommandRegistry,
     session_mgr: ?Session.SessionManager,
@@ -1533,7 +1533,7 @@ const FloatLifecycleFixture = struct {
         self.theme = @import("Theme.zig").defaultTheme();
         self.compositor = Compositor.init(&self.screen, allocator, &self.theme);
         self.layout = Layout.init(allocator);
-        self.conversation = try ConversationBuffer.init(allocator, 0, "root");
+        self.conversation = try Conversation.init(allocator, 0, "root");
         self.runner = AgentRunner.init(allocator, TestNullSink.sink(), &self.conversation);
         self.command_registry = CommandRegistry.init(allocator);
         try self.command_registry.registerBuiltIn("/quit", .quit);
@@ -1739,7 +1739,7 @@ test "handleKey routes through on_key filter and consumes when callback returns 
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var view = try ConversationBuffer.init(allocator, 0, "root");
+    var view = try Conversation.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
         fn pushVT(_: *anyopaque, _: SinkEvent) void {}
@@ -1835,7 +1835,7 @@ test "Ctrl+C bypasses a buggy on_key filter that consumes everything" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var view = try ConversationBuffer.init(allocator, 0, "root");
+    var view = try Conversation.init(allocator, 0, "root");
     defer view.deinit();
     const TestNullSink = struct {
         fn pushVT(_: *anyopaque, _: SinkEvent) void {}

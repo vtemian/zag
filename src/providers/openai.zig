@@ -1655,7 +1655,7 @@ test "openai writeMessage echoes any-provider thinking after JSONL replay" {
     // it silently. This pins the full path:
     //   JSONL entry -> hand-built assistant Message -> writeMessage -> assertion.
     //
-    // ConversationBuffer.toWireMessages does not preserve the
+    // Conversation.toWireMessages does not preserve the
     // `thinking_provider` tag (Phase D parks no provider metadata on
     // tree nodes), so the projection is not a usable substitute for
     // testing the reasoning_content gate's interaction with the tag.

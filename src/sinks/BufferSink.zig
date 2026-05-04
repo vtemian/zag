@@ -2,7 +2,7 @@
 //!
 //! BufferSink owns the call_id correlation map and current_assistant_node
 //! so AgentRunner stays free of node-pointer state. It wraps a borrowed
-//! `*ConversationBuffer` and tracks the in-progress assistant node, the
+//! `*Conversation` and tracks the in-progress assistant node, the
 //! `call_id -> *Node` map for tool results, and the last-seen tool_call
 //! fallback. Keeping this state inside the sink removes the dangling-*Node
 //! hazard on pane / provider swaps, because the runner does not hold
@@ -15,19 +15,19 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ConversationBuffer = @import("../ConversationBuffer.zig");
+const Conversation = @import("../Conversation.zig");
 const ConversationTree = @import("../ConversationTree.zig");
-const Node = ConversationBuffer.Node;
+const Node = Conversation.Node;
 const Sink = @import("../Sink.zig").Sink;
 const Event = @import("../Sink.zig").Event;
 
 pub const BufferSink = struct {
     /// Allocator for the `pending_tool_calls` map keys (duped call_ids).
     alloc: Allocator,
-    /// Borrowed pointer to the ConversationBuffer this sink writes into.
+    /// Borrowed pointer to the Conversation this sink writes into.
     /// The pane that owns both is responsible for destroying the buffer
     /// only after this sink has been deinited.
-    buffer: *ConversationBuffer,
+    buffer: *Conversation,
     /// The assistant node currently accumulating streaming deltas, or
     /// null between turns / after an `assistant_reset`.
     current_assistant_node: ?*Node = null,
@@ -44,7 +44,7 @@ pub const BufferSink = struct {
     /// so a missed thinking_stop can't mis-parent later events.
     current_thinking_node: ?*Node = null,
 
-    pub fn init(alloc: Allocator, buffer: *ConversationBuffer) BufferSink {
+    pub fn init(alloc: Allocator, buffer: *Conversation) BufferSink {
         return .{ .alloc = alloc, .buffer = buffer };
     }
 
@@ -193,7 +193,7 @@ pub const BufferSink = struct {
 };
 
 test "BufferSink run_start appends a user node" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -204,13 +204,13 @@ test "BufferSink run_start appends a user node" {
 
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
-    try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, node.node_type);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, node.node_type);
     const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "BufferSink assistant_delta creates then extends" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -222,14 +222,14 @@ test "BufferSink assistant_delta creates then extends" {
 
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
-    try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, node.node_type);
+    try std.testing.expectEqual(Conversation.NodeType.assistant_text, node.node_type);
     const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb.bytesView());
     try std.testing.expect(bs.current_assistant_node != null);
 }
 
 test "BufferSink assistant_reset removes the in-progress node" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -245,7 +245,7 @@ test "BufferSink assistant_reset removes the in-progress node" {
 }
 
 test "BufferSink tool_result correlates via call_id" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -260,7 +260,7 @@ test "BufferSink tool_result correlates via call_id" {
     try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
     const first_tool = cb.tree.root_children.items[0];
     const second_tool = cb.tree.root_children.items[1];
-    // tool_call carries its tool name on `custom_tag` (see ConversationBuffer.appendNode).
+    // tool_call carries its tool name on `custom_tag` (see Conversation.appendNode).
     try std.testing.expectEqualStrings("read", first_tool.custom_tag.?);
     try std.testing.expectEqualStrings("bash", second_tool.custom_tag.?);
 
@@ -275,7 +275,7 @@ test "BufferSink tool_result correlates via call_id" {
 }
 
 test "BufferSink tool_result falls back to last_tool_call without call_id" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -294,7 +294,7 @@ test "BufferSink tool_result falls back to last_tool_call without call_id" {
 
 test "BufferSink handles duplicate call_id without leaking the key" {
     const alloc = std.testing.allocator;
-    var cb = try ConversationBuffer.init(alloc, 0, "test");
+    var cb = try Conversation.init(alloc, 0, "test");
     defer cb.deinit();
     var bs = BufferSink.init(alloc, &cb);
     defer bs.deinit();
@@ -311,7 +311,7 @@ test "BufferSink handles duplicate call_id without leaking the key" {
 
 test "BufferSink clears pending_tool_calls on run_end" {
     const alloc = std.testing.allocator;
-    var cb = try ConversationBuffer.init(alloc, 0, "test");
+    var cb = try Conversation.init(alloc, 0, "test");
     defer cb.deinit();
     var bs = BufferSink.init(alloc, &cb);
     defer bs.deinit();
@@ -328,7 +328,7 @@ test "BufferSink clears pending_tool_calls on run_end" {
 
 test "BufferSink resetCorrelation can be called externally" {
     const alloc = std.testing.allocator;
-    var cb = try ConversationBuffer.init(alloc, 0, "test");
+    var cb = try Conversation.init(alloc, 0, "test");
     defer cb.deinit();
     var bs = BufferSink.init(alloc, &cb);
     defer bs.deinit();
@@ -340,7 +340,7 @@ test "BufferSink resetCorrelation can be called externally" {
 }
 
 test "tool_use event creates collapsed tool_call by default" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -351,12 +351,12 @@ test "tool_use event creates collapsed tool_call by default" {
 
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
-    try std.testing.expectEqual(ConversationBuffer.NodeType.tool_call, node.node_type);
+    try std.testing.expectEqual(Conversation.NodeType.tool_call, node.node_type);
     try std.testing.expect(node.collapsed);
 }
 
 test "thinking_delta event creates collapsed thinking by default" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -367,12 +367,12 @@ test "thinking_delta event creates collapsed thinking by default" {
 
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
-    try std.testing.expectEqual(ConversationBuffer.NodeType.thinking, node.node_type);
+    try std.testing.expectEqual(Conversation.NodeType.thinking, node.node_type);
     try std.testing.expect(node.collapsed);
 }
 
 test "tool_result event bumps parent tool_call dirty state" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -401,7 +401,7 @@ test "tool_result event bumps parent tool_call dirty state" {
 }
 
 test "BufferSink error_event appends an err node" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
@@ -412,7 +412,7 @@ test "BufferSink error_event appends an err node" {
 
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
-    try std.testing.expectEqual(ConversationBuffer.NodeType.err, node.node_type);
+    try std.testing.expectEqual(Conversation.NodeType.err, node.node_type);
     const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("boom", tb.bytesView());
 }

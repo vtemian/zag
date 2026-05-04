@@ -1,6 +1,6 @@
 //! NodeLineCache: memoized NodeRenderer output, keyed by (node id, content_version).
 //!
-//! Lifetime is tied to the owning ConversationBuffer: cache entries live
+//! Lifetime is tied to the owning Conversation: cache entries live
 //! in the buffer's long-lived allocator, and `deinit` walks all remaining
 //! entries. An entry is invalidated when its node's content_version
 //! advances past the stored version; entries for removed nodes are
