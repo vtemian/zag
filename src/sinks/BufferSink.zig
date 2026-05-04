@@ -192,14 +192,9 @@ pub const BufferSink = struct {
     const vtable: Sink.VTable = .{ .push = push, .deinit = deinitVT };
 };
 
-const BufferRegistry = @import("../BufferRegistry.zig");
-
 test "BufferSink run_start appends a user node" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -210,16 +205,13 @@ test "BufferSink run_start appends a user node" {
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
     try std.testing.expectEqual(ConversationBuffer.NodeType.user_message, node.node_type);
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "BufferSink assistant_delta creates then extends" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -231,17 +223,14 @@ test "BufferSink assistant_delta creates then extends" {
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
     try std.testing.expectEqual(ConversationBuffer.NodeType.assistant_text, node.node_type);
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb.bytesView());
     try std.testing.expect(bs.current_assistant_node != null);
 }
 
 test "BufferSink assistant_reset removes the in-progress node" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -256,11 +245,8 @@ test "BufferSink assistant_reset removes the in-progress node" {
 }
 
 test "BufferSink tool_result correlates via call_id" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -280,7 +266,7 @@ test "BufferSink tool_result correlates via call_id" {
 
     try std.testing.expectEqual(@as(usize, 1), first_tool.children.items.len);
     try std.testing.expectEqual(@as(usize, 0), second_tool.children.items.len);
-    const result_tb = try registry.asText(first_tool.children.items[0].buffer_id.?);
+    const result_tb = try cb.buffer_registry.asText(first_tool.children.items[0].buffer_id.?);
     try std.testing.expectEqualStrings("result-a", result_tb.bytesView());
 
     // "id-a" should have been removed from the pending map; "id-b" still in flight.
@@ -289,11 +275,8 @@ test "BufferSink tool_result correlates via call_id" {
 }
 
 test "BufferSink tool_result falls back to last_tool_call without call_id" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -305,17 +288,14 @@ test "BufferSink tool_result falls back to last_tool_call without call_id" {
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const tool = cb.tree.root_children.items[0];
     try std.testing.expectEqual(@as(usize, 1), tool.children.items.len);
-    const result_tb = try registry.asText(tool.children.items[0].buffer_id.?);
+    const result_tb = try cb.buffer_registry.asText(tool.children.items[0].buffer_id.?);
     try std.testing.expectEqualStrings("result", result_tb.bytesView());
 }
 
 test "BufferSink handles duplicate call_id without leaking the key" {
     const alloc = std.testing.allocator;
-    var registry = BufferRegistry.init(alloc);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(alloc, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
     var bs = BufferSink.init(alloc, &cb);
     defer bs.deinit();
     const s = bs.sink();
@@ -331,11 +311,8 @@ test "BufferSink handles duplicate call_id without leaking the key" {
 
 test "BufferSink clears pending_tool_calls on run_end" {
     const alloc = std.testing.allocator;
-    var registry = BufferRegistry.init(alloc);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(alloc, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
     var bs = BufferSink.init(alloc, &cb);
     defer bs.deinit();
     const s = bs.sink();
@@ -351,11 +328,8 @@ test "BufferSink clears pending_tool_calls on run_end" {
 
 test "BufferSink resetCorrelation can be called externally" {
     const alloc = std.testing.allocator;
-    var registry = BufferRegistry.init(alloc);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(alloc, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
     var bs = BufferSink.init(alloc, &cb);
     defer bs.deinit();
     const s = bs.sink();
@@ -366,11 +340,8 @@ test "BufferSink resetCorrelation can be called externally" {
 }
 
 test "tool_use event creates collapsed tool_call by default" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -385,11 +356,8 @@ test "tool_use event creates collapsed tool_call by default" {
 }
 
 test "thinking_delta event creates collapsed thinking by default" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -404,11 +372,8 @@ test "thinking_delta event creates collapsed thinking by default" {
 }
 
 test "tool_result event bumps parent tool_call dirty state" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -436,11 +401,8 @@ test "tool_result event bumps parent tool_call dirty state" {
 }
 
 test "BufferSink error_event appends an err node" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();
@@ -451,6 +413,6 @@ test "BufferSink error_event appends an err node" {
     try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
     const node = cb.tree.root_children.items[0];
     try std.testing.expectEqual(ConversationBuffer.NodeType.err, node.node_type);
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("boom", tb.bytesView());
 }

@@ -55,13 +55,13 @@ cache: NodeLineCache,
 /// triggered this error" UIs and lets popup helpers operate on
 /// either buffer kind without branching.
 row_styles: std.AutoHashMapUnmanaged(u32, Theme.HighlightSlot) = .empty,
-/// Borrowed pointer to the WindowManager's BufferRegistry. All non-
-/// `tool_call` node creation paths route content into per-node
-/// TextBuffer (or ImageBuffer) storage allocated here. Null during
-/// the brief window between `init` and `attachBufferRegistry`; every
-/// production caller wires this before creating any node, and tests
-/// that exercise content-bearing nodes must do the same.
-buffer_registry: ?*BufferRegistry = null,
+/// Owned BufferRegistry that holds the per-node TextBuffer (and
+/// ImageBuffer) storage for every content-bearing node in this
+/// conversation. Constructed in `init` and torn down in `deinit`;
+/// the conversation is the sole owner of the registry's lifetime,
+/// so split panes, subagents, and headless harnesses each get their
+/// own storage scope without the borrowed-pointer wiring step.
+buffer_registry: BufferRegistry,
 
 /// Create a new empty buffer with the given id and name. The buffer is a
 /// pure view; its LLM messages live on `ConversationHistory` and its
@@ -78,20 +78,24 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
         .allocator = allocator,
         .renderer = NodeRenderer.initDefault(),
         .cache = NodeLineCache.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
     };
 }
 
-/// Release all memory owned by this buffer: cache, tree, name.
-/// Messages and the session handle live on `ConversationHistory`; the
-/// agent thread, event queue, and streaming state live on `AgentRunner`.
-/// Neither is owned by the buffer.
+/// Release all memory owned by this buffer: cache, tree, registry,
+/// name. Messages and the session handle live on `ConversationHistory`;
+/// the agent thread, event queue, and streaming state live on
+/// `AgentRunner`. Neither is owned by the buffer.
 ///
 /// Deinit order matters: drain the cache first so entries release their
-/// spans arrays while the Node tree (and therefore the borrowed span
-/// text) is still alive. Then free the tree.
+/// spans arrays while the borrowed span text (TextBuffer bytes resolved
+/// through the registry) is still alive. Then free the tree, which
+/// holds buffer_id handles into the registry. Then free the registry,
+/// which destroys every TextBuffer/ImageBuffer.
 pub fn deinit(self: *ConversationBuffer) void {
     self.cache.deinit();
     self.tree.deinit();
+    self.buffer_registry.deinit();
     self.row_styles.deinit(self.allocator);
     self.allocator.free(self.name);
 }
@@ -121,23 +125,13 @@ pub fn clearRowStyle(self: *ConversationBuffer, row: u32) void {
     _ = self.row_styles.remove(row);
 }
 
-/// Wire a borrowed BufferRegistry pointer for migrated node-type
-/// allocation. Called by WindowManager (root + split panes), main, and
-/// Harness after the registry sits at its final address. Tests that
-/// exercise migrated paths construct a registry in scope and pass it.
-pub fn attachBufferRegistry(self: *ConversationBuffer, registry: *BufferRegistry) void {
-    self.buffer_registry = registry;
-}
-
 /// Create a new node and attach it to `parent` (or root if null).
 ///
 /// Tool_call nodes carry only metadata (tool name) and stash it on
-/// `custom_tag` until Phase D's typed metadata field replaces the
-/// custom_tag stuffing. Every other node type allocates a TextBuffer
-/// in the attached registry, writes the initial content there, and
-/// stamps the handle on `node.buffer_id`. Returns
-/// `error.NoBufferRegistry` when called for a content-bearing node
-/// before `attachBufferRegistry` ran.
+/// `custom_tag` until a typed metadata field replaces the custom_tag
+/// stuffing. Every other node type allocates a TextBuffer in the
+/// inline-owned registry, writes the initial content there, and
+/// stamps the handle on `node.buffer_id`.
 pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
     if (node_type == .tool_call) {
         const node = try self.tree.appendNode(parent, node_type);
@@ -149,10 +143,9 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
         node.custom_tag = try self.allocator.dupe(u8, content);
         return node;
     }
-    const reg = self.buffer_registry orelse return error.NoBufferRegistry;
-    const handle = try reg.createText(@tagName(node_type));
-    errdefer reg.remove(handle) catch {};
-    const tb = try reg.asText(handle);
+    const handle = try self.buffer_registry.createText(@tagName(node_type));
+    errdefer self.buffer_registry.remove(handle) catch {};
+    const tb = try self.buffer_registry.asText(handle);
     try tb.append(content);
     const node = try self.tree.appendNode(parent, node_type);
     node.buffer_id = handle;
@@ -160,20 +153,13 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
 }
 
 /// Append a tool_result node whose payload is a decoded image. Allocates
-/// an ImageBuffer in the registry, decodes `png_bytes` into it, and stamps
-/// the handle onto `node.buffer_id` so the renderer can dispatch on the
-/// buffer's kind.
-///
-/// Requires an attached BufferRegistry; image-shaped tool results have no
-/// inline-content fallback because `Node.content` is byte-only and the
-/// renderer would have to re-decode on every frame. Returns
-/// `error.NoBufferRegistry` when the registry is missing so test fixtures
-/// fail loudly instead of silently dropping the image.
+/// an ImageBuffer in the inline-owned registry, decodes `png_bytes` into
+/// it, and stamps the handle onto `node.buffer_id` so the renderer can
+/// dispatch on the buffer's kind.
 pub fn appendImageNode(self: *ConversationBuffer, parent: ?*Node, png_bytes: []const u8) !*Node {
-    const reg = self.buffer_registry orelse return error.NoBufferRegistry;
-    const handle = try reg.createImage(@tagName(NodeType.tool_result));
-    errdefer reg.remove(handle) catch {};
-    const ib = try reg.asImage(handle);
+    const handle = try self.buffer_registry.createImage(@tagName(NodeType.tool_result));
+    errdefer self.buffer_registry.remove(handle) catch {};
+    const ib = try self.buffer_registry.asImage(handle);
     try ib.setPng(png_bytes);
     const node = try self.tree.appendNode(parent, .tool_result);
     node.buffer_id = handle;
@@ -213,7 +199,7 @@ pub fn getVisibleLines(
 
     for (self.tree.root_children.items) |node| {
         if (collected >= max_lines) break;
-        try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected, self.buffer_registry);
+        try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected, &self.buffer_registry);
     }
 
     // Stamp row-background overrides keyed by absolute visible-row
@@ -250,7 +236,7 @@ fn collectVisibleLines(
     max_lines: usize,
     skipped: *usize,
     collected: *usize,
-    registry: ?*BufferRegistry,
+    registry: *const BufferRegistry,
 ) !void {
     if (collected.* >= max_lines) return;
 
@@ -319,13 +305,13 @@ fn collectVisibleLines(
 pub fn lineCount(self: *const ConversationBuffer) !usize {
     var count: usize = 0;
     for (self.tree.root_children.items) |node| {
-        count += try countVisibleLines(node, &self.renderer, self.buffer_registry);
+        count += try countVisibleLines(node, &self.renderer, &self.buffer_registry);
     }
     return count;
 }
 
 /// Recursive line counter.
-fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer, registry: ?*BufferRegistry) !usize {
+fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer, registry: *const BufferRegistry) !usize {
     var count = renderer.lineCountForNode(node, registry);
     if (!node.collapsed) {
         for (node.children.items) |child| {
@@ -342,8 +328,7 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer, registry:
 /// fork.
 pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !void {
     const handle = node.buffer_id orelse return error.NoBuffer;
-    const reg = self.buffer_registry orelse return error.NoBufferRegistry;
-    const tb = try reg.asText(handle);
+    const tb = try self.buffer_registry.asText(handle);
     try tb.append(text);
     node.markDirty();
     self.tree.generation +%= 1;
@@ -620,11 +605,8 @@ test "init and deinit" {
 
 test "appendNode creates root-level nodes" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 1, "session");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const n1 = try cb.appendNode(null, .user_message, "hello");
     const n2 = try cb.appendNode(null, .assistant_text, "hi there");
@@ -632,19 +614,16 @@ test "appendNode creates root-level nodes" {
     try std.testing.expectEqual(@as(u32, 0), n1.id);
     try std.testing.expectEqual(@as(u32, 1), n2.id);
     try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
-    const tb1 = try registry.asText(n1.buffer_id.?);
-    const tb2 = try registry.asText(n2.buffer_id.?);
+    const tb1 = try cb.buffer_registry.asText(n1.buffer_id.?);
+    const tb2 = try cb.buffer_registry.asText(n2.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb1.bytesView());
     try std.testing.expectEqualStrings("hi there", tb2.bytesView());
 }
 
 test "getVisibleLines returns rendered lines" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 3, "session");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -661,11 +640,8 @@ test "getVisibleLines returns rendered lines" {
 
 test "row_styles round trip: set, render, clear" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 4, "row-style");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "first");
     _ = try cb.appendNode(null, .user_message, "second");
@@ -691,11 +667,8 @@ test "row_styles round trip: set, render, clear" {
 
 test "readText emits user and assistant turns as plain text" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "readtext-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .assistant_text, "world");
@@ -732,11 +705,8 @@ test "fromBuffer roundtrips correctly" {
 
 test "getVisibleLines with range skips off-screen nodes" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "range-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     // Create 5 single-line nodes
     _ = try cb.appendNode(null, .user_message, "line0");
@@ -764,11 +734,8 @@ test "getVisibleLines with range skips off-screen nodes" {
 
 test "buffer interface returns line count" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "lc-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -782,11 +749,8 @@ test "buffer interface returns line count" {
 
 test "getVisibleLines returns consistent results when content unchanged" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .assistant_text, "world");
@@ -813,11 +777,8 @@ test "getVisibleLines returns consistent results when content unchanged" {
 
 test "getVisibleLines reflects new content after appendToNode" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .user_message, "hello");
 
@@ -841,11 +802,8 @@ test "getVisibleLines reflects new content after appendToNode" {
 
 test "getVisibleLines reflects new nodes after appendNode" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "append-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "first");
 
@@ -873,11 +831,8 @@ test "getVisibleLines output survives node content realloc" {
     // version-checked and discarded before any dangling slice is
     // dereferenced.
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "realloc-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .assistant_text, "hi");
 
@@ -901,11 +856,8 @@ test "getVisibleLines output survives node content realloc" {
 
 test "clear invalidates line cache" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -956,11 +908,8 @@ test "synthetic id scratch fits maxInt(u32)" {
 
 test "loadFromEntries builds node tree from session entries" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "load-test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const entries = [_]Session.Entry{
         .{ .entry_type = .user_message, .content = "first", .timestamp = 0 },
@@ -982,11 +931,8 @@ test "loadFromEntries builds node tree from session entries" {
 
 test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "thinking-load");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const entries = [_]Session.Entry{
         .{ .entry_type = .user_message, .content = "hi", .timestamp = 0 },
@@ -999,7 +945,7 @@ test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes
     try std.testing.expectEqual(@as(usize, 4), cb.tree.root_children.items.len);
     try std.testing.expectEqual(NodeType.thinking, cb.tree.root_children.items[1].node_type);
     try std.testing.expect(cb.tree.root_children.items[1].collapsed);
-    const tb = try registry.asText(cb.tree.root_children.items[1].buffer_id.?);
+    const tb = try cb.buffer_registry.asText(cb.tree.root_children.items[1].buffer_id.?);
     try std.testing.expectEqualStrings("let me think", tb.bytesView());
     try std.testing.expectEqual(NodeType.thinking_redacted, cb.tree.root_children.items[2].node_type);
     try std.testing.expect(cb.tree.root_children.items[2].collapsed);
@@ -1007,11 +953,8 @@ test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes
 
 test "loadFromEntries reloads tool_call nodes collapsed" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "tool-reload");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const entries = [_]Session.Entry{
         .{ .entry_type = .user_message, .content = "list", .timestamp = 0 },
@@ -1029,11 +972,8 @@ test "loadFromEntries reloads tool_call nodes collapsed" {
 
 test "Ctrl-R toggles collapsed on every thinking node" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "thinking-toggle");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const t1 = try cb.appendNode(null, .thinking, "a");
     t1.collapsed = true;
@@ -1068,11 +1008,8 @@ test "Ctrl-R toggles collapsed on tool_call nodes too" {
 
 test "Ctrl-R is consumed even with no thinking nodes" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "thinking-empty");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hi");
     const r = cb.handleKey(.{ .key = .{ .char = 'r' }, .modifiers = .{ .ctrl = true } });
@@ -1081,11 +1018,8 @@ test "Ctrl-R is consumed even with no thinking nodes" {
 
 test "getVisibleLines reflects collapsed-to-expanded toggle" {
     const allocator = std.testing.allocator;
-    var registry = BufferRegistry.init(allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(allocator, 0, "thinking-render");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const tnode = try cb.appendNode(null, .thinking, "line1\nline2");
     tnode.collapsed = true;
@@ -1151,11 +1085,8 @@ test "handleKey passthrough flows through the View vtable" {
 }
 
 test "View dispatch renders the conversation" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "parity");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     _ = try cb.appendNode(null, .user_message, "hello world");
 
@@ -1172,11 +1103,8 @@ test "View dispatch renders the conversation" {
 }
 
 test "contentVersion advances on appendNode" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "ver");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const before = cb.buf().contentVersion();
     _ = try cb.appendNode(null, .status, "hello");
@@ -1185,103 +1113,69 @@ test "contentVersion advances on appendNode" {
 }
 
 test "appendNode for status routes through TextBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .status, "hello");
     try std.testing.expect(node.buffer_id != null);
 
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
-test "appendNode without registry returns NoBufferRegistry for content nodes" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
-    defer cb.deinit();
-    // Intentionally no attachBufferRegistry; the migration layer's
-    // fallback path is gone, so a content-bearing node creation fails
-    // loudly instead of dropping the bytes silently.
-    try std.testing.expectError(error.NoBufferRegistry, cb.appendNode(null, .status, "hello"));
-}
-
 test "appendToNode for status routes through TextBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .status, "hello");
     try cb.appendToNode(node, " world");
 
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello world", tb.bytesView());
 }
 
 test "appendNode for user_message routes through TextBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .user_message, "hello");
     try std.testing.expect(node.buffer_id != null);
 
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("hello", tb.bytesView());
 }
 
 test "appendNode for custom routes through TextBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .custom, "payload");
     try std.testing.expect(node.buffer_id != null);
 
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("payload", tb.bytesView());
 }
 
 test "appendNode for tool_call leaves buffer_id null and stashes name on custom_tag" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
-    // tool_call carries metadata only; until Phase D introduces a typed
-    // metadata field, the tool name lives on `custom_tag` and the node
-    // owns no buffer.
+    // tool_call carries metadata only; the tool name lives on `custom_tag`
+    // and the node owns no buffer.
     const node = try cb.appendNode(null, .tool_call, "bash");
     try std.testing.expect(node.buffer_id == null);
     try std.testing.expectEqualStrings("bash", node.custom_tag.?);
 }
 
 test "appendNode for tool_result text routes through TextBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const call = try cb.appendNode(null, .tool_call, "bash");
     const result = try cb.appendNode(call, .tool_result, "ls output here");
     try std.testing.expect(result.buffer_id != null);
 
-    const tb = try registry.asText(result.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(result.buffer_id.?);
     try std.testing.expectEqualStrings("ls output here", tb.bytesView());
 }
 
@@ -1296,25 +1190,21 @@ const tiny_red_png_fixture = [_]u8{
 };
 
 test "tool_result with image data routes through ImageBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const call = try cb.appendNode(null, .tool_call, "screenshot");
     const result = try cb.appendImageNode(call, &tiny_red_png_fixture);
     try std.testing.expectEqual(NodeType.tool_result, result.node_type);
     try std.testing.expect(result.buffer_id != null);
 
-    const ib = try registry.asImage(result.buffer_id.?);
+    const ib = try cb.buffer_registry.asImage(result.buffer_id.?);
     try std.testing.expect(ib.image != null);
     try std.testing.expectEqual(@as(u32, 1), ib.image.?.width);
     try std.testing.expectEqual(@as(u32, 1), ib.image.?.height);
 
     // Renderer falls back to a placeholder line for image-backed
-    // tool_result; full inline rendering is a Phase D-or-later concern.
+    // tool_result; full inline rendering is a later concern.
     const theme = Theme.defaultTheme();
     var lines = try cb.getVisibleLines(std.testing.allocator, std.testing.allocator, &theme, 0, std.math.maxInt(usize));
     defer lines.deinit(std.testing.allocator);
@@ -1331,21 +1221,9 @@ test "tool_result with image data routes through ImageBuffer" {
     try std.testing.expect(saw_placeholder);
 }
 
-test "appendImageNode without registry returns NoBufferRegistry" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
-    defer cb.deinit();
-    // No attachBufferRegistry.
-
-    try std.testing.expectError(error.NoBufferRegistry, cb.appendImageNode(null, &tiny_red_png_fixture));
-}
-
 test "streaming deltas accumulate in assistant_text TextBuffer" {
-    var registry = BufferRegistry.init(std.testing.allocator);
-    defer registry.deinit();
-
     var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
-    cb.attachBufferRegistry(&registry);
 
     const node = try cb.appendNode(null, .assistant_text, "");
     try std.testing.expect(node.buffer_id != null);
@@ -1354,6 +1232,6 @@ test "streaming deltas accumulate in assistant_text TextBuffer" {
     try cb.appendToNode(node, ", ");
     try cb.appendToNode(node, "world!");
 
-    const tb = try registry.asText(node.buffer_id.?);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("Hello, world!", tb.bytesView());
 }
