@@ -72,7 +72,7 @@ pub const TaskContext = struct {
     /// against the subagent's allowlist and passes that down.
     registry: *const Registry,
     /// Session handle where `task_start` / `task_end` audit entries
-    /// are persisted, and which the child's ConversationBuffer
+    /// are persisted, and which the child's Conversation
     /// attaches to so its events interleave with the parent's.
     session_handle: ?*Session.SessionHandle,
     /// Optional Lua engine. Shared with the child so hooks and

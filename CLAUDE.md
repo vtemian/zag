@@ -190,10 +190,10 @@ src/
     task.zig                spawn subagent task tool
 
   Session.zig               JSONL session persistence and management
-  ConversationBuffer.zig    conversation buffer (tree, registry, persistence, projection)
+  Conversation.zig          conversation (tree, registry, persistence, projection)
   ConversationTree.zig      branching node tree (forks, retries, edits)
   NodeRegistry.zig          conversation node id allocator
-  NodeRenderer.zig          type-specific node rendering for ConversationBuffer
+  NodeRenderer.zig          type-specific node rendering for Conversation
   NodeLineCache.zig         per-node styled-line cache keyed by content version
   MarkdownParser.zig        line-by-line markdown to StyledLine converter
 
@@ -204,7 +204,7 @@ src/
     scratch.zig             scratch buffer (free-form text)
 
   sinks/
-    BufferSink.zig          sink that writes events into a ConversationBuffer
+    BufferSink.zig          sink that writes events into a Conversation
     Collector.zig           in-memory sink for tests and headless runs
     Null.zig                discarding sink
 

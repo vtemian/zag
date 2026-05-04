@@ -13,7 +13,7 @@ const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
 const Viewport = @import("Viewport.zig");
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const NodeRegistry = @import("NodeRegistry.zig");
 
 const Layout = @This();
@@ -1274,7 +1274,7 @@ test "setRoot creates a single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1291,7 +1291,7 @@ test "recalculate sets leaf rect with status row reserved" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1310,11 +1310,11 @@ test "split focuses the new pane" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    var cb1 = try Conversation.init(allocator, 0, "left");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    var cb2 = try Conversation.init(allocator, 1, "right");
     defer cb2.deinit();
-    var cb3 = try ConversationBuffer.init(allocator, 2, "bottom");
+    var cb3 = try Conversation.init(allocator, 2, "bottom");
     defer cb3.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1333,9 +1333,9 @@ test "vertical split divides width evenly" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    var cb1 = try Conversation.init(allocator, 0, "buf1");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    var cb2 = try Conversation.init(allocator, 1, "buf2");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1365,9 +1365,9 @@ test "horizontal split divides height evenly" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    var cb1 = try Conversation.init(allocator, 0, "buf1");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    var cb2 = try Conversation.init(allocator, 1, "buf2");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1396,9 +1396,9 @@ test "focus navigation between vertical splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    var cb1 = try Conversation.init(allocator, 0, "left");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    var cb2 = try Conversation.init(allocator, 1, "right");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1422,9 +1422,9 @@ test "focus navigation between horizontal splits" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "top");
+    var cb1 = try Conversation.init(allocator, 0, "top");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "bottom");
+    var cb2 = try Conversation.init(allocator, 1, "bottom");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1448,9 +1448,9 @@ test "closeWindow removes focused pane" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    var cb1 = try Conversation.init(allocator, 0, "left");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    var cb2 = try Conversation.init(allocator, 1, "right");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1473,7 +1473,7 @@ test "closeWindow is no-op on single leaf" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "only");
+    var cb = try Conversation.init(allocator, 0, "only");
     defer cb.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1488,9 +1488,9 @@ test "visibleLeaves returns all leaves" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "buf1");
+    var cb1 = try Conversation.init(allocator, 0, "buf1");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "buf2");
+    var cb2 = try Conversation.init(allocator, 1, "buf2");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1510,7 +1510,7 @@ test "recalculate with tiny screen is safe" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1526,7 +1526,7 @@ test "focus direction no-op when no neighbor exists" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "only");
+    var cb = try Conversation.init(allocator, 0, "only");
     defer cb.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1546,9 +1546,9 @@ test "setRoot replaces existing tree" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "first");
+    var cb1 = try Conversation.init(allocator, 0, "first");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "second");
+    var cb2 = try Conversation.init(allocator, 1, "second");
     defer cb2.deinit();
     var test_viewport: Viewport = .{};
 
@@ -1825,7 +1825,7 @@ test "recalculateFloats sizes a float to longest-line bounded by max_width" {
     var layout = Layout.init(allocator);
     defer layout.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "picker");
+    var cb = try Conversation.init(allocator, 0, "picker");
     defer cb.deinit();
     var test_viewport: Viewport = .{};
     // Three lines, longest is 14 chars. We bound max_width to 10 so
@@ -1848,7 +1848,7 @@ test "recalculateFloats sizes a float to longest-line bounded by max_width" {
 
     // Capped at max_width (10).
     try std.testing.expectEqual(@as(u16, 10), rect.width);
-    // Height: ConversationBuffer renders user messages with prompt
+    // Height: Conversation renders user messages with prompt
     // glyphs / spacing; the exact line count is not load-bearing
     // here, only that it sits in [min_height, max_height].
     try std.testing.expect(rect.height >= 3);

@@ -1,4 +1,4 @@
-//! ConversationTree: node tree owned by a ConversationBuffer.
+//! ConversationTree: node tree owned by a Conversation.
 //!
 //! A flat root list with arbitrary child nesting. Mutations bump a single
 //! `generation` counter so observers (cache, compositor) can detect change
@@ -168,7 +168,7 @@ pub fn deinit(self: *ConversationTree) void {
 
 /// Create a new node and attach it to `parent` (or root if null). The
 /// node's id is unique within the tree. The tree itself is content-
-/// storage-agnostic; the caller (typically `ConversationBuffer.appendNode`)
+/// storage-agnostic; the caller (typically `Conversation.appendNode`)
 /// is responsible for stamping `buffer_id` or `custom_tag` afterwards.
 /// Bumps `generation` and pushes the new id onto `dirty_nodes`.
 pub fn appendNode(self: *ConversationTree, parent: ?*Node, node_type: NodeType) !*Node {

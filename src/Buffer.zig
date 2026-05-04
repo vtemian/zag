@@ -1,7 +1,7 @@
 //! Buffer: runtime-polymorphic display buffer interface.
 //!
 //! Uses the ptr + vtable pattern (same as llm.Provider / std.mem.Allocator).
-//! Concrete implementations (ConversationBuffer, future TerminalBuffer, etc.)
+//! Concrete implementations (Conversation, future TerminalBuffer, etc.)
 //! provide a vtable and expose a buf() method returning this interface.
 
 const std = @import("std");

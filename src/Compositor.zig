@@ -15,7 +15,7 @@ const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
-const ConversationBuffer = @import("ConversationBuffer.zig");
+const Conversation = @import("Conversation.zig");
 const ConversationTree = @import("ConversationTree.zig");
 const EventOrchestrator = @import("EventOrchestrator.zig");
 const Theme = @import("Theme.zig");
@@ -27,7 +27,7 @@ const Compositor = @This();
 
 /// The screen grid to write into.
 screen: *Screen,
-/// Long-lived allocator used for per-buffer caches (e.g. ConversationBuffer
+/// Long-lived allocator used for per-buffer caches (e.g. Conversation
 /// per-node rendered-line cache).
 allocator: Allocator,
 /// Design system for colors, highlights, spacing, and borders.
@@ -270,7 +270,7 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
 fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
     const orch = self.orchestrator orelse return;
     const pane = orch.window_manager.paneFromBuffer(buf) orelse return;
-    // Scratch-backed panes have no ConversationBuffer/AgentRunner; the
+    // Scratch-backed panes have no Conversation/AgentRunner; the
     // tree cache is a conversation-only concept so there is nothing to
     // sync for them.
     const view = pane.conversation orelse return;
@@ -624,7 +624,7 @@ fn planScroll(
     }
     const total_rows = total;
     // Scrolled the entire content off the top: nothing to draw. Defensive
-    // clamp because wheel-scroll handlers in ConversationBuffer don't bound
+    // clamp because wheel-scroll handlers in Conversation don't bound
     // the offset by themselves.
     if (scroll_rows >= total_rows) {
         return .{
@@ -1233,7 +1233,7 @@ test "composite writes buffer content at leaf rect with padding" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -1263,7 +1263,7 @@ test "composite draws status line on last row" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var cb = try Conversation.init(allocator, 0, "mybuf");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1302,7 +1302,7 @@ test "composite skips clean buffer leaves" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hello");
 
@@ -1339,7 +1339,7 @@ test "drawStatusLine paints the mode indicator at column 0" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var cb = try Conversation.init(allocator, 0, "mybuf");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1363,7 +1363,7 @@ test "status row in normal mode shows mode label and buffer name only" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
     compositor.layout_dirty = true;
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var cb = try Conversation.init(allocator, 0, "mybuf");
     defer cb.deinit();
     var layout = Layout.init(allocator);
     defer layout.deinit();
@@ -1390,7 +1390,7 @@ test "composite draws rounded frame around a single pane" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "mybuf");
+    var cb = try Conversation.init(allocator, 0, "mybuf");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1421,9 +1421,9 @@ test "focused pane frame uses border_focused highlight, unfocused uses border" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "left");
+    var cb1 = try Conversation.init(allocator, 0, "left");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "right");
+    var cb2 = try Conversation.init(allocator, 1, "right");
     defer cb2.deinit();
 
     var layout = Layout.init(allocator);
@@ -1458,9 +1458,9 @@ test "focused pane title has inverse style, unfocused is plain" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb1 = try ConversationBuffer.init(allocator, 0, "aa");
+    var cb1 = try Conversation.init(allocator, 0, "aa");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "bb");
+    var cb2 = try Conversation.init(allocator, 1, "bb");
     defer cb2.deinit();
 
     var layout = Layout.init(allocator);
@@ -1508,7 +1508,7 @@ test "title is suppressed when pane width is below 6" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "longname");
+    var cb = try Conversation.init(allocator, 0, "longname");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1542,7 +1542,7 @@ test "long titles are truncated with ellipsis" {
     compositor.layout_dirty = true;
 
     // available = 12 - 6 = 6 glyphs for the name -> truncates "verylongname" to "veryl…"
-    var cb = try ConversationBuffer.init(allocator, 0, "verylongname");
+    var cb = try Conversation.init(allocator, 0, "verylongname");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1571,7 +1571,7 @@ test "focused pane renders its draft with a block cursor at end" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
     compositor.layout_dirty = true;
-    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    var cb = try Conversation.init(allocator, 0, "p");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1609,7 +1609,7 @@ test "cursor bg does not bleed across keystrokes" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
     compositor.layout_dirty = true;
-    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    var cb = try Conversation.init(allocator, 0, "p");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1651,9 +1651,9 @@ test "unfocused pane shows its draft without a cursor block" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
     compositor.layout_dirty = true;
-    var cb1 = try ConversationBuffer.init(allocator, 0, "a");
+    var cb1 = try Conversation.init(allocator, 0, "a");
     defer cb1.deinit();
-    var cb2 = try ConversationBuffer.init(allocator, 1, "b");
+    var cb2 = try Conversation.init(allocator, 1, "b");
     defer cb2.deinit();
 
     var layout = Layout.init(allocator);
@@ -1697,7 +1697,7 @@ test "normal mode does not paint a block cursor in the focused pane" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
     compositor.layout_dirty = true;
-    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    var cb = try Conversation.init(allocator, 0, "p");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1731,7 +1731,7 @@ test "status_line cache skips redraw when inputs are unchanged" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
+    var cb = try Conversation.init(allocator, 0, "cache-test");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1771,7 +1771,7 @@ test "composite twice produces identical screen content" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var cb = try ConversationBuffer.init(allocator, 0, "twice");
+    var cb = try Conversation.init(allocator, 0, "twice");
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .assistant_text, "**bold** and `code`");
@@ -1811,10 +1811,10 @@ test "drawFloats renders content and rounded border in supplied rect" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    var root_cb = try Conversation.init(allocator, 0, "root");
     defer root_cb.deinit();
 
-    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    var float_cb = try Conversation.init(allocator, 1, "float");
     defer float_cb.deinit();
     _ = try float_cb.appendNode(null, .user_message, "hello");
 
@@ -1865,11 +1865,11 @@ test "scratch leaf still renders correctly with a float overhead" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    var root_cb = try Conversation.init(allocator, 0, "root");
     defer root_cb.deinit();
     _ = try root_cb.appendNode(null, .user_message, "hello");
 
-    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    var float_cb = try Conversation.init(allocator, 1, "float");
     defer float_cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1900,9 +1900,9 @@ test "focused float draws with the focused border highlight" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    var root_cb = try Conversation.init(allocator, 0, "root");
     defer root_cb.deinit();
-    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    var float_cb = try Conversation.init(allocator, 1, "float");
     defer float_cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1932,9 +1932,9 @@ test "non-focused float draws with the plain border highlight" {
     defer compositor.deinit();
     compositor.layout_dirty = true;
 
-    var root_cb = try ConversationBuffer.init(allocator, 0, "root");
+    var root_cb = try Conversation.init(allocator, 0, "root");
     defer root_cb.deinit();
-    var float_cb = try ConversationBuffer.init(allocator, 1, "float");
+    var float_cb = try Conversation.init(allocator, 1, "float");
     defer float_cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1963,7 +1963,7 @@ test "tiny pane (height 3) skips the prompt reservation" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
     compositor.layout_dirty = true;
-    var cb = try ConversationBuffer.init(allocator, 0, "p");
+    var cb = try Conversation.init(allocator, 0, "p");
     defer cb.deinit();
 
     var layout = Layout.init(allocator);
@@ -1991,7 +1991,7 @@ test "tiny pane (height 3) skips the prompt reservation" {
 
 test "planScroll: short content fits, no scroll" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hi");
     _ = try cb.appendNode(null, .assistant_text, "ok");
@@ -2021,7 +2021,7 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
     // this test deliberately so the assertion has to be revisited alongside
     // the prefix change.
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     const long = "a" ** 60;
@@ -2045,7 +2045,7 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
 
 test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
 
     var i: usize = 0;
@@ -2081,7 +2081,7 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
 
 test "planScroll: scroll past total clamps to zero rows" {
     const allocator = std.testing.allocator;
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
     _ = try cb.appendNode(null, .user_message, "hi");
 
@@ -2102,7 +2102,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
 
@@ -2318,7 +2318,7 @@ test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
 
@@ -2374,7 +2374,7 @@ test "composite: wrapped continuation lands at content_x, not span tail (Bug B r
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
 
@@ -2446,7 +2446,7 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    var cb = try @import("ConversationBuffer.zig").init(allocator, 0, "test");
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
     var viewport: @import("Viewport.zig") = .{};
 

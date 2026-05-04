@@ -23,7 +23,7 @@ pub const PARSER_BUF_SIZE = 128;
 const READ_BUF_SIZE = 64;
 
 /// Hard cap on an accumulated bracketed paste. Sized to match the
-/// ConversationBuffer draft (4 KiB), since anything past that would be
+/// Conversation draft (4 KiB), since anything past that would be
 /// truncated at the consumer anyway.
 pub const PASTE_BUF_SIZE = 4096;
 

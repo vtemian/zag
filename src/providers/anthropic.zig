@@ -710,7 +710,7 @@ fn processSseEvent(
                 }
             } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
                 // Buffer thinking text onto the current block and forward
-                // the delta to the callback so consumers (ConversationBuffer,
+                // the delta to the callback so consumers (Conversation,
                 // trajectory writer) can stream it in real time.
                 const text = delta_obj.get("thinking").?.string;
                 if (blocks.items.len > 0) {
@@ -2135,7 +2135,7 @@ test "anthropic writeMessage drops foreign-provider thinking after JSONL replay"
     // hand-constructed message; this version pins the same gate over
     // a directly-constructed assistant Message tagged with .openai_chat.
     //
-    // Phase D's ConversationBuffer.toWireMessages does not preserve
+    // Phase D's Conversation.toWireMessages does not preserve
     // the `thinking_provider` tag (the tree carries no provider
     // metadata on its nodes), so a tree-driven version of this test
     // would silently bypass the gate it is meant to exercise. The

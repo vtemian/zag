@@ -31,7 +31,7 @@ bytes: std.ArrayList(u8),
 /// Monotonically increasing content version. Bumps on every mutation.
 /// Surfaced through `Buffer.contentVersion` per the vtable contract;
 /// today it has no in-tree observer (`NodeLineCache` keys on the
-/// node's own `content_version`, which `ConversationBuffer.appendToNode`
+/// node's own `content_version`, which `Conversation.appendToNode`
 /// bumps in lockstep). Future observers (Lua plugins watching a buffer,
 /// cross-pane shared buffers) read this directly.
 content_version: u64 = 0,

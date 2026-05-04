@@ -1,4 +1,4 @@
-//! ConversationBuffer: structured content as a tree of typed nodes.
+//! Conversation: structured content as a tree of typed nodes.
 //!
 //! A concrete Buffer implementation for agent conversations. Each node has a
 //! type (user message, assistant text, tool call, etc.) and optional children.
@@ -19,12 +19,12 @@ const input = @import("input.zig");
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
 
-const ConversationBuffer = @This();
+const Conversation = @This();
 
 const log = std.log.scoped(.conversation_buffer);
 
 /// Re-export of the tree's node type enum, so external call sites that
-/// named it `ConversationBuffer.NodeType` keep compiling during the
+/// named it `Conversation.NodeType` keep compiling during the
 /// migration. Prefer `ConversationTree.NodeType` for new code.
 pub const NodeType = ConversationTree.NodeType;
 
@@ -37,7 +37,7 @@ id: u32,
 /// Human-readable buffer name (e.g. "session"). Owned.
 name: []const u8,
 /// Semantic node tree, owned by value. Read as `self.tree.root_children`
-/// etc.; the mutation methods on `ConversationBuffer` (`appendNode`,
+/// etc.; the mutation methods on `Conversation` (`appendNode`,
 /// `clear`, ...) delegate through to this tree for backward compat.
 tree: ConversationTree,
 /// Allocator used for all buffer-owned allocations (name, cache). The
@@ -80,7 +80,7 @@ last_persisted_id: ?ulid.Ulid = null,
 /// owns the node tree, the inline `BufferRegistry`, and the session
 /// persistence state; its agent-thread coordination lives on
 /// `AgentRunner`. The two compose through `EventOrchestrator.Pane`.
-pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer {
+pub fn init(allocator: Allocator, id: u32, name: []const u8) !Conversation {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
 
@@ -105,7 +105,7 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !ConversationBuffer
 /// through the registry) is still alive. Then free the tree, which
 /// holds buffer_id handles into the registry. Then free the registry,
 /// which destroys every TextBuffer/ImageBuffer.
-pub fn deinit(self: *ConversationBuffer) void {
+pub fn deinit(self: *Conversation) void {
     self.cache.deinit();
     self.tree.deinit();
     self.buffer_registry.deinit();
@@ -128,13 +128,13 @@ pub fn deinit(self: *ConversationBuffer) void {
 /// `tree.generation` is a viable follow-up once a real consumer
 /// shows up; today the map is symmetry-only with `ScratchBuffer.row_styles`
 /// and has no live writer to break.
-pub fn setRowStyle(self: *ConversationBuffer, row: u32, slot: Theme.HighlightSlot) !void {
+pub fn setRowStyle(self: *Conversation, row: u32, slot: Theme.HighlightSlot) !void {
     try self.row_styles.put(self.allocator, row, slot);
 }
 
 /// Drop a row's highlight override. No-op when the row has no
 /// override.
-pub fn clearRowStyle(self: *ConversationBuffer, row: u32) void {
+pub fn clearRowStyle(self: *Conversation, row: u32) void {
     _ = self.row_styles.remove(row);
 }
 
@@ -145,7 +145,7 @@ pub fn clearRowStyle(self: *ConversationBuffer, row: u32) void {
 /// stuffing. Every other node type allocates a TextBuffer in the
 /// inline-owned registry, writes the initial content there, and
 /// stamps the handle on `node.buffer_id`.
-pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
+pub fn appendNode(self: *Conversation, parent: ?*Node, node_type: NodeType, content: []const u8) !*Node {
     if (node_type == .tool_call) {
         const node = try self.tree.appendNode(parent, node_type);
         errdefer {
@@ -169,7 +169,7 @@ pub fn appendNode(self: *ConversationBuffer, parent: ?*Node, node_type: NodeType
 /// an ImageBuffer in the inline-owned registry, decodes `png_bytes` into
 /// it, and stamps the handle onto `node.buffer_id` so the renderer can
 /// dispatch on the buffer's kind.
-pub fn appendImageNode(self: *ConversationBuffer, parent: ?*Node, png_bytes: []const u8) !*Node {
+pub fn appendImageNode(self: *Conversation, parent: ?*Node, png_bytes: []const u8) !*Node {
     const handle = try self.buffer_registry.createImage(@tagName(NodeType.tool_result));
     errdefer self.buffer_registry.remove(handle) catch {};
     const ib = try self.buffer_registry.asImage(handle);
@@ -196,7 +196,7 @@ pub fn appendImageNode(self: *ConversationBuffer, parent: ?*Node, png_bytes: []c
 /// cache; because those pointers are cache-owned, callers must not free
 /// them via `StyledLine.deinit`; reset the frame arena instead.
 pub fn getVisibleLines(
-    self: *ConversationBuffer,
+    self: *Conversation,
     frame_alloc: Allocator,
     cache_alloc: Allocator,
     theme: *const Theme,
@@ -315,7 +315,7 @@ fn collectVisibleLines(
 }
 
 /// Count the total number of visible lines (including children of non-collapsed nodes).
-pub fn lineCount(self: *const ConversationBuffer) !usize {
+pub fn lineCount(self: *const Conversation) !usize {
     var count: usize = 0;
     for (self.tree.root_children.items) |node| {
         count += try countVisibleLines(node, &self.renderer, &self.buffer_registry);
@@ -339,7 +339,7 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer, registry:
 /// not carry a `buffer_id` and never receive streaming deltas, so
 /// `error.NoBuffer` here points at a wiring bug, not a control-flow
 /// fork.
-pub fn appendToNode(self: *ConversationBuffer, node: *Node, text: []const u8) !void {
+pub fn appendToNode(self: *Conversation, node: *Node, text: []const u8) !void {
     const handle = node.buffer_id orelse return error.NoBuffer;
     const tb = try self.buffer_registry.asText(handle);
     try tb.append(text);
@@ -366,7 +366,7 @@ pub const ReadResult = struct {
 /// paths. Always returns the tail of the buffer so plugins see the
 /// freshest turns when they ask for a small window.
 pub fn readText(
-    self: *ConversationBuffer,
+    self: *Conversation,
     alloc: Allocator,
     max_lines: usize,
     theme: *const Theme,
@@ -396,7 +396,7 @@ pub fn readText(
 /// because this path runs during session restore, before any agent has
 /// been spawned; JSONL entries are always in chronological order so the
 /// most recently seen tool_call is the right parent.
-pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry) !void {
+pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !void {
     var last_tool_call: ?*Node = null;
     for (entries) |entry| {
         switch (entry.entry_type) {
@@ -458,14 +458,14 @@ pub fn loadFromEntries(self: *ConversationBuffer, entries: []const Session.Entry
 /// entries before their borrowed span text is freed by the tree.
 /// Also bumps tree.generation so `isDirty()` fires even if the tree
 /// was already empty.
-pub fn clear(self: *ConversationBuffer) void {
+pub fn clear(self: *Conversation) void {
     self.cache.invalidateAll();
     self.tree.clear();
 }
 
 /// Append a user_message node at the root of the tree and return it.
 /// Thin wrapper around `appendNode` used by the runner's submit path.
-pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
+pub fn appendUserNode(self: *Conversation, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
 }
 
@@ -473,7 +473,7 @@ pub fn appendUserNode(self: *ConversationBuffer, text: []const u8) !*Node {
 
 /// Attach a session handle for persistence. Does not take ownership of the
 /// handle: the caller remains responsible for closing it.
-pub fn attachSession(self: *ConversationBuffer, handle: *Session.SessionHandle) void {
+pub fn attachSession(self: *Conversation, handle: *Session.SessionHandle) void {
     self.session_handle = handle;
 }
 
@@ -487,7 +487,7 @@ pub fn attachSession(self: *ConversationBuffer, handle: *Session.SessionHandle) 
 /// Auto-threads `parent_id` from `last_persisted_id` when the caller
 /// hasn't set one explicitly, and records the persisted id so the next
 /// event in the turn can chain off of it.
-pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
+pub fn persistEvent(self: *Conversation, entry: Session.Entry) void {
     self.persistEventInternal(entry) catch |err| {
         log.err("session persist failed: {}", .{err});
         self.persist_failed = true;
@@ -498,7 +498,7 @@ pub fn persistEvent(self: *ConversationBuffer, entry: Session.Entry) void {
 /// on the failure mode and by callers (e.g. the task tool's child-event
 /// pump) that want to log a more specific message instead of flipping
 /// `persist_failed`.
-pub fn persistEventInternal(self: *ConversationBuffer, entry: Session.Entry) !void {
+pub fn persistEventInternal(self: *Conversation, entry: Session.Entry) !void {
     const sh = self.session_handle orelse return;
     var entry_with_parent = entry;
     if (entry_with_parent.parent_id == null) {
@@ -512,7 +512,7 @@ pub fn persistEventInternal(self: *ConversationBuffer, entry: Session.Entry) !vo
 /// wrapper around `persistEvent` for the submit path; the caller continues
 /// even on persist failure since we have already accepted the message
 /// into the conversation history.
-pub fn persistUserMessage(self: *ConversationBuffer, text: []const u8) void {
+pub fn persistUserMessage(self: *Conversation, text: []const u8) void {
     self.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
@@ -532,7 +532,7 @@ pub const SessionSummaryInputs = struct {
 /// auto-naming. Returns null if the conversation lacks at least one of
 /// each. The returned slices borrow from registry-owned TextBuffer bytes
 /// and are valid until the next mutation of the corresponding nodes.
-pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInputs {
+pub fn sessionSummaryInputs(self: *const Conversation) ?SessionSummaryInputs {
     var user_text: ?[]const u8 = null;
     var assistant_text: ?[]const u8 = null;
     for (self.tree.root_children.items) |node| {
@@ -572,7 +572,7 @@ pub fn sessionSummaryInputs(self: *const ConversationBuffer) ?SessionSummaryInpu
 /// matching the contract `ConversationHistory.rebuildMessages` enforced
 /// before Phase D.
 pub fn toWireMessages(
-    self: *const ConversationBuffer,
+    self: *const Conversation,
     arena: Allocator,
 ) !std.ArrayList(types.Message) {
     var messages: std.ArrayList(types.Message) = .empty;
@@ -621,7 +621,7 @@ const ProjectionState = struct {
 };
 
 fn projectNode(
-    self: *const ConversationBuffer,
+    self: *const Conversation,
     state: *ProjectionState,
     node: *const ConversationTree.Node,
 ) !void {
@@ -705,7 +705,7 @@ fn projectNode(
 }
 
 fn projectToolResult(
-    self: *const ConversationBuffer,
+    self: *const Conversation,
     state: *ProjectionState,
     node: *const ConversationTree.Node,
 ) !void {
@@ -725,7 +725,7 @@ fn projectToolResult(
 /// Resolve a node's bytes through the buffer registry. Returns an empty
 /// slice if the node has no buffer (tool_call, redacted thinking) or if
 /// the handle is stale (shouldn't happen in practice).
-fn nodeText(self: *const ConversationBuffer, node: *const ConversationTree.Node) []const u8 {
+fn nodeText(self: *const Conversation, node: *const ConversationTree.Node) []const u8 {
     const handle = node.buffer_id orelse return "";
     const tb = self.buffer_registry.asText(handle) catch return "";
     return tb.bytesView();
@@ -734,27 +734,27 @@ fn nodeText(self: *const ConversationBuffer, node: *const ConversationTree.Node)
 /// Flip `collapsed` on every foldable node (thinking, thinking_redacted,
 /// tool_call) in the tree. Returns the number of nodes touched. Used by
 /// the Ctrl-R keybinding; scoped to the buffer so the state is per-pane.
-pub fn toggleAllFoldableCollapsed(self: *ConversationBuffer) usize {
+pub fn toggleAllFoldableCollapsed(self: *Conversation) usize {
     return self.tree.toggleAllFoldableCollapsed();
 }
 
 // -- Buffer interface --------------------------------------------------------
 
-/// Create a Buffer interface from this ConversationBuffer.
-pub fn buf(self: *ConversationBuffer) Buffer {
+/// Create a Buffer interface from this Conversation.
+pub fn buf(self: *Conversation) Buffer {
     return .{ .ptr = self, .vtable = &vtable };
 }
 
 /// Return the View interface for this buffer. Today every
-/// ConversationBuffer has exactly one View, backed by the same `*Self`
+/// Conversation has exactly one View, backed by the same `*Self`
 /// pointer; future phases may attach additional Views over the same
 /// content.
-pub fn view(self: *ConversationBuffer) View {
+pub fn view(self: *Conversation) View {
     return .{ .ptr = self, .vtable = &view_vtable };
 }
 
-/// Downcast a Buffer interface back to *ConversationBuffer.
-pub fn fromBuffer(b: Buffer) *ConversationBuffer {
+/// Downcast a Buffer interface back to *Conversation.
+pub fn fromBuffer(b: Buffer) *Conversation {
     return @ptrCast(@alignCast(b.ptr));
 }
 
@@ -774,47 +774,47 @@ const view_vtable: View.VTable = .{
 };
 
 fn viewGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *Conversation = @ptrCast(@alignCast(ptr));
     return self.getVisibleLines(frame_alloc, cache_alloc, theme, skip, max_lines);
 }
 
 fn viewLineCount(ptr: *anyopaque) anyerror!usize {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const Conversation = @ptrCast(@alignCast(ptr));
     return self.lineCount();
 }
 
 fn viewHandleKey(ptr: *anyopaque, ev: input.KeyEvent) View.HandleResult {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *Conversation = @ptrCast(@alignCast(ptr));
     return self.handleKey(ev);
 }
 
 fn viewOnResize(ptr: *anyopaque, rect: Layout.Rect) void {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *Conversation = @ptrCast(@alignCast(ptr));
     self.onResize(rect);
 }
 
 fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *Conversation = @ptrCast(@alignCast(ptr));
     self.onFocus(focused);
 }
 
 fn viewOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
-    const self: *ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *Conversation = @ptrCast(@alignCast(ptr));
     return self.onMouse(ev, local_x, local_y);
 }
 
 fn bufGetName(ptr: *anyopaque) []const u8 {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const Conversation = @ptrCast(@alignCast(ptr));
     return self.name;
 }
 
 fn bufGetId(ptr: *anyopaque) u32 {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const Conversation = @ptrCast(@alignCast(ptr));
     return self.id;
 }
 
 fn bufContentVersion(ptr: *anyopaque) u64 {
-    const self: *const ConversationBuffer = @ptrCast(@alignCast(ptr));
+    const self: *const Conversation = @ptrCast(@alignCast(ptr));
     return @as(u64, self.tree.currentGeneration());
 }
 
@@ -824,7 +824,7 @@ fn bufContentVersion(ptr: *anyopaque) u64 {
 /// foldable node (thinking, thinking_redacted, tool_call); everything
 /// else passes through and `Pane.handleKey` decides whether to land it
 /// in the draft or drop it.
-pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) View.HandleResult {
+pub fn handleKey(self: *Conversation, ev: input.KeyEvent) View.HandleResult {
     if (ev.modifiers.ctrl) {
         switch (ev.key) {
             .char => |ch| {
@@ -839,22 +839,22 @@ pub fn handleKey(self: *ConversationBuffer, ev: input.KeyEvent) View.HandleResul
     return .passthrough;
 }
 
-pub fn onResize(self: *ConversationBuffer, rect: Layout.Rect) void {
+pub fn onResize(self: *Conversation, rect: Layout.Rect) void {
     _ = self;
     _ = rect;
 }
 
-pub fn onFocus(self: *ConversationBuffer, focused: bool) void {
+pub fn onFocus(self: *Conversation, focused: bool) void {
     _ = self;
     _ = focused;
 }
 
-/// Mouse handling for ConversationBuffer is a passthrough today: wheel
+/// Mouse handling for Conversation is a passthrough today: wheel
 /// scroll is owned by `EventOrchestrator.handleMouse` (which mutates
 /// the leaf's viewport directly), and the buffer has no per-cell click
 /// targets. The hook stays defined so the View vtable surface is
 /// symmetric across buffer kinds.
-pub fn onMouse(self: *ConversationBuffer, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
+pub fn onMouse(self: *Conversation, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
     _ = self;
     _ = ev;
     _ = local_x;
@@ -870,7 +870,7 @@ test {
 
 test "init and deinit" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), cb.id);
@@ -880,7 +880,7 @@ test "init and deinit" {
 
 test "appendNode creates root-level nodes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 1, "session");
+    var cb = try Conversation.init(allocator, 1, "session");
     defer cb.deinit();
 
     const n1 = try cb.appendNode(null, .user_message, "hello");
@@ -897,7 +897,7 @@ test "appendNode creates root-level nodes" {
 
 test "getVisibleLines returns rendered lines" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 3, "session");
+    var cb = try Conversation.init(allocator, 3, "session");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -915,7 +915,7 @@ test "getVisibleLines returns rendered lines" {
 
 test "row_styles round trip: set, render, clear" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 4, "row-style");
+    var cb = try Conversation.init(allocator, 4, "row-style");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "first");
@@ -942,7 +942,7 @@ test "row_styles round trip: set, render, clear" {
 
 test "readText emits user and assistant turns as plain text" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "readtext-test");
+    var cb = try Conversation.init(allocator, 0, "readtext-test");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -960,7 +960,7 @@ test "readText emits user and assistant turns as plain text" {
 
 test "buffer interface dispatches name and id" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 7, "iface-test");
+    var cb = try Conversation.init(allocator, 7, "iface-test");
     defer cb.deinit();
 
     const b = cb.buf();
@@ -970,17 +970,17 @@ test "buffer interface dispatches name and id" {
 
 test "fromBuffer roundtrips correctly" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 8, "roundtrip");
+    var cb = try Conversation.init(allocator, 8, "roundtrip");
     defer cb.deinit();
 
     const b = cb.buf();
-    const recovered = ConversationBuffer.fromBuffer(b);
+    const recovered = Conversation.fromBuffer(b);
     try std.testing.expectEqual(&cb, recovered);
 }
 
 test "getVisibleLines with range skips off-screen nodes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "range-test");
+    var cb = try Conversation.init(allocator, 0, "range-test");
     defer cb.deinit();
 
     // Create 5 single-line nodes
@@ -1009,7 +1009,7 @@ test "getVisibleLines with range skips off-screen nodes" {
 
 test "buffer interface returns line count" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "lc-test");
+    var cb = try Conversation.init(allocator, 0, "lc-test");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1024,7 +1024,7 @@ test "buffer interface returns line count" {
 
 test "getVisibleLines returns consistent results when content unchanged" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "cache-test");
+    var cb = try Conversation.init(allocator, 0, "cache-test");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1052,7 +1052,7 @@ test "getVisibleLines returns consistent results when content unchanged" {
 
 test "getVisibleLines reflects new content after appendToNode" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "dirty-test");
+    var cb = try Conversation.init(allocator, 0, "dirty-test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .user_message, "hello");
@@ -1077,7 +1077,7 @@ test "getVisibleLines reflects new content after appendToNode" {
 
 test "getVisibleLines reflects new nodes after appendNode" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "append-test");
+    var cb = try Conversation.init(allocator, 0, "append-test");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "first");
@@ -1106,7 +1106,7 @@ test "getVisibleLines output survives node content realloc" {
     // version-checked and discarded before any dangling slice is
     // dereferenced.
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "realloc-test");
+    var cb = try Conversation.init(allocator, 0, "realloc-test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .assistant_text, "hi");
@@ -1131,7 +1131,7 @@ test "getVisibleLines output survives node content realloc" {
 
 test "clear invalidates line cache" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "clear-cache-test");
+    var cb = try Conversation.init(allocator, 0, "clear-cache-test");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello");
@@ -1152,7 +1152,7 @@ test "clear invalidates line cache" {
 
 test "onMouse passes through every event kind (wheel scroll lives in EventOrchestrator)" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "mouse-test");
+    var cb = try Conversation.init(allocator, 0, "mouse-test");
     defer cb.deinit();
 
     const kinds = [_]input.MouseEvent.Kind{ .wheel_up, .wheel_down, .press, .release };
@@ -1183,7 +1183,7 @@ test "synthetic id scratch fits maxInt(u32)" {
 
 test "loadFromEntries builds node tree from session entries" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "load-test");
+    var cb = try Conversation.init(allocator, 0, "load-test");
     defer cb.deinit();
 
     const entries = [_]Session.Entry{
@@ -1206,7 +1206,7 @@ test "loadFromEntries builds node tree from session entries" {
 
 test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "thinking-load");
+    var cb = try Conversation.init(allocator, 0, "thinking-load");
     defer cb.deinit();
 
     const entries = [_]Session.Entry{
@@ -1228,7 +1228,7 @@ test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes
 
 test "loadFromEntries reloads tool_call nodes collapsed" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "tool-reload");
+    var cb = try Conversation.init(allocator, 0, "tool-reload");
     defer cb.deinit();
 
     const entries = [_]Session.Entry{
@@ -1247,7 +1247,7 @@ test "loadFromEntries reloads tool_call nodes collapsed" {
 
 test "Ctrl-R toggles collapsed on every thinking node" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "thinking-toggle");
+    var cb = try Conversation.init(allocator, 0, "thinking-toggle");
     defer cb.deinit();
 
     const t1 = try cb.appendNode(null, .thinking, "a");
@@ -1268,7 +1268,7 @@ test "Ctrl-R toggles collapsed on every thinking node" {
 
 test "Ctrl-R toggles collapsed on tool_call nodes too" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "tool-toggle");
+    var cb = try Conversation.init(allocator, 0, "tool-toggle");
     defer cb.deinit();
 
     const call = try cb.appendNode(null, .tool_call, "bash");
@@ -1283,7 +1283,7 @@ test "Ctrl-R toggles collapsed on tool_call nodes too" {
 
 test "Ctrl-R is consumed even with no thinking nodes" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "thinking-empty");
+    var cb = try Conversation.init(allocator, 0, "thinking-empty");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hi");
@@ -1293,7 +1293,7 @@ test "Ctrl-R is consumed even with no thinking nodes" {
 
 test "getVisibleLines reflects collapsed-to-expanded toggle" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "thinking-render");
+    var cb = try Conversation.init(allocator, 0, "thinking-render");
     defer cb.deinit();
 
     const tnode = try cb.appendNode(null, .thinking, "line1\nline2");
@@ -1315,7 +1315,7 @@ test "getVisibleLines reflects collapsed-to-expanded toggle" {
 
 test "handleKey returns passthrough for printable chars (drafts moved to Pane)" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{} });
@@ -1324,7 +1324,7 @@ test "handleKey returns passthrough for printable chars (drafts moved to Pane)" 
 
 test "handleKey returns passthrough for backspace (drafts moved to Pane)" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .backspace, .modifiers = .{} });
@@ -1333,7 +1333,7 @@ test "handleKey returns passthrough for backspace (drafts moved to Pane)" {
 
 test "handleKey returns passthrough for Enter (orchestrator retains the submit path)" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .enter, .modifiers = .{} });
@@ -1342,7 +1342,7 @@ test "handleKey returns passthrough for Enter (orchestrator retains the submit p
 
 test "handleKey returns passthrough for unrelated ctrl chords" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
 
     const r = cb.handleKey(.{ .key = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
@@ -1351,7 +1351,7 @@ test "handleKey returns passthrough for unrelated ctrl chords" {
 
 test "handleKey passthrough flows through the View vtable" {
     const allocator = std.testing.allocator;
-    var cb = try ConversationBuffer.init(allocator, 0, "test");
+    var cb = try Conversation.init(allocator, 0, "test");
     defer cb.deinit();
 
     const v = cb.view();
@@ -1360,7 +1360,7 @@ test "handleKey passthrough flows through the View vtable" {
 }
 
 test "View dispatch renders the conversation" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "parity");
+    var cb = try Conversation.init(std.testing.allocator, 1, "parity");
     defer cb.deinit();
 
     _ = try cb.appendNode(null, .user_message, "hello world");
@@ -1378,7 +1378,7 @@ test "View dispatch renders the conversation" {
 }
 
 test "contentVersion advances on appendNode" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "ver");
+    var cb = try Conversation.init(std.testing.allocator, 1, "ver");
     defer cb.deinit();
 
     const before = cb.buf().contentVersion();
@@ -1388,7 +1388,7 @@ test "contentVersion advances on appendNode" {
 }
 
 test "appendNode for status routes through TextBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .status, "hello");
@@ -1399,7 +1399,7 @@ test "appendNode for status routes through TextBuffer" {
 }
 
 test "appendToNode for status routes through TextBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .status, "hello");
@@ -1410,7 +1410,7 @@ test "appendToNode for status routes through TextBuffer" {
 }
 
 test "appendNode for user_message routes through TextBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .user_message, "hello");
@@ -1421,7 +1421,7 @@ test "appendNode for user_message routes through TextBuffer" {
 }
 
 test "appendNode for custom routes through TextBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .custom, "payload");
@@ -1432,7 +1432,7 @@ test "appendNode for custom routes through TextBuffer" {
 }
 
 test "appendNode for tool_call leaves buffer_id null and stashes name on custom_tag" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     // tool_call carries metadata only; the tool name lives on `custom_tag`
@@ -1443,7 +1443,7 @@ test "appendNode for tool_call leaves buffer_id null and stashes name on custom_
 }
 
 test "appendNode for tool_result text routes through TextBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const call = try cb.appendNode(null, .tool_call, "bash");
@@ -1465,7 +1465,7 @@ const tiny_red_png_fixture = [_]u8{
 };
 
 test "tool_result with image data routes through ImageBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const call = try cb.appendNode(null, .tool_call, "screenshot");
@@ -1497,7 +1497,7 @@ test "tool_result with image data routes through ImageBuffer" {
 }
 
 test "streaming deltas accumulate in assistant_text TextBuffer" {
-    var cb = try ConversationBuffer.init(std.testing.allocator, 1, "test");
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
     defer cb.deinit();
 
     const node = try cb.appendNode(null, .assistant_text, "");
