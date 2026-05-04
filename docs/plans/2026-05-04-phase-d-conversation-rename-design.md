@@ -20,12 +20,11 @@ After Phase D:
 - `ConversationBuffer` becomes `Conversation` and owns its
   `BufferRegistry` inline. The `attachBufferRegistry` post-init step
   goes away.
-- `ConversationHistory.zig` is deleted. Its message-list state was a
-  parallel projection that's now derived on demand via
-  `Conversation.toWireMessages(arena)`.
-- The turn-coordination state on `ConversationHistory` (model id,
-  active-turn fields) moves to a new `Turn` struct, owned alongside
-  `Conversation` by the `Pane`.
+- `ConversationHistory.zig` is deleted. Conversation absorbs every
+  field that lived there: the parallel `ArrayList(Message)` collapses
+  into a `toWireMessages(arena)` projection, and the persistence
+  state (`session_handle`, `persist_failed`, `last_persisted_id`)
+  becomes a normal property of the Conversation.
 - The WindowManager-global `BufferRegistry` stays but narrows in
   role: it owns Lua-managed scratch and image buffers only.
   Conversation tree-content buffers live in the per-conversation
@@ -45,21 +44,18 @@ cross-registry sharing.
   registry, Lua bindings resolve through the WM-global registry.
   Less code change than a hard split; relies on convention.
 
-- **Conversation and Turn are separate structs.** Conversation owns
-  the read-mostly conversation data (tree, registry, line cache).
-  Turn owns the runner-coordination mutable state (model id, active
-  turn). Both owned by the Pane (or equivalent). AgentRunner takes
-  pointers to both.
+- **No Turn struct.** Inventorying `ConversationHistory.zig` showed
+  it doesn't carry `model_id` or active-turn state at all — those
+  live on `llm.ProviderResult` and the agent loop's per-turn
+  runtime config respectively. The brainstorm's assumed split was
+  built on a wrong premise. Conversation absorbs every field of
+  ConversationHistory directly: messages (collapse to projection),
+  session_handle, persist_failed, last_persisted_id.
 
-- **Turn is a sibling, not nested in Conversation.** Keeps the
-  read-only conversation view cleanly separated from the runner's
-  mutation surface. Mirrors how today's `ConversationHistory` was
-  separate from `ConversationBuffer`.
-
-- **Migration sequence: registry inline → Turn extract → history
-  collapse → rename.** Four commits, each green. The risky bit
-  (history collapse, file deletion, AgentRunner signature change)
-  lands in commit 3.
+- **Migration sequence: registry inline → history collapse →
+  rename.** Three commits, each green. The risky bit (history
+  collapse, file deletion, AgentRunner signature change) lands in
+  commit 2.
 
 - **`toWireMessages(arena)` is per-call.** Each LLM turn allocates
   a fresh arena, walks the cursor's branch, derives messages, hands
@@ -82,20 +78,16 @@ allocator: Allocator
 id: u32
 name: []const u8
 tree: ConversationTree
-buffer_registry: BufferRegistry   // INLINE, owned
+buffer_registry: BufferRegistry      // INLINE, owned
 styled_line_cache: NodeLineCache
-```
 
-### Turn (new struct)
-
-```
-model_id: []const u8
-active: ?ActiveTurn
-// ActiveTurn fields determined by reading the surviving subset of
-// ConversationHistory's turn-state. Likely candidates:
-//   started_at: i64
-//   partial_assistant_node_id: ?u32
-//   tool_calls_pending: ArrayList(ToolUseId)
+// Absorbed from ConversationHistory:
+session_handle: ?*Session.SessionHandle = null
+persist_failed: bool = false
+last_persisted_id: ?ulid.Ulid = null
+// Methods absorbed: attachSession, persistEvent,
+// persistEventInternal, persistUserMessage, plus the message-list
+// methods which now derive from the tree via toWireMessages.
 ```
 
 ### Pane (after Phase D)
@@ -103,8 +95,7 @@ active: ?ActiveTurn
 ```
 buffer: Buffer
 view: View
-conversation: ?*Conversation       // renamed from ConversationBuffer
-turn: ?*Turn                       // new sibling pointer
+conversation: ?*Conversation         // renamed from ConversationBuffer
 viewport: Viewport
 draft: [MAX_DRAFT]u8 + len
 handle: ?NodeRegistry.Handle
@@ -121,7 +112,14 @@ buffer_registry: BufferRegistry   // narrowed role: Lua-managed only
 ### AgentRunner (signature change)
 
 Today: `init(alloc, sink, *ConversationHistory)`
-After: `init(alloc, sink, *Conversation, *Turn)`
+After: `init(alloc, sink, *Conversation)`
+
+Where the runner used to read model state from `*ConversationHistory`
+it didn't actually find any — model identity already came from the
+agent loop's runtime config (`agent.zig`'s `model_id` field on the
+per-call config). The signature change is a substitution: the runner
+keeps the same provider/model resolution it already does and just
+swaps the persistence-and-history pointer it carries.
 
 ## Lifetime and ownership
 
@@ -186,7 +184,7 @@ if the handle is stale, which shouldn't happen in practice).
 
 ## Migration sequence
 
-The 4-commit plan, each green:
+The 3-commit plan, each green:
 
 ### Commit 1 — BufferRegistry inline on ConversationBuffer
 
@@ -202,40 +200,32 @@ step.
   own registry directly.
 - Test fixtures that wired a registry stop bothering.
 
-### Commit 2 — Extract Turn struct from ConversationHistory
+### Commit 2 — Absorb ConversationHistory; add toWireMessages
 
-Goal: separate runner-coordination state from message-list state.
+Goal: collapse ConversationHistory into ConversationBuffer (still
+under the old name pre-rename); add the projection.
 
-- New `Turn` struct with `model_id` + `active`.
-- Pane gains `turn: ?*Turn` field; populated alongside `conversation`
-  at every Pane creation site (root pane in main, splits in WM,
-  restorePane in EventOrchestrator, test fixtures).
-- AgentRunner gains a `*Turn` parameter; today's reads of
-  `history.model_id` and `history.active_turn` flip to `turn.*`.
-- `ConversationHistory` still holds the message ArrayList; collapse
-  is commit 3.
-
-### Commit 3 — Drop ConversationHistory; add toWireMessages
-
-Goal: collapse the parallel message list into a per-turn projection.
-
-- Add `Conversation.toWireMessages(arena) ![]Message`.
-- AgentRunner switches from `history.messages.items` to
-  `conv.toWireMessages(per_turn_arena.allocator())`.
-- Delete `src/ConversationHistory.zig`.
-- AgentRunner.init signature becomes
-  `(alloc, sink, *Conversation, *Turn)`.
-- Existing message-list mutation paths (`sink.recordUserMessage`,
-  `sink.recordAssistantTurn`) become no-ops at the history level;
-  the tree mutations they were doing alongside become the only
-  source of truth.
+- Move every field on ConversationHistory onto ConversationBuffer:
+  `session_handle`, `persist_failed`, `last_persisted_id`. Move every
+  method too: `attachSession`, `persistEvent`,
+  `persistEventInternal`, `persistUserMessage`, plus the wire-format
+  message accessors that get redirected through the projection.
+- Add `ConversationBuffer.toWireMessages(arena) ![]Message`.
+- AgentRunner switches from `*ConversationHistory` to
+  `*ConversationBuffer`. Reads of `history.messages.items` become
+  `conv.toWireMessages(per_turn_arena.allocator())`. Reads of
+  `history.session_handle`, `history.persist_failed`, etc., become
+  reads on the conversation buffer.
+- Delete `src/ConversationHistory.zig`. Update CLAUDE.md's
+  architecture block.
+- AgentRunner.init signature: `(alloc, sink, *ConversationBuffer)`.
 
 This is the highest-risk commit. It changes a public-ish signature
-(AgentRunner.init) and deletes a file. Verification beyond `zig
-build test`: spot-check a streaming response through the TUI sim's
-e2e test.
+(AgentRunner.init), deletes a file, and reshapes how persistence is
+addressed across the codebase. Verification beyond `zig build test`:
+spot-check a streaming response through the TUI sim's e2e test.
 
-### Commit 4 — Rename ConversationBuffer → Conversation
+### Commit 3 — Rename ConversationBuffer → Conversation
 
 Goal: vocabulary alignment.
 
@@ -258,15 +248,15 @@ Goal: vocabulary alignment.
 
 ## Open at implementation time
 
-- The exact field set on `ActiveTurn` — depends on what
-  `ConversationHistory` actually carries today. Read the file and
-  inventory its turn-coordination fields before writing the plan.
-- Whether `Turn` lives at `src/Turn.zig` or stays inline in another
-  file. PascalCase + single-export suggests its own file.
 - Save / load round-trip through `Session.zig` — the load path calls
   `cb.appendNode(parent, node_type, content_bytes)` today; after the
   rename it calls `conversation.appendNode(...)`. Mechanical, no
-  format change.
+  format change. The persistence helpers (`persistEvent` etc.) move
+  to Conversation in commit 2; their callers update accordingly.
+- Whether the absorbed persistence methods stay on Conversation or
+  split into a separate `ConversationPersistence` mixin. For now the
+  design keeps them on Conversation — single struct, fewer pointers.
+  Phase E or later can split if it wants.
 
 ## Implementation plan
 
