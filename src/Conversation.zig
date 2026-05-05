@@ -242,6 +242,7 @@ pub fn appendImageNode(self: *Conversation, parent: ?*Node, png_bytes: []const u
     try ib.setPng(png_bytes);
     const node = try self.tree.appendNode(parent, .tool_result);
     node.buffer_id = handle;
+    self.notifyChildChanged();
     return node;
 }
 
