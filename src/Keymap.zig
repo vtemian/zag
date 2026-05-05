@@ -297,7 +297,7 @@ pub const Registry = struct {
     /// `.lua_callback` payloads MUST inspect `displaced` and unref the
     /// prior callback themselves; the registry never touches the Lua
     /// VM. Re-registering an existing (mode, spec, buffer_id) reuses
-    /// the EXISTING id — not a fresh one.
+    /// the EXISTING id, not a fresh one.
     ///
     /// Ids are minted from a monotonic u32 counter that never recycles
     /// removed slots. After `std.math.maxInt(u32)` fresh registrations

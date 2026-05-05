@@ -890,7 +890,7 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const
     // classifier expects `{"error":{...}}` at the JSON root and Codex
     // wraps the error inside `response.error`. We extract the inner
     // object and classify that. Failure to flatten just falls back to
-    // raw classification, which is fine — the worst case is a `.unknown`
+    // raw classification, which is fine; the worst case is a `.unknown`
     // bucket whose user message names the log path.
     if (emit.telemetry) |t| {
         _ = t.onStreamError(.chatgpt_response_failed, raw_data) catch |err| {
@@ -2438,7 +2438,7 @@ test "chatgpt SSE: response.failed without telemetry still terminates with Provi
     if (llm.error_detail.take()) |prev| allocator.free(prev);
     defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
 
-    // Telemetry is null — confirm the existing error path is unaffected.
+    // Telemetry is null: confirm the existing error path is unaffected.
     const result = fx.run(allocator, &.{
         .{
             .event_type = "response.failed",

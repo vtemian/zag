@@ -1829,7 +1829,7 @@ test "loadFromEntries reconstructs subagents from tagged entries" {
     // loadFromEntries skips session_start. Note: spawnSubagent appends
     // a subagent_link node only when the parent itself spawns; on
     // replay the tagged entries are routed to the child but the
-    // parent's tree only sees its own entries — so no link node is
+    // parent's tree only sees its own entries, so no link node is
     // implicitly added during replay. That's a known gap covered by a
     // task_start refinement; for commit 2 we only assert the child
     // routing behaves.

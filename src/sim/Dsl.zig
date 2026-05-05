@@ -1,3 +1,10 @@
+//! Dsl: `.zsm` scenario file parser.
+//!
+//! Splits a scenario source into a flat array of `Step`s (verb plus
+//! borrowed args slice). The parser is whitespace-tolerant and ignores
+//! `#` comment lines. Step args borrow from the input source, so the
+//! returned array does not outlive the source buffer.
+
 const std = @import("std");
 
 pub const Verb = enum {

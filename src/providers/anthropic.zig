@@ -557,7 +557,7 @@ fn parseSseStream(
 ///
 /// The user-facing `error_detail` flows through `error_class.userMessage`,
 /// so an Anthropic overload that mentions `prompt is too long` surfaces as
-/// "Context exceeds the model's window — consider compacting." instead of
+/// "Context exceeds the model's window; consider compacting." instead of
 /// a raw provider envelope. The agent-loop `.err` callback still receives
 /// a provider-tagged string so logs can correlate retries to the upstream.
 fn handleStreamErrorEvent(
@@ -579,7 +579,7 @@ fn handleStreamErrorEvent(
 
     // The agent-loop `.err` callback keeps the provider-tagged string so
     // logs and replays can distinguish anthropic stream errors from
-    // generic transport failures. Best-effort parse — we never fail the
+    // generic transport failures. Best-effort parse: we never fail the
     // outer error path on a malformed envelope.
     var parsed_kind: []const u8 = "error";
     var parsed_message: []const u8 = data;

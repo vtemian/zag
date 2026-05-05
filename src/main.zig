@@ -253,7 +253,7 @@ pub fn main() !void {
     // probing for credentials we know aren't there. With a default_model
     // set the user has already picked a provider, so MissingCredential
     // turns into an actionable hint pointing at the matching login command
-    // for that provider's auth type — re-running the picker would either
+    // for that provider's auth type. Re-running the picker would either
     // confuse the user or overwrite their explicit choice.
     var provider = if (default_model == null)
         try auth_wizard.runFirstRunWizard(

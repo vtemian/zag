@@ -1,3 +1,10 @@
+//! Spawn: fork + exec a child under a fresh PTY.
+//!
+//! Allocates a PTY pair, forks, wires the child's stdio to the slave
+//! side, sets the controlling terminal, and execs the requested argv
+//! with the supplied environment. The parent retains the master fd
+//! through the returned `Spawned` handle.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;

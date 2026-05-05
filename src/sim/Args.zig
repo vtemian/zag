@@ -1,3 +1,9 @@
+//! Args: scenario `send` argument tokenizer.
+//!
+//! Decodes the right-hand side of a `send` step into a sequence of
+//! literal strings, named keysyms (`<Enter>`, `<Esc>`, ...), and Ctrl
+//! chords (`<C-c>`). The Runner hands each token to the PTY in order.
+
 const std = @import("std");
 
 pub const KeySym = enum { enter, escape, tab, up, down, left, right, backspace, space };

@@ -13,7 +13,7 @@
 //! Both upstream sources use case-insensitive regex; Zig's stdlib has no
 //! regex, so patterns are reduced to case-insensitive substrings. The
 //! `\d+` portions of the original regexes only ever match digits, so the
-//! literal prefix is sufficient for classification — we don't need to
+//! literal prefix is sufficient for classification; we don't need to
 //! capture the number itself.
 //!
 //! Memory: `ErrorClass` is a *view* into the inputs. Slice payloads
@@ -282,11 +282,11 @@ pub fn userMessage(class: ErrorClass, allocator: Allocator) ![]u8 {
             if (c.provider_message.len > 0) {
                 break :blk std.fmt.allocPrint(
                     allocator,
-                    "Context exceeds the model's window — consider compacting. ({s})",
+                    "Context exceeds the model's window; consider compacting. ({s})",
                     .{trimForDisplay(c.provider_message)},
                 );
             }
-            break :blk allocator.dupe(u8, "Context exceeds the model's window — consider compacting.");
+            break :blk allocator.dupe(u8, "Context exceeds the model's window; consider compacting.");
         },
         .rate_limit => |c| blk: {
             if (c.retry_after_seconds) |s| {

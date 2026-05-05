@@ -385,7 +385,7 @@ fn tick(
     // content-version delta (any tree mutation bumps the buffer's
     // contentVersion) with the view-only scroll bit, so both tree
     // mutations and scrolls trigger a spinner tick here. The check is
-    // uniform across pane kinds — scratch-backed and conversation panes
+    // uniform across pane kinds: scratch-backed and conversation panes
     // both route through `pane.viewport.isDirty(buf.contentVersion())`.
     // Floats live in `extra_floats`, a sibling of `extra_panes`; a
     // plugin that mutates a float's buffer between user events must
@@ -840,7 +840,7 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         if (screen_y < rect.y or screen_y >= rect.y + rect.height) continue;
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        // Wheel events scroll the leaf's viewport directly — the buffer
+        // Wheel events scroll the leaf's viewport directly; the buffer
         // and view stay stateless about scrolling now that the viewport
         // lives on the Pane. Other mouse events still dispatch through
         // the View vtable for buffer-specific handling.

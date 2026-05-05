@@ -300,7 +300,7 @@ fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) voi
 /// Render `buf` into `outer`, where `outer` is the chrome-inclusive
 /// rect. When `reserve_prompt_row` is true, the bottom-most interior
 /// row is reserved for a `›` prompt and the content stops one row
-/// short — same shape used by tiled leaves. Floats pass `false` because
+/// short, the same shape used by tiled leaves. Floats pass `false` because
 /// they do not draw a prompt today.
 fn drawBufferIntoRect(
     self: *Compositor,
@@ -2432,7 +2432,7 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     //           line 3 at the top of the visible region, causing line 4's
     //           bottom row ("45678") to fall *off* the bottom of the pane.
     //     Either way, the bottom-most visible row of the pane did not
-    //     contain "45678" — there was a blank gap at the bottom.
+    //     contain "45678"; there was a blank gap at the bottom.
     // The current walker honors leading_skip_rows natively, so line 3 is
     // clipped to its bottom row and line 4 occupies the bottom 2 rows.
     const allocator = std.testing.allocator;

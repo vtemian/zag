@@ -1246,7 +1246,7 @@ pub fn runFirstRunWizard(
                 // config.lua's default_model points at a different one. After
                 // a successful scaffold, new_default is non-null by construction.
                 const new_model = new_default orelse {
-                    _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug — please report.\n") catch {};
+                    _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
                     std.process.exit(1);
                 };
                 const new_spec = llm.parseModelString(new_model);
@@ -1260,7 +1260,7 @@ pub fn runFirstRunWizard(
                 std.process.exit(1);
             },
             error.NoDefaultModel => {
-                _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug — please report.\n") catch {};
+                _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
                 std.process.exit(1);
             },
             else => return err,

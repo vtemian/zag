@@ -2619,7 +2619,7 @@ pub const LuaEngine = struct {
     /// `zag.width.cells(s)`: return the terminal-cell display width of
     /// `s`, with grapheme-cluster awareness (CJK is 2, emoji is 2, ZWJ
     /// sequences and combining marks are absorbed). Falls back to byte
-    /// length for invalid UTF-8 — the iterator runs over `Utf8View.initUnchecked`,
+    /// length for invalid UTF-8: the iterator runs over `Utf8View.initUnchecked`,
     /// so callers passing arbitrary bytes get a "best effort" width
     /// rather than a Lua error. Lua plugins use this in place of `#s`
     /// when laying out columns over user-supplied content.
@@ -2758,12 +2758,12 @@ pub const LuaEngine = struct {
         if (lua.typeOf(2) != .string) {
             lua.raiseErrorStr("zag.layout.split: direction must be a string", .{});
         }
-        const dir_str = lua.toString(2) catch {
+        const dir = lua.toString(2) catch {
             lua.raiseErrorStr("zag.layout.split: direction must be a string", .{});
         };
-        const direction: Layout.SplitDirection = if (std.mem.eql(u8, dir_str, "vertical"))
+        const direction: Layout.SplitDirection = if (std.mem.eql(u8, dir, "vertical"))
             .vertical
-        else if (std.mem.eql(u8, dir_str, "horizontal"))
+        else if (std.mem.eql(u8, dir, "horizontal"))
             .horizontal
         else {
             lua.raiseErrorStr("zag.layout.split: direction must be \"horizontal\" or \"vertical\"", .{});
@@ -2900,7 +2900,7 @@ pub const LuaEngine = struct {
             lua.raiseErrorStr("zag.layout.float: opts must be a table", .{});
         }
 
-        // `relative` — slice 2 accepts "editor" and "cursor". Each
+        // `relative`: slice 2 accepts "editor" and "cursor". Each
         // field read pops immediately so the stack stays clean and the
         // final `pushString(id)` is the unambiguous top.
         _ = lua.getField(2, "relative");
@@ -2937,10 +2937,10 @@ pub const LuaEngine = struct {
         switch (lua.typeOf(-1)) {
             .nil, .none => {},
             .string => {
-                const handle_str = lua.toString(-1) catch {
+                const handle = lua.toString(-1) catch {
                     lua.raiseErrorStr("zag.layout.float: win must be a handle string", .{});
                 };
-                relative_to = NodeRegistry.parseId(handle_str) catch {
+                relative_to = NodeRegistry.parseId(handle) catch {
                     lua.raiseErrorStr("zag.layout.float: invalid win handle", .{});
                 };
             },
@@ -3365,7 +3365,7 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// `zag.layout.floats() -> { handle_str, ... }`: return a Lua
+    /// `zag.layout.floats() -> { handle, ... }`: return a Lua
     /// array of `n<u32>` handle strings for every live float, in
     /// ascending z order.
     fn zagLayoutFloatsFn(lua: *Lua) i32 {
@@ -3635,7 +3635,7 @@ pub const LuaEngine = struct {
     /// `getDraft()`, so 0-indexing keeps that math straight rather than
     /// forcing every plugin to add and subtract one. `from_byte == to_byte`
     /// is a valid pure insertion at `from_byte`. Raises on invalid range
-    /// or overflow past MAX_DRAFT — autocomplete plugins know the trigger
+    /// or overflow past MAX_DRAFT. Autocomplete plugins know the trigger
     /// position and want loud failure if anything is off.
     fn zagPaneReplaceDraftRangeFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
@@ -3801,10 +3801,10 @@ pub const LuaEngine = struct {
         if (lua.typeOf(arg_index) != .string) {
             lua.raiseErrorStr(op_name ++ ": handle must be a string", .{});
         }
-        const handle_str = lua.toString(arg_index) catch {
+        const handle_value = lua.toString(arg_index) catch {
             lua.raiseErrorStr(op_name ++ ": handle must be a string", .{});
         };
-        const handle = BufferRegistry.parseId(handle_str) catch {
+        const handle = BufferRegistry.parseId(handle_value) catch {
             lua.raiseErrorStr(op_name ++ ": invalid handle", .{});
         };
         const entry = registry.resolve(handle) catch {
@@ -3847,7 +3847,7 @@ pub const LuaEngine = struct {
         if (lua.typeOf(-1) != .string) {
             lua.raiseErrorStr("zag.buffer.create: field 'kind' must be a string", .{});
         }
-        const kind_str = lua.toString(-1) catch {
+        const kind = lua.toString(-1) catch {
             lua.raiseErrorStr("zag.buffer.create: field 'kind' must be a string", .{});
         };
         // Copy-out before popping: the Lua string lives in the table
@@ -3855,9 +3855,9 @@ pub const LuaEngine = struct {
         // against it. The enum value carries the decision forward so
         // we don't keep the borrowed slice alive past the pop.
         const KindTag = enum { scratch, image };
-        const kind_tag: KindTag = if (std.mem.eql(u8, kind_str, "scratch"))
+        const kind_tag: KindTag = if (std.mem.eql(u8, kind, "scratch"))
             .scratch
-        else if (std.mem.eql(u8, kind_str, "graphics"))
+        else if (std.mem.eql(u8, kind, "graphics"))
             .image
         else {
             lua.raiseErrorStr("zag.buffer.create: unknown kind (valid kinds: \"scratch\", \"graphics\")", .{});
@@ -4059,10 +4059,10 @@ pub const LuaEngine = struct {
         if (lua.typeOf(1) != .string) {
             lua.raiseErrorStr("zag.buffer.delete: handle must be a string", .{});
         }
-        const handle_str = lua.toString(1) catch {
+        const handle_value = lua.toString(1) catch {
             lua.raiseErrorStr("zag.buffer.delete: handle must be a string", .{});
         };
-        const handle = BufferRegistry.parseId(handle_str) catch {
+        const handle = BufferRegistry.parseId(handle_value) catch {
             lua.raiseErrorStr("zag.buffer.delete: invalid handle", .{});
         };
         registry.remove(handle) catch |err| {
@@ -4109,14 +4109,14 @@ pub const LuaEngine = struct {
         if (lua.typeOf(2) != .string) {
             lua.raiseErrorStr("zag.buffer.set_fit: arg 2 must be a string", .{});
         }
-        const fit_str = lua.toString(2) catch {
+        const fit_value = lua.toString(2) catch {
             lua.raiseErrorStr("zag.buffer.set_fit: arg 2 must be a string", .{});
         };
-        const fit: ImageBuffer.Fit = if (std.mem.eql(u8, fit_str, "contain"))
+        const fit: ImageBuffer.Fit = if (std.mem.eql(u8, fit_value, "contain"))
             .contain
-        else if (std.mem.eql(u8, fit_str, "fill"))
+        else if (std.mem.eql(u8, fit_value, "fill"))
             .fill
-        else if (std.mem.eql(u8, fit_str, "actual"))
+        else if (std.mem.eql(u8, fit_value, "actual"))
             .actual
         else {
             lua.raiseErrorStr("zag.buffer.set_fit: fit must be \"contain\", \"fill\", or \"actual\"", .{});
@@ -4147,10 +4147,10 @@ pub const LuaEngine = struct {
         if (lua.typeOf(3) != .string) {
             lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
         }
-        const slot_str = lua.toString(3) catch {
+        const slot_value = lua.toString(3) catch {
             lua.raiseErrorStr("zag.buffer.set_row_style: slot must be a string", .{});
         };
-        const slot = Theme.parseHighlightSlot(slot_str) orelse {
+        const slot = Theme.parseHighlightSlot(slot_value) orelse {
             lua.raiseErrorStr("zag.buffer.set_row_style: unknown slot (valid: \"selection\", \"current_line\", \"error\", \"warning\")", .{});
         };
         const row_zero: u32 = @intCast(row_lua - 1);
@@ -4847,21 +4847,21 @@ pub const LuaEngine = struct {
                 log.err("zag.keymap{{}}: field 'buffer' must be a \"b<id>\" handle string", .{});
                 return error.LuaError;
             }
-            const handle_str = lua.toString(-1) catch {
+            const handle_value = lua.toString(-1) catch {
                 log.err("zag.keymap{{}}: field 'buffer' must be a \"b<id>\" handle string", .{});
                 return error.LuaError;
             };
-            const handle = BufferRegistry.parseId(handle_str) catch {
-                log.err("zag.keymap{{}}: invalid buffer handle '{s}'", .{handle_str});
+            const handle = BufferRegistry.parseId(handle_value) catch {
+                log.err("zag.keymap{{}}: invalid buffer handle '{s}'", .{handle_value});
                 return error.LuaError;
             };
             const engine_for_resolve = try keymapEnginePointer(lua);
             const registry = engine_for_resolve.buffer_registry orelse {
-                log.warn("zag.keymap{{}}: no buffer registry bound; cannot resolve '{s}'", .{handle_str});
+                log.warn("zag.keymap{{}}: no buffer registry bound; cannot resolve '{s}'", .{handle_value});
                 return error.LuaError;
             };
             const entry = registry.asBuffer(handle) catch {
-                log.warn("zag.keymap{{}}: stale buffer handle '{s}'", .{handle_str});
+                log.warn("zag.keymap{{}}: stale buffer handle '{s}'", .{handle_value});
                 return error.LuaError;
             };
             buffer_id = entry.getId();
@@ -4997,7 +4997,7 @@ pub const LuaEngine = struct {
     /// when restoration is not possible. Restoration is unsupported
     /// in three cases, all surfaced as a `nil` second return:
     ///   * No prior binding existed (`displaced == null`).
-    ///   * The displaced action was `.lua_callback` — the wrapper
+    ///   * The displaced action was `.lua_callback`: the wrapper
     ///     already released the registry ref, so a plugin cannot
     ///     re-register a Lua callback it did not own.
     ///   * The displaced binding was buffer-scoped. The registry
@@ -5412,14 +5412,14 @@ pub const LuaEngine = struct {
             log.warn("zag.provider(): auth.redirect_port missing for oauth kind", .{});
             return error.LuaError;
         }
-        const port_int = lua.toInteger(-1) catch {
+        const port = lua.toInteger(-1) catch {
             lua.pop(1);
             log.warn("zag.provider(): auth.redirect_port must be an integer", .{});
             return error.LuaError;
         };
         lua.pop(1);
-        const redirect_port: u16 = std.math.cast(u16, port_int) orelse {
-            log.warn("zag.provider(): auth.redirect_port {d} does not fit in u16", .{port_int});
+        const redirect_port: u16 = std.math.cast(u16, port) orelse {
+            log.warn("zag.provider(): auth.redirect_port {d} does not fit in u16", .{port});
             return error.LuaError;
         };
 
@@ -5752,10 +5752,10 @@ pub const LuaEngine = struct {
         const url = (try readStringField(lua, 1, "url", .required, allocator)) orelse unreachable;
         errdefer allocator.free(url);
 
-        const wire_str = (try readStringField(lua, 1, "wire", .required, allocator)) orelse unreachable;
-        defer allocator.free(wire_str);
-        const serializer = parseSerializer(wire_str) orelse {
-            log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire_str});
+        const wire = (try readStringField(lua, 1, "wire", .required, allocator)) orelse unreachable;
+        defer allocator.free(wire);
+        const serializer = parseSerializer(wire) orelse {
+            log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire});
             return error.LuaError;
         };
 
@@ -7170,11 +7170,11 @@ pub const LuaEngine = struct {
             // is the concatenation of every text block in this message.
             lua.newTable();
 
-            const role_str: []const u8 = switch (msg.role) {
+            const role: []const u8 = switch (msg.role) {
                 .user => "user",
                 .assistant => "assistant",
             };
-            _ = lua.pushString(role_str);
+            _ = lua.pushString(role);
             lua.setField(-2, "role");
 
             var concat: std.ArrayList(u8) = .empty;
@@ -7222,13 +7222,13 @@ pub const LuaEngine = struct {
             );
             return error.CompactEntryMissingRole;
         }
-        const role_str = lua.toString(-1) catch return error.CompactEntryReadFailed;
-        const role: types.Role = if (std.mem.eql(u8, role_str, "user"))
+        const role_value = lua.toString(-1) catch return error.CompactEntryReadFailed;
+        const role: types.Role = if (std.mem.eql(u8, role_value, "user"))
             .user
-        else if (std.mem.eql(u8, role_str, "assistant"))
+        else if (std.mem.eql(u8, role_value, "assistant"))
             .assistant
         else {
-            log.warn("compact strategy entry has unknown role: {s}", .{role_str});
+            log.warn("compact strategy entry has unknown role: {s}", .{role_value});
             return error.CompactEntryUnknownRole;
         };
 
@@ -12476,8 +12476,8 @@ test "zag.buffer.create returns a resolvable handle" {
     );
     _ = try engine.lua.getGlobal("handle");
     defer engine.lua.pop(1);
-    const handle_str = try engine.lua.toString(-1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle_value = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_value);
     const entry = try buffer_registry.resolve(handle);
     try std.testing.expect(entry == .scratch);
     try std.testing.expectEqualStrings("picker", entry.scratch.name);
@@ -12590,8 +12590,8 @@ test "zag.buffer.delete releases the slot and later lookups fail" {
         \\zag.buffer.delete(_G.handle)
     );
     _ = try engine.lua.getGlobal("handle");
-    const handle_str = try engine.lua.toString(-1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle_value = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_value);
     try std.testing.expectError(BufferRegistry.Error.StaleBuffer, buffer_registry.resolve(handle));
     engine.lua.pop(1);
 
@@ -12631,8 +12631,8 @@ test "zag.buffer.create kind=\"graphics\" returns a resolvable image handle" {
     );
     _ = try engine.lua.getGlobal("handle");
     defer engine.lua.pop(1);
-    const handle_str = try engine.lua.toString(-1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle_value = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_value);
     const entry = try buffer_registry.resolve(handle);
     try std.testing.expect(entry == .image);
     try std.testing.expectEqualStrings("diagram", entry.image.name);
@@ -12659,8 +12659,8 @@ test "zag.buffer.set_png stores decoded image on an image handle" {
     );
     _ = try engine.lua.getGlobal("handle");
     defer engine.lua.pop(1);
-    const handle_str = try engine.lua.toString(-1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle_value = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_value);
     const entry = try buffer_registry.resolve(handle);
     try std.testing.expect(entry == .image);
     try std.testing.expect(entry.image.image != null);
@@ -12708,9 +12708,9 @@ test "zag.buffer.set_fit parses valid strings and rejects invalid ones" {
         \\zag.buffer.set_fit(_G.handle, "actual")
     );
     _ = try engine.lua.getGlobal("handle");
-    const handle_str = try engine.lua.toString(-1);
+    const handle_value = try engine.lua.toString(-1);
     engine.lua.pop(1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle = try BufferRegistry.parseId(handle_value);
     const entry = try buffer_registry.resolve(handle);
     try std.testing.expectEqual(ImageBuffer.Fit.actual, entry.image.fit);
 
@@ -12756,8 +12756,8 @@ test "zag.buffer.set_row_style happy path stamps row_style on rendered line" {
         \\zag.buffer.set_row_style(_G.handle, 2, "selection")
     );
     _ = try engine.lua.getGlobal("handle");
-    const handle_str = try engine.lua.toString(-1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle_value = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_value);
     engine.lua.pop(1);
     const entry = try buffer_registry.resolve(handle);
     const sb = entry.scratch;
@@ -12905,8 +12905,8 @@ test "zag.buffer + zag.keymap e2e: bound key resolves through BufferRegistry" {
 
     // Recover the concrete Buffer.getId() the orchestrator would pass.
     _ = try engine.lua.getGlobal("handle");
-    const handle_str = try engine.lua.toString(-1);
-    const handle = try BufferRegistry.parseId(handle_str);
+    const handle_value = try engine.lua.toString(-1);
+    const handle = try BufferRegistry.parseId(handle_value);
     engine.lua.pop(1);
     const focused_buffer_id = (try buffer_registry.asBuffer(handle)).getId();
 

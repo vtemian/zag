@@ -1,13 +1,13 @@
 //! Auth-related CLI handlers for the `zag` binary.
 //!
 //! Three families live here:
-//!   * `Subcommand` + `handleSubcommand` — the `zag auth login|list|remove`
+//!   * `Subcommand` + `handleSubcommand`: the `zag auth login|list|remove`
 //!     dispatcher. Each variant boots a throwaway `LuaEngine` (the wizard
 //!     picker iterates the engine's `providers_registry`) and routes to the
 //!     matching `auth_wizard.*` entry point.
-//!   * `runLoginCommand` — the older `zag --login=<provider>` shortcut that
+//!   * `runLoginCommand`: the older `zag --login=<provider>` shortcut that
 //!     short-circuits into the OAuth signin flow.
-//!   * `formatMissingCredentialHint` — the stderr message rendered when
+//!   * `formatMissingCredentialHint`: the stderr message rendered when
 //!     provider construction fails with `error.MissingCredential`. Both the
 //!     TUI startup path and the headless harness use it.
 

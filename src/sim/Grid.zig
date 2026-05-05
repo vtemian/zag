@@ -1,17 +1,18 @@
+//! Grid: libghostty-vt Terminal plus its persistent parser stream.
+//!
+//! The stream MUST be long-lived: its parser accumulates state across
+//! successive `feed` calls (split escape sequences would otherwise be
+//! misinterpreted if the parser were recreated per call).
+//!
+//! The stream's handler holds a raw `*Terminal`, so the Grid itself
+//! must not be copied after init. We allocate it on the heap and
+//! return a pointer via `create`.
+
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 
 const Grid = @This();
 
-/// Grid wraps a libghostty-vt Terminal + its persistent parser stream.
-///
-/// The stream MUST be long-lived: its parser accumulates state across
-/// successive `feed` calls (split escape sequences would otherwise be
-/// misinterpreted if the parser were recreated per call).
-///
-/// The stream's handler holds a raw `*Terminal`, so the Grid itself must
-/// not be copied after init. We allocate it on the heap and return a
-/// pointer via `create`.
 alloc: std.mem.Allocator,
 terminal: ghostty_vt.Terminal,
 stream: ghostty_vt.TerminalStream,

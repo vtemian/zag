@@ -1,4 +1,13 @@
-//! End-to-end wiring tests for the Lua async runtime.
+//! End-to-end wiring tests for the Lua async runtime that cannot live
+//! inline.
+//!
+//! These exercise the LuaEngine + AsyncRuntime + IoPool +
+//! CompletionQueue pipeline as a single integrated stack. Pairing the
+//! tests with any one of those modules would either pull the rest into
+//! that module's test scope (defeating module isolation) or duplicate
+//! the same fixture across files. The carve-out keeps the cross-module
+//! fixtures in one place.
+
 const std = @import("std");
 const testing = std.testing;
 const LuaEngine = @import("../LuaEngine.zig").LuaEngine;

@@ -1,3 +1,13 @@
+//! Runner: scenario executor.
+//!
+//! Drives a `.zsm` scenario step-by-step against a child process spawned
+//! under a PTY. Holds the PTY grid (terminal model), the spawned child
+//! state, and the artifact sink for transcripts and snapshots. Each step
+//! either drives input into the child (send), waits on a condition over
+//! the grid (wait_text, wait_idle, wait_exit), or asserts a property
+//! (expect_text, snapshot). Maps step outcomes to a process exit code
+//! through the `Outcome` enum.
+
 const std = @import("std");
 const posix = std.posix;
 const Spawn = @import("Spawn.zig");

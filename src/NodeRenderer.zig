@@ -59,12 +59,12 @@ const Prefixes = struct {
 /// Conversation through the node's type-erased back-pointer and
 /// inspects the child's tail node to derive the label:
 ///
-///   * `ready`   — child has no nodes yet (spawn marker, no turn).
-///   * `running` — child has nodes but the tail isn't an end-state.
-///   * `done`    — child's tail is `assistant_text` (the agent's
-///                 final summary lands as a trailing text node).
-///   * `failed`  — child's tail is `err`.
-///   * `missing` — back-pointer absent or index out of bounds.
+///   * `ready`:   child has no nodes yet (spawn marker, no turn).
+///   * `running`: child has nodes but the tail isn't an end-state.
+///   * `done`:    child's tail is `assistant_text` (the agent's
+///                final summary lands as a trailing text node).
+///   * `failed`:  child's tail is `err`.
+///   * `missing`: back-pointer absent or index out of bounds.
 ///
 /// Threading policy: this runs on the UI thread during render, but the
 /// parent's agent thread may concurrently be appending into

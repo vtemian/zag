@@ -1,3 +1,13 @@
+//! End-to-end smoke test for the sim PTY stack that cannot live
+//! inline.
+//!
+//! Drives a real `/bin/cat` child through `Spawn` + `Pty` + `Grid` to
+//! verify that bytes round-trip from the master fd, through the
+//! libghostty-vt parser, and back out as plain text. Pairing this with
+//! either Spawn.zig or Grid.zig alone would mis-locate the test (it
+//! exercises both); keeping it as a sibling module test makes the
+//! cross-module dependency explicit.
+
 const std = @import("std");
 const posix = std.posix;
 const Spawn = @import("Spawn.zig");
