@@ -263,7 +263,7 @@ test "parseSlice rejects mid-file malformed JSON" {
 
 test "parseSlice rejects user_message missing content" {
     // A user_message without a content string is data loss the sim
-    // can't paper over — there is nothing to type back.
+    // can't paper over: there is nothing to type back.
     const src =
         \\{"type":"user_message","ts":1}
         \\{"type":"user_message","content":"ok","ts":2}

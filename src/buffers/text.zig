@@ -3,7 +3,7 @@
 //! (status, user_message, assistant_text, tool_result text, etc.)
 //! after Phase C of the buffer/view/pane refactor.
 //!
-//! TextBuffer has no paired View — embedded conversation buffers are
+//! TextBuffer has no paired View; embedded conversation buffers are
 //! rendered by ConversationView walking the tree, not by a standalone
 //! text-pane View. Standalone text-pane use cases are served by
 //! ScratchBuffer today.

@@ -457,7 +457,7 @@ pub fn findFloat(self: *const Layout, handle: NodeRegistry.Handle) ?*FloatNode {
 /// Patch fields of a live float's `FloatConfig` in place. Any non-null
 /// field on `patch` overwrites the corresponding `FloatConfig` field;
 /// null fields preserve the existing value. The orchestrator picks up
-/// the change on the next `recalculateFloats` pass — callers should set
+/// the change on the next `recalculateFloats` pass; callers should set
 /// `compositor.layout_dirty` so a frame is actually drawn.
 pub const FloatMovePatch = struct {
     row_offset: ?i32 = null,
@@ -736,7 +736,7 @@ pub fn recalculateFloats(self: *Layout, screen_width: u16, screen_height: u16) v
     for (self.floats.items) |f| {
         const resolved = self.resolveAnchor(f, editor_rect, screen_width, screen_height);
         // `bufpos` is the only anchor that means "hide me when off
-        // screen" — every other anchor falls back to the editor rect
+        // screen"; every other anchor falls back to the editor rect
         // so a stale `relative_to` handle still draws somewhere
         // sensible. Distinguish the two cases with a separate collapse
         // flag rather than overloading null.
@@ -848,7 +848,7 @@ const ResolvedAnchor = struct { rect: ?Rect, collapse: bool = false };
 ///                  buffer, translated through the leaf's scroll
 ///                  offset. Off-screen positions (after scroll) set
 ///                  `collapse = true` so the caller paints a 0-cell
-///                  rect — the float is effectively hidden until the
+///                  rect, so the float is effectively hidden until the
 ///                  bufpos comes back into view.
 fn resolveAnchor(
     self: *const Layout,

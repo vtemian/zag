@@ -200,7 +200,7 @@ pub const Pane = struct {
     /// Does NOT fire `pane_draft_change`. The submit pipeline drains the
     /// draft to send it to the agent; firing the hook here would make
     /// any plugin observe an empty draft right after the user pressed
-    /// Enter — misleading, and a recursion footgun (a hook that
+    /// Enter, which is misleading and a recursion footgun (a hook that
     /// re-populates the draft on every clear would loop). Plugins that
     /// want to react to submission should use `UserMessagePre` or
     /// `UserMessagePost` instead.
@@ -243,7 +243,7 @@ pub const Pane = struct {
     /// matching `getDraft()` slicing. `from_byte == to_byte` is valid and
     /// acts as a pure insertion at `from_byte`. Strict errors on invalid
     /// range (`from_byte > to_byte` or `to_byte > draft_len`) and on
-    /// overflow past `MAX_DRAFT` — autocomplete plugins know the trigger
+    /// overflow past `MAX_DRAFT`. Autocomplete plugins know the trigger
     /// range and want loud failure if anything is off.
     pub fn replaceDraftRange(
         self: *Pane,
@@ -269,7 +269,7 @@ pub const Pane = struct {
         // Shift the trailing bytes to their new home before writing the
         // replacement. When the replacement grows the draft (`replacement.len
         // > removed`), the tail moves right and source/dest overlap with
-        // dest > src — a forward `@memcpy` would clobber unread source
+        // dest > src; a forward `@memcpy` would clobber unread source
         // bytes, so we copy backward via `std.mem.copyBackwards`. When
         // the replacement shrinks, the tail moves left (dest < src) and a
         // forward `std.mem.copyForwards` is correct.
@@ -1487,13 +1487,13 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
 /// TODO(node-cursor): once the renderer grows a real per-node cursor,
 /// this surrogate collapses to "the cursor's node". Today, pressing
 /// Enter on a Conversation pane drills into the *most recent*
-/// subagent_link node regardless of where the user's eye/cursor is —
-/// surprising UX if the parent has spawned multiple subagents.
+/// subagent_link node regardless of where the user's eye/cursor is,
+/// which is surprising UX if the parent has spawned multiple subagents.
 /// See Phase E final review I2.
 ///
 /// Find the most recent `.subagent_link` node in `conv.tree.root_children`.
 /// Returns null when no subagent links exist. The drill-down keybind
-/// uses this to pick a target without a node-cursor model — once the
+/// uses this to pick a target without a node-cursor model. Once the
 /// renderer grows real cursor state this collapses to "the cursor's
 /// node" and the helper goes away.
 fn lastSubagentLink(conv: *Conversation) ?*Conversation.Node {
@@ -1524,10 +1524,10 @@ fn lastSubagentLink(conv: *Conversation) ?*Conversation.Node {
 /// subscription).
 ///
 /// Errors:
-///   * `error.NotASubagentLink`     — `node.node_type != .subagent_link`.
-///   * `error.NoConversation`       — parent pane has no Conversation.
-///   * `error.StaleSubagentIndex`   — `subagent_index` out of bounds.
-///   * `error.ParentLeafMissing`    — parent pane has no live layout
+///   * `error.NotASubagentLink`:    `node.node_type != .subagent_link`.
+///   * `error.NoConversation`:      parent pane has no Conversation.
+///   * `error.StaleSubagentIndex`:  `subagent_index` out of bounds.
+///   * `error.ParentLeafMissing`:   parent pane has no live layout
 ///                                     leaf to split (closed pane).
 pub fn enterSubagent(
     self: *WindowManager,
@@ -1751,7 +1751,7 @@ pub fn openFloatPane(
     // `enter=true` would point the snapshot at the float's own
     // (typically empty) draft and the very next sweep would see
     // "moved" on every keystroke. The find-after-add path here can
-    // only fail on stale handles, which we just produced — bug if it
+    // only fail on stale handles, which we just produced; bug if it
     // ever fires.
     if (self.layout.findFloat(handle)) |f| {
         const origin = self.getFocusedPanePtr();
@@ -1814,7 +1814,7 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     // this handle, so we don't need to clear it here. If on_close
     // already removed the float (re-entrant close), `findFloat` would
     // have returned non-null at the top of this function but the
-    // pointer would be stale by now — guard with another findFloat to
+    // pointer would be stale by now; guard with another findFloat to
     // make the second close a clean no-op.
     if (self.layout.findFloat(handle) == null) {
         self.compositor.layout_dirty = true;
@@ -1998,7 +1998,7 @@ pub fn swapProviderForPane(
 
 /// Resolve a node handle to the `*Pane` whose buffer the leaf carries.
 /// Float handles route to `paneFromFloatHandle` so plugin callers can
-/// pass float ids interchangeably with tile ids — the float bit
+/// pass float ids interchangeably with tile ids; the float bit
 /// otherwise trips `node_registry.resolve` with `StaleNode`. Rejects
 /// splits and unregistered panes loudly; handles that point at a
 /// scratch-backed pane still succeed.
@@ -2699,7 +2699,7 @@ test "Pane replaceDraftRange rejects overflow past MAX_DRAFT" {
     defer view.deinit();
     var pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = null };
 
-    // Fill the draft to MAX_DRAFT - 1, then try to insert 8 bytes —
+    // Fill the draft to MAX_DRAFT - 1, then try to insert 8 bytes:
     // the resulting length would exceed MAX_DRAFT, so the op must
     // raise without touching the draft.
     var i: usize = 0;
@@ -3200,7 +3200,7 @@ test "closeById rejects the caller's own pane" {
 
 test "closeById routes float handles to closeFloatById" {
     // Regression: pre-fix, `closeById(float_handle)` ran the leaf
-    // resolver and returned `error.NotALeaf` — a Lua-side branch on
+    // resolver and returned `error.NotALeaf`. A Lua-side branch on
     // `Layout.isFloatHandle` was the only thing keeping the picker
     // close path alive. Now `closeById` checks the float namespace
     // first so any future Zig-side caller can hand it either kind.
@@ -3492,8 +3492,8 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     // pointer must match the registry's scratch-buffer pointer (not a
     // new Conversation).
     const bh = try wm.buffer_registry.createScratch("picker");
-    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
-    const scratch_id = scratch_buf.getId();
+    const scratch_buffer = try wm.buffer_registry.asBuffer(bh);
+    const scratch_id = scratch_buffer.getId();
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
     var id_buf: [16]u8 = undefined;
@@ -3519,7 +3519,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     const new_handle: NodeRegistry.Handle = try NodeRegistry.parseId(new_id);
     const new_node = try wm.node_registry.resolve(new_handle);
     try std.testing.expectEqual(@as(u32, scratch_id), new_node.leaf.buffer.getId());
-    try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
+    try std.testing.expectEqual(scratch_buffer.ptr, new_node.leaf.buffer.ptr);
 
     // The scratch pane is tracked in extra_panes but carries null
     // runner/conversation; scratch buffers are not agent panes.
@@ -3527,7 +3527,7 @@ test "handleLayoutRequest split attaches registered buffer by handle" {
     const scratch_pane = wm.extra_panes.items[0].pane;
     try std.testing.expectEqual(@as(?*AgentRunner, null), scratch_pane.runner);
     try std.testing.expectEqual(@as(?*Conversation, null), scratch_pane.conversation);
-    try std.testing.expectEqual(scratch_buf.ptr, scratch_pane.buffer.ptr);
+    try std.testing.expectEqual(scratch_buffer.ptr, scratch_pane.buffer.ptr);
 }
 
 test "handleLayoutRequest split rejects stale buffer handle" {
@@ -3751,7 +3751,7 @@ test "enterSubagent opens a borrowed-Conversation pane and WM teardown does not 
     layout.recalculate(screen.width, screen.height);
     // setRoot ran AFTER attachLayoutRegistry, so the root leaf wasn't
     // present when the registry first walked the tree. Re-walk now so
-    // the root_pane gets its handle stamped — enterSubagent reads it.
+    // the root_pane gets its handle stamped; enterSubagent reads it.
     try wm.attachLayoutRegistry();
 
     // Spawn a subagent on the root Conversation and grab its link node.
@@ -3832,7 +3832,7 @@ test "enter_subagent action drills into the focused pane's most recent subagent"
 
     const child = try view.spawnSubagent("codereview", "");
 
-    // No-op when no subagent_link is the cursor target — but the action
+    // No-op when no subagent_link is the cursor target, but the action
     // is the high-level "drill into latest subagent" so it succeeds.
     try wm.executeAction(.enter_subagent);
 
@@ -3887,7 +3887,7 @@ test "enter_subagent action is a no-op on a Conversation without subagent_link n
     try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
     layout.recalculate(screen.width, screen.height);
 
-    // No spawnSubagent call — pressing <CR> in normal mode must not
+    // No spawnSubagent call: pressing <CR> in normal mode must not
     // panic, and must not open a new pane.
     try wm.executeAction(.enter_subagent);
     try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
@@ -4067,7 +4067,7 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
     // Seed the buffer registry and format its handle as `"b<u32>"` so
     // Lua sees the same opaque string a plugin would.
     const bh = try wm.buffer_registry.createScratch("picker");
-    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const scratch_buffer = try wm.buffer_registry.asBuffer(bh);
     const buffer_id = try BufferRegistry.formatId(allocator, bh);
     defer allocator.free(buffer_id);
 
@@ -4086,7 +4086,7 @@ test "zag.layout.split attaches a registered scratch buffer by handle" {
     const new_id = try engine.lua.toString(-1);
     const new_handle = try NodeRegistry.parseId(new_id);
     const new_node = try wm.node_registry.resolve(new_handle);
-    try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
+    try std.testing.expectEqual(scratch_buffer.ptr, new_node.leaf.buffer.ptr);
 }
 
 test "zag.layout.split keeps legacy {buffer = {type = \"conversation\"}} form working" {
@@ -4276,7 +4276,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     // `"b<u32>"` string in its JSON input, the same shape a Lua plugin
     // or an agent-authored call would produce.
     const bh = try wm.buffer_registry.createScratch("picker");
-    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const scratch_buffer = try wm.buffer_registry.asBuffer(bh);
 
     const root_handle = try wm.handleForNode(wm.layout.root.?);
     const pane_id = try NodeRegistry.formatId(allocator, root_handle);
@@ -4341,7 +4341,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
     const new_id = parsed.value.object.get("new_id").?.string;
     const new_handle = try NodeRegistry.parseId(new_id);
     const new_node = try wm.node_registry.resolve(new_handle);
-    try std.testing.expectEqual(scratch_buf.ptr, new_node.leaf.buffer.ptr);
+    try std.testing.expectEqual(scratch_buffer.ptr, new_node.leaf.buffer.ptr);
 }
 
 test "readPaneById returns rendered text with metadata" {
@@ -4828,7 +4828,7 @@ test "zag.pane.set_draft writes through to a float pane's draft" {
 
     // Open a focused float (`enter = true` so a real `Pane` is registered
     // in `extra_floats`), then set its draft via the Lua surface using
-    // the float handle string — the same `zag.pane.set_draft` call that
+    // the float handle string. The same `zag.pane.set_draft` call that
     // works on tile handles must work on float handles.
     try f.engine.lua.doString(
         \\_buf = zag.buffer.create { kind = "scratch", name = "picker" }
@@ -4871,7 +4871,7 @@ test "zag.pane.set_draft truncates input larger than MAX_DRAFT" {
 
     // Build a Lua string literal of `(MAX_DRAFT + 32)` 'x' characters via
     // `string.rep` so the test does not need to bake the constant into a
-    // literal — keeps the assertion robust to a future MAX_DRAFT bump.
+    // literal. This keeps the assertion robust to a future MAX_DRAFT bump.
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\zag.pane.set_draft("{s}", string.rep("x", {d}))
     , .{ pane_id, MAX_DRAFT + 32 }, 0);
@@ -5113,7 +5113,7 @@ test "zag.pane.replace_draft_range raises with helpful message on overflow" {
     defer allocator.free(pane_id);
 
     // Fill the draft to MAX_DRAFT - 1, then attempt an insertion of 8
-    // bytes — replacement plus existing tail exceed the cap, so the call
+    // bytes: replacement plus existing tail exceed the cap, so the call
     // must raise rather than silently corrupt.
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\zag.pane.set_draft("{s}", string.rep("a", {d}))
@@ -5769,7 +5769,7 @@ test "/model plugin commit fires set_model for the default selection" {
 
     // popup.list starts with `selection_index = 1`, so firing the global
     // <CR> binding without a preceding <Down> commits the FIRST item
-    // (provA/a1) — the same model the fixture starts with, so the swap
+    // (provA/a1), the same model the fixture starts with, so the swap
     // is a no-op. We assert that the model_picker's `on_commit` ran by
     // checking the override side-effect: set_model writes a fresh
     // ProviderResult into root_pane.provider.
@@ -5834,7 +5834,7 @@ test "/model plugin removes its routed keymaps when the popup closes" {
     // Four of the nine keys (`j`, `k`, `q`, `<CR>`) collide with the
     // built-in defaults `focus_down`, `focus_up`, `close_window`,
     // `enter_subagent`. Registering an existing (mode, spec)
-    // overwrites the action in-place — same id, same slot — so
+    // overwrites the action in-place (same id, same slot), so
     // opening the picker grows the registry by FIVE (the five
     // fresh keys), not nine. Closing the picker removes those five
     // AND re-registers the four displaced built-ins, landing us
@@ -5879,7 +5879,7 @@ test "/model plugin restores displaced built-in bindings on close" {
     // The picker overwrites the user's default `j`, `k`, `q` bindings
     // while it is open, then must restore them on close. Without the
     // restore, opening `/model` once silently breaks `j`/`k` window
-    // navigation for the rest of the process lifetime — a real bug
+    // navigation for the rest of the process lifetime: a real bug
     // shipped in the cursor-anchored picker change before the
     // displaced-spec return was added to `zag.keymap`. This test
     // pins the regression: open the picker, watch `j` route to a
@@ -6004,11 +6004,11 @@ test "openFloatPane allocates, registers, and is reachable via paneFromFloatHand
     layout.recalculate(80, 24);
 
     const bh = try wm.buffer_registry.createScratch("picker");
-    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const scratch_buffer = try wm.buffer_registry.asBuffer(bh);
     const scratch_view = try wm.buffer_registry.asView(bh);
 
     const handle = try wm.openFloatPane(
-        .{ .buffer = scratch_buf, .view = scratch_view },
+        .{ .buffer = scratch_buffer, .view = scratch_view },
         .{ .x = 10, .y = 4, .width = 60, .height = 12 },
         .{ .border = .rounded, .title = "Models", .enter = true },
     );
@@ -6020,9 +6020,9 @@ test "openFloatPane allocates, registers, and is reachable via paneFromFloatHand
     try std.testing.expect(layout.focused_float != null);
 
     const pane_ptr = wm.paneFromFloatHandle(handle).?;
-    try std.testing.expectEqual(scratch_buf.ptr, pane_ptr.buffer.ptr);
+    try std.testing.expectEqual(scratch_buffer.ptr, pane_ptr.buffer.ptr);
 
-    // `paneFromHandle` must accept float handles too — it routes through
+    // `paneFromHandle` must accept float handles too: it routes through
     // `paneFromFloatHandle` so plugin callers can pass a float id where
     // any pane id is expected (e.g. `zag.pane.set_draft`).
     const via_pane_from_handle = try wm.paneFromHandle(handle);
@@ -6103,7 +6103,7 @@ test "zag.layout.tree returns floats and focused_float fields" {
     // Open a focused float directly via `zag.layout.float`. The /model
     // picker can no longer be used here because it now opens a non-
     // focusable popup-list float (focusable = false / enter = false), so
-    // `focused_float` would stay nil — defeating the whole point of the
+    // `focused_float` would stay nil, defeating the whole point of the
     // assertion below.
     try f.engine.lua.doString(
         \\_buf = zag.buffer.create { kind = "scratch", name = "tree-test" }
@@ -6290,10 +6290,10 @@ test "describe surfaces floats array and focused_float" {
     layout.recalculate(80, 24);
 
     const bh = try wm.buffer_registry.createScratch("picker");
-    const scratch_buf = try wm.buffer_registry.asBuffer(bh);
+    const scratch_buffer = try wm.buffer_registry.asBuffer(bh);
     const scratch_view = try wm.buffer_registry.asView(bh);
     const handle = try wm.openFloatPane(
-        .{ .buffer = scratch_buf, .view = scratch_view },
+        .{ .buffer = scratch_buffer, .view = scratch_view },
         .{ .x = 10, .y = 4, .width = 30, .height = 8 },
         .{ .title = "Models", .enter = true },
     );

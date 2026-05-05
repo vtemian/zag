@@ -186,7 +186,7 @@ pub const StreamingResponse = struct {
             // streaming reader's contentLengthStream panics on .ready
             // state for some 4xx body shapes (see body_done field doc),
             // so we cannot drain inline. The re-fetch is OBSERVABILITY
-            // ONLY — we still return error.ApiError. Retry policy is
+            // ONLY: we still return error.ApiError. Retry policy is
             // explicitly out of scope for this slice.
             const side_channel_headers = buildSideChannelHeaders(allocator, extra_headers) catch |err| blk: {
                 log.warn("streaming: buildSideChannelHeaders failed: {s}", .{@errorName(err)});
@@ -197,7 +197,7 @@ pub const StreamingResponse = struct {
             // httpPostJsonRaw returns the (status, body) pair regardless
             // of HTTP status, so the 4xx envelope we want for telemetry
             // actually reaches us. raw.status is currently unused but
-            // worth threading into telemetry in slice 4 — the side
+            // worth threading into telemetry in slice 4: the side
             // channel may return a different status than the streaming
             // attempt (transient 404 -> 200, for example).
             const raw = http_mod.httpPostJsonRaw(
@@ -244,7 +244,7 @@ pub const StreamingResponse = struct {
                 );
             error_detail.set(allocator, detail);
 
-            // Existing diagnostic log line stays — useful when telemetry
+            // Existing diagnostic log line stays; useful when telemetry
             // is null and the artifact pair won't be written.
             const req_snippet = body[0..@min(body.len, MAX_ERROR_BODY_BYTES)];
             log.err("streaming: HTTP {d} {s}. url={s} sent_body={s}", .{
@@ -654,7 +654,7 @@ test "readLine reassembles a line split across reads with a 0-byte short read be
     // `stream` without `error.EndOfStream` (legal per its contract;
     // see http_stream.zig:386). `readLine` used to treat that the
     // same as EOF, returning a truncated `pending_line` and then
-    // clearing it on the next call — losing the rest of the in-flight
+    // clearing it on the next call, losing the rest of the in-flight
     // line. SSE events arriving across multiple network reads got
     // truncated mid-payload, which scrambled tool_call argument
     // accumulation downstream and forced the agent into a tool-error
@@ -718,7 +718,7 @@ test "StreamingResponse.create returns InvalidUri on malformed endpoint" {
 test "StreamingResponse.create accepts non-null telemetry pointer" {
     // The signature change must keep compiling when callers pass a real
     // Telemetry. We aim at a deliberately-unreachable URL so the call
-    // fails in network land — anything that isn't a compile error or a
+    // fails in network land; anything that isn't a compile error or a
     // panic is a pass for this test.
     const allocator = std.testing.allocator;
     const t = try telemetry.Telemetry.init(.{

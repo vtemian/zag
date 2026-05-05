@@ -305,8 +305,8 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
 /// All thinking blocks contribute their text regardless of provider
 /// tag. Cross-provider sessions (e.g. Anthropic mid-session, then
 /// switch back to Moonshot) thus carry the foreign wire's reasoning
-/// across as raw text. The alternative — strictly tagging by
-/// `.openai_chat` — silently dropped legitimate context whenever a
+/// across as raw text. The alternative (strictly tagging by
+/// `.openai_chat`) silently dropped legitimate context whenever a
 /// future ThinkingProvider variant landed and Lua plugins had no
 /// way to fix it without a Zig change.
 fn writeThinkingEcho(

@@ -369,7 +369,7 @@ test "Telemetry deinit emits timeline log line" {
     });
     // Verify the timeline string before destroying. deinit fires log.info
     // through std.options.logFn which in test binaries is the default
-    // stderr handler — no file routing in tests, so we assert on the
+    // stderr handler. No file routing in tests, so we assert on the
     // formatted line directly.
     const line = try t.formatTimeline();
     defer testing.allocator.free(line);
@@ -543,7 +543,7 @@ test "Telemetry.onHttpError caps response body at 1 MiB" {
     defer t.deinit();
 
     // Build a 2 MiB body of `x`s. Not valid JSON, so writeJsonOrString
-    // takes the quoted-string branch — easier to size-check too.
+    // takes the quoted-string branch, easier to size-check too.
     const huge = try testing.allocator.alloc(u8, 2 * 1024 * 1024);
     defer testing.allocator.free(huge);
     @memset(huge, 'x');

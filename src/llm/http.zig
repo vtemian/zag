@@ -248,7 +248,7 @@ pub const RawResponse = struct {
 /// if the server returns no body.
 ///
 /// Errors are reserved for genuine plumbing failures (URI parse, TCP,
-/// TLS, allocator). HTTP status — including 4xx/5xx — never produces
+/// TLS, allocator). HTTP status (including 4xx/5xx) never produces
 /// an error here.
 pub fn httpPostJsonRaw(
     url: []const u8,
