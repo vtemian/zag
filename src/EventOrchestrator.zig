@@ -380,14 +380,16 @@ fn tick(
     // frame and `layout_dirty` is set in time for the redraw below.
     self.sweepFloatsForAutoClose();
 
-    // Check if any pane has pending visual changes. `buffer.isDirty()`
-    // ORs the tree-generation delta with the view-only scroll bit, so
-    // both tree mutations and scrolls trigger a spinner tick here.
-    // Scratch-backed panes drive `isDirty()` through their own vtable
-    // path; the check is uniform across pane kinds. Floats live in
-    // `extra_floats`, a sibling of `extra_panes`; a plugin that mutates
-    // a float's buffer between user events must trigger a redraw the
-    // same way a tile does.
+    // Check if any pane has pending visual changes. Each pane carries
+    // its own `Viewport.isDirty(content_version)` which ORs the
+    // content-version delta (any tree mutation bumps the buffer's
+    // contentVersion) with the view-only scroll bit, so both tree
+    // mutations and scrolls trigger a spinner tick here. The check is
+    // uniform across pane kinds — scratch-backed and conversation panes
+    // both route through `pane.viewport.isDirty(buf.contentVersion())`.
+    // Floats live in `extra_floats`, a sibling of `extra_panes`; a
+    // plugin that mutates a float's buffer between user events must
+    // trigger a redraw the same way a tile does.
     const any_dirty = self.anyPaneDirty();
 
     // Spinner ticks only when actual events arrive
