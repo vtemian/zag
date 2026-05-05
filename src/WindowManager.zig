@@ -1484,6 +1484,13 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     return pane;
 }
 
+/// TODO(node-cursor): once the renderer grows a real per-node cursor,
+/// this surrogate collapses to "the cursor's node". Today, pressing
+/// Enter on a Conversation pane drills into the *most recent*
+/// subagent_link node regardless of where the user's eye/cursor is —
+/// surprising UX if the parent has spawned multiple subagents.
+/// See Phase E final review I2.
+///
 /// Find the most recent `.subagent_link` node in `conv.tree.root_children`.
 /// Returns null when no subagent links exist. The drill-down keybind
 /// uses this to pick a target without a node-cursor model — once the

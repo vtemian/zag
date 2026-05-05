@@ -145,16 +145,20 @@ pub fn init(allocator: Allocator, id: u32, name: []const u8) !Conversation {
     };
 }
 
-/// Release all memory owned by this buffer: cache, tree, registry,
-/// name. The agent thread, event queue, and streaming state live on
-/// `AgentRunner` and are not owned by the buffer; the session handle
-/// is borrowed (the WindowManager owns its lifetime).
+/// Release all memory owned by this buffer: cache, tree, subagents,
+/// registry, row_styles, name. The agent thread, event queue, and
+/// streaming state live on `AgentRunner` and are not owned by the
+/// buffer; the session handle is borrowed (the WindowManager owns its
+/// lifetime).
 ///
 /// Deinit order matters: drain the cache first so entries release their
 /// spans arrays while the borrowed span text (TextBuffer bytes resolved
 /// through the registry) is still alive. Then free the tree, which
 /// holds buffer_id handles into the registry. Then free the registry,
-/// which destroys every TextBuffer/ImageBuffer.
+/// which destroys every TextBuffer/ImageBuffer. `row_styles` and `name`
+/// are independent allocations with no cross-references into the
+/// registry, so they tear down last in any order; we keep them tail
+/// for symmetry with the field declaration order on the struct.
 pub fn deinit(self: *Conversation) void {
     self.cache.deinit();
     self.tree.deinit();
@@ -485,8 +489,8 @@ pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !voi
 /// the entry into the deepest Conversation's tree using its own
 /// `replay_last_tool_call` chain. Names start as `(unknown)` because
 /// the `task_start` marker that carries the real name is itself a
-/// tagged entry that may not arrive first; subsequent markers refine
-/// it.
+/// tagged entry that may not arrive first; `handleLoadedEntry` refines
+/// the placeholder when it sees the marker.
 fn routeReplayEntry(
     self: *Conversation,
     path: []const u32,
@@ -541,8 +545,17 @@ fn handleLoadedEntry(
         // `task_start` / `task_end` are audit markers for subagent
         // delegation. The subagent's own output is persisted inline
         // as the parent's tool_result, so replaying them as separate
-        // nodes would duplicate content in the buffer view.
-        .task_start, .task_end => {},
+        // nodes would duplicate content in the buffer view; the
+        // `task_start` payload carries the agent name + prompt that
+        // routeReplayEntry's lazy spawn could not know, so we use it
+        // to refine any "(unknown)" placeholder (or eagerly create
+        // the slot when the marker arrives before the child's first
+        // event). Malformed payloads are logged and skipped so a
+        // truncated JSONL row does not crash replay.
+        .task_start => self.refineFromTaskStart(entry.content) catch |err| {
+            log.warn("task_start refinement skipped: {}", .{err});
+        },
+        .task_end => {},
         // Inline subagent events. Render them with the same node
         // types as their top-level counterparts so the user sees
         // child activity in the transcript on replay. The
@@ -569,6 +582,110 @@ fn handleLoadedEntry(
             node.collapsed = true;
         },
     }
+}
+
+/// Parse a `task_start` JSON payload (`{"agent":..., "prompt":...}`)
+/// and refine the subagent slot it describes. Two arrival shapes:
+///
+/// 1. Tagged (entry.subagent_path != null): routeReplayEntry has
+///    already walked the path, so `self` IS the child. Replace the
+///    child's placeholder name + the parent's `subagent_link` node's
+///    `subagent_name` (and `subagent_prompt` when not yet set).
+/// 2. Untagged (root-level): the marker arrived before any tagged
+///    child events. Refine the first existing `(unknown)` slot if
+///    present (handles markers that arrive *after* the child's first
+///    event, where routeReplayEntry already created the placeholder),
+///    otherwise eagerly `spawnSubagent` so subsequent tagged events
+///    route into a properly-named child.
+///
+/// Defensive parse: malformed JSON or missing fields return without
+/// mutating anything. The caller logs and continues.
+fn refineFromTaskStart(self: *Conversation, payload: []const u8) !void {
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        self.allocator,
+        payload,
+        .{},
+    ) catch |err| {
+        log.warn("task_start payload parse failed: {}", .{err});
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    const name_value = obj.get("agent") orelse return;
+    if (name_value != .string) return;
+    const name = name_value.string;
+    const prompt: []const u8 = if (obj.get("prompt")) |p|
+        (if (p == .string) p.string else "")
+    else
+        "";
+
+    if (self.parent != null) {
+        try self.applyRefinedName(name, prompt);
+        return;
+    }
+
+    // Root-level marker: refine the first placeholder, else spawn.
+    for (self.subagents.items) |child| {
+        if (std.mem.eql(u8, child.name, "(unknown)")) {
+            try child.applyRefinedName(name, prompt);
+            return;
+        }
+    }
+    _ = try self.spawnSubagent(name, prompt);
+}
+
+/// Replace this child's placeholder name with `name`, and patch the
+/// parent's `subagent_link` node so the renderer's "[subagent: <name>]"
+/// header reflects reality. Called from refineFromTaskStart on both the
+/// tagged path (self is the child being refined) and the root path
+/// (loop above resolves the placeholder child first).
+///
+/// Lifetime: free the old name before duping the new one. The link
+/// node's `subagent_name` is already a duped, owned slice (allocated
+/// inside spawnSubagent), so it follows the same free-then-dupe shape.
+/// The link node's `subagent_prompt` is only filled in when the slot
+/// was created via `spawnSubagent("(unknown)", "")` and never since;
+/// guard the dupe behind a length check so a real prompt set at spawn
+/// time is not clobbered by a re-replay.
+fn applyRefinedName(self: *Conversation, name: []const u8, prompt: []const u8) !void {
+    const allocator = self.allocator;
+
+    const new_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(new_name);
+
+    if (self.parent) |parent| {
+        for (parent.tree.root_children.items) |link_node| {
+            if (link_node.node_type != .subagent_link) continue;
+            if (link_node.subagent_index != self.parent_subagent_id) continue;
+
+            const should_set_prompt = (prompt.len > 0) and
+                ((link_node.subagent_prompt orelse "").len == 0);
+
+            // Dupe both first so a prompt-allocation failure leaves
+            // the link node untouched (no half-applied refinement).
+            const link_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(link_name);
+
+            const link_prompt: ?[]u8 = if (should_set_prompt)
+                try allocator.dupe(u8, prompt)
+            else
+                null;
+
+            if (link_node.subagent_name) |old| allocator.free(old);
+            link_node.subagent_name = link_name;
+            if (link_prompt) |p| {
+                if (link_node.subagent_prompt) |old| allocator.free(old);
+                link_node.subagent_prompt = p;
+            }
+            link_node.markDirty();
+            break;
+        }
+    }
+
+    allocator.free(self.name);
+    self.name = new_name;
 }
 
 /// Remove all nodes from the buffer and wipe the cache. The tree's
@@ -2403,4 +2520,158 @@ test "toWireMessages projects subagent_prompt directly without system-prefix lea
     try std.testing.expect(tool_use_block == .tool_use);
     try std.testing.expect(std.mem.indexOf(u8, tool_use_block.tool_use.input_raw, "\"prompt\":\"review this\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tool_use_block.tool_use.input_raw, "You are codereview") == null);
+}
+
+test "childFinalSummaryForTask matches toWireMessages tool_result content" {
+    // Lockstep pin: tools/task.zig's runChild calls
+    // `childFinalSummaryForTask` to derive the tool result it returns to
+    // the parent's LLM, while toWireMessages projects the same child as
+    // a tool_result block. Both call sites MUST read through the same
+    // helper, otherwise a future change to either path could let the
+    // wire-format summary drift away from the persisted tool_end content.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    _ = try conv.appendNode(null, .user_message, "delegate");
+    const child = try conv.spawnSubagent("reviewer", "review this");
+    _ = try child.appendNode(null, .user_message, "review this");
+    _ = try child.appendNode(null, .assistant_text, "first chunk ");
+    _ = try child.appendNode(null, .assistant_text, "second chunk");
+
+    const summary = try Conversation.childFinalSummaryForTask(arena.allocator(), child);
+
+    const messages = try conv.toWireMessages(arena.allocator());
+    var projected: ?[]const u8 = null;
+    for (messages.items) |msg| {
+        for (msg.content) |block| {
+            if (block == .tool_result) {
+                projected = block.tool_result.content;
+                break;
+            }
+        }
+        if (projected != null) break;
+    }
+
+    try std.testing.expect(projected != null);
+    try std.testing.expectEqualStrings(summary, projected.?);
+}
+
+test "loadFromEntries refines (unknown) when task_start arrives after child events" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreTestCwd(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    // Hand-build the JSONL ordering: a tagged child event first
+    // (forces routeReplayEntry's lazy spawn under "(unknown)"), then
+    // the task_start marker. Production never emits task_start AFTER
+    // child events, but replay tooling must tolerate hand-edited or
+    // re-ordered streams without leaving the placeholder behind.
+    const child_path = try allocator.alloc(u32, 1);
+    defer allocator.free(child_path);
+    child_path[0] = 0;
+
+    var entries = [_]Session.Entry{
+        .{
+            .entry_type = .task_message,
+            .content = "child reply",
+            .timestamp = 1,
+            .subagent_path = child_path,
+        },
+        .{
+            .entry_type = .task_start,
+            .content = "{\"agent\":\"reviewer\",\"prompt\":\"review the diff\"}",
+            .timestamp = 2,
+        },
+    };
+
+    var replay = try Conversation.init(allocator, 0, "replay");
+    defer replay.deinit();
+    try replay.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(@as(usize, 1), replay.subagents.items.len);
+    const child = replay.subagents.items[0];
+    try std.testing.expectEqualStrings("reviewer", child.name);
+    try std.testing.expectEqual(@as(usize, 1), child.tree.root_children.items.len);
+
+    // The parent's link node was created by routeReplayEntry's lazy
+    // spawn with the placeholder name; the refinement must propagate
+    // back into it so the renderer's "[subagent: <name>]" line shows
+    // the real agent.
+    const link_node = replay.tree.root_children.items[0];
+    try std.testing.expectEqual(NodeType.subagent_link, link_node.node_type);
+    try std.testing.expectEqualStrings("reviewer", link_node.subagent_name.?);
+    try std.testing.expectEqualStrings("review the diff", link_node.subagent_prompt.?);
+}
+
+test "loadFromEntries pre-creates named subagent when task_start arrives first" {
+    const allocator = std.testing.allocator;
+
+    // Production ordering: task_start at root level lands BEFORE any
+    // tagged child events, so replay should eagerly spawn the slot
+    // with the real name and route subsequent tagged events into it
+    // without ever materialising a "(unknown)" placeholder.
+    const child_path = try allocator.alloc(u32, 1);
+    defer allocator.free(child_path);
+    child_path[0] = 0;
+
+    var entries = [_]Session.Entry{
+        .{
+            .entry_type = .task_start,
+            .content = "{\"agent\":\"reviewer\",\"prompt\":\"review the diff\"}",
+            .timestamp = 1,
+        },
+        .{
+            .entry_type = .task_message,
+            .content = "child reply",
+            .timestamp = 2,
+            .subagent_path = child_path,
+        },
+    };
+
+    var replay = try Conversation.init(allocator, 0, "replay");
+    defer replay.deinit();
+    try replay.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(@as(usize, 1), replay.subagents.items.len);
+    const child = replay.subagents.items[0];
+    try std.testing.expectEqualStrings("reviewer", child.name);
+
+    const link_node = replay.tree.root_children.items[0];
+    try std.testing.expectEqual(NodeType.subagent_link, link_node.node_type);
+    try std.testing.expectEqualStrings("reviewer", link_node.subagent_name.?);
+    try std.testing.expectEqualStrings("review the diff", link_node.subagent_prompt.?);
+}
+
+test "loadFromEntries skips malformed task_start payload without crashing" {
+    const allocator = std.testing.allocator;
+
+    // Malformed JSON: replay should log + skip, leaving the placeholder
+    // in place rather than crashing the load. The next task_start with
+    // valid payload (or a missing-field payload) must still refine.
+    var entries = [_]Session.Entry{
+        .{
+            .entry_type = .task_start,
+            .content = "not json {",
+            .timestamp = 1,
+        },
+    };
+
+    var replay = try Conversation.init(allocator, 0, "replay");
+    defer replay.deinit();
+    try replay.loadFromEntries(&entries);
+
+    try std.testing.expectEqual(@as(usize, 0), replay.subagents.items.len);
 }
