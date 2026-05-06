@@ -5714,6 +5714,47 @@ pub const LuaEngine = struct {
         };
     }
 
+    /// Read the optional `timeouts` table off the outer `zag.provider{...}`
+    /// table and produce an `Endpoint.TimeoutConfig`. Absent or non-table
+    /// `timeouts` returns the type's defaults. Each nested integer field
+    /// (`connect_ms`, `read_ms`, `write_ms`) is optional; present numeric
+    /// values are clamped to >= 0 and assigned, anything else falls back
+    /// to the default. No allocation: the result is plain u32 fields.
+    fn readTimeouts(lua: *Lua, table_idx: i32) llm.Endpoint.TimeoutConfig {
+        var out: llm.Endpoint.TimeoutConfig = .{};
+
+        _ = lua.getField(table_idx, "timeouts");
+        defer lua.pop(1);
+        if (!lua.isTable(-1)) return out;
+        const t_idx = lua.absIndex(-1);
+
+        if (readTimeoutMs(lua, t_idx, "connect_ms")) |v| out.connect_ms = v;
+        if (readTimeoutMs(lua, t_idx, "read_ms")) |v| out.read_ms = v;
+        if (readTimeoutMs(lua, t_idx, "write_ms")) |v| out.write_ms = v;
+
+        return out;
+    }
+
+    /// Pop a single millisecond field from the timeouts subtable. Returns
+    /// `null` if the field is absent, nil, or a non-number. A negative
+    /// integer clamps to zero so `0` keeps its "no timeout" meaning and
+    /// users never see a wraparound u32. Leaves the stack untouched.
+    fn readTimeoutMs(lua: *Lua, table_idx: i32, name: [:0]const u8) ?u32 {
+        _ = lua.getField(table_idx, name);
+        defer lua.pop(1);
+        if (lua.isNil(-1)) return null;
+        if (lua.typeOf(-1) != .number) {
+            log.warn("zag.provider(): timeouts.{s} must be a number", .{name});
+            return null;
+        }
+        const raw = lua.toInteger(-1) catch {
+            log.warn("zag.provider(): timeouts.{s} must be an integer", .{name});
+            return null;
+        };
+        const clamped: i64 = if (raw < 0) 0 else raw;
+        return std.math.cast(u32, clamped) orelse std.math.maxInt(u32);
+    }
+
     /// Zig function backing `zag.provider{...}`. Reads the full endpoint
     /// schema from the Lua table (name, url, wire, auth, headers,
     /// default_model, models), constructs a fully-owned `Endpoint`, and
@@ -5790,6 +5831,8 @@ pub const LuaEngine = struct {
             allocator.free(reasoning.verbosity);
         }
 
+        const timeouts = readTimeouts(lua, 1);
+
         const ep: llm.Endpoint = .{
             .name = name,
             .serializer = serializer,
@@ -5799,6 +5842,7 @@ pub const LuaEngine = struct {
             .default_model = default_model,
             .models = models,
             .reasoning = reasoning,
+            .timeouts = timeouts,
         };
 
         // Override-on-conflict: remove any prior entry (builtin or earlier
@@ -9632,6 +9676,52 @@ test "zag.provider{}: full x_api_key declaration registers the endpoint" {
     try std.testing.expectEqual(@as(usize, 1), ep.models.len);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), ep.models[0].input_per_mtok, 0.001);
     try std.testing.expectEqual(@as(u32, 200000), ep.models[0].context_window);
+}
+
+test "zag.provider{}: timeouts table lands on the endpoint" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "custom",
+        \\  url = "http://example.invalid",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "none" },
+        \\  default_model = "m",
+        \\  timeouts = {
+        \\    connect_ms = 5000,
+        \\    read_ms    = 7000,
+        \\    write_ms   = 9000,
+        \\  },
+        \\}
+    );
+    const ep = engine.providers_registry.find("custom") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 5000), ep.timeouts.connect_ms);
+    try std.testing.expectEqual(@as(u32, 7000), ep.timeouts.read_ms);
+    try std.testing.expectEqual(@as(u32, 9000), ep.timeouts.write_ms);
+}
+
+test "zag.provider{}: omitted timeouts table keeps registry defaults" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "custom2",
+        \\  url = "http://example.invalid",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "none" },
+        \\  default_model = "m",
+        \\}
+    );
+    const ep = engine.providers_registry.find("custom2") orelse return error.TestUnexpectedResult;
+    const defaults: llm.Endpoint.TimeoutConfig = .{};
+    try std.testing.expectEqual(defaults.connect_ms, ep.timeouts.connect_ms);
+    try std.testing.expectEqual(defaults.read_ms, ep.timeouts.read_ms);
+    try std.testing.expectEqual(defaults.write_ms, ep.timeouts.write_ms);
 }
 
 test "zag.provider{}: models parse label and recommended" {

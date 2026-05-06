@@ -33,6 +33,14 @@ zag.provider {
   --   reasoning_summary = "auto",     -- "auto" | "concise" | "detailed" | "none" (omit summary key)
   --   verbosity         = "medium",   -- "low" | "medium" | "high"
   default_model = "gpt-5.2",
+  -- Socket-level HTTP timeouts (milliseconds). 0 disables a given timer.
+  -- connect_ms is documented but unenforced today (Zig 0.15 std.http.Client
+  -- does not surface the pre-handshake socket); the OS default applies.
+  timeouts = {
+    connect_ms = 60000,
+    read_ms    = 600000,
+    write_ms   = 60000,
+  },
   models = {
     { id = "gpt-5.2",        label = "gpt-5.2 (recommended)", recommended = true, context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },
     { id = "gpt-5.4",        label = "gpt-5.4", context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },

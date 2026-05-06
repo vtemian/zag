@@ -5,6 +5,14 @@ zag.provider {
   auth = { kind = "bearer" },
   headers = { { name = "X-OpenRouter-Title", value = "Zag" } },
   default_model = "anthropic/claude-sonnet-4",
+  -- Socket-level HTTP timeouts (milliseconds). 0 disables a given timer.
+  -- connect_ms is documented but unenforced today (Zig 0.15 std.http.Client
+  -- does not surface the pre-handshake socket); the OS default applies.
+  timeouts = {
+    connect_ms = 60000,
+    read_ms    = 600000,
+    write_ms   = 60000,
+  },
   models = {
     { id = "anthropic/claude-sonnet-4", recommended = true, context_window = 200000, max_output_tokens = 8192, input_per_mtok = 3, output_per_mtok = 15 },
     { id = "openai/gpt-5",              context_window = 272000, max_output_tokens = 128000, input_per_mtok = 0, output_per_mtok = 0 },

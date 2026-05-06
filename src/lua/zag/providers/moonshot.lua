@@ -25,6 +25,14 @@ zag.provider {
   reasoning_response_fields = { "reasoning_content", "reasoning", "reasoning_text" },
   reasoning_echo_field = "reasoning_content",
   reasoning_effort_field = "reasoning_effort",
+  -- Socket-level HTTP timeouts (milliseconds). 0 disables a given timer.
+  -- connect_ms is documented but unenforced today (Zig 0.15 std.http.Client
+  -- does not surface the pre-handshake socket); the OS default applies.
+  timeouts = {
+    connect_ms = 60000,
+    read_ms    = 600000,
+    write_ms   = 60000,
+  },
   models = {
     { id = "kimi-k2.6", recommended = true, context_window = 262144, max_output_tokens = 32768, input_per_mtok = 0.95, output_per_mtok = 4.0, cache_read_per_mtok = 0.16 },
     { id = "kimi-k2.5",                     context_window = 262144, max_output_tokens = 32768, input_per_mtok = 0.60, output_per_mtok = 2.5, cache_read_per_mtok = 0.15 },

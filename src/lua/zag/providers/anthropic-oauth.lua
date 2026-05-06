@@ -28,6 +28,14 @@ zag.provider {
     },
   },
   default_model = "claude-sonnet-4-20250514",
+  -- Socket-level HTTP timeouts (milliseconds). 0 disables a given timer.
+  -- connect_ms is documented but unenforced today (Zig 0.15 std.http.Client
+  -- does not surface the pre-handshake socket); the OS default applies.
+  timeouts = {
+    connect_ms = 60000,
+    read_ms    = 600000,
+    write_ms   = 60000,
+  },
   -- Subscription-billed; cost.estimateCost returns zero for these.
   models = {
     { id = "claude-sonnet-4-20250514", recommended = true, context_window = 200000, max_output_tokens = 8192, input_per_mtok = 3,  output_per_mtok = 15,  cache_write_per_mtok = 3.75, cache_read_per_mtok = 0.3 },
