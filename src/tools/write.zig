@@ -66,7 +66,7 @@ pub fn execute(
 
     std.fs.cwd().rename(tmp_path, input.path) catch |err| {
         std.fs.cwd().deleteFile(tmp_path) catch {};
-        const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
+        const msg = std.fmt.allocPrint(allocator, "error: finalizing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
