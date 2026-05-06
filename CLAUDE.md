@@ -34,6 +34,8 @@ zag.set_default_model("openai/gpt-4o")
 
 The stdlib lives inside the binary under `zag.providers.*`: `anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `ollama`. Drop a file at `~/.config/zag/lua/zag/providers/<name>.lua` to override a stdlib entry. Declare a brand-new provider by writing its own module and `require()`ing it. `zag.provider{...}` takes the full endpoint schema (url, wire, auth, headers, default_model, models). The first-run wizard scaffolds `openai-oauth/gpt-5.2` when you pick the recommended entry.
 
+`zag.provider{...}` also accepts an optional `timeouts = { connect_ms, read_ms, write_ms }` table. Defaults are 60_000 / 600_000 / 60_000 ms. Read and write are applied at the socket layer via `setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` after the TCP+TLS handshake completes, so a wedged endpoint fails fast with `error.ReadTimeout` instead of hanging on TCP keepalive (~2 hours on macOS). Connect-phase timeouts are documented but unenforced today because Zig 0.15's `std.http.Client` does not surface the pre-handshake socket; the OS default applies (~75s on macOS, ~127s on Linux). Setting any value to 0 disables that specific timeout.
+
 `auth.json` holds provider API keys and OAuth tokens. Written by `zag auth login`; do not hand-edit. Ollama is keyless. Schema for reference only:
 
 ```json
