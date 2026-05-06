@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const error_detail = @import("error_detail.zig");
 const error_class = @import("error_class.zig");
 const http_mod = @import("http.zig");
+const registry = @import("registry.zig");
 const telemetry = @import("telemetry.zig");
 
 const log = std.log.scoped(.streaming);
@@ -79,6 +80,19 @@ pub const StreamingResponse = struct {
     /// Backing allocator used for all owned resources.
     allocator: Allocator,
 
+    /// Per-call options for `createWithOptions`. The bare-bones `create`
+    /// wrapper preserves the legacy positional shape.
+    pub const Options = struct {
+        url: []const u8,
+        body: []const u8,
+        extra_headers: []const std.http.Header,
+        telemetry_opt: ?*telemetry.Telemetry,
+        allocator: Allocator,
+        /// Socket-level timeouts applied via `setsockopt` after
+        /// `receiveHead`. When null, the OS default applies.
+        timeouts: ?registry.Endpoint.TimeoutConfig = null,
+    };
+
     /// Open a streaming HTTP POST connection.
     /// Caller must call `destroy` when done.
     ///
@@ -94,6 +108,25 @@ pub const StreamingResponse = struct {
         telemetry_opt: ?*telemetry.Telemetry,
         allocator: Allocator,
     ) !*StreamingResponse {
+        return createWithOptions(.{
+            .url = url,
+            .body = body,
+            .extra_headers = extra_headers,
+            .telemetry_opt = telemetry_opt,
+            .allocator = allocator,
+        });
+    }
+
+    /// Like `create`, plus optional socket-level timeouts. Existing
+    /// providers still call `create`; Task 3.4 will switch them to
+    /// pass the endpoint-resolved `timeouts` here.
+    pub fn createWithOptions(opts: Options) !*StreamingResponse {
+        const url = opts.url;
+        const body = opts.body;
+        const extra_headers = opts.extra_headers;
+        const telemetry_opt = opts.telemetry_opt;
+        const allocator = opts.allocator;
+
         const self = try allocator.create(StreamingResponse);
         errdefer allocator.destroy(self);
 
@@ -163,6 +196,18 @@ pub const StreamingResponse = struct {
             log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
             return error.ApiError;
         };
+
+        // Socket-level read/write timeouts. Apply after `receiveHead` because
+        // that's the first point the underlying connection (and its socket
+        // fd) is reachable. The connect phase is left to the OS default
+        // (~75s on macOS, ~127s on Linux); Zig 0.15's std.http.Client does
+        // not surface the pre-handshake socket. SSE keep-alives every few
+        // seconds satisfy the inter-byte read window in normal operation.
+        if (opts.timeouts) |to| {
+            if (self.req.connection) |conn| {
+                applySocketTimeouts(conn.stream_reader.getStream().handle, to);
+            }
+        }
 
         if (response.head.status != .ok) {
             const status: u16 = @intFromEnum(response.head.status);
@@ -309,6 +354,31 @@ pub const StreamingResponse = struct {
         return captured.toOwnedSlice(allocator);
     }
 
+    /// Apply read/write socket timeouts. Best-effort: a setsockopt failure
+    /// is logged and ignored so a missing platform feature does not
+    /// abort the request. `read_ms == 0` (or `write_ms == 0`) means
+    /// "leave the OS default in place".
+    fn applySocketTimeouts(handle: std.posix.socket_t, to: registry.Endpoint.TimeoutConfig) void {
+        if (to.read_ms > 0) {
+            const tv = std.posix.timeval{
+                .sec = @intCast(to.read_ms / 1000),
+                .usec = @intCast((to.read_ms % 1000) * 1000),
+            };
+            std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| {
+                log.warn("streaming: failed to set SO_RCVTIMEO: {s}", .{@errorName(err)});
+            };
+        }
+        if (to.write_ms > 0) {
+            const tv = std.posix.timeval{
+                .sec = @intCast(to.write_ms / 1000),
+                .usec = @intCast((to.write_ms % 1000) * 1000),
+            };
+            std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch |err| {
+                log.warn("streaming: failed to set SO_SNDTIMEO: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
     /// Free a header slice produced by `captureHeaders`. Safe on empty
     /// slices (no-op).
     fn freeHeaders(allocator: Allocator, headers: []std.http.Header) void {
@@ -400,7 +470,10 @@ pub const StreamingResponse = struct {
                 if (flag.load(.acquire)) return error.Cancelled;
             }
             var chunk: [4096]u8 = undefined;
-            const n = self.readChunk(&chunk) catch return error.ApiError;
+            const n = self.readChunk(&chunk) catch |err| switch (err) {
+                error.ReadTimeout => return error.ReadTimeout,
+                else => return error.ApiError,
+            };
             if (n == 0) {
                 // Two cases produce n == 0: real EOF (body_done was set
                 // by readChunk on EndOfStream), and a 0-byte short read
@@ -441,6 +514,12 @@ pub const StreamingResponse = struct {
     /// EndOfStream, sets body_done and returns 0 on subsequent calls
     /// without re-entering stdlib (which would panic on contentLengthStream;
     /// see the comment on body_done).
+    ///
+    /// On `error.ReadFailed` the underlying socket error is recovered via
+    /// `connection.getReadError()`. `WouldBlock` (EAGAIN) means the
+    /// `SO_RCVTIMEO` set in `createWithOptions` fired; we surface it as
+    /// `error.ReadTimeout` so callers can distinguish a genuine timeout
+    /// from an opaque transport failure.
     fn readChunk(self: *StreamingResponse, chunk: []u8) !usize {
         if (self.body_done) return 0;
         var writer: std.Io.Writer = .fixed(chunk);
@@ -450,7 +529,14 @@ pub const StreamingResponse = struct {
                 return 0;
             },
             error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
-            error.ReadFailed => return error.ApiError,
+            error.ReadFailed => {
+                if (self.req.connection) |conn| {
+                    if (conn.getReadError()) |inner| {
+                        if (inner == error.WouldBlock) return error.ReadTimeout;
+                    }
+                }
+                return error.ApiError;
+            },
         };
         return n;
     }
@@ -926,6 +1012,103 @@ test "freeHeaders is leak-clean on captured slice" {
     const head = try std.http.Client.Response.Head.parse(response_bytes);
     const captured = try StreamingResponse.captureHeaders(allocator, &head);
     StreamingResponse.freeHeaders(allocator, captured);
+}
+
+/// Mock-server thread: accepts one connection, drains the HTTP request,
+/// then writes only the response headers (no body chunks) and sleeps
+/// long enough that any read on the body side will hit `SO_RCVTIMEO`.
+/// Mirrors the `mockServeOnce` shape from `providers/chatgpt.zig` but
+/// stops short of writing a chunk so the client's body reader stalls.
+fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
+    const conn = srv.accept() catch return;
+    defer conn.stream.close();
+
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+
+    var tmp: [4096]u8 = undefined;
+    var headers_end: usize = 0;
+    while (true) {
+        const n = conn.stream.read(&tmp) catch return;
+        if (n == 0) return;
+        req.appendSlice(alloc, tmp[0..n]) catch return;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
+            headers_end = idx + 4;
+            break;
+        }
+    }
+
+    var content_length: usize = 0;
+    const headers_slice = req.items[0..headers_end];
+    var it = std.mem.splitSequence(u8, headers_slice, "\r\n");
+    while (it.next()) |line| {
+        if (line.len > 15 and std.ascii.eqlIgnoreCase(line[0..15], "content-length:")) {
+            const rest = std.mem.trim(u8, line[15..], " \t");
+            content_length = std.fmt.parseInt(usize, rest, 10) catch 0;
+            break;
+        }
+    }
+    const body_have = req.items.len - headers_end;
+    var body_remaining = if (content_length > body_have) content_length - body_have else 0;
+    while (body_remaining > 0) {
+        const want = @min(body_remaining, tmp.len);
+        const n = conn.stream.read(tmp[0..want]) catch return;
+        if (n == 0) break;
+        body_remaining -= n;
+    }
+
+    // Headers only: chunked transfer with no chunk yet, so the client's
+    // body reader will issue a recv() that blocks until SO_RCVTIMEO fires.
+    const head_only = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: close\r\n\r\n";
+    _ = conn.stream.writeAll(head_only) catch {};
+    std.Thread.sleep(sleep_ns);
+}
+
+test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-body" {
+    // Reproduces the wedged-provider scenario: the server returns 200 OK
+    // with chunked-encoded headers but never sends a chunk. Without
+    // SO_RCVTIMEO the client would wait the OS default (~75s on macOS,
+    // ~127s on Linux) before TCP keepalive notices. With a 500 ms
+    // SO_RCVTIMEO, the body read fails fast with EAGAIN and the wrapper
+    // surfaces it as `error.ReadTimeout`.
+    const allocator = std.testing.allocator;
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    // Sleep well past the 500 ms read timeout so the test fails clearly
+    // when the timeout machinery is missing or wired wrong.
+    const thr = try std.Thread.spawn(.{}, mockTimeoutServer, .{ &server, 3 * std.time.ns_per_s });
+    defer {
+        server.deinit();
+        thr.join();
+    }
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const start = std.time.milliTimestamp();
+    const stream = try StreamingResponse.createWithOptions(.{
+        .url = url,
+        .body = "",
+        .extra_headers = &.{},
+        .telemetry_opt = null,
+        .allocator = allocator,
+        .timeouts = .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 },
+    });
+    defer stream.destroy();
+
+    const result = stream.readLine(null);
+    const elapsed = std.time.milliTimestamp() - start;
+    try std.testing.expectError(error.ReadTimeout, result);
+    // 500 ms timeout plus generous slack for connect/handshake. The
+    // OS-default behaviour would push this well past 60 s.
+    try std.testing.expect(elapsed < 1500);
 }
 
 test {
