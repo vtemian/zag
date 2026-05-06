@@ -20,12 +20,6 @@ const log = std.log.scoped(.http);
 /// logs readable.
 const MAX_ERROR_BODY_BYTES: usize = 2048;
 
-/// Hard cap on the response body we accumulate. Defends against a
-/// runaway server that streams without ever closing. 16 MiB comfortably
-/// fits any realistic JSON envelope from a provider while keeping the
-/// upper bound on memory consumption explicit.
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-
 /// Build HTTP headers from an endpoint's auth config plus a freshly-resolved
 /// credential out of `auth.json`. Every auth-header value is heap-allocated
 /// so `freeHeaders` can free them uniformly. Static endpoint headers are
@@ -356,7 +350,6 @@ pub fn httpPostJsonRaw(
             },
         };
         if (n == 0) break;
-        if (out.items.len + n > MAX_BODY_BYTES) return error.ResponseBodyTooLarge;
         try out.appendSlice(allocator, chunk[0..n]);
     }
 
