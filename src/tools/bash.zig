@@ -70,7 +70,18 @@ pub fn execute(
         else => 1,
     };
 
-    const msg = std.fmt.allocPrint(allocator, "exit code: {d}\n\nstdout:\n{s}\nstderr:\n{s}", .{ exit_code, outcome.stdout, outcome.stderr }) catch return types.oomResult();
+    const truncate_note: []const u8 = blk: {
+        if (outcome.stdout_truncated and outcome.stderr_truncated)
+            break :blk "\n[truncated: stdout and stderr exceeded 1 MiB]";
+        if (outcome.stdout_truncated) break :blk "\n[truncated: stdout exceeded 1 MiB]";
+        if (outcome.stderr_truncated) break :blk "\n[truncated: stderr exceeded 1 MiB]";
+        break :blk "";
+    };
+    const msg = std.fmt.allocPrint(
+        allocator,
+        "exit code: {d}\n\nstdout:\n{s}\nstderr:\n{s}{s}",
+        .{ exit_code, outcome.stdout, outcome.stderr, truncate_note },
+    ) catch return types.oomResult();
     return .{
         .content = msg,
         .is_error = exit_code != 0,
@@ -84,6 +95,8 @@ const Outcome = struct {
     stdout: []u8,
     stderr: []u8,
     cancelled: bool,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
 };
 
 /// Read child stdout/stderr while periodically checking `cancel`.
@@ -91,6 +104,11 @@ const Outcome = struct {
 /// Uses `std.Io.poll` with a 50ms timeout so the loop wakes up even if the
 /// child produces no output, giving cancellation a bounded latency.
 /// Returns when both pipes hit EOF (child closed them) or `cancel` fires.
+///
+/// When either stream's buffered output crosses `max_output_bytes`, the first
+/// `max_output_bytes` are captured into a heap-owned snapshot, the truncated
+/// flag is set, and subsequent bytes are tossed from the buffer so the child
+/// keeps draining without blocking on a full pipe.
 fn collectWithCancel(
     child: *std.process.Child,
     allocator: Allocator,
@@ -101,6 +119,13 @@ fn collectWithCancel(
         .stderr = child.stderr.?,
     });
     defer poller.deinit();
+
+    // Snapshots of the first `max_output_bytes` for each stream, taken at the
+    // moment the cap is first crossed. Null until that happens.
+    var stdout_snapshot: ?[]u8 = null;
+    errdefer if (stdout_snapshot) |s| allocator.free(s);
+    var stderr_snapshot: ?[]u8 = null;
+    errdefer if (stderr_snapshot) |s| allocator.free(s);
 
     var cancelled = false;
     while (true) {
@@ -115,17 +140,51 @@ fn collectWithCancel(
         // pollTimeout returns true both when data arrived and when it simply
         // timed out, so re-check cancel on the next iteration rather than
         // doing bounds work here.
-        const stdout_r = poller.reader(.stdout);
-        if (stdout_r.bufferedLen() > max_output_bytes) return error.StdoutStreamTooLong;
-        const stderr_r = poller.reader(.stderr);
-        if (stderr_r.bufferedLen() > max_output_bytes) return error.StderrStreamTooLong;
+        try captureAndDrainOverflow(poller.reader(.stdout), allocator, &stdout_snapshot);
+        try captureAndDrainOverflow(poller.reader(.stderr), allocator, &stderr_snapshot);
     }
 
-    const stdout = try poller.toOwnedSlice(.stdout);
-    errdefer allocator.free(stdout);
-    const stderr = try poller.toOwnedSlice(.stderr);
+    const stdout_truncated = stdout_snapshot != null;
+    const stderr_truncated = stderr_snapshot != null;
 
-    return .{ .stdout = stdout, .stderr = stderr, .cancelled = cancelled };
+    const stdout = if (stdout_snapshot) |s| blk: {
+        stdout_snapshot = null;
+        break :blk s;
+    } else try poller.toOwnedSlice(.stdout);
+    errdefer allocator.free(stdout);
+    const stderr = if (stderr_snapshot) |s| blk: {
+        stderr_snapshot = null;
+        break :blk s;
+    } else try poller.toOwnedSlice(.stderr);
+
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .cancelled = cancelled,
+        .stdout_truncated = stdout_truncated,
+        .stderr_truncated = stderr_truncated,
+    };
+}
+
+/// Once a stream's buffer crosses `max_output_bytes`, snapshot the first
+/// `max_output_bytes` (one-time copy) and toss everything currently buffered.
+/// On every subsequent call once the snapshot exists, just toss whatever new
+/// bytes arrived so the child doesn't block on a full pipe.
+fn captureAndDrainOverflow(
+    r: *std.Io.Reader,
+    allocator: Allocator,
+    snapshot: *?[]u8,
+) !void {
+    if (snapshot.* != null) {
+        // Already truncated; drop new bytes to keep the pipe draining.
+        r.tossBuffered();
+        return;
+    }
+    if (r.bufferedLen() <= max_output_bytes) return;
+    const buf = r.buffered();
+    const copy = try allocator.dupe(u8, buf[0..max_output_bytes]);
+    snapshot.* = copy;
+    r.tossBuffered();
 }
 
 /// JSON schema and metadata sent to the LLM so it knows how to invoke this tool.
@@ -225,4 +284,18 @@ test "bash kills child on cancel" {
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.is_error);
     try std.testing.expectEqualStrings("error: cancelled", result.?.content);
+}
+
+test "bash truncates stdout instead of erroring on overflow" {
+    const allocator = std.testing.allocator;
+    // Print ~1.3 MiB of A's via /dev/zero + tr to make it printable.
+    const json =
+        \\{"command":"head -c 1300000 /dev/zero | tr '\\0' 'A'"}
+    ;
+    const result = try execute(json, allocator, null);
+    defer allocator.free(result.content);
+    try std.testing.expect(!result.is_error or std.mem.indexOf(u8, result.content, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
+    // Partial content must be present; we should see "AAAA..." substring.
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "AAAA") != null);
 }
