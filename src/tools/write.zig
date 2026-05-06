@@ -38,14 +38,35 @@ pub fn execute(
         };
     }
 
-    const file = std.fs.cwd().createFile(input.path, .{}) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
-        return .{ .content = msg, .is_error = true };
-    };
-    defer file.close();
+    // Atomic write: serialize to `<path>.tmp`, fsync, close, then rename over
+    // the destination. A mid-write failure leaves the original content intact
+    // because the rename only happens after the body is fully on disk.
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{input.path}) catch return types.oomResult();
+    defer allocator.free(tmp_path);
 
-    file.writeAll(input.content) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "error: writing to '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
+    {
+        const file = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
+            return .{ .content = msg, .is_error = true };
+        };
+        defer file.close();
+
+        file.writeAll(input.content) catch |err| {
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+            const msg = std.fmt.allocPrint(allocator, "error: writing to '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
+            return .{ .content = msg, .is_error = true };
+        };
+
+        file.sync() catch |err| {
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+            const msg = std.fmt.allocPrint(allocator, "error: syncing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
+            return .{ .content = msg, .is_error = true };
+        };
+    }
+
+    std.fs.cwd().rename(tmp_path, input.path) catch |err| {
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+        const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
@@ -137,4 +158,37 @@ test "write returns detailed error result for invalid JSON input" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "write") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "invalid input") != null);
+}
+
+test "write leaves original file intact when destination is a directory" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = "/tmp/zag-test-write-atomic-victim";
+    std.fs.cwd().makePath(tmp_dir) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    // Pre-populate the destination so we can verify it survives a failed write.
+    const original_path = try std.fmt.allocPrint(allocator, "{s}/file.txt", .{tmp_dir});
+    defer allocator.free(original_path);
+    {
+        const f = try std.fs.cwd().createFile(original_path, .{});
+        defer f.close();
+        try f.writeAll("ORIGINAL");
+    }
+
+    // Try to write to a path that's actually a directory (will fail mid-flow).
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"{s}\",\"content\":\"NEW\"}}",
+        .{tmp_dir}, // path is the directory itself; createFile will EISDIR
+    );
+    defer allocator.free(json);
+
+    const result = try execute(json, allocator, null);
+    defer allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+
+    // The original sibling file must be unchanged.
+    const verify = try std.fs.cwd().readFileAlloc(allocator, original_path, 1024);
+    defer allocator.free(verify);
+    try std.testing.expectEqualStrings("ORIGINAL", verify);
 }
