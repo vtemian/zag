@@ -37,6 +37,13 @@ pub const Endpoint = struct {
     /// verbosity=medium` block byte-for-byte. Other serializers ignore
     /// the field.
     reasoning: ReasoningConfig = .{},
+    /// Per-endpoint HTTP timeout knobs. Applied at the socket layer
+    /// after the TCP+TLS handshake completes so a wedged provider
+    /// fails fast instead of hanging on TCP keepalive (~2 hours on
+    /// macOS). Connect-phase timeouts are left to the OS default
+    /// because Zig 0.15's `std.http.Client` does not expose the
+    /// pre-handshake socket.
+    timeouts: TimeoutConfig = .{},
 
     /// How the API key is sent in HTTP headers. The `.oauth` variant carries
     /// the full `OAuthSpec` so auth.zig / oauth.zig / llm/http.zig can drive
@@ -160,6 +167,30 @@ pub const Endpoint = struct {
         /// the codex wire's nested `reasoning.effort` (see `effort` above)
         /// because the Responses API has its own placement convention.
         effort_request_field: ?[]const u8 = null,
+    };
+
+    /// Socket-level HTTP timeouts applied per endpoint. Consumed by
+    /// `llm/http.zig` and `llm/streaming.zig` after `req.receiveHead`
+    /// so the connection's socket fd is reachable for `setsockopt`.
+    /// All values are milliseconds; 0 means "no timeout" and falls
+    /// back to OS-default behavior.
+    pub const TimeoutConfig = struct {
+        /// Time to establish the TCP+TLS connection, in milliseconds.
+        /// 0 means "no timeout" (legacy behavior). Note: today this
+        /// is documented but unenforced because Zig 0.15's
+        /// `std.http.Client` does not surface the pre-handshake
+        /// socket; the OS default applies (~75s on macOS, ~127s on
+        /// Linux).
+        connect_ms: u32 = 60_000,
+        /// Time between bytes from the server, in milliseconds. For
+        /// streaming endpoints this is the inter-chunk timeout; SSE
+        /// keep-alives every few seconds satisfy this. For
+        /// non-streaming, this caps the whole response. 0 means "no
+        /// timeout."
+        read_ms: u32 = 600_000,
+        /// Time to send the request body, in milliseconds. Rarely
+        /// the bottleneck. 0 means "no timeout."
+        write_ms: u32 = 60_000,
     };
 
     /// Per-model rate card: context limits and dollar cost per million tokens.
@@ -287,11 +318,14 @@ pub const Endpoint = struct {
                 .echo_field = reasoning_echo_field,
                 .effort_request_field = reasoning_effort_request_field,
             },
+            // TimeoutConfig holds only u32 fields; copy by value.
+            .timeouts = self.timeouts,
         };
     }
 
     /// Free all heap-allocated strings. Pair with dupe().
     pub fn free(self: Endpoint, allocator: Allocator) void {
+        // `self.timeouts` holds only u32 fields; nothing to free.
         allocator.free(self.reasoning.effort);
         allocator.free(self.reasoning.summary);
         allocator.free(self.reasoning.verbosity);
