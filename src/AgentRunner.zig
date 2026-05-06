@@ -153,13 +153,36 @@ pub fn deinit(self: *AgentRunner) void {
 
 /// Cancel and join the agent thread if running. Tear down the event
 /// queue if it was initialized. Safe to call multiple times.
+///
+/// Two-step teardown to avoid two related bugs:
+///   1. A worker parked on `req.done.wait()` only unblocks via the
+///      orchestrator's dispatch path. Shutdown bypasses the orchestrator,
+///      so we drain pending round-trip requests under the queue mutex
+///      before joining; otherwise `t.join()` hangs forever.
+///   2. `event_queue.deinit` does not free payload bytes for events
+///      still in the ring. After joining we drain the remaining events
+///      and call `freeOwned` on each before tearing the queue down.
 pub fn shutdown(self: *AgentRunner) void {
     if (self.agent_thread) |t| {
         self.cancel_flag.store(true, .release);
+        if (self.queue_active) {
+            drainPendingRoundTrips(&self.event_queue, self.allocator);
+        }
         t.join();
         self.agent_thread = null;
     }
     if (self.queue_active) {
+        var scratch: [64]agent_events.AgentEvent = undefined;
+        var freed: usize = 0;
+        while (true) {
+            const drained = self.event_queue.drain(&scratch);
+            if (drained == 0) break;
+            for (scratch[0..drained]) |event| {
+                event.freeOwned(self.allocator);
+                freed += 1;
+            }
+        }
+        if (freed > 0) log.debug("agent_runner: shutdown drained {d} pending events", .{freed});
         self.event_queue.deinit();
         self.queue_active = false;
     }
