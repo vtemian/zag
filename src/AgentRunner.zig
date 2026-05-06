@@ -653,6 +653,93 @@ pub fn dispatchHookRequests(
     queue.tail = write;
 }
 
+comptime {
+    // If a new AgentEvent variant is added without updating
+    // drainPendingRoundTrips, this assertion fires at compile time.
+    // Round-trip variants need to be added to the switch below so a
+    // worker parked on req.done.wait() unblocks during shutdown.
+    const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
+    if (variant_count != 18) {
+        @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
+    }
+}
+
+/// Walk the queue under its mutex and signal `done` on every parked
+/// round-trip request so a worker that's waiting on `req.done.wait()`
+/// can unblock and unwind. Stamps `error_name = "drained_during_shutdown"`
+/// where the variant supports it; layout_request flags `is_error` instead
+/// because it has no `error_name` field.
+///
+/// Non-round-trip variants (text_delta, tool_result, info, err, etc.)
+/// are left in place; the caller frees their payloads via `freeOwned`
+/// after the agent thread is joined.
+///
+/// Unlike `dispatchHookRequests`, this helper does NOT call into Lua or
+/// the window manager. Shutdown is the wrong moment to fire handlers:
+/// the engine is itself tearing down. We only need to release waiters.
+fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator) void {
+    queue.mutex.lock();
+    defer queue.mutex.unlock();
+
+    var idx: usize = queue.head;
+    var remaining: usize = queue.len;
+    while (remaining > 0) : ({
+        idx = (idx + 1) % queue.buffer.len;
+        remaining -= 1;
+    }) {
+        switch (queue.buffer[idx]) {
+            .hook_request => |r| r.done.set(),
+            .lua_tool_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .layout_request => |r| {
+                r.is_error = true;
+                r.done.set();
+            },
+            .prompt_assembly_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .jit_context_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .tool_transform_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .tool_gate_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .loop_detect_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .compact_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            // Payload-bearing events stay in the ring; the post-join
+            // drain in `shutdown` calls `freeOwned` on each.
+            .text_delta,
+            .thinking_delta,
+            .thinking_stop,
+            .tool_start,
+            .tool_result,
+            .info,
+            .done,
+            .err,
+            .reset_assistant_text,
+            => {},
+        }
+    }
+    // Wake any producer parked in pushWithBackpressure so it can
+    // observe the shutdown signal instead of timing out.
+    queue.drained.broadcast();
+}
+
 /// Outcome of a per-tick drain. `any_drained` is true when at least one
 /// event was processed this tick (used by the orchestrator to snap the
 /// pane viewport to the bottom). `finished` is true when a `.done`
@@ -1951,4 +2038,36 @@ test "node_version_snapshot starts at zero; compositor sync advances it" {
     // Simulate what Compositor.syncTreeSnapshot does after painting.
     runner.node_version_snapshot = cb.tree.currentGeneration();
     try std.testing.expectEqual(cb.tree.currentGeneration(), runner.node_version_snapshot);
+}
+
+test "drainPendingRoundTrips signals done and stamps shutdown reason" {
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    const ctx: prompt_mod.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-05-06",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    var fake_req = agent_events.PromptAssemblyRequest.init(&ctx, alloc);
+
+    try queue.push(.{ .prompt_assembly_request = &fake_req });
+
+    // Simulate the shutdown-time drain: it must release the parked
+    // worker by signalling done, with a recognisable error_name so the
+    // waiter sees "queue drained during shutdown" instead of
+    // dereferencing a null result.
+    drainPendingRoundTrips(&queue, alloc);
+
+    try std.testing.expect(fake_req.done.isSet());
+    try std.testing.expectEqualStrings(
+        "drained_during_shutdown",
+        fake_req.error_name orelse "",
+    );
 }
