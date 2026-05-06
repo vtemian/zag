@@ -5725,7 +5725,11 @@ pub const LuaEngine = struct {
 
         _ = lua.getField(table_idx, "timeouts");
         defer lua.pop(1);
-        if (!lua.isTable(-1)) return out;
+        if (lua.isNil(-1)) return out;
+        if (!lua.isTable(-1)) {
+            log.warn("zag.provider: 'timeouts' must be a table; falling back to defaults", .{});
+            return out;
+        }
         const t_idx = lua.absIndex(-1);
 
         if (readTimeoutMs(lua, t_idx, "connect_ms")) |v| out.connect_ms = v;
