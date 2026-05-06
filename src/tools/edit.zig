@@ -31,6 +31,11 @@ pub fn execute(
     defer parsed.deinit();
     const input = parsed.value;
 
+    if (input.old_text.len == 0) {
+        const msg = allocator.dupe(u8, "error: old_text must not be empty") catch return types.oomResult();
+        return .{ .content = msg, .is_error = true };
+    }
+
     const content = std.fs.cwd().readFileAlloc(allocator, input.path, types.max_file_bytes) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
@@ -325,6 +330,29 @@ test "edit: CRLF file matches LF-supplied old_text" {
     const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
     defer allocator.free(written);
     try std.testing.expectEqualStrings("goodbye\nworld\r\n", written);
+}
+
+test "edit rejects empty old_text" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/zag-test-edit-empty-old.txt";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer file.close();
+        try file.writeAll("hello world");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"{s}\",\"old_text\":\"\",\"new_text\":\"x\"}}",
+        .{tmp_path},
+    );
+    defer allocator.free(json);
+
+    const result = try execute(json, allocator, null);
+    defer allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "old_text") != null);
 }
 
 test "edit: LF file with LF old_text continues to work (no regression)" {
