@@ -58,7 +58,7 @@ pub const OpenAiSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator);
+        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, self.endpoint.timeouts);
         defer req.allocator.free(response_bytes);
 
         return parseResponse(response_bytes, self.endpoint.reasoning, req.allocator);

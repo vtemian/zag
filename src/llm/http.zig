@@ -10,6 +10,8 @@ const Allocator = std.mem.Allocator;
 const Endpoint = @import("../llm.zig").Endpoint;
 const auth = @import("../auth.zig");
 const error_detail = @import("error_detail.zig");
+const registry = @import("registry.zig");
+const socket_timeouts = @import("socket_timeouts.zig");
 
 const log = std.log.scoped(.http);
 
@@ -17,6 +19,12 @@ const log = std.log.scoped(.http);
 /// detail. Enough to show a JSON error envelope; small enough to keep
 /// logs readable.
 const MAX_ERROR_BODY_BYTES: usize = 2048;
+
+/// Hard cap on the response body we accumulate. Defends against a
+/// runaway server that streams without ever closing. 16 MiB comfortably
+/// fits any realistic JSON envelope from a provider while keeping the
+/// upper bound on memory consumption explicit.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build HTTP headers from an endpoint's auth config plus a freshly-resolved
 /// credential out of `auth.json`. Every auth-header value is heap-allocated
@@ -255,29 +263,106 @@ pub fn httpPostJsonRaw(
     body: []const u8,
     extra_headers: []const std.http.Header,
     allocator: Allocator,
+    timeouts: ?registry.Endpoint.TimeoutConfig,
 ) !RawResponse {
-    var out: std.io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
     const uri = std.Uri.parse(url) catch return error.InvalidUri;
 
-    const result = client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = .POST,
-        .payload = body,
-        .response_writer = &out.writer,
+    // Manual request flow (vs `client.fetch`) so we can reach the
+    // connection's socket fd after `receiveHead` and apply read/write
+    // timeouts. Mirrors `streaming.zig`'s template; behaviorally
+    // identical to the previous fetch call (POST, JSON content-type,
+    // unhandled redirects, no keep-alive).
+    var req = client.request(.POST, uri, .{
         .extra_headers = extra_headers,
         .headers = .{
             .content_type = .{ .override = "application/json" },
         },
-    }) catch return error.ApiError;
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+    }) catch |err| {
+        log.err("http: request creation failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    defer req.deinit();
+
+    // Send the request body.
+    req.transfer_encoding = .{ .content_length = body.len };
+    var bw = req.sendBodyUnflushed(&.{}) catch |err| {
+        log.err("http: sendBodyUnflushed failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    bw.writer.writeAll(body) catch |err| {
+        log.err("http: body write failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    bw.end() catch |err| {
+        log.err("http: body end failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    (req.connection orelse {
+        log.err("http: no connection after body send", .{});
+        return error.ApiError;
+    }).flush() catch |err| {
+        log.err("http: flush failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+
+    // Receive response headers.
+    var no_redirects: [0]u8 = .{};
+    var response = req.receiveHead(&no_redirects) catch |err| {
+        log.err("http: receiveHead failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+
+    // Socket-level read/write timeouts. Apply after `receiveHead`
+    // because that's the first point the underlying connection (and its
+    // socket fd) is reachable. Connect phase remains OS-default.
+    if (timeouts) |to| {
+        if (req.connection) |conn| {
+            socket_timeouts.applySocketTimeouts(
+                conn.stream_reader.getStream().handle,
+                to.read_ms,
+                to.write_ms,
+            );
+        }
+    }
+
+    // Read the body. EAGAIN (`error.WouldBlock`) recovered through
+    // `connection.getReadError()` after the wrapper `error.ReadFailed`
+    // surfaces as `error.ReadTimeout` so callers can distinguish a
+    // genuine timeout from an opaque transport failure.
+    var transfer_buf: [8192]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    while (true) {
+        var chunk: [4096]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&chunk);
+        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
+            error.ReadFailed => {
+                if (req.connection) |conn| {
+                    if (conn.getReadError()) |inner| {
+                        if (inner == error.WouldBlock) return error.ReadTimeout;
+                    }
+                }
+                return error.ApiError;
+            },
+        };
+        if (n == 0) break;
+        if (out.items.len + n > MAX_BODY_BYTES) return error.ResponseBodyTooLarge;
+        try out.appendSlice(allocator, chunk[0..n]);
+    }
 
     return .{
-        .status = @intFromEnum(result.status),
-        .body = try out.toOwnedSlice(),
+        .status = @intFromEnum(response.head.status),
+        .body = try out.toOwnedSlice(allocator),
     };
 }
 
@@ -293,8 +378,9 @@ pub fn httpPostJson(
     body: []const u8,
     extra_headers: []const std.http.Header,
     allocator: Allocator,
+    timeouts: ?registry.Endpoint.TimeoutConfig,
 ) ![]const u8 {
-    const raw = try httpPostJsonRaw(url, body, extra_headers, allocator);
+    const raw = try httpPostJsonRaw(url, body, extra_headers, allocator, timeouts);
     if (raw.status >= 200 and raw.status < 300) return raw.body;
     defer raw.deinit(allocator);
     const snippet = raw.body[0..@min(raw.body.len, MAX_ERROR_BODY_BYTES)];
@@ -418,7 +504,7 @@ test "buildHeaders+freeHeaders round-trip with static endpoint headers (no leak)
 
 test "httpPostJson returns InvalidUri on malformed endpoint" {
     const allocator = std.testing.allocator;
-    const result = httpPostJson("not a url", "", &.{}, allocator);
+    const result = httpPostJson("not a url", "", &.{}, allocator, null);
     try std.testing.expectError(error.InvalidUri, result);
 }
 
@@ -426,7 +512,7 @@ test "httpPostJsonRaw returns InvalidUri on malformed endpoint" {
     // Plumbing failures still propagate as errors (URI parse is not an
     // HTTP status). Symmetric with the convenience wrapper above.
     const allocator = std.testing.allocator;
-    const result = httpPostJsonRaw("not a url", "", &.{}, allocator);
+    const result = httpPostJsonRaw("not a url", "", &.{}, allocator, null);
     try std.testing.expectError(error.InvalidUri, result);
 }
 
@@ -705,6 +791,98 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
         }
     }
     try std.testing.expect(saw_auth and saw_acct);
+}
+
+/// Mock-server thread for the non-streaming timeout test. Accepts one
+/// connection, drains the HTTP request, then writes only the response
+/// headers (chunked transfer, no chunk yet) and sleeps long enough that
+/// any read on the body side hits `SO_RCVTIMEO`. Mirrors
+/// `mockTimeoutServer` in `streaming.zig`.
+fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
+    const conn = srv.accept() catch return;
+    defer conn.stream.close();
+
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+
+    var tmp: [4096]u8 = undefined;
+    var headers_end: usize = 0;
+    while (true) {
+        const n = conn.stream.read(&tmp) catch return;
+        if (n == 0) return;
+        req.appendSlice(alloc, tmp[0..n]) catch return;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
+            headers_end = idx + 4;
+            break;
+        }
+    }
+
+    var content_length: usize = 0;
+    const headers_slice = req.items[0..headers_end];
+    var it = std.mem.splitSequence(u8, headers_slice, "\r\n");
+    while (it.next()) |line| {
+        if (line.len > 15 and std.ascii.eqlIgnoreCase(line[0..15], "content-length:")) {
+            const rest = std.mem.trim(u8, line[15..], " \t");
+            content_length = std.fmt.parseInt(usize, rest, 10) catch 0;
+            break;
+        }
+    }
+    const body_have = req.items.len - headers_end;
+    var body_remaining = if (content_length > body_have) content_length - body_have else 0;
+    while (body_remaining > 0) {
+        const want = @min(body_remaining, tmp.len);
+        const n = conn.stream.read(tmp[0..want]) catch return;
+        if (n == 0) break;
+        body_remaining -= n;
+    }
+
+    // Headers only: chunked transfer with no chunk yet, so the client's
+    // body reader will issue a recv() that blocks until SO_RCVTIMEO
+    // fires.
+    const head_only = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: close\r\n\r\n";
+    _ = conn.stream.writeAll(head_only) catch {};
+    std.Thread.sleep(sleep_ns);
+}
+
+test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body" {
+    // Reproduces the wedged-provider scenario for the non-streaming
+    // path: server returns 200 OK with chunked-encoded headers but
+    // never sends a chunk. Without SO_RCVTIMEO the client would wait
+    // the OS default (~75s on macOS, ~127s on Linux). With a 500 ms
+    // SO_RCVTIMEO the body read fails fast with EAGAIN, recovered as
+    // `error.ReadTimeout`.
+    const allocator = std.testing.allocator;
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    const thr = try std.Thread.spawn(.{}, mockTimeoutServer, .{ &server, 3 * std.time.ns_per_s });
+    defer {
+        server.deinit();
+        thr.join();
+    }
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const start = std.time.milliTimestamp();
+    const result = httpPostJsonRaw(
+        url,
+        "{}",
+        &.{},
+        allocator,
+        .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 },
+    );
+    const elapsed = std.time.milliTimestamp() - start;
+    try std.testing.expectError(error.ReadTimeout, result);
+    // 500 ms timeout plus generous slack for connect/handshake. The
+    // OS-default behaviour would push this well past 60 s.
+    try std.testing.expect(elapsed < 1500);
 }
 
 test {

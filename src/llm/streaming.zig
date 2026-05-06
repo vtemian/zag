@@ -17,6 +17,7 @@ const error_detail = @import("error_detail.zig");
 const error_class = @import("error_class.zig");
 const http_mod = @import("http.zig");
 const registry = @import("registry.zig");
+const socket_timeouts = @import("socket_timeouts.zig");
 const telemetry = @import("telemetry.zig");
 
 const log = std.log.scoped(.streaming);
@@ -205,7 +206,11 @@ pub const StreamingResponse = struct {
         // seconds satisfy the inter-byte read window in normal operation.
         if (opts.timeouts) |to| {
             if (self.req.connection) |conn| {
-                applySocketTimeouts(conn.stream_reader.getStream().handle, to);
+                socket_timeouts.applySocketTimeouts(
+                    conn.stream_reader.getStream().handle,
+                    to.read_ms,
+                    to.write_ms,
+                );
             }
         }
 
@@ -250,6 +255,7 @@ pub const StreamingResponse = struct {
                 body,
                 side_channel_headers,
                 allocator,
+                opts.timeouts,
             ) catch |err| blk: {
                 log.warn("streaming: side-channel re-fetch failed: {s}", .{@errorName(err)});
                 break :blk http_mod.RawResponse{ .status = 0, .body = "" };
@@ -352,31 +358,6 @@ pub const StreamingResponse = struct {
             try captured.append(allocator, .{ .name = name, .value = value });
         }
         return captured.toOwnedSlice(allocator);
-    }
-
-    /// Apply read/write socket timeouts. Best-effort: a setsockopt failure
-    /// is logged and ignored so a missing platform feature does not
-    /// abort the request. `read_ms == 0` (or `write_ms == 0`) means
-    /// "leave the OS default in place".
-    fn applySocketTimeouts(handle: std.posix.socket_t, to: registry.Endpoint.TimeoutConfig) void {
-        if (to.read_ms > 0) {
-            const tv = std.posix.timeval{
-                .sec = @intCast(to.read_ms / 1000),
-                .usec = @intCast((to.read_ms % 1000) * 1000),
-            };
-            std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| {
-                log.warn("streaming: failed to set SO_RCVTIMEO: {s}", .{@errorName(err)});
-            };
-        }
-        if (to.write_ms > 0) {
-            const tv = std.posix.timeval{
-                .sec = @intCast(to.write_ms / 1000),
-                .usec = @intCast((to.write_ms % 1000) * 1000),
-            };
-            std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch |err| {
-                log.warn("streaming: failed to set SO_SNDTIMEO: {s}", .{@errorName(err)});
-            };
-        }
     }
 
     /// Free a header slice produced by `captureHeaders`. Safe on empty
