@@ -203,6 +203,10 @@ pub const Request = struct {
     /// inject this as a top-level JSON field; everyone else drops it
     /// silently.
     thinking_effort: ?[]const u8 = null,
+    /// Per-call timeout override. When null, the endpoint's defaults apply.
+    /// Lets the agent layer bump timeouts for known-slow operations like
+    /// /compact without changing the endpoint config.
+    timeouts: ?Endpoint.TimeoutConfig = null,
 
     /// Join the stable and volatile halves with "\n\n" into a single
     /// owned string. Providers that can only emit one system field
@@ -257,6 +261,9 @@ pub const StreamRequest = struct {
     /// by the agent loop (one `Telemetry` per while-loop iteration);
     /// providers and `streaming.create` only borrow.
     telemetry: ?*telemetry.Telemetry = null,
+    /// Per-call timeout override. When null, the endpoint's defaults apply.
+    /// See `Request.timeouts`.
+    timeouts: ?Endpoint.TimeoutConfig = null,
 
     /// Join the stable and volatile halves. See `Request.joinedSystem`.
     pub fn joinedSystem(self: *const StreamRequest, allocator: Allocator) ![]u8 {

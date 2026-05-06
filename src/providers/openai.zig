@@ -58,7 +58,7 @@ pub const OpenAiSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, self.endpoint.timeouts);
+        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, req.timeouts orelse self.endpoint.timeouts);
         defer req.allocator.free(response_bytes);
 
         return parseResponse(response_bytes, self.endpoint.reasoning, req.allocator);
@@ -85,7 +85,14 @@ pub const OpenAiSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.telemetry, req.allocator);
+        const stream = try llm.streaming.StreamingResponse.createWithOptions(.{
+            .url = self.endpoint.url,
+            .body = body,
+            .extra_headers = headers.items,
+            .telemetry_opt = req.telemetry,
+            .allocator = req.allocator,
+            .timeouts = req.timeouts orelse self.endpoint.timeouts,
+        });
         defer stream.destroy();
 
         return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel);

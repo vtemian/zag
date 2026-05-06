@@ -88,7 +88,14 @@ pub const ChatgptSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, null, req.allocator);
+        const stream = try llm.streaming.StreamingResponse.createWithOptions(.{
+            .url = self.endpoint.url,
+            .body = body,
+            .extra_headers = headers.items,
+            .telemetry_opt = null,
+            .allocator = req.allocator,
+            .timeouts = req.timeouts orelse self.endpoint.timeouts,
+        });
         defer stream.destroy();
 
         var cancel = std.atomic.Value(bool).init(false);
@@ -137,7 +144,14 @@ pub const ChatgptSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const stream = try llm.streaming.StreamingResponse.create(self.endpoint.url, body, headers.items, req.telemetry, req.allocator);
+        const stream = try llm.streaming.StreamingResponse.createWithOptions(.{
+            .url = self.endpoint.url,
+            .body = body,
+            .extra_headers = headers.items,
+            .telemetry_opt = req.telemetry,
+            .allocator = req.allocator,
+            .timeouts = req.timeouts orelse self.endpoint.timeouts,
+        });
         defer stream.destroy();
 
         return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry);
