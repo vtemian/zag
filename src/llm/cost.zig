@@ -94,9 +94,28 @@ pub fn estimateCost(
         return null;
     };
 
+    // OpenAI-shaped wires (`openai`, `chatgpt`) report `cached_tokens` as a
+    // *subset* of `prompt_tokens`/`input_tokens`; Anthropic's
+    // `cache_read_input_tokens` is *disjoint* from `input_tokens`. Billing
+    // both at full rate would double-count the cached portion on OpenAI
+    // wires every turn. The chatgpt (Codex) Responses API follows OpenAI
+    // semantics; the serializer doesn't surface cached tokens today, but
+    // when it does they will share the OpenAI subset shape.
+    const cached_overlaps_input = switch (endpoint.serializer) {
+        .openai, .chatgpt => true,
+        .anthropic => false,
+    };
+    // Saturating subtraction guards against malformed usage reports where
+    // a provider claims `cache_read > input`; clamp to zero rather than
+    // wrapping around.
+    const effective_input = if (cached_overlaps_input)
+        usage.input_tokens -| usage.cache_read_tokens
+    else
+        usage.input_tokens;
+
     const one_mtok: f64 = 1_000_000.0;
     var total: f64 = 0;
-    total += @as(f64, @floatFromInt(usage.input_tokens)) / one_mtok * rate.input_per_mtok;
+    total += @as(f64, @floatFromInt(effective_input)) / one_mtok * rate.input_per_mtok;
     total += @as(f64, @floatFromInt(usage.output_tokens)) / one_mtok * rate.output_per_mtok;
     if (rate.cache_write_per_mtok) |r| {
         total += @as(f64, @floatFromInt(usage.cache_creation_tokens)) / one_mtok * r;
@@ -173,8 +192,9 @@ test "estimateCost: skips nil cache rates" {
         .cache_creation_tokens = 1_000_000,
         .cache_read_tokens = 1_000_000,
     }).?;
-    // 2.50 + 10.0 + 0 + 1.25 = 13.75
-    try std.testing.expectApproxEqAbs(@as(f64, 13.75), cost, 0.001);
+    // OpenAI: cached_tokens is a subset of input_tokens. Effective uncached
+    // input is 1M - 1M = 0. Total = 0 + 10.0 + 0 (nil cache_write) + 1.25.
+    try std.testing.expectApproxEqAbs(@as(f64, 11.25), cost, 0.001);
 }
 
 test "estimateCost: unknown provider returns null" {
@@ -219,6 +239,77 @@ test "shouldWarnForModel tracks distinct models separately" {
     try std.testing.expect(shouldWarnForModel("cost-test/distinct-bar"));
     try std.testing.expect(!shouldWarnForModel("cost-test/distinct-foo"));
     try std.testing.expect(!shouldWarnForModel("cost-test/distinct-bar"));
+}
+
+test "openai cost subtracts cached tokens from input rate" {
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const ep: Endpoint = .{
+        .name = "openai-test-cached",
+        .serializer = .openai,
+        .url = "https://x",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "gpt-test",
+        .models = &.{
+            .{
+                .id = "gpt-test",
+                .context_window = 1000,
+                .max_output_tokens = 100,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 4.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.25,
+            },
+        },
+    };
+    try reg.add(try ep.dupe(std.testing.allocator));
+
+    // OpenAI: prompt_tokens already includes cached_tokens. 1M prompt of which
+    // 500k were cache hits should bill 500k uncached input + 500k cached read.
+    // 0.5 * 1.0 + 0.5 * 0.25 = 0.625
+    const cost = estimateCost(&reg, "openai-test-cached/gpt-test", .{
+        .input_tokens = 1_000_000,
+        .output_tokens = 0,
+        .cache_creation_tokens = 0,
+        .cache_read_tokens = 500_000,
+    }).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.625), cost, 0.001);
+}
+
+test "anthropic cost bills cached tokens additively (sanity)" {
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    const ep: Endpoint = .{
+        .name = "anthropic-test-cached",
+        .serializer = .anthropic,
+        .url = "https://x",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "claude-test",
+        .models = &.{
+            .{
+                .id = "claude-test",
+                .context_window = 1000,
+                .max_output_tokens = 100,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 4.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.25,
+            },
+        },
+    };
+    try reg.add(try ep.dupe(std.testing.allocator));
+
+    // Anthropic: cache_read_input_tokens is disjoint from input_tokens.
+    // 1M input + 500k cached read => 1.0 + 0.125 = 1.125
+    const cost = estimateCost(&reg, "anthropic-test-cached/claude-test", .{
+        .input_tokens = 1_000_000,
+        .output_tokens = 0,
+        .cache_creation_tokens = 0,
+        .cache_read_tokens = 500_000,
+    }).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.125), cost, 0.001);
 }
 
 test {
