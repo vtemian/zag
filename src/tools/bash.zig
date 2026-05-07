@@ -1,4 +1,27 @@
-//! Bash tool: executes shell commands via /bin/sh -c.
+//! Bash tool: execute shell commands with a sandbox.
+//!
+//! Threat model:
+//! * Secret exfiltration: denies reads of ~/.ssh, ~/.aws, ~/.gnupg,
+//!   ~/.netrc, the entire ~/.config tree (broad-deny so future zag-stored
+//!   credentials at ~/.config/zag/auth.json are covered without per-path
+//!   maintenance), /etc/passwd, /private/etc, /Library/Keychains.
+//! * Filesystem damage: writes restricted to $PWD and /tmp; the four
+//!   standard sinks (/dev/null, /dev/stdout, /dev/stderr, /dev/tty) are
+//!   write-allowed as literals so normal shell scripts function.
+//! * Lateral movement: ~/.ssh/authorized_keys, ~/.bashrc etc. denied by
+//!   the write scope.
+//! * Network tunneling: outbound network denied except loopback.
+//!
+//! Platform support:
+//! * macOS: sandbox-exec with a generated seatbelt profile (see
+//!   buildSeatbeltProfile).
+//! * Linux: not yet sandboxed (see Phase B bubblewrap plan). Bash runs
+//!   unconfined; users on Linux must trust their agent prompts.
+//!
+//! Opt-out:
+//! * zag.set_bash_sandbox_level("permissive") in config.lua disables the
+//!   sandbox entirely. Intended for users who audit prompts themselves.
+//!   Logs a warning line on activation.
 //!
 //! Returns stdout, stderr, and exit code. While the child runs, polls the
 //! `cancel` flag at a 50ms cadence and kills the child on request so the
