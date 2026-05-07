@@ -3744,9 +3744,10 @@ pub const LuaEngine = struct {
     }
 
     /// `zag.providers.list()`: snapshot the endpoint registry as a Lua
-    /// table keyed by provider name. Each entry carries `default_model`
-    /// and a `models` array of `{ id, label?, recommended }` rows so a
-    /// Lua picker can render them without touching the Zig registry.
+    /// table keyed by provider name. Each entry carries `default_model`,
+    /// a `timeouts` subtable, and a `models` array of
+    /// `{ id, label?, recommended }` rows so a Lua picker can render
+    /// them without touching the Zig registry.
     fn zagProvidersListFn(lua: *Lua) i32 {
         const engine = getEngineFromState(lua);
         lua.newTable();
@@ -3755,6 +3756,15 @@ pub const LuaEngine = struct {
 
             _ = lua.pushString(ep.default_model);
             lua.setField(-2, "default_model");
+
+            lua.newTable();
+            lua.pushInteger(@intCast(ep.timeouts.connect_ms));
+            lua.setField(-2, "connect_ms");
+            lua.pushInteger(@intCast(ep.timeouts.read_ms));
+            lua.setField(-2, "read_ms");
+            lua.pushInteger(@intCast(ep.timeouts.write_ms));
+            lua.setField(-2, "write_ms");
+            lua.setField(-2, "timeouts");
 
             lua.newTable();
             for (ep.models, 0..) |m, idx| {
@@ -9726,6 +9736,29 @@ test "zag.provider{}: omitted timeouts table keeps registry defaults" {
     try std.testing.expectEqual(defaults.connect_ms, ep.timeouts.connect_ms);
     try std.testing.expectEqual(defaults.read_ms, ep.timeouts.read_ms);
     try std.testing.expectEqual(defaults.write_ms, ep.timeouts.write_ms);
+}
+
+test "zag.providers.list() surfaces timeouts subtable" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "listed",
+        \\  url = "http://example.invalid",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "none" },
+        \\  default_model = "m",
+        \\  timeouts = { connect_ms = 1234, read_ms = 5678, write_ms = 91011 },
+        \\}
+        \\local snap = zag.providers.list()
+        \\local entry = assert(snap.listed, "missing entry")
+        \\local t = assert(entry.timeouts, "missing timeouts")
+        \\assert(t.connect_ms == 1234, "connect_ms drift: " .. tostring(t.connect_ms))
+        \\assert(t.read_ms    == 5678, "read_ms drift: "    .. tostring(t.read_ms))
+        \\assert(t.write_ms   == 91011, "write_ms drift: "   .. tostring(t.write_ms))
+    );
 }
 
 test "zag.provider{}: models parse label and recommended" {

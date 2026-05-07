@@ -294,7 +294,8 @@ test "bash truncates stdout instead of erroring on overflow" {
     ;
     const result = try execute(json, allocator, null);
     defer allocator.free(result.content);
-    try std.testing.expect(!result.is_error or std.mem.indexOf(u8, result.content, "truncated") != null);
+    // head exits 0; truncation does not flip is_error.
+    try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
     // Partial content must be present; we should see "AAAA..." substring.
     try std.testing.expect(std.mem.indexOf(u8, result.content, "AAAA") != null);
