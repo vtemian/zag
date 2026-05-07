@@ -233,6 +233,65 @@ pub const tool = types.Tool{
     .execute = &execute,
 };
 
+const SeatbeltInputs = struct {
+    cwd: []const u8,
+    home: []const u8,
+};
+
+/// Generate a seatbelt profile (macOS sandbox-exec DSL) for one bash
+/// invocation. The profile is a Scheme-like s-expression describing
+/// allow/deny rules for file access, network, and process spawn. Order
+/// matters: deny rules placed AFTER an allow rule for an overlapping
+/// subpath override the allow.
+fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "(version 1)\n");
+    try buf.appendSlice(allocator, "(deny default)\n");
+    try buf.appendSlice(allocator, "(allow process-fork)\n");
+    try buf.appendSlice(allocator, "(allow process-exec)\n");
+    try buf.appendSlice(allocator, "(allow signal (target self))\n");
+    try buf.appendSlice(allocator, "(allow sysctl-read)\n");
+    try buf.appendSlice(allocator, "(allow file-read-metadata)\n");
+
+    // Read: cwd, home, standard system paths, and /dev (so head -c
+    // /dev/zero and friends keep working under the sandbox).
+    try buf.writer(allocator).print("(allow file-read* (subpath \"{s}\"))\n", .{inputs.cwd});
+    try buf.writer(allocator).print("(allow file-read* (subpath \"{s}\"))\n", .{inputs.home});
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/usr\"))\n");
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/bin\"))\n");
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/opt/homebrew\"))\n");
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/tmp\"))\n");
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/private/tmp\"))\n");
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/dev\"))\n");
+
+    // Deny secrets (ordered AFTER the home subpath so they override).
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{inputs.home});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{inputs.home});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{inputs.home});
+    try buf.writer(allocator).print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{inputs.home});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.config\"))\n", .{inputs.home});
+    try buf.appendSlice(allocator, "(deny file-read* (subpath \"/Library/Keychains\"))\n");
+    try buf.appendSlice(allocator, "(deny file-read* (subpath \"/private/etc/master.passwd\"))\n");
+
+    // Write: cwd, /tmp, plus the standard /dev sinks as literals.
+    try buf.writer(allocator).print("(allow file-write* (subpath \"{s}\"))\n", .{inputs.cwd});
+    try buf.appendSlice(allocator, "(allow file-write* (subpath \"/tmp\"))\n");
+    try buf.appendSlice(allocator, "(allow file-write* (subpath \"/private/tmp\"))\n");
+    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/null\"))\n");
+    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stdout\"))\n");
+    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stderr\"))\n");
+    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/tty\"))\n");
+
+    // Network: loopback only.
+    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"localhost:*\"))\n");
+    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"127.0.0.1:*\"))\n");
+    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"::1:*\"))\n");
+
+    return buf.toOwnedSlice(allocator);
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
@@ -322,4 +381,70 @@ test "bash truncates stdout instead of erroring on overflow" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
     // Partial content must be present; we should see "AAAA..." substring.
     try std.testing.expect(std.mem.indexOf(u8, result.content, "AAAA") != null);
+}
+
+test "buildSeatbeltProfile denies ~/.ssh by default" {
+    const allocator = std.testing.allocator;
+    const profile = try buildSeatbeltProfile(allocator, .{
+        .cwd = "/tmp/test",
+        .home = "/Users/test",
+    });
+    defer allocator.free(profile);
+
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/Users/test/.ssh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/tmp/test") != null);
+}
+
+test "buildSeatbeltProfile denies ~/.config tree as a whole" {
+    const allocator = std.testing.allocator;
+    const profile = try buildSeatbeltProfile(allocator, .{
+        .cwd = "/tmp/test",
+        .home = "/Users/test",
+    });
+    defer allocator.free(profile);
+
+    // Broad-deny so ~/.config/zag/auth.json (and any future ~/.config/<x>)
+    // are covered without per-tool maintenance.
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/Users/test/.config") != null);
+}
+
+test "buildSeatbeltProfile allows /tmp for scratch writes" {
+    const allocator = std.testing.allocator;
+    const profile = try buildSeatbeltProfile(allocator, .{
+        .cwd = "/home/test/project",
+        .home = "/home/test",
+    });
+    defer allocator.free(profile);
+
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/tmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "file-write") != null);
+}
+
+test "buildSeatbeltProfile allows /dev for read and standard write sinks" {
+    const allocator = std.testing.allocator;
+    const profile = try buildSeatbeltProfile(allocator, .{
+        .cwd = "/tmp/x",
+        .home = "/Users/x",
+    });
+    defer allocator.free(profile);
+
+    // Reads under /dev allow head -c /dev/zero, scripts that read
+    // /dev/urandom, etc. Writes are restricted to the four literal sinks.
+    try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-read* (subpath \"/dev\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/dev/null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/dev/stderr") != null);
+}
+
+test "buildSeatbeltProfile denies outbound network except loopback" {
+    const allocator = std.testing.allocator;
+    const profile = try buildSeatbeltProfile(allocator, .{
+        .cwd = "/tmp/x",
+        .home = "/Users/x",
+    });
+    defer allocator.free(profile);
+
+    try std.testing.expect(std.mem.indexOf(u8, profile, "network-outbound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "localhost") != null or
+        std.mem.indexOf(u8, profile, "127.0.0.1") != null);
 }
