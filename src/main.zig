@@ -9,6 +9,7 @@ const std = @import("std");
 const posix = std.posix;
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
+const bash_tool = @import("tools/bash.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const Conversation = @import("Conversation.zig");
@@ -411,6 +412,14 @@ pub fn main() !void {
     // so the pointer is stable for the lifetime of the engine.
     lua_engine.window_manager = &orchestrator.window_manager;
     lua_engine.buffer_registry = &orchestrator.window_manager.buffer_registry;
+
+    // Bash sandbox config: borrowed by both the engine (for the Lua
+    // setter) and the bash module (for execute-time branching). Stack
+    // address is stable for the rest of the function, which is the
+    // process lifetime here.
+    var bash_config: bash_tool.Config = .{};
+    lua_engine.bash_config = &bash_config;
+    bash_tool.bindConfig(&bash_config);
 
     // Publish the root leaf's packed handle on the root runner so the
     // agent thread can mirror it into `tools.current_caller_pane_id`

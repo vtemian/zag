@@ -8,6 +8,7 @@ const zlua = @import("zlua");
 const build_options = @import("build_options");
 const types = @import("types.zig");
 const tools_mod = @import("tools.zig");
+const bash_tool = @import("tools/bash.zig");
 const Hooks = @import("Hooks.zig");
 const Keymap = @import("Keymap.zig");
 const Buffer = @import("Buffer.zig");
@@ -174,6 +175,11 @@ pub const LuaEngine = struct {
     /// raise a clean Lua error, and `zag.keymap{buffer=...}` cannot
     /// resolve handle strings.
     buffer_registry: ?*BufferRegistry = null,
+    /// Borrowed pointer to the bash sandbox config struct. `main.zig`
+    /// wires this after init; tests can set it directly. `null` means
+    /// bash defaults to strict (the safe path), matching the threat-model
+    /// contract documented in `tools/bash.zig`.
+    bash_config: ?*bash_tool.Config = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
     tasks: std.AutoHashMap(i32, *Task),
     /// Handlers registered via `zag.context.on_tool_result(name, fn)`.
@@ -617,6 +623,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "set_default_model");
         lua.pushFunction(zlua.wrap(zagSetThinkingEffortFn));
         lua.setField(-2, "set_thinking_effort");
+        lua.pushFunction(zlua.wrap(zagSetBashSandboxLevelFn));
+        lua.setField(-2, "set_bash_sandbox_level");
         lua.pushFunction(zlua.wrap(zagProviderFn));
         lua.setField(-2, "provider");
         lua.pushFunction(zlua.wrap(zagSleepFn));
@@ -5115,6 +5123,43 @@ pub const LuaEngine = struct {
         const owned = try engine.allocator.dupe(u8, model);
         if (engine.default_model) |old| engine.allocator.free(old);
         engine.default_model = owned;
+        return 0;
+    }
+
+    /// Zig function backing `zag.set_bash_sandbox_level(level)`.
+    /// Valid levels: `"strict"` (default, sandbox on) and `"permissive"`
+    /// (sandbox off; logs a warning so the opt-out is visible). Unknown
+    /// levels and non-string args raise a Lua runtime error. When the
+    /// engine has no `bash_config` bound (e.g. engine-only tests that
+    /// don't wire main.zig), the handler is a no-op on the flag side and
+    /// still validates the level argument.
+    fn zagSetBashSandboxLevelFn(lua: *Lua) !i32 {
+        if (lua.typeOf(1) != .string) {
+            log.warn("zag.set_bash_sandbox_level(): arg 1 must be a string", .{});
+            return error.LuaError;
+        }
+        const level = lua.toString(1) catch {
+            log.warn("zag.set_bash_sandbox_level(): arg 1 must be a string", .{});
+            return error.LuaError;
+        };
+
+        _ = lua.getField(zlua.registry_index, "_zag_engine");
+        const ptr = lua.toPointer(-1) catch {
+            log.warn("zag.set_bash_sandbox_level(): engine pointer not set (call storeSelfPointer first)", .{});
+            return error.LuaError;
+        };
+        lua.pop(1);
+        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+        if (std.mem.eql(u8, level, "strict")) {
+            if (engine.bash_config) |cfg| cfg.permissive = false;
+        } else if (std.mem.eql(u8, level, "permissive")) {
+            if (engine.bash_config) |cfg| cfg.permissive = true;
+            log.warn("bash sandbox set to permissive; commands run unconfined", .{});
+        } else {
+            log.warn("zag.set_bash_sandbox_level: unknown level '{s}'", .{level});
+            return error.LuaError;
+        }
         return 0;
     }
 
@@ -9645,6 +9690,33 @@ test "zag.set_thinking_effort rejects unknown levels" {
         error.LuaRuntime,
         engine.lua.doString("zag.set_thinking_effort(\"extreme\")"),
     );
+}
+
+test "zag.set_bash_sandbox_level(permissive) flips bash_config" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var bash_config: bash_tool.Config = .{};
+    engine.bash_config = &bash_config;
+
+    try engine.lua.doString("zag.set_bash_sandbox_level('permissive')");
+    try std.testing.expect(bash_config.permissive);
+
+    try engine.lua.doString("zag.set_bash_sandbox_level('strict')");
+    try std.testing.expect(!bash_config.permissive);
+}
+
+test "zag.set_bash_sandbox_level rejects unknown level" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var bash_config: bash_tool.Config = .{};
+    engine.bash_config = &bash_config;
+
+    const result = engine.lua.doString("zag.set_bash_sandbox_level('yolo')");
+    try std.testing.expectError(error.LuaRuntime, result);
 }
 
 test "zag.set_thinking_effort replaces prior value without leaking" {

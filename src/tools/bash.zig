@@ -34,6 +34,24 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.tool_bash);
 
+/// Sandbox knobs reachable from Lua. The engine borrows a pointer; bash
+/// reads the flag at execute time. Default is strict (sandbox on).
+pub const Config = struct {
+    permissive: bool = false,
+};
+
+/// Set by `LuaEngine` after binding so `execute` can branch on the flag
+/// without a per-call lookup. `null` means no engine bound the config;
+/// in that case we default to the safe path (strict sandbox on macOS).
+var bound_config: ?*Config = null;
+
+/// Bind the sandbox config struct. Pass `null` to clear; pass a stable
+/// pointer that outlives every `execute` call. `LuaEngine` calls this
+/// from `main.zig` after wiring the engine borrows.
+pub fn bindConfig(cfg: ?*Config) void {
+    bound_config = cfg;
+}
+
 /// Interval between cancel-flag checks while collecting child output.
 const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
 
@@ -67,7 +85,9 @@ pub fn execute(
     // Lifetime: Child.init borrows the argv slices for the duration of
     // spawn+wait. We allocate argv + dupe the profile here and free both
     // via the outer `defer` after the function's last wait() call returns.
+    const permissive = if (bound_config) |c| c.permissive else false;
     const sandbox_argv: ?[]const []const u8 = sandbox_blk: {
+        if (permissive) break :sandbox_blk null;
         if (builtin.os.tag != .macos) break :sandbox_blk null;
 
         const home = std.posix.getenv("HOME") orelse "/";
