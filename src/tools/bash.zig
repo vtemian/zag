@@ -90,9 +90,15 @@ pub fn execute(
         if (permissive) break :sandbox_blk null;
         if (builtin.os.tag != .macos) break :sandbox_blk null;
 
-        const home = std.posix.getenv("HOME") orelse "/";
+        const home = std.posix.getenv("HOME") orelse home_blk: {
+            log.warn("HOME unset; sandbox secret-deny rules will be rooted at '/' (no per-user secrets denied)", .{});
+            break :home_blk "/";
+        };
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/";
+        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch |err| cwd_blk: {
+            log.warn("realpath('.') failed ({s}); sandbox cwd write-scope will be rooted at '/', expect EPERM on writes", .{@errorName(err)});
+            break :cwd_blk "/";
+        };
 
         const profile = buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "error: failed to build sandbox profile: {s}", .{@errorName(err)}) catch return types.oomResult();
