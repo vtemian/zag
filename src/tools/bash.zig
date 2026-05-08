@@ -59,7 +59,49 @@ pub fn execute(
     defer parsed.deinit();
     const input = parsed.value;
 
-    var child = std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
+    // On macOS, wrap the spawn in `sandbox-exec -p <profile> /bin/sh -c <cmd>`
+    // so the threat model in the module docstring actually holds. On other
+    // platforms this branch evaluates to null and we fall back to the
+    // legacy unsandboxed spawn (Phase B will add a Linux sandbox).
+    //
+    // Lifetime: Child.init borrows the argv slices for the duration of
+    // spawn+wait. We allocate argv + dupe the profile here and free both
+    // via the outer `defer` after the function's last wait() call returns.
+    const sandbox_argv: ?[]const []const u8 = sandbox_blk: {
+        if (builtin.os.tag != .macos) break :sandbox_blk null;
+
+        const home = std.posix.getenv("HOME") orelse "/";
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/";
+
+        const profile = buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home }) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "error: failed to build sandbox profile: {s}", .{@errorName(err)}) catch return types.oomResult();
+            return .{ .content = msg, .is_error = true };
+        };
+        defer allocator.free(profile);
+
+        const argv_buf = allocator.alloc([]const u8, 6) catch return types.oomResult();
+        const profile_owned = allocator.dupe(u8, profile) catch {
+            allocator.free(argv_buf);
+            return types.oomResult();
+        };
+        argv_buf[0] = "/usr/bin/sandbox-exec";
+        argv_buf[1] = "-p";
+        argv_buf[2] = profile_owned;
+        argv_buf[3] = "/bin/sh";
+        argv_buf[4] = "-c";
+        argv_buf[5] = input.command;
+        break :sandbox_blk argv_buf;
+    };
+    defer if (sandbox_argv) |argv| {
+        allocator.free(argv[2]);
+        allocator.free(argv);
+    };
+
+    var child = if (sandbox_argv) |argv|
+        std.process.Child.init(argv, allocator)
+    else
+        std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
@@ -475,4 +517,18 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     try child.spawn();
     const term = try child.wait();
     try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+}
+
+test "execute denies reading ~/.ssh on macOS" {
+    // The agent tries to read the current user's ~/.ssh. If it works,
+    // the sandbox failed. If the read is blocked, the output should
+    // not contain anything resembling a private-key header.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const result = try execute("{\"command\":\"cat ~/.ssh/id_rsa 2>&1 || true\"}", allocator, null);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "BEGIN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "PRIVATE KEY") == null);
 }
