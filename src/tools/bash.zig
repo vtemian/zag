@@ -28,6 +28,7 @@
 //! agent can interrupt long-running commands.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../types.zig");
 const Allocator = std.mem.Allocator;
 
@@ -255,18 +256,15 @@ fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![
     try buf.appendSlice(allocator, "(allow sysctl-read)\n");
     try buf.appendSlice(allocator, "(allow file-read-metadata)\n");
 
-    // Read: cwd, home, standard system paths, and /dev (so head -c
-    // /dev/zero and friends keep working under the sandbox).
-    try buf.writer(allocator).print("(allow file-read* (subpath \"{s}\"))\n", .{inputs.cwd});
-    try buf.writer(allocator).print("(allow file-read* (subpath \"{s}\"))\n", .{inputs.home});
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/usr\"))\n");
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/bin\"))\n");
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/opt/homebrew\"))\n");
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/tmp\"))\n");
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/private/tmp\"))\n");
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/dev\"))\n");
+    // Read: broad allow on /, then deny secrets explicitly. The broad
+    // allow is necessary because /bin/sh's dyld needs to read
+    // /System/Library/dyld/dyld_shared_cache_*, /Library/*, /private/var/db/*,
+    // and other paths an enumerated allow-list cannot reasonably cover.
+    // Secrets are denied below; seatbelt evaluates rules top-to-bottom
+    // and later rules override earlier ones.
+    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/\"))\n");
 
-    // Deny secrets (ordered AFTER the home subpath so they override).
+    // Deny secrets (ordered AFTER the broad allow so they override).
     try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{inputs.home});
     try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{inputs.home});
     try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{inputs.home});
@@ -284,10 +282,10 @@ fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![
     try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stderr\"))\n");
     try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/tty\"))\n");
 
-    // Network: loopback only.
+    // Network: loopback only. sandbox-exec accepts only `*` or `localhost`
+    // as the host literal in (remote ip ...); numeric IPs make the entire
+    // profile parse-fail, so we keep just the symbolic localhost rule.
     try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"localhost:*\"))\n");
-    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"127.0.0.1:*\"))\n");
-    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"::1:*\"))\n");
 
     return buf.toOwnedSlice(allocator);
 }
@@ -429,11 +427,12 @@ test "buildSeatbeltProfile allows /dev for read and standard write sinks" {
     });
     defer allocator.free(profile);
 
-    // Reads under /dev allow head -c /dev/zero, scripts that read
-    // /dev/urandom, etc. Writes are restricted to the four literal sinks.
-    try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-read* (subpath \"/dev\"))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, profile, "/dev/null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, profile, "/dev/stderr") != null);
+    // The broad `(subpath "/")` allow covers /dev/zero, /dev/urandom,
+    // and any other path scripts might read. Writes are restricted to
+    // the four literal sinks.
+    try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-read* (subpath \"/\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-write* (literal \"/dev/null\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-write* (literal \"/dev/stderr\"))") != null);
 }
 
 test "buildSeatbeltProfile denies outbound network except loopback" {
@@ -445,6 +444,35 @@ test "buildSeatbeltProfile denies outbound network except loopback" {
     defer allocator.free(profile);
 
     try std.testing.expect(std.mem.indexOf(u8, profile, "network-outbound") != null);
-    try std.testing.expect(std.mem.indexOf(u8, profile, "localhost") != null or
-        std.mem.indexOf(u8, profile, "127.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "localhost") != null);
+    // sandbox-exec rejects numeric IPs in (remote ip ...). If we ever
+    // reintroduce them the profile fails to parse and every spawn dies
+    // with exit 65. Pin the symbolic-only contract.
+    try std.testing.expect(std.mem.indexOf(u8, profile, "127.0.0.1") == null);
+}
+
+test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" {
+    // Integration test: prior unit tests only checked profile string
+    // contents. They do not catch sandbox-exec syntax errors or rules
+    // too narrow to let dyld load /bin/sh. Run the real binary against
+    // the real profile so any future regression to either class of bug
+    // surfaces here, not in production.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const home = std.posix.getenv("HOME") orelse "/";
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/";
+    const profile = try buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home });
+    defer allocator.free(profile);
+
+    var child = std.process.Child.init(
+        &.{ "/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", "exit 0" },
+        allocator,
+    );
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const term = try child.wait();
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
 }
