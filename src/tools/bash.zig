@@ -39,6 +39,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../types.zig");
+const landlock = @import("../sandbox/landlock_linux.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.tool_bash);
@@ -86,18 +87,17 @@ pub fn execute(
     defer parsed.deinit();
     const input = parsed.value;
 
-    // On macOS, wrap the spawn in `sandbox-exec -p <profile> /bin/sh -c <cmd>`
-    // so the threat model in the module docstring actually holds. On other
-    // platforms this branch evaluates to null and we fall back to the
-    // legacy unsandboxed spawn (Phase B will add a Linux sandbox).
+    // Wrap the shell in a platform-specific sandbox helper so the threat
+    // model in the module docstring actually holds. macOS uses Apple's
+    // sandbox-exec; Linux re-execs ourselves as `--__sandbox-helper` to
+    // install landlock between fork and exec. Other platforms get the
+    // unsandboxed fallback.
     //
-    // Lifetime: Child.init borrows the argv slices for the duration of
-    // spawn+wait. We allocate argv + dupe the profile here and free both
-    // via the outer `defer` after the function's last wait() call returns.
+    // Lifetime: Child.init borrows the argv slices. We free the heap-owned
+    // slots via freeSandboxArgv after the function's last wait().
     const permissive = if (bound_config) |c| c.permissive else false;
-    const sandbox_argv: ?[]const []const u8 = sandbox_blk: {
+    const sandbox: ?SandboxArgv = sandbox_blk: {
         if (permissive) break :sandbox_blk null;
-        if (builtin.os.tag != .macos) break :sandbox_blk null;
 
         const home = std.posix.getenv("HOME") orelse home_blk: {
             log.warn("HOME unset; sandbox secret-deny rules will be rooted at '/' (no per-user secrets denied)", .{});
@@ -109,32 +109,23 @@ pub fn execute(
             break :cwd_blk "/";
         };
 
-        const profile = buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home }) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "error: failed to build sandbox profile: {s}", .{@errorName(err)}) catch return types.oomResult();
-            return .{ .content = msg, .is_error = true };
+        const built: ?SandboxArgv = switch (builtin.os.tag) {
+            .macos => buildMacosArgv(allocator, cwd, home, input.command) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "error: failed to build macOS sandbox argv: {s}", .{@errorName(err)}) catch return types.oomResult();
+                return .{ .content = msg, .is_error = true };
+            },
+            .linux => buildLinuxArgv(allocator, cwd, home, input.command) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "error: failed to build linux sandbox argv: {s}", .{@errorName(err)}) catch return types.oomResult();
+                return .{ .content = msg, .is_error = true };
+            },
+            else => null,
         };
-        defer allocator.free(profile);
-
-        const argv_buf = allocator.alloc([]const u8, 6) catch return types.oomResult();
-        const profile_owned = allocator.dupe(u8, profile) catch {
-            allocator.free(argv_buf);
-            return types.oomResult();
-        };
-        argv_buf[0] = "/usr/bin/sandbox-exec";
-        argv_buf[1] = "-p";
-        argv_buf[2] = profile_owned;
-        argv_buf[3] = "/bin/sh";
-        argv_buf[4] = "-c";
-        argv_buf[5] = input.command;
-        break :sandbox_blk argv_buf;
+        break :sandbox_blk built;
     };
-    defer if (sandbox_argv) |argv| {
-        allocator.free(argv[2]);
-        allocator.free(argv);
-    };
+    defer if (sandbox) |sb| freeSandboxArgv(allocator, sb);
 
-    var child = if (sandbox_argv) |argv|
-        std.process.Child.init(argv, allocator)
+    var child = if (sandbox) |sb|
+        std.process.Child.init(sb.argv, allocator)
     else
         std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
     child.stdout_behavior = .Pipe;
@@ -310,6 +301,80 @@ pub const tool = types.Tool{
     .definition = definition,
     .execute = &execute,
 };
+
+/// Tag for `freeSandboxArgv` so the platform-specific heap-owned slots
+/// can be released without re-querying os.tag.
+const SandboxPlatform = enum { macos, linux };
+
+const SandboxArgv = struct {
+    argv: []const []const u8,
+    platform: SandboxPlatform,
+};
+
+fn buildMacosArgv(
+    allocator: Allocator,
+    cwd: []const u8,
+    home: []const u8,
+    command: []const u8,
+) !SandboxArgv {
+    const profile = try buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home });
+    errdefer allocator.free(profile);
+
+    const argv = try allocator.alloc([]const u8, 6);
+    errdefer allocator.free(argv);
+
+    argv[0] = "/usr/bin/sandbox-exec";
+    argv[1] = "-p";
+    argv[2] = profile;
+    argv[3] = "/bin/sh";
+    argv[4] = "-c";
+    argv[5] = command;
+    return .{ .argv = argv, .platform = .macos };
+}
+
+fn buildLinuxArgv(
+    allocator: Allocator,
+    cwd: []const u8,
+    home: []const u8,
+    command: []const u8,
+) !SandboxArgv {
+    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_path = try std.fs.selfExePath(&self_buf);
+
+    const self_owned = try allocator.dupe(u8, self_path);
+    errdefer allocator.free(self_owned);
+    const cwd_owned = try allocator.dupe(u8, cwd);
+    errdefer allocator.free(cwd_owned);
+    const home_owned = try allocator.dupe(u8, home);
+    errdefer allocator.free(home_owned);
+
+    const argv = try allocator.alloc([]const u8, 8);
+    errdefer allocator.free(argv);
+
+    argv[0] = self_owned;
+    argv[1] = "--__sandbox-helper";
+    argv[2] = cwd_owned;
+    argv[3] = home_owned;
+    argv[4] = "--";
+    argv[5] = "/bin/sh";
+    argv[6] = "-c";
+    argv[7] = command;
+    return .{ .argv = argv, .platform = .linux };
+}
+
+fn freeSandboxArgv(allocator: Allocator, sb: SandboxArgv) void {
+    switch (sb.platform) {
+        .macos => {
+            allocator.free(sb.argv[2]); // duped seatbelt profile
+        },
+        .linux => {
+            allocator.free(sb.argv[0]); // duped self_path
+            allocator.free(sb.argv[2]); // duped cwd
+            allocator.free(sb.argv[3]); // duped home
+        },
+    }
+    allocator.free(sb.argv);
+}
 
 const SeatbeltInputs = struct {
     cwd: []const u8,
@@ -559,6 +624,63 @@ test "execute denies reading ~/.ssh on macOS" {
     // the sandbox failed. If the read is blocked, the output should
     // not contain anything resembling a private-key header.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const result = try execute("{\"command\":\"cat ~/.ssh/id_rsa 2>&1 || true\"}", allocator, null);
+    defer allocator.free(result.content);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "BEGIN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "PRIVATE KEY") == null);
+}
+
+test "buildMacosArgv preserves seatbelt argv shape" {
+    // Pure refactor guard: this test fixes the shape of the already-
+    // shipping macOS argv against future regressions.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const sb = try buildMacosArgv(allocator, "/tmp/work", "/Users/u", "echo hi");
+    defer freeSandboxArgv(allocator, sb);
+
+    try std.testing.expectEqual(SandboxPlatform.macos, sb.platform);
+    try std.testing.expectEqual(@as(usize, 6), sb.argv.len);
+    try std.testing.expectEqualStrings("/usr/bin/sandbox-exec", sb.argv[0]);
+    try std.testing.expectEqualStrings("-p", sb.argv[1]);
+    try std.testing.expectEqualStrings("/bin/sh", sb.argv[3]);
+    try std.testing.expectEqualStrings("-c", sb.argv[4]);
+    try std.testing.expectEqualStrings("echo hi", sb.argv[5]);
+    try std.testing.expect(std.mem.indexOf(u8, sb.argv[2], "(version 1)") != null);
+}
+
+test "buildLinuxArgv produces self-re-exec argv shape" {
+    const allocator = std.testing.allocator;
+    const sb = try buildLinuxArgv(allocator, "/tmp/work", "/home/u", "echo hi");
+    defer freeSandboxArgv(allocator, sb);
+
+    try std.testing.expectEqual(SandboxPlatform.linux, sb.platform);
+    try std.testing.expectEqual(@as(usize, 8), sb.argv.len);
+    try std.testing.expectEqualStrings("--__sandbox-helper", sb.argv[1]);
+    try std.testing.expectEqualStrings("/tmp/work", sb.argv[2]);
+    try std.testing.expectEqualStrings("/home/u", sb.argv[3]);
+    try std.testing.expectEqualStrings("--", sb.argv[4]);
+    try std.testing.expectEqualStrings("/bin/sh", sb.argv[5]);
+    try std.testing.expectEqualStrings("-c", sb.argv[6]);
+    try std.testing.expectEqualStrings("echo hi", sb.argv[7]);
+    try std.testing.expect(sb.argv[0].len > 0);
+    try std.testing.expect(std.fs.path.isAbsolute(sb.argv[0]));
+}
+
+test "execute denies reading ~/.ssh on Linux" {
+    // End-to-end check, gated on landlock availability. NOTE: zig's
+    // test runner replaces main(), so the --__sandbox-helper branch
+    // does not fire here; this test exercises argv plumbing and the
+    // spawn/wait machinery but does NOT install landlock. Real
+    // sandbox denial is verified manually against the built zag binary
+    // (see docs/plans/2026-05-15-bash-sandbox-linux.md done-when).
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    switch (landlock.probeAbi()) {
+        .supported => {},
+        .unsupported => return error.SkipZigTest,
+    }
 
     const allocator = std.testing.allocator;
     const result = try execute("{\"command\":\"cat ~/.ssh/id_rsa 2>&1 || true\"}", allocator, null);
