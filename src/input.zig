@@ -355,6 +355,39 @@ test "parse SGR mouse release" {
     }
 }
 
+test "parse SGR mouse drag (button-held motion sets .drag kind)" {
+    // Motion-with-button-held has the 0x20 bit set on the button byte;
+    // button code 32 = button-1 (0) + motion bit (0x20).
+    // ESC [ < 3 2 ; 1 0 ; 7 M
+    const event = parseBytes(&.{ 0x1b, '[', '<', '3', '2', ';', '1', '0', ';', '7', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(@as(u8, 0), m.button);
+            try std.testing.expectEqual(@as(u16, 10), m.x);
+            try std.testing.expectEqual(@as(u16, 7), m.y);
+            // `is_press` stays true on drag because the button is held;
+            // callers that care about button-edge vs. motion must check
+            // `kind == .drag`.
+            try std.testing.expectEqual(true, m.is_press);
+            try std.testing.expectEqual(MouseEvent.Kind.drag, m.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SGR mouse press without motion bit stays .press" {
+    // Regression: ensure the motion-bit decode does not steal the press
+    // classification when 0x20 is clear. Button code 2 = right-button press.
+    const event = parseBytes(&.{ 0x1b, '[', '<', '2', ';', '4', ';', '4', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(@as(u8, 2), m.button);
+            try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parse Ctrl+C" {
     // Ctrl+C = 0x03
     const event = parseBytes(&.{0x03}) orelse return error.TestUnexpectedResult;

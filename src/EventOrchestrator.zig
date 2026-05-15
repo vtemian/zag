@@ -820,12 +820,15 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
 
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        // Wheel events scroll the float's viewport directly; other
-        // mouse events route through the float's View as before.
+        // Wheel events scroll the float's viewport directly. Drag and
+        // motion events route through the float's View; the
+        // `mouse_anchor` update above already lets a follower float
+        // track the pointer on every drag without any per-event work
+        // here, so the drag arm only needs to hand the event off.
         switch (ev.kind) {
             .wheel_up => scrollFloatBy(f, .up),
             .wheel_down => scrollFloatBy(f, .down),
-            else => {
+            .drag, .press, .release => {
                 if (self.window_manager.paneFromFloatHandle(f.handle)) |fp| {
                     _ = fp.view.onMouse(ev, local_x, local_y);
                 }
@@ -845,12 +848,14 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         const local_y = screen_y - rect.y;
         // Wheel events scroll the leaf's viewport directly; the buffer
         // and view stay stateless about scrolling now that the viewport
-        // lives on the Pane. Other mouse events still dispatch through
-        // the View vtable for buffer-specific handling.
+        // lives on the Pane. Press/release/drag all dispatch through
+        // the View vtable for buffer-specific handling; the `.drag` arm
+        // is listed explicitly so adding new MouseEvent.Kind variants
+        // forces a decision here.
         switch (ev.kind) {
             .wheel_up => scrollLeafBy(&node.leaf, .up),
             .wheel_down => scrollLeafBy(&node.leaf, .down),
-            else => _ = node.leaf.view.onMouse(ev, local_x, local_y),
+            .drag, .press, .release => _ = node.leaf.view.onMouse(ev, local_x, local_y),
         }
         return;
     }
