@@ -218,6 +218,11 @@ pub const StyledSpan = struct {
 /// guarantees the bytes stay valid for at least one frame and for the
 /// lifetime of any cache entry that holds the span. The consumer never
 /// frees `text`.
+///
+/// The test "StyledLine.deinit does not free span text" pins this
+/// invariant. If you find yourself wanting to free span.text from
+/// `deinit`, you are changing the contract; update the producers too
+/// (NodeLineCache, NodeRenderer, MarkdownParser).
 pub const StyledLine = struct {
     /// Ordered spans composing this line.
     spans: []const StyledSpan,
@@ -649,4 +654,16 @@ test "StyledLine construction" {
     // First span should have the input_prompt style (bold + accent fg)
     try std.testing.expect(line.spans[0].style.bold);
     try std.testing.expect(line.spans[0].style.fg != null);
+}
+
+test "StyledLine.deinit does not free span text (borrowed-slice invariant)" {
+    // Build a StyledLine whose span text points at a static literal.
+    // If deinit ever calls allocator.free(span.text), testing.allocator's
+    // GPA aborts with "free of pointer not allocated by this allocator"
+    // and the test fails loudly instead of going UAF in production.
+    const static_text = "borrowed";
+    var spans = try std.testing.allocator.alloc(StyledSpan, 1);
+    spans[0] = .{ .text = static_text, .style = .{} };
+    const line: StyledLine = .{ .spans = spans, .row_style = null };
+    line.deinit(std.testing.allocator);
 }
