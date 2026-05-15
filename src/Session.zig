@@ -622,9 +622,20 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
 
     var line_iter = std.mem.splitScalar(u8, content, '\n');
     var line_index: usize = 0;
+    var line_start_offset: usize = 0;
     while (line_iter.next()) |line| {
+        defer line_start_offset += line.len + 1;
         if (line.len == 0) continue;
-        var entry = parseEntry(line, allocator) catch continue;
+        var entry = parseEntry(line, allocator) catch |err| {
+            // Crash-recovery (recoverSessionFiles) already trims any
+            // torn trailing line before we get here, so a parse failure
+            // mid-file is real corruption and we want it greppable.
+            log.warn(
+                "loadEntries: skipping corrupt entry at byte {d} of {s}: {s}",
+                .{ line_start_offset, path, @errorName(err) },
+            );
+            continue;
+        };
         const previous_id: ?ulid.Ulid = if (entries.items.len > 0)
             entries.items[entries.items.len - 1].id
         else
@@ -2412,4 +2423,74 @@ test "backfillEntry mixes line index into seed to avoid same-ms collisions" {
     try std.testing.expect(!isZeroUlid(loaded[0].id));
     try std.testing.expect(!isZeroUlid(loaded[1].id));
     try std.testing.expect(!std.mem.eql(u8, &loaded[0].id, &loaded[1].id));
+}
+
+test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
+    // Regression pin: parseEntry failures in loadEntries skip the bad
+    // line and continue. A corrupt line in the middle of a JSONL file
+    // must not cause subsequent valid rows to be lost. The corrupt
+    // payload below uses an unknown entry kind, which trips
+    // error.UnknownEntryType inside parseEntry.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    _ = try handle.appendEntry(.{
+        .entry_type = .user_message,
+        .content = "valid",
+        .timestamp = 1_000,
+    });
+
+    // Splice a corrupt line directly into the JSONL file. The handle
+    // owns an open writer for this file; close it first so we can
+    // reopen it for append-mode writes without confusing the writer's
+    // position bookkeeping.
+    handle.close();
+
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(
+        &jsonl_path_buf,
+        ".zag/sessions/{s}.jsonl",
+        .{session_id},
+    );
+    {
+        var f = try std.fs.cwd().openFile(jsonl_path, .{ .mode = .read_write });
+        defer f.close();
+        try f.seekFromEnd(0);
+        try f.writeAll("{\"type\":\"BOGUS\"}\n");
+    }
+
+    // Reopen the session and append a second valid entry after the
+    // corrupt line so the corruption sits strictly mid-file.
+    var handle2 = try mgr.loadSession(session_id);
+    _ = try handle2.appendEntry(.{
+        .entry_type = .user_message,
+        .content = "after",
+        .timestamp = 2_000,
+    });
+    handle2.close();
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    // Expected rows: session_start (from createSession) + "valid" +
+    // "after". The corrupt line is dropped.
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqual(EntryType.session_start, loaded[0].entry_type);
+    try std.testing.expectEqualStrings("valid", loaded[1].content);
+    try std.testing.expectEqualStrings("after", loaded[2].content);
 }
