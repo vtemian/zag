@@ -2681,11 +2681,16 @@ test "NodeLineCache rotates spans pointer on put-replace" {
     // the cache owns the StyledLine slice and each line's spans array,
     // while StyledSpan.text is borrowed from the node's TextBuffer.
     // collectVisibleLines copies StyledLine headers into a frame arena,
-    // sharing the spans pointer with the cache entry. If a future change
-    // makes cache.put skip the free-then-realloc on version bump, a
-    // caller still holding a frame snapshot would deref a dangling
-    // pointer. testing.allocator's leak detector backstops the contract
-    // from the other direction (double-free or missed free on replace).
+    // sharing the spans pointer with the cache entry.
+    //
+    // Asserts spans.ptr rotates across a content_version bump: a future
+    // change that reuses the same spans allocation across versions trips
+    // this. testing.allocator's leak detector backstops from the other
+    // direction (double-free or missed free on replace).
+    //
+    // We do NOT hold the first frame snapshot across the second
+    // getVisibleLines call. Doing so would be UB-by-contract once put
+    // replaces the entry; documenting it via `_ = text1_first;` below.
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "spans-rotation");
     defer cb.deinit();

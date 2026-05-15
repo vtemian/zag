@@ -219,9 +219,9 @@ pub const StyledSpan = struct {
 /// lifetime of any cache entry that holds the span. The consumer never
 /// frees `text`.
 ///
-/// The test "StyledLine.deinit does not free span text" pins this
-/// invariant. If you find yourself wanting to free span.text from
-/// `deinit`, you are changing the contract; update the producers too
+/// The test "StyledLine.deinit does not free span text (borrowed-slice
+/// invariant)" pins this. If you find yourself wanting to free span.text
+/// from `deinit`, you are changing the contract; update the producers too
 /// (NodeLineCache, NodeRenderer, MarkdownParser).
 pub const StyledLine = struct {
     /// Ordered spans composing this line.
