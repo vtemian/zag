@@ -210,6 +210,10 @@ pub const Request = struct {
     /// Lets the agent layer bump timeouts for known-slow operations like
     /// /compact without changing the endpoint config.
     timeouts: ?Endpoint.TimeoutConfig = null,
+    /// Optional out-param where the provider writes a user-facing error
+    /// message on failure. Null = caller doesn't want the detail (matches
+    /// the historical threadlocal-default behavior).
+    error_detail_out: ?*error_detail.ErrorDetail = null,
 
     /// Join the stable and volatile halves with "\n\n" into a single
     /// owned string. Providers that can only emit one system field
@@ -267,6 +271,9 @@ pub const StreamRequest = struct {
     /// Per-call timeout override. When null, the endpoint's defaults apply.
     /// See `Request.timeouts`.
     timeouts: ?Endpoint.TimeoutConfig = null,
+    /// Optional out-param for a user-facing error message. See
+    /// `Request.error_detail_out`.
+    error_detail_out: ?*error_detail.ErrorDetail = null,
 
     /// Join the stable and volatile halves. See `Request.joinedSystem`.
     pub fn joinedSystem(self: *const StreamRequest, allocator: Allocator) ![]u8 {
