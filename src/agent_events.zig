@@ -472,6 +472,13 @@ pub const PromptAssemblyRequest = struct {
     pub fn init(ctx: *const prompt.LayerContext, allocator: Allocator) PromptAssemblyRequest {
         return .{ .ctx = ctx, .allocator = allocator };
     }
+
+    /// Free the `AssembledPrompt` arena owned by `result`, if any. Safe
+    /// to call when `result` is null.
+    pub fn freeResult(self: *PromptAssemblyRequest) void {
+        if (self.result) |*assembled| assembled.deinit();
+        self.result = null;
+    }
 };
 
 /// Round-trip request pushed by the agent thread when a tool call has
@@ -529,6 +536,13 @@ pub const JitContextRequest = struct {
             .is_error = is_error,
             .allocator = allocator,
         };
+    }
+
+    /// Free the handler's duped return bytes, if any. Safe to call when
+    /// `result` is null.
+    pub fn freeResult(self: *JitContextRequest) void {
+        if (self.result) |bytes| self.allocator.free(bytes);
+        self.result = null;
     }
 };
 
@@ -588,6 +602,13 @@ pub const ToolTransformRequest = struct {
             .is_error = is_error,
             .allocator = allocator,
         };
+    }
+
+    /// Free the handler's duped replacement bytes, if any. Safe to call
+    /// when `result` is null.
+    pub fn freeResult(self: *ToolTransformRequest) void {
+        if (self.result) |bytes| self.allocator.free(bytes);
+        self.result = null;
     }
 };
 

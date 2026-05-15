@@ -4056,3 +4056,23 @@ test "fireCompact returns null when queue is at capacity" {
     const result = try fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
     try std.testing.expectEqual(@as(?[]types.Message, null), result);
 }
+
+test "round-trip Request types all expose freeResult" {
+    // Comptime guard: if a new round-trip variant is added without
+    // freeResult, this fails to compile.
+    comptime {
+        const types_to_check = .{
+            agent_events.PromptAssemblyRequest,
+            agent_events.ToolGateRequest,
+            agent_events.JitContextRequest,
+            agent_events.ToolTransformRequest,
+            agent_events.LoopDetectRequest,
+            agent_events.CompactRequest,
+        };
+        for (types_to_check) |T| {
+            if (!@hasDecl(T, "freeResult")) {
+                @compileError(@typeName(T) ++ " must declare freeResult");
+            }
+        }
+    }
+}
