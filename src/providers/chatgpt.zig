@@ -926,50 +926,44 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const
     // object and classify that. Failure to flatten just falls back to
     // raw classification, which is fine; the worst case is a `.unknown`
     // bucket whose user message names the log path.
-    if (emit.telemetry) |t| {
-        _ = t.onStreamError(.chatgpt_response_failed, raw_data) catch |err| {
-            log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
-        };
-    }
     const flattened_envelope = flattenResponseError(emit.allocator, raw_data) catch null;
     defer if (flattened_envelope) |f| emit.allocator.free(f);
     const for_classify: []const u8 = flattened_envelope orelse raw_data;
-    const class = llm.error_class.classify(0, for_classify, &.{});
 
-    // Surface the classifier output to the UI through `error_detail` so
-    // codex `usage_not_included` / `context_length_exceeded` envelopes
-    // render with the friendly hint. Best-effort: a userMessage failure
-    // just leaves the slot untouched.
-    if (llm.error_class.userMessage(class, emit.allocator)) |detail| {
-        llm.error_detail.set(emit.allocator, detail);
-    } else |err| {
-        log.warn("error_class.userMessage failed: {s}", .{@errorName(err)});
-    }
-
-    // The agent-loop `.err` callback keeps the provider-tagged
-    // "{code}: {message}" string so logs can correlate retries to the
-    // upstream code. The UI gets the friendly text via error_detail
-    // above; the .err string is for observers.
     emit.stop_reason.* = .end_turn;
 
-    const response_value = obj.get("response") orelse {
-        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return error.ProviderResponseFailed;
+    // Best-effort parse: pull code+message out of `response.error` for
+    // the provider-tagged `.err` string. Malformed envelopes (missing
+    // `response`/`error` keys, wrong types) fall back to the literal
+    // "response.failed" string the prior implementation emitted.
+    const text = parseFailedErrorText(emit.allocator, obj) catch |err| switch (err) {
+        error.MalformedFailedEnvelope => null,
+        else => |e| return e,
     };
-    if (response_value != .object) {
-        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return error.ProviderResponseFailed;
-    }
+    defer if (text) |t| emit.allocator.free(t);
+    const err_text: []const u8 = text orelse "response.failed";
 
-    const response = response_value.object;
-    const err_value = response.get("error") orelse {
-        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return error.ProviderResponseFailed;
-    };
-    if (err_value != .object) {
-        emit.callback.on_event(emit.callback.ctx, .{ .err = "response.failed" });
-        return error.ProviderResponseFailed;
-    }
+    llm.stream_error.handle(
+        emit.allocator,
+        .chatgpt_response_failed,
+        raw_data,
+        for_classify,
+        err_text,
+        emit.telemetry,
+        emit.callback,
+    );
+    return error.ProviderResponseFailed;
+}
+
+/// Pull the `{code}: {message}` text out of a `response.failed` envelope.
+/// Returns `error.MalformedFailedEnvelope` when any of the expected JSON
+/// path segments are missing or the wrong type; callers fall back to a
+/// generic "response.failed" string in that case.
+fn parseFailedErrorText(allocator: Allocator, obj: std.json.ObjectMap) ![]u8 {
+    const response_value = obj.get("response") orelse return error.MalformedFailedEnvelope;
+    if (response_value != .object) return error.MalformedFailedEnvelope;
+    const err_value = response_value.object.get("error") orelse return error.MalformedFailedEnvelope;
+    if (err_value != .object) return error.MalformedFailedEnvelope;
 
     const err_obj = err_value.object;
     const code: []const u8 = if (err_obj.get("code")) |c|
@@ -981,11 +975,7 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const
     else
         "";
 
-    const text = try std.fmt.allocPrint(emit.allocator, "{s}: {s}", .{ code, message });
-    defer emit.allocator.free(text);
-
-    emit.callback.on_event(emit.callback.ctx, .{ .err = text });
-    return error.ProviderResponseFailed;
+    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ code, message });
 }
 
 fn handleIncomplete(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const u8) !void {
