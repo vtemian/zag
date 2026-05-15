@@ -67,9 +67,6 @@ pub fn parseSgrMouse(seq: []const u8) Event {
             .button = button,
             .x = nums[1],
             .y = nums[2],
-            // Drag keeps `is_press = true` because the button is physically
-            // held during motion. Use `kind` to tell press from drag.
-            .is_press = is_press,
             .kind = kind,
             .modifiers = modifiers,
         },

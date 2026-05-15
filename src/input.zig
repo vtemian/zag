@@ -332,7 +332,6 @@ test "parse SGR mouse press: CSI < 0;10;5 M" {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(@as(u16, 10), m.x);
             try std.testing.expectEqual(@as(u16, 5), m.y);
-            try std.testing.expectEqual(true, m.is_press);
             try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
             try std.testing.expectEqual(KeyEvent.no_modifiers, m.modifiers);
         },
@@ -348,7 +347,6 @@ test "parse SGR mouse release" {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(@as(u16, 3), m.x);
             try std.testing.expectEqual(@as(u16, 7), m.y);
-            try std.testing.expectEqual(false, m.is_press);
             try std.testing.expectEqual(MouseEvent.Kind.release, m.kind);
         },
         else => return error.TestUnexpectedResult,
@@ -365,10 +363,6 @@ test "parse SGR mouse drag (button-held motion sets .drag kind)" {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(@as(u16, 10), m.x);
             try std.testing.expectEqual(@as(u16, 7), m.y);
-            // `is_press` stays true on drag because the button is held;
-            // callers that care about button-edge vs. motion must check
-            // `kind == .drag`.
-            try std.testing.expectEqual(true, m.is_press);
             try std.testing.expectEqual(MouseEvent.Kind.drag, m.kind);
         },
         else => return error.TestUnexpectedResult,
@@ -604,7 +598,7 @@ test "parse SGR mouse with Ctrl modifier" {
         .mouse => |m| {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(true, m.modifiers.ctrl);
-            try std.testing.expectEqual(true, m.is_press);
+            try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
         },
         else => return error.TestUnexpectedResult,
     }

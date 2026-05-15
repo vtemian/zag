@@ -127,19 +127,12 @@ pub const MouseEvent = struct {
     x: u16,
     /// Row (1-based).
     y: u16,
-    /// true for press (M) and drag (button held during motion), false for
-    /// release (m). Wheel events report `true`. Because both `.press` and
-    /// `.drag` set this flag, callers that need to distinguish a button
-    /// edge from button-held motion must inspect `kind` (which is
-    /// authoritative); `is_press` survives only for legacy call sites
-    /// that still ask "is the button down".
-    is_press: bool,
     /// What the event represents. `press`/`release` carry button edges,
     /// `drag` is motion-with-button-held (xterm `?1002`), and
     /// `wheel_up`/`wheel_down` carry scroll-wheel ticks. Wheel events are
     /// emitted by the SGR encoder when the high bit (0x40) of the button
     /// byte is set; drag is signalled by the 0x20 motion bit.
-    kind: Kind = .press,
+    kind: Kind,
     /// Modifier keys held during the mouse event.
     modifiers: KeyEvent.Modifiers,
 

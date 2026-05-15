@@ -1625,7 +1625,6 @@ test "onMouse passes through every event kind (wheel scroll lives in EventOrches
             .button = 0,
             .x = 1,
             .y = 1,
-            .is_press = true,
             .kind = k,
             .modifiers = input.KeyEvent.no_modifiers,
         };

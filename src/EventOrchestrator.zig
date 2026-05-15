@@ -1385,7 +1385,6 @@ test "mouse click on a focusable float makes it the focused float" {
         .x = 11,
         .y = 8,
         .modifiers = .{},
-        .is_press = true,
         .kind = .press,
     };
     orch.handleMouse(ev);
