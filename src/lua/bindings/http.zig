@@ -15,8 +15,6 @@ const async_job = @import("../Job.zig");
 const http_stream_mod = @import("../primitives/http_stream.zig");
 const lua_json = @import("../lua_json.zig");
 
-const log = std.log.scoped(.lua);
-
 /// `zag.http.get(url, opts?)`: synchronous-looking HTTP GET. Yields
 /// the coroutine until the worker finishes the request, then resumes
 /// with (response, nil) on success or (nil, err) on failure.
