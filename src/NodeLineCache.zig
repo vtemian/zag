@@ -1,15 +1,31 @@
-//! NodeLineCache: memoized NodeRenderer output, keyed by (node id, content_version).
+//! NodeLineCache: memoized NodeRenderer output keyed by (node id, content_version).
 //!
-//! Lifetime is tied to the owning Conversation: cache entries live
-//! in the buffer's long-lived allocator, and `deinit` walks all remaining
-//! entries. An entry is invalidated when its node's content_version
-//! advances past the stored version; entries for removed nodes are
-//! dropped via `dropNode(id)` or wiped in bulk via `invalidateAll`.
+//! Three braided lifetimes:
 //!
-//! Under the StyledSpan borrowed-slice contract (see `Theme.zig`), span
-//! text lifetimes are managed by the node's `content.items`; this cache
-//! only owns the `spans` arrays. Deinit calls `StyledLine.deinit` on each
-//! cached line, which frees the spans array but leaves text bytes alone.
+//! 1. The cache's `lines: []StyledLine` slice. Owned by `self.allocator`.
+//!    Freed in `put` on replace and in `deinit`/`dropNode`/`invalidateAll`.
+//!
+//! 2. Each `StyledLine.spans` array. Owned by `self.allocator`. Freed
+//!    indirectly via `StyledLine.deinit` from the cache's free paths.
+//!
+//! 3. Each `StyledSpan.text` slice. **Borrowed** from the source node's
+//!    TextBuffer. NEVER freed by the cache. The producer guarantees the
+//!    text bytes stay valid for the lifetime of any cache entry that
+//!    references them. In practice the agent thread parks while the
+//!    orchestrator drains its queue on the UI thread; see Conversation.zig
+//!    threading-policy doc.
+//!
+//! An entry is invalidated when its node's content_version advances past
+//! the stored version; entries for removed nodes are dropped via
+//! `dropNode(id)` or wiped in bulk via `invalidateAll`.
+//!
+//! Regression pins:
+//! - Conversation.zig: "NodeLineCache rotates spans pointer on put-replace"
+//! - Theme.zig: "StyledLine.deinit does not free span text (borrowed-slice invariant)"
+//!
+//! If you weaken any of the three lifetimes (e.g. by sharing a spans slice
+//! across versions, or by making span.text owned), update both tests so
+//! the new contract is the one that's pinned.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
