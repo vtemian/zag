@@ -29,12 +29,18 @@ pub const OpenAiSerializer = struct {
     const vtable: Provider.VTable = .{
         .call = callImpl,
         .call_streaming = callStreamingImpl,
+        .deinit = deinitImpl,
         .name = "openai",
     };
 
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *OpenAiSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
+        const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
     }
 
     fn callImpl(

@@ -38,12 +38,18 @@ pub const ChatgptSerializer = struct {
     const vtable: Provider.VTable = .{
         .call = callImpl,
         .call_streaming = callStreamingImpl,
+        .deinit = deinitImpl,
         .name = "chatgpt",
     };
 
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *ChatgptSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
+        const self: *ChatgptSerializer = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
     }
 
     fn callImpl(

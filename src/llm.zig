@@ -317,6 +317,12 @@ pub const Provider = struct {
             req: *const StreamRequest,
         ) ProviderError!types.LlmResponse,
 
+        /// Free the heap state behind `ptr`. Allocator must match the one
+        /// used to allocate the state. Null means "no per-provider state
+        /// to free" (impossible for stdlib providers; reserved for future
+        /// stateless wire forms).
+        deinit: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void = null,
+
         /// Human-readable provider name (for logging and display).
         name: []const u8,
     };
@@ -893,6 +899,28 @@ test "Provider callStreaming dispatches to vtable" {
     try std.testing.expectEqual(@as(u32, 1), test_impl.stream_count);
     try std.testing.expectEqual(@as(u32, 2), counter.event_count);
     try std.testing.expectEqualStrings("test_stream", p.vtable.name);
+}
+
+test "Provider.VTable carries deinit; create+deinit round-trips cleanly" {
+    const alloc = std.testing.allocator;
+    const ep: Endpoint = .{
+        .name = "test-anthropic",
+        .serializer = .anthropic,
+        .url = "http://localhost",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+    const owned_ep = try ep.dupe(alloc);
+    defer owned_ep.free(alloc);
+
+    const state = try alloc.create(anthropic.AnthropicSerializer);
+    state.* = .{ .endpoint = &owned_ep, .auth_path = "/tmp/x", .model = "m" };
+    const provider = state.provider();
+
+    try std.testing.expect(provider.vtable.deinit != null);
+    provider.vtable.deinit.?(provider.ptr, alloc);
 }
 
 test "parseModelString splits provider and model" {

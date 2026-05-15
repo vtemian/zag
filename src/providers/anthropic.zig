@@ -65,12 +65,18 @@ pub const AnthropicSerializer = struct {
     const vtable: Provider.VTable = .{
         .call = callImpl,
         .call_streaming = callStreamingImpl,
+        .deinit = deinitImpl,
         .name = "anthropic",
     };
 
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *AnthropicSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
+        const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
     }
 
     fn callImpl(
