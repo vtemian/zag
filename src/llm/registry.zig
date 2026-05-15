@@ -9,14 +9,40 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Serializer = @import("../llm.zig").Serializer;
+const Provider = @import("../llm.zig").Provider;
+
+/// Signature of every provider's `create` function. Endpoints carry one of
+/// these so `createProviderFromLuaConfig` can construct the right provider
+/// state without switching on a closed enum. Out-of-tree wire modules point
+/// the field at their own `create` function; the stdlib factories live in
+/// `src/providers/*.zig`.
+pub const Factory = *const fn (
+    std.mem.Allocator,
+    *const Endpoint,
+    []const u8,
+    []const u8,
+) anyerror!Provider;
+
+/// Per-endpoint wire-protocol semantics that the rest of the runtime
+/// consults to make accounting and request-shaping decisions. New wires
+/// declare their behavior by setting these flags rather than gating on
+/// a closed enum identity.
+pub const WireSemantics = struct {
+    /// True when the provider reports cached input tokens as a subset of
+    /// the total `prompt_tokens` count (OpenAI / Codex). False when
+    /// cached tokens are reported separately and additively (Anthropic).
+    /// Drives the cost-accounting subtraction in `llm/cost.zig`.
+    cached_overlaps_input: bool = false,
+};
 
 /// Everything needed to talk to a specific LLM endpoint.
 pub const Endpoint = struct {
     /// Human-readable name (e.g., "openrouter", "ollama").
     name: []const u8,
-    /// Which wire format this endpoint speaks.
-    serializer: Serializer,
+    /// Wire-protocol semantics that drive accounting and request shaping
+    /// decisions. Defaults match Anthropic-style behavior; openai/chatgpt
+    /// wires override `cached_overlaps_input = true` at construction.
+    wire_semantics: WireSemantics = .{},
     /// Full URL for chat completions.
     url: []const u8,
     /// How to send the API key in HTTP headers.
@@ -44,6 +70,11 @@ pub const Endpoint = struct {
     /// because Zig 0.15's `std.http.Client` does not expose the
     /// pre-handshake socket.
     timeouts: TimeoutConfig = .{},
+    /// Build a Provider from this endpoint. Set by the registry/Lua reader
+    /// to the matching stdlib factory; out-of-tree wire modules can also
+    /// point this at their own `create` function. Copied by value in
+    /// `Endpoint.dupe` (POD function pointer).
+    factory: Factory,
 
     /// How the API key is sent in HTTP headers. The `.oauth` variant carries
     /// the full `OAuthSpec` so auth.zig / oauth.zig / llm/http.zig can drive
@@ -304,7 +335,8 @@ pub const Endpoint = struct {
 
         return .{
             .name = name,
-            .serializer = self.serializer,
+            // `WireSemantics` is POD (bool fields); copy by value.
+            .wire_semantics = self.wire_semantics,
             .url = url,
             .auth = auth,
             .headers = headers,
@@ -320,6 +352,8 @@ pub const Endpoint = struct {
             },
             // TimeoutConfig holds only u32 fields; copy by value.
             .timeouts = self.timeouts,
+            // Function pointer; copy by value.
+            .factory = self.factory,
         };
     }
 
@@ -553,12 +587,31 @@ pub const Registry = struct {
     }
 };
 
+/// Stub factory used by test fixtures in this file. The tests only exercise
+/// dupe/free and Registry CRUD, never the factory itself, so we hand back a
+/// trivially-allocatable provider with a no-op vtable. Importing the real
+/// stdlib factories from `src/providers/*.zig` would create a circular
+/// import (providers depend on `llm.zig`, which re-exports this module).
+fn testStubFactory(
+    allocator: std.mem.Allocator,
+    endpoint: *const Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) anyerror!Provider {
+    _ = allocator;
+    _ = endpoint;
+    _ = auth_path;
+    _ = model;
+    return error.NotImplemented;
+}
+
 test "Endpoint.dupe creates independent copy" {
     const allocator = std.testing.allocator;
 
     const original = Endpoint{
         .name = "test",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://example.com",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
@@ -571,7 +624,7 @@ test "Endpoint.dupe creates independent copy" {
 
     try std.testing.expectEqualStrings("test", duped.name);
     try std.testing.expectEqualStrings("https://example.com", duped.url);
-    try std.testing.expectEqual(Serializer.openai, duped.serializer);
+    try std.testing.expectEqual(true, duped.wire_semantics.cached_overlaps_input);
     try std.testing.expectEqual(Endpoint.Auth.bearer, duped.auth);
     try std.testing.expectEqual(@as(usize, 1), duped.headers.len);
     try std.testing.expectEqualStrings("X-Custom", duped.headers[0].name);
@@ -658,7 +711,8 @@ test "Auth oauth variant carries full spec" {
 test "Endpoint.dupe/free round-trips the .oauth variant's nested strings" {
     const original: Endpoint = .{
         .name = "oauth-test",
-        .serializer = .chatgpt,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .{ .oauth = .{
             .issuer = "https://auth.example.com/authorize",
@@ -703,7 +757,8 @@ test "Endpoint.dupe/free round-trips the .oauth variant's nested strings" {
 test "Endpoint.dupe copies default_model and models slice" {
     const original: Endpoint = .{
         .name = "test",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -737,7 +792,8 @@ test "Registry.add takes ownership of an already-dupe'd endpoint" {
 
     const raw: Endpoint = .{
         .name = "custom",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
         .headers = &.{},
@@ -756,7 +812,8 @@ test "Registry.remove drops an existing entry and returns true" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "removable",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
         .headers = &.{},
@@ -781,7 +838,7 @@ test "Registry.remove followed by add implements override" {
 
     const seed: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{},
@@ -792,7 +849,7 @@ test "Registry.remove followed by add implements override" {
 
     const replacement: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://custom.example.com/messages",
         .auth = .x_api_key,
         .headers = &.{},
@@ -812,7 +869,7 @@ test "Registry.dupe produces an independent deep copy" {
 
     const ep: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{},
@@ -834,7 +891,8 @@ test "Registry.add rejects duplicate names" {
     defer reg.deinit();
     const raw: Endpoint = .{
         .name = "dup",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
         .headers = &.{},
@@ -849,7 +907,7 @@ test "ModelRate dupe round trips label and recommended" {
     const gpa = std.testing.allocator;
     var ep: Endpoint = .{
         .name = "prov",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://example.com",
         .auth = .none,
         .headers = &.{},
@@ -907,7 +965,8 @@ test "Endpoint.dupe round-trips response_fields and echo_field" {
     const fields = [_][]const u8{ "reasoning_content", "reasoning" };
     const original = Endpoint{
         .name = "moonshot",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.moonshot.ai/v1/chat/completions",
         .auth = .bearer,
         .headers = &.{},
@@ -939,7 +998,8 @@ test "Endpoint.dupe round-trips effort_request_field" {
 
     const original = Endpoint{
         .name = "moonshot",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.moonshot.ai/v1/chat/completions",
         .auth = .bearer,
         .headers = &.{},

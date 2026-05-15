@@ -1387,7 +1387,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
     const entries = [_]llm.Endpoint{
         .{
             .name = "anthropic",
-            .serializer = .anthropic,
+            .factory = llm.anthropic.create,
             .url = "https://api.anthropic.com/v1/messages",
             .auth = .x_api_key,
             .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
@@ -1396,7 +1396,8 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         },
         .{
             .name = "openai",
-            .serializer = .openai,
+            .factory = llm.openai.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://api.openai.com/v1/chat/completions",
             .auth = .bearer,
             .headers = &.{},
@@ -1405,7 +1406,8 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         },
         .{
             .name = "openrouter",
-            .serializer = .openai,
+            .factory = llm.openai.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://openrouter.ai/api/v1/chat/completions",
             .auth = .bearer,
             .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
@@ -1414,7 +1416,8 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         },
         .{
             .name = "groq",
-            .serializer = .openai,
+            .factory = llm.openai.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://api.groq.com/openai/v1/chat/completions",
             .auth = .bearer,
             .headers = &.{},
@@ -1423,7 +1426,8 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         },
         .{
             .name = "ollama",
-            .serializer = .openai,
+            .factory = llm.openai.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "http://localhost:11434/v1/chat/completions",
             .auth = .none,
             .headers = &.{},
@@ -1432,7 +1436,8 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         },
         .{
             .name = "openai-oauth",
-            .serializer = .chatgpt,
+            .factory = llm.chatgpt.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://chatgpt.com/backend-api/codex/responses",
             .auth = .{ .oauth = .{
                 .issuer = "https://auth.openai.com/oauth/authorize",
@@ -2597,7 +2602,7 @@ test "promptModel returns null when endpoint has no models" {
     const deps = testDeps(&stdin, &stdout_writer.writer, &registry);
     const ep: llm.Endpoint = .{
         .name = "prov",
-        .serializer = .anthropic,
+        .factory = llm.anthropic.create,
         .url = "",
         .auth = .none,
         .headers = &.{},
@@ -2647,7 +2652,7 @@ test "promptModel returns recommended id on immediate Enter" {
     };
     const ep: llm.Endpoint = .{
         .name = "prov",
-        .serializer = .anthropic,
+        .factory = llm.anthropic.create,
         .url = "",
         .auth = .none,
         .headers = &.{},

@@ -38,12 +38,18 @@ pub const ChatgptSerializer = struct {
     const vtable: Provider.VTable = .{
         .call = callImpl,
         .call_streaming = callStreamingImpl,
+        .deinit = deinitImpl,
         .name = "chatgpt",
     };
 
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *ChatgptSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
+        const self: *ChatgptSerializer = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
     }
 
     fn callImpl(
@@ -157,6 +163,20 @@ pub const ChatgptSerializer = struct {
         return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry);
     }
 };
+
+/// Build a Provider whose state is a freshly-allocated `ChatgptSerializer`.
+/// Stored on `Endpoint.factory` for every ChatGPT-wire endpoint; the Lua
+/// reader resolves the `wire = "chatgpt"` string to this function pointer.
+pub fn create(
+    allocator: Allocator,
+    endpoint: *const llm.Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) !Provider {
+    const state = try allocator.create(ChatgptSerializer);
+    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    return state.provider();
+}
 
 /// Serialize a non-streaming Responses API request body. Uses the legacy
 /// hardcoded reasoning/verbosity defaults so existing call sites (and golden
@@ -2042,7 +2062,8 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
 
     const endpoint: llm.Endpoint = .{
         .name = "openai-oauth",
-        .serializer = .chatgpt,
+        .factory = create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = mock_url,
         .auth = .{ .oauth = .{
             .issuer = "https://auth.openai.com/oauth/authorize",
@@ -2154,7 +2175,6 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
     var result = try llm.createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator);
     defer result.deinit();
 
-    try std.testing.expectEqual(llm.Serializer.chatgpt, result.serializer);
     try std.testing.expectEqualStrings("openai-oauth/gpt-5-codex", result.model_id);
     try std.testing.expectEqualStrings("chatgpt", result.provider.vtable.name);
 
@@ -2199,7 +2219,8 @@ fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
     errdefer reg.deinit();
     const ep: llm.Endpoint = .{
         .name = "openai-oauth",
-        .serializer = .chatgpt,
+        .factory = create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .{ .oauth = .{
             .issuer = "https://auth.openai.com/oauth/authorize",
