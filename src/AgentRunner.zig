@@ -326,6 +326,7 @@ pub fn formatAgentErrorMessage(
     err: anyerror,
     provider_name: []const u8,
     allocator: Allocator,
+    detail_opt: ?*llm.error_detail.ErrorDetail,
 ) ![]u8 {
     return switch (err) {
         error.NotLoggedIn => std.fmt.allocPrint(
@@ -344,17 +345,21 @@ pub fn formatAgentErrorMessage(
             // instead of just "ApiError". When the body is a JSON shape
             // we recognise (Codex `detail`, OpenAI/Anthropic
             // `error.message`), unwrap it to the human-readable string;
-            // otherwise show the raw captured detail.
-            if (llm.error_detail.take()) |detail| {
-                defer allocator.free(detail);
-                if (std.mem.indexOfScalar(u8, detail, '{')) |json_start| {
-                    const json_slice = detail[json_start..];
+            // otherwise show the raw captured detail. Prefer the
+            // caller-owned `ErrorDetail` when wired; fall back to the
+            // threadlocal so legacy paths (tests that have not migrated
+            // yet) keep producing the same string.
+            const detail = if (detail_opt) |d| d.take() else llm.error_detail.take();
+            if (detail) |bytes| {
+                defer allocator.free(bytes);
+                if (std.mem.indexOfScalar(u8, bytes, '{')) |json_start| {
+                    const json_slice = bytes[json_start..];
                     if (extractApiErrorMessage(allocator, json_slice)) |pretty| {
                         defer allocator.free(pretty);
                         break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{pretty});
                     } else |_| {}
                 }
-                break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{detail});
+                break :blk std.fmt.allocPrint(allocator, "ApiError: {s}", .{bytes});
             }
             break :blk allocator.dupe(u8, "ApiError");
         },
@@ -439,6 +444,18 @@ fn threadMain(
     // stale `true` and divert the first user message.
     defer turn_in_progress.store(false, .release);
 
+    // Caller-owned upstream-error slot. Provider transport writers
+    // (`http.zig` non-2xx, `streaming.zig` non-2xx, anthropic
+    // `handleStreamErrorEvent`, chatgpt `handleFailed`) route the
+    // status+body string here via `error_detail_out` on Request and
+    // StreamRequest. `formatAgentErrorMessage` reads it back on the
+    // error path below. `set()` overwrites in place each turn, so the
+    // most recent failure wins. Child Conversations spawned by the
+    // task tool run in their own `threadMain` with their own slot, so
+    // they cannot clobber the parent's detail.
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
     agent.runLoopStreaming(
         messages,
         registry,
@@ -451,12 +468,13 @@ fn threadMain(
         turn_in_progress,
         model_spec,
         session_id,
+        &detail,
     ) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
         // queue counter and `.done` is still pushed so the UI returns to
         // idle rather than getting stuck.
-        const message = formatAgentErrorMessage(err, model_spec.provider_name, allocator) catch {
+        const message = formatAgentErrorMessage(err, model_spec.provider_name, allocator, &detail) catch {
             _ = queue.dropped.fetchAdd(1, .monotonic);
             queue.tryPush(allocator, .done);
             return;
@@ -1940,32 +1958,33 @@ test "drainEvents joins thread and deinits queue on .done" {
 
 test "formatAgentErrorMessage hints NotLoggedIn with provider name" {
     const allocator = std.testing.allocator;
-    const msg = try formatAgentErrorMessage(error.NotLoggedIn, "openai-oauth", allocator);
+    const msg = try formatAgentErrorMessage(error.NotLoggedIn, "openai-oauth", allocator, null);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("Not signed in. Run: zag --login=openai-oauth", msg);
 }
 
 test "formatAgentErrorMessage hints LoginExpired with provider name" {
     const allocator = std.testing.allocator;
-    const msg = try formatAgentErrorMessage(error.LoginExpired, "openai-oauth", allocator);
+    const msg = try formatAgentErrorMessage(error.LoginExpired, "openai-oauth", allocator, null);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("OAuth token expired. Re-run: zag --login=openai-oauth", msg);
 }
 
 test "formatAgentErrorMessage for ApiError without detail shows the error name" {
     const allocator = std.testing.allocator;
-    // Defensive clear in case a prior test left a detail in the slot.
-    llm.error_detail.clear(allocator);
-    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError", msg);
 }
 
 test "formatAgentErrorMessage for ApiError surfaces stored transport detail" {
     const allocator = std.testing.allocator;
-    const detail = try allocator.dupe(u8, "HTTP 401 (unauthorized): {\"error\":\"bad token\"}");
-    llm.error_detail.set(allocator, detail);
-    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    try detail.set("HTTP 401 (unauthorized): {{\"error\":\"bad token\"}}", .{});
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings(
         "ApiError: HTTP 401 (unauthorized): {\"error\":\"bad token\"}",
@@ -1975,12 +1994,13 @@ test "formatAgentErrorMessage for ApiError surfaces stored transport detail" {
 
 test "formatAgentErrorMessage extracts Codex detail from HTTP 400 body" {
     const allocator = std.testing.allocator;
-    const detail = try allocator.dupe(
-        u8,
-        "HTTP 400 (bad_request): {\"detail\":\"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.\"}",
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    try detail.set(
+        "HTTP 400 (bad_request): {{\"detail\":\"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.\"}}",
+        .{},
     );
-    llm.error_detail.set(allocator, detail);
-    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings(
         "ApiError: The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
@@ -1990,28 +2010,30 @@ test "formatAgentErrorMessage extracts Codex detail from HTTP 400 body" {
 
 test "formatAgentErrorMessage extracts OpenAI error.message shape" {
     const allocator = std.testing.allocator;
-    const detail = try allocator.dupe(
-        u8,
-        "HTTP 401 (unauthorized): {\"error\":{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\"}}",
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    try detail.set(
+        "HTTP 401 (unauthorized): {{\"error\":{{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\"}}}}",
+        .{},
     );
-    llm.error_detail.set(allocator, detail);
-    const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator);
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError: Invalid API key", msg);
 }
 
 test "formatAgentErrorMessage falls through when detail body is not JSON" {
     const allocator = std.testing.allocator;
-    const detail = try allocator.dupe(u8, "HTTP 502 (bad_gateway): upstream gone");
-    llm.error_detail.set(allocator, detail);
-    const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    try detail.set("HTTP 502 (bad_gateway): upstream gone", .{});
+    const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expect(std.mem.indexOf(u8, msg, "HTTP 502") != null);
 }
 
 test "formatAgentErrorMessage falls back to error name for unhinted errors" {
     const allocator = std.testing.allocator;
-    const msg = try formatAgentErrorMessage(error.MalformedResponse, "openai-oauth", allocator);
+    const msg = try formatAgentErrorMessage(error.MalformedResponse, "openai-oauth", allocator, null);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("MalformedResponse", msg);
 }

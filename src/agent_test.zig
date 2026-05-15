@@ -91,7 +91,7 @@ test "callLlm threads telemetry handle through StreamRequest into provider" {
     });
     defer handle.deinit();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, handle, null);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, handle, null, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
@@ -114,7 +114,7 @@ test "callLlm leaves StreamRequest.telemetry null when caller passes null" {
     defer capture.deinit();
     const p = capture.provider();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
@@ -191,7 +191,7 @@ test "callLlm dupes thinking_effort so providers get an owned copy, not the LuaE
     defer capture.deinit();
     const p = capture.provider();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, &engine);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, &engine, null);
     defer response.deinit(allocator);
 
     try std.testing.expect(capture.captured_present);
@@ -246,6 +246,7 @@ test "runLoopStreaming constructs Telemetry per turn with session_id and provide
         &turn_in_progress,
         spec,
         "sess-runloop",
+        null,
     );
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);

@@ -63,6 +63,15 @@ pub fn runLoopStreaming(
     /// for the TUI, the headless harness for `--instruction-file`) keeps
     /// it alive across the loop. Pass `""` from tests that don't care.
     session_id: []const u8,
+    /// Caller-owned error-detail slot. When non-null, provider transport
+    /// writers (`http.zig` non-2xx, `streaming.zig` non-2xx, anthropic
+    /// `handleStreamErrorEvent`, chatgpt `handleFailed`) route the
+    /// upstream status+body into this slot via `error_detail_out` on the
+    /// `Request`/`StreamRequest` struct. `AgentRunner.threadMain` owns it
+    /// across the run and reads it from `formatAgentErrorMessage` after a
+    /// loop error. Tests that don't care about the friendly detail pass
+    /// `null` and the writers fall back to the threadlocal (legacy path).
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
@@ -213,7 +222,7 @@ pub fn runLoopStreaming(
         );
         defer if (filtered_owned) |d| allocator.free(d);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle, lua_engine);
+        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         try emitTokenUsage(response, allocator, queue);
         // Snapshot the latest input token count so the next iteration's
@@ -547,6 +556,13 @@ pub fn callLlm(
     cancel: *agent_events.CancelFlag,
     telemetry_opt: ?*llm.telemetry.Telemetry,
     lua_engine: ?*LuaEngine.LuaEngine,
+    /// Caller-owned slot the provider transport writes a user-facing
+    /// error message into on non-2xx and stream error frames. The agent
+    /// thread (`AgentRunner.threadMain`) owns this across the run and
+    /// reads it back in `formatAgentErrorMessage` after a loop error.
+    /// Threaded through both the streaming and non-streaming Request so
+    /// either path's error surfaces in the same slot.
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !types.LlmResponse {
     var stream_ctx: StreamContext = .{ .queue = queue, .allocator = allocator };
     const callback: llm.StreamCallback = .{
@@ -576,6 +592,7 @@ pub fn callLlm(
         .cancel = cancel,
         .telemetry = telemetry_opt,
         .thinking_effort = thinking_effort,
+        .error_detail_out = error_detail_out,
     };
 
     return provider.callStreaming(&stream_req) catch |streaming_err| {
@@ -591,6 +608,7 @@ pub fn callLlm(
             .tool_definitions = tool_defs,
             .allocator = allocator,
             .thinking_effort = thinking_effort,
+            .error_detail_out = error_detail_out,
         };
         const fallback = try provider.call(&req);
         // If streaming already rendered partial text, discard it so the
