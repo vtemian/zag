@@ -1982,7 +1982,7 @@ test "formatAgentErrorMessage for ApiError surfaces stored transport detail" {
     const allocator = std.testing.allocator;
     var detail = llm.error_detail.ErrorDetail.init(allocator);
     defer detail.deinit();
-    try detail.set("HTTP 401 (unauthorized): {{\"error\":\"bad token\"}}", .{});
+    detail.setOwned(try allocator.dupe(u8, "HTTP 401 (unauthorized): {\"error\":\"bad token\"}"));
     const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings(
@@ -1995,10 +1995,10 @@ test "formatAgentErrorMessage extracts Codex detail from HTTP 400 body" {
     const allocator = std.testing.allocator;
     var detail = llm.error_detail.ErrorDetail.init(allocator);
     defer detail.deinit();
-    try detail.set(
-        "HTTP 400 (bad_request): {{\"detail\":\"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.\"}}",
-        .{},
-    );
+    detail.setOwned(try allocator.dupe(
+        u8,
+        "HTTP 400 (bad_request): {\"detail\":\"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.\"}",
+    ));
     const msg = try formatAgentErrorMessage(error.ApiError, "openai-oauth", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings(
@@ -2011,10 +2011,10 @@ test "formatAgentErrorMessage extracts OpenAI error.message shape" {
     const allocator = std.testing.allocator;
     var detail = llm.error_detail.ErrorDetail.init(allocator);
     defer detail.deinit();
-    try detail.set(
-        "HTTP 401 (unauthorized): {{\"error\":{{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\"}}}}",
-        .{},
-    );
+    detail.setOwned(try allocator.dupe(
+        u8,
+        "HTTP 401 (unauthorized): {\"error\":{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\"}}",
+    ));
     const msg = try formatAgentErrorMessage(error.ApiError, "openai", allocator, &detail);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("ApiError: Invalid API key", msg);
