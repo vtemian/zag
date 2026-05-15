@@ -79,10 +79,8 @@ pub fn handle(
     if (detail) |d| {
         if (error_detail_out) |out| {
             out.set("{s}", .{d}) catch {};
-            allocator.free(d);
-        } else {
-            llm.error_detail.set(allocator, d);
         }
+        allocator.free(d);
     }
 
     callback.on_event(callback.ctx, .{ .err = text });

@@ -345,11 +345,10 @@ pub fn formatAgentErrorMessage(
             // instead of just "ApiError". When the body is a JSON shape
             // we recognise (Codex `detail`, OpenAI/Anthropic
             // `error.message`), unwrap it to the human-readable string;
-            // otherwise show the raw captured detail. Prefer the
-            // caller-owned `ErrorDetail` when wired; fall back to the
-            // threadlocal so legacy paths (tests that have not migrated
-            // yet) keep producing the same string.
-            const detail = if (detail_opt) |d| d.take() else llm.error_detail.take();
+            // otherwise show the raw captured detail. When `detail_opt`
+            // is null the caller did not wire an `ErrorDetail`, so we
+            // just print the bare error name.
+            const detail = if (detail_opt) |d| d.take() else null;
             if (detail) |bytes| {
                 defer allocator.free(bytes);
                 if (std.mem.indexOfScalar(u8, bytes, '{')) |json_start| {

@@ -475,8 +475,8 @@ pub const StreamEmitter = struct {
     /// the existing error path runs.
     telemetry: ?*llm.telemetry.Telemetry = null,
     /// Optional caller-owned destination for the user-facing detail
-    /// string written by `handleFailed`. When null, the writer falls
-    /// back to the `error_detail` threadlocal.
+    /// string written by `handleFailed`. When null, the detail is logged
+    /// and dropped.
     error_detail_out: ?*llm.error_detail.ErrorDetail = null,
 };
 

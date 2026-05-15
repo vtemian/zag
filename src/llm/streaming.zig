@@ -93,8 +93,7 @@ pub const StreamingResponse = struct {
         /// `receiveHead`. When null, the OS default applies.
         timeouts: ?registry.Endpoint.TimeoutConfig = null,
         /// Caller-owned destination for the user-facing detail string on
-        /// non-2xx. When null, the writer falls back to the
-        /// `error_detail` threadlocal so legacy callers keep working.
+        /// non-2xx. When null, the detail is logged and dropped.
         error_detail_out: ?*error_detail.ErrorDetail = null,
     };
 
@@ -299,10 +298,8 @@ pub const StreamingResponse = struct {
                 );
             if (opts.error_detail_out) |out| {
                 out.set("{s}", .{detail}) catch {};
-                allocator.free(detail);
-            } else {
-                error_detail.set(allocator, detail);
             }
+            allocator.free(detail);
 
             // Existing diagnostic log line stays; useful when telemetry
             // is null and the artifact pair won't be written.

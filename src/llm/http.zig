@@ -364,17 +364,15 @@ pub fn httpPostJsonRaw(
 
 /// Send a JSON POST request and return the response body on 2xx, or
 /// `error.ApiError` (with the user-facing detail routed to
-/// `error_detail_out` or the threadlocal fallback) on any other status.
-/// Both providers share this HTTP plumbing; only the URL and extra headers differ.
+/// `error_detail_out` when non-null) on any other status. Both providers
+/// share this HTTP plumbing; only the URL and extra headers differ.
 ///
 /// This is a thin convenience wrapper over `httpPostJsonRaw` for callers
 /// that want the historical 2xx-or-throw shape. Observability code that
 /// needs the body on 4xx/5xx should call `httpPostJsonRaw` directly.
 ///
 /// `error_detail_out` is the caller-owned destination for the user-facing
-/// detail string on non-2xx. When null, the writer falls back to the
-/// `error_detail` threadlocal so callers without a `Request` keep
-/// working unchanged.
+/// detail string on non-2xx. When null, the detail is logged and dropped.
 pub fn httpPostJson(
     url: []const u8,
     body: []const u8,
@@ -395,10 +393,8 @@ pub fn httpPostJson(
     ) catch return error.ApiError;
     if (error_detail_out) |out| {
         out.set("{s}", .{detail}) catch {};
-        allocator.free(detail);
-    } else {
-        error_detail.set(allocator, detail);
     }
+    allocator.free(detail);
     return error.ApiError;
 }
 

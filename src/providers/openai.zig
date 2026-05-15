@@ -1568,9 +1568,8 @@ test "parseSseStream returns ProviderResponseFailed on mid-stream error envelope
     defer sr.pending_line.deinit(allocator);
     defer sr.remainder.deinit(allocator);
 
-    // Drain any prior thread-local error_detail so we observe a clean
-    // hand-off here.
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
 
     const Recorder = struct {
         alloc: Allocator,
@@ -1594,7 +1593,7 @@ test "parseSseStream returns ProviderResponseFailed on mid-stream error envelope
 
     var cancel = std.atomic.Value(bool).init(false);
 
-    const result = parseSseStream(&sr, .{}, allocator, callback, &cancel, null, null);
+    const result = parseSseStream(&sr, .{}, allocator, callback, &cancel, null, &detail);
     try std.testing.expectError(error.ProviderResponseFailed, result);
 
     try std.testing.expect(recorder.saw_err);
@@ -1602,9 +1601,9 @@ test "parseSseStream returns ProviderResponseFailed on mid-stream error envelope
     try std.testing.expect(std.mem.indexOf(u8, recorder.message.items, "too many") != null);
 
     // error_detail is populated for the agent error formatter.
-    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
-    defer allocator.free(detail);
-    try std.testing.expect(detail.len > 0);
+    const got = detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(got);
+    try std.testing.expect(got.len > 0);
 }
 
 test "openai writeMessage emits tool role for tool_result" {
