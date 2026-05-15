@@ -22,6 +22,7 @@ pub const telemetry = @import("llm/telemetry.zig");
 const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
+pub const WireSemantics = registry_mod.WireSemantics;
 pub const freeOAuthSpec = registry_mod.freeOAuthSpec;
 
 const log = std.log.scoped(.llm);
@@ -694,6 +695,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const openai_ep: Endpoint = .{
         .name = "openai",
         .serializer = .openai,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.openai.com/v1/chat/completions",
         .auth = .bearer,
         .headers = &.{},
@@ -705,6 +707,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const ollama_ep: Endpoint = .{
         .name = "ollama",
         .serializer = .openai,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "http://localhost:11434/v1/chat/completions",
         .auth = .none,
         .headers = &.{},
@@ -716,6 +719,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const openai_oauth_ep: Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .{ .oauth = .{
             .issuer = "https://auth.openai.com/oauth/authorize",

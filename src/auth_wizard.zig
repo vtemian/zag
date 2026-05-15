@@ -1397,6 +1397,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         .{
             .name = "openai",
             .serializer = .openai,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://api.openai.com/v1/chat/completions",
             .auth = .bearer,
             .headers = &.{},
@@ -1406,6 +1407,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         .{
             .name = "openrouter",
             .serializer = .openai,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://openrouter.ai/api/v1/chat/completions",
             .auth = .bearer,
             .headers = &.{.{ .name = "X-OpenRouter-Title", .value = "Zag" }},
@@ -1415,6 +1417,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         .{
             .name = "groq",
             .serializer = .openai,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://api.groq.com/openai/v1/chat/completions",
             .auth = .bearer,
             .headers = &.{},
@@ -1424,6 +1427,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         .{
             .name = "ollama",
             .serializer = .openai,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "http://localhost:11434/v1/chat/completions",
             .auth = .none,
             .headers = &.{},
@@ -1433,6 +1437,7 @@ fn seedTestRegistry(allocator: std.mem.Allocator) !llm.Registry {
         .{
             .name = "openai-oauth",
             .serializer = .chatgpt,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://chatgpt.com/backend-api/codex/responses",
             .auth = .{ .oauth = .{
                 .issuer = "https://auth.openai.com/oauth/authorize",

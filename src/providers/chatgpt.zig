@@ -2049,6 +2049,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     const endpoint: llm.Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = mock_url,
         .auth = .{ .oauth = .{
             .issuer = "https://auth.openai.com/oauth/authorize",
@@ -2206,6 +2207,7 @@ fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
     const ep: llm.Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .{ .oauth = .{
             .issuer = "https://auth.openai.com/oauth/authorize",

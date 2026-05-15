@@ -5857,6 +5857,17 @@ pub const LuaEngine = struct {
             log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire});
             return error.LuaError;
         };
+        // Derive wire semantics from the wire string. OpenAI-shaped wires
+        // (`openai`, `chatgpt`) report cached input tokens as a subset of
+        // `prompt_tokens`; Anthropic reports them disjointly. Cost
+        // accounting reads this flag directly (see `llm/cost.zig`). No
+        // Lua-side surface for users to override yet; a future
+        // `wire_semantics = {...}` table can be added if a real wire
+        // diverges from its base.
+        const wire_semantics: llm.WireSemantics = switch (serializer) {
+            .openai, .chatgpt => .{ .cached_overlaps_input = true },
+            .anthropic => .{ .cached_overlaps_input = false },
+        };
 
         const default_model = (try readStringField(lua, 1, "default_model", .required, allocator)) orelse unreachable;
         errdefer allocator.free(default_model);
@@ -5894,6 +5905,7 @@ pub const LuaEngine = struct {
         const ep: llm.Endpoint = .{
             .name = name,
             .serializer = serializer,
+            .wire_semantics = wire_semantics,
             .url = url,
             .auth = auth_val,
             .headers = headers,
