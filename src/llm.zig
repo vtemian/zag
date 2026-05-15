@@ -23,6 +23,7 @@ const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
 pub const WireSemantics = registry_mod.WireSemantics;
+pub const Factory = registry_mod.Factory;
 pub const freeOAuthSpec = registry_mod.freeOAuthSpec;
 
 const log = std.log.scoped(.llm);
@@ -523,47 +524,16 @@ pub fn createProviderFromLuaConfig(
     const auth_path = try allocator.dupe(u8, auth_file_path);
     errdefer allocator.free(auth_path);
 
-    switch (endpoint.serializer) {
-        .anthropic => {
-            const state = try allocator.create(anthropic.AnthropicSerializer);
-            state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = spec.model_id };
-            return .{
-                .provider = state.provider(),
-                .model_id = model_id,
-                .state = state,
-                .auth_path = auth_path,
-                .registry = owned_registry,
-                .allocator = allocator,
-                .serializer = .anthropic,
-            };
-        },
-        .openai => {
-            const state = try allocator.create(openai.OpenAiSerializer);
-            state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = spec.model_id };
-            return .{
-                .provider = state.provider(),
-                .model_id = model_id,
-                .state = state,
-                .auth_path = auth_path,
-                .registry = owned_registry,
-                .allocator = allocator,
-                .serializer = .openai,
-            };
-        },
-        .chatgpt => {
-            const state = try allocator.create(chatgpt.ChatgptSerializer);
-            state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = spec.model_id };
-            return .{
-                .provider = state.provider(),
-                .model_id = model_id,
-                .state = state,
-                .auth_path = auth_path,
-                .registry = owned_registry,
-                .allocator = allocator,
-                .serializer = .chatgpt,
-            };
-        },
-    }
+    const provider = try endpoint.factory(allocator, endpoint, auth_path, spec.model_id);
+    return .{
+        .provider = provider,
+        .model_id = model_id,
+        .state = provider.ptr,
+        .auth_path = auth_path,
+        .registry = owned_registry,
+        .allocator = allocator,
+        .serializer = endpoint.serializer,
+    };
 }
 
 /// Accumulates content blocks and assembles an LlmResponse.
@@ -684,6 +654,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const anthropic_ep: Endpoint = .{
         .name = "anthropic",
         .serializer = .anthropic,
+        .factory = anthropic.create,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
@@ -695,6 +666,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const openai_ep: Endpoint = .{
         .name = "openai",
         .serializer = .openai,
+        .factory = openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.openai.com/v1/chat/completions",
         .auth = .bearer,
@@ -707,6 +679,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const ollama_ep: Endpoint = .{
         .name = "ollama",
         .serializer = .openai,
+        .factory = openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "http://localhost:11434/v1/chat/completions",
         .auth = .none,
@@ -719,6 +692,7 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
     const openai_oauth_ep: Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .factory = chatgpt.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .{ .oauth = .{
@@ -902,6 +876,7 @@ test "Provider.VTable carries deinit; create+deinit round-trips cleanly" {
     const ep: Endpoint = .{
         .name = "test-anthropic",
         .serializer = .anthropic,
+        .factory = anthropic.create,
         .url = "http://localhost",
         .auth = .x_api_key,
         .headers = &.{},
@@ -915,6 +890,26 @@ test "Provider.VTable carries deinit; create+deinit round-trips cleanly" {
     state.* = .{ .endpoint = &owned_ep, .auth_path = "/tmp/x", .model = "m" };
     const provider = state.provider();
 
+    try std.testing.expect(provider.vtable.deinit != null);
+    provider.vtable.deinit.?(provider.ptr, alloc);
+}
+
+test "Endpoint.factory builds Provider whose vtable.deinit frees state" {
+    const alloc = std.testing.allocator;
+    const ep: Endpoint = .{
+        .name = "test-anthropic",
+        .serializer = .anthropic,
+        .factory = anthropic.create,
+        .url = "http://localhost",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{},
+    };
+    const owned_ep = try ep.dupe(alloc);
+    defer owned_ep.free(alloc);
+
+    const provider = try owned_ep.factory(alloc, &owned_ep, "/tmp/x", "m");
     try std.testing.expect(provider.vtable.deinit != null);
     provider.vtable.deinit.?(provider.ptr, alloc);
 }

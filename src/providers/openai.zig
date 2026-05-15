@@ -105,6 +105,20 @@ pub const OpenAiSerializer = struct {
     }
 };
 
+/// Build a Provider whose state is a freshly-allocated `OpenAiSerializer`.
+/// Stored on `Endpoint.factory` for every OpenAI-wire endpoint; the Lua
+/// reader resolves the `wire = "openai"` string to this function pointer.
+pub fn create(
+    allocator: Allocator,
+    endpoint: *const llm.Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) !Provider {
+    const state = try allocator.create(OpenAiSerializer);
+    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    return state.provider();
+}
+
 fn buildRequestBody(
     model: []const u8,
     system_prompt: []const u8,

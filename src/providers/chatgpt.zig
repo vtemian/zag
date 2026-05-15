@@ -164,6 +164,20 @@ pub const ChatgptSerializer = struct {
     }
 };
 
+/// Build a Provider whose state is a freshly-allocated `ChatgptSerializer`.
+/// Stored on `Endpoint.factory` for every ChatGPT-wire endpoint; the Lua
+/// reader resolves the `wire = "chatgpt"` string to this function pointer.
+pub fn create(
+    allocator: Allocator,
+    endpoint: *const llm.Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) !Provider {
+    const state = try allocator.create(ChatgptSerializer);
+    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    return state.provider();
+}
+
 /// Serialize a non-streaming Responses API request body. Uses the legacy
 /// hardcoded reasoning/verbosity defaults so existing call sites (and golden
 /// fixtures) keep producing byte-identical output.
@@ -2049,6 +2063,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     const endpoint: llm.Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .factory = create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = mock_url,
         .auth = .{ .oauth = .{
@@ -2207,6 +2222,7 @@ fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
     const ep: llm.Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .factory = create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .{ .oauth = .{

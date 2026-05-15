@@ -127,12 +127,30 @@ pub fn estimateCost(
 
 // -- Tests -------------------------------------------------------------------
 
+/// Stub factory used by test fixtures in this file. Cost estimation never
+/// invokes the factory, but `Endpoint` literals need a value for the field.
+/// Importing the real stdlib factories from `src/providers/*.zig` would
+/// create a circular import via `llm.zig`.
+fn testStubFactory(
+    allocator: std.mem.Allocator,
+    endpoint: *const Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) anyerror!@import("../llm.zig").Provider {
+    _ = allocator;
+    _ = endpoint;
+    _ = auth_path;
+    _ = model;
+    return error.NotImplemented;
+}
+
 test "estimateCost: looks up per-model rate through registry split on slash" {
     var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-slash",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -167,6 +185,7 @@ test "estimateCost: skips nil cache rates" {
     const ep: Endpoint = .{
         .name = "openai-test-nilcache",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .bearer,
@@ -209,6 +228,7 @@ test "estimateCost: unknown model within known provider returns null" {
     const ep: Endpoint = .{
         .name = "anthropic-test-unknown",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -247,6 +267,7 @@ test "openai cost subtracts cached tokens from input rate" {
     const ep: Endpoint = .{
         .name = "openai-test-cached",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .bearer,
@@ -284,6 +305,7 @@ test "anthropic cost bills cached tokens additively (sanity)" {
     const ep: Endpoint = .{
         .name = "anthropic-test-cached",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -327,6 +349,7 @@ test "cost: cached_overlaps_input read from endpoint.wire_semantics, not seriali
     const overlap_ep: Endpoint = .{
         .name = "overlap-test",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .bearer,
@@ -349,6 +372,7 @@ test "cost: cached_overlaps_input read from endpoint.wire_semantics, not seriali
     const additive_ep: Endpoint = .{
         .name = "additive-test",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = false },
         .url = "https://x",
         .auth = .x_api_key,

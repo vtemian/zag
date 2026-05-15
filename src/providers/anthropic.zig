@@ -139,6 +139,20 @@ pub const AnthropicSerializer = struct {
     }
 };
 
+/// Build a Provider whose state is a freshly-allocated `AnthropicSerializer`.
+/// Stored on `Endpoint.factory` for every Anthropic-wire endpoint; the Lua
+/// reader resolves the `wire = "anthropic"` string to this function pointer.
+pub fn create(
+    allocator: Allocator,
+    endpoint: *const llm.Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) !Provider {
+    const state = try allocator.create(AnthropicSerializer);
+    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    return state.provider();
+}
+
 /// Serializes the system prompt, messages, and tool definitions into a JSON
 /// request body suitable for the Anthropic Messages API. The `system_stable`
 /// half is marked with `cache_control: {type: "ephemeral"}` so Anthropic

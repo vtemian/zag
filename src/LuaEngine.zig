@@ -5400,6 +5400,28 @@ pub const LuaEngine = struct {
         return null;
     }
 
+    /// Resolve a Lua `wire = "..."` string to the matching stdlib factory
+    /// pointer. The lookup is the only place that hard-codes which wire
+    /// names ship in-tree; an out-of-tree wire would add an entry to
+    /// `stdlib_factories` (or, in a future iteration, register itself
+    /// through a Lua API). Returns `null` for unknown wire names so the
+    /// caller surfaces a `LuaError` with the same shape as before.
+    const StdlibFactory = struct {
+        name: []const u8,
+        factory: llm.Factory,
+    };
+    const stdlib_factories: []const StdlibFactory = &.{
+        .{ .name = "anthropic", .factory = @import("providers/anthropic.zig").create },
+        .{ .name = "openai", .factory = @import("providers/openai.zig").create },
+        .{ .name = "chatgpt", .factory = @import("providers/chatgpt.zig").create },
+    };
+    fn resolveWireFactory(s: []const u8) ?llm.Factory {
+        for (stdlib_factories) |entry| {
+            if (std.mem.eql(u8, s, entry.name)) return entry.factory;
+        }
+        return null;
+    }
+
     /// Read the `auth = { kind = "...", ... }` subtable from the Lua table at
     /// `table_idx` and produce an `Endpoint.Auth` value.
     ///
@@ -5857,6 +5879,10 @@ pub const LuaEngine = struct {
             log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire});
             return error.LuaError;
         };
+        const factory = resolveWireFactory(wire) orelse {
+            log.warn("zag.provider(): no stdlib factory for wire '{s}'", .{wire});
+            return error.LuaError;
+        };
         // Derive wire semantics from the wire string. OpenAI-shaped wires
         // (`openai`, `chatgpt`) report cached input tokens as a subset of
         // `prompt_tokens`; Anthropic reports them disjointly. Cost
@@ -5905,6 +5931,7 @@ pub const LuaEngine = struct {
         const ep: llm.Endpoint = .{
             .name = name,
             .serializer = serializer,
+            .factory = factory,
             .wire_semantics = wire_semantics,
             .url = url,
             .auth = auth_val,
@@ -16346,6 +16373,7 @@ test "bootstrap is a no-op when config.lua already populated the registry" {
     const ep: llm.Endpoint = .{
         .name = "anthropic",
         .serializer = .anthropic,
+        .factory = llm.anthropic.create,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{},

@@ -237,6 +237,7 @@ fn testHintRegistry(allocator: std.mem.Allocator) !llm.Registry {
     const openai_ep: llm.Endpoint = .{
         .name = "openai",
         .serializer = .openai,
+        .factory = llm.openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.openai.com/v1/chat/completions",
         .auth = .bearer,
@@ -249,6 +250,7 @@ fn testHintRegistry(allocator: std.mem.Allocator) !llm.Registry {
     const oauth_ep: llm.Endpoint = .{
         .name = "openai-oauth",
         .serializer = .chatgpt,
+        .factory = llm.chatgpt.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
         .auth = .{ .oauth = .{

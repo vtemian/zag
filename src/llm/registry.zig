@@ -10,6 +10,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Serializer = @import("../llm.zig").Serializer;
+const Provider = @import("../llm.zig").Provider;
+
+/// Signature of every provider's `create` function. Endpoints carry one of
+/// these so `createProviderFromLuaConfig` can construct the right provider
+/// state without switching on a closed enum. Out-of-tree wire modules point
+/// the field at their own `create` function; the stdlib factories live in
+/// `src/providers/*.zig`.
+pub const Factory = *const fn (
+    std.mem.Allocator,
+    *const Endpoint,
+    []const u8,
+    []const u8,
+) anyerror!Provider;
 
 /// Per-endpoint wire-protocol semantics that the rest of the runtime
 /// consults instead of branching on `Serializer` identity. New wires
@@ -61,6 +74,11 @@ pub const Endpoint = struct {
     /// because Zig 0.15's `std.http.Client` does not expose the
     /// pre-handshake socket.
     timeouts: TimeoutConfig = .{},
+    /// Build a Provider from this endpoint. Set by the registry/Lua reader
+    /// to the matching stdlib factory; out-of-tree wire modules can also
+    /// point this at their own `create` function. Copied by value in
+    /// `Endpoint.dupe` (POD function pointer).
+    factory: Factory,
 
     /// How the API key is sent in HTTP headers. The `.oauth` variant carries
     /// the full `OAuthSpec` so auth.zig / oauth.zig / llm/http.zig can drive
@@ -339,6 +357,8 @@ pub const Endpoint = struct {
             },
             // TimeoutConfig holds only u32 fields; copy by value.
             .timeouts = self.timeouts,
+            // Function pointer; copy by value.
+            .factory = self.factory,
         };
     }
 
@@ -572,12 +592,31 @@ pub const Registry = struct {
     }
 };
 
+/// Stub factory used by test fixtures in this file. The tests only exercise
+/// dupe/free and Registry CRUD, never the factory itself, so we hand back a
+/// trivially-allocatable provider with a no-op vtable. Importing the real
+/// stdlib factories from `src/providers/*.zig` would create a circular
+/// import (providers depend on `llm.zig`, which re-exports this module).
+fn testStubFactory(
+    allocator: std.mem.Allocator,
+    endpoint: *const Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) anyerror!Provider {
+    _ = allocator;
+    _ = endpoint;
+    _ = auth_path;
+    _ = model;
+    return error.NotImplemented;
+}
+
 test "Endpoint.dupe creates independent copy" {
     const allocator = std.testing.allocator;
 
     const original = Endpoint{
         .name = "test",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://example.com",
         .auth = .bearer,
@@ -679,6 +718,7 @@ test "Endpoint.dupe/free round-trips the .oauth variant's nested strings" {
     const original: Endpoint = .{
         .name = "oauth-test",
         .serializer = .chatgpt,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .{ .oauth = .{
@@ -725,6 +765,7 @@ test "Endpoint.dupe copies default_model and models slice" {
     const original: Endpoint = .{
         .name = "test",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .x_api_key,
@@ -760,6 +801,7 @@ test "Registry.add takes ownership of an already-dupe'd endpoint" {
     const raw: Endpoint = .{
         .name = "custom",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
@@ -780,6 +822,7 @@ test "Registry.remove drops an existing entry and returns true" {
     const ep: Endpoint = .{
         .name = "removable",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
@@ -806,6 +849,7 @@ test "Registry.remove followed by add implements override" {
     const seed: Endpoint = .{
         .name = "anthropic",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{},
@@ -817,6 +861,7 @@ test "Registry.remove followed by add implements override" {
     const replacement: Endpoint = .{
         .name = "anthropic",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://custom.example.com/messages",
         .auth = .x_api_key,
         .headers = &.{},
@@ -837,6 +882,7 @@ test "Registry.dupe produces an independent deep copy" {
     const ep: Endpoint = .{
         .name = "anthropic",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
         .headers = &.{},
@@ -859,6 +905,7 @@ test "Registry.add rejects duplicate names" {
     const raw: Endpoint = .{
         .name = "dup",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
@@ -875,6 +922,7 @@ test "ModelRate dupe round trips label and recommended" {
     var ep: Endpoint = .{
         .name = "prov",
         .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://example.com",
         .auth = .none,
         .headers = &.{},
@@ -933,6 +981,7 @@ test "Endpoint.dupe round-trips response_fields and echo_field" {
     const original = Endpoint{
         .name = "moonshot",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.moonshot.ai/v1/chat/completions",
         .auth = .bearer,
@@ -966,6 +1015,7 @@ test "Endpoint.dupe round-trips effort_request_field" {
     const original = Endpoint{
         .name = "moonshot",
         .serializer = .openai,
+        .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.moonshot.ai/v1/chat/completions",
         .auth = .bearer,
