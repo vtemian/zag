@@ -422,26 +422,20 @@ fn fireToolGate(
     if (engine.tool_gate_handler == null) return null;
 
     var req = agent_events.ToolGateRequest.init(model, available_tools, allocator);
-    queue.push(.{ .tool_gate_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                req.freeResult();
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.ToolGateRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        else => return err,
+    };
     if (req.error_name) |name| {
         log.warn("tool gate handler failed: {s}", .{name});
         req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    // Transfer ownership of the duped allowlist to the caller. Clearing
+    // the slot makes any subsequent freeResult() a safe no-op.
+    req.result = null;
+    return out;
 }
 
 /// Build a filtered `tool_defs` slice keyed by the gate's allowlist.
