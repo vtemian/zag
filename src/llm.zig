@@ -418,16 +418,8 @@ pub const ProviderResult = struct {
         self.allocator.free(self.auth_path);
         self.allocator.free(self.model_id);
         self.registry.deinit();
-        switch (self.serializer) {
-            .anthropic => {
-                self.allocator.destroy(@as(*anthropic.AnthropicSerializer, @ptrCast(@alignCast(self.state))));
-            },
-            .openai => {
-                self.allocator.destroy(@as(*openai.OpenAiSerializer, @ptrCast(@alignCast(self.state))));
-            },
-            .chatgpt => {
-                self.allocator.destroy(@as(*chatgpt.ChatgptSerializer, @ptrCast(@alignCast(self.state))));
-            },
+        if (self.provider.vtable.deinit) |deinit_fn| {
+            deinit_fn(self.provider.ptr, self.allocator);
         }
     }
 };
