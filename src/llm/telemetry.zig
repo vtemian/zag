@@ -40,12 +40,17 @@ pub const StreamErrorKind = enum {
     chatgpt_response_failed,
     /// ChatGPT Responses API `response.incomplete` event payload.
     chatgpt_response_incomplete,
+    /// OpenAI Chat Completions mid-stream error frame: an SSE
+    /// `data: {"error":{...}}` envelope delivered after the stream has
+    /// already started (instead of an HTTP error status).
+    openai_stream_error,
 
     pub fn toString(self: StreamErrorKind) []const u8 {
         return switch (self) {
             .anthropic_error => "anthropic_error",
             .chatgpt_response_failed => "chatgpt_response_failed",
             .chatgpt_response_incomplete => "chatgpt_response_incomplete",
+            .openai_stream_error => "openai_stream_error",
         };
     }
 };
