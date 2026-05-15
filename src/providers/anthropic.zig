@@ -573,21 +573,10 @@ fn handleStreamErrorEvent(
     data: []const u8,
     allocator: Allocator,
 ) !void {
-    // Telemetry classifies and dumps the artifact. When telemetry is
-    // absent (mostly tests), classify directly so the user-facing string
-    // still benefits from the structured message.
-    const class: llm.error_class.ErrorClass = if (telemetry) |t|
-        t.onStreamError(.anthropic_error, data) catch |err| blk: {
-            log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
-            break :blk llm.error_class.classify(0, data, &.{});
-        }
-    else
-        llm.error_class.classify(0, data, &.{});
-
-    // The agent-loop `.err` callback keeps the provider-tagged string so
-    // logs and replays can distinguish anthropic stream errors from
-    // generic transport failures. Best-effort parse: we never fail the
-    // outer error path on a malformed envelope.
+    // Best-effort parse: we never fail the outer error path on a
+    // malformed envelope. The provider-tagged string is what observers
+    // see in the `.err` callback so logs and replays can distinguish
+    // anthropic stream errors from generic transport failures.
     var parsed_kind: []const u8 = "error";
     var parsed_message: []const u8 = data;
 
@@ -614,14 +603,8 @@ fn handleStreamErrorEvent(
         .{ parsed_kind, parsed_message },
     );
     defer allocator.free(text);
-    callback.on_event(callback.ctx, .{ .err = text });
 
-    // The UI-bound detail goes through the classifier so codex-equivalent
-    // overflows render with the friendly text. On classification failure
-    // fall back to the provider-tagged string we already have on hand.
-    const detail = llm.error_class.userMessage(class, allocator) catch
-        try allocator.dupe(u8, text);
-    llm.error_detail.set(allocator, detail);
+    llm.stream_error.handle(allocator, .anthropic_error, data, data, text, telemetry, callback);
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.

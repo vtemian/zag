@@ -629,17 +629,6 @@ fn handleStreamError(
     data: []const u8,
     allocator: Allocator,
 ) !void {
-    // Telemetry classifies and dumps the artifact. When telemetry is
-    // absent (mostly tests), classify directly so the user-facing string
-    // still benefits from the structured message.
-    const class: llm.error_class.ErrorClass = if (telemetry) |t|
-        t.onStreamError(.openai_stream_error, data) catch |err| blk: {
-            log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
-            break :blk llm.error_class.classify(0, data, &.{});
-        }
-    else
-        llm.error_class.classify(0, data, &.{});
-
     // Best-effort parse of code+message for the .err callback string.
     // We never fail the outer error path on a malformed envelope.
     var parsed_code: []const u8 = "error";
@@ -672,14 +661,8 @@ fn handleStreamError(
         .{ parsed_code, parsed_message },
     );
     defer allocator.free(text);
-    callback.on_event(callback.ctx, .{ .err = text });
 
-    // UI-bound detail flows through the classifier so context-overflow
-    // envelopes surface with the friendly hint. On classification failure
-    // fall back to the provider-tagged string.
-    const detail = llm.error_class.userMessage(class, allocator) catch
-        try allocator.dupe(u8, text);
-    llm.error_detail.set(allocator, detail);
+    llm.stream_error.handle(allocator, .openai_stream_error, data, data, text, telemetry, callback);
 }
 
 // -- Tests -------------------------------------------------------------------

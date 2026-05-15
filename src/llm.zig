@@ -19,6 +19,7 @@ pub const http = @import("llm/http.zig");
 pub const error_detail = @import("llm/error_detail.zig");
 pub const error_class = @import("llm/error_class.zig");
 pub const telemetry = @import("llm/telemetry.zig");
+pub const stream_error = @import("llm/stream_error.zig");
 const registry_mod = @import("llm/registry.zig");
 pub const Endpoint = registry_mod.Endpoint;
 pub const Registry = registry_mod.Registry;
