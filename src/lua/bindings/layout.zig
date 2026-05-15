@@ -785,28 +785,6 @@ fn readOptionalBoolField(lua: *Lua, tbl: i32, comptime name: [:0]const u8, compt
     };
 }
 
-/// Read an integer field from a Lua table at stack index `tbl`,
-/// raising a typed Lua error on miss / non-integer / negative.
-/// Shared between the various `zag.layout.float` field readers so
-/// the error messages stay uniform. Pops the field after read.
-fn readU16Field(lua: *Lua, tbl: i32, comptime name: [:0]const u8, comptime op: []const u8) u16 {
-    _ = lua.getField(tbl, name);
-    defer lua.pop(1);
-    if (lua.typeOf(-1) != .number) {
-        lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{});
-    }
-    const n = lua.toInteger(-1) catch {
-        lua.raiseErrorStr(op ++ ": " ++ name ++ " must be an integer", .{});
-    };
-    if (n < 0) {
-        lua.raiseErrorStr(op ++ ": " ++ name ++ " must be >= 0", .{});
-    }
-    if (n > std.math.maxInt(u16)) {
-        lua.raiseErrorStr(op ++ ": " ++ name ++ " exceeds u16 range", .{});
-    }
-    return @intCast(n);
-}
-
 /// `zag.layout.resize(id, ratio)`: apply a new split ratio to the
 /// split identified by `id`. Non-split handles are rejected by the
 /// window manager.
