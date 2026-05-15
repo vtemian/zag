@@ -126,10 +126,10 @@ pub fn init() !Terminal {
     // 9. Install SIGWINCH handler
     installSigwinchHandler();
 
-    // 8. Detect 24-bit color capability from $COLORTERM.
+    // 10. Detect 24-bit color capability from $COLORTERM.
     true_color = detectTrueColor();
 
-    // 9. Query initial terminal size
+    // 11. Query initial terminal size
     const size = getSize() catch |err| blk: {
         log.warn("getSize failed ({s}), falling back to 24x80", .{@errorName(err)});
         break :blk Size{ .rows = 24, .cols = 80 };
