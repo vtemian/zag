@@ -829,28 +829,20 @@ fn fireJitContextRequest(
         is_error,
         allocator,
     );
-    // Queue-full means the main loop is saturated; skip the round-trip
-    // rather than parking on `done` that nobody will signal.
-    queue.push(.{ .jit_context_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                if (req.result) |attached| allocator.free(attached);
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.JitContextRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("jit context handler '{s}' failed: {s}", .{ tc.name, name });
-        if (req.result) |attached| allocator.free(attached);
+        req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    // Transfer ownership of the duped attachment to the caller. Clearing
+    // the slot makes any subsequent freeResult() a safe no-op.
+    req.result = null;
+    return out;
 }
 
 /// Fire `zag.tools.transform_output` for one tool call and block on a
