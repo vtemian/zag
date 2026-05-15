@@ -329,7 +329,7 @@ fn tick(
                 if (self.handleKey(k) == .quit) running.* = false;
             },
             .mouse => |m| self.handleMouse(m),
-            .paste => |bytes| self.handlePaste(bytes),
+            .paste => |paste| self.handlePaste(paste.content, paste.truncated),
             else => {},
         }
     }
@@ -762,8 +762,11 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 /// insert mode; in normal mode a stray paste is dropped on purpose (it
 /// would otherwise land as input-that-looks-like-commands). The bytes
 /// are a borrowed slice into the parser's paste buffer and are only
-/// valid for this call.
-fn handlePaste(self: *EventOrchestrator, bytes: []const u8) void {
+/// valid for this call. `parser_dropped` reports how many bytes the
+/// input parser already trimmed off (PASTE_BUF_SIZE overflow); we hand
+/// it to `appendPaste` so the WindowManager can surface the drop on
+/// the status row.
+fn handlePaste(self: *EventOrchestrator, bytes: []const u8, parser_dropped: usize) void {
     self.window_manager.transient_status_len = 0;
     if (self.window_manager.current_mode != .insert) return;
     const focused = self.window_manager.getFocusedPanePtr();
@@ -771,7 +774,7 @@ fn handlePaste(self: *EventOrchestrator, bytes: []const u8) void {
     // focused. Submit-side gating still applies (only agent panes
     // submit), so a paste into a scratch pane is harmless: it sits in
     // the draft until focus moves or the user clears it.
-    focused.appendPaste(bytes);
+    focused.appendPaste(bytes, parser_dropped);
 }
 
 fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {

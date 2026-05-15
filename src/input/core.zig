@@ -19,11 +19,19 @@ pub const Event = union(enum) {
     mouse: MouseEvent,
     /// The terminal was resized.
     resize: struct { rows: u16, cols: u16 },
-    /// Raw bytes between a CSI 200~ / CSI 201~ pair. The slice is a
+    /// Raw bytes between a CSI 200~ / CSI 201~ pair. `content` is a
     /// borrowed view into the owning `Parser`'s paste buffer and is
     /// valid only until the next `Parser.feedBytes` call, so consumers
-    /// must copy immediately (e.g., into a buffer's draft).
-    paste: []const u8,
+    /// must copy immediately (e.g., into a buffer's draft). `truncated`
+    /// counts bytes the parser dropped because the paste exceeded
+    /// `PASTE_BUF_SIZE`; consumers surface this so silent truncation
+    /// becomes visible to the user.
+    paste: struct {
+        /// Captured paste bytes, capped at `PASTE_BUF_SIZE`.
+        content: []const u8,
+        /// Bytes the parser had to drop on overflow; 0 means clean paste.
+        truncated: usize = 0,
+    },
     /// No event available (non-blocking read returned nothing).
     none,
 };

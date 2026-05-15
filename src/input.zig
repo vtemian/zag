@@ -24,6 +24,7 @@ pub const parseBytes = core.parseBytes;
 
 pub const Parser = parser_mod.Parser;
 pub const PARSER_BUF_SIZE = parser_mod.PARSER_BUF_SIZE;
+pub const PASTE_BUF_SIZE = parser_mod.PASTE_BUF_SIZE;
 
 // -- Tests -------------------------------------------------------------------
 
@@ -165,7 +166,10 @@ test "Parser emits a single paste event for a bracketed paste block" {
     p.feedBytes(input_bytes, 0);
     const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;
     switch (event) {
-        .paste => |bytes| try std.testing.expectEqualSlices(u8, body, bytes),
+        .paste => |paste| {
+            try std.testing.expectEqualSlices(u8, body, paste.content);
+            try std.testing.expectEqual(@as(usize, 0), paste.truncated);
+        },
         else => return error.TestUnexpectedResult,
     }
     // After emitting the paste, no further events are pending.
@@ -180,7 +184,7 @@ test "Parser handles a bracketed paste split across reads" {
     p.feedBytes("lo\x1b[201~", 0);
     const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;
     switch (event) {
-        .paste => |bytes| try std.testing.expectEqualSlices(u8, "hello", bytes),
+        .paste => |paste| try std.testing.expectEqualSlices(u8, "hello", paste.content),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -193,9 +197,56 @@ test "Parser: raw ESC inside a paste is not flushed by the ESC timeout" {
     // bypasses it and still emits the paste intact.
     const event = p.nextEvent(1000) orelse return error.TestUnexpectedResult;
     switch (event) {
-        .paste => |bytes| try std.testing.expectEqualSlices(u8, body, bytes),
+        .paste => |paste| try std.testing.expectEqualSlices(u8, body, paste.content),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "Parser emits paste with truncated count when content exceeds PASTE_BUF_SIZE" {
+    // Pasting more than the parser's PASTE_BUF_SIZE must still emit a
+    // paste event capped at the buffer size, and surface the number of
+    // bytes dropped so the consumer can warn the user. The feed runs
+    // through `feedBytes` in 64-byte chunks (matching production's
+    // READ_BUF_SIZE) so the in-paste branch flushes incrementally
+    // instead of overflowing the 128-byte pending buffer.
+    const allocator = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendNTimes(allocator, 'A', parser_mod.PASTE_BUF_SIZE + 100);
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(allocator);
+    try feed.appendSlice(allocator, "\x1b[200~");
+    try feed.appendSlice(allocator, body.items);
+    try feed.appendSlice(allocator, "\x1b[201~");
+
+    // Silence the per-chunk `paste truncated` warns from
+    // appendToPasteBuf; the behaviour under test is the emitted event's
+    // truncated count, not the log spam.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var p: Parser = .{};
+    var offset: usize = 0;
+    while (offset < feed.items.len) {
+        const chunk_end = @min(offset + 64, feed.items.len);
+        p.feedBytes(feed.items[offset..chunk_end], 0);
+        // Drain any events the chunk produced so the in-paste state
+        // makes progress.
+        while (p.nextEvent(0)) |ev| {
+            switch (ev) {
+                .paste => |paste| {
+                    try std.testing.expectEqual(@as(usize, parser_mod.PASTE_BUF_SIZE), paste.content.len);
+                    try std.testing.expectEqual(@as(usize, 100), paste.truncated);
+                    return;
+                },
+                else => {},
+            }
+        }
+        offset = chunk_end;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "parse ASCII character 'A'" {
