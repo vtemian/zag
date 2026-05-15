@@ -420,14 +420,14 @@ pub const ProviderResult = struct {
 /// `default_model` is the model string the user set via
 /// `zag.set_default_model("prov/id")` (null falls back to
 /// `anthropic/claude-sonnet-4-20250514`). Credentials are not loaded
-/// eagerly here; the serializer holds the path and resolves fresh bytes
+/// eagerly here; the provider holds the path and resolves fresh bytes
 /// per request via `buildHeaders`. A single up-front existence check keeps
 /// the fail-fast behaviour for api-key providers: a missing entry surfaces
 /// as `error.MissingCredential` before the TUI boots.
 /// Endpoints whose `auth` discriminator is `.none` (e.g. Ollama) skip the
 /// credential lookup entirely. The returned `ProviderResult` owns the duped
 /// model string, the duped auth-file path, the endpoint registry, and the
-/// serializer state.
+/// provider state.
 ///
 /// Construct the default `auth.json` path in `buf` as
 /// `$HOME/.config/zag/auth.json`, falling back to `./.config/zag/auth.json`
