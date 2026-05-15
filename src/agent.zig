@@ -916,26 +916,18 @@ fn fireLoopDetect(
         identical_streak,
         allocator,
     );
-    queue.push(.{ .loop_detect_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                req.freeResult();
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.LoopDetectRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("loop detect handler failed: {s}", .{name});
         req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    req.result = null; // transfer ownership; freeResult becomes a no-op
+    return out;
 }
 
 /// Fire `zag.compact.strategy` at the top of the next iteration when
