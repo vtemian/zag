@@ -2023,9 +2023,8 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     });
     defer t.deinit();
 
-    // Drain any error_detail set by prior tests so we observe a clean
-    // hand-off here.
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
 
     const Recorder = struct {
         alloc: Allocator,
@@ -2048,7 +2047,7 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     const callback: llm.StreamCallback = .{ .ctx = &recorder, .on_event = &Recorder.onEvent };
 
     const envelope = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"the assistant is overloaded\"}}";
-    try handleStreamErrorEvent(callback, t, envelope, allocator, null);
+    try handleStreamErrorEvent(callback, t, envelope, allocator, &detail);
 
     try std.testing.expect(t.had_error);
     // Some classification kind is set; exact tag depends on substring rules
@@ -2069,9 +2068,9 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     // detail flows through `error_class.userMessage` now, so for an
     // unclassified envelope it falls into the `.unknown` bucket whose
     // user message names the log path.
-    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
-    defer allocator.free(detail);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "Check ~/.zag/logs") != null);
+    const got = detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Check ~/.zag/logs") != null);
 }
 
 test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
@@ -2088,17 +2087,18 @@ test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
     var sink: u8 = 0;
     const callback: llm.StreamCallback = .{ .ctx = &sink, .on_event = &Sink.onEvent };
 
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
 
     // Use a context-overflow envelope so the classifier produces a
     // friendly user message we can assert against. A bare "boom" body
     // would route to `.unknown` whose message names ~/.zag/logs.
     const envelope = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"prompt is too long\"}}";
-    try handleStreamErrorEvent(callback, null, envelope, allocator, null);
+    try handleStreamErrorEvent(callback, null, envelope, allocator, &detail);
 
-    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
-    defer allocator.free(detail);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "Context exceeds the model's window") != null);
+    const got = detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Context exceeds the model's window") != null);
 }
 
 test "anthropic writeMessage escapes tu.id, tu.name, and tr.tool_use_id" {

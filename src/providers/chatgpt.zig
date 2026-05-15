@@ -1337,6 +1337,7 @@ const DispatchFixture = struct {
     output_tokens: u32,
     recorder: EventRecorder,
     telemetry: ?*llm.telemetry.Telemetry = null,
+    error_detail_out: ?*llm.error_detail.ErrorDetail = null,
 
     fn init(allocator: Allocator) DispatchFixture {
         return .{
@@ -1367,6 +1368,7 @@ const DispatchFixture = struct {
             .output_tokens = &self.output_tokens,
             .callback = self.recorder.callback(),
             .telemetry = self.telemetry,
+            .error_detail_out = self.error_detail_out,
         };
         for (fixtures) |f| {
             try dispatchEvent(.{ .event_type = f.event_type, .data = f.data }, &emitter);
@@ -1454,10 +1456,11 @@ test "chatgpt SSE: response.failed emits err with code and message" {
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
 
-    // handleFailed populates error_detail via the classifier; drain prior
-    // values and reclaim what we wrote so testing.allocator stays leak-free.
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
-    defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
+    // handleFailed writes the user-facing detail into the caller-owned
+    // ErrorDetail; the deinit reclaims whatever the classifier produced.
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    fx.error_detail_out = &detail;
 
     // `response.failed` now terminates dispatch with ProviderResponseFailed;
     // the `.err` callback still fires before the error propagates.
@@ -1482,8 +1485,9 @@ test "chatgpt SSE: response.failed returns error to caller" {
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
 
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
-    defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    fx.error_detail_out = &detail;
 
     // Accumulate a text delta first so we also exercise the outer cleanup
     // path that frees partial blocks on the error return.
@@ -2382,9 +2386,9 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
     defer fx.deinit(allocator);
     fx.telemetry = t;
 
-    // Drain any error_detail set by prior tests so leak detection here
-    // sees only what this test produces.
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    fx.error_detail_out = &detail;
 
     const envelope = "{\"response\":{\"id\":\"r_99\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too big\"}}}";
     const result = fx.run(allocator, &.{
@@ -2397,9 +2401,9 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
 
     // The classifier saw the flattened envelope and produced the
     // context-overflow user message; that's what the UI surfaces.
-    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
-    defer allocator.free(detail);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "Context exceeds the model's window") != null);
+    const got = detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Context exceeds the model's window") != null);
 
     // The artifact landed alongside the (test) log path.
     const expected = (try file_log.artifactPath(allocator, ".turn-6.stream-error.json")) orelse
@@ -2469,8 +2473,9 @@ test "chatgpt SSE: response.failed without telemetry still terminates with Provi
     var fx = DispatchFixture.init(allocator);
     defer fx.deinit(allocator);
 
-    if (llm.error_detail.take()) |prev| allocator.free(prev);
-    defer if (llm.error_detail.take()) |bytes| allocator.free(bytes);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    fx.error_detail_out = &detail;
 
     // Telemetry is null: confirm the existing error path is unaffected.
     const result = fx.run(allocator, &.{
