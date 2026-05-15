@@ -323,6 +323,13 @@ fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
 ///
 /// Comptime contract: `T` must have a `done` field and a `freeResult`
 /// method. Both checks fail the build, not at runtime.
+///
+/// Liveness invariant: a main-thread dispatcher (today
+/// `AgentRunner.dispatchHookRequests`) must eventually drain the queue
+/// and call `req.done.set()`. Without that, the wait loop spins on the
+/// 50ms cadence forever when `cancel` is also never set. Cheap to spin,
+/// but a refactor that decouples the dispatcher must preserve this
+/// guarantee.
 fn marshalRequest(
     comptime T: type,
     req: *T,
@@ -402,12 +409,11 @@ fn fireLifecycleHook(
     }
 }
 
-/// Fire `zag.tools.gate` once per turn before `callLlm` and block on
-/// a main-thread round-trip. Returns the duped allowlist (caller owns
-/// outer slice + every interior string; release via the helper on the
-/// `ToolGateRequest` or by walking the slice manually) or null when no
-/// handler is registered, the handler returned nil/empty, or it
-/// errored. Skips the round-trip entirely when no engine is present
+/// Fire `zag.tools.gate` once per turn before `callLlm` via
+/// `marshalRequest`. Returns the duped allowlist (caller owns outer
+/// slice + every interior string) or null when no handler is registered,
+/// the handler returned nil/empty, errored, or the event queue was
+/// saturated. Skips the round-trip entirely when no engine is present
 /// or the gate slot is empty so the no-op fast path stays cheap.
 fn fireToolGate(
     lua_engine: ?*LuaEngine.LuaEngine,
@@ -802,12 +808,12 @@ fn firePostHook(
     };
 }
 
-/// Fire `zag.context.on_tool_result` for one tool call and block on a
-/// main-thread round-trip. Mirrors `firePostHook`'s cancel-poll cadence.
-/// Returns the duped attachment string (caller owns) or null when no
-/// handler is registered, the handler returned nil, or the handler
-/// errored. Skips the round-trip entirely when no handler is registered
-/// for `tc.name` so the no-op fast path stays cheap.
+/// Fire `zag.context.on_tool_result` for one tool call via
+/// `marshalRequest`. Returns the duped attachment string (caller owns)
+/// or null when no handler is registered, the handler returned nil,
+/// errored, or the event queue was saturated. Skips the round-trip
+/// entirely when no handler is registered for `tc.name` so the no-op
+/// fast path stays cheap.
 fn fireJitContextRequest(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
@@ -844,14 +850,14 @@ fn fireJitContextRequest(
     return out;
 }
 
-/// Fire `zag.tools.transform_output` for one tool call and block on a
-/// main-thread round-trip. Mirrors `fireJitContextRequest`'s structure;
-/// the only semantic difference belongs to the caller, which REPLACES
-/// the tool output rather than appending. Returns the duped replacement
-/// string (caller owns) or null when no handler is registered, the
-/// handler returned nil, or the handler errored. Skips the round-trip
-/// entirely when no handler is registered for `tc.name` so the no-op
-/// fast path stays cheap.
+/// Fire `zag.tools.transform_output` for one tool call via
+/// `marshalRequest`. The handler's returned string REPLACES the tool
+/// output (semantic difference from `fireJitContextRequest`, which
+/// appends). Returns the duped replacement (caller owns) or null when
+/// no handler is registered, the handler returned nil, errored, or the
+/// event queue was saturated. Skips the round-trip entirely when no
+/// handler is registered for `tc.name` so the no-op fast path stays
+/// cheap.
 fn fireToolTransformRequest(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
@@ -888,11 +894,11 @@ fn fireToolTransformRequest(
     return out;
 }
 
-/// Fire `zag.loop.detect` after the most recent tool execution and
-/// block on a main-thread round-trip. Returns the decoded `LoopAction`
-/// (caller owns any heap bytes inside, e.g. `reminder` text) or null
-/// when no handler is registered, the handler returned nil, or the
-/// handler errored. Skips the round-trip entirely when no engine is
+/// Fire `zag.loop.detect` after the most recent tool execution via
+/// `marshalRequest`. Returns the decoded `LoopAction` (caller owns any
+/// heap bytes inside, e.g. `reminder` text) or null when no handler is
+/// registered, the handler returned nil, errored, or the event queue
+/// was saturated. Skips the round-trip entirely when no engine is
 /// present or the detector slot is empty so the no-op fast path stays
 /// cheap.
 fn fireLoopDetect(
