@@ -771,10 +771,15 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 /// valid for this call. `parser_dropped` reports how many bytes the
 /// input parser already trimmed off (PASTE_BUF_SIZE overflow); we hand
 /// it to `appendPaste` so the WindowManager can surface the drop on
-/// the status row.
+/// the status row. In non-insert mode the paste body goes nowhere but
+/// parser-level truncation must still surface, otherwise a 30 KiB
+/// paste over the cap vanishes with zero user feedback.
 fn handlePaste(self: *EventOrchestrator, bytes: []const u8, parser_dropped: usize) void {
     self.window_manager.transient_status_len = 0;
-    if (self.window_manager.current_mode != .insert) return;
+    if (self.window_manager.current_mode != .insert) {
+        if (parser_dropped > 0) self.window_manager.setPasteTruncatedStatus(parser_dropped);
+        return;
+    }
     const focused = self.window_manager.getFocusedPanePtr();
     // Drafts are pane-scoped now; paste lands on whichever pane is
     // focused. Submit-side gating still applies (only agent panes
@@ -2061,4 +2066,49 @@ test "scrollViewportBy up with last_total_rows=0 stays at 0" {
 
     scrollViewportBy(&viewport, .up);
     try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
+
+test "handlePaste in normal mode still surfaces parser-level truncation" {
+    // Regression: a user who pastes 30 KiB while in normal mode used to
+    // get zero feedback. The parser dropped bytes past PASTE_BUF_SIZE,
+    // handlePaste cleared the status row, then bailed on the mode check
+    // before any indicator ran. The truncation must survive the mode
+    // bail or the cap is invisible to the user.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    f.wm.current_mode = .normal;
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.handlePaste("hello", 200);
+    f.wm.* = orch.window_manager;
+
+    const status = f.wm.transient_status[0..f.wm.transient_status_len];
+    try std.testing.expect(std.mem.indexOf(u8, status, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "200") != null);
+}
+
+test "handlePaste in normal mode with no truncation clears prior status" {
+    // Counter-test: a clean paste in normal mode still clears whatever
+    // transient status was on screen (matching handleKey's "any event
+    // dismisses status" gesture). Truncation case is the exception, not
+    // the rule.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    f.wm.current_mode = .normal;
+    f.wm.setPasteTruncatedStatus(42);
+    try std.testing.expect(f.wm.transient_status_len > 0);
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.handlePaste("hello", 0);
+    f.wm.* = orch.window_manager;
+
+    try std.testing.expectEqual(@as(u8, 0), f.wm.transient_status_len);
 }
