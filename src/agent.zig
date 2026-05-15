@@ -293,6 +293,64 @@ pub fn runLoopStreaming(
     }
 }
 
+/// Translate a comptime-known request type into the matching
+/// `AgentEvent` union variant. Used by `marshalRequest` so a single
+/// generic helper can push any of the six round-trip request types
+/// without runtime dispatch. A new round-trip variant must be added
+/// here or the compile fails loudly.
+fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
+    return switch (T) {
+        agent_events.PromptAssemblyRequest => .{ .prompt_assembly_request = req },
+        agent_events.ToolGateRequest => .{ .tool_gate_request = req },
+        agent_events.JitContextRequest => .{ .jit_context_request = req },
+        agent_events.ToolTransformRequest => .{ .tool_transform_request = req },
+        agent_events.LoopDetectRequest => .{ .loop_detect_request = req },
+        agent_events.CompactRequest => .{ .compact_request = req },
+        else => @compileError("marshalRequest does not handle " ++ @typeName(T)),
+    };
+}
+
+/// Push `req` onto the queue, then poll `req.done` with 50ms timed
+/// waits while checking `cancel`. On cancel, wait for the main side
+/// to finish writing `req.result` (it owns the request until dispatch
+/// completes), call `req.freeResult()`, and return `error.Cancelled`.
+/// On normal completion return without freeing: the caller reads
+/// `req.result` and decides ownership.
+///
+/// Push failure surfaces as `error.EventQueueFull`. Call sites that
+/// want the silent-skip semantics catch that error and translate it
+/// to null at their own layer; the generic helper does not.
+///
+/// Comptime contract: `T` must have a `done` field and a `freeResult`
+/// method. Both checks fail the build, not at runtime.
+fn marshalRequest(
+    comptime T: type,
+    req: *T,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !void {
+    comptime {
+        if (!@hasField(T, "done")) @compileError(@typeName(T) ++ " missing 'done' field");
+        if (!@hasDecl(T, "freeResult")) @compileError(@typeName(T) ++ " missing 'freeResult' method");
+    }
+
+    queue.push(makeAgentEvent(T, req)) catch return error.EventQueueFull;
+
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            return;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                // Main may still be inside the dispatch handler writing
+                // to req.result. Wait for done before touching it.
+                req.done.wait();
+                req.freeResult();
+                return error.Cancelled;
+            }
+        }
+    }
+}
+
 /// Push a `prompt_assembly_request` onto the event queue and park until
 /// the main thread renders the Lua prompt registry. Polls `cancel` every
 /// 50ms so a user interrupt still tears down the wait. On cancellation,
@@ -3932,6 +3990,41 @@ test "fireToolTransformRequest cancel path waits for handle then frees and retur
     };
     const result = fireToolTransformRequest(&engine, tc, "tool out", false, alloc, &queue, &cancel);
     try std.testing.expectError(error.Cancelled, result);
+}
+
+test "marshalRequest cancel path signals done and frees result via freeResult" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  return "appended"
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "tool out", false, alloc);
+    const result = marshalRequest(agent_events.JitContextRequest, &req, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
 }
 
 // `queue.push` returns `error.QueueFull` on a saturated ring. Each fire
