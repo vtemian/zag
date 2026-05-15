@@ -5342,8 +5342,7 @@ pub const LuaEngine = struct {
             headers.deinit(allocator);
         }
 
-        if (lua_json.isLuaArray(lua, inner)) {
-            const len = lua.rawLen(inner);
+        if (lua_json.luaArrayLength(lua, inner)) |len| {
             for (0..len) |i| {
                 _ = lua.rawGetIndex(inner, @intCast(i + 1));
                 defer lua.pop(1);

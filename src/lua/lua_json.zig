@@ -89,9 +89,8 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
             try types.writeJsonString(writer, str);
         },
         .table => {
-            if (isLuaArray(lua, abs_index)) {
+            if (luaArrayLength(lua, abs_index)) |length| {
                 try writer.writeByte('[');
-                const length = lua.rawLen(abs_index);
                 for (0..length) |i| {
                     if (i > 0) try writer.writeByte(',');
                     _ = lua.rawGetIndex(abs_index, @as(i64, @intCast(i + 1)));
@@ -128,11 +127,11 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
     }
 }
 
-/// A Lua table is an array iff every key is an integer in `1..n` with no gaps
-/// and no non-integer keys. `rawLen` returns an unspecified border on sparse
-/// tables, so walk every entry instead and let the caller emit sparse or
-/// string-keyed tables as JSON objects.
-pub fn isLuaArray(lua: *Lua, index: i32) bool {
+/// Returns the array length when the table's keys are exactly `1..n` integers
+/// (no gaps, no non-integer keys, n > 0); returns null otherwise. `rawLen`
+/// returns an unspecified border on sparse tables, so we walk every entry
+/// and report the size we observed so callers iterate without a second pass.
+pub fn luaArrayLength(lua: *Lua, index: i32) ?usize {
     const abs = lua.absIndex(index);
     var max_key: i64 = 0;
     var count: i64 = 0;
@@ -144,22 +143,23 @@ pub fn isLuaArray(lua: *Lua, index: i32) bool {
     while (lua.next(abs)) {
         if (!lua.isInteger(-2)) {
             lua.pop(2);
-            return false;
+            return null;
         }
         const k = lua.toInteger(-2) catch {
             lua.pop(2);
-            return false;
+            return null;
         };
         if (k < 1) {
             lua.pop(2);
-            return false;
+            return null;
         }
         if (k > max_key) max_key = k;
         count += 1;
         lua.pop(1); // pop value, keep key for next iteration
     }
 
-    return count > 0 and max_key == count;
+    if (count == 0 or max_key != count) return null;
+    return @intCast(count);
 }
 
 test "luaTableToJson: integer and float subtypes formatted distinctly" {
@@ -198,7 +198,7 @@ test "luaTableToJson: integer and float subtypes formatted distinctly" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"42\"") == null);
 }
 
-test "isLuaArray: sparse table is NOT an array" {
+test "luaArrayLength: sparse table is NOT an array" {
     const allocator = std.testing.allocator;
     const lua = try Lua.init(allocator);
     defer lua.deinit();
@@ -211,10 +211,10 @@ test "isLuaArray: sparse table is NOT an array" {
     lua.pushInteger(50);
     lua.rawSetIndex(-2, 5); // gap at 3,4
 
-    try std.testing.expect(!isLuaArray(lua, -1));
+    try std.testing.expectEqual(@as(?usize, null), luaArrayLength(lua, -1));
 }
 
-test "isLuaArray: contiguous 1..n is an array" {
+test "luaArrayLength: contiguous 1..n returns n" {
     const allocator = std.testing.allocator;
     const lua = try Lua.init(allocator);
     defer lua.deinit();
@@ -227,10 +227,10 @@ test "isLuaArray: contiguous 1..n is an array" {
     lua.pushInteger(3);
     lua.rawSetIndex(-2, 3);
 
-    try std.testing.expect(isLuaArray(lua, -1));
+    try std.testing.expectEqual(@as(?usize, 3), luaArrayLength(lua, -1));
 }
 
-test "isLuaArray: mixed integer + string keys is NOT an array" {
+test "luaArrayLength: mixed integer + string keys is NOT an array" {
     const allocator = std.testing.allocator;
     const lua = try Lua.init(allocator);
     defer lua.deinit();
@@ -241,5 +241,5 @@ test "isLuaArray: mixed integer + string keys is NOT an array" {
     _ = lua.pushString("not-an-index");
     lua.setField(-2, "key");
 
-    try std.testing.expect(!isLuaArray(lua, -1));
+    try std.testing.expectEqual(@as(?usize, null), luaArrayLength(lua, -1));
 }
