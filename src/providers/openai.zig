@@ -95,7 +95,7 @@ pub const OpenAiSerializer = struct {
         });
         defer stream.destroy();
 
-        return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel);
+        return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel, req.telemetry);
     }
 };
 
@@ -438,6 +438,7 @@ fn parseSseStream(
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
+    telemetry: ?*llm.telemetry.Telemetry,
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -491,6 +492,16 @@ fn parseSseStream(
                     };
                 };
             }
+        }
+
+        // Mid-stream `{"error":{...}}` envelopes used to fall through the
+        // `choices orelse continue` gate below, so the turn assembled as
+        // an empty success. Capture the envelope, surface it through
+        // telemetry + error_detail + the .err callback, and propagate
+        // ProviderResponseFailed so the agent loop can fall back.
+        if (obj.get("error") != null) {
+            try handleStreamError(callback, telemetry, sse.data, allocator);
+            return error.ProviderResponseFailed;
         }
 
         const choices = obj.get("choices") orelse continue;
@@ -597,6 +608,78 @@ fn parseSseStream(
     // reported separately via prompt_tokens_details.cached_tokens and are a subset of
     // prompt_tokens. Pass 0 for cache_creation to stay honest.
     return builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator);
+}
+
+/// Handle an OpenAI Chat Completions mid-stream `{"error":{...}}` envelope.
+/// Reports the raw payload to telemetry, fires the `.err` callback for
+/// observers, and stashes a user-facing message in `llm.error_detail` so
+/// the UI can show it. Returns nothing; the caller propagates
+/// `error.ProviderResponseFailed`.
+///
+/// Envelope shape used by OpenAI-compatible Chat Completions servers:
+///   {"error":{"code":"rate_limit_exceeded","message":"..."}}
+///
+/// Mirrors `anthropic.handleStreamErrorEvent` and `chatgpt.handleFailed`:
+/// the `.err` string carries the provider-tagged "{code}: {message}" so
+/// logs can correlate retries to the upstream; the UI gets the friendly
+/// text via `error_detail` through the classifier.
+fn handleStreamError(
+    callback: llm.StreamCallback,
+    telemetry: ?*llm.telemetry.Telemetry,
+    data: []const u8,
+    allocator: Allocator,
+) !void {
+    // Telemetry classifies and dumps the artifact. When telemetry is
+    // absent (mostly tests), classify directly so the user-facing string
+    // still benefits from the structured message.
+    const class: llm.error_class.ErrorClass = if (telemetry) |t|
+        t.onStreamError(.openai_stream_error, data) catch |err| blk: {
+            log.warn("telemetry.onStreamError failed: {s}", .{@errorName(err)});
+            break :blk llm.error_class.classify(0, data, &.{});
+        }
+    else
+        llm.error_class.classify(0, data, &.{});
+
+    // Best-effort parse of code+message for the .err callback string.
+    // We never fail the outer error path on a malformed envelope.
+    var parsed_code: []const u8 = "error";
+    var parsed_message: []const u8 = data;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch null;
+    defer if (parsed) |p| p.deinit();
+    if (parsed) |p| {
+        if (p.value == .object) {
+            if (p.value.object.get("error")) |err_value| {
+                if (err_value == .object) {
+                    if (err_value.object.get("code")) |c| {
+                        if (c == .string) parsed_code = c.string;
+                    }
+                    if (err_value.object.get("type")) |ty| {
+                        // Some OpenAI-compatible servers omit `code` and only set `type`.
+                        if (ty == .string and std.mem.eql(u8, parsed_code, "error")) parsed_code = ty.string;
+                    }
+                    if (err_value.object.get("message")) |m| {
+                        if (m == .string) parsed_message = m.string;
+                    }
+                }
+            }
+        }
+    }
+
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "openai stream error: {s}: {s}",
+        .{ parsed_code, parsed_message },
+    );
+    defer allocator.free(text);
+    callback.on_event(callback.ctx, .{ .err = text });
+
+    // UI-bound detail flows through the classifier so context-overflow
+    // envelopes surface with the friendly hint. On classification failure
+    // fall back to the provider-tagged string.
+    const detail = llm.error_class.userMessage(class, allocator) catch
+        try allocator.dupe(u8, text);
+    llm.error_detail.set(allocator, detail);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -1286,7 +1369,7 @@ test "parseSseStream captures usage and cached_tokens from final chunk" {
         .on_event = &noopStreamCallback,
     };
 
-    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel);
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 12), response.input_tokens);
@@ -1361,7 +1444,7 @@ test "parseSseStream accumulates reasoning_content into a thinking block" {
         .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
     };
 
-    const resp = try parseSseStream(&sr, reasoning, allocator, cb, &cancel);
+    const resp = try parseSseStream(&sr, reasoning, allocator, cb, &cancel, null);
     defer resp.deinit(allocator);
 
     // Two thinking_delta events, then one text_delta event.
@@ -1423,7 +1506,7 @@ test "parseSseStream accumulates tool_call arguments across multiple delta event
         .on_event = &noopStreamCallback,
     };
 
-    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel);
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null);
     defer response.deinit(allocator);
 
     // Should have exactly one tool_use block with the full argument
@@ -1441,6 +1524,72 @@ test "parseSseStream accumulates tool_call arguments across multiple delta event
         }
     }
     try std.testing.expectEqual(@as(usize, 1), tool_use_count);
+}
+
+test "parseSseStream returns ProviderResponseFailed on mid-stream error envelope" {
+    const allocator = std.testing.allocator;
+
+    // OpenAI Chat Completions can deliver a JSON error envelope mid-stream
+    // after the HTTP head has already returned 200. Today the loop drops
+    // the chunk at `obj.get("choices") orelse continue` and assembles an
+    // empty success response, hiding the failure from the user.
+    const sse_body =
+        "data: {\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"too many\"}}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fake = std.Io.Reader.fixed(sse_body);
+
+    var sr: llm.streaming.StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    // Drain any prior thread-local error_detail so we observe a clean
+    // hand-off here.
+    if (llm.error_detail.take()) |prev| allocator.free(prev);
+
+    const Recorder = struct {
+        alloc: Allocator,
+        saw_err: bool = false,
+        message: std.ArrayList(u8) = .empty,
+
+        fn onEvent(ctx: *anyopaque, event: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .err => |text| {
+                    self.saw_err = true;
+                    self.message.appendSlice(self.alloc, text) catch {};
+                },
+                else => {},
+            }
+        }
+    };
+    var recorder: Recorder = .{ .alloc = allocator };
+    defer recorder.message.deinit(allocator);
+    const callback: llm.StreamCallback = .{ .ctx = &recorder, .on_event = &Recorder.onEvent };
+
+    var cancel = std.atomic.Value(bool).init(false);
+
+    const result = parseSseStream(&sr, .{}, allocator, callback, &cancel, null);
+    try std.testing.expectError(error.ProviderResponseFailed, result);
+
+    try std.testing.expect(recorder.saw_err);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.message.items, "rate_limit_exceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.message.items, "too many") != null);
+
+    // error_detail is populated for the agent error formatter.
+    const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
+    defer allocator.free(detail);
+    try std.testing.expect(detail.len > 0);
 }
 
 test "openai writeMessage emits tool role for tool_result" {
