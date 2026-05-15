@@ -14,8 +14,6 @@ const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const subagents_mod = @import("../../subagents.zig");
 
-const log = std.log.scoped(.lua);
-
 /// Zig function backing `zag.subagent.register{name, description,
 /// prompt, model?, tools?}`. Reads the table, validates shapes via
 /// `SubagentRegistry.register`, and surfaces any validation or
