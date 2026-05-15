@@ -873,26 +873,20 @@ fn fireToolTransformRequest(
         is_error,
         allocator,
     );
-    queue.push(.{ .tool_transform_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                if (req.result) |replacement| allocator.free(replacement);
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.ToolTransformRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("tool transform handler '{s}' failed: {s}", .{ tc.name, name });
-        if (req.result) |replacement| allocator.free(replacement);
+        req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    // Transfer ownership of the duped replacement to the caller. Clearing
+    // the slot makes any subsequent freeResult() a safe no-op.
+    req.result = null;
+    return out;
 }
 
 /// Fire `zag.loop.detect` after the most recent tool execution and
