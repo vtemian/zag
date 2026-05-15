@@ -364,25 +364,15 @@ fn marshalPromptAssembly(
     cancel: *agent_events.CancelFlag,
 ) !prompt.AssembledPrompt {
     var req = agent_events.PromptAssemblyRequest.init(ctx, allocator);
-    queue.push(.{ .prompt_assembly_request = &req }) catch return error.EventQueueFull;
+    try marshalRequest(agent_events.PromptAssemblyRequest, &req, queue, cancel);
 
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| break else |_| {
-            if (cancel.load(.acquire)) {
-                // The main thread still owns the request until it pops
-                // from the queue and signals done. Wait one more poll
-                // interval so we don't free a request still being read.
-                req.done.wait();
-                if (req.result) |assembled| {
-                    var owned = assembled;
-                    owned.deinit();
-                }
-                return error.Cancelled;
-            }
-        }
+    if (req.result) |assembled| {
+        const out = assembled;
+        // Transfer arena ownership to the caller. Clearing the slot
+        // makes any subsequent freeResult() a safe no-op.
+        req.result = null;
+        return out;
     }
-
-    if (req.result) |assembled| return assembled;
     if (req.error_name) |name| {
         log.warn("prompt assembly marshalling failed: {s}", .{name});
     }
@@ -3989,6 +3979,47 @@ test "fireToolTransformRequest cancel path waits for handle then frees and retur
         .input_raw = "{}",
     };
     const result = fireToolTransformRequest(&engine, tc, "tool out", false, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+}
+
+test "marshalPromptAssembly cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // No prompt-registry handler is needed: with cancel pre-set, the
+    // helper returns error.Cancelled before any Lua-side render runs.
+    // The engine still has to exist so `dispatchHookRequests` can drain
+    // the request from the queue and signal `done`.
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const ctx: prompt.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    const result = marshalPromptAssembly(&ctx, alloc, &queue, &cancel);
     try std.testing.expectError(error.Cancelled, result);
 }
 
