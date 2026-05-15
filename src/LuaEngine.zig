@@ -617,14 +617,8 @@ pub const LuaEngine = struct {
         lua.setField(-2, "keymap_remove");
         lua.pushFunction(zlua.wrap(zagCommandFn));
         lua.setField(-2, "command");
-        lua.pushFunction(zlua.wrap(zagSetEscapeTimeoutMsFn));
-        lua.setField(-2, "set_escape_timeout_ms");
-        lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
-        lua.setField(-2, "set_default_model");
-        lua.pushFunction(zlua.wrap(zagSetThinkingEffortFn));
-        lua.setField(-2, "set_thinking_effort");
-        lua.pushFunction(zlua.wrap(zagSetBashSandboxLevelFn));
-        lua.setField(-2, "set_bash_sandbox_level");
+        // zag.set_*; bound from src/lua/bindings/setters.zig. [zag_table].
+        @import("lua/bindings/setters.zig").registerOn(lua);
         lua.pushFunction(zlua.wrap(zagProviderFn));
         lua.setField(-2, "provider");
         lua.pushFunction(zlua.wrap(zagSleepFn));
@@ -4782,142 +4776,11 @@ pub const LuaEngine = struct {
         return @ptrCast(@alignCast(@constCast(ptr)));
     }
 
-    /// Zig function backing `zag.set_escape_timeout_ms(ms)`.
-    /// Writes the bare-Escape deadline through `engine.input_parser`,
-    /// which the orchestrator reads on every tick via
-    /// `window_manager.inputParser()`. Negative timeouts are rejected
-    /// as a Lua runtime error.
-    fn zagSetEscapeTimeoutMsFn(lua: *Lua) !i32 {
-        const ms = lua.checkInteger(1);
-        if (ms < 0) {
-            log.warn("zag.set_escape_timeout_ms(): negative timeout {d}", .{ms});
-            return error.LuaError;
-        }
-
-        _ = lua.getField(zlua.registry_index, "_zag_engine");
-        const ptr = lua.toPointer(-1) catch {
-            log.warn("zag.set_escape_timeout_ms(): engine pointer not set (call storeSelfPointer first)", .{});
-            return error.LuaError;
-        };
-        lua.pop(1);
-        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
-
-        engine.input_parser.escape_timeout_ms = ms;
-        return 0;
-    }
-
-    /// Zig function backing `zag.set_default_model("prov/id")`.
-    /// Stores the duped string into `engine.default_model`, freeing any
-    /// prior value. Non-string arguments warn-log and return `error.LuaError`
-    /// (which `zlua.wrap` surfaces as a Lua runtime error to the caller).
-    /// We reject numbers explicitly because Lua 5.4 silently coerces them
-    /// through `toString`.
-    fn zagSetDefaultModelFn(lua: *Lua) !i32 {
-        if (lua.typeOf(1) != .string) {
-            log.warn("zag.set_default_model(): arg 1 must be a string", .{});
-            return error.LuaError;
-        }
-        const model = lua.toString(1) catch {
-            log.warn("zag.set_default_model(): arg 1 must be a string", .{});
-            return error.LuaError;
-        };
-
-        _ = lua.getField(zlua.registry_index, "_zag_engine");
-        const ptr = lua.toPointer(-1) catch {
-            log.warn("zag.set_default_model(): engine pointer not set (call storeSelfPointer first)", .{});
-            return error.LuaError;
-        };
-        lua.pop(1);
-        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
-
-        const owned = try engine.allocator.dupe(u8, model);
-        if (engine.default_model) |old| engine.allocator.free(old);
-        engine.default_model = owned;
-        return 0;
-    }
-
-    /// Zig function backing `zag.set_bash_sandbox_level(level)`.
-    /// Valid levels: `"strict"` (default, sandbox on) and `"permissive"`
-    /// (sandbox off; logs a warning so the opt-out is visible). Unknown
-    /// levels and non-string args raise a Lua runtime error. When the
-    /// engine has no `bash_config` bound (e.g. engine-only tests that
-    /// don't wire main.zig), the handler is a no-op on the flag side and
-    /// still validates the level argument.
-    fn zagSetBashSandboxLevelFn(lua: *Lua) !i32 {
-        if (lua.typeOf(1) != .string) {
-            log.warn("zag.set_bash_sandbox_level(): arg 1 must be a string", .{});
-            return error.LuaError;
-        }
-        const level = lua.toString(1) catch {
-            log.warn("zag.set_bash_sandbox_level(): arg 1 must be a string", .{});
-            return error.LuaError;
-        };
-
-        _ = lua.getField(zlua.registry_index, "_zag_engine");
-        const ptr = lua.toPointer(-1) catch {
-            log.warn("zag.set_bash_sandbox_level(): engine pointer not set (call storeSelfPointer first)", .{});
-            return error.LuaError;
-        };
-        lua.pop(1);
-        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
-
-        if (std.mem.eql(u8, level, "strict")) {
-            if (engine.bash_config) |cfg| cfg.permissive = false;
-        } else if (std.mem.eql(u8, level, "permissive")) {
-            if (engine.bash_config) |cfg| cfg.permissive = true;
-            log.warn("bash sandbox set to permissive; commands run unconfined", .{});
-        } else {
-            log.warn("zag.set_bash_sandbox_level: unknown level '{s}'", .{level});
-            return error.LuaError;
-        }
-        return 0;
-    }
-
     /// Read accessor for the runtime reasoning_effort level. Providers
     /// that opted into `effort_request_field` consult this on each call
     /// to decide whether to inject the knob into the outgoing request.
     pub fn currentThinkingEffort(self: *LuaEngine) ?[]const u8 {
         return self.thinking_effort;
-    }
-
-    /// Zig function backing `zag.set_thinking_effort(level)`.
-    /// Accepts one of `"minimal"`, `"low"`, `"medium"`, `"high"`, or
-    /// `nil` to clear the runtime setting. Stored module-level on the
-    /// engine so it survives across turns within a session. Providers
-    /// that didn't opt in via `effort_request_field` see the value but
-    /// drop it silently; this matches pi-mono's "providers carry their
-    /// own quirks" stance and keeps the knob declarative.
-    fn zagSetThinkingEffortFn(lua: *Lua) !i32 {
-        _ = lua.getField(zlua.registry_index, "_zag_engine");
-        const ptr = lua.toPointer(-1) catch {
-            log.warn("zag.set_thinking_effort(): engine pointer not set (call storeSelfPointer first)", .{});
-            return error.LuaError;
-        };
-        lua.pop(1);
-        const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
-
-        // Nil clears the level; pass-through for users who want to
-        // turn the knob off mid-session without restarting.
-        if (lua.typeOf(1) == .nil or lua.typeOf(1) == .none) {
-            if (engine.thinking_effort) |old| engine.allocator.free(old);
-            engine.thinking_effort = null;
-            return 0;
-        }
-
-        if (lua.typeOf(1) != .string) {
-            log.warn("zag.set_thinking_effort(): arg 1 must be a string or nil", .{});
-            return error.LuaError;
-        }
-        const level = lua.toString(1) catch {
-            log.warn("zag.set_thinking_effort(): arg 1 must be a string or nil", .{});
-            return error.LuaError;
-        };
-        _ = try requireOneOf(level, &[_][]const u8{ "minimal", "low", "medium", "high" }, "set_thinking_effort");
-
-        const owned = try engine.allocator.dupe(u8, level);
-        if (engine.thinking_effort) |old| engine.allocator.free(old);
-        engine.thinking_effort = owned;
-        return 0;
     }
 
     // -- Lua table reader helpers (used by zag.provider, future schema work) ---
@@ -5377,7 +5240,7 @@ pub const LuaEngine = struct {
     /// success; logs and returns `error.LuaError` on mismatch. Used for the
     /// closed enum-like fields on `ReasoningConfig` so a typo in `config.lua`
     /// surfaces at config-load time rather than after the request fails.
-    fn requireOneOf(value: []const u8, allowed: []const []const u8, field: [:0]const u8) ![]const u8 {
+    pub fn requireOneOf(value: []const u8, allowed: []const []const u8, field: [:0]const u8) ![]const u8 {
         for (allowed) |opt| {
             if (std.mem.eql(u8, value, opt)) return value;
         }
