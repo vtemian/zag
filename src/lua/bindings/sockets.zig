@@ -17,10 +17,8 @@
 //! dispatchers stay in LuaEngine.zig because `AgentRunner` calls them
 //! directly via the engine pointer.
 
-const std = @import("std");
 const zlua = @import("zlua");
 const Lua = zlua.Lua;
-const Allocator = std.mem.Allocator;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 
 /// Register the `zag.tools` subtable on the `zag` table.
