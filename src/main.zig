@@ -6,8 +6,10 @@
 //! off to EventOrchestrator. Anything event-loop-shaped lives there.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const llm = @import("llm.zig");
+const sandbox_helper = @import("sandbox/helper_linux.zig");
 const tools = @import("tools.zig");
 const bash_tool = @import("tools/bash.zig");
 const Screen = @import("Screen.zig");
@@ -108,6 +110,27 @@ fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle
 
 /// Top-level entry: wires subsystems and hands control to EventOrchestrator.
 pub fn main() !void {
+    // Sandbox helper short-circuit: when invoked as
+    // `zag --__sandbox-helper <cwd> <home> -- /bin/sh -c <cmd>` by
+    // tools/bash.zig, we install landlock and execve into the tail. This
+    // path never returns and runs before any normal startup (no GPA, no
+    // tracing, no logfile). Linux-only; comptime-dead elsewhere.
+    if (comptime builtin.os.tag == .linux) {
+        const raw_argv = std.os.argv;
+        if (raw_argv.len >= 2) {
+            const arg1 = std.mem.span(raw_argv[1]);
+            if (std.mem.eql(u8, arg1, sandbox_helper.flag)) {
+                var argv_list: [256][:0]const u8 = undefined;
+                if (raw_argv.len > argv_list.len) {
+                    std.debug.print("zag: argv too long for sandbox helper\n", .{});
+                    std.process.exit(2);
+                }
+                for (raw_argv, 0..) |p, i| argv_list[i] = std.mem.span(p);
+                sandbox_helper.run(argv_list[0..raw_argv.len]);
+            }
+        }
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -503,6 +526,7 @@ test {
     _ = @import("Instruction.zig");
     _ = @import("Reminder.zig");
     _ = @import("sandbox/landlock_linux.zig");
+    _ = @import("sandbox/helper_linux.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
