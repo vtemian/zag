@@ -230,6 +230,14 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
             continue;
         }
 
+        // VS-15 (U+FE0E) absorbs and demotes a width-2 base to width 1.
+        // VS-15 requests text-style rendering, so a Unicode-correct terminal
+        // draws the cluster as a single cell.
+        if (next == 0xFE0E) {
+            if (base_width == 2) base_width = 1;
+            continue;
+        }
+
         // ZWJ: consume the ZWJ and the codepoint after it (the joined
         // emoji). If nothing follows, the sequence is malformed at EOF.
         // Stop cleanly.
@@ -306,6 +314,26 @@ test "nextCluster: emoji + VS-16 upgrades base to width 2" {
     const c = nextCluster(&iter).?;
     try testing.expectEqual(@as(u21, 0x2764), c.base);
     try testing.expectEqual(@as(u2, 2), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: VS-15 demotes emoji presentation to width 1" {
+    // VS-15 (U+FE0E) requests text-style rendering. Symmetric to VS-16:
+    // a width-1 base + VS-15 stays at width 1 (no promotion).
+    var iter = iterOf("\u{2764}\u{FE0E}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x2764), c.base);
+    try testing.expectEqual(@as(u2, 1), c.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: VS-15 demotes wide emoji to width 1" {
+    // A natively wide emoji (U+1F600 grinning face) with VS-15 requests
+    // text-style rendering, so the cluster demotes to width 1.
+    var iter = iterOf("\u{1F600}\u{FE0E}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 0x1F600), c.base);
+    try testing.expectEqual(@as(u2, 1), c.width);
     try testing.expect(nextCluster(&iter) == null);
 }
 
