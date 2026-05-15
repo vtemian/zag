@@ -70,16 +70,16 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
             }
         },
         .number => {
-            // Try integer first
-            const integer = lua.toInteger(abs_index) catch {
+            if (lua.isInteger(abs_index)) {
+                const integer = lua.toInteger(abs_index) catch unreachable;
+                try writer.print("{d}", .{integer});
+            } else {
                 const number = lua.toNumber(abs_index) catch {
                     try writer.writeAll("null");
                     return;
                 };
                 try writer.print("{d}", .{number});
-                return;
-            };
-            try writer.print("{d}", .{integer});
+            }
         },
         .string => {
             const str = lua.toString(abs_index) catch {
@@ -143,4 +143,38 @@ pub fn isLuaArray(lua: *Lua, index: i32) bool {
     }
     // Has integer keys 1..length, consider it an array
     return true;
+}
+
+test "luaTableToJson: float values preserved" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+
+    lua.newTable();
+    _ = lua.pushString("pi");
+    lua.pushNumber(3.14);
+    lua.setTable(-3);
+
+    const json = try luaTableToJson(lua, -1, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "3.14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"3\"") == null);
+}
+
+test "luaTableToJson: integer values emitted without decimal" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+
+    lua.newTable();
+    _ = lua.pushString("count");
+    lua.pushInteger(42);
+    lua.setTable(-3);
+
+    const json = try luaTableToJson(lua, -1, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "42.") == null);
 }
