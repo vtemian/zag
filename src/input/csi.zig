@@ -26,7 +26,7 @@ pub fn parseCsi(seq: []const u8) Event {
         return parseKittyKey(seq[0 .. seq.len - 1]);
     }
 
-    // Simple single-letter CSI sequences: arrows, home, end
+    // Simple single-letter CSI sequences: arrows, home, end, focus, shift-tab.
     if (seq.len == 1) {
         return switch (seq[0]) {
             'A' => Event{ .key = .{ .key = .up, .modifiers = KeyEvent.no_modifiers } },
@@ -35,6 +35,11 @@ pub fn parseCsi(seq: []const u8) Event {
             'D' => Event{ .key = .{ .key = .left, .modifiers = KeyEvent.no_modifiers } },
             'H' => Event{ .key = .{ .key = .home, .modifiers = KeyEvent.no_modifiers } },
             'F' => Event{ .key = .{ .key = .end, .modifiers = KeyEvent.no_modifiers } },
+            // xterm focus reporting (?1004): terminal sends I on focus-in
+            // and O on focus-out. Payload-less; the orchestrator reads the
+            // tag and acts on it.
+            'I' => Event.focus_in,
+            'O' => Event.focus_out,
             'Z' => Event{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } },
             else => Event.none,
         };

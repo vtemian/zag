@@ -388,6 +388,20 @@ test "parse SGR mouse press without motion bit stays .press" {
     }
 }
 
+test "Parser emits focus_in on ESC[I" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, '[', 'I' }, 0);
+    const ev = p.nextEvent(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ev == .focus_in);
+}
+
+test "Parser emits focus_out on ESC[O" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, '[', 'O' }, 0);
+    const ev = p.nextEvent(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ev == .focus_out);
+}
+
 test "parse Ctrl+C" {
     // Ctrl+C = 0x03
     const event = parseBytes(&.{0x03}) orelse return error.TestUnexpectedResult;

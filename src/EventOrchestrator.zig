@@ -330,6 +330,12 @@ fn tick(
             },
             .mouse => |m| self.handleMouse(m),
             .paste => |paste| self.handlePaste(paste.content, paste.truncated),
+            // Focus reporting (?1004): log only for now. A future commit
+            // can use these to dim chrome or pause animations on
+            // focus_out. Explicit arms keep the catch-all from silently
+            // swallowing them and force intent when new variants land.
+            .focus_in => log.debug("terminal focus_in", .{}),
+            .focus_out => log.debug("terminal focus_out", .{}),
             else => {},
         }
     }

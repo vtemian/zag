@@ -19,6 +19,11 @@ pub const Event = union(enum) {
     mouse: MouseEvent,
     /// The terminal was resized.
     resize: struct { rows: u16, cols: u16 },
+    /// The terminal window gained focus (xterm `?1004`, `ESC [ I`).
+    /// Payload-less because the sequence carries no further info.
+    focus_in,
+    /// The terminal window lost focus (xterm `?1004`, `ESC [ O`).
+    focus_out,
     /// Raw bytes between a CSI 200~ / CSI 201~ pair. `content` is a
     /// borrowed view into the owning `Parser`'s paste buffer and is
     /// valid only until the next `Parser.feedBytes` call, so consumers
