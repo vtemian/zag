@@ -2675,3 +2675,57 @@ test "loadFromEntries skips malformed task_start payload without crashing" {
 
     try std.testing.expectEqual(@as(usize, 0), replay.subagents.items.len);
 }
+
+test "NodeLineCache rotates spans pointer on put-replace" {
+    // Regression pin for the three-lifetime braid in NodeLineCache:
+    // the cache owns the StyledLine slice and each line's spans array,
+    // while StyledSpan.text is borrowed from the node's TextBuffer.
+    // collectVisibleLines copies StyledLine headers into a frame arena,
+    // sharing the spans pointer with the cache entry. If a future change
+    // makes cache.put skip the free-then-realloc on version bump, a
+    // caller still holding a frame snapshot would deref a dangling
+    // pointer. testing.allocator's leak detector backstops the contract
+    // from the other direction (double-free or missed free on replace).
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "spans-rotation");
+    defer cb.deinit();
+
+    const node = try cb.appendNode(null, .assistant_text, "first content\n");
+
+    const theme = Theme.defaultTheme();
+
+    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    try std.testing.expect(lines1.items.len >= 1);
+    try std.testing.expect(lines1.items[0].spans.len >= 1);
+    const spans1_ptr = @intFromPtr(lines1.items[0].spans.ptr);
+    const text1_first = lines1.items[0].spans[0].text;
+    lines1.deinit(allocator);
+
+    try cb.appendToNode(node, "second content\n");
+
+    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    defer lines2.deinit(allocator);
+    try std.testing.expect(lines2.items.len >= 1);
+    try std.testing.expect(lines2.items[0].spans.len >= 1);
+    const spans2_ptr = @intFromPtr(lines2.items[0].spans.ptr);
+
+    try std.testing.expect(spans1_ptr != spans2_ptr);
+
+    var found_second = false;
+    for (lines2.items) |line| {
+        for (line.spans) |span| {
+            if (std.mem.indexOf(u8, span.text, "second") != null) {
+                found_second = true;
+                break;
+            }
+        }
+        if (found_second) break;
+    }
+    try std.testing.expect(found_second);
+
+    // text1_first points into the freed spans array's text slice (which
+    // borrowed from the node's TextBuffer); after put-replace it is
+    // UB-by-contract to dereference. We discard it to make the borrow
+    // explicit in the test and document the lifetime constraint.
+    _ = text1_first;
+}
