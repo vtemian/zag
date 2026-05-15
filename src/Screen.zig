@@ -423,6 +423,20 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
             const row: u16 = @intCast(row_usize);
             const row_base = row_usize * @as(usize, self.width);
 
+            // Steady-state idle frames have most or all rows unchanged.
+            // A single SIMD-friendly bytewise compare short-circuits the
+            // ~width per-cell `cellsEqual` calls. Both grids are populated
+            // by identical paths (`@memset(empty_cell)` then either field
+            // mutation via `getCell` or full assignment of the same const
+            // `empty_cell`, followed by `@memcpy(previous, current)`), so
+            // padding bytes are consistent and bytewise equality coincides
+            // with `cellsEqual` for in-grid cells. A false negative is
+            // harmless: the per-cell loop below still emits zero bytes for
+            // each `cellsEqual` cell.
+            const cur_row = self.current[row_base .. row_base + self.width];
+            const prev_row = self.previous[row_base .. row_base + self.width];
+            if (std.mem.eql(u8, std.mem.sliceAsBytes(cur_row), std.mem.sliceAsBytes(prev_row))) continue;
+
             var col: u16 = 0;
             while (col < self.width) {
                 const idx = row_base + col;
@@ -849,6 +863,13 @@ test "render copies current to previous" {
     try std.testing.expectEqual(@as(u21, 'A'), screen.previous[0].codepoint);
 }
 
+// Behavioral contract pinned for the per-row `std.mem.eql` shortcut in
+// `render`: when no cell mutated between frames, every row hits the
+// bytewise-equal fast path and the only bytes emitted are the sync
+// markers. If the shortcut ever regressed to a per-cell walk with a
+// padding-bit mismatch, this test would still pass (per-cell `cellsEqual`
+// is the safety net), so it does not directly observe the row-skip; it
+// observes the end-to-end behavior that the shortcut preserves.
 test "second render with no new changes produces only sync markers" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 5, 3);
