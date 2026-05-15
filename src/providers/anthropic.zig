@@ -99,7 +99,7 @@ pub const AnthropicSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, req.timeouts orelse self.endpoint.timeouts);
+        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, req.timeouts orelse self.endpoint.timeouts, req.error_detail_out);
         defer req.allocator.free(response_bytes);
 
         return parseResponse(response_bytes, req.allocator);
@@ -132,10 +132,11 @@ pub const AnthropicSerializer = struct {
             .telemetry_opt = req.telemetry,
             .allocator = req.allocator,
             .timeouts = req.timeouts orelse self.endpoint.timeouts,
+            .error_detail_out = req.error_detail_out,
         });
         defer stream.destroy();
 
-        return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry);
+        return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry, req.error_detail_out);
     }
 };
 
@@ -507,6 +508,7 @@ fn parseSseStream(
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
     telemetry: ?*llm.telemetry.Telemetry,
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -531,7 +533,7 @@ fn parseSseStream(
         // then propagate the existing provider-error sentinel so the agent
         // loop can fall back to its retry / surface paths.
         if (std.mem.eql(u8, sse.event_type, "error")) {
-            try handleStreamErrorEvent(callback, telemetry, sse.data, allocator);
+            try handleStreamErrorEvent(callback, telemetry, sse.data, allocator, error_detail_out);
             return error.ProviderResponseFailed;
         }
         try processSseEvent(
@@ -592,6 +594,7 @@ fn handleStreamErrorEvent(
     telemetry: ?*llm.telemetry.Telemetry,
     data: []const u8,
     allocator: Allocator,
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !void {
     // Best-effort parse: we never fail the outer error path on a
     // malformed envelope. The provider-tagged string is what observers
@@ -624,7 +627,16 @@ fn handleStreamErrorEvent(
     );
     defer allocator.free(text);
 
-    llm.stream_error.handle(allocator, .anthropic_error, data, data, text, telemetry, callback);
+    llm.stream_error.handle(
+        allocator,
+        .anthropic_error,
+        data,
+        data,
+        text,
+        telemetry,
+        callback,
+        error_detail_out,
+    );
 }
 
 /// Process a single dispatched SSE event by parsing its JSON data.
@@ -2036,7 +2048,7 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     const callback: llm.StreamCallback = .{ .ctx = &recorder, .on_event = &Recorder.onEvent };
 
     const envelope = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"the assistant is overloaded\"}}";
-    try handleStreamErrorEvent(callback, t, envelope, allocator);
+    try handleStreamErrorEvent(callback, t, envelope, allocator, null);
 
     try std.testing.expect(t.had_error);
     // Some classification kind is set; exact tag depends on substring rules
@@ -2082,7 +2094,7 @@ test "anthropic parseSseStream maps event:error to ProviderResponseFailed" {
     // friendly user message we can assert against. A bare "boom" body
     // would route to `.unknown` whose message names ~/.zag/logs.
     const envelope = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"prompt is too long\"}}";
-    try handleStreamErrorEvent(callback, null, envelope, allocator);
+    try handleStreamErrorEvent(callback, null, envelope, allocator, null);
 
     const detail = llm.error_detail.take() orelse return error.MissingErrorDetail;
     defer allocator.free(detail);

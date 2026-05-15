@@ -58,6 +58,7 @@ pub fn handle(
     text: []const u8,
     telemetry: ?*llm.telemetry.Telemetry,
     callback: llm.StreamCallback,
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) void {
     if (telemetry) |t| {
         _ = t.onStreamError(kind, raw) catch |err| {
@@ -75,7 +76,14 @@ pub fn handle(
     // callback below still fires.
     const detail = llm.error_class.userMessage(class, allocator) catch
         allocator.dupe(u8, text) catch null;
-    if (detail) |d| llm.error_detail.set(allocator, d);
+    if (detail) |d| {
+        if (error_detail_out) |out| {
+            out.set("{s}", .{d}) catch {};
+            allocator.free(d);
+        } else {
+            llm.error_detail.set(allocator, d);
+        }
+    }
 
     callback.on_event(callback.ctx, .{ .err = text });
 }

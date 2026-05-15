@@ -363,18 +363,25 @@ pub fn httpPostJsonRaw(
 }
 
 /// Send a JSON POST request and return the response body on 2xx, or
-/// `error.ApiError` (with `error_detail` populated) on any other status.
+/// `error.ApiError` (with the user-facing detail routed to
+/// `error_detail_out` or the threadlocal fallback) on any other status.
 /// Both providers share this HTTP plumbing; only the URL and extra headers differ.
 ///
 /// This is a thin convenience wrapper over `httpPostJsonRaw` for callers
 /// that want the historical 2xx-or-throw shape. Observability code that
 /// needs the body on 4xx/5xx should call `httpPostJsonRaw` directly.
+///
+/// `error_detail_out` is the caller-owned destination for the user-facing
+/// detail string on non-2xx. When null, the writer falls back to the
+/// `error_detail` threadlocal so callers without a `Request` keep
+/// working unchanged.
 pub fn httpPostJson(
     url: []const u8,
     body: []const u8,
     extra_headers: []const std.http.Header,
     allocator: Allocator,
     timeouts: ?registry.Endpoint.TimeoutConfig,
+    error_detail_out: ?*error_detail.ErrorDetail,
 ) ![]const u8 {
     const raw = try httpPostJsonRaw(url, body, extra_headers, allocator, timeouts);
     if (raw.status >= 200 and raw.status < 300) return raw.body;
@@ -386,7 +393,12 @@ pub fn httpPostJson(
         "HTTP {d}: {s}",
         .{ raw.status, snippet },
     ) catch return error.ApiError;
-    error_detail.set(allocator, detail);
+    if (error_detail_out) |out| {
+        out.set("{s}", .{detail}) catch {};
+        allocator.free(detail);
+    } else {
+        error_detail.set(allocator, detail);
+    }
     return error.ApiError;
 }
 
@@ -503,7 +515,7 @@ test "buildHeaders+freeHeaders round-trip with static endpoint headers (no leak)
 
 test "httpPostJson returns InvalidUri on malformed endpoint" {
     const allocator = std.testing.allocator;
-    const result = httpPostJson("not a url", "", &.{}, allocator, null);
+    const result = httpPostJson("not a url", "", &.{}, allocator, null, null);
     try std.testing.expectError(error.InvalidUri, result);
 }
 

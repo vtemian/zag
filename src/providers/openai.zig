@@ -64,7 +64,7 @@ pub const OpenAiSerializer = struct {
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
         defer llm.http.freeHeaders(self.endpoint, &headers, req.allocator);
 
-        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, req.timeouts orelse self.endpoint.timeouts);
+        const response_bytes = try llm.http.httpPostJson(self.endpoint.url, body, headers.items, req.allocator, req.timeouts orelse self.endpoint.timeouts, req.error_detail_out);
         defer req.allocator.free(response_bytes);
 
         return parseResponse(response_bytes, self.endpoint.reasoning, req.allocator);
@@ -98,10 +98,11 @@ pub const OpenAiSerializer = struct {
             .telemetry_opt = req.telemetry,
             .allocator = req.allocator,
             .timeouts = req.timeouts orelse self.endpoint.timeouts,
+            .error_detail_out = req.error_detail_out,
         });
         defer stream.destroy();
 
-        return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel, req.telemetry);
+        return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel, req.telemetry, req.error_detail_out);
     }
 };
 
@@ -459,6 +460,7 @@ fn parseSseStream(
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
     telemetry: ?*llm.telemetry.Telemetry,
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -520,7 +522,7 @@ fn parseSseStream(
         // telemetry + error_detail + the .err callback, and propagate
         // ProviderResponseFailed so the agent loop can fall back.
         if (obj.get("error") != null) {
-            try handleStreamError(callback, telemetry, sse.data, allocator);
+            try handleStreamError(callback, telemetry, sse.data, allocator, error_detail_out);
             return error.ProviderResponseFailed;
         }
 
@@ -648,6 +650,7 @@ fn handleStreamError(
     telemetry: ?*llm.telemetry.Telemetry,
     data: []const u8,
     allocator: Allocator,
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !void {
     // Best-effort parse of code+message for the .err callback string.
     // We never fail the outer error path on a malformed envelope.
@@ -682,7 +685,16 @@ fn handleStreamError(
     );
     defer allocator.free(text);
 
-    llm.stream_error.handle(allocator, .openai_stream_error, data, data, text, telemetry, callback);
+    llm.stream_error.handle(
+        allocator,
+        .openai_stream_error,
+        data,
+        data,
+        text,
+        telemetry,
+        callback,
+        error_detail_out,
+    );
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -1372,7 +1384,7 @@ test "parseSseStream captures usage and cached_tokens from final chunk" {
         .on_event = &noopStreamCallback,
     };
 
-    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null);
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 12), response.input_tokens);
@@ -1447,7 +1459,7 @@ test "parseSseStream accumulates reasoning_content into a thinking block" {
         .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
     };
 
-    const resp = try parseSseStream(&sr, reasoning, allocator, cb, &cancel, null);
+    const resp = try parseSseStream(&sr, reasoning, allocator, cb, &cancel, null, null);
     defer resp.deinit(allocator);
 
     // Two thinking_delta events, then one text_delta event.
@@ -1509,7 +1521,7 @@ test "parseSseStream accumulates tool_call arguments across multiple delta event
         .on_event = &noopStreamCallback,
     };
 
-    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null);
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null, null);
     defer response.deinit(allocator);
 
     // Should have exactly one tool_use block with the full argument
@@ -1582,7 +1594,7 @@ test "parseSseStream returns ProviderResponseFailed on mid-stream error envelope
 
     var cancel = std.atomic.Value(bool).init(false);
 
-    const result = parseSseStream(&sr, .{}, allocator, callback, &cancel, null);
+    const result = parseSseStream(&sr, .{}, allocator, callback, &cancel, null, null);
     try std.testing.expectError(error.ProviderResponseFailed, result);
 
     try std.testing.expect(recorder.saw_err);

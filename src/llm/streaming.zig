@@ -92,6 +92,10 @@ pub const StreamingResponse = struct {
         /// Socket-level timeouts applied via `setsockopt` after
         /// `receiveHead`. When null, the OS default applies.
         timeouts: ?registry.Endpoint.TimeoutConfig = null,
+        /// Caller-owned destination for the user-facing detail string on
+        /// non-2xx. When null, the writer falls back to the
+        /// `error_detail` threadlocal so legacy callers keep working.
+        error_detail_out: ?*error_detail.ErrorDetail = null,
     };
 
     /// Open a streaming HTTP POST connection.
@@ -293,7 +297,12 @@ pub const StreamingResponse = struct {
                     "HTTP {d} ({s}). Check ~/.zag/logs for the request body.",
                     .{ status, @tagName(response.head.status) },
                 );
-            error_detail.set(allocator, detail);
+            if (opts.error_detail_out) |out| {
+                out.set("{s}", .{detail}) catch {};
+                allocator.free(detail);
+            } else {
+                error_detail.set(allocator, detail);
+            }
 
             // Existing diagnostic log line stays; useful when telemetry
             // is null and the artifact pair won't be written.

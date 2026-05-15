@@ -101,12 +101,13 @@ pub const ChatgptSerializer = struct {
             .telemetry_opt = null,
             .allocator = req.allocator,
             .timeouts = req.timeouts orelse self.endpoint.timeouts,
+            .error_detail_out = req.error_detail_out,
         });
         defer stream.destroy();
 
         var cancel = std.atomic.Value(bool).init(false);
         const noop_callback: llm.StreamCallback = .{ .ctx = undefined, .on_event = noopEvent };
-        return parseSseStream(stream, req.allocator, noop_callback, &cancel, null);
+        return parseSseStream(stream, req.allocator, noop_callback, &cancel, null, req.error_detail_out);
     }
 
     fn noopEvent(_: *anyopaque, _: llm.StreamEvent) void {}
@@ -157,10 +158,11 @@ pub const ChatgptSerializer = struct {
             .telemetry_opt = req.telemetry,
             .allocator = req.allocator,
             .timeouts = req.timeouts orelse self.endpoint.timeouts,
+            .error_detail_out = req.error_detail_out,
         });
         defer stream.destroy();
 
-        return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry);
+        return parseSseStream(stream, req.allocator, req.callback, req.cancel, req.telemetry, req.error_detail_out);
     }
 };
 
@@ -472,6 +474,10 @@ pub const StreamEmitter = struct {
     /// envelope to `Telemetry.onStreamError` for artifact capture before
     /// the existing error path runs.
     telemetry: ?*llm.telemetry.Telemetry = null,
+    /// Optional caller-owned destination for the user-facing detail
+    /// string written by `handleFailed`. When null, the writer falls
+    /// back to the `error_detail` threadlocal.
+    error_detail_out: ?*llm.error_detail.ErrorDetail = null,
 };
 
 /// Dispatch a single framed SSE event to the accumulator. `event_type` tells
@@ -951,6 +957,7 @@ fn handleFailed(obj: std.json.ObjectMap, emit: *StreamEmitter, raw_data: []const
         err_text,
         emit.telemetry,
         emit.callback,
+        emit.error_detail_out,
     );
     return error.ProviderResponseFailed;
 }
@@ -1019,6 +1026,7 @@ pub fn parseSseStream(
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
     telemetry: ?*llm.telemetry.Telemetry,
+    error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !types.LlmResponse {
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
@@ -1038,6 +1046,7 @@ pub fn parseSseStream(
         .output_tokens = &output_tokens,
         .callback = callback,
         .telemetry = telemetry,
+        .error_detail_out = error_detail_out,
     };
 
     var scratch: [128]u8 = undefined;
