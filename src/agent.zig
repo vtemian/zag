@@ -969,29 +969,17 @@ fn fireCompact(
     if (tokens_used < threshold) return null;
 
     var req = agent_events.CompactRequest.init(messages, tokens_used, tokens_max, allocator);
-    queue.push(.{ .compact_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                req.freeResult();
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("compact strategy handler failed: {s}", .{name});
         req.freeResult();
         return null;
     }
     const replacement = req.result orelse return null;
-    // Transfer ownership to the caller. Clear the request slot so
-    // `freeResult` is a no-op if the caller drops the request later.
-    req.result = null;
+    req.result = null; // transfer ownership; freeResult becomes a no-op
     return replacement;
 }
 
