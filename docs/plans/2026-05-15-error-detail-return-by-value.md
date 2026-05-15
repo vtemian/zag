@@ -198,18 +198,21 @@ EOF
 
 **Files:** `src/agent.zig` (or `src/AgentRunner.zig`, whichever holds the per-turn frame), `src/AgentRunner.zig:formatAgentErrorMessage`.
 
-### Step 1: Allocate an `ErrorDetail` per turn
+### Step 1: Allocate an `ErrorDetail` owned by the loop
 
-At the top of the turn loop (`agent.zig:142` or wherever Telemetry is constructed):
+In `AgentRunner.threadMain` (or wherever the loop is driven and `catch`-handles a `try runLoopStreaming(...)`):
 
 ```zig
 var detail = error_detail.ErrorDetail.init(allocator);
 defer detail.deinit();
 
-// Pass into Request and StreamRequest construction
-stream_req.error_detail_out = &detail;
-// (also for non-streaming Request)
+// Pass &detail into runLoopStreaming, which threads it into
+// Request.error_detail_out and StreamRequest.error_detail_out
+// on each turn. ErrorDetail.set replaces the prior message, so the
+// slot is effectively per-turn even though the storage is per-loop.
 ```
+
+The slot must outlive `try runLoopStreaming(...)` so the surrounding `catch` arm (which runs `formatAgentErrorMessage`) can read the detail. A literal per-iteration `defer detail.deinit()` inside the loop would free the message before `formatAgentErrorMessage` reads it.
 
 ### Step 2: `formatAgentErrorMessage` reads from the owned detail
 
@@ -346,10 +349,28 @@ EOF
 
 The plan is done when:
 
-1. Six commits land on `main`.
+1. The six task commits plus any review-driven follow-ups land on the branch.
 2. `grep threadlocal src/llm/error_detail.zig` returns empty.
-3. `grep error_detail\.set src/` returns empty (the free function no longer exists; only `ErrorDetail.set` method calls remain).
+3. `grep error_detail\.set src/` returns empty (the free function no longer exists; only `ErrorDetail.set` and `ErrorDetail.setOwned` method calls remain).
 4. `zig build test` green at every commit.
+
+## Rollback contract
+
+Each commit is independently revertable. A revert of Task N restores the slot's behavior to the post-Task-(N-1) state because:
+
+- Tasks 1 and 2 only add surface (struct, field). Revert is harmless.
+- Task 3 adds an `if (out) |...| else { threadlocal }` branch. Reverting the four writers takes them back to the threadlocal-only path; tests at this point still drained the threadlocal so they survive.
+- Task 4 sets `error_detail_out = &detail` on the request struct. Reverting it makes every writer hit the `else` branch and write the threadlocal as before.
+- Task 5 migrates tests. Reverting it puts the test drains back; production still works either way.
+- Task 6 deletes the threadlocal. Reverting it restores the threadlocal var and free functions; the per-call `ErrorDetail` path coexists.
+
+A revert of any single commit therefore leaves both the production code path and the test suite consistent, without manual stitching.
+
+## Success metric
+
+Beyond "tests pass + grep empty", the user-visible win:
+
+- Concurrent agent runners and child subagents no longer race on a shared slot. Pre-migration, a parent's failed Anthropic stream could be clobbered by a child's failing Codex call (same threadlocal, same thread under cooperative scheduling). Post-migration each runner owns its own `ErrorDetail`; clobber is structurally impossible.
 
 ## Estimated scope
 
@@ -364,7 +385,15 @@ Total: ~5.5 hours. The middle (Tasks 3-5) is mechanical but tedious.
 
 ## Notes for the executor
 
-- `httpPostJsonRaw` is called from non-Request contexts (OAuth token refresh, auth wizard). Those calls can pass `null` for `error_detail_out` and accept that no friendly detail surfaces. Confirm via `grep -n httpPostJsonRaw src/ src/llm/`.
+- `httpPostJsonRaw`'s real callers are `httpPostJson` itself and `streaming.zig`'s side-channel re-fetch (observability for the artifact pair). OAuth token refresh and the auth wizard use `std.http.Client.fetch` directly, not `httpPostJsonRaw`. The streaming side-channel re-fetch only inspects status/body for telemetry and does not need to write `error_detail_out`. Conclusion: leave `httpPostJsonRaw` alone. Confirm via `grep -n httpPostJsonRaw src/ src/llm/`.
 - The non-streaming `Request` path at `agent.zig:587-595` does NOT carry telemetry today. The same caller-owned `ErrorDetail` works for both because `error_detail_out` is on Request too.
 - `extractApiErrorMessage` in `AgentRunner.zig` parses JSON-shaped errors from a string. After migration the string comes from the owned `ErrorDetail` instead of `take()`. Logic unchanged.
 - Sub-task clobber risk that motivated the original review concern: with a per-call `ErrorDetail`, child Conversations now have their own and CANNOT clobber the parent. This is a quiet correctness win, not just a code-cleanliness one.
+
+## Follow-ups landed during execution
+
+These were caught by review during the run, not in the original plan:
+
+1. **`ErrorDetail.set` strong-exception-safety.** The originally-prescribed body freed the old `message` before `try allocPrint`; OOM mid-overwrite would have left a dangling pointer. Final shape allocates first, frees second, then assigns. Strong exception safety.
+2. **`ErrorDetail.setOwned`.** Avoids the double-allocation pattern at writer sites. Writers already build the detail string with `allocPrint`; without `setOwned`, calling `set("{s}", .{slice})` re-allocates the same bytes. With `setOwned`, the writer's slice is adopted into the slot directly. Saves one allocation per error path and lets test fixtures pass JSON literals without `{{ }}` brace-escaping.
+3. **Stale doc-comment refresh.** `runLoopStreaming`'s `error_detail_out` doc continued to mention the threadlocal fallback after Task 6 deleted it; updated to "writers silently drop the detail when no slot is wired."
