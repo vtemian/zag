@@ -145,12 +145,20 @@ pub fn isLuaArray(lua: *Lua, index: i32) bool {
     return true;
 }
 
-test "luaTableToJson: float values preserved" {
+test "luaTableToJson: integer and float subtypes formatted distinctly" {
     const allocator = std.testing.allocator;
     const lua = try Lua.init(allocator);
     defer lua.deinit();
 
+    // One table holding both subtypes so a branch swap or
+    // catch-ladder regression can't silently homogenize them.
     lua.newTable();
+    _ = lua.pushString("whole");
+    lua.pushInteger(42);
+    lua.setTable(-3);
+    _ = lua.pushString("half");
+    lua.pushNumber(42.5);
+    lua.setTable(-3);
     _ = lua.pushString("pi");
     lua.pushNumber(3.14);
     lua.setTable(-3);
@@ -158,23 +166,17 @@ test "luaTableToJson: float values preserved" {
     const json = try luaTableToJson(lua, -1, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "3.14") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"3\"") == null);
-}
+    // Floats keep their fractional part. Anchor on the leading colon
+    // so substrings like "13.14" or "42.50001" can't sneak through.
+    try std.testing.expect(std.mem.indexOf(u8, json, ":3.14,") != null or
+        std.mem.indexOf(u8, json, ":3.14}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ":42.5,") != null or
+        std.mem.indexOf(u8, json, ":42.5}") != null);
 
-test "luaTableToJson: integer values emitted without decimal" {
-    const allocator = std.testing.allocator;
-    const lua = try Lua.init(allocator);
-    defer lua.deinit();
-
-    lua.newTable();
-    _ = lua.pushString("count");
-    lua.pushInteger(42);
-    lua.setTable(-3);
-
-    const json = try luaTableToJson(lua, -1, allocator);
-    defer allocator.free(json);
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "42.") == null);
+    // Integer emits no decimal at all. Anchor on a JSON delimiter on
+    // both sides so a stray "42" inside "342" or "42.0" can't pass.
+    try std.testing.expect(std.mem.indexOf(u8, json, ":42,") != null or
+        std.mem.indexOf(u8, json, ":42}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ":42.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"42\"") == null);
 }
