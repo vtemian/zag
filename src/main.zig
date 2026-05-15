@@ -502,6 +502,7 @@ test {
     _ = @import("prompt.zig");
     _ = @import("Instruction.zig");
     _ = @import("Reminder.zig");
+    _ = @import("sandbox/landlock_linux.zig");
 }
 
 test "appendStatusLine creates a status node on the given view" {
