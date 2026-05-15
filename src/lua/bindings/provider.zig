@@ -635,6 +635,33 @@ pub fn readNullableFloat(lua: *Lua, table_idx: i32, name: [:0]const u8) !?f64 {
 /// (`connect_ms`, `read_ms`, `write_ms`) is optional; present numeric
 /// values are clamped to >= 0 and assigned, anything else falls back
 /// to the default. No allocation: the result is plain u32 fields.
+/// Read the optional `wire_semantics = {...}` subtable, falling back to
+/// `default` for any field not present. The default is normally derived
+/// from the wire string in `zagProviderFn`; this function lets the user
+/// override individual flags when a real wire diverges from its base
+/// (e.g. an Anthropic-shaped clone served over the `openai` wire).
+///
+/// Returns `error.LuaError` if the subtable itself is the wrong type,
+/// or if any known field has the wrong type. Unknown subtable fields
+/// are silently ignored so future flags can be added without breaking
+/// existing configs.
+pub fn readWireSemantics(lua: *Lua, table_idx: i32, default: llm.WireSemantics) !llm.WireSemantics {
+    _ = lua.getField(table_idx, "wire_semantics");
+    defer lua.pop(1);
+    if (lua.isNil(-1)) return default;
+    if (!lua.isTable(-1)) {
+        log.warn("zag.provider(): 'wire_semantics' must be a table", .{});
+        return error.LuaError;
+    }
+    const t_idx = lua.absIndex(-1);
+
+    var out = default;
+    if (try readOptionalBool(lua, t_idx, "cached_overlaps_input")) |v| {
+        out.cached_overlaps_input = v;
+    }
+    return out;
+}
+
 pub fn readTimeouts(lua: *Lua, table_idx: i32) llm.Endpoint.TimeoutConfig {
     var out: llm.Endpoint.TimeoutConfig = .{};
 
@@ -721,14 +748,16 @@ fn zagProviderFn(lua: *Lua) !i32 {
     // Derive wire semantics from the wire string. OpenAI-shaped wires
     // (`openai`, `chatgpt`) report cached input tokens as a subset of
     // `prompt_tokens`; Anthropic reports them disjointly. Cost
-    // accounting reads this flag directly (see `llm/cost.zig`). No
-    // Lua-side surface for users to override yet; a future
-    // `wire_semantics = {...}` table can be added if a real wire
-    // diverges from its base.
-    const wire_semantics: llm.WireSemantics = if (std.mem.eql(u8, wire, "anthropic"))
+    // accounting reads this flag directly (see `llm/cost.zig`). An
+    // optional `wire_semantics = { cached_overlaps_input = bool }`
+    // subtable overrides the wire-derived default for clones that
+    // diverge from their base (e.g. an Anthropic-shaped clone served
+    // over the `openai` wire).
+    const wire_default: llm.WireSemantics = if (std.mem.eql(u8, wire, "anthropic"))
         .{ .cached_overlaps_input = false }
     else
         .{ .cached_overlaps_input = true };
+    const wire_semantics = try readWireSemantics(lua, 1, wire_default);
 
     const default_model = (try readStringField(lua, 1, "default_model", .required, allocator)) orelse unreachable;
     errdefer allocator.free(default_model);

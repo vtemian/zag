@@ -4247,6 +4247,79 @@ test "zag.provider{}: omitted timeouts table keeps registry defaults" {
     try std.testing.expectEqual(defaults.write_ms, ep.timeouts.write_ms);
 }
 
+test "zag.provider{}: wire_semantics table overrides the wire-derived default" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // openai-wire defaults to cached_overlaps_input=true; override to false.
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "openai-anthropic-shaped",
+        \\  url = "http://example.invalid",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "m",
+        \\  wire_semantics = { cached_overlaps_input = false },
+        \\}
+    );
+    const ep_a = engine.providers_registry.find("openai-anthropic-shaped") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(false, ep_a.wire_semantics.cached_overlaps_input);
+
+    // anthropic-wire defaults to cached_overlaps_input=false; override to true.
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "anthropic-openai-shaped",
+        \\  url = "http://example.invalid",
+        \\  wire = "anthropic",
+        \\  auth = { kind = "x_api_key" },
+        \\  default_model = "m",
+        \\  wire_semantics = { cached_overlaps_input = true },
+        \\}
+    );
+    const ep_b = engine.providers_registry.find("anthropic-openai-shaped") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true, ep_b.wire_semantics.cached_overlaps_input);
+}
+
+test "zag.provider{}: omitted wire_semantics table keeps wire-derived default" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.provider{
+        \\  name = "default-openai",
+        \\  url = "http://example.invalid",
+        \\  wire = "openai",
+        \\  auth = { kind = "bearer" },
+        \\  default_model = "m",
+        \\}
+    );
+    const ep = engine.providers_registry.find("default-openai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
+}
+
+test "zag.provider{}: malformed wire_semantics surfaces LuaRuntime" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Non-boolean cached_overlaps_input is a user error, not a fall-back.
+    try std.testing.expectError(
+        error.LuaRuntime,
+        engine.lua.doString(
+            \\zag.provider{
+            \\  name = "bad-wire-semantics",
+            \\  url = "http://example.invalid",
+            \\  wire = "openai",
+            \\  auth = { kind = "bearer" },
+            \\  default_model = "m",
+            \\  wire_semantics = { cached_overlaps_input = "yes" },
+            \\}
+        ),
+    );
+}
+
 test "zag.providers.list() surfaces timeouts subtable" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
