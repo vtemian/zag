@@ -297,9 +297,10 @@ pub const StreamingResponse = struct {
                     .{ status, @tagName(response.head.status) },
                 );
             if (opts.error_detail_out) |out| {
-                out.set("{s}", .{detail}) catch {};
+                out.setOwned(detail);
+            } else {
+                allocator.free(detail);
             }
-            allocator.free(detail);
 
             // Existing diagnostic log line stays; useful when telemetry
             // is null and the artifact pair won't be written.

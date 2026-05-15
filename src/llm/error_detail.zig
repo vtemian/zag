@@ -31,6 +31,15 @@ pub const ErrorDetail = struct {
         self.message = new_message;
     }
 
+    /// Take ownership of an already-allocated slice. Used by provider
+    /// transport writers that have already built the detail string;
+    /// avoids a second allocPrint that `set("{s}", .{slice})` would
+    /// otherwise force. The slice must come from `self.allocator`.
+    pub fn setOwned(self: *ErrorDetail, owned: []u8) void {
+        if (self.message) |m| self.allocator.free(m);
+        self.message = owned;
+    }
+
     /// Take ownership of the slot's contents. Returns null if unset.
     /// Caller frees the returned slice with the same allocator.
     pub fn take(self: *ErrorDetail) ?[]u8 {
@@ -57,4 +66,25 @@ test "ErrorDetail: set overwrites previous message without leaking" {
     const owned = detail.take() orelse return error.TestUnexpectedResult;
     defer std.testing.allocator.free(owned);
     try std.testing.expectEqualStrings("second 2", owned);
+}
+
+test "ErrorDetail: setOwned adopts caller-allocated slice" {
+    var detail = ErrorDetail.init(std.testing.allocator);
+    defer detail.deinit();
+    const adopted = try std.testing.allocator.dupe(u8, "HTTP 500: upstream");
+    detail.setOwned(adopted);
+    const owned = detail.take() orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("HTTP 500: upstream", owned);
+}
+
+test "ErrorDetail: setOwned frees previous message" {
+    var detail = ErrorDetail.init(std.testing.allocator);
+    defer detail.deinit();
+    try detail.set("first", .{});
+    const adopted = try std.testing.allocator.dupe(u8, "second");
+    detail.setOwned(adopted);
+    const owned = detail.take() orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("second", owned);
 }

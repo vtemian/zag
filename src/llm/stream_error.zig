@@ -78,9 +78,10 @@ pub fn handle(
         allocator.dupe(u8, text) catch null;
     if (detail) |d| {
         if (error_detail_out) |out| {
-            out.set("{s}", .{d}) catch {};
+            out.setOwned(d);
+        } else {
+            allocator.free(d);
         }
-        allocator.free(d);
     }
 
     callback.on_event(callback.ctx, .{ .err = text });

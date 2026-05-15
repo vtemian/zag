@@ -392,9 +392,10 @@ pub fn httpPostJson(
         .{ raw.status, snippet },
     ) catch return error.ApiError;
     if (error_detail_out) |out| {
-        out.set("{s}", .{detail}) catch {};
+        out.setOwned(detail);
+    } else {
+        allocator.free(detail);
     }
-    allocator.free(detail);
     return error.ApiError;
 }
 
