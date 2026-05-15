@@ -70,16 +70,16 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
             }
         },
         .number => {
-            // Try integer first
-            const integer = lua.toInteger(abs_index) catch {
+            if (lua.isInteger(abs_index)) {
+                const integer = lua.toInteger(abs_index) catch unreachable;
+                try writer.print("{d}", .{integer});
+            } else {
                 const number = lua.toNumber(abs_index) catch {
                     try writer.writeAll("null");
                     return;
                 };
                 try writer.print("{d}", .{number});
-                return;
-            };
-            try writer.print("{d}", .{integer});
+            }
         },
         .string => {
             const str = lua.toString(abs_index) catch {
@@ -89,9 +89,8 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
             try types.writeJsonString(writer, str);
         },
         .table => {
-            if (isLuaArray(lua, abs_index)) {
+            if (luaArrayLength(lua, abs_index)) |length| {
                 try writer.writeByte('[');
-                const length = lua.rawLen(abs_index);
                 for (0..length) |i| {
                     if (i > 0) try writer.writeByte(',');
                     _ = lua.rawGetIndex(abs_index, @as(i64, @intCast(i + 1)));
@@ -128,19 +127,119 @@ pub fn luaValueToJson(lua: *Lua, index: i32, writer: anytype) !void {
     }
 }
 
-/// Heuristic: a Lua table is an array if it has consecutive integer keys starting at 1.
-pub fn isLuaArray(lua: *Lua, index: i32) bool {
-    const length = lua.rawLen(index);
-    if (length == 0) {
-        // Check if the table is truly empty (no keys at all) vs an object
-        lua.pushNil();
-        if (lua.next(index)) {
+/// Returns the array length when the table's keys are exactly `1..n` integers
+/// (no gaps, no non-integer keys, n > 0); returns null otherwise. `rawLen`
+/// returns an unspecified border on sparse tables, so we walk every entry
+/// and report the size we observed so callers iterate without a second pass.
+pub fn luaArrayLength(lua: *Lua, index: i32) ?usize {
+    const abs = lua.absIndex(index);
+    var max_key: i64 = 0;
+    var count: i64 = 0;
+
+    // Stack invariant during the walk: [..., key, value]. We pop the value
+    // (leaving the key) so the next lua.next(abs) call can advance. On any
+    // early return, pop both so the caller sees the original stack height.
+    lua.pushNil();
+    while (lua.next(abs)) {
+        if (!lua.isInteger(-2)) {
             lua.pop(2);
-            return false; // has keys, so it's an object
+            return null;
         }
-        // truly empty: treat as object {}
-        return false;
+        const k = lua.toInteger(-2) catch {
+            lua.pop(2);
+            return null;
+        };
+        if (k < 1) {
+            lua.pop(2);
+            return null;
+        }
+        if (k > max_key) max_key = k;
+        count += 1;
+        lua.pop(1); // pop value, keep key for next iteration
     }
-    // Has integer keys 1..length, consider it an array
-    return true;
+
+    if (count == 0 or max_key != count) return null;
+    return @intCast(count);
+}
+
+test "luaTableToJson: integer and float subtypes formatted distinctly" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+
+    // One table holding both subtypes so a branch swap or
+    // catch-ladder regression can't silently homogenize them.
+    lua.newTable();
+    _ = lua.pushString("whole");
+    lua.pushInteger(42);
+    lua.setTable(-3);
+    _ = lua.pushString("half");
+    lua.pushNumber(42.5);
+    lua.setTable(-3);
+    _ = lua.pushString("pi");
+    lua.pushNumber(3.14);
+    lua.setTable(-3);
+
+    const json = try luaTableToJson(lua, -1, allocator);
+    defer allocator.free(json);
+
+    // Floats keep their fractional part. Anchor on the leading colon
+    // so substrings like "13.14" or "42.50001" can't sneak through.
+    try std.testing.expect(std.mem.indexOf(u8, json, ":3.14,") != null or
+        std.mem.indexOf(u8, json, ":3.14}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ":42.5,") != null or
+        std.mem.indexOf(u8, json, ":42.5}") != null);
+
+    // Integer emits no decimal at all. Anchor on a JSON delimiter on
+    // both sides so a stray "42" inside "342" or "42.0" can't pass.
+    try std.testing.expect(std.mem.indexOf(u8, json, ":42,") != null or
+        std.mem.indexOf(u8, json, ":42}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ":42.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"42\"") == null);
+}
+
+test "luaArrayLength: sparse table is NOT an array" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+
+    lua.newTable();
+    lua.pushInteger(10);
+    lua.rawSetIndex(-2, 1);
+    lua.pushInteger(20);
+    lua.rawSetIndex(-2, 2);
+    lua.pushInteger(50);
+    lua.rawSetIndex(-2, 5); // gap at 3,4
+
+    try std.testing.expectEqual(@as(?usize, null), luaArrayLength(lua, -1));
+}
+
+test "luaArrayLength: contiguous 1..n returns n" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+
+    lua.newTable();
+    lua.pushInteger(1);
+    lua.rawSetIndex(-2, 1);
+    lua.pushInteger(2);
+    lua.rawSetIndex(-2, 2);
+    lua.pushInteger(3);
+    lua.rawSetIndex(-2, 3);
+
+    try std.testing.expectEqual(@as(?usize, 3), luaArrayLength(lua, -1));
+}
+
+test "luaArrayLength: mixed integer + string keys is NOT an array" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+
+    lua.newTable();
+    lua.pushInteger(1);
+    lua.rawSetIndex(-2, 1);
+    _ = lua.pushString("not-an-index");
+    lua.setField(-2, "key");
+
+    try std.testing.expectEqual(@as(?usize, null), luaArrayLength(lua, -1));
 }

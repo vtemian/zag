@@ -157,25 +157,29 @@ pub const Pane = struct {
     }
 
     /// Append a chunk of bytes to the draft (e.g. a bracketed paste).
-    /// Truncates past `draft.len` with a warn log. Skips the snapshot
-    /// and hook fire when no bytes will land (empty input or full draft):
+    /// `parser_dropped` is the bytes-dropped count the input parser
+    /// already trimmed off this paste (PASTE_BUF_SIZE overflow); a
+    /// nonzero value or a further clip against MAX_DRAFT publishes the
+    /// total drop via `transient_status` so the user sees a status-row
+    /// warning instead of a silent loss. Skips the snapshot and hook
+    /// fire when no bytes will land (empty input or full draft):
     /// firing `pane_draft_change` with previous == current is observably
     /// a no-op event, and plugins should not have to filter it.
-    pub fn appendPaste(self: *Pane, data: []const u8) void {
-        if (data.len == 0) return;
+    pub fn appendPaste(self: *Pane, data: []const u8, parser_dropped: usize) void {
+        if (data.len == 0 and parser_dropped == 0) return;
         const room = self.draft.len - self.draft_len;
         const to_copy = @min(room, data.len);
-        if (to_copy == 0) {
-            log.warn("paste truncated: {d} bytes dropped (draft full)", .{data.len});
-            return;
+        const draft_dropped = data.len - to_copy;
+        const total_dropped = parser_dropped + draft_dropped;
+        if (total_dropped > 0) {
+            log.warn("paste truncated: {d} bytes dropped", .{total_dropped});
+            if (self.wm) |wm| wm.setPasteTruncatedStatus(total_dropped);
         }
+        if (to_copy == 0) return;
         var prev_buf: [MAX_DRAFT]u8 = undefined;
         const prev = snapshotDraft(self, &prev_buf);
         @memcpy(self.draft[self.draft_len..][0..to_copy], data[0..to_copy]);
         self.draft_len += to_copy;
-        if (to_copy < data.len) {
-            log.warn("paste truncated: {d} bytes dropped (draft full)", .{data.len - to_copy});
-        }
         self.fireDraftChange(prev);
     }
 
@@ -397,9 +401,12 @@ fn snapshotDraft(pane: *const Pane, dest: []u8) []const u8 {
     return dest[0..n];
 }
 
-/// Maximum bytes of in-progress draft a single pane can hold. Fixed so
-/// the draft lives inline on the Pane struct with no separate alloc.
-pub const MAX_DRAFT = 4096;
+/// Maximum bytes of in-progress draft a single pane can hold. 64 KiB
+/// matches `input.PASTE_BUF_SIZE` so a clean bracketed paste lands
+/// without losing the tail; an over-cap paste still surfaces a
+/// bytes-dropped count via `transient_status`. Fixed so the draft lives
+/// inline on the Pane struct with no separate alloc.
+pub const MAX_DRAFT = 64 * 1024;
 
 /// A registered pane plus the persistence handle that keeps it tied to
 /// an on-disk session. WindowManager owns each `PaneEntry`: deinit
@@ -1416,6 +1423,14 @@ pub fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
         return 0;
     };
     return @intCast(written.len);
+}
+
+/// Publish a paste-truncation warning on the status row. Cleared by the
+/// next key event the same way `formatSplitAnnounce` is. Silently no-ops
+/// if the message doesn't fit (the status buffer is 64 bytes wide).
+pub fn setPasteTruncatedStatus(self: *WindowManager, dropped: usize) void {
+    const written = std.fmt.bufPrint(&self.transient_status, "paste truncated: {d} bytes dropped", .{dropped}) catch return;
+    self.transient_status_len = @intCast(written.len);
 }
 
 /// Create a new split pane: conversation + sink + runner + optional
@@ -4522,7 +4537,8 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
 
     const ep_a: llm.Endpoint = .{
         .name = "provA",
-        .serializer = .openai,
+        .factory = llm.openai.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://a.example",
         .auth = .none,
         .headers = &.{},
@@ -4536,7 +4552,8 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
 
     const ep_b: llm.Endpoint = .{
         .name = "provB",
-        .serializer = .openai,
+        .factory = llm.openai.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://b.example",
         .auth = .none,
         .headers = &.{},
@@ -5373,7 +5390,7 @@ test "PaneDraftChange does not fire when appendPaste is called with empty data" 
         \\end)
     );
 
-    f.wm.root_pane.appendPaste("");
+    f.wm.root_pane.appendPaste("", 0);
 
     _ = try engine.lua.getGlobal("fired_count");
     try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
@@ -5410,11 +5427,58 @@ test "PaneDraftChange does not fire when appendPaste has no room in the draft" {
         \\end)
     );
 
-    f.wm.root_pane.appendPaste("more");
+    f.wm.root_pane.appendPaste("more", 0);
 
     _ = try engine.lua.getGlobal("fired_count");
     try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
     engine.lua.pop(1);
+}
+
+test "appendPaste sets transient_status when parser flagged paste as truncated" {
+    // Parser already clipped 200 bytes off the paste before handing it to
+    // the window manager. The user must see a status-row indicator with
+    // the bytes-dropped count so the silent truncation becomes visible.
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+    try f.wm.attachLayoutRegistry();
+
+    f.wm.root_pane.appendPaste("hello", 200);
+
+    const status = f.wm.transient_status[0..f.wm.transient_status_len];
+    try std.testing.expect(std.mem.indexOf(u8, status, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "200") != null);
+}
+
+test "appendPaste sets transient_status when draft has no room for full content" {
+    // Parser delivered the paste intact, but the per-pane MAX_DRAFT cap
+    // chops the tail. The dropped count must still surface on the status
+    // row instead of disappearing into a log line.
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+    try f.wm.attachLayoutRegistry();
+
+    // Pre-fill the draft so only 4 bytes of room remain.
+    f.wm.root_pane.draft_len = MAX_DRAFT - 4;
+    @memset(f.wm.root_pane.draft[0 .. MAX_DRAFT - 4], 'a');
+
+    f.wm.root_pane.appendPaste("123456789", 0);
+
+    const status = f.wm.transient_status[0..f.wm.transient_status_len];
+    try std.testing.expect(std.mem.indexOf(u8, status, "truncated") != null);
+    // 9 incoming bytes, 4 fit, so 5 dropped.
+    try std.testing.expect(std.mem.indexOf(u8, status, "5") != null);
 }
 
 test "PaneDraftChange does not fire when setDraft is called with current draft text" {
@@ -5540,7 +5604,8 @@ test "zag.providers.list reflects the endpoint registry" {
     // wires it through `zag.provider{...}`.
     const ep: llm.Endpoint = .{
         .name = "provX",
-        .serializer = .openai,
+        .factory = llm.openai.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x.example",
         .auth = .none,
         .headers = &.{},
@@ -5616,7 +5681,8 @@ const ModelPickerPluginFixture = struct {
 
         const ep_a: llm.Endpoint = .{
             .name = "provA",
-            .serializer = .openai,
+            .factory = llm.openai.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://a.example",
             .auth = .none,
             .headers = &.{},
@@ -5657,7 +5723,8 @@ const ModelPickerPluginFixture = struct {
         // the fixture registry.
         const engine_ep: llm.Endpoint = .{
             .name = "provA",
-            .serializer = .openai,
+            .factory = llm.openai.create,
+            .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://a.example",
             .auth = .none,
             .headers = &.{},

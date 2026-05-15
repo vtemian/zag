@@ -8,6 +8,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Endpoint = @import("../llm.zig").Endpoint;
+const anthropic_provider = @import("../providers/anthropic.zig");
+const openai_provider = @import("../providers/openai.zig");
+const chatgpt_provider = @import("../providers/chatgpt.zig");
 const auth = @import("../auth.zig");
 const error_detail = @import("error_detail.zig");
 const registry = @import("registry.zig");
@@ -405,7 +408,8 @@ test "buildHeaders creates correct auth for bearer endpoint" {
 
     const endpoint = Endpoint{
         .name = "test",
-        .serializer = .openai,
+        .factory = openai_provider.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://example.com",
         .auth = .bearer,
         .headers = &.{.{ .name = "X-Custom", .value = "val" }},
@@ -441,7 +445,7 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
 
     const endpoint = Endpoint{
         .name = "test",
-        .serializer = .anthropic,
+        .factory = anthropic_provider.create,
         .url = "https://example.com",
         .auth = .x_api_key,
         .headers = &.{.{ .name = "anthropic-version", .value = "2023-06-01" }},
@@ -461,7 +465,8 @@ test "buildHeaders handles no-auth endpoint" {
     const allocator = std.testing.allocator;
     const endpoint = Endpoint{
         .name = "ollama",
-        .serializer = .openai,
+        .factory = openai_provider.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "http://localhost:11434/v1/chat/completions",
         .auth = .none,
         .headers = &.{},
@@ -477,7 +482,8 @@ test "buildHeaders handles no-auth endpoint" {
 test "buildHeaders+freeHeaders round-trip with static endpoint headers (no leak)" {
     const endpoint: Endpoint = .{
         .name = "test",
-        .serializer = .openai,
+        .factory = openai_provider.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .none,
         .headers = &.{
@@ -744,7 +750,8 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
 
     const endpoint: Endpoint = .{
         .name = "lua-declared-oauth",
-        .serializer = .chatgpt,
+        .factory = chatgpt_provider.create,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://example.test/responses",
         .auth = .{ .oauth = .{
             .issuer = "https://idp.test/authorize",

@@ -24,6 +24,7 @@ pub const parseBytes = core.parseBytes;
 
 pub const Parser = parser_mod.Parser;
 pub const PARSER_BUF_SIZE = parser_mod.PARSER_BUF_SIZE;
+pub const PASTE_BUF_SIZE = parser_mod.PASTE_BUF_SIZE;
 
 // -- Tests -------------------------------------------------------------------
 
@@ -165,7 +166,10 @@ test "Parser emits a single paste event for a bracketed paste block" {
     p.feedBytes(input_bytes, 0);
     const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;
     switch (event) {
-        .paste => |bytes| try std.testing.expectEqualSlices(u8, body, bytes),
+        .paste => |paste| {
+            try std.testing.expectEqualSlices(u8, body, paste.content);
+            try std.testing.expectEqual(@as(usize, 0), paste.truncated);
+        },
         else => return error.TestUnexpectedResult,
     }
     // After emitting the paste, no further events are pending.
@@ -180,7 +184,7 @@ test "Parser handles a bracketed paste split across reads" {
     p.feedBytes("lo\x1b[201~", 0);
     const event = p.nextEvent(0) orelse return error.TestUnexpectedResult;
     switch (event) {
-        .paste => |bytes| try std.testing.expectEqualSlices(u8, "hello", bytes),
+        .paste => |paste| try std.testing.expectEqualSlices(u8, "hello", paste.content),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -193,9 +197,56 @@ test "Parser: raw ESC inside a paste is not flushed by the ESC timeout" {
     // bypasses it and still emits the paste intact.
     const event = p.nextEvent(1000) orelse return error.TestUnexpectedResult;
     switch (event) {
-        .paste => |bytes| try std.testing.expectEqualSlices(u8, body, bytes),
+        .paste => |paste| try std.testing.expectEqualSlices(u8, body, paste.content),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "Parser emits paste with truncated count when content exceeds PASTE_BUF_SIZE" {
+    // Pasting more than the parser's PASTE_BUF_SIZE must still emit a
+    // paste event capped at the buffer size, and surface the number of
+    // bytes dropped so the consumer can warn the user. The feed runs
+    // through `feedBytes` in 64-byte chunks (matching production's
+    // READ_BUF_SIZE) so the in-paste branch flushes incrementally
+    // instead of overflowing the 128-byte pending buffer.
+    const allocator = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendNTimes(allocator, 'A', parser_mod.PASTE_BUF_SIZE + 100);
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(allocator);
+    try feed.appendSlice(allocator, "\x1b[200~");
+    try feed.appendSlice(allocator, body.items);
+    try feed.appendSlice(allocator, "\x1b[201~");
+
+    // Silence the per-chunk `paste truncated` warns from
+    // appendToPasteBuf; the behaviour under test is the emitted event's
+    // truncated count, not the log spam.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var p: Parser = .{};
+    var offset: usize = 0;
+    while (offset < feed.items.len) {
+        const chunk_end = @min(offset + 64, feed.items.len);
+        p.feedBytes(feed.items[offset..chunk_end], 0);
+        // Drain any events the chunk produced so the in-paste state
+        // makes progress.
+        while (p.nextEvent(0)) |ev| {
+            switch (ev) {
+                .paste => |paste| {
+                    try std.testing.expectEqual(@as(usize, parser_mod.PASTE_BUF_SIZE), paste.content.len);
+                    try std.testing.expectEqual(@as(usize, 100), paste.truncated);
+                    return;
+                },
+                else => {},
+            }
+        }
+        offset = chunk_end;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "parse ASCII character 'A'" {
@@ -281,7 +332,6 @@ test "parse SGR mouse press: CSI < 0;10;5 M" {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(@as(u16, 10), m.x);
             try std.testing.expectEqual(@as(u16, 5), m.y);
-            try std.testing.expectEqual(true, m.is_press);
             try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
             try std.testing.expectEqual(KeyEvent.no_modifiers, m.modifiers);
         },
@@ -297,11 +347,53 @@ test "parse SGR mouse release" {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(@as(u16, 3), m.x);
             try std.testing.expectEqual(@as(u16, 7), m.y);
-            try std.testing.expectEqual(false, m.is_press);
             try std.testing.expectEqual(MouseEvent.Kind.release, m.kind);
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parse SGR mouse drag (button-held motion sets .drag kind)" {
+    // Motion-with-button-held has the 0x20 bit set on the button byte;
+    // button code 32 = button-1 (0) + motion bit (0x20).
+    // ESC [ < 3 2 ; 1 0 ; 7 M
+    const event = parseBytes(&.{ 0x1b, '[', '<', '3', '2', ';', '1', '0', ';', '7', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(@as(u8, 0), m.button);
+            try std.testing.expectEqual(@as(u16, 10), m.x);
+            try std.testing.expectEqual(@as(u16, 7), m.y);
+            try std.testing.expectEqual(MouseEvent.Kind.drag, m.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SGR mouse press without motion bit stays .press" {
+    // Regression: ensure the motion-bit decode does not steal the press
+    // classification when 0x20 is clear. Button code 2 = right-button press.
+    const event = parseBytes(&.{ 0x1b, '[', '<', '2', ';', '4', ';', '4', 'M' }) orelse return error.TestUnexpectedResult;
+    switch (event) {
+        .mouse => |m| {
+            try std.testing.expectEqual(@as(u8, 2), m.button);
+            try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Parser emits focus_in on ESC[I" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, '[', 'I' }, 0);
+    const ev = p.nextEvent(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ev == .focus_in);
+}
+
+test "Parser emits focus_out on ESC[O" {
+    var p: Parser = .{};
+    p.feedBytes(&.{ 0x1b, '[', 'O' }, 0);
+    const ev = p.nextEvent(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ev == .focus_out);
 }
 
 test "parse Ctrl+C" {
@@ -506,7 +598,7 @@ test "parse SGR mouse with Ctrl modifier" {
         .mouse => |m| {
             try std.testing.expectEqual(@as(u8, 0), m.button);
             try std.testing.expectEqual(true, m.modifiers.ctrl);
-            try std.testing.expectEqual(true, m.is_press);
+            try std.testing.expectEqual(MouseEvent.Kind.press, m.kind);
         },
         else => return error.TestUnexpectedResult,
     }

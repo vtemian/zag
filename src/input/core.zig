@@ -19,11 +19,24 @@ pub const Event = union(enum) {
     mouse: MouseEvent,
     /// The terminal was resized.
     resize: struct { rows: u16, cols: u16 },
-    /// Raw bytes between a CSI 200~ / CSI 201~ pair. The slice is a
+    /// The terminal window gained focus (xterm `?1004`, `ESC [ I`).
+    /// Payload-less because the sequence carries no further info.
+    focus_in,
+    /// The terminal window lost focus (xterm `?1004`, `ESC [ O`).
+    focus_out,
+    /// Raw bytes between a CSI 200~ / CSI 201~ pair. `content` is a
     /// borrowed view into the owning `Parser`'s paste buffer and is
     /// valid only until the next `Parser.feedBytes` call, so consumers
-    /// must copy immediately (e.g., into a buffer's draft).
-    paste: []const u8,
+    /// must copy immediately (e.g., into a buffer's draft). `truncated`
+    /// counts bytes the parser dropped because the paste exceeded
+    /// `PASTE_BUF_SIZE`; consumers surface this so silent truncation
+    /// becomes visible to the user.
+    paste: struct {
+        /// Captured paste bytes, capped at `PASTE_BUF_SIZE`.
+        content: []const u8,
+        /// Bytes the parser had to drop on overflow; 0 means clean paste.
+        truncated: usize = 0,
+    },
     /// No event available (non-blocking read returned nothing).
     none,
 };
@@ -114,18 +127,17 @@ pub const MouseEvent = struct {
     x: u16,
     /// Row (1-based).
     y: u16,
-    /// true for press (M), false for release (m). Wheel events report `true`.
-    is_press: bool,
-    /// What the event represents. `press`/`release` carry button clicks;
+    /// What the event represents. `press`/`release` carry button edges,
+    /// `drag` is motion-with-button-held (xterm `?1002`), and
     /// `wheel_up`/`wheel_down` carry scroll-wheel ticks. Wheel events are
     /// emitted by the SGR encoder when the high bit (0x40) of the button
-    /// byte is set.
-    kind: Kind = .press,
+    /// byte is set; drag is signalled by the 0x20 motion bit.
+    kind: Kind,
     /// Modifier keys held during the mouse event.
     modifiers: KeyEvent.Modifiers,
 
     /// Discriminator for what the mouse byte encoded.
-    pub const Kind = enum { press, release, wheel_up, wheel_down };
+    pub const Kind = enum { press, release, drag, wheel_up, wheel_down };
 };
 
 /// Result of trying to parse one event from the head of a byte buffer.

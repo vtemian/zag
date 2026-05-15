@@ -22,10 +22,12 @@ pub const PARSER_BUF_SIZE = 128;
 /// Maximum bytes we read in a single poll, enough for any escape sequence.
 const READ_BUF_SIZE = 64;
 
-/// Hard cap on an accumulated bracketed paste. Sized to match the
-/// Conversation draft (4 KiB), since anything past that would be
-/// truncated at the consumer anyway.
-pub const PASTE_BUF_SIZE = 4096;
+/// Hard cap on an accumulated bracketed paste. 64 KiB lets users paste
+/// stack traces, code listings, and chat transcripts without hitting a
+/// silent truncation. Sized to match `WindowManager.MAX_DRAFT`; on
+/// overflow the parser surfaces a byte count so the consumer can warn
+/// the user instead of losing tail bytes invisibly.
+pub const PASTE_BUF_SIZE = 64 * 1024;
 
 /// Bracketed paste start marker: `ESC [ 2 0 0 ~`.
 const paste_start = "\x1b[200~";
@@ -65,6 +67,9 @@ pub const Parser = struct {
     /// and between paste emissions; reused across pastes.
     paste_buf: [PASTE_BUF_SIZE]u8 = undefined,
     paste_len: usize = 0,
+    /// Count of bytes dropped because the current paste exceeded
+    /// `PASTE_BUF_SIZE`. Reset to 0 after each paste event is emitted.
+    paste_truncated: usize = 0,
     in_paste: bool = false,
 
     /// Append bytes to the pending buffer. On overflow (a pathological
@@ -114,6 +119,7 @@ pub const Parser = struct {
             {
                 self.in_paste = true;
                 self.paste_len = 0;
+                self.paste_truncated = 0;
                 self.consume(paste_start.len, now_ms);
                 continue;
             }
@@ -159,7 +165,12 @@ pub const Parser = struct {
                 self.appendToPasteBuf(slice[0..i]);
                 self.consume(i + paste_end.len, now_ms);
                 self.in_paste = false;
-                return Event{ .paste = self.paste_buf[0..self.paste_len] };
+                const dropped = self.paste_truncated;
+                self.paste_truncated = 0;
+                return Event{ .paste = .{
+                    .content = self.paste_buf[0..self.paste_len],
+                    .truncated = dropped,
+                } };
             }
         }
 
@@ -175,15 +186,19 @@ pub const Parser = struct {
         return null;
     }
 
-    /// Append `data` to `paste_buf`, clipping at `PASTE_BUF_SIZE`.
-    /// Truncation is logged once per paste so consumers can notice.
+    /// Append `data` to `paste_buf`, clipping at `PASTE_BUF_SIZE`. Bytes
+    /// that don't fit are counted into `paste_truncated` so the eventual
+    /// paste event can carry the drop total to the consumer; a single
+    /// `log.warn` per call still surfaces the truncation in the trace.
     fn appendToPasteBuf(self: *Parser, data: []const u8) void {
         const room = self.paste_buf.len - self.paste_len;
         const to_copy = @min(room, data.len);
         @memcpy(self.paste_buf[self.paste_len..][0..to_copy], data[0..to_copy]);
         self.paste_len += to_copy;
         if (to_copy < data.len) {
-            log.warn("paste truncated: {d} bytes dropped (paste_buf full)", .{data.len - to_copy});
+            const dropped = data.len - to_copy;
+            self.paste_truncated += dropped;
+            log.warn("paste truncated: {d} bytes dropped (paste_buf full)", .{dropped});
         }
     }
 

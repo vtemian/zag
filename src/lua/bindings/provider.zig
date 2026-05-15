@@ -217,8 +217,7 @@ pub fn readHeaderList(
         headers.deinit(allocator);
     }
 
-    if (lua_json.isLuaArray(lua, inner)) {
-        const len = lua.rawLen(inner);
+    if (lua_json.luaArrayLength(lua, inner)) |len| {
         for (0..len) |i| {
             _ = lua.rawGetIndex(inner, @intCast(i + 1));
             defer lua.pop(1);
@@ -267,12 +266,25 @@ pub fn readHeaderList(
     return try headers.toOwnedSlice(allocator);
 }
 
-/// Parse the closed `wire` enum surfaced by `zag.provider{}`. Returns
-/// `null` when the string doesn't match any known serializer.
-pub fn parseSerializer(s: []const u8) ?llm.Serializer {
-    if (std.mem.eql(u8, s, "anthropic")) return .anthropic;
-    if (std.mem.eql(u8, s, "openai")) return .openai;
-    if (std.mem.eql(u8, s, "chatgpt")) return .chatgpt;
+/// Resolve a Lua `wire = "..."` string to the matching stdlib factory
+/// pointer. The lookup is the only place that hard-codes which wire
+/// names ship in-tree; an out-of-tree wire would add an entry to
+/// `stdlib_factories` (or, in a future iteration, register itself
+/// through a Lua API). Returns `null` for unknown wire names so the
+/// caller surfaces a `LuaError` with the same shape as before.
+const StdlibFactory = struct {
+    name: []const u8,
+    factory: llm.Factory,
+};
+const stdlib_factories: []const StdlibFactory = &.{
+    .{ .name = "anthropic", .factory = @import("../../providers/anthropic.zig").create },
+    .{ .name = "openai", .factory = @import("../../providers/openai.zig").create },
+    .{ .name = "chatgpt", .factory = @import("../../providers/chatgpt.zig").create },
+};
+pub fn resolveWireFactory(s: []const u8) ?llm.Factory {
+    for (stdlib_factories) |entry| {
+        if (std.mem.eql(u8, s, entry.name)) return entry.factory;
+    }
     return null;
 }
 
@@ -702,10 +714,21 @@ fn zagProviderFn(lua: *Lua) !i32 {
 
     const wire = (try readStringField(lua, 1, "wire", .required, allocator)) orelse unreachable;
     defer allocator.free(wire);
-    const serializer = parseSerializer(wire) orelse {
+    const factory = resolveWireFactory(wire) orelse {
         log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire});
         return error.LuaError;
     };
+    // Derive wire semantics from the wire string. OpenAI-shaped wires
+    // (`openai`, `chatgpt`) report cached input tokens as a subset of
+    // `prompt_tokens`; Anthropic reports them disjointly. Cost
+    // accounting reads this flag directly (see `llm/cost.zig`). No
+    // Lua-side surface for users to override yet; a future
+    // `wire_semantics = {...}` table can be added if a real wire
+    // diverges from its base.
+    const wire_semantics: llm.WireSemantics = if (std.mem.eql(u8, wire, "anthropic"))
+        .{ .cached_overlaps_input = false }
+    else
+        .{ .cached_overlaps_input = true };
 
     const default_model = (try readStringField(lua, 1, "default_model", .required, allocator)) orelse unreachable;
     errdefer allocator.free(default_model);
@@ -742,7 +765,8 @@ fn zagProviderFn(lua: *Lua) !i32 {
 
     const ep: llm.Endpoint = .{
         .name = name,
-        .serializer = serializer,
+        .factory = factory,
+        .wire_semantics = wire_semantics,
         .url = url,
         .auth = auth_val,
         .headers = headers,

@@ -100,15 +100,14 @@ pub fn estimateCost(
     // both at full rate would double-count the cached portion on OpenAI
     // wires every turn. The chatgpt (Codex) Responses API follows OpenAI
     // semantics; the serializer doesn't surface cached tokens today, but
-    // when it does they will share the OpenAI subset shape.
-    const cached_overlaps_input = switch (endpoint.serializer) {
-        .openai, .chatgpt => true,
-        .anthropic => false,
-    };
+    // when it does they will share the OpenAI subset shape. The
+    // `wire_semantics.cached_overlaps_input` flag is set when the endpoint
+    // is constructed (builtin literal or Lua `zag.provider{wire="..."}`).
+    //
     // Saturating subtraction guards against malformed usage reports where
     // a provider claims `cache_read > input`; clamp to zero rather than
     // wrapping around.
-    const effective_input = if (cached_overlaps_input)
+    const effective_input = if (endpoint.wire_semantics.cached_overlaps_input)
         usage.input_tokens -| usage.cache_read_tokens
     else
         usage.input_tokens;
@@ -128,12 +127,29 @@ pub fn estimateCost(
 
 // -- Tests -------------------------------------------------------------------
 
+/// Stub factory used by test fixtures in this file. Cost estimation never
+/// invokes the factory, but `Endpoint` literals need a value for the field.
+/// Importing the real stdlib factories from `src/providers/*.zig` would
+/// create a circular import via `llm.zig`.
+fn testStubFactory(
+    allocator: std.mem.Allocator,
+    endpoint: *const Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) anyerror!@import("../llm.zig").Provider {
+    _ = allocator;
+    _ = endpoint;
+    _ = auth_path;
+    _ = model;
+    return error.NotImplemented;
+}
+
 test "estimateCost: looks up per-model rate through registry split on slash" {
     var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-slash",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -167,7 +183,8 @@ test "estimateCost: skips nil cache rates" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "openai-test-nilcache",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .bearer,
         .headers = &.{},
@@ -208,7 +225,7 @@ test "estimateCost: unknown model within known provider returns null" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-unknown",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -246,7 +263,8 @@ test "openai cost subtracts cached tokens from input rate" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "openai-test-cached",
-        .serializer = .openai,
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
         .auth = .bearer,
         .headers = &.{},
@@ -282,7 +300,7 @@ test "anthropic cost bills cached tokens additively (sanity)" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-cached",
-        .serializer = .anthropic,
+        .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
         .headers = &.{},
@@ -310,6 +328,79 @@ test "anthropic cost bills cached tokens additively (sanity)" {
         .cache_read_tokens = 500_000,
     }).?;
     try std.testing.expectApproxEqAbs(@as(f64, 1.125), cost, 0.001);
+}
+
+test "cost: cached_overlaps_input read from endpoint.wire_semantics, not serializer" {
+    // Two endpoints, identical rate card, identical usage. The only
+    // difference is `wire_semantics.cached_overlaps_input`. The "true"
+    // (OpenAI/Codex) branch subtracts cached tokens from the input
+    // rate; the "false" (Anthropic) branch bills cached tokens
+    // additively. Mirrors the numbers already proven in the two
+    // sibling tests above so a future refactor cannot silently flip
+    // the bool's meaning without diverging from documented behavior.
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const overlap_ep: Endpoint = .{
+        .name = "overlap-test",
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
+        .url = "https://x",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{
+            .{
+                .id = "m",
+                .context_window = 1000,
+                .max_output_tokens = 100,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 4.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.25,
+            },
+        },
+    };
+    try reg.add(try overlap_ep.dupe(std.testing.allocator));
+
+    const additive_ep: Endpoint = .{
+        .name = "additive-test",
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = false },
+        .url = "https://x",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "m",
+        .models = &.{
+            .{
+                .id = "m",
+                .context_window = 1000,
+                .max_output_tokens = 100,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 4.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.25,
+            },
+        },
+    };
+    try reg.add(try additive_ep.dupe(std.testing.allocator));
+
+    const usage: Usage = .{
+        .input_tokens = 1_000_000,
+        .output_tokens = 0,
+        .cache_creation_tokens = 0,
+        .cache_read_tokens = 500_000,
+    };
+
+    // Subset accounting: 500k uncached input + 500k cached read.
+    // 0.5 * 1.0 + 0.5 * 0.25 = 0.625
+    const overlap_cost = estimateCost(&reg, "overlap-test/m", usage).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.625), overlap_cost, 0.001);
+
+    // Additive accounting: 1M input + 500k cached read.
+    // 1.0 * 1.0 + 0.5 * 0.25 = 1.125
+    const additive_cost = estimateCost(&reg, "additive-test/m", usage).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.125), additive_cost, 0.001);
 }
 
 test {

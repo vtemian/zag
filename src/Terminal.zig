@@ -100,9 +100,15 @@ pub fn init() !Terminal {
     try writeEscapeSequence("\x1b[?2026h");
     errdefer writeEscapeSequence("\x1b[?2026l") catch {};
 
-    // 6. Enable mouse tracking (X10 + SGR extended)
-    try writeEscapeSequence("\x1b[?1000h\x1b[?1006h");
-    errdefer writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch {};
+    // 6. Enable mouse tracking + focus reporting: ?1000 (button
+    //    press/release) + ?1002 (button-held motion, i.e. drag) +
+    //    ?1004 (window focus in/out: ESC [ I / ESC [ O) + ?1006 (SGR
+    //    extended coordinates). Order matters per xterm convention:
+    //    enable in increasing mode-number order so trackers come up
+    //    before the encoder that serialises them. Disable reverses the
+    //    order so the encoder shuts off before the trackers.
+    try writeEscapeSequence("\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h");
+    errdefer writeEscapeSequence("\x1b[?1006l\x1b[?1004l\x1b[?1002l\x1b[?1000l") catch {};
 
     // 7. Enable bracketed paste so a multi-line paste arrives as one
     //    event (bracketed by CSI 200~ / CSI 201~) instead of hundreds
@@ -120,10 +126,10 @@ pub fn init() !Terminal {
     // 9. Install SIGWINCH handler
     installSigwinchHandler();
 
-    // 8. Detect 24-bit color capability from $COLORTERM.
+    // 10. Detect 24-bit color capability from $COLORTERM.
     true_color = detectTrueColor();
 
-    // 9. Query initial terminal size
+    // 11. Query initial terminal size
     const size = getSize() catch |err| blk: {
         log.warn("getSize failed ({s}), falling back to 24x80", .{@errorName(err)});
         break :blk Size{ .rows = 24, .cols = 80 };
@@ -166,8 +172,8 @@ pub fn deinit(self: *Terminal) void {
     writeEscapeSequence("\x1b[?2004l") catch |err| {
         log.warn("failed to disable bracketed paste: {s}", .{@errorName(err)});
     };
-    writeEscapeSequence("\x1b[?1006l\x1b[?1000l") catch |err| {
-        log.warn("failed to disable mouse tracking: {s}", .{@errorName(err)});
+    writeEscapeSequence("\x1b[?1006l\x1b[?1004l\x1b[?1002l\x1b[?1000l") catch |err| {
+        log.warn("failed to disable mouse tracking and focus reporting: {s}", .{@errorName(err)});
     };
     writeEscapeSequence("\x1b[?2026l") catch |err| {
         log.warn("failed to disable synchronized output: {s}", .{@errorName(err)});

@@ -29,12 +29,18 @@ pub const OpenAiSerializer = struct {
     const vtable: Provider.VTable = .{
         .call = callImpl,
         .call_streaming = callStreamingImpl,
+        .deinit = deinitImpl,
         .name = "openai",
     };
 
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *OpenAiSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
+        const self: *OpenAiSerializer = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
     }
 
     fn callImpl(
@@ -98,6 +104,20 @@ pub const OpenAiSerializer = struct {
         return parseSseStream(stream, self.endpoint.reasoning, req.allocator, req.callback, req.cancel);
     }
 };
+
+/// Build a Provider whose state is a freshly-allocated `OpenAiSerializer`.
+/// Stored on `Endpoint.factory` for every OpenAI-wire endpoint; the Lua
+/// reader resolves the `wire = "openai"` string to this function pointer.
+pub fn create(
+    allocator: Allocator,
+    endpoint: *const llm.Endpoint,
+    auth_path: []const u8,
+    model: []const u8,
+) !Provider {
+    const state = try allocator.create(OpenAiSerializer);
+    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    return state.provider();
+}
 
 fn buildRequestBody(
     model: []const u8,

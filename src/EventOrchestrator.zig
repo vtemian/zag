@@ -329,7 +329,13 @@ fn tick(
                 if (self.handleKey(k) == .quit) running.* = false;
             },
             .mouse => |m| self.handleMouse(m),
-            .paste => |bytes| self.handlePaste(bytes),
+            .paste => |paste| self.handlePaste(paste.content, paste.truncated),
+            // Focus reporting (?1004): log only for now. A future commit
+            // can use these to dim chrome or pause animations on
+            // focus_out. Explicit arms keep the catch-all from silently
+            // swallowing them and force intent when new variants land.
+            .focus_in => log.debug("terminal focus_in", .{}),
+            .focus_out => log.debug("terminal focus_out", .{}),
             else => {},
         }
     }
@@ -762,16 +768,24 @@ fn handleCommand(self: *EventOrchestrator, command: []const u8) CommandResult {
 /// insert mode; in normal mode a stray paste is dropped on purpose (it
 /// would otherwise land as input-that-looks-like-commands). The bytes
 /// are a borrowed slice into the parser's paste buffer and are only
-/// valid for this call.
-fn handlePaste(self: *EventOrchestrator, bytes: []const u8) void {
+/// valid for this call. `parser_dropped` reports how many bytes the
+/// input parser already trimmed off (PASTE_BUF_SIZE overflow); we hand
+/// it to `appendPaste` so the WindowManager can surface the drop on
+/// the status row. In non-insert mode the paste body goes nowhere but
+/// parser-level truncation must still surface, otherwise a 30 KiB
+/// paste over the cap vanishes with zero user feedback.
+fn handlePaste(self: *EventOrchestrator, bytes: []const u8, parser_dropped: usize) void {
     self.window_manager.transient_status_len = 0;
-    if (self.window_manager.current_mode != .insert) return;
+    if (self.window_manager.current_mode != .insert) {
+        if (parser_dropped > 0) self.window_manager.setPasteTruncatedStatus(parser_dropped);
+        return;
+    }
     const focused = self.window_manager.getFocusedPanePtr();
     // Drafts are pane-scoped now; paste lands on whichever pane is
     // focused. Submit-side gating still applies (only agent panes
     // submit), so a paste into a scratch pane is harmless: it sits in
     // the draft until focus moves or the user clears it.
-    focused.appendPaste(bytes);
+    focused.appendPaste(bytes, parser_dropped);
 }
 
 fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
@@ -817,12 +831,15 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
 
         const local_x = screen_x - rect.x;
         const local_y = screen_y - rect.y;
-        // Wheel events scroll the float's viewport directly; other
-        // mouse events route through the float's View as before.
+        // Wheel events scroll the float's viewport directly. Drag and
+        // motion events route through the float's View; the
+        // `mouse_anchor` update above already lets a follower float
+        // track the pointer on every drag without any per-event work
+        // here, so the drag arm only needs to hand the event off.
         switch (ev.kind) {
             .wheel_up => scrollFloatBy(f, .up),
             .wheel_down => scrollFloatBy(f, .down),
-            else => {
+            .drag, .press, .release => {
                 if (self.window_manager.paneFromFloatHandle(f.handle)) |fp| {
                     _ = fp.view.onMouse(ev, local_x, local_y);
                 }
@@ -842,12 +859,14 @@ fn handleMouse(self: *EventOrchestrator, ev: input.MouseEvent) void {
         const local_y = screen_y - rect.y;
         // Wheel events scroll the leaf's viewport directly; the buffer
         // and view stay stateless about scrolling now that the viewport
-        // lives on the Pane. Other mouse events still dispatch through
-        // the View vtable for buffer-specific handling.
+        // lives on the Pane. Press/release/drag all dispatch through
+        // the View vtable for buffer-specific handling; the `.drag` arm
+        // is listed explicitly so adding new MouseEvent.Kind variants
+        // forces a decision here.
         switch (ev.kind) {
             .wheel_up => scrollLeafBy(&node.leaf, .up),
             .wheel_down => scrollLeafBy(&node.leaf, .down),
-            else => _ = node.leaf.view.onMouse(ev, local_x, local_y),
+            .drag, .press, .release => _ = node.leaf.view.onMouse(ev, local_x, local_y),
         }
         return;
     }
@@ -1366,7 +1385,6 @@ test "mouse click on a focusable float makes it the focused float" {
         .x = 11,
         .y = 8,
         .modifiers = .{},
-        .is_press = true,
         .kind = .press,
     };
     orch.handleMouse(ev);
@@ -2047,4 +2065,49 @@ test "scrollViewportBy up with last_total_rows=0 stays at 0" {
 
     scrollViewportBy(&viewport, .up);
     try std.testing.expectEqual(@as(u32, 0), viewport.scroll_offset);
+}
+
+test "handlePaste in normal mode still surfaces parser-level truncation" {
+    // Regression: a user who pastes 30 KiB while in normal mode used to
+    // get zero feedback. The parser dropped bytes past PASTE_BUF_SIZE,
+    // handlePaste cleared the status row, then bailed on the mode check
+    // before any indicator ran. The truncation must survive the mode
+    // bail or the cap is invisible to the user.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    f.wm.current_mode = .normal;
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.handlePaste("hello", 200);
+    f.wm.* = orch.window_manager;
+
+    const status = f.wm.transient_status[0..f.wm.transient_status_len];
+    try std.testing.expect(std.mem.indexOf(u8, status, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "200") != null);
+}
+
+test "handlePaste in normal mode with no truncation clears prior status" {
+    // Counter-test: a clean paste in normal mode still clears whatever
+    // transient status was on screen (matching handleKey's "any event
+    // dismisses status" gesture). Truncation case is the exception, not
+    // the rule.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    f.wm.current_mode = .normal;
+    f.wm.setPasteTruncatedStatus(42);
+    try std.testing.expect(f.wm.transient_status_len > 0);
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    orch.handlePaste("hello", 0);
+    f.wm.* = orch.window_manager;
+
+    try std.testing.expectEqual(@as(u8, 0), f.wm.transient_status_len);
 }

@@ -293,12 +293,76 @@ pub fn runLoopStreaming(
     }
 }
 
-/// Push a `prompt_assembly_request` onto the event queue and park until
-/// the main thread renders the Lua prompt registry. Polls `cancel` every
-/// 50ms so a user interrupt still tears down the wait. On cancellation,
-/// the still-queued request is serviced by `dispatchHookRequests` (or
-/// the drain fall-through) and signals `done` with an error_name; we
-/// surface `error.Cancelled` to the caller so the turn unwinds cleanly.
+/// Translate a comptime-known request type into the matching
+/// `AgentEvent` union variant. Used by `marshalRequest` so a single
+/// generic helper can push any of the six round-trip request types
+/// without runtime dispatch. A new round-trip variant must be added
+/// here or the compile fails loudly.
+fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
+    return switch (T) {
+        agent_events.PromptAssemblyRequest => .{ .prompt_assembly_request = req },
+        agent_events.ToolGateRequest => .{ .tool_gate_request = req },
+        agent_events.JitContextRequest => .{ .jit_context_request = req },
+        agent_events.ToolTransformRequest => .{ .tool_transform_request = req },
+        agent_events.LoopDetectRequest => .{ .loop_detect_request = req },
+        agent_events.CompactRequest => .{ .compact_request = req },
+        else => @compileError("marshalRequest does not handle " ++ @typeName(T)),
+    };
+}
+
+/// Push `req` onto the queue, then poll `req.done` with 50ms timed
+/// waits while checking `cancel`. On cancel, wait for the main side
+/// to finish writing `req.result` (it owns the request until dispatch
+/// completes), call `req.freeResult()`, and return `error.Cancelled`.
+/// On normal completion return without freeing: the caller reads
+/// `req.result` and decides ownership.
+///
+/// Push failure surfaces as `error.EventQueueFull`. Call sites that
+/// want the silent-skip semantics catch that error and translate it
+/// to null at their own layer; the generic helper does not.
+///
+/// Comptime contract: `T` must have a `done` field and a `freeResult`
+/// method. Both checks fail the build, not at runtime.
+///
+/// Liveness invariant: a main-thread dispatcher (today
+/// `AgentRunner.dispatchHookRequests`) must eventually drain the queue
+/// and call `req.done.set()`. Without that, the wait loop spins on the
+/// 50ms cadence forever when `cancel` is also never set. Cheap to spin,
+/// but a refactor that decouples the dispatcher must preserve this
+/// guarantee.
+fn marshalRequest(
+    comptime T: type,
+    req: *T,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !void {
+    comptime {
+        if (!@hasField(T, "done")) @compileError(@typeName(T) ++ " missing 'done' field");
+        if (!@hasDecl(T, "freeResult")) @compileError(@typeName(T) ++ " missing 'freeResult' method");
+    }
+
+    queue.push(makeAgentEvent(T, req)) catch return error.EventQueueFull;
+
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            return;
+        } else |_| {
+            if (cancel.load(.acquire)) {
+                // Main may still be inside the dispatch handler writing
+                // to req.result. Wait for done before touching it.
+                req.done.wait();
+                req.freeResult();
+                return error.Cancelled;
+            }
+        }
+    }
+}
+
+/// Marshal a prompt-assembly round-trip to the main thread via
+/// `marshalRequest`, then transfer the `AssembledPrompt` arena to the
+/// caller. Returns `error.PromptAssemblyFailed` if the main side reports
+/// failure via `error_name`, or `error.Cancelled` if the turn was
+/// cancelled mid-wait.
 fn marshalPromptAssembly(
     ctx: *const prompt.LayerContext,
     allocator: Allocator,
@@ -306,25 +370,15 @@ fn marshalPromptAssembly(
     cancel: *agent_events.CancelFlag,
 ) !prompt.AssembledPrompt {
     var req = agent_events.PromptAssemblyRequest.init(ctx, allocator);
-    queue.push(.{ .prompt_assembly_request = &req }) catch return error.EventQueueFull;
+    try marshalRequest(agent_events.PromptAssemblyRequest, &req, queue, cancel);
 
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| break else |_| {
-            if (cancel.load(.acquire)) {
-                // The main thread still owns the request until it pops
-                // from the queue and signals done. Wait one more poll
-                // interval so we don't free a request still being read.
-                req.done.wait();
-                if (req.result) |assembled| {
-                    var owned = assembled;
-                    owned.deinit();
-                }
-                return error.Cancelled;
-            }
-        }
+    if (req.result) |assembled| {
+        const out = assembled;
+        // Transfer arena ownership to the caller. Clearing the slot
+        // makes any subsequent freeResult() a safe no-op.
+        req.result = null;
+        return out;
     }
-
-    if (req.result) |assembled| return assembled;
     if (req.error_name) |name| {
         log.warn("prompt assembly marshalling failed: {s}", .{name});
     }
@@ -355,12 +409,11 @@ fn fireLifecycleHook(
     }
 }
 
-/// Fire `zag.tools.gate` once per turn before `callLlm` and block on
-/// a main-thread round-trip. Returns the duped allowlist (caller owns
-/// outer slice + every interior string; release via the helper on the
-/// `ToolGateRequest` or by walking the slice manually) or null when no
-/// handler is registered, the handler returned nil/empty, or it
-/// errored. Skips the round-trip entirely when no engine is present
+/// Fire `zag.tools.gate` once per turn before `callLlm` via
+/// `marshalRequest`. Returns the duped allowlist (caller owns outer
+/// slice + every interior string) or null when no handler is registered,
+/// the handler returned nil/empty, errored, or the event queue was
+/// saturated. Skips the round-trip entirely when no engine is present
 /// or the gate slot is empty so the no-op fast path stays cheap.
 fn fireToolGate(
     lua_engine: ?*LuaEngine.LuaEngine,
@@ -374,26 +427,20 @@ fn fireToolGate(
     if (engine.tool_gate_handler == null) return null;
 
     var req = agent_events.ToolGateRequest.init(model, available_tools, allocator);
-    queue.push(.{ .tool_gate_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                req.freeResult();
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.ToolGateRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("tool gate handler failed: {s}", .{name});
         req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    // Transfer ownership of the duped allowlist to the caller. Clearing
+    // the slot makes any subsequent freeResult() a safe no-op.
+    req.result = null;
+    return out;
 }
 
 /// Build a filtered `tool_defs` slice keyed by the gate's allowlist.
@@ -761,12 +808,12 @@ fn firePostHook(
     };
 }
 
-/// Fire `zag.context.on_tool_result` for one tool call and block on a
-/// main-thread round-trip. Mirrors `firePostHook`'s cancel-poll cadence.
-/// Returns the duped attachment string (caller owns) or null when no
-/// handler is registered, the handler returned nil, or the handler
-/// errored. Skips the round-trip entirely when no handler is registered
-/// for `tc.name` so the no-op fast path stays cheap.
+/// Fire `zag.context.on_tool_result` for one tool call via
+/// `marshalRequest`. Returns the duped attachment string (caller owns)
+/// or null when no handler is registered, the handler returned nil,
+/// errored, or the event queue was saturated. Skips the round-trip
+/// entirely when no handler is registered for `tc.name` so the no-op
+/// fast path stays cheap.
 fn fireJitContextRequest(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
@@ -787,38 +834,30 @@ fn fireJitContextRequest(
         is_error,
         allocator,
     );
-    // Queue-full means the main loop is saturated; skip the round-trip
-    // rather than parking on `done` that nobody will signal.
-    queue.push(.{ .jit_context_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                if (req.result) |attached| allocator.free(attached);
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.JitContextRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("jit context handler '{s}' failed: {s}", .{ tc.name, name });
-        if (req.result) |attached| allocator.free(attached);
+        req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    // Transfer ownership of the duped attachment to the caller. Clearing
+    // the slot makes any subsequent freeResult() a safe no-op.
+    req.result = null;
+    return out;
 }
 
-/// Fire `zag.tools.transform_output` for one tool call and block on a
-/// main-thread round-trip. Mirrors `fireJitContextRequest`'s structure;
-/// the only semantic difference belongs to the caller, which REPLACES
-/// the tool output rather than appending. Returns the duped replacement
-/// string (caller owns) or null when no handler is registered, the
-/// handler returned nil, or the handler errored. Skips the round-trip
-/// entirely when no handler is registered for `tc.name` so the no-op
-/// fast path stays cheap.
+/// Fire `zag.tools.transform_output` for one tool call via
+/// `marshalRequest`. The handler's returned string REPLACES the tool
+/// output (semantic difference from `fireJitContextRequest`, which
+/// appends). Returns the duped replacement (caller owns) or null when
+/// no handler is registered, the handler returned nil, errored, or the
+/// event queue was saturated. Skips the round-trip entirely when no
+/// handler is registered for `tc.name` so the no-op fast path stays
+/// cheap.
 fn fireToolTransformRequest(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
@@ -839,33 +878,27 @@ fn fireToolTransformRequest(
         is_error,
         allocator,
     );
-    queue.push(.{ .tool_transform_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                if (req.result) |replacement| allocator.free(replacement);
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.ToolTransformRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("tool transform handler '{s}' failed: {s}", .{ tc.name, name });
-        if (req.result) |replacement| allocator.free(replacement);
+        req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    // Transfer ownership of the duped replacement to the caller. Clearing
+    // the slot makes any subsequent freeResult() a safe no-op.
+    req.result = null;
+    return out;
 }
 
-/// Fire `zag.loop.detect` after the most recent tool execution and
-/// block on a main-thread round-trip. Returns the decoded `LoopAction`
-/// (caller owns any heap bytes inside, e.g. `reminder` text) or null
-/// when no handler is registered, the handler returned nil, or the
-/// handler errored. Skips the round-trip entirely when no engine is
+/// Fire `zag.loop.detect` after the most recent tool execution via
+/// `marshalRequest`. Returns the decoded `LoopAction` (caller owns any
+/// heap bytes inside, e.g. `reminder` text) or null when no handler is
+/// registered, the handler returned nil, errored, or the event queue
+/// was saturated. Skips the round-trip entirely when no engine is
 /// present or the detector slot is empty so the no-op fast path stays
 /// cheap.
 fn fireLoopDetect(
@@ -888,26 +921,18 @@ fn fireLoopDetect(
         identical_streak,
         allocator,
     );
-    queue.push(.{ .loop_detect_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                req.freeResult();
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.LoopDetectRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("loop detect handler failed: {s}", .{name});
         req.freeResult();
         return null;
     }
-    return req.result;
+    const out = req.result;
+    req.result = null; // transfer ownership; freeResult becomes a no-op
+    return out;
 }
 
 /// Fire `zag.compact.strategy` at the top of the next iteration when
@@ -949,29 +974,17 @@ fn fireCompact(
     if (tokens_used < threshold) return null;
 
     var req = agent_events.CompactRequest.init(messages, tokens_used, tokens_max, allocator);
-    queue.push(.{ .compact_request = &req }) catch return null;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) {
-                // Main may still be inside handleX(req) writing to req.result.
-                // Wait for it to signal done before touching req.result.
-                req.done.wait();
-                req.freeResult();
-                return error.Cancelled;
-            }
-        }
-    }
+    marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return null,
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.error_name) |name| {
         log.warn("compact strategy handler failed: {s}", .{name});
         req.freeResult();
         return null;
     }
     const replacement = req.result orelse return null;
-    // Transfer ownership to the caller. Clear the request slot so
-    // `freeResult` is a no-op if the caller drops the request later.
-    req.result = null;
+    req.result = null; // transfer ownership; freeResult becomes a no-op
     return replacement;
 }
 
@@ -3934,6 +3947,82 @@ test "fireToolTransformRequest cancel path waits for handle then frees and retur
     try std.testing.expectError(error.Cancelled, result);
 }
 
+test "marshalPromptAssembly cancel path waits for handle then frees and returns Cancelled" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // No prompt-registry handler is needed: with cancel pre-set, the
+    // helper returns error.Cancelled before any Lua-side render runs.
+    // The engine still has to exist so `dispatchHookRequests` can drain
+    // the request from the queue and signal `done`.
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    const ctx: prompt.LayerContext = .{
+        .model = .{ .provider_name = "test", .model_id = "test" },
+        .cwd = "/tmp",
+        .worktree = "/tmp",
+        .agent_name = "zag",
+        .date_iso = "2026-04-22",
+        .is_git_repo = false,
+        .platform = "darwin",
+        .tools = &.{},
+    };
+    const result = marshalPromptAssembly(&ctx, alloc, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+}
+
+test "marshalRequest cancel path signals done and frees result via freeResult" {
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString(
+        \\zag.context.on_tool_result("read", function(ctx)
+        \\  return "appended"
+        \\end)
+    );
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(true);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, CancelPathHarness.delayedPump, .{
+        &queue,
+        &engine,
+        &stop,
+        150 * std.time.ns_per_ms,
+    });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    var req = agent_events.JitContextRequest.init("read", "{}", "tool out", false, alloc);
+    const result = marshalRequest(agent_events.JitContextRequest, &req, &queue, &cancel);
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result == null);
+}
+
 // `queue.push` returns `error.QueueFull` on a saturated ring. Each fire
 // helper swallows that with `catch return null;` so a saturated queue
 // surfaces as a quiet null, NOT as a propagated error. These tests pin
@@ -4055,4 +4144,24 @@ test "fireCompact returns null when queue is at capacity" {
     // attempts the queue push (rather than bypassing on the fast path).
     const result = try fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
     try std.testing.expectEqual(@as(?[]types.Message, null), result);
+}
+
+test "round-trip Request types all expose freeResult" {
+    // Comptime guard: if a new round-trip variant is added without
+    // freeResult, this fails to compile.
+    comptime {
+        const types_to_check = .{
+            agent_events.PromptAssemblyRequest,
+            agent_events.ToolGateRequest,
+            agent_events.JitContextRequest,
+            agent_events.ToolTransformRequest,
+            agent_events.LoopDetectRequest,
+            agent_events.CompactRequest,
+        };
+        for (types_to_check) |T| {
+            if (!@hasDecl(T, "freeResult")) {
+                @compileError(@typeName(T) ++ " must declare freeResult");
+            }
+        }
+    }
 }

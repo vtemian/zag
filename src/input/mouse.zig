@@ -43,22 +43,32 @@ pub fn parseSgrMouse(seq: []const u8) Event {
 
     const b = nums[0];
     const is_wheel = (b & 0x40) != 0;
+    // Bit 0x20 is xterm's "motion" indicator (?1002): the byte carries a
+    // pointer move while a button is held. Strip it before classifying
+    // the button so the low two bits still pick the right one.
+    const is_motion = !is_wheel and (b & 0x20) != 0;
     const button: u8 = if (is_wheel) 0 else @as(u8, @truncate(b & 0x03));
     const kind: MouseEvent.Kind = if (is_wheel)
         (if ((b & 0x01) == 0) .wheel_up else .wheel_down)
-    else if (is_press) .press else .release;
+    else if (!is_press)
+        .release
+    else if (is_motion)
+        .drag
+    else
+        .press;
     const modifiers = KeyEvent.Modifiers{
         .shift = (b & 0x04) != 0,
         .alt = (b & 0x08) != 0,
         .ctrl = (b & 0x10) != 0,
     };
 
-    return Event{ .mouse = .{
-        .button = button,
-        .x = nums[1],
-        .y = nums[2],
-        .is_press = is_press,
-        .kind = kind,
-        .modifiers = modifiers,
-    } };
+    return Event{
+        .mouse = .{
+            .button = button,
+            .x = nums[1],
+            .y = nums[2],
+            .kind = kind,
+            .modifiers = modifiers,
+        },
+    };
 }

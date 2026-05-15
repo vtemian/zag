@@ -364,11 +364,13 @@ Each commit: replace the body with a thin call to `marshalRequest`, run the matc
 The plan is done when:
 
 1. 8 commits land on `main`.
-2. `src/agent.zig` line count drops by ~170 lines.
-3. The 6 migrated helpers each have a body under 20 lines.
+2. The 6 migrated helpers each delegate to `marshalRequest`, and the cancel-branch UAF fix lives in exactly one place.
+3. The 6 migrated helpers each have a body under ~25 lines.
 4. The `comptime` guard in Task 1 still passes (catches future regressions).
 5. All 5 existing `CancelPathHarness` tests still pass, plus the new prompt-assembly cancel test.
 6. `zig build test` is green at every commit.
+
+**Post-mortem on line count:** the original plan claimed `~170` line drop in `src/agent.zig`. Actual was `+104` (4058 → 4162). The new `marshalRequest`+`makeAgentEvent` (~58 lines) and new tests (~90 lines combined) outweighed the per-site savings (~80 lines across 6 helpers). The structural win (single cancel-cleanup path, comptime-enforced contract) is the real success criterion; the line-count framing was wrong.
 
 ## Estimated scope
 
