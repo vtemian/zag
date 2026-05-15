@@ -70,7 +70,7 @@ pub fn runLoopStreaming(
     /// `Request`/`StreamRequest` struct. `AgentRunner.threadMain` owns it
     /// across the run and reads it from `formatAgentErrorMessage` after a
     /// loop error. Tests that don't care about the friendly detail pass
-    /// `null` and the writers fall back to the threadlocal (legacy path).
+    /// `null`; writers then silently drop the detail.
     error_detail_out: ?*llm.error_detail.ErrorDetail,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
