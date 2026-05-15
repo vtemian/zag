@@ -351,12 +351,11 @@ fn marshalRequest(
     }
 }
 
-/// Push a `prompt_assembly_request` onto the event queue and park until
-/// the main thread renders the Lua prompt registry. Polls `cancel` every
-/// 50ms so a user interrupt still tears down the wait. On cancellation,
-/// the still-queued request is serviced by `dispatchHookRequests` (or
-/// the drain fall-through) and signals `done` with an error_name; we
-/// surface `error.Cancelled` to the caller so the turn unwinds cleanly.
+/// Marshal a prompt-assembly round-trip to the main thread via
+/// `marshalRequest`, then transfer the `AssembledPrompt` arena to the
+/// caller. Returns `error.PromptAssemblyFailed` if the main side reports
+/// failure via `error_name`, or `error.Cancelled` if the turn was
+/// cancelled mid-wait.
 fn marshalPromptAssembly(
     ctx: *const prompt.LayerContext,
     allocator: Allocator,
@@ -424,7 +423,7 @@ fn fireToolGate(
     var req = agent_events.ToolGateRequest.init(model, available_tools, allocator);
     marshalRequest(agent_events.ToolGateRequest, &req, queue, cancel) catch |err| switch (err) {
         error.EventQueueFull => return null,
-        else => return err,
+        error.Cancelled => return error.Cancelled,
     };
     if (req.error_name) |name| {
         log.warn("tool gate handler failed: {s}", .{name});
