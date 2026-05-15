@@ -273,16 +273,6 @@ pub const StreamRequest = struct {
     }
 };
 
-/// Wire format for request/response serialization.
-pub const Serializer = enum {
-    /// Anthropic Messages API format.
-    anthropic,
-    /// OpenAI Chat Completions API format (also used by OpenRouter, Groq, Ollama, etc.).
-    openai,
-    /// OpenAI Responses API format (ChatGPT backend, used with OAuth).
-    chatgpt,
-};
-
 /// Runtime-polymorphic LLM provider interface.
 /// Uses the ptr + vtable pattern (same as std.mem.Allocator).
 /// Each provider implements call() for its specific API format.
@@ -406,15 +396,13 @@ pub const ProviderResult = struct {
     model_id: []const u8,
     /// The allocated provider state. Must be destroyed when done.
     state: *anyopaque,
-    /// Absolute path to `auth.json`, owned by this result. Serializers
+    /// Absolute path to `auth.json`, owned by this result. Providers
     /// borrow it for per-request credential resolution.
     auth_path: []const u8,
     /// Endpoint registry (owned, freed on deinit).
     registry: Registry,
     /// Allocator used to create the state (for cleanup).
     allocator: Allocator,
-    /// Which serializer was used (needed for type-correct destroy).
-    serializer: Serializer,
 
     pub fn deinit(self: *ProviderResult) void {
         self.allocator.free(self.auth_path);
@@ -532,7 +520,6 @@ pub fn createProviderFromLuaConfig(
         .auth_path = auth_path,
         .registry = owned_registry,
         .allocator = allocator,
-        .serializer = endpoint.serializer,
     };
 }
 
@@ -653,7 +640,6 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
 
     const anthropic_ep: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
         .factory = anthropic.create,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
@@ -665,7 +651,6 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
 
     const openai_ep: Endpoint = .{
         .name = "openai",
-        .serializer = .openai,
         .factory = openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.openai.com/v1/chat/completions",
@@ -678,7 +663,6 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
 
     const ollama_ep: Endpoint = .{
         .name = "ollama",
-        .serializer = .openai,
         .factory = openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "http://localhost:11434/v1/chat/completions",
@@ -691,7 +675,6 @@ fn testRegistryWithKnownProviders(allocator: Allocator) !Registry {
 
     const openai_oauth_ep: Endpoint = .{
         .name = "openai-oauth",
-        .serializer = .chatgpt,
         .factory = chatgpt.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
@@ -875,7 +858,6 @@ test "Provider.VTable carries deinit; create+deinit round-trips cleanly" {
     const alloc = std.testing.allocator;
     const ep: Endpoint = .{
         .name = "test-anthropic",
-        .serializer = .anthropic,
         .factory = anthropic.create,
         .url = "http://localhost",
         .auth = .x_api_key,
@@ -898,7 +880,6 @@ test "Endpoint.factory builds Provider whose vtable.deinit frees state" {
     const alloc = std.testing.allocator;
     const ep: Endpoint = .{
         .name = "test-anthropic",
-        .serializer = .anthropic,
         .factory = anthropic.create,
         .url = "http://localhost",
         .auth = .x_api_key,
@@ -977,7 +958,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
 
     try std.testing.expectEqualStrings("openai/gpt-4o", result.model_id);
     try std.testing.expectEqualStrings(auth_path, result.auth_path);
-    try std.testing.expectEqual(Serializer.openai, result.serializer);
+    try std.testing.expectEqualStrings("openai", result.provider.vtable.name);
 }
 
 test "createProviderFromLuaConfig surfaces NoDefaultModel when default_model unset" {
@@ -1051,7 +1032,7 @@ test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints"
 
     try std.testing.expectEqualStrings("ollama/llama3", result.model_id);
     try std.testing.expectEqualStrings(auth_path, result.auth_path);
-    try std.testing.expectEqual(Serializer.openai, result.serializer);
+    try std.testing.expectEqualStrings("openai", result.provider.vtable.name);
 }
 
 test "createProviderFromLuaConfig returns UnknownProvider for unsupported provider" {

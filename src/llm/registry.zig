@@ -9,7 +9,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Serializer = @import("../llm.zig").Serializer;
 const Provider = @import("../llm.zig").Provider;
 
 /// Signature of every provider's `create` function. Endpoints carry one of
@@ -25,9 +24,9 @@ pub const Factory = *const fn (
 ) anyerror!Provider;
 
 /// Per-endpoint wire-protocol semantics that the rest of the runtime
-/// consults instead of branching on `Serializer` identity. New wires
-/// declare their behavior by setting these flags rather than adding
-/// another arm to a closed enum switch.
+/// consults to make accounting and request-shaping decisions. New wires
+/// declare their behavior by setting these flags rather than gating on
+/// a closed enum identity.
 pub const WireSemantics = struct {
     /// True when the provider reports cached input tokens as a subset of
     /// the total `prompt_tokens` count (OpenAI / Codex). False when
@@ -40,12 +39,9 @@ pub const WireSemantics = struct {
 pub const Endpoint = struct {
     /// Human-readable name (e.g., "openrouter", "ollama").
     name: []const u8,
-    /// Which wire format this endpoint speaks.
-    serializer: Serializer,
     /// Wire-protocol semantics that drive accounting and request shaping
-    /// decisions without forcing a `Serializer` switch on every consumer.
-    /// Defaults match Anthropic-style behavior; openai/chatgpt wires
-    /// override `cached_overlaps_input = true` at construction.
+    /// decisions. Defaults match Anthropic-style behavior; openai/chatgpt
+    /// wires override `cached_overlaps_input = true` at construction.
     wire_semantics: WireSemantics = .{},
     /// Full URL for chat completions.
     url: []const u8,
@@ -339,7 +335,6 @@ pub const Endpoint = struct {
 
         return .{
             .name = name,
-            .serializer = self.serializer,
             // `WireSemantics` is POD (bool fields); copy by value.
             .wire_semantics = self.wire_semantics,
             .url = url,
@@ -615,7 +610,6 @@ test "Endpoint.dupe creates independent copy" {
 
     const original = Endpoint{
         .name = "test",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://example.com",
@@ -630,7 +624,7 @@ test "Endpoint.dupe creates independent copy" {
 
     try std.testing.expectEqualStrings("test", duped.name);
     try std.testing.expectEqualStrings("https://example.com", duped.url);
-    try std.testing.expectEqual(Serializer.openai, duped.serializer);
+    try std.testing.expectEqual(true, duped.wire_semantics.cached_overlaps_input);
     try std.testing.expectEqual(Endpoint.Auth.bearer, duped.auth);
     try std.testing.expectEqual(@as(usize, 1), duped.headers.len);
     try std.testing.expectEqualStrings("X-Custom", duped.headers[0].name);
@@ -717,7 +711,6 @@ test "Auth oauth variant carries full spec" {
 test "Endpoint.dupe/free round-trips the .oauth variant's nested strings" {
     const original: Endpoint = .{
         .name = "oauth-test",
-        .serializer = .chatgpt,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -764,7 +757,6 @@ test "Endpoint.dupe/free round-trips the .oauth variant's nested strings" {
 test "Endpoint.dupe copies default_model and models slice" {
     const original: Endpoint = .{
         .name = "test",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -800,7 +792,6 @@ test "Registry.add takes ownership of an already-dupe'd endpoint" {
 
     const raw: Endpoint = .{
         .name = "custom",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -821,7 +812,6 @@ test "Registry.remove drops an existing entry and returns true" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "removable",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -848,7 +838,6 @@ test "Registry.remove followed by add implements override" {
 
     const seed: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
@@ -860,7 +849,6 @@ test "Registry.remove followed by add implements override" {
 
     const replacement: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://custom.example.com/messages",
         .auth = .x_api_key,
@@ -881,7 +869,6 @@ test "Registry.dupe produces an independent deep copy" {
 
     const ep: Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,
@@ -904,7 +891,6 @@ test "Registry.add rejects duplicate names" {
     defer reg.deinit();
     const raw: Endpoint = .{
         .name = "dup",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -921,7 +907,6 @@ test "ModelRate dupe round trips label and recommended" {
     const gpa = std.testing.allocator;
     var ep: Endpoint = .{
         .name = "prov",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://example.com",
         .auth = .none,
@@ -980,7 +965,6 @@ test "Endpoint.dupe round-trips response_fields and echo_field" {
     const fields = [_][]const u8{ "reasoning_content", "reasoning" };
     const original = Endpoint{
         .name = "moonshot",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.moonshot.ai/v1/chat/completions",
@@ -1014,7 +998,6 @@ test "Endpoint.dupe round-trips effort_request_field" {
 
     const original = Endpoint{
         .name = "moonshot",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://api.moonshot.ai/v1/chat/completions",

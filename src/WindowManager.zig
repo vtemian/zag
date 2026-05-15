@@ -4537,7 +4537,6 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
 
     const ep_a: llm.Endpoint = .{
         .name = "provA",
-        .serializer = .openai,
         .factory = llm.openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://a.example",
@@ -4553,7 +4552,6 @@ fn buildPickerFixture(allocator: std.mem.Allocator, f: *PickerFixture) !void {
 
     const ep_b: llm.Endpoint = .{
         .name = "provB",
-        .serializer = .openai,
         .factory = llm.openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://b.example",
@@ -5606,7 +5604,6 @@ test "zag.providers.list reflects the endpoint registry" {
     // wires it through `zag.provider{...}`.
     const ep: llm.Endpoint = .{
         .name = "provX",
-        .serializer = .openai,
         .factory = llm.openai.create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x.example",
@@ -5684,7 +5681,6 @@ const ModelPickerPluginFixture = struct {
 
         const ep_a: llm.Endpoint = .{
             .name = "provA",
-            .serializer = .openai,
             .factory = llm.openai.create,
             .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://a.example",
@@ -5727,7 +5723,6 @@ const ModelPickerPluginFixture = struct {
         // the fixture registry.
         const engine_ep: llm.Endpoint = .{
             .name = "provA",
-            .serializer = .openai,
             .factory = llm.openai.create,
             .wire_semantics = .{ .cached_overlaps_input = true },
             .url = "https://a.example",

@@ -5391,15 +5391,6 @@ pub const LuaEngine = struct {
         return try headers.toOwnedSlice(allocator);
     }
 
-    /// Parse the closed `wire` enum surfaced by `zag.provider{}`. Returns
-    /// `null` when the string doesn't match any known serializer.
-    fn parseSerializer(s: []const u8) ?llm.Serializer {
-        if (std.mem.eql(u8, s, "anthropic")) return .anthropic;
-        if (std.mem.eql(u8, s, "openai")) return .openai;
-        if (std.mem.eql(u8, s, "chatgpt")) return .chatgpt;
-        return null;
-    }
-
     /// Resolve a Lua `wire = "..."` string to the matching stdlib factory
     /// pointer. The lookup is the only place that hard-codes which wire
     /// names ship in-tree; an out-of-tree wire would add an entry to
@@ -5875,12 +5866,8 @@ pub const LuaEngine = struct {
 
         const wire = (try readStringField(lua, 1, "wire", .required, allocator)) orelse unreachable;
         defer allocator.free(wire);
-        const serializer = parseSerializer(wire) orelse {
-            log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire});
-            return error.LuaError;
-        };
         const factory = resolveWireFactory(wire) orelse {
-            log.warn("zag.provider(): no stdlib factory for wire '{s}'", .{wire});
+            log.warn("zag.provider(): unknown wire '{s}' (expected anthropic|openai|chatgpt)", .{wire});
             return error.LuaError;
         };
         // Derive wire semantics from the wire string. OpenAI-shaped wires
@@ -5890,10 +5877,10 @@ pub const LuaEngine = struct {
         // Lua-side surface for users to override yet; a future
         // `wire_semantics = {...}` table can be added if a real wire
         // diverges from its base.
-        const wire_semantics: llm.WireSemantics = switch (serializer) {
-            .openai, .chatgpt => .{ .cached_overlaps_input = true },
-            .anthropic => .{ .cached_overlaps_input = false },
-        };
+        const wire_semantics: llm.WireSemantics = if (std.mem.eql(u8, wire, "anthropic"))
+            .{ .cached_overlaps_input = false }
+        else
+            .{ .cached_overlaps_input = true };
 
         const default_model = (try readStringField(lua, 1, "default_model", .required, allocator)) orelse unreachable;
         errdefer allocator.free(default_model);
@@ -5930,7 +5917,6 @@ pub const LuaEngine = struct {
 
         const ep: llm.Endpoint = .{
             .name = name,
-            .serializer = serializer,
             .factory = factory,
             .wire_semantics = wire_semantics,
             .url = url,
@@ -9794,7 +9780,8 @@ test "zag.provider{}: full x_api_key declaration registers the endpoint" {
     );
     const ep = engine.providers_registry.find("anthropic") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
-    try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.anthropic.create), ep.factory);
+    try std.testing.expectEqual(false, ep.wire_semantics.cached_overlaps_input);
     try std.testing.expectEqual(llm.Endpoint.Auth.x_api_key, ep.auth);
     try std.testing.expectEqualStrings("claude-sonnet-4-20250514", ep.default_model);
     try std.testing.expectEqual(@as(usize, 1), ep.models.len);
@@ -12537,7 +12524,8 @@ test "stdlib: require(zag.providers.anthropic) registers anthropic" {
     const ep = engine.providers_registry.find("anthropic") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
     try std.testing.expectEqualStrings("claude-sonnet-4-20250514", ep.default_model);
-    try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.anthropic.create), ep.factory);
+    try std.testing.expectEqual(false, ep.wire_semantics.cached_overlaps_input);
     try std.testing.expect(ep.models.len >= 2);
     try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .x_api_key);
@@ -12558,7 +12546,8 @@ test "stdlib: require(zag.providers.openai) registers openai" {
     const ep = engine.providers_registry.find("openai") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://api.openai.com/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("gpt-4o", ep.default_model);
-    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.openai.create), ep.factory);
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
     try std.testing.expect(ep.models.len >= 2);
     try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
@@ -12579,7 +12568,8 @@ test "stdlib: require(zag.providers.openrouter) registers openrouter" {
     const ep = engine.providers_registry.find("openrouter") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", ep.default_model);
-    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.openai.create), ep.factory);
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
     try std.testing.expect(ep.models.len >= 1);
     try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
@@ -12599,7 +12589,8 @@ test "stdlib: require(zag.providers.groq) registers groq" {
     const ep = engine.providers_registry.find("groq") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", ep.default_model);
-    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.openai.create), ep.factory);
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
     try std.testing.expect(ep.models.len >= 1);
     try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .bearer);
@@ -12617,7 +12608,8 @@ test "stdlib: require(zag.providers.ollama) registers ollama" {
     const ep = engine.providers_registry.find("ollama") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("llama3", ep.default_model);
-    try std.testing.expectEqual(llm.Serializer.openai, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.openai.create), ep.factory);
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
     try std.testing.expect(ep.models.len >= 1);
     try std.testing.expectEqual(true, ep.models[0].recommended);
     try std.testing.expect(std.meta.activeTag(ep.auth) == .none);
@@ -12634,7 +12626,8 @@ test "stdlib: require(zag.providers.openai-oauth) registers openai-oauth with Co
 
     const ep = engine.providers_registry.find("openai-oauth") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", ep.url);
-    try std.testing.expectEqual(llm.Serializer.chatgpt, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.chatgpt.create), ep.factory);
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
     switch (ep.auth) {
         .oauth => |spec| {
             try std.testing.expectEqualStrings("app_EMoamEEZ73f0CkXaXp7hrann", spec.client_id);
@@ -12676,7 +12669,8 @@ test "stdlib: require(zag.providers.anthropic-oauth) registers Claude Max spec" 
 
     const ep = engine.providers_registry.find("anthropic-oauth") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
-    try std.testing.expectEqual(llm.Serializer.anthropic, ep.serializer);
+    try std.testing.expectEqual(@as(llm.Factory, llm.anthropic.create), ep.factory);
+    try std.testing.expectEqual(false, ep.wire_semantics.cached_overlaps_input);
     switch (ep.auth) {
         .oauth => |spec| {
             try std.testing.expectEqual(@as(u16, 53692), spec.redirect_port);
@@ -16372,7 +16366,6 @@ test "bootstrap is a no-op when config.lua already populated the registry" {
 
     const ep: llm.Endpoint = .{
         .name = "anthropic",
-        .serializer = .anthropic,
         .factory = llm.anthropic.create,
         .url = "https://api.anthropic.com/v1/messages",
         .auth = .x_api_key,

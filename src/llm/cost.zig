@@ -149,7 +149,6 @@ test "estimateCost: looks up per-model rate through registry split on slash" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-slash",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
@@ -184,7 +183,6 @@ test "estimateCost: skips nil cache rates" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "openai-test-nilcache",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -227,7 +225,6 @@ test "estimateCost: unknown model within known provider returns null" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-unknown",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
@@ -266,7 +263,6 @@ test "openai cost subtracts cached tokens from input rate" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "openai-test-cached",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -304,7 +300,6 @@ test "anthropic cost bills cached tokens additively (sanity)" {
     defer reg.deinit();
     const ep: Endpoint = .{
         .name = "anthropic-test-cached",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .url = "https://x",
         .auth = .x_api_key,
@@ -348,7 +343,6 @@ test "cost: cached_overlaps_input read from endpoint.wire_semantics, not seriali
 
     const overlap_ep: Endpoint = .{
         .name = "overlap-test",
-        .serializer = .openai,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://x",
@@ -371,7 +365,6 @@ test "cost: cached_overlaps_input read from endpoint.wire_semantics, not seriali
 
     const additive_ep: Endpoint = .{
         .name = "additive-test",
-        .serializer = .anthropic,
         .factory = testStubFactory,
         .wire_semantics = .{ .cached_overlaps_input = false },
         .url = "https://x",

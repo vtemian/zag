@@ -2062,7 +2062,6 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
 
     const endpoint: llm.Endpoint = .{
         .name = "openai-oauth",
-        .serializer = .chatgpt,
         .factory = create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = mock_url,
@@ -2176,7 +2175,6 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
     var result = try llm.createProviderFromLuaConfig(&registry, "openai-oauth/gpt-5-codex", auth_path, allocator);
     defer result.deinit();
 
-    try std.testing.expectEqual(llm.Serializer.chatgpt, result.serializer);
     try std.testing.expectEqualStrings("openai-oauth/gpt-5-codex", result.model_id);
     try std.testing.expectEqualStrings("chatgpt", result.provider.vtable.name);
 
@@ -2221,7 +2219,6 @@ fn seedOpenAiOauthRegistry(allocator: std.mem.Allocator) !llm.Registry {
     errdefer reg.deinit();
     const ep: llm.Endpoint = .{
         .name = "openai-oauth",
-        .serializer = .chatgpt,
         .factory = create,
         .wire_semantics = .{ .cached_overlaps_input = true },
         .url = "https://chatgpt.com/backend-api/codex/responses",
