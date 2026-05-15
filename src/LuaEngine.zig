@@ -44,6 +44,7 @@ const AsyncRuntime = @import("lua/AsyncRuntime.zig").AsyncRuntime;
 const embedded = @import("lua/embedded.zig");
 const provider_bindings = @import("lua/bindings/provider.zig");
 const prompt_bindings = @import("lua/bindings/prompt.zig");
+const sockets_bindings = @import("lua/bindings/sockets.zig");
 
 /// Whether the Lua sandbox strips dangerous globals before user code runs.
 /// Off by default: `config.lua` is user-owned code (same trust model as
@@ -757,31 +758,20 @@ pub const LuaEngine = struct {
         // single global pre-callLlm hook; `transform_output(name, fn)`
         // hangs a per-tool post-execution output rewriter. Future tool-
         // facing sockets hang off the same table. Stack: [zag_table].
-        lua.newTable(); // [zag_table, tools_table]
-        lua.pushFunction(zlua.wrap(zagToolsGateFn));
-        lua.setField(-2, "gate");
-        lua.pushFunction(zlua.wrap(zagToolTransformOutputFn));
-        lua.setField(-2, "transform_output");
-        lua.setField(-2, "tools"); // zag.tools = tools_table; [zag_table]
+        sockets_bindings.registerToolsTable(lua);
 
         // zag.loop; namespace for agent-loop sockets. Today only
         // `detect(fn)` (single global post-tool-result hook). The
         // detector returns either a reminder to inject on the next
         // turn or an abort to stop the loop. Stack: [zag_table].
-        lua.newTable(); // [zag_table, loop_table]
-        lua.pushFunction(zlua.wrap(zagLoopDetectFn));
-        lua.setField(-2, "detect");
-        lua.setField(-2, "loop"); // zag.loop = loop_table; [zag_table]
+        sockets_bindings.registerLoopTable(lua);
 
         // zag.compact; namespace for context-compaction sockets. Today
         // only `strategy(fn)` (single global pre-callLlm hook fired at
         // the high-water threshold). The strategy returns a replacement
         // message array (installed in place of the existing history) or
         // nil (skip this turn). Stack: [zag_table].
-        lua.newTable(); // [zag_table, compact_table]
-        lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
-        lua.setField(-2, "strategy");
-        lua.setField(-2, "compact"); // zag.compact = compact_table; [zag_table]
+        sockets_bindings.registerCompactTable(lua);
 
         // zag.width; grapheme-aware terminal-cell width measurement. Plugins
         // doing column alignment (e.g. popup-completion menus with mixed
@@ -2488,93 +2478,6 @@ pub const LuaEngine = struct {
         return &self.jit_context_handlers;
     }
 
-    /// Zig function backing `zag.tools.transform_output(tool_name, fn)`.
-    ///
-    /// Registers a Lua handler that the harness invokes after every
-    /// completed call to the tool with the matching name. Same lifecycle
-    /// as `zag.context.on_tool_result`; the difference is purely how the
-    /// agent loop consumes the return value (REPLACE vs append).
-    ///
-    /// Args:
-    /// - arg 1 (string, required, non-empty): tool name to match.
-    /// - arg 2 (function, required): handler `fn(ctx) -> string|nil`.
-    ///
-    /// Re-registering an existing tool name unrefs the previous function
-    /// before stashing the new one; the owned name slice is reused so the
-    /// hashmap key stays stable.
-    fn zagToolTransformOutputFn(lua: *Lua) i32 {
-        const engine = getEngineFromState(lua);
-
-        if (lua.typeOf(1) != .string) {
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: arg 1 must be a string tool name",
-                .{},
-            );
-        }
-        const tool_name = lua.toString(1) catch {
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: arg 1 could not be read",
-                .{},
-            );
-        };
-        if (tool_name.len == 0) {
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: arg 1 must not be empty",
-                .{},
-            );
-        }
-
-        if (!lua.isFunction(2)) {
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: arg 2 must be a function",
-                .{},
-            );
-        }
-
-        // Push a copy of arg 2 so ref() pops the duplicate and leaves the
-        // original argument frame intact.
-        lua.pushValue(2);
-        const fn_ref = lua.ref(zlua.registry_index) catch {
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: failed to ref handler",
-                .{},
-            );
-        };
-        errdefer lua.unref(zlua.registry_index, fn_ref);
-
-        // Re-registration: unref the old fn but keep the existing owned
-        // name slice (the map key aliases it, so freeing would dangle the
-        // bucket key). Just swap the value in place.
-        if (engine.tool_transform_handlers.getPtr(tool_name)) |existing| {
-            lua.unref(zlua.registry_index, existing.fn_ref);
-            existing.fn_ref = fn_ref;
-            return 0;
-        }
-
-        const owned_name = engine.allocator.dupe(u8, tool_name) catch {
-            lua.unref(zlua.registry_index, fn_ref);
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: out of memory duping tool name",
-                .{},
-            );
-        };
-        errdefer engine.allocator.free(owned_name);
-
-        engine.tool_transform_handlers.put(engine.allocator, owned_name, .{
-            .tool_name = owned_name,
-            .fn_ref = fn_ref,
-        }) catch {
-            lua.unref(zlua.registry_index, fn_ref);
-            engine.allocator.free(owned_name);
-            lua.raiseErrorStr(
-                "zag.tools.transform_output: out of memory inserting handler",
-                .{},
-            );
-        };
-
-        return 0;
-    }
-
     /// Run the tool-output transform handler for `req.tool_name` on the
     /// main thread. Builds a Lua-side context table identical in shape to
     /// the JIT context handler's, calls the registered function via
@@ -2643,51 +2546,6 @@ pub const LuaEngine = struct {
         self: *LuaEngine,
     ) *std.StringHashMapUnmanaged(JitHandler) {
         return &self.tool_transform_handlers;
-    }
-
-    /// Zig function backing `zag.tools.gate(fn)`.
-    ///
-    /// Registers the single global gate handler the harness invokes
-    /// once per turn (before each `callLlm`). Re-registering replaces
-    /// the previous function; the old Lua ref is unrefed so memory
-    /// does not bloat across reloads. Pass nil to clear.
-    ///
-    /// Args:
-    /// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
-    fn zagToolsGateFn(lua: *Lua) i32 {
-        const engine = getEngineFromState(lua);
-
-        // Allow `zag.tools.gate(nil)` to clear the handler. Anything
-        // else that isn't a function is a programmer error.
-        if (lua.isNil(1)) {
-            if (engine.tool_gate_handler) |old| {
-                lua.unref(zlua.registry_index, old);
-                engine.tool_gate_handler = null;
-            }
-            return 0;
-        }
-        if (!lua.isFunction(1)) {
-            lua.raiseErrorStr(
-                "zag.tools.gate: arg 1 must be a function or nil",
-                .{},
-            );
-        }
-
-        // Push a copy of arg 1 so ref() pops the duplicate and leaves
-        // the original argument frame intact.
-        lua.pushValue(1);
-        const fn_ref = lua.ref(zlua.registry_index) catch {
-            lua.raiseErrorStr(
-                "zag.tools.gate: failed to ref handler",
-                .{},
-            );
-        };
-
-        if (engine.tool_gate_handler) |old| {
-            lua.unref(zlua.registry_index, old);
-        }
-        engine.tool_gate_handler = fn_ref;
-        return 0;
     }
 
     /// Run the tool-gate handler on the main thread. Builds a
@@ -2777,51 +2635,6 @@ pub const LuaEngine = struct {
     /// Test-only accessor for the single global tool-gate handler ref.
     pub fn toolGateHandler(self: *const LuaEngine) ?i32 {
         return self.tool_gate_handler;
-    }
-
-    /// Zig function backing `zag.loop.detect(fn)`.
-    ///
-    /// Registers the single global loop-detector handler the harness
-    /// invokes after every tool execution. Re-registering replaces
-    /// the previous function; the old Lua ref is unrefed so memory
-    /// does not bloat across reloads. Pass nil to clear.
-    ///
-    /// Args:
-    /// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
-    fn zagLoopDetectFn(lua: *Lua) i32 {
-        const engine = getEngineFromState(lua);
-
-        // Allow `zag.loop.detect(nil)` to clear the handler. Anything
-        // else that isn't a function is a programmer error.
-        if (lua.isNil(1)) {
-            if (engine.loop_detect_handler) |old| {
-                lua.unref(zlua.registry_index, old);
-                engine.loop_detect_handler = null;
-            }
-            return 0;
-        }
-        if (!lua.isFunction(1)) {
-            lua.raiseErrorStr(
-                "zag.loop.detect: arg 1 must be a function or nil",
-                .{},
-            );
-        }
-
-        // Push a copy of arg 1 so ref() pops the duplicate and leaves
-        // the original argument frame intact.
-        lua.pushValue(1);
-        const fn_ref = lua.ref(zlua.registry_index) catch {
-            lua.raiseErrorStr(
-                "zag.loop.detect: failed to ref handler",
-                .{},
-            );
-        };
-
-        if (engine.loop_detect_handler) |old| {
-            lua.unref(zlua.registry_index, old);
-        }
-        engine.loop_detect_handler = fn_ref;
-        return 0;
     }
 
     /// Run the loop-detector handler on the main thread. Builds a
@@ -2923,52 +2736,6 @@ pub const LuaEngine = struct {
     /// Test-only accessor for the single global loop-detector handler ref.
     pub fn loopDetectHandler(self: *const LuaEngine) ?i32 {
         return self.loop_detect_handler;
-    }
-
-    /// Zig function backing `zag.compact.strategy(fn)`.
-    ///
-    /// Registers the single global compaction-strategy handler the
-    /// harness invokes when the running token estimate crosses the
-    /// high-water threshold. Re-registering replaces the previous
-    /// function; the old Lua ref is unrefed so memory does not bloat
-    /// across reloads. Pass nil to clear.
-    ///
-    /// Args:
-    /// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
-    fn zagCompactStrategyFn(lua: *Lua) i32 {
-        const engine = getEngineFromState(lua);
-
-        // Allow `zag.compact.strategy(nil)` to clear the handler.
-        // Anything else that isn't a function is a programmer error.
-        if (lua.isNil(1)) {
-            if (engine.compact_handler) |old| {
-                lua.unref(zlua.registry_index, old);
-                engine.compact_handler = null;
-            }
-            return 0;
-        }
-        if (!lua.isFunction(1)) {
-            lua.raiseErrorStr(
-                "zag.compact.strategy: arg 1 must be a function or nil",
-                .{},
-            );
-        }
-
-        // Push a copy of arg 1 so ref() pops the duplicate and leaves
-        // the original argument frame intact.
-        lua.pushValue(1);
-        const fn_ref = lua.ref(zlua.registry_index) catch {
-            lua.raiseErrorStr(
-                "zag.compact.strategy: failed to ref handler",
-                .{},
-            );
-        };
-
-        if (engine.compact_handler) |old| {
-            lua.unref(zlua.registry_index, old);
-        }
-        engine.compact_handler = fn_ref;
-        return 0;
     }
 
     /// Push a Lua-side message snapshot onto the stack for the compact
