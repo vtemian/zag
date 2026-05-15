@@ -28,8 +28,9 @@ pub const ErrorDetail = struct {
     }
 
     pub fn set(self: *ErrorDetail, comptime fmt: []const u8, args: anytype) !void {
+        const new_message = try std.fmt.allocPrint(self.allocator, fmt, args);
         if (self.message) |m| self.allocator.free(m);
-        self.message = try std.fmt.allocPrint(self.allocator, fmt, args);
+        self.message = new_message;
     }
 
     /// Take ownership of the slot's contents. Returns null if unset.
@@ -95,4 +96,14 @@ test "ErrorDetail: set + take round-trips" {
     const owned = detail.take() orelse return error.TestUnexpectedResult;
     defer std.testing.allocator.free(owned);
     try std.testing.expect(std.mem.indexOf(u8, owned, "429") != null);
+}
+
+test "ErrorDetail: set overwrites previous message without leaking" {
+    var detail = ErrorDetail.init(std.testing.allocator);
+    defer detail.deinit();
+    try detail.set("first", .{});
+    try detail.set("second {d}", .{2});
+    const owned = detail.take() orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("second 2", owned);
 }
