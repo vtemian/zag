@@ -17,9 +17,10 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const log = std.log.scoped(.sandbox_seccomp);
 
-comptime {
-    if (builtin.os.tag != .linux) @compileError("seccomp_linux is linux-only");
-}
+// Non-Linux targets compile this module as a stub (constants below are
+// pure Zig and work anywhere; the syscall body is comptime-gated inside
+// installSocketFamilyFilter). Matches the runtime-guard pattern used by
+// landlock_linux.zig so helper_linux.zig can unconditionally @import us.
 
 // --- Constants ---
 
@@ -58,6 +59,7 @@ pub const OFFSET_ARG0_LO: u32 = 16;
 pub const InstallError = error{
     PrctlFailed,
     SeccompFailed,
+    Unsupported,
 };
 
 // --- Public API ---
@@ -74,6 +76,7 @@ pub const InstallError = error{
 ///
 /// Filter is inherited across execve so the bash child enforces it.
 pub fn installSocketFamilyFilter() InstallError!void {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
     const arch_current: u32 = @intFromEnum(linux.AUDIT.ARCH.current);
     const sys_socket: u32 = @intFromEnum(linux.SYS.socket);
     const af_inet: u32 = linux.AF.INET;
@@ -142,7 +145,7 @@ test "SockFilter is exactly 8 bytes" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(SockFilter));
 }
 
-test "filter program builds without panicking" {
+test "filter constants resolve on linux targets" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     // Resolve the comptime constants the filter depends on. No install
     // here (the test runner has no NNP and we don't want to lock down
@@ -151,4 +154,9 @@ test "filter program builds without panicking" {
     try std.testing.expect(arch_current != 0);
     const sys_socket: u32 = @intFromEnum(linux.SYS.socket);
     try std.testing.expect(sys_socket != 0);
+}
+
+test "installSocketFamilyFilter returns Unsupported off-linux" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.Unsupported, installSocketFamilyFilter());
 }
