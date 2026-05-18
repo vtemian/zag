@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const landlock = @import("landlock_linux.zig");
+const seccomp = @import("seccomp_linux.zig");
 
 pub const flag = "--__sandbox-helper";
 
@@ -50,6 +51,21 @@ pub fn run(argv: []const [:0]const u8) noreturn {
         else => |e| {
             std.debug.print(
                 "zag: bash sandbox setup failed ({s}); running unconfined\n",
+                .{@errorName(e)},
+            );
+        },
+    };
+
+    seccomp.installSocketFamilyFilter() catch |err| switch (err) {
+        error.Unsupported => {
+            std.debug.print(
+                "zag: bash net filter unavailable on this kernel; outbound network unrestricted\n",
+                .{},
+            );
+        },
+        else => |e| {
+            std.debug.print(
+                "zag: bash net filter setup failed ({s}); outbound network unrestricted\n",
                 .{@errorName(e)},
             );
         },
@@ -120,4 +136,10 @@ test "parseArgs rejects wrong flag in slot 1" {
 // builtin is referenced so the import isn't dead on macOS builds.
 comptime {
     _ = builtin.os.tag;
+}
+
+test "helper_linux pulls in seccomp module" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const seccomp_mod = @import("seccomp_linux.zig");
+    _ = seccomp_mod;
 }
