@@ -581,20 +581,25 @@ fn parseSseStream(
 
                     var tool_call = &tool_calls.items[index];
 
+                    // OpenAI's streaming contract sends `id` and `name`
+                    // once, in the first delta that introduces a tool_call
+                    // for this index. Kimi K2.6 re-sends both fields in
+                    // every delta for the same index; appending would
+                    // produce "read:0read:0" / "readread" and the next
+                    // turn would fail server-side because the echoed
+                    // tool_call_id no longer matches what the model knows.
+                    // Set-once for id and name; arguments still accumulate.
                     if (tc_item.object.get("id")) |id| {
-                        if (id == .string) {
+                        if (id == .string and tool_call.id.items.len == 0) {
                             try tool_call.id.appendSlice(allocator, id.string);
                         }
                     }
 
                     if (tc_item.object.get("function")) |func| {
                         if (func.object.get("name")) |name| {
-                            if (name == .string) {
-                                const was_empty = tool_call.name.items.len == 0;
+                            if (name == .string and tool_call.name.items.len == 0) {
                                 try tool_call.name.appendSlice(allocator, name.string);
-                                if (was_empty) {
-                                    callback.on_event(callback.ctx, .{ .tool_start = name.string });
-                                }
+                                callback.on_event(callback.ctx, .{ .tool_start = name.string });
                             }
                         }
                         if (func.object.get("arguments")) |args| {
@@ -1539,6 +1544,128 @@ test "parseSseStream accumulates tool_call arguments across multiple delta event
         }
     }
     try std.testing.expectEqual(@as(usize, 1), tool_use_count);
+}
+
+test "parseSseStream survives repeated id field across deltas for parallel tool_calls" {
+    // Regression repro: Kimi K2.6 streams parallel tool_calls where each
+    // delta for a given `index` re-sends the `id` field. The first delta
+    // has `id:"read:0",function:{name,arguments}`, later deltas for the
+    // same index keep echoing `id:"read:0"` while extending arguments.
+    //
+    // The next-turn request then fails server-side with
+    //   "an assistant message with 'tool_calls' must be followed by tool
+    //    messages responding to each 'tool_call_id'. The following
+    //    tool_call_ids did not have response messages:
+    //    read:0, read:1, bash:2, read:3"
+    // because the parsed tool_use ids are `read:0read:0` etc — concatenated
+    // by `tool_call.id.appendSlice` in parseSseStream — while the local
+    // tool_result blocks keep the (also concatenated) ids, so the wire
+    // pairs internally but no longer matches what Kimi knows on the
+    // server side.
+    //
+    // Pin the contract: a repeated id field MUST NOT extend the parsed id.
+    const allocator = std.testing.allocator;
+
+    // 5 parallel tool_calls (read:0, read:1, bash:2, read:3, read:4).
+    // Each tool_call gets its id repeated across two deltas to mimic
+    // Kimi's wire shape.
+    const sse_body =
+        // First wave: every index introduces itself with id+name+args opener.
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[" ++
+        "{\"index\":0,\"id\":\"read:0\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\"}}," ++
+        "{\"index\":1,\"id\":\"read:1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\"}}," ++
+        "{\"index\":2,\"id\":\"bash:2\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"c\"}}," ++
+        "{\"index\":3,\"id\":\"read:3\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\"}}," ++
+        "{\"index\":4,\"id\":\"read:4\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\"}}" ++
+        "]}}]}\n" ++
+        "\n" ++
+        // Second wave: id re-sent for every index, arguments continue.
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[" ++
+        "{\"index\":0,\"id\":\"read:0\",\"function\":{\"arguments\":\"ath\\\":\\\"a\\\"}\"}}," ++
+        "{\"index\":1,\"id\":\"read:1\",\"function\":{\"arguments\":\"ath\\\":\\\"b\\\"}\"}}," ++
+        "{\"index\":2,\"id\":\"bash:2\",\"function\":{\"arguments\":\"md\\\":\\\"ls\\\"}\"}}," ++
+        "{\"index\":3,\"id\":\"read:3\",\"function\":{\"arguments\":\"ath\\\":\\\"c\\\"}\"}}," ++
+        "{\"index\":4,\"id\":\"read:4\",\"function\":{\"arguments\":\"ath\\\":\\\"d\\\"}\"}}" ++
+        "]}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\"}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fake = std.Io.Reader.fixed(sse_body);
+
+    var sr: llm.streaming.StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var sink: u8 = 0;
+    const callback: llm.StreamCallback = .{
+        .ctx = @ptrCast(&sink),
+        .on_event = &noopStreamCallback,
+    };
+
+    const response = try parseSseStream(&sr, .{}, allocator, callback, &cancel, null, null);
+    defer response.deinit(allocator);
+
+    // Five parsed tool_use blocks, ids match Kimi's `<name>:<index>` form
+    // exactly (no concatenation from id appendSlice across deltas).
+    const expected_ids = [_][]const u8{ "read:0", "read:1", "bash:2", "read:3", "read:4" };
+    var seen: [5]bool = .{ false, false, false, false, false };
+    var tool_use_count: usize = 0;
+    for (response.content) |block| {
+        if (block != .tool_use) continue;
+        tool_use_count += 1;
+        var matched = false;
+        for (expected_ids, 0..) |want, i| {
+            if (std.mem.eql(u8, block.tool_use.id, want)) {
+                seen[i] = true;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            std.debug.print("unexpected tool_use id: '{s}'\n", .{block.tool_use.id});
+            return error.UnexpectedToolUseId;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), tool_use_count);
+    for (seen, expected_ids) |hit, want| {
+        if (!hit) {
+            std.debug.print("missing tool_use id: '{s}'\n", .{want});
+            return error.MissingExpectedToolUseId;
+        }
+    }
+
+    // Round-trip: serialize the assistant message back through writeMessage
+    // and verify the wire contains all five `tool_call_id`s intact. This
+    // is what the next-turn request would carry; matching server-side
+    // tool_result rows depend on these exact strings.
+    const msg = types.Message{ .role = .assistant, .content = response.content };
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeMessage(msg, .{}, &out.writer);
+    const json = out.written();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const tool_calls = parsed.value.object.get("tool_calls") orelse return error.MissingToolCallsOnWire;
+    try std.testing.expectEqual(@as(usize, 5), tool_calls.array.items.len);
+    for (tool_calls.array.items, expected_ids) |tc, want| {
+        const id = tc.object.get("id") orelse return error.MissingIdOnWire;
+        try std.testing.expectEqualStrings(want, id.string);
+    }
 }
 
 test "parseSseStream returns ProviderResponseFailed on mid-stream error envelope" {
