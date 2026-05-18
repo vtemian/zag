@@ -1051,6 +1051,15 @@ pub fn lastResultIsError(results: []const types.ContentBlock) bool {
 /// push tool_result. Tool execution errors are captured as error
 /// results; infrastructure failures (cancel, OOM, queue push) are
 /// returned as errors for the caller to handle.
+///
+/// Two allocators because the parallel-tool path puts each worker on its
+/// own arena: `allocator` is per-call scratch (the worker's arena, or the
+/// agent thread's wire_arena on the inline path), `queue.allocator` is the
+/// long-lived thread-safe heap that owns every byte we hand to the queue
+/// or return through `ToolCallResult`. The split prevents two workers
+/// racing on a shared non-thread-safe `ArenaAllocator` (which was the
+/// SIGABRT in width.zig / std.json: concurrent `dupe()` from two threads
+/// corrupted the arena's bump pointer and returned freed-poison bytes).
 fn runToolStep(
     tc: types.ContentBlock.ToolUse,
     registry: *const tools.Registry,
@@ -1061,22 +1070,29 @@ fn runToolStep(
 ) !ToolCallResult {
     if (cancel.load(.acquire)) return error.Cancelled;
 
-    const outcome = try firePreHook(lua_engine, tc, allocator, queue, cancel);
+    // Every byte the caller will read AFTER this function returns has to
+    // live on a heap that outlives the worker's arena and is safe to touch
+    // from multiple threads. The queue's allocator (the runner's GPA) is
+    // both. Callers (`executeOneToolCall`, `executeToolsSingle`,
+    // `executeTools`) free results with the same allocator.
+    const payload_alloc = queue.allocator;
+
+    const outcome = try firePreHook(lua_engine, tc, payload_alloc, queue, cancel);
 
     switch (outcome) {
         .vetoed => |reason| {
-            defer allocator.free(reason);
+            defer payload_alloc.free(reason);
 
-            const synth = try std.fmt.allocPrint(allocator, "vetoed by hook: {s}", .{reason});
-            errdefer allocator.free(synth);
+            const synth = try std.fmt.allocPrint(payload_alloc, "vetoed by hook: {s}", .{reason});
+            errdefer payload_alloc.free(synth);
 
             {
-                const start_name = try allocator.dupe(u8, tc.name);
-                errdefer allocator.free(start_name);
-                const start_id = try allocator.dupe(u8, tc.id);
-                errdefer allocator.free(start_id);
-                const start_input = try allocator.dupe(u8, tc.input_raw);
-                errdefer allocator.free(start_input);
+                const start_name = try payload_alloc.dupe(u8, tc.name);
+                errdefer payload_alloc.free(start_name);
+                const start_id = try payload_alloc.dupe(u8, tc.id);
+                errdefer payload_alloc.free(start_id);
+                const start_input = try payload_alloc.dupe(u8, tc.input_raw);
+                errdefer payload_alloc.free(start_input);
                 queue.pushWithBackpressure(.{ .tool_start = .{
                     .name = start_name,
                     .call_id = start_id,
@@ -1084,10 +1100,10 @@ fn runToolStep(
                 } }, agent_events.default_backpressure_ms) catch {};
             }
 
-            const result_content = try allocator.dupe(u8, synth);
-            errdefer allocator.free(result_content);
-            const result_id = try allocator.dupe(u8, tc.id);
-            errdefer allocator.free(result_id);
+            const result_content = try payload_alloc.dupe(u8, synth);
+            errdefer payload_alloc.free(result_content);
+            const result_id = try payload_alloc.dupe(u8, tc.id);
+            errdefer payload_alloc.free(result_id);
             queue.pushWithBackpressure(.{ .tool_result = .{
                 .content = result_content,
                 .is_error = true,
@@ -1097,16 +1113,16 @@ fn runToolStep(
             return .{ .content = synth, .is_error = true, .owned = true };
         },
         .proceed => |maybe_rewrite| {
-            defer if (maybe_rewrite) |r| allocator.free(r);
+            defer if (maybe_rewrite) |r| payload_alloc.free(r);
             const effective_input = maybe_rewrite orelse tc.input_raw;
 
             {
-                const start_name = try allocator.dupe(u8, tc.name);
-                errdefer allocator.free(start_name);
-                const start_id = try allocator.dupe(u8, tc.id);
-                errdefer allocator.free(start_id);
-                const start_input = try allocator.dupe(u8, effective_input);
-                errdefer allocator.free(start_input);
+                const start_name = try payload_alloc.dupe(u8, tc.name);
+                errdefer payload_alloc.free(start_name);
+                const start_id = try payload_alloc.dupe(u8, tc.id);
+                errdefer payload_alloc.free(start_id);
+                const start_input = try payload_alloc.dupe(u8, effective_input);
+                errdefer payload_alloc.free(start_input);
                 queue.pushWithBackpressure(.{ .tool_start = .{
                     .name = start_name,
                     .call_id = start_id,
@@ -1115,15 +1131,22 @@ fn runToolStep(
             }
 
             const t0 = std.time.milliTimestamp();
+            // The tool itself allocates from `allocator` (the per-worker
+            // arena on the parallel path). Whatever it returns gets duped
+            // into `payload_alloc` immediately so the arena can be torn
+            // down at worker exit without leaving dangling pointers in
+            // events or in the returned result.
             var final: ToolCallResult = blk: {
                 if (registry.execute(tc.name, effective_input, allocator, cancel)) |ok| {
-                    break :blk .{ .content = ok.content, .is_error = ok.is_error, .owned = ok.owned };
+                    defer if (ok.owned) allocator.free(ok.content);
+                    const escaping = try payload_alloc.dupe(u8, ok.content);
+                    break :blk .{ .content = escaping, .is_error = ok.is_error, .owned = true };
                 } else |err| {
-                    const msg = try std.fmt.allocPrint(allocator, "error: tool execution failed: {s}", .{@errorName(err)});
+                    const msg = try std.fmt.allocPrint(payload_alloc, "error: tool execution failed: {s}", .{@errorName(err)});
                     break :blk .{ .content = msg, .is_error = true, .owned = true };
                 }
             };
-            errdefer if (final.owned) allocator.free(final.content);
+            errdefer payload_alloc.free(final.content);
             // milliTimestamp() is monotonic in practice but the type is i64.
             // Clamp to 0 to avoid negative-delta wraparound when casting to u64.
             const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - t0));
@@ -1134,7 +1157,7 @@ fn runToolStep(
             // Reassigning `final` in place keeps the single errdefer above
             // pointing at whichever slice is currently live.
             if (post.content_rewrite) |rewrite| {
-                if (final.owned) allocator.free(final.content);
+                payload_alloc.free(final.content);
                 final = .{ .content = rewrite, .is_error = final.is_error, .owned = true };
             }
             if (post.is_error_rewrite) |b| final.is_error = b;
@@ -1144,14 +1167,14 @@ fn runToolStep(
             // walked up from the read path). The combined buffer replaces
             // `final.content` so both the conversation history and the
             // queued tool_result event carry the augmented text.
-            if (try fireJitContextRequest(lua_engine, tc, final.content, final.is_error, allocator, queue, cancel)) |attached| {
-                defer allocator.free(attached);
+            if (try fireJitContextRequest(lua_engine, tc, final.content, final.is_error, payload_alloc, queue, cancel)) |attached| {
+                defer payload_alloc.free(attached);
                 const combined = try std.fmt.allocPrint(
-                    allocator,
+                    payload_alloc,
                     "{s}\n\n{s}",
                     .{ final.content, attached },
                 );
-                if (final.owned) allocator.free(final.content);
+                payload_alloc.free(final.content);
                 final = .{ .content = combined, .is_error = final.is_error, .owned = true };
             }
 
@@ -1160,15 +1183,15 @@ fn runToolStep(
             // Runs AFTER the JIT context attach so transforms see the
             // post-JIT content; this lets a transform decide whether to
             // preserve, replace, or trim the appended instructions.
-            if (try fireToolTransformRequest(lua_engine, tc, final.content, final.is_error, allocator, queue, cancel)) |replacement| {
-                if (final.owned) allocator.free(final.content);
+            if (try fireToolTransformRequest(lua_engine, tc, final.content, final.is_error, payload_alloc, queue, cancel)) |replacement| {
+                payload_alloc.free(final.content);
                 final = .{ .content = replacement, .is_error = final.is_error, .owned = true };
             }
 
-            const result_content = try allocator.dupe(u8, final.content);
-            errdefer allocator.free(result_content);
-            const result_id = try allocator.dupe(u8, tc.id);
-            errdefer allocator.free(result_id);
+            const result_content = try payload_alloc.dupe(u8, final.content);
+            errdefer payload_alloc.free(result_content);
+            const result_id = try payload_alloc.dupe(u8, tc.id);
+            errdefer payload_alloc.free(result_id);
             queue.pushWithBackpressure(.{ .tool_result = .{
                 .content = result_content,
                 .is_error = final.is_error,
@@ -1243,15 +1266,33 @@ pub fn executeTools(
     // Parallel path: spawn one thread per tool call
     const n = tool_calls.len;
 
+    // ToolCallResult.content survives the worker thread and is read here
+    // after join; runToolStep dupes it into `queue.allocator`, so we free
+    // with that same allocator. The wider `allocator` parameter is the
+    // agent thread's wire_arena, which we cannot use as the per-worker
+    // scratch because `std.heap.ArenaAllocator` is not thread-safe.
     const results = try allocator.alloc(ToolCallResult, n);
     defer {
         for (results) |r| {
-            if (r.owned) allocator.free(r.content);
+            if (r.owned) queue.allocator.free(r.content);
         }
         allocator.free(results);
     }
     // Initialize to default error state
     for (results) |*r| r.* = .{};
+
+    // One arena per worker, parented to the runner's GPA so concurrent
+    // worker allocations don't race a shared arena's bump pointer. The
+    // arenas are torn down here after join; every byte that needs to
+    // outlive the worker (queue payloads, the `final` result returned
+    // through `results[i]`) has already been duped into `queue.allocator`
+    // inside runToolStep.
+    const worker_arenas = try allocator.alloc(std.heap.ArenaAllocator, n);
+    defer {
+        for (worker_arenas) |*a| a.deinit();
+        allocator.free(worker_arenas);
+    }
+    for (worker_arenas) |*a| a.* = std.heap.ArenaAllocator.init(queue.allocator);
 
     const contexts = try allocator.alloc(ToolCallContext, n);
     defer allocator.free(contexts);
@@ -1266,7 +1307,7 @@ pub fn executeTools(
             .index = i,
             .tool_call = tc,
             .registry = registry,
-            .allocator = allocator,
+            .allocator = worker_arenas[i].allocator(),
             .queue = queue,
             .cancel = cancel,
             .results = results,
@@ -1325,7 +1366,10 @@ fn executeToolsSingle(
     lua_engine: ?*LuaEngine.LuaEngine,
 ) ![]types.ContentBlock {
     const step = try runToolStep(tc, registry, allocator, queue, cancel, lua_engine);
-    defer if (step.owned) allocator.free(step.content);
+    // `runToolStep` dupes the returned content into `queue.allocator` so a
+    // parallel worker can tear down its arena at exit; the inline path
+    // honors the same ownership rule for one allocator across both shapes.
+    defer if (step.owned) queue.allocator.free(step.content);
 
     // Separate copy for conversation history (Message owns these).
     const msg_content = try allocator.dupe(u8, step.content);
