@@ -691,3 +691,43 @@ test "execute denies reading ~/.ssh on Linux" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "BEGIN") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "PRIVATE KEY") == null);
 }
+
+test "Linux sandbox helper imports seccomp module" {
+    // Structural compile check: helper_linux must pull in seccomp_linux
+    // and the install path must compile cleanly. Real net-deny verified
+    // manually against the built binary (see manual instructions below).
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const helper = @import("../sandbox/helper_linux.zig");
+    const seccomp = @import("../sandbox/seccomp_linux.zig");
+    _ = helper;
+    _ = seccomp;
+}
+
+// Manual integration tests (Phase C network filter, Linux only):
+//
+// On a Linux host with kernel >= 3.5 (seccomp) and >= 5.13 (landlock):
+//
+//   zig build
+//
+//   # Outbound IPv4 connect: should fail with EACCES at socket(), not connect()
+//   ./zig-out/bin/zag --__sandbox-helper "$PWD" "$HOME" -- /bin/sh -c \
+//     'echo test | nc -w 1 1.1.1.1 53 2>&1; echo exit=$?'
+//   # Expected: "Permission denied" or similar; nc exits non-zero.
+//
+//   # AF_UNIX still works (docker.sock here as a generic example)
+//   ./zig-out/bin/zag --__sandbox-helper "$PWD" "$HOME" -- /bin/sh -c \
+//     'echo | socat - UNIX-CONNECT:/var/run/docker.sock 2>&1; echo exit=$?'
+//   # Expected: either "connection refused" if docker is down, or normal
+//   # protocol response. NOT "Permission denied" at socket().
+//
+//   # Loopback is intentionally also denied (Option A tradeoff)
+//   ./zig-out/bin/zag --__sandbox-helper "$PWD" "$HOME" -- /bin/sh -c \
+//     'curl -m 1 http://127.0.0.1:80 2>&1; echo exit=$?'
+//   # Expected: "Couldn't connect" because socket(AF_INET) is denied
+//   # before curl reaches connect(). Users who need loopback opt out
+//   # via zag.set_bash_sandbox_level("permissive") in config.lua.
+//
+//   # Filesystem deny still works (regression check)
+//   ./zig-out/bin/zag --__sandbox-helper "$PWD" "$HOME" -- /bin/sh -c \
+//     'cat ~/.ssh/id_rsa 2>&1; echo exit=$?'
+//   # Expected: "Permission denied" from cat; ssh key not in output.
