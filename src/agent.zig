@@ -339,7 +339,7 @@ fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
 /// 50ms cadence forever when `cancel` is also never set. Cheap to spin,
 /// but a refactor that decouples the dispatcher must preserve this
 /// guarantee.
-fn marshalRequest(
+pub fn marshalRequest(
     comptime T: type,
     req: *T,
     queue: *agent_events.EventQueue,
@@ -372,7 +372,7 @@ fn marshalRequest(
 /// caller. Returns `error.PromptAssemblyFailed` if the main side reports
 /// failure via `error_name`, or `error.Cancelled` if the turn was
 /// cancelled mid-wait.
-fn marshalPromptAssembly(
+pub fn marshalPromptAssembly(
     ctx: *const prompt.LayerContext,
     allocator: Allocator,
     queue: *agent_events.EventQueue,
@@ -424,7 +424,7 @@ fn fireLifecycleHook(
 /// the handler returned nil/empty, errored, or the event queue was
 /// saturated. Skips the round-trip entirely when no engine is present
 /// or the gate slot is empty so the no-op fast path stays cheap.
-fn fireToolGate(
+pub fn fireToolGate(
     lua_engine: ?*LuaEngine.LuaEngine,
     model: []const u8,
     available_tools: []const []const u8,
@@ -491,7 +491,7 @@ fn applyToolGate(
 /// inside this helper so the caller never sees it. Names borrowed
 /// from `tool_defs[i].name` are stable for the lifetime of `tool_defs`,
 /// so we hand them to the gate without duping.
-fn gateToolDefs(
+pub fn gateToolDefs(
     lua_engine: ?*LuaEngine.LuaEngine,
     model_id: []const u8,
     tool_defs: []const types.ToolDefinition,
@@ -638,7 +638,7 @@ pub fn callLlm(
 /// downstream parser can populate all four `llm.cost.Usage` fields.
 /// Old two-field form is preserved when both cache counts are zero so
 /// providers that don't cache don't grow the line.
-fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *agent_events.EventQueue) !void {
+pub fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *agent_events.EventQueue) !void {
     const has_cache = response.cache_creation_tokens > 0 or response.cache_read_tokens > 0;
     const msg = if (has_cache)
         try std.fmt.allocPrint(
@@ -832,7 +832,7 @@ fn firePostHook(
 /// errored, or the event queue was saturated. Skips the round-trip
 /// entirely when no handler is registered for `tc.name` so the no-op
 /// fast path stays cheap.
-fn fireJitContextRequest(
+pub fn fireJitContextRequest(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
     output: []const u8,
@@ -876,7 +876,7 @@ fn fireJitContextRequest(
 /// event queue was saturated. Skips the round-trip entirely when no
 /// handler is registered for `tc.name` so the no-op fast path stays
 /// cheap.
-fn fireToolTransformRequest(
+pub fn fireToolTransformRequest(
     lua_engine: ?*LuaEngine.LuaEngine,
     tc: types.ContentBlock.ToolUse,
     output: []const u8,
@@ -919,7 +919,7 @@ fn fireToolTransformRequest(
 /// was saturated. Skips the round-trip entirely when no engine is
 /// present or the detector slot is empty so the no-op fast path stays
 /// cheap.
-fn fireLoopDetect(
+pub fn fireLoopDetect(
     lua_engine: ?*LuaEngine.LuaEngine,
     last_tool_name: []const u8,
     last_tool_input: []const u8,
@@ -974,7 +974,7 @@ fn fireLoopDetect(
 /// from the snapshot. The returned messages are reconstructed as
 /// single-block text messages. See `CompactRequest` in
 /// `agent_events.zig` for the full contract and v2 follow-up.
-fn fireCompact(
+pub fn fireCompact(
     lua_engine: ?*LuaEngine.LuaEngine,
     messages: []const types.Message,
     tokens_used: u32,
@@ -1015,7 +1015,7 @@ fn fireCompact(
 ///
 /// Both `messages` storage and `replacement` (outer slice and each
 /// `Message`'s content) are owned by `allocator`.
-fn installCompactReplacement(
+pub fn installCompactReplacement(
     messages: *std.ArrayList(types.Message),
     allocator: Allocator,
     replacement: []types.Message,
@@ -1038,7 +1038,7 @@ fn installCompactReplacement(
 /// comes straight from `executeTools` so non-tool_result blocks are
 /// not expected; we tolerate them by returning false rather than
 /// hard-failing on shape drift.
-fn lastResultIsError(results: []const types.ContentBlock) bool {
+pub fn lastResultIsError(results: []const types.ContentBlock) bool {
     if (results.len == 0) return false;
     return switch (results[results.len - 1]) {
         .tool_result => |r| r.is_error,
@@ -1354,7 +1354,7 @@ fn executeToolsSingle(
 /// per-call done (Codex / ChatGPT Responses API) finished its stream while
 /// the agent was still about to dispatch a tool. The terminal `AgentEvent.done`
 /// is pushed by `AgentRunner.threadMain` after `runLoopStreaming` returns.
-fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
+pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
     const stream_ctx: *StreamContext = @ptrCast(@alignCast(ctx));
     const alloc = stream_ctx.allocator;
     const agent_event: agent_events.AgentEvent = switch (event) {
