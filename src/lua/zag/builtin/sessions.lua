@@ -25,6 +25,7 @@ local state = {
     last_render = {},     -- array of { kind, session_id?, depth, label } for keymap dispatch
     hook_ids = {},        -- registered hook ids, removed on close
     keymap_ids = {},      -- registered buffer-local keymap ids
+    render_count = 0,     -- test-only counter: bumped on every _render call
 }
 
 function M.toggle()
@@ -64,7 +65,38 @@ function M.open()
     state.pane_id = pane_id
 
     M._bind_keymaps()
+    M._subscribe_hooks()
     M._render()
+end
+
+-- Subscribe to the two events that should refresh the sidebar:
+--   * SessionListChanged: any session was created/renamed/deleted in
+--     this zag process. Re-render to pick up the new label set.
+--   * PaneFocused: the user just focused INTO the sidebar pane. Refresh
+--     to catch list mutations made by a different zag process while the
+--     sidebar pane was unfocused. We deliberately ignore focus swaps
+--     that target other panes — refreshing on every pane swap would be
+--     noisy and serves no purpose.
+--
+-- Each registered id is appended to `state.hook_ids` so `M.close()`
+-- can tear them down as a set. The handlers guard on `state.buffer_id`
+-- so a hook that somehow survives a close (e.g. fired between
+-- `pcall(zag.hook_del, id)` and the buffer_id reset) is a no-op.
+--
+-- Reentrancy note: `zag.sessions.list()` is a pure read on the Zig
+-- side (SessionManager.listSessions does no Lua callbacks and fires
+-- no hooks), so reading it from inside a hook callback is safe.
+function M._subscribe_hooks()
+    table.insert(state.hook_ids, zag.hook("SessionListChanged", function(_evt)
+        if not state.buffer_id then return end
+        M._render()
+    end))
+    table.insert(state.hook_ids, zag.hook("PaneFocused", function(evt)
+        if not state.buffer_id then return end
+        if evt.pane_handle == state.pane_id then
+            M._render()
+        end
+    end))
 end
 
 -- Bind buffer-local keymaps for sidebar navigation. Every binding
@@ -199,6 +231,7 @@ end
 function M._render()
     if not state.buffer_id then return end
 
+    state.render_count = state.render_count + 1
     local rows = M._collect_rows()
     state.last_render = rows
 

@@ -15,6 +15,7 @@ const Job = @import("Job.zig").Job;
 const Scope = @import("Scope.zig").Scope;
 const Session = @import("../Session.zig");
 const BufferRegistry = @import("../BufferRegistry.zig");
+const Hooks = @import("../Hooks.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -862,6 +863,156 @@ test "sessions sidebar expand/collapse toggle state.expanded for the cursor row"
         \\-- returns; we just assert it does not raise.
         \\local ok, err = pcall(sidebar._activate)
         \\assert(ok, "activate must not raise: " .. tostring(err))
+    );
+}
+
+// Task 4.3: SessionListChanged refresh.
+// Firing the SessionListChanged hook (via the Lua binding's rename
+// path, since SessionManager itself does not fire it) must call back
+// into M._render so the sidebar picks up the new label. We assert the
+// pre/post render counts AND that the rendered buffer line reflects
+// the renamed value.
+test "sessions sidebar refreshes on SessionListChanged" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_a = try mgr.createSession("test-model");
+    const a_id = try allocator.dupe(u8, h_a.id[0..h_a.id_len]);
+    defer allocator.free(a_id);
+    h_a.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(a_id);
+    engine.lua.setGlobal("_test_a_id");
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\-- Subscribe by hand: the test bypasses M.open (no
+        \\-- WindowManager in headless mode) so we wire the hooks
+        \\-- directly. The render count is zeroed AFTER subscribe so
+        \\-- the initial _render bump does not contaminate the delta.
+        \\sidebar._subscribe_hooks()
+        \\sidebar._set_filter_for_test("")
+        \\local st = sidebar._state_for_test()
+        \\
+        \\local lines_before = zag.buffer.get_lines(buf)
+        \\assert(#lines_before == 1,
+        \\       "expected 1 line before rename, got " .. tostring(#lines_before))
+        \\
+        \\local count_before = st.render_count
+        \\zag.sessions.rename(_test_a_id, "fresh-name")
+        \\assert(st.render_count > count_before,
+        \\       "render_count should bump on SessionListChanged: "
+        \\       .. tostring(count_before) .. " -> " .. tostring(st.render_count))
+        \\
+        \\local lines_after = zag.buffer.get_lines(buf)
+        \\assert(#lines_after == 1,
+        \\       "still 1 row after rename, got " .. tostring(#lines_after))
+        \\assert(lines_after[1]:find("fresh-name", 1, true) ~= nil,
+        \\       "row should reflect rename: " .. tostring(lines_after[1]))
+    );
+}
+
+// Task 4.3: PaneFocused refresh only when the sidebar pane is the
+// focus target. A focus swap to any other pane must be ignored — the
+// sidebar already re-renders on SessionListChanged; refreshing on
+// every focus swap would be redundant noise.
+test "sessions sidebar refreshes on PaneFocused only when sidebar is the target" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_a = try mgr.createSession("test-model");
+    h_a.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    // Force a known pane_id on the sidebar state so we can craft a
+    // matching / non-matching pane_handle for the fired events. The
+    // production path sets this from `zag.layout.split`, which is
+    // unavailable in the headless harness.
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._subscribe_hooks()
+        \\sidebar._set_filter_for_test("")
+        \\local st = sidebar._state_for_test()
+        \\st.pane_id = "n1"
+        \\st.render_count = 0
+    );
+
+    // Fire PaneFocused for a non-sidebar pane: render_count must NOT bump.
+    var other: Hooks.HookPayload = .{ .pane_focused = .{
+        .pane_handle = "n2",
+        .previous_handle = "",
+    } };
+    _ = try engine.fireHook(&other);
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local st = sidebar._state_for_test()
+        \\assert(st.render_count == 0,
+        \\       "PaneFocused on a non-sidebar pane must not refresh, count="
+        \\       .. tostring(st.render_count))
+    );
+
+    // Fire PaneFocused for the sidebar's own pane_id: render_count
+    // must increment exactly once.
+    var self_focus: Hooks.HookPayload = .{ .pane_focused = .{
+        .pane_handle = "n1",
+        .previous_handle = "n2",
+    } };
+    _ = try engine.fireHook(&self_focus);
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local st = sidebar._state_for_test()
+        \\assert(st.render_count == 1,
+        \\       "PaneFocused on the sidebar pane must refresh exactly once, count="
+        \\       .. tostring(st.render_count))
     );
 }
 
