@@ -1997,6 +1997,10 @@ test "planScroll: short content fits, no scroll" {
     const allocator = std.testing.allocator;
     var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    // This test exercises scroll math in isolation; the inter-turn gap is
+    // covered by Conversation tests, so disable it here to keep the row
+    // arithmetic readable.
+    cb.turn_gap = 0;
     _ = try cb.appendNode(null, .user_message, "hi");
     _ = try cb.appendNode(null, .assistant_text, "ok");
 
@@ -2051,6 +2055,9 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     const allocator = std.testing.allocator;
     var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    // Inline math below counts only node lines; turn-gap interleaving is
+    // covered by Conversation tests, so disable it here.
+    cb.turn_gap = 0;
 
     var i: usize = 0;
     while (i < 10) : (i += 1) {
@@ -2452,6 +2459,9 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
 
     var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
+    // Mid-line scroll math relies on uninterrupted line walking; the
+    // turn-gap row count is exercised in Conversation tests.
+    cb.turn_gap = 0;
     var viewport: @import("Viewport.zig") = .{};
 
     var i: usize = 0;
