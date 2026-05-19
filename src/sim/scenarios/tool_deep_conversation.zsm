@@ -19,7 +19,10 @@ send "Use the read tool on /tmp/zag-sim-deep/seed.txt and quote its exact conten
 wait_text /seed-token-DK1/ 45s
 
 send "Use the write tool to create /tmp/zag-sim-deep/note.txt with the single line 'note-token-MV2'." <Enter>
-wait_idle 45s
+# The write tool returns "wrote N lines to <path>" (src/tools/write.zig:82),
+# which surfaces in the tool_result block. Anchor on the path so we know
+# the write actually completed before we list the directory.
+wait_text /note.txt/ 45s
 
 send "Run 'ls /tmp/zag-sim-deep && cat /tmp/zag-sim-deep/note.txt' as one bash tool call." <Enter>
 wait_text /note-token-MV2/ 45s

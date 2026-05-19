@@ -11,6 +11,7 @@ const Scenario = @import("Scenario.zig");
 const Runner = @import("Runner.zig");
 const Artifacts = @import("Artifacts.zig");
 const Replay = @import("Replay.zig");
+const Args = @import("Args.zig");
 
 comptime {
     _ = @import("Pty.zig");
@@ -66,10 +67,19 @@ pub fn main() !u8 {
 fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var artifacts_override: ?[]const u8 = null;
     var scenario_path: ?[]const u8 = null;
+    var wait_default_ms: ?u32 = null;
 
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--artifacts=")) {
             artifacts_override = arg["--artifacts=".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--wait-default=")) {
+            const raw = arg["--wait-default=".len..];
+            wait_default_ms = Args.parseDurationMs(raw) catch {
+                reportFmt("zag-sim run: bad duration '{s}' (use 300ms / 30s / raw ms)\n", .{raw});
+                return exit_harness_error;
+            };
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -95,9 +105,10 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     };
     defer artifacts.destroy();
 
-    const result = Scenario.runFile(alloc, path, .{
-        .artifacts = artifacts,
-    }) catch |e| {
+    var run_opts: Scenario.RunOptions = .{ .artifacts = artifacts };
+    if (wait_default_ms) |ms| run_opts.wait_default_ms = ms;
+
+    const result = Scenario.runFile(alloc, path, run_opts) catch |e| {
         reportFmt("zag-sim run: {s}: {s}\n", .{ path, @errorName(e) });
         return exit_harness_error;
     };
@@ -196,9 +207,13 @@ fn printUsage(file: std.fs.File) void {
         \\zag-sim: terminal scenario driver
         \\
         \\usage:
-        \\  zag-sim run <scenario.zsm> [--artifacts=<dir>]
+        \\  zag-sim run <scenario.zsm> [--artifacts=<dir>] [--wait-default=<dur>]
         \\  zag-sim replay-gen <session.jsonl> --out=<dir>
         \\  zag-sim --help | -h
+        \\
+        \\--wait-default sets the fallback timeout for wait_text and wait_exit
+        \\steps that don't carry a per-step duration. Defaults to 10s. Use
+        \\300ms / 30s / raw-ms forms (e.g. --wait-default=45s for slow models).
         \\
         \\exit codes:
         \\  0  pass
@@ -250,6 +265,16 @@ test "dispatchRun rejects unknown flags" {
     const bad = try std.testing.allocator.dupeZ(u8, "--bogus");
     defer std.testing.allocator.free(bad);
     var argv_storage = [_][:0]u8{bad};
+    const code = try dispatchRun(std.testing.allocator, argv_storage[0..]);
+    try std.testing.expectEqual(@intFromEnum(Runner.Outcome.harness_error), code);
+}
+
+test "dispatchRun rejects --wait-default with a bad duration" {
+    const bad = try std.testing.allocator.dupeZ(u8, "--wait-default=garbage");
+    defer std.testing.allocator.free(bad);
+    const scenario = try std.testing.allocator.dupeZ(u8, "/tmp/zag-sim-nonexistent.zsm");
+    defer std.testing.allocator.free(scenario);
+    var argv_storage = [_][:0]u8{ bad, scenario };
     const code = try dispatchRun(std.testing.allocator, argv_storage[0..]);
     try std.testing.expectEqual(@intFromEnum(Runner.Outcome.harness_error), code);
 }
