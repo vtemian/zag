@@ -494,6 +494,101 @@ test "zag.sessions.rename rejects an unknown project_path hint" {
     );
 }
 
+// SessionListChanged is fired by the Lua binding (not by Session.zig)
+// after a successful rename so the sidebar plugin can refresh without
+// polling. The fire site sits on the Lua-surface side of the boundary
+// because SessionManager is a pure data layer; pushing a *LuaEngine
+// dependency down into it would create a cycle (LuaEngine -> Session,
+// Session -> LuaEngine.fireHook).
+test "zag.sessions.rename fires SessionListChanged with change=renamed" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(id);
+    handle.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\_G.events = {}
+        \\zag.hook("SessionListChanged", function(evt)
+        \\    table.insert(_G.events, { change = evt.change, session_id = evt.session_id })
+        \\end)
+        \\local sessions = zag.sessions.list()
+        \\assert(#sessions == 1)
+        \\zag.sessions.rename(sessions[1].id, "fired-from-rename")
+        \\assert(#_G.events == 1, "expected exactly one event, got " .. tostring(#_G.events))
+        \\assert(_G.events[1].change == "renamed",
+        \\       "wrong change tag: " .. tostring(_G.events[1].change))
+        \\assert(_G.events[1].session_id == sessions[1].id,
+        \\       "wrong session id: " .. tostring(_G.events[1].session_id))
+    );
+}
+
+test "zag.sessions.delete fires SessionListChanged with change=deleted" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    handle.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\_G.events = {}
+        \\zag.hook("SessionListChanged", function(evt)
+        \\    table.insert(_G.events, { change = evt.change, session_id = evt.session_id })
+        \\end)
+        \\local sessions = zag.sessions.list()
+        \\assert(#sessions == 1)
+        \\local target_id = sessions[1].id
+        \\zag.sessions.delete(target_id)
+        \\assert(#_G.events == 1, "expected exactly one event, got " .. tostring(#_G.events))
+        \\assert(_G.events[1].change == "deleted",
+        \\       "wrong change tag: " .. tostring(_G.events[1].change))
+        \\assert(_G.events[1].session_id == target_id,
+        \\       "wrong session id: " .. tostring(_G.events[1].session_id))
+        \\-- Idempotent delete of an already-missing id must NOT fire a
+        \\-- second event; otherwise the sidebar would needlessly refresh.
+        \\zag.sessions.delete(target_id)
+        \\assert(#_G.events == 1, "second delete must not re-fire, got " .. tostring(#_G.events))
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

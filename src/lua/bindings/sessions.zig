@@ -42,8 +42,33 @@ const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const Session = @import("../../Session.zig");
 const ProjectRegistry = @import("../../project_registry.zig");
+const Hooks = @import("../../Hooks.zig");
 
 const log = std.log.scoped(.lua_sessions);
+
+/// Fire `SessionListChanged` for an already-successful session mutation.
+/// Best-effort: hook failures (allocator pressure, a buggy plugin) are
+/// logged and dropped so the mutation's success on disk is not reflected
+/// as a Lua-side failure. The hook fires synchronously on the Lua main
+/// thread, which is where every binding callback already runs.
+///
+/// `change` is the enum literal of the anonymous union-member enum
+/// declared on `HookPayload.session_list_changed.change`; pass `.created`,
+/// `.renamed`, or `.deleted` directly. Comptime coercion through
+/// `HookPayload` initialization picks up the right tag.
+fn fireSessionListChanged(
+    engine: *LuaEngine,
+    change: anytype,
+    session_id: []const u8,
+) void {
+    var payload: Hooks.HookPayload = .{ .session_list_changed = .{
+        .change = change,
+        .session_id = session_id,
+    } };
+    _ = engine.fireHook(&payload) catch |err| {
+        log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(err)});
+    };
+}
 
 /// Resolve `$HOME/.config/zag` the same way `Session.recordCwdInRegistry`
 /// does. Returns an owned slice; caller frees with `allocator.free`.
@@ -334,6 +359,7 @@ fn zagSessionsRenameFn(lua: *Lua) i32 {
             lua.raiseErrorStr("%s", .{msg.ptr});
         },
     };
+    fireSessionListChanged(engine, .renamed, id);
     return 0;
 }
 
@@ -374,6 +400,7 @@ fn zagSessionsDeleteFn(lua: *Lua) i32 {
             lua.raiseErrorStr("%s", .{msg.ptr});
         },
     };
+    fireSessionListChanged(engine, .deleted, id);
     return 0;
 }
 
