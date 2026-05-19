@@ -1362,17 +1362,18 @@ test "runLoopStreaming model_spec drives the per-provider prompt pack via the Lu
     );
 }
 
-test "runLoopStreaming model_spec.context_window crosses fireCompact's 80% threshold" {
+test "runLoopStreaming model_spec.context_window trips fireCompact's room-based threshold" {
     // Pins the plumbing fix that replaced the hardcoded
     // `compact_context_window: u32 = 0` in AgentRunner with
     // `model_spec.context_window`. `runLoopStreaming` forwards the
     // field to `fireCompact` verbatim, so a unit test that drives
     // `fireCompact` with the same number a real ModelSpec would carry
     // is sufficient: it proves the threshold ladder fires once a
-    // production-shaped spec lands in the loop. With `tokens_used =
-    // 850` and `context_window = 1000` we sit at 85%, above the 80%
-    // fire threshold, so the strategy must be invoked and a
-    // replacement returned.
+    // production-shaped spec lands in the loop. With anchor 850 +
+    // fixture trailing (~6) ≈ 856 and reserve_tokens = 200 we leave
+    // only 144 of room in a 1000-token window, well below the 200
+    // reserve so the strategy must be invoked and a replacement
+    // returned.
     if (LuaEngine.sandbox_enabled) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -1413,19 +1414,23 @@ test "runLoopStreaming model_spec.context_window crosses fireCompact's 80% thres
     };
 
     // Mirrors the call site at the top of `runLoopStreaming`'s loop:
-    // tokens_used = 850 vs. spec.context_window = 1000 sits at 85% so
-    // `fireCompact` MUST cross the 80% threshold and round-trip to the
+    // anchor.input_tokens = 850 vs. spec.context_window = 1000 with
+    // reserve_tokens = 200 leaves only 150 of room, so `fireCompact`
+    // MUST trip the room-based threshold and round-trip to the
     // strategy handler. Before this plumbing fix the call site passed
     // a hardcoded 0, which short-circuits the helper before the
     // threshold check; the test here would still pass on the bug
     // (because we call fireCompact directly with the right ceiling),
     // so we additionally pin the value via a Lua-side counter to
     // catch any future regression in the handler dispatch path.
+    const anchor: llm.Usage = .{ .input_tokens = 850 };
     const replacement = try agent.fireCompact(
         &engine,
         fixture.items,
-        850,
+        anchor,
+        1, // fixture[1] is the assistant turn the usage report belongs to.
         real_spec.context_window,
+        200, // reserve_tokens: fires above 800 = 1000-200.
         alloc,
         &queue,
         &cancel,
@@ -2058,7 +2063,8 @@ test "fireCompact bypasses round-trip when engine is null" {
         fixture.deinit(alloc);
     }
 
-    const replacement = try agent.fireCompact(null, fixture.items, 1000, 1000, alloc, &queue, &cancel);
+    // Engine is null so the call short-circuits before estimation; anchor inputs are irrelevant.
+    const replacement = try agent.fireCompact(null, fixture.items, null, null, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
     try std.testing.expectEqual(@as(usize, 0), queue.len);
 }
@@ -2080,8 +2086,9 @@ test "fireCompact bypasses round-trip when no handler is registered" {
         fixture.deinit(alloc);
     }
 
-    // No pump thread: a stray push would hang on `done.wait`.
-    const replacement = try agent.fireCompact(&engine, fixture.items, 1000, 1000, alloc, &queue, &cancel);
+    // No pump thread: a stray push would hang on `done.wait`. Handler-missing
+    // short-circuit fires before estimation; anchor inputs are irrelevant.
+    const replacement = try agent.fireCompact(&engine, fixture.items, null, null, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
     try std.testing.expectEqual(@as(usize, 0), queue.len);
 }
@@ -2107,13 +2114,13 @@ test "fireCompact bypasses round-trip when tokens_max is zero" {
     }
 
     // tokens_max = 0 means "no model rate card", so even with a registered
-    // strategy `fireCompact` skips the round-trip.
-    const replacement = try agent.fireCompact(&engine, fixture.items, 1000, 0, alloc, &queue, &cancel);
+    // strategy `fireCompact` skips the round-trip before estimating.
+    const replacement = try agent.fireCompact(&engine, fixture.items, null, null, 0, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
     try std.testing.expectEqual(@as(usize, 0), queue.len);
 }
 
-test "fireCompact bypasses round-trip when usage is below 80%" {
+test "fireCompact bypasses round-trip when estimate still has room above reserve" {
     const alloc = std.testing.allocator;
 
     var engine = try LuaEngine.LuaEngine.init(alloc);
@@ -2133,8 +2140,9 @@ test "fireCompact bypasses round-trip when usage is below 80%" {
         fixture.deinit(alloc);
     }
 
-    // 79% of 1000 = 790; threshold is 800 (80%). No fire.
-    const replacement = try agent.fireCompact(&engine, fixture.items, 790, 1000, alloc, &queue, &cancel);
+    // Anchor 790 + trailing(tool_result content ~ 6 tokens) = 796. With
+    // reserve=200 the threshold is 1000-200=800, so we sit below. No fire.
+    const replacement = try agent.fireCompact(&engine, fixture.items, llm.Usage{ .input_tokens = 790 }, 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
     try std.testing.expectEqual(@as(usize, 0), queue.len);
 }
@@ -2187,7 +2195,7 @@ test "fireCompact returns shrunk history when strategy drops the oldest tool_res
     }
 
     const original_len = fixture.items.len;
-    const replacement = try agent.fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
+    const replacement = try agent.fireCompact(&engine, fixture.items, llm.Usage{ .input_tokens = 850 }, 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement != null);
     defer {
         for (replacement.?) |m| m.deinit(alloc);
@@ -2232,7 +2240,7 @@ test "fireCompact returns null when strategy returns nil" {
         fixture.deinit(alloc);
     }
 
-    const replacement = try agent.fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
+    const replacement = try agent.fireCompact(&engine, fixture.items, llm.Usage{ .input_tokens = 850 }, 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
 }
 
@@ -2263,7 +2271,7 @@ test "fireCompact returns null and warns on strategy error" {
         fixture.deinit(alloc);
     }
 
-    const replacement = try agent.fireCompact(&engine, fixture.items, 850, 1000, alloc, &queue, &cancel);
+    const replacement = try agent.fireCompact(&engine, fixture.items, llm.Usage{ .input_tokens = 850 }, 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement == null);
 }
 
@@ -2609,7 +2617,7 @@ test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompac
 
     // 850/1000 = 85% sits above the 80% fire threshold so `fireCompact`
     // does the round-trip rather than bypassing it.
-    const replacement = try agent.fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
+    const replacement = try agent.fireCompact(&engine, &messages, llm.Usage{ .input_tokens = 850 }, messages.len - 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expect(replacement != null);
     defer {
         for (replacement.?) |m| m.deinit(alloc);
@@ -2775,7 +2783,7 @@ test "fireCompact cancel path waits for handle then frees and returns Cancelled"
 
     // 850/1000 = 85% crosses the 80% threshold so `fireCompact` does the
     // round-trip rather than bypassing it on the no-op fast path.
-    const result = agent.fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
+    const result = agent.fireCompact(&engine, &messages, llm.Usage{ .input_tokens = 850 }, messages.len - 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expectError(error.Cancelled, result);
 }
 
@@ -3048,7 +3056,7 @@ test "fireCompact returns null when queue is at capacity" {
 
     // 850/1000 = 85% crosses the 80% threshold so the helper actually
     // attempts the queue push (rather than bypassing on the fast path).
-    const result = try agent.fireCompact(&engine, &messages, 850, 1000, alloc, &queue, &cancel);
+    const result = try agent.fireCompact(&engine, &messages, llm.Usage{ .input_tokens = 850 }, messages.len - 1, 1000, 200, alloc, &queue, &cancel);
     try std.testing.expectEqual(@as(?[]types.Message, null), result);
 }
 

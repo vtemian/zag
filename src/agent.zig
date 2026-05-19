@@ -22,6 +22,15 @@ const log = std.log.scoped(.agent);
 /// `ctx.agent_name`.
 pub const default_agent_name = "zag";
 
+/// Default reserve budget (tokens) held back from the model's context
+/// window when the agent loop fires compaction. Picked to match
+/// pi-mono's `DEFAULT_COMPACTION_SETTINGS.reserveTokens`
+/// (compaction.ts:114): big enough to absorb estimator error plus the
+/// next tool result, small enough that it doesn't dwarf the available
+/// context on 200k+ window models. Phase 1.5 surfaces this as a
+/// Lua-tunable knob via `zag.compact.set_reserve_tokens`.
+pub const DEFAULT_RESERVE_TOKENS: u32 = 16384;
+
 /// Sentinel `ModelSpec` for callers that don't have a real one (unit tests
 /// and some headless harnesses without a populated registry). Production
 /// turns must NEVER pass this: the dispatcher in `zag.prompt.init` matches
@@ -53,10 +62,12 @@ pub fn runLoopStreaming(
     /// drive the `zag.prompt.init` dispatcher (and any Lua `for_model`
     /// layer) so the per-provider pack body actually fires; production
     /// callers must not pass `UNKNOWN_MODEL`. `context_window` drives the
-    /// `zag.compact.strategy` fire threshold (currently 80% of the cap
-    /// against the prior turn's `input_tokens`); a zero value disables
-    /// compaction entirely so callers without a rate card (some tests,
-    /// the headless eval) still run cleanly.
+    /// `zag.compact.strategy` fire threshold: the loop estimates the next
+    /// request's input-token cost via `estimateContextTokens` and fires
+    /// once that estimate leaves fewer than `DEFAULT_RESERVE_TOKENS` of
+    /// room before the cap. A zero value disables compaction entirely so
+    /// callers without a rate card (some tests, the headless eval) still
+    /// run cleanly.
     model_spec: llm.ModelSpec,
     /// Stable session identifier surfaced in the per-turn `Telemetry`
     /// timeline line and artifact files. Borrowed; the caller (main.zig
@@ -122,17 +133,12 @@ pub fn runLoopStreaming(
     defer allocator.free(last_tool_input);
     var identical_streak: u32 = 0;
 
-    // Token estimate from the prior turn's response. Drives the
-    // compaction fire at the top of each iteration; zero on the first
-    // turn so compaction never runs against an empty conversation.
-    var last_input_tokens: u32 = 0;
     // Predictive-estimator anchors: the last assistant turn's full
     // Usage and its index in `messages`. Null on the first turn (no
     // turn has run) and after aborted/errored turns (provider reported
     // zero tokens; anchoring on that would understate the conversation
-    // size). Phase 1.4 swaps the compaction trigger over to consume
-    // these instead of `last_input_tokens`; kept in parallel here so
-    // this commit doesn't break the existing call site.
+    // size). Consumed by `fireCompact` at the top of each iteration to
+    // sum `last_usage + estimated_trailing` against the model's window.
     var last_usage_anchor: ?llm.Usage = null;
     var last_usage_index: ?usize = null;
 
@@ -169,16 +175,18 @@ pub fn runLoopStreaming(
         // request. The strategy may rewrite the message history (e.g.
         // drop oldest tool_result blocks) so the upcoming `callLlm`
         // request stays under the model's context window. Skipped on
-        // the first turn (no token estimate yet), when no engine is
+        // the first turn (no usage anchor yet), when no engine is
         // wired in, when the strategy slot is empty, when the caller
-        // didn't supply a context window, or when usage is below the
-        // 80% high-water mark. See `fireCompact` for the full no-op
-        // ladder.
+        // didn't supply a context window, or when the predictive
+        // estimate still leaves more than `reserve_tokens` of room.
+        // See `fireCompact` for the full no-op ladder.
         if (try fireCompact(
             lua_engine,
             messages.items,
-            last_input_tokens,
+            last_usage_anchor,
+            last_usage_index,
             model_spec.context_window,
+            DEFAULT_RESERVE_TOKENS,
             allocator,
             queue,
             cancel,
@@ -236,13 +244,10 @@ pub fn runLoopStreaming(
         try emitTokenUsage(response, allocator, queue);
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
-        // configured context window. The full `Usage` snapshot anchors
-        // the predictive estimator in `estimateContextTokens`; we only
-        // anchor when the provider actually reported tokens, because a
-        // mid-stream cancel or error returns the response with zero
-        // counts and anchoring on that would mute compaction for the
-        // rest of the run.
-        last_input_tokens = response.input_tokens;
+        // configured context window. Only anchor when the provider
+        // actually reported tokens: a mid-stream cancel or error
+        // returns the response with zero counts and anchoring on that
+        // would mute compaction for the rest of the run.
         if (response.input_tokens > 0 or response.output_tokens > 0) {
             last_usage_anchor = .{
                 .input_tokens = response.input_tokens,
@@ -250,8 +255,8 @@ pub fn runLoopStreaming(
                 .cache_creation_tokens = response.cache_creation_tokens,
                 .cache_read_tokens = response.cache_read_tokens,
             };
-            // `messages.append` at the top of this block (line ~226) put
-            // the assistant we just got at the tail of `messages.items`;
+            // `messages.append` at the top of this block put the
+            // assistant we just got at the tail of `messages.items`;
             // its index is therefore `len - 1`.
             last_usage_index = messages.items.len - 1;
         }
@@ -1232,19 +1237,26 @@ test "estimateContextTokens regression: mid-turn tool_result blowup is caught" {
     try std.testing.expectEqual(@as(u32, 500), est.total);
 }
 
-/// Fire `zag.compact.strategy` at the top of the next iteration when
-/// the running token estimate crosses the 80% high-water mark of the
-/// model's context window. Returns the replacement message slice
-/// (caller owns the outer slice plus every nested ContentBlock
-/// allocation, all duped through `allocator`) or null when the
-/// strategy declines to compact.
+/// Fire `zag.compact.strategy` at the top of the next iteration when the
+/// predictive estimate of the upcoming request's input-token cost leaves
+/// fewer than `reserve_tokens` tokens of room before the model's
+/// context window. Returns the replacement message slice (caller owns
+/// the outer slice plus every nested ContentBlock allocation, all duped
+/// through `allocator`) or null when the strategy declines to compact.
+///
+/// The estimate (`estimateContextTokens`) sums the most recent assistant
+/// `Usage` plus a char-heuristic for every message appended after it.
+/// That trailing portion is what catches mid-turn blowups: a fresh user
+/// message carrying a large tool_result lands AFTER the last usage
+/// report, so the prior reactive snapshot (last input_tokens alone)
+/// missed it entirely and let oversized requests escape.
 ///
 /// No-op fast path: skips the round-trip entirely when no engine is
 /// wired in, the strategy slot is empty, the caller didn't supply a
-/// context window, or the prior turn's input token count is below
-/// `tokens_max * 0.80`. The threshold lives here (not on the Lua side)
-/// because the agent owns the canonical token estimate and a bad
-/// threshold should not be a Lua plugin's problem to override.
+/// context window, or the estimate still has room above `reserve_tokens`.
+/// The threshold lives here (not on the Lua side) because the agent
+/// owns the canonical token estimate and a bad threshold should not be
+/// a Lua plugin's problem to override.
 ///
 /// Lossy round-trip: the strategy receives a Lua snapshot of each
 /// message as `{role, content}` where `content` is the concatenation
@@ -1256,8 +1268,10 @@ test "estimateContextTokens regression: mid-turn tool_result blowup is caught" {
 pub fn fireCompact(
     lua_engine: ?*LuaEngine.LuaEngine,
     messages: []const types.Message,
-    tokens_used: u32,
+    last_usage: ?llm.Usage,
+    last_usage_index: ?usize,
     tokens_max: u32,
+    reserve_tokens: u32,
     allocator: Allocator,
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
@@ -1265,12 +1279,13 @@ pub fn fireCompact(
     const engine = lua_engine orelse return null;
     if (engine.compact_handler == null) return null;
     if (tokens_max == 0) return null;
-    // Threshold: 80% of the model's context window. Held here so a
-    // misbehaving plugin can't hide the trigger point from the harness.
-    const threshold = (@as(u64, tokens_max) * 4) / 5;
-    if (tokens_used < threshold) return null;
+    const est = estimateContextTokens(messages, last_usage, last_usage_index);
+    // Room-based threshold: fire when fewer than `reserve_tokens` would
+    // remain in the context window after sending the upcoming request.
+    // Mirrors pi-mono's `shouldCompact` (compaction.ts:195-199).
+    if (est.total + reserve_tokens <= tokens_max) return null;
 
-    var req = agent_events.CompactRequest.init(messages, tokens_used, tokens_max, allocator);
+    var req = agent_events.CompactRequest.init(messages, est.total, tokens_max, allocator);
     marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
         error.EventQueueFull => return null,
         error.Cancelled => return error.Cancelled,
