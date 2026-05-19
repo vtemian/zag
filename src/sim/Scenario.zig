@@ -87,10 +87,18 @@ fn runSourceImpl(
     defer r.deinit();
     // Registered after r.init so they fire *before* r.deinit (LIFO defer).
     // Tail the user's real ~/.local/share/zag log and write the crash report
-    // while the child's status is still observable.
+    // while the child's status is still observable. Also drop a copy of the
+    // freshest .zag/sessions/*.jsonl into the artifacts dir so downstream
+    // audits (e.g. parallel vs serial tool calls in tool_parallel.zsm) can
+    // inspect the wire-truth without re-running the scenario.
     defer {
         r.writeCrashReportIfBad(opts.artifacts) catch {};
         if (r.env.get("HOME")) |home| opts.artifacts.tailZagLog(home) catch {};
+        const cwd = std.process.getCwdAlloc(alloc) catch null;
+        if (cwd) |p| {
+            defer alloc.free(p);
+            opts.artifacts.copyNewestSession(p) catch {};
+        }
     }
 
     for (steps, 0..) |step, idx| {
@@ -147,7 +155,7 @@ fn executeStep(r: *Runner, step: Dsl.Step, opts: RunOptions) !void {
             const ms = try Args.parseDurationMs(step.args);
             try r.executeWaitIdle(ms);
         },
-        .wait_exit => try r.executeWaitExit(opts.wait_default_ms),
+        .wait_exit => try r.executeWaitExit(step.args, opts.wait_default_ms),
         .expect_text => try r.executeExpectText(step.args),
         .snapshot => try r.executeSnapshot(step.args, opts.artifacts),
     }

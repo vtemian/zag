@@ -7,8 +7,7 @@
 # anchors on deterministic data even though LLM replies vary.
 
 spawn ./zig-out/bin/zag --last
-wait_idle 2s
-expect_text /zag-resume-seed-token-FT4/
+wait_text /zag-resume-seed-token-FT4/ 10s
 snapshot resumed
 send "/quit" <Enter>
 wait_exit

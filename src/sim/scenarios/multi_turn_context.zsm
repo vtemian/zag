@@ -1,16 +1,15 @@
 # Two-turn context carry-over. Turn 1 establishes a token, turn 2 asks
 # the model to recall it. If conversation history serialization breaks
 # (turn 1's user message or assistant reply isn't included in turn 2's
-# request), the recall fails and the assertion catches it.
+# request), the recall fails and the wait_text deadline catches it.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "Remember this token for the rest of our conversation: zag-ctx-token-PL9. Just acknowledge briefly." <Enter>
-wait_idle 20s
+wait_idle 30s
 send "What was the token I asked you to remember? Reply with just the token, nothing else." <Enter>
-wait_idle 20s
-expect_text /zag-ctx-token-PL9/
+wait_text /zag-ctx-token-PL9/ 30s
 snapshot final
 send "/quit" <Enter>
 wait_exit

@@ -6,20 +6,21 @@
 # trip up the streaming state machine.
 #
 # Ctrl+C is the real cancel hotkey in zag (see EventOrchestrator.zig).
-# Esc only enters normal mode in the modal keymap, it does NOT abort a
+# Esc only enters normal mode in the modal keymap; it does NOT abort a
 # running agent.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "Write a 500-word essay about the history of pseudo-terminals on UNIX. Be thorough." <Enter>
-# Let the model start streaming a bit, then cancel the turn.
+# wait_idle here is intentional: we want the model to START streaming
+# before we cancel. There is no deterministic signal for "streaming
+# has begun", so a small fixed wait is the honest choice.
 wait_idle 4s
 send <C-c>
 wait_idle 1s
 send "Forget that. Just run bash 'echo zag-recover-token-T7'." <Enter>
-wait_idle 25s
-expect_text /zag-recover-token-T7/
+wait_text /zag-recover-token-T7/ 45s
 snapshot final
 send "/quit" <Enter>
 wait_exit

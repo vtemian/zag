@@ -42,12 +42,34 @@ parser, tool dispatch, conversation history, slash commands).
 - We **don't** `expect_text` on model output (LLMs are non-deterministic). We
   assert on tool output, user message echoes, slash command banners, and UI
   affordances that are deterministic.
-- `wait_idle` durations are sized for first-token latency + a short reply.
-  Bump them if your default model is slow.
+- Prefer `wait_text /token/ Ns` (poll until token appears or deadline fires)
+  over `wait_idle Ns; expect_text /token/` (sleep then check). The former is
+  signal-driven and survives slow models; the latter assumes a worst-case
+  duration and flakes when the model is faster or slower than you guessed.
+- `wait_idle` still has a place: when there's no deterministic anchor (e.g.
+  giving the model time to start streaming before a Ctrl+C cancel).
 - `snapshot <label>` writes the final grid into the run's artifact dir so you
   can eyeball regressions visually.
 - All scenarios end with `wait_exit`; a non-zero exit or signal is surfaced
   as `crash.txt` in the artifact dir.
+
+## What lands in the artifact dir
+
+Each run drops the following into `$TMPDIR/zag-sim-<pid>-<ts>/` (or the
+`--artifacts=<dir>` override):
+
+- `summary.json` — pass/fail outcome and per-step timings
+- `<label>.grid` — every `snapshot` step output
+- `zag.log` — tail of the zag log under `~/.zag/logs/`
+- `session.jsonl` — the freshest `.zag/sessions/*.jsonl` zag wrote during
+  the run. Use this when the grid text can't disambiguate something the
+  scenario claims to test. For example, `tool_parallel.zsm` only verifies
+  that both tokens appeared on the grid; to audit whether the model
+  actually emitted both `tool_use` blocks in a single assistant turn
+  (parallel) or in two consecutive turns (serial), open `session.jsonl`
+  and count `tool_use` events between `assistant` boundaries.
+- `crash.txt` — only when the child exited non-zero or via a signal we
+  didn't send ourselves.
 
 ## When a real run crashes
 

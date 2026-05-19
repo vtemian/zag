@@ -1,14 +1,14 @@
 # Single bash tool call. Asks the model to shell out for a deterministic
-# string and asserts the string lands on the grid. The model's wording
-# around the tool call is non-deterministic, but `echo`'s output isn't,
-# so we anchor on the bash stdout that the tool result must surface.
+# string and waits for that string to land on the grid. The model's
+# wording is non-deterministic, but `echo`'s output isn't, so we anchor
+# on the bash stdout the tool result must surface. wait_text polls
+# until the token appears or the per-step deadline fires.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "Use the bash tool to run exactly this command: echo zag-bash-token-7Q3. Do not print the token any other way." <Enter>
-wait_idle 30s
-expect_text /zag-bash-token-7Q3/
+wait_text /zag-bash-token-7Q3/ 60s
 snapshot final
 send "/quit" <Enter>
 wait_exit

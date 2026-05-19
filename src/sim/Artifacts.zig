@@ -109,7 +109,7 @@ pub fn readNewestLog(alloc: std.mem.Allocator, home: []const u8) !?[]u8 {
     };
     defer dir.close();
 
-    const newest = try findNewestLog(alloc, dir, logs_dir);
+    const newest = try findNewestWithSuffix(alloc, dir, logs_dir, ".log");
     const log_path = newest orelse return null;
     defer alloc.free(log_path);
 
@@ -117,6 +117,41 @@ pub fn readNewestLog(alloc: std.mem.Allocator, home: []const u8) !?[]u8 {
         error.FileNotFound => null,
         else => e,
     };
+}
+
+/// Copy the freshest `.zag/sessions/*.jsonl` under `cwd` into
+/// `<self.dir>/session.jsonl`. Lets scenarios audit structural
+/// properties of the run that the grid text cannot expose: how many
+/// tool_use events were emitted, whether they shared an assistant
+/// parent (parallel) or sat in separate turns (serial), and the exact
+/// wire bytes the provider returned. Best-effort: returns success when
+/// the sessions dir is missing.
+pub fn copyNewestSession(self: *Artifacts, cwd: []const u8) !void {
+    const sessions_dir = try std.fs.path.join(self.alloc, &.{ cwd, ".zag", "sessions" });
+    defer self.alloc.free(sessions_dir);
+
+    var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return,
+        else => return e,
+    };
+    defer dir.close();
+
+    const newest = try findNewestWithSuffix(self.alloc, dir, sessions_dir, ".jsonl");
+    const session_path = newest orelse return;
+    defer self.alloc.free(session_path);
+
+    const bytes = std.fs.cwd().readFileAlloc(self.alloc, session_path, max_session_read_bytes) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
+    defer self.alloc.free(bytes);
+
+    const out_path = try self.pathFor("session.jsonl");
+    defer self.alloc.free(out_path);
+
+    const file = try std.fs.createFileAbsolute(out_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
 }
 
 /// Cap the line count we tail. The artifacts dir is meant to be skim-able;
@@ -129,7 +164,12 @@ const tail_log_max_lines: usize = 200;
 /// tailer only ever cares about the last N lines.
 const max_log_read_bytes: usize = 8 * 1024 * 1024;
 
-fn findNewestLog(alloc: std.mem.Allocator, dir: std.fs.Dir, dir_path: []const u8) !?[]u8 {
+/// Hard read cap for session JSONL. Sessions accumulate over a run but are
+/// bounded by the conversation length; 32 MiB is generous for anything a
+/// scenario could produce in one PTY-driven session.
+const max_session_read_bytes: usize = 32 * 1024 * 1024;
+
+fn findNewestWithSuffix(alloc: std.mem.Allocator, dir: std.fs.Dir, dir_path: []const u8, suffix: []const u8) !?[]u8 {
     var it = dir.iterate();
     var newest_path: ?[]u8 = null;
     errdefer if (newest_path) |p| alloc.free(p);
@@ -137,7 +177,7 @@ fn findNewestLog(alloc: std.mem.Allocator, dir: std.fs.Dir, dir_path: []const u8
 
     while (try it.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
+        if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
         const stat = dir.statFile(entry.name) catch continue;
         if (stat.mtime <= newest_mtime) continue;
 
@@ -242,6 +282,69 @@ test "tailZagLog copies last N lines of newest .log" {
     // First line of the tail should be line-300 (500 - 200).
     try std.testing.expect(std.mem.startsWith(u8, tailed, "line-300\n"));
     try std.testing.expect(std.mem.endsWith(u8, tailed, "line-499\n"));
+}
+
+test "copyNewestSession copies the freshest .jsonl by mtime" {
+    var cwd_tmp = std.testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+
+    try cwd_tmp.dir.makePath(".zag/sessions");
+    var sessions = try cwd_tmp.dir.openDir(".zag/sessions", .{});
+    defer sessions.close();
+
+    // Write three sessions, touching one as newest. The on-disk mtime
+    // resolution is too coarse to distinguish files created back-to-back,
+    // so we explicitly setEndTime each one in order.
+    try sessions.writeFile(.{ .sub_path = "old.jsonl", .data = "{\"k\":\"old\"}\n" });
+    try sessions.writeFile(.{ .sub_path = "mid.jsonl", .data = "{\"k\":\"mid\"}\n" });
+    try sessions.writeFile(.{ .sub_path = "new.jsonl", .data = "{\"k\":\"new\"}\n" });
+
+    const now = std.time.nanoTimestamp();
+    const sec: i128 = 1_000_000_000;
+    var f_old = try sessions.openFile("old.jsonl", .{ .mode = .read_write });
+    try f_old.updateTimes(now - 30 * sec, now - 30 * sec);
+    f_old.close();
+    var f_mid = try sessions.openFile("mid.jsonl", .{ .mode = .read_write });
+    try f_mid.updateTimes(now - 10 * sec, now - 10 * sec);
+    f_mid.close();
+    var f_new = try sessions.openFile("new.jsonl", .{ .mode = .read_write });
+    try f_new.updateTimes(now, now);
+    f_new.close();
+
+    var artifacts_tmp = std.testing.tmpDir(.{});
+    defer artifacts_tmp.cleanup();
+    const art_path = try artifacts_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(art_path);
+
+    const artifacts = try create(std.testing.allocator, art_path);
+    defer artifacts.destroy();
+
+    const cwd_path = try cwd_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd_path);
+
+    try artifacts.copyNewestSession(cwd_path);
+
+    const got = try artifacts_tmp.dir.readFileAlloc(std.testing.allocator, "session.jsonl", 64 * 1024);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("{\"k\":\"new\"}\n", got);
+}
+
+test "copyNewestSession is a noop when sessions dir is missing" {
+    var cwd_tmp = std.testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd_path = try cwd_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd_path);
+
+    var artifacts_tmp = std.testing.tmpDir(.{});
+    defer artifacts_tmp.cleanup();
+    const art_path = try artifacts_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(art_path);
+
+    const artifacts = try create(std.testing.allocator, art_path);
+    defer artifacts.destroy();
+
+    try artifacts.copyNewestSession(cwd_path);
+    try std.testing.expectError(error.FileNotFound, artifacts_tmp.dir.openFile("session.jsonl", .{}));
 }
 
 test "tailZagLog is a noop when logs dir is missing" {

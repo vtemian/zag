@@ -13,21 +13,18 @@ wait_text /Welcome to zag/
 wait_idle 500ms
 
 send "Run this single bash command: rm -rf /tmp/zag-sim-deep && mkdir -p /tmp/zag-sim-deep && echo 'seed-token-DK1' > /tmp/zag-sim-deep/seed.txt && ls /tmp/zag-sim-deep" <Enter>
-wait_idle 25s
-expect_text /seed.txt/
+wait_text /seed.txt/ 45s
 
 send "Use the read tool on /tmp/zag-sim-deep/seed.txt and quote its exact contents back to me in your reply." <Enter>
-wait_idle 30s
-expect_text /seed-token-DK1/
+wait_text /seed-token-DK1/ 45s
 
 send "Use the write tool to create /tmp/zag-sim-deep/note.txt with the single line 'note-token-MV2'." <Enter>
-wait_idle 30s
+wait_idle 45s
 
 send "Run 'ls /tmp/zag-sim-deep && cat /tmp/zag-sim-deep/note.txt' as one bash tool call." <Enter>
-wait_idle 30s
-expect_text /seed.txt/
-expect_text /note.txt/
-expect_text /note-token-MV2/
+wait_text /note-token-MV2/ 45s
+wait_text /seed.txt/ 5s
+wait_text /note.txt/ 5s
 
 snapshot final
 send "/quit" <Enter>

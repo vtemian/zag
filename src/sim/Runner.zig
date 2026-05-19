@@ -115,10 +115,14 @@ pub const Runner = struct {
     }
 
     pub fn executeWaitText(self: *Runner, raw: []const u8, default_timeout_ms: u32) !void {
-        // Accept /regex/ or plain substring. Task 2.4 uses substring matching
-        // for both shapes; a real regex engine arrives later.
-        const pattern = stripRegexDelims(raw);
-        const deadline_ms = std.time.milliTimestamp() + default_timeout_ms;
+        // Accept `/regex/`, `/regex/ 40s`, `substring`, or `substring 40s`.
+        // Substring matching for both pattern shapes; a real regex engine
+        // arrives later. The optional trailing duration lets slow real-LLM
+        // scenarios wait long enough for first-token latency without the
+        // operator hardcoding a global default.
+        const parsed = Args.parsePatternAndTimeout(raw);
+        const timeout_ms = parsed.timeout_ms orelse default_timeout_ms;
+        const deadline_ms = std.time.milliTimestamp() + timeout_ms;
         while (true) {
             const remaining = @max(@as(i64, 0), deadline_ms - std.time.milliTimestamp());
             const status = try self.pumpOnce(@intCast(@min(remaining, 250)));
@@ -128,7 +132,7 @@ pub const Runner = struct {
             }
             const dump = try self.grid.plainText();
             defer self.alloc.free(dump);
-            if (std.mem.indexOf(u8, dump, pattern) != null) return;
+            if (std.mem.indexOf(u8, dump, parsed.pattern) != null) return;
             if (std.time.milliTimestamp() >= deadline_ms) return error.WaitTextTimeout;
         }
     }
@@ -164,8 +168,9 @@ pub const Runner = struct {
         try file.writeAll(dump);
     }
 
-    pub fn executeWaitExit(self: *Runner, deadline_ms: u32) !void {
-        const deadline = std.time.milliTimestamp() + deadline_ms;
+    pub fn executeWaitExit(self: *Runner, raw: []const u8, default_timeout_ms: u32) !void {
+        const timeout_ms = Args.parseOptionalTimeout(raw) orelse default_timeout_ms;
+        const deadline = std.time.milliTimestamp() + timeout_ms;
         while (true) {
             const remaining = @max(@as(i64, 0), deadline - std.time.milliTimestamp());
             if (remaining == 0) return error.WaitExitTimeout;
@@ -379,7 +384,7 @@ test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
     // executeWaitExit now surfaces non-zero status as ChildExitedDuringWait;
     // this test exercises crash.txt writing, so swallow the expected error
     // and let writeCrashReportIfBad inspect child_status.
-    r.executeWaitExit(2000) catch |e| switch (e) {
+    r.executeWaitExit("", 2000) catch |e| switch (e) {
         error.ChildExitedDuringWait => {},
         else => return e,
     };
@@ -418,7 +423,7 @@ test "writeCrashReportIfBad records SIGABRT name when child aborts" {
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
     // Same as above: wait_exit now correctly errors on signal exit; this
     // test only cares that writeCrashReportIfBad records the signal name.
-    r.executeWaitExit(2000) catch |e| switch (e) {
+    r.executeWaitExit("", 2000) catch |e| switch (e) {
         error.ChildExitedDuringWait => {},
         else => return e,
     };
@@ -443,7 +448,7 @@ test "writeCrashReportIfBad is a noop on clean exit" {
     const argv = [_][*:0]const u8{"/usr/bin/true"};
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try r.executeWaitExit(2000);
+    try r.executeWaitExit("", 2000);
 
     try r.writeCrashReportIfBad(artifacts);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("crash.txt", .{}));
@@ -455,7 +460,7 @@ test "executeWaitExit returns when child exits cleanly" {
     const argv = [_][*:0]const u8{"/usr/bin/true"};
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try r.executeWaitExit(2000);
+    try r.executeWaitExit("", 2000);
 }
 
 test "executeWaitExit surfaces non-zero exit as ChildExitedDuringWait" {
@@ -464,7 +469,7 @@ test "executeWaitExit surfaces non-zero exit as ChildExitedDuringWait" {
     const argv = [_][*:0]const u8{ "/bin/sh", "-c", "exit 42" };
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try std.testing.expectError(error.ChildExitedDuringWait, r.executeWaitExit(2000));
+    try std.testing.expectError(error.ChildExitedDuringWait, r.executeWaitExit("", 2000));
 }
 
 test "executeWaitExit surfaces signaled exit as ChildExitedDuringWait" {
@@ -474,7 +479,7 @@ test "executeWaitExit surfaces signaled exit as ChildExitedDuringWait" {
     const argv = [_][*:0]const u8{ "/bin/sh", "-c", "kill -ABRT $$" };
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try std.testing.expectError(error.ChildExitedDuringWait, r.executeWaitExit(2000));
+    try std.testing.expectError(error.ChildExitedDuringWait, r.executeWaitExit("", 2000));
 }
 
 test "executeSetEnv stores KEY=VALUE" {

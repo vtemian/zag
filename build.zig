@@ -89,11 +89,53 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_sim_tests.step);
 
     // --- test-sim-e2e -------------------------------------------------------
-    // Empty by default. Real-provider scenarios (real_smoke_hello.zsm) need
-    // the user's ~/.config/zag/auth.json and burn tokens, so they aren't on
-    // the default test path; run them manually via `zag-sim run <scenario>`.
-    const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag");
+    // Real-provider scenarios need the user's ~/.config/zag/auth.json and
+    // burn real API tokens, so they're gated behind `ZAG_E2E=1`. Without
+    // that env, the step is a no-op so CI and casual `zig build test-sim-e2e`
+    // invocations don't silently spend money or fail on missing creds. With
+    // ZAG_E2E=1, every .zsm under src/sim/scenarios/ runs in series, with
+    // the resume_seed -> resume_last pair chained explicitly so the second
+    // step sees the session the first one wrote.
+    const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag (set ZAG_E2E=1)");
     sim_e2e_step.dependOn(b.getInstallStep());
+
+    const zag_e2e = std.process.getEnvVarOwned(b.allocator, "ZAG_E2E") catch null;
+    if (zag_e2e) |val| {
+        defer b.allocator.free(val);
+        if (std.mem.eql(u8, val, "1")) {
+            // Scenarios that don't depend on previous state. Order does not
+            // matter; we serialise via the chain below to keep token spend
+            // predictable and avoid hammering the provider in parallel.
+            const independent_scenarios = [_][]const u8{
+                "src/sim/scenarios/slash_quit.zsm",
+                "src/sim/scenarios/real_smoke_hello.zsm",
+                "src/sim/scenarios/tool_use_bash.zsm",
+                "src/sim/scenarios/tool_use_read_edit.zsm",
+                "src/sim/scenarios/tool_parallel.zsm",
+                "src/sim/scenarios/tool_reuse_sequence.zsm",
+                "src/sim/scenarios/tool_deep_conversation.zsm",
+                "src/sim/scenarios/multi_turn_context.zsm",
+                "src/sim/scenarios/mid_turn_interrupt.zsm",
+            };
+            var prev_step: *std.Build.Step = b.getInstallStep();
+            for (independent_scenarios) |path| {
+                const cmd = b.addRunArtifact(sim_exe);
+                cmd.addArgs(&.{ "run", path });
+                cmd.step.dependOn(prev_step);
+                prev_step = &cmd.step;
+            }
+            // resume_seed must run before resume_last (same cwd, same
+            // .zag/sessions/ dir). Chain them on top of the independent
+            // scenarios.
+            const seed_cmd = b.addRunArtifact(sim_exe);
+            seed_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_seed.zsm" });
+            seed_cmd.step.dependOn(prev_step);
+            const last_cmd = b.addRunArtifact(sim_exe);
+            last_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_last.zsm" });
+            last_cmd.step.dependOn(&seed_cmd.step);
+            sim_e2e_step.dependOn(&last_cmd.step);
+        }
+    }
 
     const validate_step = b.step("validate-trajectory", "Run zag --headless and validate output against harbor");
     const script = b.addSystemCommand(&.{"scripts/validate-trajectory.sh"});
