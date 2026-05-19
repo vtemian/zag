@@ -1,0 +1,409 @@
+//! zag.sessions Lua bindings.
+//!
+//! Read-only enumeration and mutation surface consumed by the sessions
+//! sidebar plugin. The full surface is:
+//!
+//!   * `zag.sessions.list()` — array of `{id, name, model, created_ms,
+//!     updated_ms, message_count, project}` rows aggregated across every
+//!     project recorded in `ProjectRegistry`, sorted by `updated_ms`
+//!     descending.
+//!   * `zag.sessions.rename(id, new_name)` — find which project owns
+//!     `id`, update its `meta.json`. Raises on missing id.
+//!   * `zag.sessions.delete(id)` — remove `.jsonl` + `.meta.json` for
+//!     the session in its owning project.
+//!   * `zag.sessions.current()` — id string of the session bound to the
+//!     focused conversation pane, or `nil`.
+//!   * `zag.sessions.subagents(id)` — array of `{call_id, tool_input,
+//!     timestamp_ms}` rows for each `task_start` entry in `id`'s
+//!     JSONL.
+//!
+//! Cross-project lookup walks `ProjectRegistry.listProjects()` and probes
+//! each project root via `Session.listSessionsAt`; the standalone helper
+//! avoids re-registering visited projects in the registry (which would
+//! be circular).
+//!
+//! Note: `zag.sessions.open(id)` is intentionally NOT installed here.
+//! That binding lives in Task 1.4b alongside the pane-swap logic.
+
+const std = @import("std");
+const zlua = @import("zlua");
+const Lua = zlua.Lua;
+
+const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
+const Session = @import("../../Session.zig");
+const ProjectRegistry = @import("../../project_registry.zig");
+
+const log = std.log.scoped(.lua_sessions);
+
+/// Resolve `$HOME/.config/zag` the same way `Session.recordCwdInRegistry`
+/// does. Returns an owned slice; caller frees with `allocator.free`.
+fn resolveConfigDir(allocator: std.mem.Allocator) ![]u8 {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".config", "zag" });
+}
+
+/// One row of the aggregated session list. `project_path` is borrowed
+/// from the enclosing `Collection.project_paths` slot; `meta` carries
+/// inline storage and owns nothing.
+const Row = struct {
+    meta: Session.Meta,
+    project_path: []const u8,
+};
+
+/// Owned bundle returned by `collectRows`. `project_paths` holds the
+/// deduped allocation backing every `Row.project_path` slice; freeing
+/// the collection releases the rows array and every project_path in one
+/// pass without the double-free risk of dedupe-on-free.
+const Collection = struct {
+    rows: []Row,
+    project_paths: [][]u8,
+
+    fn deinit(self: *Collection, allocator: std.mem.Allocator) void {
+        allocator.free(self.rows);
+        for (self.project_paths) |p| allocator.free(p);
+        allocator.free(self.project_paths);
+    }
+};
+
+/// Collect every session across every registered project plus the live
+/// cwd. The cwd is included explicitly because the registry is updated
+/// lazily on `SessionManager.init`; if `init` failed earlier in the
+/// current process, the sidebar would otherwise miss its own project.
+///
+/// Returns a sorted (newest first) `Collection`. Caller calls
+/// `Collection.deinit` to release every owned slot.
+fn collectRows(allocator: std.mem.Allocator) !Collection {
+    var rows: std.ArrayList(Row) = .empty;
+    errdefer rows.deinit(allocator);
+
+    var project_paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (project_paths.items) |p| allocator.free(p);
+        project_paths.deinit(allocator);
+    }
+
+    const config_dir = resolveConfigDir(allocator) catch |err| switch (err) {
+        // No HOME: degrade to "no registry projects visible". The
+        // sidebar still works for whichever project the process happens
+        // to be running in once that gets folded in below.
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (config_dir) |d| allocator.free(d);
+
+    if (config_dir) |dir| {
+        var registry = ProjectRegistry.init(allocator, dir) catch |err| blk: {
+            // A broken registry must not fail the whole binding: log and
+            // skip the registry traversal, fall through to the cwd probe.
+            log.warn("project registry open failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (registry) |*r| {
+            defer r.deinit();
+            const projects = try r.listProjects();
+            defer {
+                for (projects) |p| allocator.free(p.path);
+                allocator.free(projects);
+            }
+            for (projects) |p| {
+                try appendProjectRows(allocator, &rows, &project_paths, p.path);
+            }
+        }
+    }
+
+    // Fold in the current cwd in case the registry was unreachable or
+    // had not yet been updated when the sidebar first opened.
+    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_real| {
+        defer allocator.free(cwd_real);
+        try appendProjectRows(allocator, &rows, &project_paths, cwd_real);
+    } else |err| {
+        log.warn("cwd realpath failed: {s}", .{@errorName(err)});
+    }
+
+    std.mem.sort(Row, rows.items, {}, struct {
+        fn lessThan(_: void, a: Row, b: Row) bool {
+            return a.meta.updated > b.meta.updated;
+        }
+    }.lessThan);
+
+    return .{
+        .rows = try rows.toOwnedSlice(allocator),
+        .project_paths = try project_paths.toOwnedSlice(allocator),
+    };
+}
+
+fn appendProjectRows(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    project_paths: *std.ArrayList([]u8),
+    project_path: []const u8,
+) !void {
+    // Dedupe by linear scan; project counts are tiny (tens at most),
+    // so an O(n) probe beats the bookkeeping of a hash map keyed on
+    // the same allocation we're tracking for free.
+    for (project_paths.items) |existing| {
+        if (std.mem.eql(u8, existing, project_path)) return;
+    }
+    const owned = try allocator.dupe(u8, project_path);
+    errdefer allocator.free(owned);
+    try project_paths.append(allocator, owned);
+
+    const metas = Session.listSessionsAt(allocator, owned) catch |err| {
+        log.warn("listSessionsAt({s}) failed: {s}", .{ owned, @errorName(err) });
+        return;
+    };
+    defer allocator.free(metas);
+
+    for (metas) |m| {
+        try rows.append(allocator, .{ .meta = m, .project_path = owned });
+    }
+}
+
+/// Push a single row onto the Lua stack as a table with the public
+/// keys documented at the top of this file.
+fn pushRow(lua: *Lua, row: Row) void {
+    lua.createTable(0, 7);
+
+    _ = lua.pushString(row.meta.idSlice());
+    lua.setField(-2, "id");
+
+    _ = lua.pushString(row.meta.nameSlice());
+    lua.setField(-2, "name");
+
+    _ = lua.pushString(row.meta.modelSlice());
+    lua.setField(-2, "model");
+
+    lua.pushInteger(row.meta.created);
+    lua.setField(-2, "created_ms");
+
+    lua.pushInteger(row.meta.updated);
+    lua.setField(-2, "updated_ms");
+
+    lua.pushInteger(@intCast(row.meta.message_count));
+    lua.setField(-2, "message_count");
+
+    _ = lua.pushString(row.project_path);
+    lua.setField(-2, "project");
+}
+
+/// `zag.sessions.list()` — see top-of-file docstring.
+fn zagSessionsListFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    var collection = collectRows(engine.allocator) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.list: {s}", .{@errorName(err)}) catch
+            "zag.sessions.list failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+    defer collection.deinit(engine.allocator);
+
+    lua.createTable(@intCast(collection.rows.len), 0);
+    for (collection.rows, 0..) |row, i| {
+        pushRow(lua, row);
+        lua.setIndex(-2, @intCast(i + 1));
+    }
+    return 1;
+}
+
+/// Search every project in the registry plus the live cwd for `id` and
+/// return the owning project's absolute path. Caller owns the slice and
+/// frees it. Returns null when the id is not present in any project.
+fn findProjectForId(allocator: std.mem.Allocator, id: []const u8) !?[]u8 {
+    var collection = try collectRows(allocator);
+    defer collection.deinit(allocator);
+    for (collection.rows) |r| {
+        if (std.mem.eql(u8, r.meta.idSlice(), id)) {
+            return try allocator.dupe(u8, r.project_path);
+        }
+    }
+    return null;
+}
+
+/// `zag.sessions.rename(id, new_name)` — see top-of-file docstring.
+fn zagSessionsRenameFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.sessions.rename: id must be a string", .{});
+    }
+    const id = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.sessions.rename: id must be a string", .{});
+    };
+    if (lua.typeOf(2) != .string) {
+        lua.raiseErrorStr("zag.sessions.rename: name must be a string", .{});
+    }
+    const new_name = lua.toString(2) catch {
+        lua.raiseErrorStr("zag.sessions.rename: name must be a string", .{});
+    };
+
+    const project_owned = findProjectForId(engine.allocator, id) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.rename: {s}", .{@errorName(err)}) catch
+            "zag.sessions.rename: lookup failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+    if (project_owned == null) {
+        lua.raiseErrorStr("zag.sessions.rename: unknown session id", .{});
+    }
+    defer engine.allocator.free(project_owned.?);
+
+    Session.renameSessionAt(engine.allocator, project_owned.?, id, new_name) catch |err| switch (err) {
+        error.InvalidSessionId => lua.raiseErrorStr("zag.sessions.rename: invalid session id", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.rename: {s}", .{@errorName(err)}) catch
+                "zag.sessions.rename failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
+    };
+    return 0;
+}
+
+/// `zag.sessions.delete(id)` — see top-of-file docstring.
+fn zagSessionsDeleteFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.sessions.delete: id must be a string", .{});
+    }
+    const id = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.sessions.delete: id must be a string", .{});
+    };
+
+    const project_owned = findProjectForId(engine.allocator, id) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.delete: {s}", .{@errorName(err)}) catch
+            "zag.sessions.delete: lookup failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+    if (project_owned == null) {
+        // Match SessionManager.deleteSession's idempotency contract: a
+        // delete of an already-absent session is a no-op, not an error.
+        return 0;
+    }
+    defer engine.allocator.free(project_owned.?);
+
+    Session.deleteSessionAt(project_owned.?, id) catch |err| switch (err) {
+        error.InvalidSessionId => lua.raiseErrorStr("zag.sessions.delete: invalid session id", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.delete: {s}", .{@errorName(err)}) catch
+                "zag.sessions.delete failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
+    };
+    return 0;
+}
+
+/// `zag.sessions.current()` — see top-of-file docstring.
+fn zagSessionsCurrentFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.pushNil();
+        return 1;
+    };
+
+    const pane = wm.getFocusedPanePtr();
+    const conv = pane.conversation orelse {
+        lua.pushNil();
+        return 1;
+    };
+    const sh = conv.session_handle orelse {
+        lua.pushNil();
+        return 1;
+    };
+    _ = lua.pushString(sh.id[0..sh.id_len]);
+    return 1;
+}
+
+/// Push the ULID of an entry as a 26-char base32 string. The loader
+/// backfills synthetic ids for pre-migration rows, so this slot is
+/// always populated; we push the raw bytes directly because ULID's
+/// base32 alphabet is already ASCII.
+fn pushUlidString(lua: *Lua, ulid_bytes: [26]u8) void {
+    _ = lua.pushString(ulid_bytes[0..]);
+}
+
+/// `zag.sessions.subagents(id)` — see top-of-file docstring.
+fn zagSessionsSubagentsFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.sessions.subagents: id must be a string", .{});
+    }
+    const id = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.sessions.subagents: id must be a string", .{});
+    };
+
+    const project_owned = findProjectForId(engine.allocator, id) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.subagents: {s}", .{@errorName(err)}) catch
+            "zag.sessions.subagents: lookup failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+    if (project_owned == null) {
+        lua.raiseErrorStr("zag.sessions.subagents: unknown session id", .{});
+    }
+    defer engine.allocator.free(project_owned.?);
+
+    const entries = Session.loadEntriesAt(engine.allocator, project_owned.?, id) catch |err| switch (err) {
+        error.InvalidSessionId => lua.raiseErrorStr("zag.sessions.subagents: invalid session id", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.subagents: {s}", .{@errorName(err)}) catch
+                "zag.sessions.subagents: load failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
+    };
+    defer {
+        for (entries) |e| Session.freeEntry(e, engine.allocator);
+        engine.allocator.free(entries);
+    }
+
+    // Two-pass to size the result table accurately; task_start entries
+    // are sparse so a flat resize would over-allocate the array part.
+    var spawn_count: usize = 0;
+    for (entries) |e| {
+        if (e.entry_type == .task_start) spawn_count += 1;
+    }
+
+    lua.createTable(@intCast(spawn_count), 0);
+    var index: i32 = 0;
+    for (entries) |e| {
+        if (e.entry_type != .task_start) continue;
+        index += 1;
+        lua.createTable(0, 3);
+
+        pushUlidString(lua, e.id);
+        lua.setField(-2, "call_id");
+
+        _ = lua.pushString(e.content);
+        lua.setField(-2, "tool_input");
+
+        lua.pushInteger(e.timestamp);
+        lua.setField(-2, "timestamp_ms");
+
+        lua.setIndex(-2, index);
+    }
+    return 1;
+}
+
+/// Register the `zag.sessions` subtable. Caller has the `zag` table at
+/// stack top; on return the `zag` table is still at stack top with
+/// `sessions` attached. Mirrors `registerLayoutTable`'s registration
+/// shape and ordering.
+pub fn registerOn(lua: *Lua) void {
+    lua.newTable(); // [zag_table, sessions_table]
+    lua.pushFunction(zlua.wrap(zagSessionsListFn));
+    lua.setField(-2, "list");
+    lua.pushFunction(zlua.wrap(zagSessionsRenameFn));
+    lua.setField(-2, "rename");
+    lua.pushFunction(zlua.wrap(zagSessionsDeleteFn));
+    lua.setField(-2, "delete");
+    lua.pushFunction(zlua.wrap(zagSessionsCurrentFn));
+    lua.setField(-2, "current");
+    lua.pushFunction(zlua.wrap(zagSessionsSubagentsFn));
+    lua.setField(-2, "subagents");
+    lua.setField(-2, "sessions"); // zag.sessions = sessions_table; [zag_table]
+}

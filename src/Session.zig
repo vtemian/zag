@@ -777,6 +777,210 @@ pub fn freeEntry(entry: Entry, allocator: Allocator) void {
     if (entry.subagent_path) |path| allocator.free(path);
 }
 
+/// List sessions for an arbitrary project rooted at `project_path`.
+/// Reads `<project_path>/.zag/sessions/*.meta.json` directly, without
+/// touching cwd or the project registry. Used by the sessions sidebar to
+/// aggregate sessions across every cwd zag has been launched in; the cwd
+/// case is handled by `SessionManager.listSessions` and uses the same
+/// on-disk layout.
+///
+/// Returns an empty slice when the sessions dir is missing (the project
+/// directory might have been deleted between registry update and lookup).
+/// Caller owns the returned slice.
+pub fn listSessionsAt(allocator: Allocator, project_path: []const u8) ![]Meta {
+    var dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/{s}", .{ project_path, sessions_dir }) catch
+        return error.PathTooLong;
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return &.{},
+        else => return e,
+    };
+    defer dir.close();
+
+    var metas: std.ArrayList(Meta) = .empty;
+    errdefer metas.deinit(allocator);
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".meta.json")) continue;
+
+        const meta = readMetaFromDir(dir, entry.name, allocator) catch continue;
+        try metas.append(allocator, meta);
+    }
+
+    std.mem.sort(Meta, metas.items, {}, struct {
+        fn lessThan(_: void, a: Meta, b: Meta) bool {
+            return a.updated > b.updated;
+        }
+    }.lessThan);
+
+    return metas.toOwnedSlice(allocator);
+}
+
+/// Read a `Meta` from `<dir>/<name>` without going through `std.fs.cwd()`.
+/// Used by `listSessionsAt` so cross-project enumeration does not require
+/// chdir'ing into the project root.
+fn readMetaFromDir(dir: std.fs.Dir, name: []const u8, allocator: Allocator) !Meta {
+    const content = try dir.readFileAlloc(allocator, name, 4096);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    var meta = Meta{};
+
+    if (obj.get("id")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            const len: u8 = @intCast(@min(s.len, meta.id.len));
+            @memcpy(meta.id[0..len], s[0..len]);
+            meta.id_len = len;
+        }
+    }
+    if (obj.get("name")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            const len: u8 = @intCast(@min(s.len, meta.name.len));
+            @memcpy(meta.name[0..len], s[0..len]);
+            meta.name_len = len;
+        }
+    }
+    if (obj.get("model")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            const len: u8 = @intCast(@min(s.len, meta.model.len));
+            @memcpy(meta.model[0..len], s[0..len]);
+            meta.model_len = len;
+        }
+    }
+    if (obj.get("created")) |v| {
+        if (v == .integer) meta.created = v.integer;
+    }
+    if (obj.get("updated")) |v| {
+        if (v == .integer) meta.updated = v.integer;
+    }
+    if (obj.get("message_count")) |v| {
+        if (v == .integer) meta.message_count = @intCast(v.integer);
+    }
+
+    return meta;
+}
+
+/// Delete a session's `.jsonl` + `.meta.json` under an arbitrary project
+/// root. Idempotent (missing files are tolerated). Used by the sidebar
+/// binding to delete sessions in projects other than the current cwd.
+pub fn deleteSessionAt(project_path: []const u8, id: []const u8) !void {
+    if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+    var jsonl_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const jsonl_path = std.fmt.bufPrint(
+        &jsonl_path_buf,
+        "{s}/{s}/{s}.jsonl",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    var meta_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(
+        &meta_path_buf,
+        "{s}/{s}/{s}.meta.json",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    std.fs.cwd().deleteFile(jsonl_path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    };
+    std.fs.cwd().deleteFile(meta_path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    };
+}
+
+/// Rename a session's `.meta.json` under an arbitrary project root. Reads
+/// the existing meta, replaces `name` and `updated`, then writes back via
+/// the same atomic temp+rename `writeMetaFile` uses. Does NOT append a
+/// `session_rename` audit entry to the JSONL: cross-project rename hits
+/// projects that may have an open `SessionHandle` writer in another
+/// process, and we cannot safely append from outside that writer's
+/// `append_mutex`. The lost audit row is the accepted trade-off; the
+/// meta change is what every reader actually consults.
+pub fn renameSessionAt(
+    allocator: Allocator,
+    project_path: []const u8,
+    id: []const u8,
+    new_name: []const u8,
+) !void {
+    if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+    var meta_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(
+        &meta_path_buf,
+        "{s}/{s}/{s}.meta.json",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    var meta = try readMetaFile(meta_path, allocator);
+    const name_len: u8 = @intCast(@min(new_name.len, meta.name.len));
+    @memcpy(meta.name[0..name_len], new_name[0..name_len]);
+    meta.name_len = name_len;
+    meta.updated = std.time.milliTimestamp();
+
+    try writeMetaFile(meta_path, &meta);
+}
+
+/// Variant of `loadEntries` that reads from `<project_path>/.zag/sessions/`
+/// instead of cwd. Used by the sidebar binding's `subagents(id)` to crawl
+/// sessions belonging to projects other than the current cwd.
+pub fn loadEntriesAt(allocator: Allocator, project_path: []const u8, id: []const u8) ![]Entry {
+    if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &path_buf,
+        "{s}/{s}/{s}.jsonl",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |e| {
+        log.err("failed to read session file: {}", .{e});
+        return e;
+    };
+    defer allocator.free(content);
+
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        for (entries.items) |entry| freeEntry(entry, allocator);
+        entries.deinit(allocator);
+    }
+
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var line_index: usize = 0;
+    var line_start_offset: usize = 0;
+    while (line_iter.next()) |line| {
+        defer line_start_offset += line.len + 1;
+        if (line.len == 0) continue;
+        var entry = parseEntry(line, allocator) catch |err| {
+            log.warn(
+                "loadEntriesAt: skipping corrupt entry at byte {d} of {s}: {s}",
+                .{ line_start_offset, path, @errorName(err) },
+            );
+            continue;
+        };
+        const previous_id: ?ulid.Ulid = if (entries.items.len > 0)
+            entries.items[entries.items.len - 1].id
+        else
+            null;
+        backfillEntry(&entry, previous_id, line_index);
+        try entries.append(allocator, entry);
+        line_index += 1;
+    }
+
+    return entries.toOwnedSlice(allocator);
+}
+
 /// Outcome of a session's crash-recovery pass. `actual_line_count` is the
 /// number of complete JSONL lines after truncation, used by `loadSession`
 /// to reconcile against `meta.message_count`.
@@ -2625,6 +2829,126 @@ test "SessionManager.deleteSession removes both .jsonl and .meta.json and is ide
     var meta_path_buf: [256]u8 = undefined;
     const meta_path = try std.fmt.bufPrint(&meta_path_buf, ".zag/sessions/{s}.meta.json", .{id});
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(meta_path, .{}));
+}
+
+test "listSessionsAt enumerates sessions for a non-cwd project root" {
+    const allocator = std.testing.allocator;
+
+    // Two tmp dirs simulate two distinct project roots. Create a session
+    // in the first via SessionManager (with that dir as cwd), then chdir
+    // away and confirm listSessionsAt finds it via the absolute path.
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        handle.close();
+    }
+
+    // Move cwd into project_b: from b's perspective, project_a is a
+    // foreign project root and listSessionsAt is the only way to see it.
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const sessions = try listSessionsAt(allocator, path_a);
+    defer allocator.free(sessions);
+
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("test-model", sessions[0].modelSlice());
+}
+
+test "listSessionsAt returns empty slice when project dir is missing" {
+    const allocator = std.testing.allocator;
+    const sessions = try listSessionsAt(allocator, "/no/such/path/zag-nonexistent");
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(@as(usize, 0), sessions.len);
+}
+
+test "deleteSessionAt removes session files under a non-cwd project root" {
+    const allocator = std.testing.allocator;
+
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    var id_owned: []u8 = undefined;
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        id_owned = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+        handle.close();
+    }
+    defer allocator.free(id_owned);
+
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try deleteSessionAt(path_a, id_owned);
+
+    const sessions = try listSessionsAt(allocator, path_a);
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(@as(usize, 0), sessions.len);
+
+    // Idempotent: a second delete on the same id is a no-op.
+    try deleteSessionAt(path_a, id_owned);
+
+    // Reject ids that try to escape.
+    try std.testing.expectError(error.InvalidSessionId, deleteSessionAt(path_a, "../etc/passwd"));
+}
+
+test "renameSessionAt updates meta name under a non-cwd project root" {
+    const allocator = std.testing.allocator;
+
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    var id_owned: []u8 = undefined;
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        id_owned = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+        handle.close();
+    }
+    defer allocator.free(id_owned);
+
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try renameSessionAt(allocator, path_a, id_owned, "renamed-cross-project");
+
+    const sessions = try listSessionsAt(allocator, path_a);
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("renamed-cross-project", sessions[0].nameSlice());
+
+    try std.testing.expectError(error.InvalidSessionId, renameSessionAt(allocator, path_a, "../bad", "x"));
 }
 
 test "SessionManager.loadSession rejects ids that try to escape the sessions dir" {
