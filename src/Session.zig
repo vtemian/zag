@@ -258,8 +258,9 @@ pub const SessionManager = struct {
         // zag has ever been launched in. A bad HOME, missing config dir,
         // permission denied, or a malformed registry must not prevent
         // session bring-up: log and continue.
-        recordCwdInRegistry(allocator) catch |e| {
-            log.warn("project_registry update skipped: {s}", .{@errorName(e)});
+        recordCwdInRegistry(allocator) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => log.warn("project_registry update skipped: {s}", .{@errorName(e)}),
         };
 
         return .{ .allocator = allocator };
@@ -2713,7 +2714,7 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
     var value_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (value.len + 1 > value_buf.len) return;
+    std.debug.assert(value.len + 1 <= value_buf.len);
     @memcpy(value_buf[0..value.len], value);
     value_buf[value.len] = 0;
     _ = setenv(name.ptr, value_buf[0..value.len :0].ptr, 1);
