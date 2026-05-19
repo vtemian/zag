@@ -45,12 +45,11 @@ pub fn registerLoopTable(lua: *Lua) void {
 }
 
 /// Register the `zag.compact` subtable on the `zag` table.
-/// Exposes `strategy` and `set_reserve_tokens`.
+/// Exposes the single `strategy_v2` hook (full-fidelity blocks +
+/// structured returns) plus the reserve / keep_recent setters.
 /// Stack on entry/exit: [zag_table].
 pub fn registerCompactTable(lua: *Lua) void {
     lua.newTable();
-    lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
-    lua.setField(-2, "strategy");
     lua.pushFunction(zlua.wrap(zagCompactStrategyV2Fn));
     lua.setField(-2, "strategy_v2");
     lua.pushFunction(zlua.wrap(zagCompactSetReserveTokensFn));
@@ -236,52 +235,6 @@ fn zagLoopDetectFn(lua: *Lua) i32 {
         lua.unref(zlua.registry_index, old);
     }
     engine.loop_detect_handler = fn_ref;
-    return 0;
-}
-
-/// Zig function backing `zag.compact.strategy(fn)`.
-///
-/// Registers the single global compaction-strategy handler the
-/// harness invokes when the running token estimate crosses the
-/// high-water threshold. Re-registering replaces the previous
-/// function; the old Lua ref is unrefed so memory does not bloat
-/// across reloads. Pass nil to clear.
-///
-/// Args:
-/// - arg 1 (function or nil, required): handler `fn(ctx) -> table|nil`.
-fn zagCompactStrategyFn(lua: *Lua) i32 {
-    const engine = LuaEngine.getEngineFromState(lua);
-
-    // Allow `zag.compact.strategy(nil)` to clear the handler.
-    // Anything else that isn't a function is a programmer error.
-    if (lua.isNil(1)) {
-        if (engine.compact_handler) |old| {
-            lua.unref(zlua.registry_index, old);
-            engine.compact_handler = null;
-        }
-        return 0;
-    }
-    if (!lua.isFunction(1)) {
-        lua.raiseErrorStr(
-            "zag.compact.strategy: arg 1 must be a function or nil",
-            .{},
-        );
-    }
-
-    // Push a copy of arg 1 so ref() pops the duplicate and leaves
-    // the original argument frame intact.
-    lua.pushValue(1);
-    const fn_ref = lua.ref(zlua.registry_index) catch {
-        lua.raiseErrorStr(
-            "zag.compact.strategy: failed to ref handler",
-            .{},
-        );
-    };
-
-    if (engine.compact_handler) |old| {
-        lua.unref(zlua.registry_index, old);
-    }
-    engine.compact_handler = fn_ref;
     return 0;
 }
 

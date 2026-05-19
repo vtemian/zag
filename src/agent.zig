@@ -455,7 +455,6 @@ fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
         agent_events.JitContextRequest => .{ .jit_context_request = req },
         agent_events.ToolTransformRequest => .{ .tool_transform_request = req },
         agent_events.LoopDetectRequest => .{ .loop_detect_request = req },
-        agent_events.CompactRequest => .{ .compact_request = req },
         agent_events.CompactRequestV2 => .{ .compact_request_v2 = req },
         else => @compileError("marshalRequest does not handle " ++ @typeName(T)),
     };
@@ -1532,10 +1531,24 @@ pub const CompactionFireOutcome = union(enum) {
     replaced: []types.Message,
 };
 
-/// Unified entry point that prefers the v2 strategy when registered
-/// and otherwise routes to v1. Centralises the dispatch so
-/// `runLoopStreaming` doesn't grow another conditional branch every
-/// time a new hook variant lands.
+/// Fire `zag.compact.strategy_v2` at the top of each iteration when
+/// the predictive estimate trips the room-based threshold. Sees a
+/// full-fidelity message snapshot (every ContentBlock variant survives
+/// the round-trip) and decodes the structured return into one of the
+/// three `CompactionFireOutcome` variants.
+///
+/// The estimate (`estimateContextTokens`) sums the most recent
+/// assistant `Usage` plus a char-heuristic for every message appended
+/// after it. That trailing portion catches mid-turn blowups: a fresh
+/// user message carrying a large tool_result lands AFTER the last
+/// usage report, so a reactive snapshot would have missed it.
+///
+/// No-op fast path: skips the round-trip when no engine is wired in,
+/// no strategy is registered, the caller didn't supply a context
+/// window, or the estimate still has room above `reserve_tokens`. The
+/// agent loop's Zig fallback chain still runs in those cases — the
+/// strategy hook is a customization point on top of the default, not
+/// the only way compaction happens.
 pub fn fireCompactUnified(
     lua_engine: ?*LuaEngine.LuaEngine,
     messages: []const types.Message,
@@ -1548,55 +1561,12 @@ pub fn fireCompactUnified(
     cancel: *agent_events.CancelFlag,
 ) !CompactionFireOutcome {
     const engine = lua_engine orelse return .skipped;
-    if (engine.compact_handler_v2 != null) {
-        return fireCompactV2(
-            engine,
-            messages,
-            last_usage,
-            last_usage_index,
-            tokens_max,
-            reserve_tokens,
-            allocator,
-            queue,
-            cancel,
-        );
-    }
-    const replacement = try fireCompact(
-        lua_engine,
-        messages,
-        last_usage,
-        last_usage_index,
-        tokens_max,
-        reserve_tokens,
-        allocator,
-        queue,
-        cancel,
-    );
-    return if (replacement) |r| .{ .replaced = r } else .skipped;
-}
-
-/// v2 variant. Same threshold logic as v1 (predictive estimate +
-/// room-based check) but the round-trip uses `CompactRequestV2` so
-/// the strategy sees full-fidelity blocks and can return any of the
-/// three structured outcomes. On any marshal-side error we fall back
-/// to `.skipped` so the agent loop's Zig fallback still runs.
-fn fireCompactV2(
-    engine: *LuaEngine.LuaEngine,
-    messages: []const types.Message,
-    last_usage: ?llm.Usage,
-    last_usage_index: ?usize,
-    tokens_max: u32,
-    reserve_tokens: u32,
-    allocator: Allocator,
-    queue: *agent_events.EventQueue,
-    cancel: *agent_events.CancelFlag,
-    // engine is currently only used as a "v2 handler is registered" gate
-    // (the gate fires before we reach this function). It's kept on the
-    // signature so future revisions can read per-engine knobs (e.g. a
-    // v2-specific reserve_tokens) without touching every call site.
-) !CompactionFireOutcome {
-    _ = engine;
+    if (engine.compact_handler_v2 == null) return .skipped;
     if (tokens_max == 0) {
+        // Surface the disabled-state loudly: production callers always
+        // have a context_window; only headless / test paths run with
+        // zero. One warn per process via the dedup set keeps the noise
+        // floor at 1.
         if (llm.cost.shouldWarnForModel("__zag_compact_disabled__")) {
             log.warn(
                 "compaction disabled: model has no context_window; oversized requests will reach the provider unchecked",
@@ -1606,6 +1576,8 @@ fn fireCompactV2(
         return .skipped;
     }
     const est = estimateContextTokens(messages, last_usage, last_usage_index);
+    // Room-based threshold mirrors pi-mono `shouldCompact`
+    // (compaction.ts:195-199).
     if (est.total + reserve_tokens <= tokens_max) return .skipped;
 
     var req = agent_events.CompactRequestV2.init(messages, est.total, tokens_max, allocator);
@@ -1614,7 +1586,7 @@ fn fireCompactV2(
         error.Cancelled => return error.Cancelled,
     };
     if (req.error_name) |name| {
-        log.warn("compact_v2 strategy handler failed: {s}", .{name});
+        log.warn("compact strategy handler failed: {s}", .{name});
         req.freeOutcome();
         return .skipped;
     }
@@ -1624,89 +1596,14 @@ fn fireCompactV2(
         .replace => |r| blk: {
             // Transfer ownership of the messages slice; clear the
             // outcome so freeOutcome becomes a no-op for the data we
-            // just adopted. The summary is dropped (telemetry-only and
-            // we don't have a sink for it today).
+            // just adopted. `summary` is dropped today (telemetry-only
+            // and there's no sink for it yet).
             const moved = r.messages;
             if (r.summary) |s| req.allocator.free(s);
             req.outcome = .use_default;
             break :blk .{ .replaced = moved };
         },
     };
-}
-
-/// Fire `zag.compact.strategy` at the top of the next iteration when the
-/// predictive estimate of the upcoming request's input-token cost leaves
-/// fewer than `reserve_tokens` tokens of room before the model's
-/// context window. Returns the replacement message slice (caller owns
-/// the outer slice plus every nested ContentBlock allocation, all duped
-/// through `allocator`) or null when the strategy declines to compact.
-///
-/// The estimate (`estimateContextTokens`) sums the most recent assistant
-/// `Usage` plus a char-heuristic for every message appended after it.
-/// That trailing portion is what catches mid-turn blowups: a fresh user
-/// message carrying a large tool_result lands AFTER the last usage
-/// report, so the prior reactive snapshot (last input_tokens alone)
-/// missed it entirely and let oversized requests escape.
-///
-/// No-op fast path: skips the round-trip entirely when no engine is
-/// wired in, the strategy slot is empty, the caller didn't supply a
-/// context window, or the estimate still has room above `reserve_tokens`.
-/// The threshold lives here (not on the Lua side) because the agent
-/// owns the canonical token estimate and a bad threshold should not be
-/// a Lua plugin's problem to override.
-///
-/// Lossy round-trip: the strategy receives a Lua snapshot of each
-/// message as `{role, content}` where `content` is the concatenation
-/// of every `text` block in the original message. tool_use,
-/// tool_result, thinking, and redacted_thinking blocks are dropped
-/// from the snapshot. The returned messages are reconstructed as
-/// single-block text messages. See `CompactRequest` in
-/// `agent_events.zig` for the full contract and v2 follow-up.
-pub fn fireCompact(
-    lua_engine: ?*LuaEngine.LuaEngine,
-    messages: []const types.Message,
-    last_usage: ?llm.Usage,
-    last_usage_index: ?usize,
-    tokens_max: u32,
-    reserve_tokens: u32,
-    allocator: Allocator,
-    queue: *agent_events.EventQueue,
-    cancel: *agent_events.CancelFlag,
-) !?[]types.Message {
-    const engine = lua_engine orelse return null;
-    if (engine.compact_handler == null) return null;
-    if (tokens_max == 0) {
-        // Surface the disabled-state loudly: production callers always
-        // have a context_window; only headless / test paths run with
-        // zero. Producing one warn per engine via the `unknown` slot
-        // (no model id available here) keeps the noise floor at 1.
-        if (llm.cost.shouldWarnForModel("__zag_compact_disabled__")) {
-            log.warn(
-                "compaction disabled: model has no context_window; oversized requests will reach the provider unchecked",
-                .{},
-            );
-        }
-        return null;
-    }
-    const est = estimateContextTokens(messages, last_usage, last_usage_index);
-    // Room-based threshold: fire when fewer than `reserve_tokens` would
-    // remain in the context window after sending the upcoming request.
-    // Mirrors pi-mono's `shouldCompact` (compaction.ts:195-199).
-    if (est.total + reserve_tokens <= tokens_max) return null;
-
-    var req = agent_events.CompactRequest.init(messages, est.total, tokens_max, allocator);
-    marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
-        error.EventQueueFull => return null,
-        error.Cancelled => return error.Cancelled,
-    };
-    if (req.error_name) |name| {
-        log.warn("compact strategy handler failed: {s}", .{name});
-        req.freeResult();
-        return null;
-    }
-    const replacement = req.result orelse return null;
-    req.result = null; // transfer ownership; freeResult becomes a no-op
-    return replacement;
 }
 
 /// Swap `replacement` into `messages` without losing history if the
