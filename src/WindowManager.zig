@@ -6771,6 +6771,32 @@ test "deinit tears down extra_floats with no leaks" {
     wm.deinit();
 }
 
+test "zag.layout.tree returns live cols and rows" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // The fixture seeds an 80x24 screen; cols/rows must echo those
+    // values so plugins (sessions sidebar) can size splits in
+    // cell-count terms rather than guessing a fixed ratio.
+    try f.engine.lua.doString(
+        \\_t = zag.layout.tree()
+        \\_cols = _t.cols
+        \\_rows = _t.rows
+    );
+
+    _ = try f.engine.lua.getGlobal("_cols");
+    defer f.engine.lua.pop(1);
+    const cols = try f.engine.lua.toInteger(-1);
+    try std.testing.expectEqual(@as(@TypeOf(cols), 80), cols);
+
+    _ = try f.engine.lua.getGlobal("_rows");
+    defer f.engine.lua.pop(1);
+    const rows = try f.engine.lua.toInteger(-1);
+    try std.testing.expectEqual(@as(@TypeOf(rows), 24), rows);
+}
+
 test "zag.layout.tree returns floats and focused_float fields" {
     const allocator = std.testing.allocator;
     var f: ModelPickerPluginFixture = undefined;

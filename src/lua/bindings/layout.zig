@@ -27,7 +27,9 @@ const WindowManager = @import("../../WindowManager.zig");
 const lua_json = @import("../lua_json.zig");
 
 /// `zag.layout.tree()`: return the live window tree as a Lua table
-/// mirroring the WindowManager describe output.
+/// mirroring the WindowManager describe output. `cols` and `rows` carry
+/// the live screen dimensions so plugins can size splits in cell-count
+/// terms (e.g. the sessions sidebar pinning itself to ~30 columns).
 fn zagLayoutTreeFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
     const wm = engine.window_manager orelse {
@@ -44,6 +46,14 @@ fn zagLayoutTreeFn(lua: *Lua) i32 {
         const msg = std.fmt.bufPrintZ(&buf, "zag.layout.tree: decode failed: {s}", .{@errorName(err)}) catch "zag.layout.tree: decode failed";
         lua.raiseErrorStr("%s", .{msg.ptr});
     };
+    // Splice cols/rows onto the returned tree table. We do this in the
+    // binding rather than the describe() JSON serializer so the JSONL
+    // describe transport stays a pure tree dump (root/focus/nodes/floats)
+    // and the live screen geometry is only attached on the Lua surface.
+    lua.pushInteger(@intCast(wm.screen.width));
+    lua.setField(-2, "cols");
+    lua.pushInteger(@intCast(wm.screen.height));
+    lua.setField(-2, "rows");
     return 1;
 }
 
