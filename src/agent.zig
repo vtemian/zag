@@ -1061,6 +1061,151 @@ test "estimateMessageTokens sums multi-block message" {
     try std.testing.expectEqual(@as(u32, 2), estimateMessageTokens(msg));
 }
 
+/// Predictive estimate of the upcoming request's input-token cost.
+/// Anchors on the most recent assistant `Usage` reported by the
+/// provider (treated as the true cost of everything up to and including
+/// that turn) and adds the char-heuristic estimate for every message
+/// appended after it. The trailing portion is what catches mid-turn
+/// blowups: a fresh user message carrying a large tool_result lands
+/// AFTER the last assistant usage report, so the reactive
+/// `last_input_tokens` snapshot misses it entirely.
+///
+/// `anchor` may be null on the first turn (no usage reported yet); the
+/// fallback walks every message with the char heuristic. `anchor_index`
+/// points at the message whose usage IS the anchor; messages with
+/// indices `> anchor_index` are the trailing additions.
+///
+/// All four `Usage` token classes are summed. For Anthropic this is
+/// strictly additive; for OpenAI `cache_read_tokens` is already inside
+/// `input_tokens` (see `endpoint.wire_semantics.cached_overlaps_input`
+/// in `src/llm/cost.zig`), so the OpenAI sum slightly overcounts —
+/// conservative in the right direction for a budget check.
+pub const ContextEstimate = struct {
+    /// Best estimate of the next request's input-token size.
+    total: u32,
+    /// Sum of the anchored assistant turn's four Usage fields, or zero
+    /// when no usage anchor exists yet.
+    usage_anchor: u32,
+    /// Char-heuristic estimate for messages appended after the anchor.
+    trailing: u32,
+    /// Index of the anchor message in `messages`, or null when no usage
+    /// has been reported yet.
+    anchor_index: ?usize,
+};
+
+pub fn estimateContextTokens(
+    messages: []const types.Message,
+    anchor: ?llm.Usage,
+    anchor_index: ?usize,
+) ContextEstimate {
+    if (anchor == null or anchor_index == null) {
+        var sum: u32 = 0;
+        for (messages) |m| sum += estimateMessageTokens(m);
+        return .{
+            .total = sum,
+            .usage_anchor = 0,
+            .trailing = sum,
+            .anchor_index = null,
+        };
+    }
+    const u = anchor.?;
+    const usage_total: u32 = u.input_tokens + u.output_tokens +
+        u.cache_creation_tokens + u.cache_read_tokens;
+    var trailing: u32 = 0;
+    const start = anchor_index.? + 1;
+    if (start < messages.len) {
+        for (messages[start..]) |m| trailing += estimateMessageTokens(m);
+    }
+    return .{
+        .total = usage_total + trailing,
+        .usage_anchor = usage_total,
+        .trailing = trailing,
+        .anchor_index = anchor_index,
+    };
+}
+
+test "estimateContextTokens no anchor, no messages returns zero" {
+    const est = estimateContextTokens(&.{}, null, null);
+    try std.testing.expectEqual(@as(u32, 0), est.total);
+    try std.testing.expectEqual(@as(u32, 0), est.usage_anchor);
+    try std.testing.expectEqual(@as(u32, 0), est.trailing);
+    try std.testing.expectEqual(@as(?usize, null), est.anchor_index);
+}
+
+test "estimateContextTokens no anchor falls back to char heuristic on all messages" {
+    const blocks_a = [_]types.ContentBlock{.{ .text = .{ .text = "abcdefgh" } }}; // 8 -> 2
+    const blocks_b = [_]types.ContentBlock{.{ .text = .{ .text = "1234" } }}; // 4 -> 1
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &blocks_a },
+        .{ .role = .assistant, .content = &blocks_b },
+    };
+    const est = estimateContextTokens(&msgs, null, null);
+    try std.testing.expectEqual(@as(u32, 3), est.total);
+    try std.testing.expectEqual(@as(u32, 0), est.usage_anchor);
+    try std.testing.expectEqual(@as(u32, 3), est.trailing);
+}
+
+test "estimateContextTokens anchor at last message: trailing is zero" {
+    const blocks = [_]types.ContentBlock{.{ .text = .{ .text = "ignored" } }};
+    const msgs = [_]types.Message{.{ .role = .assistant, .content = &blocks }};
+    const u: llm.Usage = .{ .input_tokens = 100, .output_tokens = 50 };
+    const est = estimateContextTokens(&msgs, u, 0);
+    try std.testing.expectEqual(@as(u32, 150), est.total);
+    try std.testing.expectEqual(@as(u32, 150), est.usage_anchor);
+    try std.testing.expectEqual(@as(u32, 0), est.trailing);
+}
+
+test "estimateContextTokens anchor + trailing messages summed" {
+    const blocks_anchor = [_]types.ContentBlock{.{ .text = .{ .text = "ignored" } }};
+    const blocks_after_1 = [_]types.ContentBlock{.{ .text = .{ .text = "abcdefgh" } }}; // 2
+    const blocks_after_2 = [_]types.ContentBlock{.{ .text = .{ .text = "1234" } }}; // 1
+    const msgs = [_]types.Message{
+        .{ .role = .assistant, .content = &blocks_anchor },
+        .{ .role = .user, .content = &blocks_after_1 },
+        .{ .role = .user, .content = &blocks_after_2 },
+    };
+    const u: llm.Usage = .{ .input_tokens = 100, .output_tokens = 50 };
+    const est = estimateContextTokens(&msgs, u, 0);
+    // anchor: 150. trailing: 2 + 1 = 3. total: 153.
+    try std.testing.expectEqual(@as(u32, 153), est.total);
+    try std.testing.expectEqual(@as(u32, 150), est.usage_anchor);
+    try std.testing.expectEqual(@as(u32, 3), est.trailing);
+}
+
+test "estimateContextTokens sums all four Usage token classes" {
+    const u: llm.Usage = .{
+        .input_tokens = 10,
+        .output_tokens = 20,
+        .cache_creation_tokens = 30,
+        .cache_read_tokens = 40,
+    };
+    const blocks = [_]types.ContentBlock{.{ .text = .{ .text = "x" } }};
+    const msgs = [_]types.Message{.{ .role = .assistant, .content = &blocks }};
+    const est = estimateContextTokens(&msgs, u, 0);
+    try std.testing.expectEqual(@as(u32, 100), est.usage_anchor);
+}
+
+test "estimateContextTokens regression: mid-turn tool_result blowup is caught" {
+    // Reproduces the 500k bug shape in miniature. Last assistant reported
+    // 100 tokens. Next user message attaches a 400-token tool_result.
+    // Reactive snapshot (last_input_tokens=100) misses the trailing cost;
+    // predictive estimate must catch it.
+    var big: [1600]u8 = undefined;
+    @memset(&big, 'x');
+    const blocks_assistant = [_]types.ContentBlock{.{ .text = .{ .text = "ok" } }};
+    const blocks_user = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "x", .content = &big, .is_error = false } },
+    };
+    const msgs = [_]types.Message{
+        .{ .role = .assistant, .content = &blocks_assistant },
+        .{ .role = .user, .content = &blocks_user },
+    };
+    const u: llm.Usage = .{ .input_tokens = 100 };
+    const est = estimateContextTokens(&msgs, u, 0);
+    // anchor=100, trailing=ceil(1600/4)=400, total=500.
+    try std.testing.expectEqual(@as(u32, 500), est.total);
+}
+
 /// Fire `zag.compact.strategy` at the top of the next iteration when
 /// the running token estimate crosses the 80% high-water mark of the
 /// model's context window. Returns the replacement message slice
