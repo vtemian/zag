@@ -172,16 +172,24 @@ fn loadFromDisk(self: *ProjectRegistry) !void {
     }
 }
 
+// Two concurrent zag processes can still race read-modify-write here:
+// each loads the registry, appends its own cwd, and the later writer's
+// rename wins for the merged set. We accept that lost-update window for
+// v1; the only invariant we protect is "no half-written file on disk",
+// which the per-PID tmp + atomic rename below guarantees.
 fn saveAtomic(self: *ProjectRegistry) !void {
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{self.file_path}) catch
+    const pid: i32 = @intCast(std.c.getpid());
+    // Per-PID tmp filename so two zag processes can't truncate each
+    // other's in-flight write on a shared `projects.json.tmp` path.
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.{d}.tmp", .{ self.file_path, pid }) catch
         return error.PathTooLong;
 
     const cwd = std.fs.cwd();
 
-    // Belt-and-suspenders: a stale <path>.tmp from a prior crash would
-    // otherwise inherit its old contents on createFile.truncate. Unlink
-    // first so each save starts from a clean slate.
+    // Belt-and-suspenders: a stale per-PID tmp from a prior crash in
+    // *this* process would otherwise inherit its old contents on
+    // createFile.truncate. Unlink first so each save starts clean.
     cwd.deleteFile(tmp_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -318,6 +326,44 @@ test "listProjects sorts most-recent-first" {
     try std.testing.expectEqualStrings("/projects/newest", list[0].path);
     try std.testing.expectEqualStrings("/projects/middle", list[1].path);
     try std.testing.expectEqualStrings("/projects/oldest", list[2].path);
+}
+
+test "saveAtomic uses a process-scoped tmp filename" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Plant a stale tmp file belonging to a *different* pid. saveAtomic
+    // must leave it alone (it would belong to another live zag, not us).
+    // The legacy shared-tmp path "projects.json.tmp" must also be left
+    // alone, since it is no longer in our cleanup namespace.
+    try tmp.dir.writeFile(.{ .sub_path = "projects.json.99999999.tmp", .data = "other-process" });
+    try tmp.dir.writeFile(.{ .sub_path = "projects.json.tmp", .data = "legacy-shared" });
+
+    var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
+    defer reg.deinit();
+
+    try reg.register("/projects/a", 1000);
+
+    // Our pid's tmp must be cleaned up after the rename.
+    const our_pid: i32 = @intCast(std.c.getpid());
+    var our_tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const our_tmp_name = try std.fmt.bufPrint(&our_tmp_buf, "projects.json.{d}.tmp", .{our_pid});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(our_tmp_name, .{}));
+
+    // The foreign-pid tmp and the legacy shared tmp must still be there.
+    try tmp.dir.access("projects.json.99999999.tmp", .{});
+    try tmp.dir.access("projects.json.tmp", .{});
+
+    // And the real registry got written.
+    const list = try reg.listProjects();
+    defer {
+        for (list) |p| std.testing.allocator.free(p.path);
+        std.testing.allocator.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.len);
+    try std.testing.expectEqualStrings("/projects/a", list[0].path);
 }
 
 test {
