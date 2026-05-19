@@ -56,6 +56,10 @@ pub fn registerCompactTable(lua: *Lua) void {
     lua.setField(-2, "set_reserve_tokens");
     lua.pushFunction(zlua.wrap(zagCompactSetKeepRecentTokensFn));
     lua.setField(-2, "set_keep_recent_tokens");
+    lua.pushFunction(zlua.wrap(zagCompactGetReserveTokensFn));
+    lua.setField(-2, "get_reserve_tokens");
+    lua.pushFunction(zlua.wrap(zagCompactGetKeepRecentTokensFn));
+    lua.setField(-2, "get_keep_recent_tokens");
     lua.setField(-2, "compact");
 }
 
@@ -328,4 +332,22 @@ fn zagCompactSetKeepRecentTokensFn(lua: *Lua) i32 {
         @intCast(n);
     engine.compact_keep_recent_tokens = clamped;
     return 0;
+}
+
+/// Zig function backing `zag.compact.get_reserve_tokens()`. Returns the
+/// current value so the Lua default strategy can compute the same
+/// trigger threshold the agent loop uses.
+fn zagCompactGetReserveTokensFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    lua.pushInteger(@intCast(engine.compact_reserve_tokens));
+    return 1;
+}
+
+/// Zig function backing `zag.compact.get_keep_recent_tokens()`. Returns
+/// the current budget for the kept suffix; the Lua default summarizer
+/// uses it to pick a cut point that matches the user-configured value.
+fn zagCompactGetKeepRecentTokensFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    lua.pushInteger(@intCast(engine.compact_keep_recent_tokens));
+    return 1;
 }

@@ -10941,12 +10941,69 @@ test "loadBuiltinPlugins eager-loads zag.compact.* entries" {
     try std.testing.expect(engine.compactHandler() != null);
 }
 
-test "zag.compact.default is a registered no-op returning nil" {
-    // Default stdlib plugin keeps the hook slot non-null (so plugin
-    // overrides have an obvious anchor file) but always returns nil,
-    // deferring to the Zig fallback in runDefaultSummarization. Users
-    // overriding this file in ~/.config/zag/lua/zag/compact/ get full
-    // control of the strategy.
+test "zag.compact.default produces a structured summary end-to-end" {
+    // Full Lua path: real default plugin, real coroutine spawn, real
+    // worker pool, stub provider returning the summary text. Asserts
+    // the strategy produced a .replace outcome whose summary message
+    // wraps the provider's response in the prefix/suffix sentinels
+    // (so the next iteration can detect a prior summary).
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+    engine.loadBuiltinPlugins();
+
+    var stub = StubCompactProvider{ .response_text = "## Goal\nport pi-mono" };
+    const provider = stub.provider();
+    engine.current_provider = &provider;
+    engine.current_model_spec = .{ .provider_name = "stub", .model_id = "stub-1" };
+    defer {
+        engine.current_provider = null;
+        engine.current_model_spec = null;
+    }
+
+    // Shrink keep_recent so the small fixture trips the cut.
+    try engine.lua.doString("zag.compact.set_keep_recent_tokens(1)");
+
+    // Three-message fixture so the cut leaves a non-empty
+    // summarize range.
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "first question" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "first answer" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "now do the thing" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+        .{ .role = .assistant, .content = &b2 },
+        .{ .role = .user, .content = &b3 },
+    };
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try engine.handleCompactRequest(&req);
+    switch (req.outcome) {
+        .replace => |r| {
+            // First message must be the wrapped summary; the prefix
+            // is byte-identical between the Lua prompts.lua constant
+            // and the Zig COMPACTION_SUMMARY_PREFIX so the next
+            // iteration's extractPriorSummary recognises it.
+            try std.testing.expect(r.messages.len >= 1);
+            const summary_text = r.messages[0].content[0].text.text;
+            try std.testing.expect(std.mem.indexOf(u8, summary_text, "<summary>") != null);
+            try std.testing.expect(std.mem.indexOf(u8, summary_text, "</summary>") != null);
+            try std.testing.expect(std.mem.indexOf(u8, summary_text, "## Goal") != null);
+        },
+        else => return error.TestUnexpectedOutcome,
+    }
+}
+
+test "zag.compact.default returns .use_default when no provider is attached" {
+    // The Lua default strategy calls zag.llm.complete. Without an
+    // async runtime AND without a current_provider attached, the
+    // primitive surfaces an error which the strategy catches and
+    // returns nil from — outcome becomes .use_default so the Zig
+    // fallback chain runs. This is the safe-by-default behaviour
+    // when no engine wiring is in place (tests / headless eval).
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();

@@ -36,6 +36,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.jit.agents_md", .code = @embedFile("zag/jit/agents_md.lua") },
     .{ .name = "zag.loop.default", .code = @embedFile("zag/loop/default.lua") },
     .{ .name = "zag.compact.default", .code = @embedFile("zag/compact/default.lua") },
+    .{ .name = "zag.compact.prompts", .code = @embedFile("zag/compact/prompts.lua") },
     .{ .name = "zag.prompt", .code = @embedFile("zag/prompt/init.lua") },
     .{ .name = "zag.prompt.anthropic", .code = @embedFile("zag/prompt/anthropic.lua") },
     .{ .name = "zag.prompt.openai-codex", .code = @embedFile("zag/prompt/openai-codex.lua") },
@@ -56,7 +57,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 26), entries.len);
+    try std.testing.expectEqual(@as(usize, 27), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -173,12 +174,19 @@ test "find returns the entry for the popup-list helper" {
 test "find returns the entry for the default compaction strategy" {
     const e = find("zag.compact.default").?;
     try std.testing.expectEqualStrings("zag.compact.default", e.name);
-    // Phase 3b: default strategy registers a no-op (returns nil) so
-    // the agent loop's Zig fallback (runDefaultSummarization) owns
-    // the real summarization. The hook registration call itself must
-    // still appear.
+    // Default strategy registers via zag.compact.strategy and drives a
+    // structured-summary LLM call via zag.llm.complete. The compiled
+    // module must reference both surfaces.
     try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.compact.strategy") != null);
-    try std.testing.expect(std.mem.indexOf(u8, e.code, "return nil") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.llm.complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "require(\"zag.compact.prompts\")") != null);
+}
+
+test "find returns the entry for the compaction prompts module" {
+    const e = find("zag.compact.prompts").?;
+    try std.testing.expectEqualStrings("zag.compact.prompts", e.name);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "## Goal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "SUMMARY_PREFIX") != null);
 }
 
 test {
