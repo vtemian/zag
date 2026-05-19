@@ -362,6 +362,11 @@ pub fn formatAgentErrorMessage(
             }
             break :blk allocator.dupe(u8, "ApiError");
         },
+        error.ContextWindowExceeded => allocator.dupe(
+            u8,
+            "Context window exceeded after compaction. The conversation is too large to send. " ++
+                "Try /clear to start fresh, raise zag.compact.set_reserve_tokens, or switch to a model with a larger window.",
+        ),
         else => allocator.dupe(u8, @errorName(err)),
     };
 }

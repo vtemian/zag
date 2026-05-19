@@ -193,6 +193,47 @@ pub fn runLoopStreaming(
             cancel,
         )) |replacement| {
             try installCompactReplacement(messages, allocator, replacement);
+            // Compaction rewrote history; invalidate the usage anchor.
+            // The provider's last usage report described the pre-compact
+            // conversation and no longer maps onto the new shape, so the
+            // next iteration must walk from scratch (anchor=null → char
+            // heuristic across all retained messages).
+            last_usage_anchor = null;
+            last_usage_index = null;
+        }
+
+        // Pre-flight cap with inline fallback. The Lua strategy may have
+        // declined (e.g. no handler / EventQueueFull / shrank less than
+        // needed). Re-estimate; if we'd still overshoot, walk the cut
+        // helper and drop oldest messages until we fit. Only refuse the
+        // turn when even the cut-down history can't make room — at
+        // which point the user message itself is the bug.
+        if (model_spec.context_window > 0) {
+            var post = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
+            if (post.total > model_spec.context_window) {
+                const budget: u32 = if (model_spec.context_window > reserve_tokens)
+                    model_spec.context_window - reserve_tokens
+                else
+                    1;
+                const cut = findCutPoint(messages.items, budget);
+                if (cut.first_kept > 0) {
+                    log.warn(
+                        "inline drop-oldest fallback: dropping {d} of {d} messages to fit context",
+                        .{ cut.first_kept, messages.items.len },
+                    );
+                    try dropOldestMessages(messages, allocator, cut.first_kept);
+                    last_usage_anchor = null;
+                    last_usage_index = null;
+                    post = estimateContextTokens(messages.items, null, null);
+                }
+                if (post.total > model_spec.context_window) {
+                    log.err(
+                        "context overflow: estimated {d} tokens still exceeds model window {d} after compaction and fallback; refusing to send",
+                        .{ post.total, model_spec.context_window },
+                    );
+                    return error.ContextWindowExceeded;
+                }
+            }
         }
 
         // Mark the turn as in-flight so `EventOrchestrator.onUserInputSubmitted`
@@ -1446,7 +1487,19 @@ pub fn fireCompact(
 ) !?[]types.Message {
     const engine = lua_engine orelse return null;
     if (engine.compact_handler == null) return null;
-    if (tokens_max == 0) return null;
+    if (tokens_max == 0) {
+        // Surface the disabled-state loudly: production callers always
+        // have a context_window; only headless / test paths run with
+        // zero. Producing one warn per engine via the `unknown` slot
+        // (no model id available here) keeps the noise floor at 1.
+        if (llm.cost.shouldWarnForModel("__zag_compact_disabled__")) {
+            log.warn(
+                "compaction disabled: model has no context_window; oversized requests will reach the provider unchecked",
+                .{},
+            );
+        }
+        return null;
+    }
     const est = estimateContextTokens(messages, last_usage, last_usage_index);
     // Room-based threshold: fire when fewer than `reserve_tokens` would
     // remain in the context window after sending the upcoming request.
@@ -1491,6 +1544,67 @@ pub fn installCompactReplacement(
     messages.clearRetainingCapacity();
     messages.appendSliceAssumeCapacity(replacement);
     allocator.free(replacement);
+}
+
+/// Free and remove the first `drop_count` messages from `messages`,
+/// shifting the survivors left. Used as the Phase 7 inline fallback
+/// when the Lua compaction strategy declined and the request would
+/// still overshoot the context window: we walk `findCutPoint` to
+/// pick a safe boundary, then trim. Caller owns the storage and the
+/// content of every message via `allocator`.
+pub fn dropOldestMessages(
+    messages: *std.ArrayList(types.Message),
+    allocator: Allocator,
+    drop_count: usize,
+) !void {
+    if (drop_count == 0) return;
+    if (drop_count >= messages.items.len) {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.clearRetainingCapacity();
+        return;
+    }
+    for (messages.items[0..drop_count]) |m| m.deinit(allocator);
+    const remaining = messages.items.len - drop_count;
+    std.mem.copyForwards(
+        types.Message,
+        messages.items[0..remaining],
+        messages.items[drop_count..],
+    );
+    messages.shrinkRetainingCapacity(remaining);
+}
+
+test "dropOldestMessages removes a prefix and shifts survivors left" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (list.items) |m| m.deinit(alloc);
+        list.deinit(alloc);
+    }
+    for ([_][]const u8{ "first", "second", "third" }) |label| {
+        const text = try alloc.dupe(u8, label);
+        errdefer alloc.free(text);
+        const blocks = try alloc.alloc(types.ContentBlock, 1);
+        errdefer alloc.free(blocks);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try list.append(alloc, .{ .role = .user, .content = blocks });
+    }
+    try dropOldestMessages(&list, alloc, 2);
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqualStrings("third", list.items[0].content[0].text.text);
+}
+
+test "dropOldestMessages with drop_count >= len clears the list" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList(types.Message) = .empty;
+    defer list.deinit(alloc);
+    const text = try alloc.dupe(u8, "lonely");
+    errdefer alloc.free(text);
+    const blocks = try alloc.alloc(types.ContentBlock, 1);
+    errdefer alloc.free(blocks);
+    blocks[0] = .{ .text = .{ .text = text } };
+    try list.append(alloc, .{ .role = .user, .content = blocks });
+    try dropOldestMessages(&list, alloc, 5);
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
 /// Inspect a freshly built tool-result content slice and report
