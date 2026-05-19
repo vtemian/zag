@@ -332,6 +332,12 @@ pub const SessionManager = struct {
 
     /// Open an existing session by ID.
     pub fn loadSession(self: *SessionManager, id: []const u8) !SessionHandle {
+        // Reject ids that could escape the sessions directory. `createSession`
+        // generates ids from `generateId` (hex digits only), so this guard
+        // matters for callers reaching `loadSession` from less-trusted
+        // surfaces (Lua bindings, future IPC).
+        if (!isValidSessionId(id)) return error.InvalidSessionId;
+
         var jsonl_path_buf: [256]u8 = undefined;
         const jsonl_path = std.fmt.bufPrint(&jsonl_path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
             return error.PathTooLong;
@@ -2619,6 +2625,24 @@ test "SessionManager.deleteSession removes both .jsonl and .meta.json and is ide
     var meta_path_buf: [256]u8 = undefined;
     const meta_path = try std.fmt.bufPrint(&meta_path_buf, ".zag/sessions/{s}.meta.json", .{id});
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(meta_path, .{}));
+}
+
+test "SessionManager.loadSession rejects ids that try to escape the sessions dir" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+
+    try std.testing.expectError(error.InvalidSessionId, mgr.loadSession("../etc/passwd"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.loadSession("foo/bar"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.loadSession(""));
 }
 
 test "SessionManager.deleteSession rejects ids that try to escape the sessions dir" {
