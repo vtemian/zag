@@ -218,19 +218,26 @@ pub const StyledSpan = struct {
     text: []const u8,
     /// Visual style for this span.
     style: CellStyle,
+    /// When true, `StyledLine.deinit` frees `text` with the same
+    /// allocator it frees the spans array with. Producers that derive
+    /// strings (decoded JSON, formatted labels) and have nowhere else
+    /// to park them set this; the default-false preserves the
+    /// borrowed-slice contract for span text sliced into node-owned
+    /// buffers (the common case for markdown / plain-text nodes).
+    owned: bool = false,
 };
 
 /// A styled line: a sequence of spans that together form one visual line.
 ///
-/// Ownership contract: `StyledSpan.text` is a borrowed slice. The producer
-/// guarantees the bytes stay valid for at least one frame and for the
-/// lifetime of any cache entry that holds the span. The consumer never
-/// frees `text`.
-///
-/// The test "StyledLine.deinit does not free span text (borrowed-slice
-/// invariant)" pins this. If you find yourself wanting to free span.text
-/// from `deinit`, you are changing the contract; update the producers too
-/// (NodeLineCache, NodeRenderer, MarkdownParser).
+/// Ownership contract: `StyledSpan.text` is a borrowed slice **by
+/// default**. The producer guarantees the bytes stay valid for at
+/// least one frame and for the lifetime of any cache entry that holds
+/// the span. Producers that need to ship derived strings (decoded
+/// JSON, formatted labels) can opt into `owned = true` per span;
+/// `StyledLine.deinit` will free those slices with the same allocator
+/// it frees the spans array with. The default-false path preserves
+/// the original borrowed-slice contract for spans sliced into node-
+/// owned buffers.
 pub const StyledLine = struct {
     /// Ordered spans composing this line.
     spans: []const StyledSpan,
@@ -255,11 +262,14 @@ pub const StyledLine = struct {
         return buf;
     }
 
-    /// Free memory owned by this styled line. Under the borrowed-slice
-    /// contract only the spans array is owned; span text lifetimes are
-    /// managed by whoever produced them (node content, static strings,
-    /// frame arena).
+    /// Free memory owned by this styled line. Span text is freed only
+    /// for spans flagged `owned = true`; under the default borrowed-
+    /// slice contract span text lifetimes are managed by whoever
+    /// produced them (node content, static strings, frame arena).
     pub fn deinit(self: StyledLine, allocator: std.mem.Allocator) void {
+        for (self.spans) |s| {
+            if (s.owned) allocator.free(s.text);
+        }
         allocator.free(self.spans);
     }
 };
@@ -373,6 +383,9 @@ pub fn defaultTheme() Theme {
             .current_line = .{ .bg = current_line_bg },
             .warning = .{ .fg = warning, .bold = true },
             .subagent_placeholder = .{ .fg = muted },
+            .tool_rule = .{ .fg = dim },
+            .diff_add = .{ .fg = success },
+            .diff_remove = .{ .fg = err_color },
         },
         .spacing = .{
             .turn_gap = 1,

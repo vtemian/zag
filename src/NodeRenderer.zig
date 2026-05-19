@@ -53,7 +53,39 @@ const Prefixes = struct {
     const subagent_open = "[subagent: ";
     const subagent_close = "] ";
     const subagent_unnamed = "<unnamed>";
+
+    /// Rule run for pi-mono-style tool-call block headers and footers.
+    /// Length matches the typical opening dash run plus padding; we
+    /// emit the literal `──── ` prefix and `─` suffix runs by slicing
+    /// into this constant so each rendered line borrows static text
+    /// (no per-render allocation for the chrome).
+    const rule_short = "────";
+    /// Dash run for the footer line under a tool-call block. 36 dashes
+    /// is enough for most code-edit headers without wrapping in a
+    /// reasonably sized pane; the renderer slices the prefix it needs.
+    const rule_long = "────────────────────────────────────";
+    const rule_space = " ";
+
+    /// Prefix for body lines under a rich tool-call block. Indents
+    /// the body one column so the rule lines visually contain the
+    /// block.
+    const tool_body_indent = " ";
+    const diff_add_marker = "+ ";
+    const diff_remove_marker = "- ";
+    /// Shell prompt marker shown on a `bash` tool-call header instead
+    /// of the bare tool name.
+    const bash_prompt = "$ ";
+    /// Truncation footer for `bash` and `read` blocks when the body
+    /// exceeds the inline display cap.
+    const tool_truncated_suffix = " (Ctrl-R for full output)";
 };
+
+/// Body-line cap for tool-call blocks whose body is unbounded. `bash`
+/// stdout and `read` file contents can be huge; truncate inline so
+/// the transcript stays scannable, and let the user opt into the
+/// full body via Ctrl-R (collapsed state) or by re-running the call.
+const bash_inline_lines: usize = 6;
+const read_inline_lines: usize = 6;
 
 /// Status label for a subagent_link node. Resolves the parent
 /// Conversation through the node's type-erased back-pointer and
@@ -240,6 +272,7 @@ pub fn lineCountForNode(_: *const NodeRenderer, node: *const Node, registry: *co
         .separator => 1,
         .err, .thinking_redacted => 1,
         .tool_call => blk: {
+            if (richToolCallLineCount(node, registry)) |n| break :blk n;
             // Collapsed tool_call with a non-empty tool_result child gets a
             // hint line under the [tool] header announcing the hidden body.
             if (hiddenToolResultLineCount(node, registry) > 0) break :blk 2;
@@ -367,6 +400,322 @@ fn splitAndAppendIndented(
 
 /// Built-in renderer: produces one or more StyledLines per node using type-specific formatting.
 /// Multi-line content (containing \n) is split into separate display lines.
+/// Mirror of `renderRichToolCall` that only counts lines. Returns null
+/// when the rich render would NOT fire (unknown tool, missing or
+/// invalid `tool_input_raw`), in which case the caller falls back to
+/// the legacy line-count rule.
+///
+/// Must stay in lockstep with `renderRichToolCall`'s output shape:
+///   - 1 header rule line
+///   - body lines:
+///       * `edit`: lineCount(old_text) + lineCount(new_text)
+///       * `write`: lineCount(content)
+///       * `bash` / `read`: min(lineCount(result), inline_cap), plus
+///         1 truncation footer when the cap was hit
+///   - 1 footer rule line
+///
+/// Uses a stack-allocated allocator-friendly parse path because the
+/// caller (`lineCountForNode`) doesn't have an allocator to spend on
+/// the JSON tree. We use a heap-backed FBA so the parse stays bounded
+/// and the count survives even for inputs slightly above the buffer.
+fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?usize {
+    const tool_name = node.custom_tag orelse return null;
+    const raw = node.tool_input_raw orelse return null;
+
+    // 16 KiB is enough for the four built-in tools' inputs in practice
+    // (Anthropic caps `bash.command` at 16 KiB, `edit.new_text` is
+    // bounded by the file body). When the buffer overflows we bail to
+    // the legacy count rather than mis-counting and corrupting the
+    // scroll math.
+    var scratch_buf: [16 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&scratch_buf);
+    const fba_alloc = fba.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, fba_alloc, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+
+    if (std.mem.eql(u8, tool_name, "edit")) {
+        if (jsonString(&root, "path") == null) return null;
+        const old_text = jsonString(&root, "old_text") orelse "";
+        const new_text = jsonString(&root, "new_text") orelse "";
+        return 2 + lineCount(old_text) + lineCount(new_text);
+    } else if (std.mem.eql(u8, tool_name, "write")) {
+        if (jsonString(&root, "path") == null) return null;
+        const content = jsonString(&root, "content") orelse "";
+        return 2 + lineCount(content);
+    } else if (std.mem.eql(u8, tool_name, "bash")) {
+        if (jsonString(&root, "command") == null) return null;
+        return 2 + bodyLineCount(node, registry, bash_inline_lines);
+    } else if (std.mem.eql(u8, tool_name, "read")) {
+        if (jsonString(&root, "path") == null) return null;
+        return 2 + bodyLineCount(node, registry, read_inline_lines);
+    }
+    return null;
+}
+
+/// Body line count for bash/read: the tool_result child's content
+/// capped at `inline_lines`, plus 1 for the truncation footer when
+/// the cap was hit. Matches what `appendMarkedLines` + the truncation
+/// suffix emit in the renderer.
+fn bodyLineCount(node: *const Node, registry: *const BufferRegistry, inline_lines: usize) usize {
+    const result = firstToolResultBytes(node, registry);
+    const result_lines = lineCount(result);
+    if (result_lines == 0) return 0;
+    if (result_lines <= inline_lines) return result_lines;
+    return inline_lines + 1; // capped body plus 1 truncation footer
+}
+
+/// Pi-mono-style rich rendering for the four built-in tool_call types.
+/// Returns true when the node is one of `edit`/`write`/`bash`/`read`
+/// AND `tool_input_raw` parses as JSON; otherwise returns false so the
+/// caller can fall through to the legacy `[tool] <name>` header.
+///
+/// Strings extracted from the parsed JSON are duped into `allocator`
+/// before the parse arena tears down, so the resulting StyledLines
+/// borrow text that lives at least as long as the cache entry.
+fn renderRichToolCall(
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    registry: *const BufferRegistry,
+) !bool {
+    const tool_name = node.custom_tag orelse return false;
+    const raw = node.tool_input_raw orelse return false;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const root = parsed.value.object;
+
+    if (std.mem.eql(u8, tool_name, "edit")) {
+        return renderEditBlock(lines, allocator, theme, &root);
+    } else if (std.mem.eql(u8, tool_name, "write")) {
+        return renderWriteBlock(lines, allocator, theme, &root);
+    } else if (std.mem.eql(u8, tool_name, "bash")) {
+        return renderBashBlock(node, lines, allocator, theme, registry, &root);
+    } else if (std.mem.eql(u8, tool_name, "read")) {
+        return renderReadBlock(node, lines, allocator, theme, registry, &root);
+    }
+    return false;
+}
+
+fn jsonString(root: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = root.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Emit the opening `──── <label> ────` line. `label` is duped into
+/// `allocator` and flagged `owned` so the cache (or test cleanup)
+/// frees it when the line is dropped; static prefix/suffix bytes
+/// borrow against `Prefixes`.
+fn appendRuleHeader(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    label: []const u8,
+) !void {
+    const owned_label = try allocator.dupe(u8, label);
+    const rule = theme.highlights.tool_rule;
+    const accent = theme.highlights.tool_call;
+    const spans = try allocator.alloc(StyledSpan, 5);
+    spans[0] = .{ .text = Prefixes.rule_short, .style = rule };
+    spans[1] = .{ .text = Prefixes.rule_space, .style = rule };
+    spans[2] = .{ .text = owned_label, .style = accent, .owned = true };
+    spans[3] = .{ .text = Prefixes.rule_space, .style = rule };
+    spans[4] = .{ .text = Prefixes.rule_short, .style = rule };
+    try lines.append(allocator, .{ .spans = spans });
+}
+
+/// Emit the closing footer rule line.
+fn appendRuleFooter(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+) !void {
+    try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.rule_long, theme.highlights.tool_rule));
+}
+
+/// Split `content` on newlines and emit one StyledLine per segment,
+/// each with a marker prefix (e.g. `+ `, `- `, ` `). Returns the
+/// number of lines appended.
+fn appendMarkedLines(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    content: []const u8,
+    marker: []const u8,
+    marker_style: Theme.CellStyle,
+    body_style: Theme.CellStyle,
+    max_lines: ?usize,
+) !usize {
+    var emitted: usize = 0;
+    var rest: []const u8 = content;
+    while (rest.len > 0) {
+        if (max_lines) |cap| if (emitted >= cap) break;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const segment = if (nl) |n| rest[0..n] else rest;
+        const owned = try allocator.dupe(u8, segment);
+        const spans = try allocator.alloc(StyledSpan, 2);
+        spans[0] = .{ .text = marker, .style = marker_style };
+        spans[1] = .{ .text = owned, .style = body_style, .owned = true };
+        try lines.append(allocator, .{ .spans = spans });
+        emitted += 1;
+        rest = if (nl) |n| rest[n + 1 ..] else &.{};
+    }
+    return emitted;
+}
+
+fn renderEditBlock(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    root: *const std.json.ObjectMap,
+) !bool {
+    const path = jsonString(root, "path") orelse return false;
+    const old_text = jsonString(root, "old_text") orelse "";
+    const new_text = jsonString(root, "new_text") orelse "";
+
+    var label_buf: std.ArrayList(u8) = .empty;
+    defer label_buf.deinit(allocator);
+    try label_buf.appendSlice(allocator, "edit ");
+    try label_buf.appendSlice(allocator, path);
+    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+
+    const remove_style = theme.highlights.diff_remove;
+    const add_style = theme.highlights.diff_add;
+    _ = try appendMarkedLines(lines, allocator, old_text, Prefixes.diff_remove_marker, remove_style, remove_style, null);
+    _ = try appendMarkedLines(lines, allocator, new_text, Prefixes.diff_add_marker, add_style, add_style, null);
+
+    try appendRuleFooter(lines, allocator, theme);
+    return true;
+}
+
+fn renderWriteBlock(
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    root: *const std.json.ObjectMap,
+) !bool {
+    const path = jsonString(root, "path") orelse return false;
+    const content = jsonString(root, "content") orelse "";
+
+    var label_buf: std.ArrayList(u8) = .empty;
+    defer label_buf.deinit(allocator);
+    try label_buf.appendSlice(allocator, "write ");
+    try label_buf.appendSlice(allocator, path);
+    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+
+    _ = try appendMarkedLines(
+        lines,
+        allocator,
+        content,
+        Prefixes.tool_body_indent,
+        theme.highlights.tool_result,
+        theme.highlights.assistant_text,
+        null,
+    );
+    try appendRuleFooter(lines, allocator, theme);
+    return true;
+}
+
+fn renderBashBlock(
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    registry: *const BufferRegistry,
+    root: *const std.json.ObjectMap,
+) !bool {
+    const cmd = jsonString(root, "command") orelse return false;
+
+    var label_buf: std.ArrayList(u8) = .empty;
+    defer label_buf.deinit(allocator);
+    try label_buf.appendSlice(allocator, "bash ");
+    try label_buf.appendSlice(allocator, Prefixes.bash_prompt);
+    try label_buf.appendSlice(allocator, cmd);
+    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+
+    const result_bytes = firstToolResultBytes(node, registry);
+    const result_lines = lineCount(result_bytes);
+    const emitted = try appendMarkedLines(
+        lines,
+        allocator,
+        result_bytes,
+        Prefixes.tool_body_indent,
+        theme.highlights.tool_result,
+        theme.highlights.tool_result,
+        bash_inline_lines,
+    );
+    if (result_lines > emitted) {
+        try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.tool_truncated_suffix, theme.highlights.tool_result));
+    }
+    try appendRuleFooter(lines, allocator, theme);
+    return true;
+}
+
+fn renderReadBlock(
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    registry: *const BufferRegistry,
+    root: *const std.json.ObjectMap,
+) !bool {
+    const path = jsonString(root, "path") orelse return false;
+
+    var label_buf: std.ArrayList(u8) = .empty;
+    defer label_buf.deinit(allocator);
+    try label_buf.appendSlice(allocator, "read ");
+    try label_buf.appendSlice(allocator, path);
+    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+
+    const result_bytes = firstToolResultBytes(node, registry);
+    const result_lines = lineCount(result_bytes);
+    const emitted = try appendMarkedLines(
+        lines,
+        allocator,
+        result_bytes,
+        Prefixes.tool_body_indent,
+        theme.highlights.tool_result,
+        theme.highlights.tool_result,
+        read_inline_lines,
+    );
+    if (result_lines > emitted) {
+        try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.tool_truncated_suffix, theme.highlights.tool_result));
+    }
+    try appendRuleFooter(lines, allocator, theme);
+    return true;
+}
+
+/// Resolve the bytes of the first `tool_result` child of `node`, if
+/// any. Image-backed tool_results return an empty slice (the inline
+/// preview doesn't have a useful text form).
+fn firstToolResultBytes(node: *const Node, registry: *const BufferRegistry) []const u8 {
+    for (node.children.items) |child| {
+        if (child.node_type != .tool_result) continue;
+        if (isImageBacked(child, registry)) return "";
+        return nodeBytes(child, registry);
+    }
+    return "";
+}
+
+/// Count one line per content slice plus one for every interior `\n`.
+/// Trailing newlines do not count toward another line (matches the
+/// rendered output shape). An empty slice yields 0 lines.
+fn lineCount(content: []const u8) usize {
+    if (content.len == 0) return 0;
+    var count: usize = 1;
+    for (content) |c| {
+        if (c == '\n') count += 1;
+    }
+    if (content[content.len - 1] == '\n') count -= 1;
+    return count;
+}
+
 fn renderDefault(
     node: *const Node,
     lines: *std.ArrayList(StyledLine),
@@ -392,6 +741,19 @@ fn renderDefault(
             return;
         },
         .tool_call => {
+            // Rich pi-mono-style block render for the four built-in tools
+            // (`edit`, `write`, `bash`, `read`). Falls back to the legacy
+            // `[tool] <name>` header when the tool isn't one we know how
+            // to pretty-print or when the node has no `tool_input_raw`
+            // (legacy JSONL row).
+            //
+            // The rich render fires regardless of `collapsed` state so
+            // the diff/output/path is visible by default. `collapsed`
+            // still controls whether the tool_result child renders as
+            // a sibling line below (see `collectVisibleLines`): Ctrl-R
+            // expands the full untruncated body underneath.
+            if (try renderRichToolCall(node, lines, allocator, theme, registry)) return;
+
             const style = theme.highlights.tool_call;
             try lines.append(allocator, try twoSpanLine(allocator, Prefixes.tool_call, style, content, style));
             const hidden = hiddenToolResultLineCount(node, registry);
@@ -970,4 +1332,99 @@ test "subagent_link renders status reflecting child Conversation tail node" {
         defer allocator.free(text);
         try std.testing.expect(std.mem.endsWith(u8, text, "failed"));
     }
+}
+
+test "renderDefault edit tool_call emits diff block" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const input =
+        \\{"path":"src/foo.zig","old_text":"line a\nline b","new_text":"line a\nline c\nline d"}
+    ;
+    const node = try cb.appendToolCallNode(null, "edit", "edit:0", input);
+    _ = try cb.appendNode(node, .tool_result, "ok");
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+    // Header rule + 2 `-` lines + 3 `+` lines + footer rule = 7 lines.
+    try std.testing.expectEqual(@as(usize, 7), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expect(std.mem.indexOf(u8, header, "edit src/foo.zig") != null);
+    try std.testing.expect(std.mem.startsWith(u8, header, "────"));
+
+    const removed = try lines.items[1].toText(allocator);
+    defer allocator.free(removed);
+    try std.testing.expectEqualStrings("- line a", removed);
+
+    const added = try lines.items[3].toText(allocator);
+    defer allocator.free(added);
+    try std.testing.expectEqualStrings("+ line a", added);
+
+    const footer = try lines.items[6].toText(allocator);
+    defer allocator.free(footer);
+    try std.testing.expect(std.mem.startsWith(u8, footer, "────"));
+
+    // Line count must match what renderDefault produced (else viewport
+    // math goes wrong inside collectVisibleLines).
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(@as(usize, 7), renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "renderDefault bash tool_call shows command and truncated output" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const input =
+        \\{"command":"ls -la"}
+    ;
+    const node = try cb.appendToolCallNode(null, "bash", "bash:0", input);
+    // 8 output lines triggers truncation at bash_inline_lines (6).
+    const big_output = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8";
+    _ = try cb.appendNode(node, .tool_result, big_output);
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+    // Header + 6 capped body lines + 1 truncation footer + closing rule = 9.
+    try std.testing.expectEqual(@as(usize, 9), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expect(std.mem.indexOf(u8, header, "bash $ ls -la") != null);
+
+    const truncated = try lines.items[7].toText(allocator);
+    defer allocator.free(truncated);
+    try std.testing.expect(std.mem.indexOf(u8, truncated, "Ctrl-R") != null);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(@as(usize, 9), renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "renderDefault read tool_call falls back when tool_input_raw is missing" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // Legacy node: no tool_input_raw → renderRichToolCall returns false,
+    // and the legacy `[tool] <name>` header fires.
+    const node = try cb.appendNode(null, .tool_call, "read");
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+    try std.testing.expect(lines.items.len >= 1);
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("[tool] read", header);
 }
