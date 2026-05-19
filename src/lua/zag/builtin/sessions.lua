@@ -1,9 +1,10 @@
 -- Builtin sessions sidebar. Toggle with `<C-e>` or `/sessions`.
 --
--- This file is the wiring skeleton (Task 3.1). Open/close/render
--- comes in Task 3.2 and beyond. For now `M.toggle()` is a no-op stub
--- that logs at debug level so the command and keymap can be smoke-
--- tested end to end.
+-- `M.toggle()` opens a left-anchored vertical split bound to a scratch
+-- buffer, then renders one row per registered session. Tree expansion
+-- of subagents lands in Phase 5; today the row shows the session
+-- name (or its truncated id) with a ▸ / ▾ glyph reflecting the
+-- expanded set.
 --
 -- State lives in this module table so it survives pane close/reopen.
 -- It is intentionally module-local (`local state`); nothing outside
@@ -25,11 +26,6 @@ local state = {
     hook_ids = {},        -- registered hook ids, removed on close
     keymap_ids = {},      -- registered buffer-local keymap ids
 }
-
--- The placeholder header rendered until Task 4.1 wires the real
--- session list. Kept as a module-local so future tasks can swap it
--- out cleanly without touching M.open.
-local PLACEHOLDER_HEADER = "-- sessions --"
 
 function M.toggle()
     if state.pane_id then
@@ -70,12 +66,73 @@ function M.open()
     M._render()
 end
 
+-- Walk the registered sessions and return an array of row tables.
+-- Each row carries the data the keymap dispatcher (Task 4.2) needs to
+-- act on the cursor's current line, plus the rendered label. Phase 5
+-- adds expanded-subagent rows; today we surface only the session
+-- header even when state.expanded[id] is set, so the ▾ glyph is the
+-- only visible affordance for the upcoming expansion.
+function M._collect_rows()
+    local rows = {}
+    local sessions = zag.sessions.list()
+    local filter_lc = state.filter ~= "" and state.filter:lower() or nil
+    for _, s in ipairs(sessions) do
+        local display = (s.name ~= nil and s.name ~= "") and s.name or string.sub(s.id, 1, 8)
+        local matches = filter_lc == nil or display:lower():find(filter_lc, 1, true) ~= nil
+        if matches then
+            local glyph = state.expanded[s.id] and "▾" or "▸"
+            table.insert(rows, {
+                kind = "session",
+                session_id = s.id,
+                project = s.project,
+                name = display,
+                depth = 0,
+                label = glyph .. " " .. display,
+            })
+        end
+    end
+    return rows
+end
+
 function M._render()
     if not state.buffer_id then return end
-    -- Task 4.1 replaces this with the real session list. The header
-    -- keeps the pane visibly non-empty so we can validate the split
-    -- worked end to end before the renderer lands.
-    zag.buffer.set_lines(state.buffer_id, { PLACEHOLDER_HEADER })
+
+    local rows = M._collect_rows()
+    state.last_render = rows
+
+    local lines = {}
+    for _, r in ipairs(rows) do
+        table.insert(lines, r.label)
+    end
+
+    -- Filter mode lands in Task 7.1; the prompt-line bump is wired
+    -- now so the future task only needs to flip state.mode.
+    local cursor_offset = 0
+    if state.mode == "filter" then
+        table.insert(lines, 1, "/" .. state.filter)
+        cursor_offset = 1
+    end
+
+    zag.buffer.set_lines(state.buffer_id, lines)
+
+    -- Clamp cursor into the rendered range. An empty list leaves the
+    -- cursor at 1 with no row to highlight; the set_row_style call is
+    -- guarded against that case so we don't poke a non-existent row.
+    if #lines == 0 then
+        state.cursor_row = 1
+        return
+    end
+    if state.cursor_row < 1 then
+        state.cursor_row = 1
+    elseif state.cursor_row > #rows then
+        state.cursor_row = #rows
+    end
+
+    local highlight_row = state.cursor_row + cursor_offset
+    -- "selection" is the Theme highlight slot meant for popup-list /
+    -- picker cursor rows (see src/Theme.zig HighlightSlot). The model
+    -- picker and zag.popup.list use the same slot.
+    zag.buffer.set_row_style(state.buffer_id, highlight_row, "selection")
 end
 
 function M.close()
@@ -97,9 +154,34 @@ function M.close()
     state.pane_id = nil
     state.buffer_id = nil
     state.host_pane = nil
-    -- cursor_row, expanded, filter, mode, rename_buf are deliberately
-    -- preserved so toggling the sidebar shut and back open lands the
-    -- user back where they were.
+    -- Drop the cached row list so a stale session_id can't leak into
+    -- the next open's keymap dispatch path. cursor_row, expanded,
+    -- filter, mode, rename_buf are deliberately preserved so toggling
+    -- the sidebar shut and back open lands the user back where they were.
+    state.last_render = {}
+end
+
+-- Test-only seam. Production code always reaches `_render` via
+-- `M.open`, which wires `state.buffer_id` through `zag.layout.split`.
+-- Headless integration tests can't bind a WindowManager, so this
+-- helper lets a test attach a pre-created scratch buffer directly
+-- and exercise the render path without the layout dependency.
+function M._attach_buffer_for_test(buffer_id)
+    state.buffer_id = buffer_id
+end
+
+-- Test-only seam matching the plan's "expose a private _set_filter
+-- helper" note. Avoids forcing a filter-mode roundtrip through
+-- keymaps for a simple substring assertion.
+function M._set_filter_for_test(s)
+    state.filter = s or ""
+    M._render()
+end
+
+-- Test-only introspection so a test can assert state survives
+-- across an `M.close()` / `M.open()` cycle.
+function M._state_for_test()
+    return state
 end
 
 -- Register the slash command. `zag.command{ name = "sessions" }`

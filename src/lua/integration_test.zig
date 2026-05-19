@@ -14,6 +14,7 @@ const LuaEngine = @import("../LuaEngine.zig").LuaEngine;
 const Job = @import("Job.zig").Job;
 const Scope = @import("Scope.zig").Scope;
 const Session = @import("../Session.zig");
+const BufferRegistry = @import("../BufferRegistry.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -603,6 +604,106 @@ test "zag.sessions.delete fires SessionListChanged with change=deleted" {
         \\-- second event; otherwise the sidebar would needlessly refresh.
         \\zag.sessions.delete(target_id)
         \\assert(#_G.events == 1, "second delete must not re-fire, got " .. tostring(#_G.events))
+    );
+}
+
+// Task 4.1: sessions sidebar renders one row per registered session,
+// applies a substring filter, and preserves cursor state across the
+// close/open cycle. The headless harness has no WindowManager, so we
+// drive `_render` through the module's test seam after attaching a
+// scratch buffer directly.
+test "sessions sidebar renders one row per session and filters by name" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    // Two sessions, names chosen so the substring filter test below
+    // has an unambiguous match against "alp".
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+    var h_beta = try mgr.createSession("test-model");
+    const beta_id = try allocator.dupe(u8, h_beta.id[0..h_beta.id_len]);
+    defer allocator.free(beta_id);
+    h_beta.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    // Hand the ids to Lua so we can rename without round-tripping the
+    // values through a heredoc.
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+    _ = engine.lua.pushString(beta_id);
+    engine.lua.setGlobal("_test_beta_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\zag.sessions.rename(_test_beta_id, "beta")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local lines = zag.buffer.get_lines(buf)
+        \\assert(#lines == 2, "expected 2 lines, got " .. tostring(#lines))
+        \\-- Order is registry-driven; check both labels are present
+        \\-- without baking in a specific ordering.
+        \\local has_alpha, has_beta = false, false
+        \\for _, line in ipairs(lines) do
+        \\    if line:find("alpha", 1, true) then has_alpha = true end
+        \\    if line:find("beta", 1, true) then has_beta = true end
+        \\end
+        \\assert(has_alpha, "alpha row missing: " .. table.concat(lines, "|"))
+        \\assert(has_beta, "beta row missing: " .. table.concat(lines, "|"))
+        \\
+        \\-- Substring filter narrows the list to alpha only.
+        \\sidebar._set_filter_for_test("alp")
+        \\local filtered = zag.buffer.get_lines(buf)
+        \\assert(#filtered == 1, "expected 1 filtered line, got " .. tostring(#filtered))
+        \\assert(filtered[1]:find("alpha", 1, true) ~= nil,
+        \\       "filtered row should contain alpha: " .. tostring(filtered[1]))
+        \\
+        \\-- Reset filter and bump cursor so we can verify it survives
+        \\-- the close/open cycle.
+        \\sidebar._set_filter_for_test("")
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 2
+        \\
+        \\-- Simulate close: clear the test buffer binding and re-attach
+        \\-- on reopen. close() guards on state.pane_id, which we never
+        \\-- set in the test seam, so we manually drop buffer_id and
+        \\-- last_render the same way close() would.
+        \\st.buffer_id = nil
+        \\st.last_render = {}
+        \\
+        \\-- Reopen: re-attach the buffer and re-render. cursor_row is
+        \\-- preserved by design.
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\local st_after = sidebar._state_for_test()
+        \\assert(st_after.cursor_row == 2,
+        \\       "cursor_row should survive close/open, got " .. tostring(st_after.cursor_row))
     );
 }
 
