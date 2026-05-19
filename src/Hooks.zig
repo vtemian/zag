@@ -19,6 +19,9 @@ pub const EventKind = enum {
     agent_done,
     agent_err,
     pane_draft_change,
+    session_list_changed,
+    pane_focused,
+    layout_resize,
 };
 
 /// Map a Lua-facing event name like "ToolPre" to an EventKind.
@@ -34,6 +37,9 @@ pub fn parseEventName(name: []const u8) ?EventKind {
         .{ "AgentDone", .agent_done },
         .{ "AgentErr", .agent_err },
         .{ "PaneDraftChange", .pane_draft_change },
+        .{ "SessionListChanged", .session_list_changed },
+        .{ "PaneFocused", .pane_focused },
+        .{ "LayoutResize", .layout_resize },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) return entry[1];
@@ -117,6 +123,31 @@ pub const HookPayload = union(EventKind) {
         /// the dispatcher allocates a copy via the registry allocator
         /// and stores it here. The caller of `fireHook` owns and frees.
         draft_rewrite: ?[]const u8,
+    },
+    session_list_changed: struct {
+        /// What kind of mutation happened to the session list.
+        change: enum { created, renamed, deleted },
+        /// Identifier of the affected session (ULID string). Borrowed
+        /// from the caller; valid for the duration of the hook fire only.
+        session_id: []const u8,
+    },
+    pane_focused: struct {
+        /// Stable layout handle of the newly focused pane, formatted via
+        /// `NodeRegistry.formatId`. Used as the pattern key so plugins
+        /// can scope a hook to a single pane. Borrowed; valid for the
+        /// duration of the hook fire only.
+        pane_handle: []const u8,
+        /// Stable layout handle of the previously focused pane, or an
+        /// empty string when there was no prior focus (e.g. first focus
+        /// after startup). Borrowed; valid for the duration of the hook
+        /// fire only.
+        previous_handle: []const u8,
+    },
+    layout_resize: struct {
+        /// New terminal width in cells, post-recalculate.
+        cols: u16,
+        /// New terminal height in cells, post-recalculate.
+        rows: u16,
     },
 
     pub fn kind(self: HookPayload) EventKind {
@@ -276,7 +307,15 @@ test "parseEventName maps all known event strings" {
     try std.testing.expectEqual(Hooks.EventKind.tool_pre, Hooks.parseEventName("ToolPre").?);
     try std.testing.expectEqual(Hooks.EventKind.agent_err, Hooks.parseEventName("AgentErr").?);
     try std.testing.expectEqual(Hooks.EventKind.pane_draft_change, Hooks.parseEventName("PaneDraftChange").?);
+    try std.testing.expectEqual(Hooks.EventKind.session_list_changed, Hooks.parseEventName("SessionListChanged").?);
+    try std.testing.expectEqual(Hooks.EventKind.pane_focused, Hooks.parseEventName("PaneFocused").?);
+    try std.testing.expectEqual(Hooks.EventKind.layout_resize, Hooks.parseEventName("LayoutResize").?);
     try std.testing.expect(Hooks.parseEventName("Nope") == null);
+}
+
+test "HookPayload kind() returns layout_resize tag" {
+    const p: HookPayload = .{ .layout_resize = .{ .cols = 120, .rows = 40 } };
+    try std.testing.expectEqual(EventKind.layout_resize, p.kind());
 }
 
 test "HookRequest carries payload and signals done" {
@@ -296,6 +335,22 @@ test "HookRequest carries payload and signals done" {
 test "HookPayload kind() returns the union tag" {
     const p: HookPayload = .{ .agent_done = {} };
     try std.testing.expectEqual(EventKind.agent_done, p.kind());
+}
+
+test "HookPayload kind() returns session_list_changed tag" {
+    const p: HookPayload = .{ .session_list_changed = .{
+        .change = .created,
+        .session_id = "01HXYZ",
+    } };
+    try std.testing.expectEqual(EventKind.session_list_changed, p.kind());
+}
+
+test "HookPayload kind() returns pane_focused tag" {
+    const p: HookPayload = .{ .pane_focused = .{
+        .pane_handle = "L1",
+        .previous_handle = "",
+    } };
+    try std.testing.expectEqual(EventKind.pane_focused, p.kind());
 }
 
 test "Registry registers, iterates, and unregisters" {

@@ -36,6 +36,13 @@ pub const Surface = struct {
 /// Direction of a window split.
 pub const SplitDirection = enum { horizontal, vertical };
 
+/// Which side of the new split the freshly-attached pane occupies.
+/// `.second` (the default) keeps the legacy behavior: the new leaf
+/// becomes the right/bottom child and the previously-focused leaf
+/// stays on the left/top. `.first` flips the order so the new leaf
+/// is the left/top child, which is what left-anchored sidebars want.
+pub const Side = enum { first, second };
+
 /// Direction for vim-style focus navigation.
 pub const FocusDirection = enum { left, right, up, down };
 
@@ -580,14 +587,30 @@ pub fn setRootViewport(self: *Layout, viewport: *Viewport) void {
     }
 }
 
-/// Split the focused window vertically (left/right).
+/// Split the focused window vertically (left/right). The new leaf
+/// lands on the right by default; pass `.first` to anchor it on the
+/// left (sidebar-style).
 pub fn splitVertical(self: *Layout, ratio: f32, surface: Surface) !void {
-    try self.splitFocused(.vertical, ratio, surface);
+    try self.splitFocused(.vertical, ratio, surface, .second);
 }
 
-/// Split the focused window horizontally (top/bottom).
+/// Like `splitVertical` but lets the caller pick which side the new
+/// leaf occupies. Carved out as a separate entry point so existing
+/// call sites stay terse; new code that needs left-anchored panes
+/// (the sessions sidebar) goes through this variant.
+pub fn splitVerticalSide(self: *Layout, ratio: f32, surface: Surface, side: Side) !void {
+    try self.splitFocused(.vertical, ratio, surface, side);
+}
+
+/// Split the focused window horizontally (top/bottom). New leaf
+/// defaults to the bottom child; pass `.first` to anchor on top.
 pub fn splitHorizontal(self: *Layout, ratio: f32, surface: Surface) !void {
-    try self.splitFocused(.horizontal, ratio, surface);
+    try self.splitFocused(.horizontal, ratio, surface, .second);
+}
+
+/// Like `splitHorizontal` with explicit side selection.
+pub fn splitHorizontalSide(self: *Layout, ratio: f32, surface: Surface, side: Side) !void {
+    try self.splitFocused(.horizontal, ratio, surface, side);
 }
 
 /// Close the focused window. If the root is a single leaf, this is a no-op.
@@ -1040,7 +1063,12 @@ pub fn visibleLeaves(self: *const Layout, out: []*LayoutNode, out_len: *usize) v
 // ---- Internal helpers -------------------------------------------------------
 
 /// Split the focused leaf into a split node with the existing leaf and a new one.
-fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_surface: Surface) !void {
+/// `side` picks whether the new leaf becomes the first (left/top) or second
+/// (right/bottom) child. The split `ratio` is always the proportion of the
+/// first child, so flipping `side` while keeping a 0.5 ratio yields the
+/// same visual split, but a 0.2 ratio with `.first` produces a narrow
+/// left sidebar (new pane = first = 20%).
+fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_surface: Surface, side: Side) !void {
     const r = self.root orelse return error.NoRoot;
     const f = self.focused orelse return error.NoRoot;
 
@@ -1065,11 +1093,19 @@ fn splitFocused(self: *Layout, direction: SplitDirection, ratio: f32, new_surfac
     const split = try self.allocator.create(LayoutNode);
     errdefer self.allocator.destroy(split);
 
+    const first_child: *LayoutNode = switch (side) {
+        .first => new_leaf,
+        .second => f,
+    };
+    const second_child: *LayoutNode = switch (side) {
+        .first => f,
+        .second => new_leaf,
+    };
     split.* = .{ .split = .{
         .direction = direction,
         .ratio = ratio,
-        .first = f,
-        .second = new_leaf,
+        .first = first_child,
+        .second = second_child,
         .rect = existing_rect,
     } };
     try self.trackRegister(split);
@@ -1358,6 +1394,36 @@ test "vertical split divides width evenly" {
     try std.testing.expectEqual(@as(u16, 40), second.rect.width);
     try std.testing.expectEqual(@as(u16, 23), first.rect.height);
     try std.testing.expectEqual(@as(u16, 23), second.rect.height);
+}
+
+test "splitVerticalSide first puts the new pane on the left" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var cb1 = try Conversation.init(allocator, 0, "host");
+    defer cb1.deinit();
+    var cb2 = try Conversation.init(allocator, 1, "sidebar");
+    defer cb2.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
+    layout.recalculate(80, 24);
+
+    try layout.splitVerticalSide(0.2, .{ .buffer = cb2.buf(), .view = cb2.view(), .viewport = &test_viewport }, .first);
+    layout.recalculate(80, 24);
+
+    const split = layout.root.?.split;
+    // ratio = 0.2 of 80 cols = 16; the new "sidebar" pane is the
+    // first child and gets that narrow slice on the left.
+    try std.testing.expectEqualStrings("sidebar", split.first.leaf.buffer.getName());
+    try std.testing.expectEqualStrings("host", split.second.leaf.buffer.getName());
+    try std.testing.expectEqual(@as(u16, 0), split.first.leaf.rect.x);
+    try std.testing.expectEqual(@as(u16, 16), split.first.leaf.rect.width);
+    try std.testing.expectEqual(@as(u16, 16), split.second.leaf.rect.x);
+    try std.testing.expectEqual(@as(u16, 64), split.second.leaf.rect.width);
+    // Focus still follows the freshly attached pane.
+    try std.testing.expectEqualStrings("sidebar", layout.getFocusedLeaf().?.buffer.getName());
 }
 
 test "horizontal split divides height evenly" {

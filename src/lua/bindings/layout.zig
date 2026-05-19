@@ -27,7 +27,9 @@ const WindowManager = @import("../../WindowManager.zig");
 const lua_json = @import("../lua_json.zig");
 
 /// `zag.layout.tree()`: return the live window tree as a Lua table
-/// mirroring the WindowManager describe output.
+/// mirroring the WindowManager describe output. `cols` and `rows` carry
+/// the live screen dimensions so plugins can size splits in cell-count
+/// terms (e.g. the sessions sidebar pinning itself to ~30 columns).
 fn zagLayoutTreeFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
     const wm = engine.window_manager orelse {
@@ -44,6 +46,14 @@ fn zagLayoutTreeFn(lua: *Lua) i32 {
         const msg = std.fmt.bufPrintZ(&buf, "zag.layout.tree: decode failed: {s}", .{@errorName(err)}) catch "zag.layout.tree: decode failed";
         lua.raiseErrorStr("%s", .{msg.ptr});
     };
+    // Splice cols/rows onto the returned tree table. We do this in the
+    // binding rather than the describe() JSON serializer so the JSONL
+    // describe transport stays a pure tree dump (root/focus/nodes/floats)
+    // and the live screen geometry is only attached on the Lua surface.
+    lua.pushInteger(@intCast(wm.screen.width));
+    lua.setField(-2, "cols");
+    lua.pushInteger(@intCast(wm.screen.height));
+    lua.setField(-2, "rows");
     return 1;
 }
 
@@ -88,6 +98,12 @@ fn zagLayoutFocusFn(lua: *Lua) i32 {
 ///   * `"b<u32>"`: an opaque `BufferRegistry` handle string. The new
 ///     pane borrows that buffer by pointer; the registry keeps it
 ///     alive.
+///
+/// `opts.side` picks which side of the split the new pane occupies:
+///   * `"second"` (default): new pane lands right (vertical) or bottom
+///     (horizontal). Matches the legacy `<C-w>v` / `<C-w>s` behavior.
+///   * `"first"`: new pane lands left (vertical) or top (horizontal).
+///     Used by the sessions sidebar to anchor itself on the left.
 fn zagLayoutSplitFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
     const wm = engine.window_manager orelse {
@@ -108,13 +124,35 @@ fn zagLayoutSplitFn(lua: *Lua) i32 {
         lua.raiseErrorStr("zag.layout.split: direction must be \"horizontal\" or \"vertical\"", .{});
     };
 
-    // Optional opts table at arg 3: `{ buffer = <selector> }`. The
-    // selector is either a table (legacy `{ type = "conversation" }`)
-    // or a string (`"b<u32>"` handle). Anything else raises so the
-    // caller sees the failure on the first call, not later when the
-    // pane shows up empty.
+    // Optional opts table at arg 3: `{ buffer = <selector>, side = ... }`.
+    // The `buffer` selector is either a table (legacy `{ type = "conversation" }`)
+    // or a string (`"b<u32>"` handle). The `side` field picks first/second
+    // child placement. Anything else raises so the caller sees the failure
+    // on the first call, not later when the pane shows up empty.
     var attached: ?WindowManager.AttachedSurface = null;
+    var side: Layout.Side = .second;
     if (lua.isTable(3)) {
+        _ = lua.getField(3, "side");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.split: side must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "first")) {
+                    side = .first;
+                } else if (std.mem.eql(u8, s, "second")) {
+                    side = .second;
+                } else {
+                    lua.raiseErrorStr("zag.layout.split: side must be \"first\" or \"second\"", .{});
+                }
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.split: side must be a string", .{});
+            },
+        }
+        lua.pop(1);
+
         _ = lua.getField(3, "buffer");
         defer lua.pop(1);
         switch (lua.typeOf(-1)) {
@@ -155,7 +193,7 @@ fn zagLayoutSplitFn(lua: *Lua) i32 {
         }
     }
 
-    const new_handle = wm.splitById(handle, direction, attached) catch |err| {
+    const new_handle = wm.splitByIdSide(handle, direction, attached, side) catch |err| {
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split: {s}", .{@errorName(err)}) catch "zag.layout.split failed";
         lua.raiseErrorStr("%s", .{msg.ptr});
@@ -1019,6 +1057,54 @@ fn zagPaneReplaceDraftRangeFn(lua: *Lua) i32 {
     return 0;
 }
 
+/// `zag.pane.session_id(pane_id)`: return the session id (string) the
+/// pane's conversation is bound to, or `nil` when the pane has no
+/// conversation (scratch buffer), no session handle, or the handle
+/// string does not resolve to a live pane. Mirrors the
+/// `zag.sessions.current()` chain but lets the sidebar look up a
+/// specific pane after a `PaneFocused` hook rather than always reading
+/// the live focused pane.
+///
+/// Stale/unknown handles return nil rather than raising so callers
+/// reading after a focus change remain resilient to a pane that has
+/// already been closed mid-event.
+fn zagPaneSessionIdFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.pushNil();
+        return 1;
+    };
+
+    // Lenient parse: the sidebar may call us with whatever handle the
+    // PaneFocused event carried, and that pane may have already been
+    // closed. Treat malformed/stale strings the same as "no session
+    // here" rather than raising on the caller.
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.pane.session_id: id must be a string", .{});
+    }
+    const id = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.pane.session_id: id must be a string", .{});
+    };
+    const handle = NodeRegistry.parseId(id) catch {
+        lua.pushNil();
+        return 1;
+    };
+    const pane = wm.paneFromHandle(handle) catch {
+        lua.pushNil();
+        return 1;
+    };
+    const conv = pane.conversation orelse {
+        lua.pushNil();
+        return 1;
+    };
+    const sh = conv.session_handle orelse {
+        lua.pushNil();
+        return 1;
+    };
+    _ = lua.pushString(sh.id[0..sh.id_len]);
+    return 1;
+}
+
 /// Register the `zag.layout` subtable. Caller has the `zag` table at
 /// stack top; on return the `zag` table is still at stack top with
 /// `layout` attached. Mirrors the original registration order from
@@ -1063,5 +1149,7 @@ pub fn registerPaneTable(lua: *Lua) void {
     lua.setField(-2, "get_draft");
     lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
     lua.setField(-2, "replace_draft_range");
+    lua.pushFunction(zlua.wrap(zagPaneSessionIdFn));
+    lua.setField(-2, "session_id");
     lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
 }

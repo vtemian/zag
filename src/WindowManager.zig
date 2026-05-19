@@ -732,11 +732,29 @@ pub fn deinit(self: *WindowManager) void {
 // -- Window management -------------------------------------------------------
 
 /// Resize screen and layout, then notify every leaf's buffer of its new rect.
+/// After leaves have been notified, publish a `LayoutResize` hook so plugins
+/// (the sessions sidebar uses it to re-pin its width to ~30 cells) can react.
 pub fn handleResize(self: *WindowManager, cols: u16, rows: u16) !void {
     try self.screen.resize(cols, rows);
     self.layout.recalculate(cols, rows);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
+    self.fireLayoutResize(cols, rows);
+}
+
+/// Best-effort `LayoutResize` fire. Allocates nothing and is safe to call
+/// even when no Lua engine is attached (tests, headless harness). A hook
+/// failure is logged and dropped: resize must not be blocked by a flaky
+/// plugin.
+fn fireLayoutResize(self: *WindowManager, cols: u16, rows: u16) void {
+    const engine = self.lua_engine orelse return;
+    var payload: Hooks.HookPayload = .{ .layout_resize = .{
+        .cols = cols,
+        .rows = rows,
+    } };
+    _ = engine.fireHook(&payload) catch |err| {
+        log.warn("layout_resize hook fire failed: {}", .{err});
+    };
 }
 
 /// Walk all visible leaves and forward each leaf's current rect to the
@@ -760,16 +778,63 @@ pub fn doFocus(self: *WindowManager, dir: Layout.FocusDirection) void {
     self.layout.focusDirection(dir);
     self.compositor.layout_dirty = true;
     const next = self.layout.getFocusedLeaf();
-    notifyFocusSwap(prev, next);
+    self.notifyFocusSwap(prev, next);
 }
 
 /// Fire `onFocus(false)` on `prev` and `onFocus(true)` on `next` when the
-/// two are distinct. Extracted so every layout path that moves focus
-/// (navigation, split, close) routes through one place.
-fn notifyFocusSwap(prev: ?*Layout.LayoutNode.Leaf, next: ?*Layout.LayoutNode.Leaf) void {
+/// two are distinct, then publish a `PaneFocused` hook so plugins (the
+/// sessions sidebar, future floats, etc.) can react. Extracted so every
+/// layout path that moves focus (navigation, split, close) routes
+/// through one place.
+fn notifyFocusSwap(
+    self: *WindowManager,
+    prev: ?*Layout.LayoutNode.Leaf,
+    next: ?*Layout.LayoutNode.Leaf,
+) void {
     if (prev == next) return;
     if (prev) |prev_leaf| prev_leaf.view.onFocus(false);
     if (next) |next_leaf| next_leaf.view.onFocus(true);
+    self.firePaneFocused(prev, next);
+}
+
+/// Best-effort `PaneFocused` fire. Resolves each leaf to its stable
+/// pane handle via the buffer-pointer reverse lookup (the same path
+/// `pane_draft_change` takes) and pushes a `Hooks.HookPayload` through
+/// `LuaEngine.fireHook`. A missing engine, an unregistered leaf, or a
+/// hook failure are all logged and dropped: focus swap must not be
+/// blocked by a flaky plugin.
+fn firePaneFocused(
+    self: *WindowManager,
+    prev: ?*Layout.LayoutNode.Leaf,
+    next: ?*Layout.LayoutNode.Leaf,
+) void {
+    const engine = self.lua_engine orelse return;
+
+    // Format both handles inline to dodge the alloc that `formatId`
+    // would do. `"n" + u32 max digits = 11 chars`, so 16 is plenty.
+    var prev_buf: [16]u8 = undefined;
+    var next_buf: [16]u8 = undefined;
+    const prev_str = handleString(self, prev, &prev_buf);
+    const next_str = handleString(self, next, &next_buf);
+
+    var payload: Hooks.HookPayload = .{ .pane_focused = .{
+        .pane_handle = next_str,
+        .previous_handle = prev_str,
+    } };
+    _ = engine.fireHook(&payload) catch |err| {
+        log.warn("pane_focused hook fire failed: {}", .{err});
+    };
+}
+
+/// Resolve `leaf` to its stable pane handle string ("n{packed_u32}"),
+/// or `""` when there is no leaf or the registry / pane lookup drifts.
+/// Writes into `dest` and returns the slice covering the encoded bytes.
+fn handleString(self: *WindowManager, leaf: ?*Layout.LayoutNode.Leaf, dest: []u8) []const u8 {
+    const l = leaf orelse return "";
+    const pane = self.paneFromBufferPtr(l.buffer) orelse return "";
+    const handle = pane.handle orelse return "";
+    const packed_u32: u32 = @bitCast(handle);
+    return std.fmt.bufPrint(dest, "n{d}", .{packed_u32}) catch "";
 }
 
 /// Focus the leaf identified by `handle`. Stale or split-pointing handles
@@ -782,7 +847,7 @@ pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     const prev = self.layout.getFocusedLeaf();
     self.layout.focused = node;
     self.compositor.layout_dirty = true;
-    notifyFocusSwap(prev, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(prev, self.layout.getFocusedLeaf());
 }
 
 /// Split the leaf identified by `handle` and return the handle of the
@@ -804,6 +869,21 @@ pub fn splitById(
     direction: Layout.SplitDirection,
     attached: ?AttachedSurface,
 ) !NodeRegistry.Handle {
+    return self.splitByIdSide(handle, direction, attached, .second);
+}
+
+/// Variant of `splitById` that lets the caller pick which side of the
+/// new split the freshly-attached pane occupies. `.second` matches the
+/// legacy `splitById` behavior (new pane goes right/bottom); `.first`
+/// flips the order so the new pane is the left/top child. Used by the
+/// sessions sidebar plugin to anchor itself on the left.
+pub fn splitByIdSide(
+    self: *WindowManager,
+    handle: NodeRegistry.Handle,
+    direction: Layout.SplitDirection,
+    attached: ?AttachedSurface,
+    side: Layout.Side,
+) !NodeRegistry.Handle {
     const target = try self.node_registry.resolve(handle);
     if (target.* != .leaf) return error.NotALeaf;
 
@@ -812,9 +892,9 @@ pub fn splitById(
     defer self.layout.focused = prev_focus;
 
     if (attached) |a| {
-        try self.doSplitWithBuffer(direction, a);
+        try self.doSplitWithBuffer(direction, a, side);
     } else {
-        self.doSplit(direction);
+        self.doSplitSide(direction, side);
     }
 
     // `doSplit*` leaves focus on the new leaf. Look its handle up in the
@@ -1290,6 +1370,14 @@ pub fn modeAfterKey(
 
 /// Split the focused window, creating a new pane with its own session.
 pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
+    self.doSplitSide(direction, .second);
+}
+
+/// `doSplit` with explicit side selection. The keymap-driven splits
+/// (`.split_vertical`, `.split_horizontal`) always go through `.second`
+/// for backwards compatibility; the sessions sidebar takes the `.first`
+/// path via `splitByIdSide`.
+pub fn doSplitSide(self: *WindowManager, direction: Layout.SplitDirection, side: Layout.Side) void {
     // Capture the label that createSplitPane is about to consume so the
     // announce below matches the new pane's name.
     const scratch_id = self.next_scratch_id;
@@ -1304,8 +1392,8 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     const split_entry = self.extra_panes.items[self.extra_panes.items.len - 1];
     const surface: Layout.Surface = .{ .buffer = pane.buffer, .view = pane.view, .viewport = &split_entry.pane.viewport };
     const split = switch (direction) {
-        .vertical => self.layout.splitVertical(0.5, surface),
-        .horizontal => self.layout.splitHorizontal(0.5, surface),
+        .vertical => self.layout.splitVerticalSide(0.5, surface, side),
+        .horizontal => self.layout.splitHorizontalSide(0.5, surface, side),
     };
     split catch |err| {
         log.warn("split failed: {}", .{err});
@@ -1338,7 +1426,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // The new pane is ready to be typed into. Drop back to insert mode so
     // the user can start a conversation without an extra `i` keystroke,
@@ -1358,6 +1446,7 @@ pub fn doSplitWithBuffer(
     self: *WindowManager,
     direction: Layout.SplitDirection,
     attached: AttachedSurface,
+    side: Layout.Side,
 ) !void {
     const prev_focus = self.layout.getFocusedLeaf();
 
@@ -1384,8 +1473,8 @@ pub fn doSplitWithBuffer(
     errdefer _ = self.extra_panes.pop();
 
     switch (direction) {
-        .vertical => try self.layout.splitVertical(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }),
-        .horizontal => try self.layout.splitHorizontal(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }),
+        .vertical => try self.layout.splitVerticalSide(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }, side),
+        .horizontal => try self.layout.splitHorizontalSide(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }, side),
     }
 
     // Stamp the new leaf's stable handle onto the entry's pane so
@@ -1402,7 +1491,7 @@ pub fn doSplitWithBuffer(
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // Non-agent panes stay in whatever mode the user was in; there is
     // no draft to type into.
@@ -1497,6 +1586,136 @@ pub fn createSplitPane(self: *WindowManager) !Pane {
     entry.session_handle = sh;
 
     return pane;
+}
+
+/// Build a fresh agent pane bound to an EXISTING on-disk session.
+///
+/// Mirrors `createSplitPane`, but instead of asking SessionManager to
+/// allocate a brand-new id, it calls `loadSession(id)` and replays the
+/// JSONL through `loadFromEntries`. The result is a Pane whose
+/// Conversation already contains the session's history and whose
+/// SessionHandle is the writer for any future turns appended in this
+/// pane.
+///
+/// Errors:
+///   * `error.SessionManagerUnavailable`: persistence was disabled at
+///     boot (e.g. unwritable `.zag/sessions`); no SessionManager to
+///     load from.
+///   * Anything `loadSession` / `loadEntries` / `loadFromEntries`
+///     propagates (InvalidSessionId, FileNotFound, ...).
+///
+/// On error, no PaneEntry is appended and every partial allocation is
+/// released via `errdefer` so `testing.allocator` stays clean.
+pub fn openSessionPane(self: *WindowManager, id: []const u8) !Pane {
+    const mgr = &(self.session_mgr.* orelse return error.SessionManagerUnavailable);
+
+    var name_scratch: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+
+    const cb = try self.allocator.create(Conversation);
+    errdefer self.allocator.destroy(cb);
+    cb.* = try Conversation.init(self.allocator, self.next_buffer_id, name);
+    errdefer cb.deinit();
+
+    const bs = try self.allocator.create(BufferSink);
+    errdefer self.allocator.destroy(bs);
+    bs.* = BufferSink.init(self.allocator, cb);
+    errdefer bs.deinit();
+
+    const runner = try self.allocator.create(AgentRunner);
+    errdefer self.allocator.destroy(runner);
+    runner.* = AgentRunner.init(self.allocator, bs.sink(), cb);
+    errdefer runner.deinit();
+
+    runner.wake_fd = self.wake_write_fd;
+    runner.lua_engine = self.lua_engine;
+    runner.window_manager = self;
+    runner.skills = self.skills;
+
+    self.next_buffer_id += 1;
+    self.next_scratch_id += 1;
+
+    // Load the session AFTER the Conversation exists: loadEntries
+    // allocates an `Entry[]` we must free before returning regardless
+    // of success.
+    const sh = try self.allocator.create(Session.SessionHandle);
+    errdefer self.allocator.destroy(sh);
+    sh.* = try mgr.loadSession(id);
+    errdefer sh.close();
+
+    const entries = try Session.loadEntries(id, self.allocator);
+    defer {
+        for (entries) |entry| Session.freeEntry(entry, self.allocator);
+        self.allocator.free(entries);
+    }
+    try cb.loadFromEntries(entries);
+    cb.attachSession(sh);
+
+    // Adopt the session's display name when present so the sidebar's
+    // current-session highlight matches the title bar.
+    if (sh.meta.name_len > 0) {
+        self.allocator.free(cb.name);
+        cb.name = try self.allocator.dupe(u8, sh.meta.nameSlice());
+    }
+
+    const pane: Pane = .{
+        .buffer = cb.buf(),
+        .view = cb.view(),
+        .conversation = cb,
+        .runner = runner,
+        .wm = self,
+    };
+
+    const entry = try self.allocator.create(PaneEntry);
+    errdefer self.allocator.destroy(entry);
+    entry.* = .{ .pane = pane, .sink_storage = bs, .session_handle = sh };
+
+    try self.extra_panes.append(self.allocator, entry);
+
+    return pane;
+}
+
+/// Split the focused leaf and attach a new agent pane bound to the
+/// EXISTING session `id`. The new pane lands on the `.second` side of
+/// a horizontal split so it sits to the right of (or below) the
+/// caller, which is what the sessions sidebar wants when the user
+/// presses Enter.
+///
+/// Returns the handle of the freshly-attached leaf so callers can
+/// address the new pane (e.g. to set focus or read its session id).
+pub fn splitFocusedWithSession(
+    self: *WindowManager,
+    id: []const u8,
+) !NodeRegistry.Handle {
+    const prev_focus = self.layout.getFocusedLeaf();
+    const pane = try self.openSessionPane(id);
+    const split_entry = self.extra_panes.items[self.extra_panes.items.len - 1];
+    const surface: Layout.Surface = .{
+        .buffer = pane.buffer,
+        .view = pane.view,
+        .viewport = &split_entry.pane.viewport,
+    };
+    try self.layout.splitVerticalSide(0.5, surface, .second);
+
+    // Stamp the new leaf's handle so future pane lookups land on the
+    // session pane rather than its parent.
+    var new_handle: ?NodeRegistry.Handle = null;
+    if (self.layout.focused) |new_leaf| {
+        if (self.handleForNode(new_leaf)) |h| {
+            if (pane.runner) |r| r.pane_handle_packed = @bitCast(h);
+            split_entry.pane.handle = h;
+            new_handle = h;
+        } else |err| {
+            log.warn("session pane leaf missing from registry: {}", .{err});
+        }
+    }
+
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+
+    return new_handle orelse error.FocusLost;
 }
 
 /// TODO(node-cursor): once the renderer grows a real per-node cursor,
@@ -1612,7 +1831,7 @@ pub fn enterSubagent(
         .leaf => &parent_node.leaf,
         .split => null,
     };
-    notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
 }
 
 /// Try to create and attach a session to a pane. Returns the handle or
@@ -4242,6 +4461,249 @@ test "zag.layout.split rejects a malformed buffer handle string" {
     engine.lua.pop(1);
 }
 
+test "zag.layout.split honors side = \"first\" by anchoring the new pane on the left" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    const bh = try wm.buffer_registry.createScratch("sessions");
+    const sidebar_buffer = try wm.buffer_registry.asBuffer(bh);
+    const buffer_id = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buffer_id);
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // ratio = 0.2 puts the sidebar at ~16 cols on an 80-col screen
+    // when it lands on the left (side = "first" means the new pane
+    // is the first child and consumes the ratio).
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.new_id = zag.layout.split("{s}", "vertical", {{ buffer = "{s}", side = "first", ratio = 0.2 }})
+    , .{ pane_id, buffer_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("new_id");
+    defer engine.lua.pop(1);
+    const new_id = try engine.lua.toString(-1);
+    const new_handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
+
+    // The sidebar buffer should be in the freshly-created leaf.
+    try std.testing.expectEqual(sidebar_buffer.ptr, new_node.leaf.buffer.ptr);
+
+    // The root is now a split; first child is the sidebar (new), second is the host (original root pane).
+    const root_node = wm.layout.root.?;
+    try std.testing.expect(root_node.* == .split);
+    try std.testing.expectEqual(new_node, root_node.split.first);
+    // The original root pane survived: its buffer pointer matches the
+    // conversation buffer attached to the test's `pane` value.
+    try std.testing.expectEqual(view.buf().ptr, root_node.split.second.leaf.buffer.ptr);
+}
+
+test "zag.layout.split rejects an unknown side value" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.layout.split("{s}", "vertical", {{ side = "middle" }})
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    const result = engine.lua.doString(script);
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "sessions sidebar M.open creates a left pane and M.close removes it; state survives toggle" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    // Walk the layout tree from the Lua side to count panes. Single
+    // doString call so the local `sessions` and `count_panes` helpers
+    // stay in scope across the open/close/reopen assertions.
+    try engine.lua.doString(
+        \\local sessions = require("zag.builtin.sessions")
+        \\local function count_panes()
+        \\    local tree = zag.layout.tree()
+        \\    local n = 0
+        \\    for _, node in pairs(tree.nodes) do
+        \\        if node.kind == "pane" then n = n + 1 end
+        \\    end
+        \\    return n
+        \\end
+        \\
+        \\assert(count_panes() == 1, "expected exactly one pane before open, got " .. tostring(count_panes()))
+        \\
+        \\sessions.toggle()
+        \\assert(count_panes() == 2, "expected two panes after first toggle, got " .. tostring(count_panes()))
+        \\
+        \\sessions.toggle()
+        \\assert(count_panes() == 1, "expected one pane after close, got " .. tostring(count_panes()))
+        \\
+        \\sessions.toggle()
+        \\assert(count_panes() == 2, "expected two panes after reopen, got " .. tostring(count_panes()))
+        \\
+        \\-- A second open() must be a no-op, not stack a second pane.
+        \\sessions.open()
+        \\assert(count_panes() == 2, "open should be idempotent")
+        \\
+        \\-- A second close() after an explicit close must also be a no-op.
+        \\sessions.close()
+        \\assert(count_panes() == 1, "close should leave one pane")
+        \\sessions.close()
+        \\assert(count_panes() == 1, "close should be idempotent")
+    );
+}
+
 test "layout_split tool mounts scratch buffer by handle end-to-end" {
     const allocator = std.testing.allocator;
 
@@ -5154,6 +5616,110 @@ test "zag.pane.replace_draft_range raises with helpful message on overflow" {
     try std.testing.expectEqual(MAX_DRAFT - 1, f.wm.root_pane.draft_len);
 }
 
+test "zag.pane.session_id returns the bound session id for a conversation pane" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+
+    // The PickerFixture's root_pane is conversation-backed but
+    // session-less. Attach a real SessionHandle pointing at a temp
+    // JSONL file so the binding has something to read.
+    std.fs.cwd().makePath(".zag/sessions") catch {};
+    const session_id = "panebind_test_0123456789abcdef0";
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
+    defer std.fs.cwd().deleteFile(jsonl_path) catch {};
+    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    var handle = Session.SessionHandle{
+        .id_len = @intCast(session_id.len),
+        .file = file,
+        .meta = .{},
+        .allocator = allocator,
+    };
+    @memcpy(handle.id[0..session_id.len], session_id);
+    defer handle.close();
+    f.conversation.session_handle = &handle;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.sid = zag.pane.session_id("{s}")
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("sid");
+    defer engine.lua.pop(1);
+    try std.testing.expectEqualStrings(session_id, try engine.lua.toString(-1));
+}
+
+test "zag.pane.session_id returns nil for a session-less conversation pane" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+
+    // PickerFixture's root_pane conversation has session_handle = null
+    // (scratch-equivalent for this binding's lookup chain). The sidebar
+    // never highlights a row for a session-less pane. The assert lives
+    // inside Lua because `getGlobal` raises on nil slots (so reading
+    // `_G.sid` back to Zig and checking isNil would always fail).
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local sid = zag.pane.session_id("{s}")
+        \\assert(sid == nil, "expected nil for session-less pane, got " .. tostring(sid))
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+}
+
+test "zag.pane.session_id returns nil for an unknown handle string" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    // `n9999` is well-formed but not registered; the binding must not
+    // raise so a sidebar reading after a pane-close race remains safe.
+    try engine.lua.doString(
+        \\local sid = zag.pane.session_id("n9999")
+        \\assert(sid == nil, "expected nil for unknown handle, got " .. tostring(sid))
+    );
+}
+
 test "PaneDraftChange fires on root pane draft mutation" {
     const allocator = std.testing.allocator;
     var f: PickerFixture = undefined;
@@ -5589,6 +6155,278 @@ test "PaneDraftChange hook ref cleanup leaves no leaks on engine deinit" {
     // testing.allocator catches the leak if `Hook.pattern` or the
     // dispatcher's pending_cancel_reason isn't freed on deinit.
     f.wm.lua_engine = null;
+}
+
+test "PaneFocused fires on focus swap with prev and next pane handles" {
+    // Drive the swap through `focusById` (one of the five public paths
+    // that ends in `notifyFocusSwap`). After `doSplit` two leaves exist;
+    // focusing back to the original leaf must fire one PaneFocused event
+    // carrying both handles formatted as `NodeRegistry.formatId` strings.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    try wm.attachLayoutRegistry();
+    layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = wm;
+    wm.lua_engine = &engine;
+
+    // doSplit fires its own PaneFocused (root -> new pane); register the
+    // hook *after* the split so the test only observes the second swap.
+    wm.doSplit(.vertical);
+
+    const first_leaf = wm.layout.root.?.split.first;
+    const second_leaf = wm.layout.root.?.split.second;
+    const first_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == first_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    const second_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == second_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    const first_id = try NodeRegistry.formatId(allocator, first_handle);
+    defer allocator.free(first_id);
+    const second_id = try NodeRegistry.formatId(allocator, second_handle);
+    defer allocator.free(second_id);
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\_G.last_pane = nil
+        \\_G.last_prev = nil
+        \\zag.hook("PaneFocused", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\  _G.last_pane = evt.pane_handle
+        \\  _G.last_prev = evt.previous_handle
+        \\end)
+    );
+
+    try wm.focusById(first_handle);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_pane");
+    try std.testing.expectEqualStrings(first_id, try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_prev");
+    try std.testing.expectEqualStrings(second_id, try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneFocused pattern key scopes hook to a single pane handle" {
+    // A `pattern = "<handle>"` filter must only match swaps that land on
+    // that handle. Focusing back to a different leaf must NOT fire.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    try wm.attachLayoutRegistry();
+    layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = wm;
+    wm.lua_engine = &engine;
+
+    wm.doSplit(.vertical);
+
+    const first_leaf = wm.layout.root.?.split.first;
+    const first_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == first_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+
+    // Register a hook scoped to a fictitious handle. The real swap below
+    // lands on `first_handle`, which is NOT this pattern; no fire.
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneFocused", { pattern = "n9999" }, function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    try wm.focusById(first_handle);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "LayoutResize fires from handleResize with new cols and rows" {
+    // The sessions sidebar uses `LayoutResize` to re-pin its width to
+    // ~30 cells after a terminal resize. The hook must fire exactly once
+    // per `handleResize` and carry the post-recalculate dimensions.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    try wm.attachLayoutRegistry();
+    layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = wm;
+    wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\_G.last_cols = nil
+        \\_G.last_rows = nil
+        \\zag.hook("LayoutResize", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\  _G.last_cols = evt.cols
+        \\  _G.last_rows = evt.rows
+        \\end)
+    );
+
+    try wm.handleResize(120, 40);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_cols");
+    try std.testing.expectEqual(@as(i64, 120), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_rows");
+    try std.testing.expectEqual(@as(i64, 40), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
 }
 
 test "zag.providers.list reflects the endpoint registry" {
@@ -6159,6 +6997,32 @@ test "deinit tears down extra_floats with no leaks" {
     _ = try wm.openFloatPane(.{ .buffer = buf2, .view = view2 }, .{ .x = 5, .y = 5, .width = 10, .height = 4 }, .{ .title = "second" });
 
     wm.deinit();
+}
+
+test "zag.layout.tree returns live cols and rows" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // The fixture seeds an 80x24 screen; cols/rows must echo those
+    // values so plugins (sessions sidebar) can size splits in
+    // cell-count terms rather than guessing a fixed ratio.
+    try f.engine.lua.doString(
+        \\_t = zag.layout.tree()
+        \\_cols = _t.cols
+        \\_rows = _t.rows
+    );
+
+    _ = try f.engine.lua.getGlobal("_cols");
+    defer f.engine.lua.pop(1);
+    const cols = try f.engine.lua.toInteger(-1);
+    try std.testing.expectEqual(@as(@TypeOf(cols), 80), cols);
+
+    _ = try f.engine.lua.getGlobal("_rows");
+    defer f.engine.lua.pop(1);
+    const rows = try f.engine.lua.toInteger(-1);
+    try std.testing.expectEqual(@as(@TypeOf(rows), 24), rows);
 }
 
 test "zag.layout.tree returns floats and focused_float fields" {
@@ -7147,4 +8011,154 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
         );
         return error.TestPopupListTooSlow;
     }
+}
+
+test "splitFocusedWithSession attaches loaded session to a new pane" {
+    const allocator = std.testing.allocator;
+
+    // A real SessionManager (cwd-relative) is required: openSessionPane
+    // routes through `mgr.loadSession`, which reads `.zag/sessions`.
+    // Run inside std.testing.tmpDir so the on-disk JSONL+meta we create
+    // here cannot collide with the host project's `.zag/sessions`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer {
+        if (std.fs.openDirAbsolute(orig_cwd, .{})) |d_const| {
+            var d = d_const;
+            d.setAsCwd() catch {};
+            d.close();
+        } else |_| {}
+    }
+
+    var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
+    var seed_handle = try mgr_opt.?.createSession("test-model");
+    const session_id_len = seed_handle.id_len;
+    var session_id_buf: [32]u8 = undefined;
+    @memcpy(session_id_buf[0..session_id_len], seed_handle.id[0..session_id_len]);
+    const session_id = session_id_buf[0..session_id_len];
+
+    _ = try seed_handle.appendEntry(.{
+        .entry_type = .user_message,
+        .content = "hi from disk",
+        .timestamp = 0,
+    });
+    seed_handle.close();
+
+    // Real Layout + Screen + Compositor: splitFocusedWithSession calls
+    // `layout.recalculate(screen.width, screen.height)` and stamps the
+    // new leaf's handle via `compositor.layout_dirty`. Same scaffolding
+    // as `splitById creates a new leaf and returns its handle`.
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &mgr_opt,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    const new_handle = try wm.splitFocusedWithSession(session_id);
+
+    // The layout grew a new leaf next to root, the focused leaf is the
+    // session pane, and the new pane's Conversation carries the
+    // replayed user_message plus a live SessionHandle bound to `id`.
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+    const new_node = try wm.node_registry.resolve(new_handle);
+    try std.testing.expect(new_node.* == .leaf);
+    try std.testing.expectEqual(new_node, wm.layout.focused);
+
+    const session_pane = wm.extra_panes.items[0];
+    const session_conv = session_pane.pane.conversation orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), session_conv.tree.root_children.items.len);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, session_conv.tree.root_children.items[0].node_type);
+
+    const sh = session_conv.session_handle orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(session_id, sh.id[0..sh.id_len]);
+}
+
+test "splitFocusedWithSession rejects sessions when persistence is disabled" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    // session_mgr = null: persistence disabled at boot.
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    try std.testing.expectError(
+        error.SessionManagerUnavailable,
+        wm.splitFocusedWithSession("0123456789abcdef0123456789abcdef"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
 }

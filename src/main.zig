@@ -525,6 +525,7 @@ test {
     _ = @import("prompt.zig");
     _ = @import("Instruction.zig");
     _ = @import("Reminder.zig");
+    _ = @import("project_registry.zig");
     _ = @import("sandbox/landlock_linux.zig");
     _ = @import("sandbox/helper_linux.zig");
 }

@@ -694,6 +694,13 @@ pub const LuaEngine = struct {
         // bodies and `registerPaneTable` live in lua/bindings/layout.zig.
         layout_bindings.registerPaneTable(lua);
 
+        // zag.sessions; cross-project session enumeration + mutation.
+        // The sessions sidebar plugin (Phase 3) reads from `list` and
+        // calls `rename` / `delete`; `current()` reads the focused
+        // pane's bound session id, `subagents(id)` lazily parses task
+        // entries from a session's JSONL.
+        @import("lua/bindings/sessions.zig").registerOn(lua);
+
         // zag.providers; read-only view of the endpoint registry so a
         // Lua model picker can enumerate providers/models without
         // re-implementing the stdlib bookkeeping. Bound from

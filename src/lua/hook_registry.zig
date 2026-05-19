@@ -510,6 +510,23 @@ pub const HookDispatcher = struct {
                 setTableString(lua, "draft_text", p.draft_text);
                 if (p.previous_text) |prev| setTableString(lua, "previous_text", prev);
             },
+            .session_list_changed => |p| {
+                const change_str: []const u8 = switch (p.change) {
+                    .created => "created",
+                    .renamed => "renamed",
+                    .deleted => "deleted",
+                };
+                setTableString(lua, "change", change_str);
+                setTableString(lua, "session_id", p.session_id);
+            },
+            .pane_focused => |p| {
+                setTableString(lua, "pane_handle", p.pane_handle);
+                setTableString(lua, "previous_handle", p.previous_handle);
+            },
+            .layout_resize => |p| {
+                setTableInt(lua, "cols", @intCast(p.cols));
+                setTableInt(lua, "rows", @intCast(p.rows));
+            },
         }
     }
 
@@ -550,13 +567,14 @@ pub fn maxDepthFor(kind: Hooks.EventKind) u32 {
 }
 
 /// Key used for pattern matching against a hook's pattern.
-/// ToolPre/ToolPost use the tool name, PaneDraftChange uses the pane
-/// handle string; all other events use "".
+/// ToolPre/ToolPost use the tool name, PaneDraftChange and PaneFocused
+/// use the pane handle string; all other events use "".
 pub fn hookPatternKey(payload: Hooks.HookPayload) []const u8 {
     return switch (payload) {
         .tool_pre => |p| p.name,
         .tool_post => |p| p.name,
         .pane_draft_change => |p| p.pane_handle,
+        .pane_focused => |p| p.pane_handle,
         else => "",
     };
 }

@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
+const ProjectRegistry = @import("project_registry.zig");
 
 const Session = @This();
 
@@ -156,6 +157,22 @@ fn isZeroUlid(id: ulid.Ulid) bool {
     return true;
 }
 
+/// Reject ids that would let a caller escape the sessions directory or
+/// name a parent directory. `createSession` generates ids from `generateId`
+/// (hex digits only), so this guard is for callers that arrived from a
+/// less-trusted surface (Lua bindings, future IPC).
+fn isValidSessionId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    if (id.len > 32) return false;
+    for (id) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Session metadata stored in the companion .meta.json file.
 /// Uses fixed-size char arrays to avoid heap allocation.
 pub const Meta = struct {
@@ -194,6 +211,35 @@ pub const Meta = struct {
     }
 };
 
+/// Resolve `$HOME/.config/zag` and register the current cwd in the global
+/// project registry. Mirrors `auth_wizard.buildPaths`'s resolution rule
+/// (HOME plus `.config/zag`) so the sidebar agrees with auth.json on
+/// where the per-user config directory lives.
+///
+/// The cwd is canonicalized with `realpath` before insertion so the same
+/// project reached via a symlink alias or with a trailing slash collapses
+/// to a single registry entry; if realpath fails (e.g. the cwd was
+/// removed between getCwdAlloc and realpathAlloc, rare but possible) the
+/// raw cwd string is used as a fallback rather than abandoning the call.
+fn recordCwdInRegistry(allocator: Allocator) !void {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+
+    const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zag" });
+    defer allocator.free(config_dir);
+
+    const raw_cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(raw_cwd);
+
+    const canonical_cwd = std.fs.realpathAlloc(allocator, raw_cwd) catch raw_cwd;
+    defer if (canonical_cwd.ptr != raw_cwd.ptr) allocator.free(canonical_cwd);
+
+    var registry = try ProjectRegistry.init(allocator, config_dir);
+    defer registry.deinit();
+
+    try registry.register(canonical_cwd, std.time.milliTimestamp());
+}
+
 /// Manages session creation, loading, and listing.
 pub const SessionManager = struct {
     /// Allocator for temporary operations (directory iteration, sorting).
@@ -206,6 +252,17 @@ pub const SessionManager = struct {
             log.err("failed to create sessions dir: {}", .{e});
             return e;
         };
+
+        // Best-effort: record this cwd in the global project registry so
+        // the sessions sidebar can aggregate runs across every project
+        // zag has ever been launched in. A bad HOME, missing config dir,
+        // permission denied, or a malformed registry must not prevent
+        // session bring-up: log and continue.
+        recordCwdInRegistry(allocator) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => log.warn("project_registry update skipped: {s}", .{@errorName(e)}),
+        };
+
         return .{ .allocator = allocator };
     }
 
@@ -275,6 +332,12 @@ pub const SessionManager = struct {
 
     /// Open an existing session by ID.
     pub fn loadSession(self: *SessionManager, id: []const u8) !SessionHandle {
+        // Reject ids that could escape the sessions directory. `createSession`
+        // generates ids from `generateId` (hex digits only), so this guard
+        // matters for callers reaching `loadSession` from less-trusted
+        // surfaces (Lua bindings, future IPC).
+        if (!isValidSessionId(id)) return error.InvalidSessionId;
+
         var jsonl_path_buf: [256]u8 = undefined;
         const jsonl_path = std.fmt.bufPrint(&jsonl_path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
             return error.PathTooLong;
@@ -378,6 +441,32 @@ pub const SessionManager = struct {
 
         const id = list[0].idSlice();
         return try self.allocator.dupe(u8, id);
+    }
+
+    /// Remove a session's `.jsonl` and `.meta.json` from disk. Idempotent
+    /// when neither file exists. Caller is responsible for closing any open
+    /// SessionHandle for this id first; deleting under an open fd leaks the
+    /// handle and the JSONL file remains writable through it until close.
+    pub fn deleteSession(self: *SessionManager, id: []const u8) !void {
+        _ = self;
+        if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+        var jsonl_path_buf: [256]u8 = undefined;
+        const jsonl_path = std.fmt.bufPrint(&jsonl_path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
+            return error.PathTooLong;
+        var meta_path_buf: [256]u8 = undefined;
+        const meta_path = std.fmt.bufPrint(&meta_path_buf, sessions_dir ++ "/{s}.meta.json", .{id}) catch
+            return error.PathTooLong;
+
+        const cwd = std.fs.cwd();
+        cwd.deleteFile(jsonl_path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+        cwd.deleteFile(meta_path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
     }
 
     /// Load an existing session or fall back to creating a new one.
@@ -686,6 +775,210 @@ pub fn freeEntry(entry: Entry, allocator: Allocator) void {
     if (entry.encrypted_data) |ed| allocator.free(ed);
     if (entry.tool_use_id) |id| allocator.free(id);
     if (entry.subagent_path) |path| allocator.free(path);
+}
+
+/// List sessions for an arbitrary project rooted at `project_path`.
+/// Reads `<project_path>/.zag/sessions/*.meta.json` directly, without
+/// touching cwd or the project registry. Used by the sessions sidebar to
+/// aggregate sessions across every cwd zag has been launched in; the cwd
+/// case is handled by `SessionManager.listSessions` and uses the same
+/// on-disk layout.
+///
+/// Returns an empty slice when the sessions dir is missing (the project
+/// directory might have been deleted between registry update and lookup).
+/// Caller owns the returned slice.
+pub fn listSessionsAt(allocator: Allocator, project_path: []const u8) ![]Meta {
+    var dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/{s}", .{ project_path, sessions_dir }) catch
+        return error.PathTooLong;
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return &.{},
+        else => return e,
+    };
+    defer dir.close();
+
+    var metas: std.ArrayList(Meta) = .empty;
+    errdefer metas.deinit(allocator);
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".meta.json")) continue;
+
+        const meta = readMetaFromDir(dir, entry.name, allocator) catch continue;
+        try metas.append(allocator, meta);
+    }
+
+    std.mem.sort(Meta, metas.items, {}, struct {
+        fn lessThan(_: void, a: Meta, b: Meta) bool {
+            return a.updated > b.updated;
+        }
+    }.lessThan);
+
+    return metas.toOwnedSlice(allocator);
+}
+
+/// Read a `Meta` from `<dir>/<name>` without going through `std.fs.cwd()`.
+/// Used by `listSessionsAt` so cross-project enumeration does not require
+/// chdir'ing into the project root.
+fn readMetaFromDir(dir: std.fs.Dir, name: []const u8, allocator: Allocator) !Meta {
+    const content = try dir.readFileAlloc(allocator, name, 4096);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    var meta = Meta{};
+
+    if (obj.get("id")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            const len: u8 = @intCast(@min(s.len, meta.id.len));
+            @memcpy(meta.id[0..len], s[0..len]);
+            meta.id_len = len;
+        }
+    }
+    if (obj.get("name")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            const len: u8 = @intCast(@min(s.len, meta.name.len));
+            @memcpy(meta.name[0..len], s[0..len]);
+            meta.name_len = len;
+        }
+    }
+    if (obj.get("model")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            const len: u8 = @intCast(@min(s.len, meta.model.len));
+            @memcpy(meta.model[0..len], s[0..len]);
+            meta.model_len = len;
+        }
+    }
+    if (obj.get("created")) |v| {
+        if (v == .integer) meta.created = v.integer;
+    }
+    if (obj.get("updated")) |v| {
+        if (v == .integer) meta.updated = v.integer;
+    }
+    if (obj.get("message_count")) |v| {
+        if (v == .integer) meta.message_count = @intCast(v.integer);
+    }
+
+    return meta;
+}
+
+/// Delete a session's `.jsonl` + `.meta.json` under an arbitrary project
+/// root. Idempotent (missing files are tolerated). Used by the sidebar
+/// binding to delete sessions in projects other than the current cwd.
+pub fn deleteSessionAt(project_path: []const u8, id: []const u8) !void {
+    if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+    var jsonl_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const jsonl_path = std.fmt.bufPrint(
+        &jsonl_path_buf,
+        "{s}/{s}/{s}.jsonl",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    var meta_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(
+        &meta_path_buf,
+        "{s}/{s}/{s}.meta.json",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    std.fs.cwd().deleteFile(jsonl_path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    };
+    std.fs.cwd().deleteFile(meta_path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    };
+}
+
+/// Rename a session's `.meta.json` under an arbitrary project root. Reads
+/// the existing meta, replaces `name` and `updated`, then writes back via
+/// the same atomic temp+rename `writeMetaFile` uses. Does NOT append a
+/// `session_rename` audit entry to the JSONL: cross-project rename hits
+/// projects that may have an open `SessionHandle` writer in another
+/// process, and we cannot safely append from outside that writer's
+/// `append_mutex`. The lost audit row is the accepted trade-off; the
+/// meta change is what every reader actually consults.
+pub fn renameSessionAt(
+    allocator: Allocator,
+    project_path: []const u8,
+    id: []const u8,
+    new_name: []const u8,
+) !void {
+    if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+    var meta_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(
+        &meta_path_buf,
+        "{s}/{s}/{s}.meta.json",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    var meta = try readMetaFile(meta_path, allocator);
+    const name_len: u8 = @intCast(@min(new_name.len, meta.name.len));
+    @memcpy(meta.name[0..name_len], new_name[0..name_len]);
+    meta.name_len = name_len;
+    meta.updated = std.time.milliTimestamp();
+
+    try writeMetaFile(meta_path, &meta);
+}
+
+/// Variant of `loadEntries` that reads from `<project_path>/.zag/sessions/`
+/// instead of cwd. Used by the sidebar binding's `subagents(id)` to crawl
+/// sessions belonging to projects other than the current cwd.
+pub fn loadEntriesAt(allocator: Allocator, project_path: []const u8, id: []const u8) ![]Entry {
+    if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &path_buf,
+        "{s}/{s}/{s}.jsonl",
+        .{ project_path, sessions_dir, id },
+    ) catch return error.PathTooLong;
+
+    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |e| {
+        log.err("failed to read session file: {}", .{e});
+        return e;
+    };
+    defer allocator.free(content);
+
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        for (entries.items) |entry| freeEntry(entry, allocator);
+        entries.deinit(allocator);
+    }
+
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var line_index: usize = 0;
+    var line_start_offset: usize = 0;
+    while (line_iter.next()) |line| {
+        defer line_start_offset += line.len + 1;
+        if (line.len == 0) continue;
+        var entry = parseEntry(line, allocator) catch |err| {
+            log.warn(
+                "loadEntriesAt: skipping corrupt entry at byte {d} of {s}: {s}",
+                .{ line_start_offset, path, @errorName(err) },
+            );
+            continue;
+        };
+        const previous_id: ?ulid.Ulid = if (entries.items.len > 0)
+            entries.items[entries.items.len - 1].id
+        else
+            null;
+        backfillEntry(&entry, previous_id, line_index);
+        try entries.append(allocator, entry);
+        line_index += 1;
+    }
+
+    return entries.toOwnedSlice(allocator);
 }
 
 /// Outcome of a session's crash-recovery pass. `actual_line_count` is the
@@ -2493,4 +2786,344 @@ test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
     try std.testing.expectEqual(EntryType.session_start, loaded[0].entry_type);
     try std.testing.expectEqualStrings("valid", loaded[1].content);
     try std.testing.expectEqualStrings("after", loaded[2].content);
+}
+
+test "SessionManager.deleteSession removes both .jsonl and .meta.json and is idempotent" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(id);
+    handle.close();
+
+    // Sanity: the session is listed before deletion.
+    {
+        const before = try mgr.listSessions();
+        defer allocator.free(before);
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+    }
+
+    try mgr.deleteSession(id);
+
+    const after = try mgr.listSessions();
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+
+    // Idempotent: a second delete on the same id is a no-op.
+    try mgr.deleteSession(id);
+
+    // The underlying files must actually be gone.
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{id});
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(jsonl_path, .{}));
+
+    var meta_path_buf: [256]u8 = undefined;
+    const meta_path = try std.fmt.bufPrint(&meta_path_buf, ".zag/sessions/{s}.meta.json", .{id});
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(meta_path, .{}));
+}
+
+test "listSessionsAt enumerates sessions for a non-cwd project root" {
+    const allocator = std.testing.allocator;
+
+    // Two tmp dirs simulate two distinct project roots. Create a session
+    // in the first via SessionManager (with that dir as cwd), then chdir
+    // away and confirm listSessionsAt finds it via the absolute path.
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        handle.close();
+    }
+
+    // Move cwd into project_b: from b's perspective, project_a is a
+    // foreign project root and listSessionsAt is the only way to see it.
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const sessions = try listSessionsAt(allocator, path_a);
+    defer allocator.free(sessions);
+
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("test-model", sessions[0].modelSlice());
+}
+
+test "listSessionsAt returns empty slice when project dir is missing" {
+    const allocator = std.testing.allocator;
+    const sessions = try listSessionsAt(allocator, "/no/such/path/zag-nonexistent");
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(@as(usize, 0), sessions.len);
+}
+
+test "deleteSessionAt removes session files under a non-cwd project root" {
+    const allocator = std.testing.allocator;
+
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    var id_owned: []u8 = undefined;
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        id_owned = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+        handle.close();
+    }
+    defer allocator.free(id_owned);
+
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try deleteSessionAt(path_a, id_owned);
+
+    const sessions = try listSessionsAt(allocator, path_a);
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(@as(usize, 0), sessions.len);
+
+    // Idempotent: a second delete on the same id is a no-op.
+    try deleteSessionAt(path_a, id_owned);
+
+    // Reject ids that try to escape.
+    try std.testing.expectError(error.InvalidSessionId, deleteSessionAt(path_a, "../etc/passwd"));
+}
+
+test "renameSessionAt updates meta name under a non-cwd project root" {
+    const allocator = std.testing.allocator;
+
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    var id_owned: []u8 = undefined;
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        id_owned = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+        handle.close();
+    }
+    defer allocator.free(id_owned);
+
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try renameSessionAt(allocator, path_a, id_owned, "renamed-cross-project");
+
+    const sessions = try listSessionsAt(allocator, path_a);
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("renamed-cross-project", sessions[0].nameSlice());
+
+    try std.testing.expectError(error.InvalidSessionId, renameSessionAt(allocator, path_a, "../bad", "x"));
+}
+
+// Locks in the documented contract on `renameSessionAt`: it deliberately
+// drops the `session_rename` audit row because it cannot hold the owning
+// SessionHandle's `append_mutex` from outside the writer process. If a
+// future change makes the audit row load-bearing, this test fails first
+// and forces the contract to be revisited.
+test "renameSessionAt does not append a session_rename audit entry" {
+    const allocator = std.testing.allocator;
+
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    var id_owned: []u8 = undefined;
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        id_owned = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+        handle.close();
+    }
+    defer allocator.free(id_owned);
+
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const before = try loadEntriesAt(allocator, path_a, id_owned);
+    defer {
+        for (before) |e| freeEntry(e, allocator);
+        allocator.free(before);
+    }
+    const before_count = before.len;
+
+    try renameSessionAt(allocator, path_a, id_owned, "audit-drop-check");
+
+    const after = try loadEntriesAt(allocator, path_a, id_owned);
+    defer {
+        for (after) |e| freeEntry(e, allocator);
+        allocator.free(after);
+    }
+    try std.testing.expectEqual(before_count, after.len);
+    for (after) |e| {
+        try std.testing.expect(e.entry_type != .session_rename);
+    }
+}
+
+test "SessionManager.loadSession rejects ids that try to escape the sessions dir" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+
+    try std.testing.expectError(error.InvalidSessionId, mgr.loadSession("../etc/passwd"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.loadSession("foo/bar"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.loadSession(""));
+}
+
+test "SessionManager.deleteSession rejects ids that try to escape the sessions dir" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+
+    try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession("../etc/passwd"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession("foo/bar"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession(""));
+}
+
+test "SessionManager.init records cwd in the global project registry" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    // Point the registry at a per-test home. SessionManager.init resolves
+    // the registry path as `$HOME/.config/zag/projects.json`, so swapping
+    // HOME for the duration of the test isolates the registry from the
+    // developer's real ~/.config/zag and from other tests.
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try SessionManager.init(allocator);
+    _ = &mgr;
+
+    // The registry file must exist at the expected path and contain the
+    // realpath'd cwd we just chdir'd into.
+    const registry_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/projects.json", .{fake_home});
+    defer allocator.free(registry_path);
+
+    const data = try std.fs.cwd().readFileAlloc(allocator, registry_path, 64 * 1024);
+    defer allocator.free(data);
+
+    // The cwd recorded in the registry is the canonicalized one. macOS
+    // tmpDir paths land under /private/var/..., and `tmp.dir.setAsCwd()`
+    // followed by `realpathAlloc(".")` returns that canonical form, so
+    // the registry entry must match `fake_home` byte-for-byte.
+    try std.testing.expect(std.mem.indexOf(u8, data, fake_home) != null);
+}
+
+test "SessionManager.init succeeds when HOME is unset" {
+    // A missing HOME must not prevent SessionManager.init from
+    // succeeding: the sidebar feature is best effort, session creation
+    // is not. The registry call hits error.EnvironmentVariableNotFound
+    // and is swallowed.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+
+    _ = unsetenv("HOME");
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try SessionManager.init(allocator);
+    _ = &mgr;
+}
+
+// `setenv(3)` / `unsetenv(3)` are POSIX. Zig 0.15's std does not expose a
+// portable `setEnvVar`, so tests reach for the C entry points directly.
+// This is test-only; production code reads HOME via `getEnvVarOwned`.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
+    var value_buf: [std.fs.max_path_bytes]u8 = undefined;
+    std.debug.assert(value.len + 1 <= value_buf.len);
+    @memcpy(value_buf[0..value.len], value);
+    value_buf[value.len] = 0;
+    _ = setenv(name.ptr, value_buf[0..value.len :0].ptr, 1);
+}
+
+fn restoreEnvForTest(name: [:0]const u8, prev: ?[]const u8) void {
+    if (prev) |p| {
+        setEnvForTest(name, p);
+    } else {
+        _ = unsetenv(name.ptr);
+    }
 }
