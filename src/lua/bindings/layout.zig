@@ -88,6 +88,12 @@ fn zagLayoutFocusFn(lua: *Lua) i32 {
 ///   * `"b<u32>"`: an opaque `BufferRegistry` handle string. The new
 ///     pane borrows that buffer by pointer; the registry keeps it
 ///     alive.
+///
+/// `opts.side` picks which side of the split the new pane occupies:
+///   * `"second"` (default): new pane lands right (vertical) or bottom
+///     (horizontal). Matches the legacy `<C-w>v` / `<C-w>s` behavior.
+///   * `"first"`: new pane lands left (vertical) or top (horizontal).
+///     Used by the sessions sidebar to anchor itself on the left.
 fn zagLayoutSplitFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
     const wm = engine.window_manager orelse {
@@ -108,13 +114,35 @@ fn zagLayoutSplitFn(lua: *Lua) i32 {
         lua.raiseErrorStr("zag.layout.split: direction must be \"horizontal\" or \"vertical\"", .{});
     };
 
-    // Optional opts table at arg 3: `{ buffer = <selector> }`. The
-    // selector is either a table (legacy `{ type = "conversation" }`)
-    // or a string (`"b<u32>"` handle). Anything else raises so the
-    // caller sees the failure on the first call, not later when the
-    // pane shows up empty.
+    // Optional opts table at arg 3: `{ buffer = <selector>, side = ... }`.
+    // The `buffer` selector is either a table (legacy `{ type = "conversation" }`)
+    // or a string (`"b<u32>"` handle). The `side` field picks first/second
+    // child placement. Anything else raises so the caller sees the failure
+    // on the first call, not later when the pane shows up empty.
     var attached: ?WindowManager.AttachedSurface = null;
+    var side: Layout.Side = .second;
     if (lua.isTable(3)) {
+        _ = lua.getField(3, "side");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.split: side must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "first")) {
+                    side = .first;
+                } else if (std.mem.eql(u8, s, "second")) {
+                    side = .second;
+                } else {
+                    lua.raiseErrorStr("zag.layout.split: side must be \"first\" or \"second\"", .{});
+                }
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.split: side must be a string", .{});
+            },
+        }
+        lua.pop(1);
+
         _ = lua.getField(3, "buffer");
         defer lua.pop(1);
         switch (lua.typeOf(-1)) {
@@ -155,7 +183,7 @@ fn zagLayoutSplitFn(lua: *Lua) i32 {
         }
     }
 
-    const new_handle = wm.splitById(handle, direction, attached) catch |err| {
+    const new_handle = wm.splitByIdSide(handle, direction, attached, side) catch |err| {
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split: {s}", .{@errorName(err)}) catch "zag.layout.split failed";
         lua.raiseErrorStr("%s", .{msg.ptr});

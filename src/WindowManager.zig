@@ -851,6 +851,21 @@ pub fn splitById(
     direction: Layout.SplitDirection,
     attached: ?AttachedSurface,
 ) !NodeRegistry.Handle {
+    return self.splitByIdSide(handle, direction, attached, .second);
+}
+
+/// Variant of `splitById` that lets the caller pick which side of the
+/// new split the freshly-attached pane occupies. `.second` matches the
+/// legacy `splitById` behavior (new pane goes right/bottom); `.first`
+/// flips the order so the new pane is the left/top child. Used by the
+/// sessions sidebar plugin to anchor itself on the left.
+pub fn splitByIdSide(
+    self: *WindowManager,
+    handle: NodeRegistry.Handle,
+    direction: Layout.SplitDirection,
+    attached: ?AttachedSurface,
+    side: Layout.Side,
+) !NodeRegistry.Handle {
     const target = try self.node_registry.resolve(handle);
     if (target.* != .leaf) return error.NotALeaf;
 
@@ -859,9 +874,9 @@ pub fn splitById(
     defer self.layout.focused = prev_focus;
 
     if (attached) |a| {
-        try self.doSplitWithBuffer(direction, a);
+        try self.doSplitWithBuffer(direction, a, side);
     } else {
-        self.doSplit(direction);
+        self.doSplitSide(direction, side);
     }
 
     // `doSplit*` leaves focus on the new leaf. Look its handle up in the
@@ -1337,6 +1352,14 @@ pub fn modeAfterKey(
 
 /// Split the focused window, creating a new pane with its own session.
 pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
+    self.doSplitSide(direction, .second);
+}
+
+/// `doSplit` with explicit side selection. The keymap-driven splits
+/// (`.split_vertical`, `.split_horizontal`) always go through `.second`
+/// for backwards compatibility; the sessions sidebar takes the `.first`
+/// path via `splitByIdSide`.
+pub fn doSplitSide(self: *WindowManager, direction: Layout.SplitDirection, side: Layout.Side) void {
     // Capture the label that createSplitPane is about to consume so the
     // announce below matches the new pane's name.
     const scratch_id = self.next_scratch_id;
@@ -1351,8 +1374,8 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     const split_entry = self.extra_panes.items[self.extra_panes.items.len - 1];
     const surface: Layout.Surface = .{ .buffer = pane.buffer, .view = pane.view, .viewport = &split_entry.pane.viewport };
     const split = switch (direction) {
-        .vertical => self.layout.splitVertical(0.5, surface),
-        .horizontal => self.layout.splitHorizontal(0.5, surface),
+        .vertical => self.layout.splitVerticalSide(0.5, surface, side),
+        .horizontal => self.layout.splitHorizontalSide(0.5, surface, side),
     };
     split catch |err| {
         log.warn("split failed: {}", .{err});
@@ -1405,6 +1428,7 @@ pub fn doSplitWithBuffer(
     self: *WindowManager,
     direction: Layout.SplitDirection,
     attached: AttachedSurface,
+    side: Layout.Side,
 ) !void {
     const prev_focus = self.layout.getFocusedLeaf();
 
@@ -1431,8 +1455,8 @@ pub fn doSplitWithBuffer(
     errdefer _ = self.extra_panes.pop();
 
     switch (direction) {
-        .vertical => try self.layout.splitVertical(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }),
-        .horizontal => try self.layout.splitHorizontal(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }),
+        .vertical => try self.layout.splitVerticalSide(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }, side),
+        .horizontal => try self.layout.splitHorizontalSide(0.5, .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport }, side),
     }
 
     // Stamp the new leaf's stable handle onto the entry's pane so
