@@ -230,6 +230,18 @@ pub const LuaEngine = struct {
     /// fires compaction earlier; smaller fires later. Zero disables
     /// the room buffer (estimator still gates the call).
     compact_reserve_tokens: u32 = @import("agent.zig").DEFAULT_RESERVE_TOKENS,
+    /// Borrowed pointer to the Provider currently driving the agent
+    /// loop. `runLoopStreaming` sets this on entry and clears it on
+    /// exit (defer); the pointer must outlive any in-flight
+    /// `zag.llm.complete` Job (the worker pool joins on shutdown, so
+    /// the borrow is safe for the call duration). Null when no agent
+    /// loop is attached — `zag.llm.complete` errors in that case
+    /// rather than guessing a default.
+    current_provider: ?*const @import("llm.zig").Provider = null,
+    /// Borrowed `ModelSpec` matching `current_provider`. Used to tag
+    /// telemetry and (eventually) to honour per-model overrides in
+    /// `zag.llm.complete`. Cleared alongside `current_provider`.
+    current_model_spec: ?@import("llm.zig").ModelSpec = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -745,11 +757,19 @@ pub const LuaEngine = struct {
         sockets_bindings.registerLoopTable(lua);
 
         // zag.compact; namespace for context-compaction sockets. Today
-        // only `strategy(fn)` (single global pre-callLlm hook fired at
-        // the high-water threshold). The strategy returns a replacement
-        // message array (installed in place of the existing history) or
-        // nil (skip this turn). Stack: [zag_table].
+        // `strategy(fn)` (single global pre-callLlm hook fired when the
+        // predictive estimator trips the room-based threshold) and
+        // `set_reserve_tokens(n)` (tunes that threshold). Stack:
+        // [zag_table].
         sockets_bindings.registerCompactTable(lua);
+
+        // zag.llm; namespace for direct LLM access from plugins. Today
+        // only `complete{system, messages, max_tokens}` (one-shot
+        // completion via the engine's currently-attached provider).
+        // Yields the coroutine; resumes with the response text. Used
+        // by the default compaction strategy to produce structured
+        // summaries. Stack: [zag_table].
+        @import("lua/bindings/llm.zig").registerLlmTable(lua);
 
         // zag.width; grapheme-aware terminal-cell width measurement. Plugins
         // doing column alignment (e.g. popup-completion menus with mixed
@@ -10489,6 +10509,35 @@ test "zag.compact.strategy registers a single global handler" {
         \\zag.compact.strategy(function(ctx) return nil end)
     );
     try std.testing.expect(engine.compactHandler() != null);
+}
+
+test "zag.llm.complete is registered as a callable on the zag table" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Probe via Lua: the table and the field must exist as a function.
+    // Calling it without a coroutine would error at the yieldable
+    // check, so we just inspect the type.
+    try engine.lua.doString(
+        \\assert(type(zag.llm) == "table", "zag.llm table missing")
+        \\assert(type(zag.llm.complete) == "function", "zag.llm.complete missing")
+    );
+}
+
+test "zag.llm.complete rejects calls from outside a coroutine" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // No coroutine, no agent loop. The yieldable check must trip first
+    // and surface as a Lua error.
+    try engine.lua.doString(
+        \\local ok, err = pcall(function() zag.llm.complete({system="x", messages={{role="user", content="hi"}}}) end)
+        \\if ok then error("expected zag.llm.complete to raise outside a coroutine") end
+    );
 }
 
 test "zag.compact.set_reserve_tokens writes engine.compact_reserve_tokens" {

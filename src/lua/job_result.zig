@@ -267,6 +267,29 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
             co.pushNil();
             return 2;
         },
+        .llm_complete => {
+            // Success: push the assembled response text, then free the
+            // engine-allocated slice. Lua copied via pushString.
+            const r = blk: {
+                if (job.result) |res| switch (res) {
+                    .llm_complete => |lr| break :blk lr,
+                    else => {},
+                };
+                co.pushNil();
+                _ = co.pushString("io_error: llm_complete missing result");
+                return 2;
+            };
+            co.newTable();
+            _ = co.pushString(r.text);
+            co.setField(-2, "text");
+            co.pushInteger(@intCast(r.input_tokens));
+            co.setField(-2, "input_tokens");
+            co.pushInteger(@intCast(r.output_tokens));
+            co.setField(-2, "output_tokens");
+            allocator.free(r.text);
+            co.pushNil();
+            return 2;
+        },
     }
 }
 

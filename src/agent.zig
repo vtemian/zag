@@ -122,6 +122,22 @@ pub fn runLoopStreaming(
     tools.lua_request_queue = queue;
     defer tools.lua_request_queue = null;
 
+    // Attach the live Provider + ModelSpec to the engine so Lua-side
+    // primitives (`zag.llm.complete` today, more later) can issue
+    // out-of-band completions during the loop. Provider is borrowed;
+    // `provider` here is a value type whose vtable points at the
+    // stable per-thread state, so taking its address is safe for the
+    // entire `runLoopStreaming` lifetime. The defer clears both fields
+    // on exit so a stale pointer can't survive into a later call.
+    if (lua_engine) |engine| {
+        engine.current_provider = &provider;
+        engine.current_model_spec = model_spec;
+    }
+    defer if (lua_engine) |engine| {
+        engine.current_provider = null;
+        engine.current_model_spec = null;
+    };
+
     // Loop-detector state: track the most recent (name, input) pair and a
     // streak counter so `zag.loop.detect` can flag repeated identical
     // tool calls. Owned here for the duration of the run; `last_input`

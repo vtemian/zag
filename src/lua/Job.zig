@@ -285,6 +285,54 @@ pub const FsStatResult = struct {
     mode: u32,
 };
 
+/// One conversation message handed to `zag.llm.complete`. The Lua
+/// binding deep-copies the role string and content text into the
+/// caller's primitive_arena; the worker reconstructs `types.Message`
+/// values pointing into the same arena before calling the provider.
+pub const LlmCompleteMessage = struct {
+    /// One of "user" or "assistant" (lowercase). Borrowed from the
+    /// caller's arena.
+    role: []const u8,
+    /// Concatenated text content for this turn. Borrowed from the
+    /// caller's arena. The binding accepts both a bare string and a
+    /// `{{type="text", text="..."}, ...}` block array; in either case
+    /// the worker sees a flat string.
+    text: []const u8,
+};
+
+/// Payload for an `llm_complete` job. The Lua binding allocates the
+/// arrays into the caller's primitive_arena; the worker borrows them
+/// for the duration of `provider.call`. `provider` is the engine's
+/// currently-attached provider (set by `runLoopStreaming`); the worker
+/// must not retain it past the call.
+pub const LlmCompleteSpec = struct {
+    /// System prompt (joined stable + volatile). Borrowed from the
+    /// caller's arena. Empty string means "no system prompt".
+    system: []const u8 = "",
+    /// Conversation history in chronological order. Borrowed.
+    messages: []const LlmCompleteMessage,
+    /// Optional max_tokens override; null means "let provider pick".
+    max_tokens: ?u32 = null,
+    /// Borrowed pointer to the engine's currently-attached Provider.
+    /// Pinned for the lifetime of the job by `LuaEngine.current_provider`
+    /// which `runLoopStreaming` sets at agent-loop entry and clears at
+    /// exit. The worker calls `provider.call(&req)` and never frees.
+    provider: *const @import("../llm.zig").Provider,
+    /// Model id for telemetry; borrowed. Empty when no model is
+    /// attached.
+    model_id: []const u8 = "",
+};
+
+/// Success payload for an `llm_complete` job. `text` is the
+/// concatenation of every text content block from the assistant's
+/// response. Heap-allocated on the engine allocator; freed by
+/// `pushJobResultOntoStack` after `pushString` copies into Lua.
+pub const LlmCompleteResult = struct {
+    text: []const u8,
+    input_tokens: u32 = 0,
+    output_tokens: u32 = 0,
+};
+
 /// What the worker should do with this job. The scheduler fills this in
 /// before submit.
 pub const JobKind = union(enum) {
@@ -328,6 +376,10 @@ pub const JobKind = union(enum) {
     fs_remove: FsRemoveSpec,
     fs_list: FsListSpec,
     fs_stat: FsStatSpec,
+    /// One-shot LLM completion. Worker lives in `primitives/llm.zig`;
+    /// reads the engine's currently-attached provider and synchronously
+    /// invokes `provider.call(req)` on the pool thread.
+    llm_complete: LlmCompleteSpec,
 };
 
 /// Success payload handed back to the coroutine on resume. `.empty` means
@@ -339,6 +391,7 @@ pub const JobResult = union(enum) {
     fs_read: FsReadResult,
     fs_list: FsListResult,
     fs_stat: FsStatResult,
+    llm_complete: LlmCompleteResult,
 };
 
 /// Stable string tag surfaced to Lua on failure. The strings are part of

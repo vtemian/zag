@@ -145,6 +145,7 @@ fn executeJob(alloc: Allocator, job: *Job) void {
         .fs_remove => @import("primitives/fs.zig").executeRemove(alloc, job),
         .fs_list => @import("primitives/fs.zig").executeList(alloc, job),
         .fs_stat => @import("primitives/fs.zig").executeStat(alloc, job),
+        .llm_complete => @import("primitives/llm.zig").executeLlmComplete(alloc, job),
         // CmdHandle helper threads synthesise these kinds directly
         // onto the completion queue; the pool never dispatches them.
         // Seeing one here is a programmer bug. Handle each variant
