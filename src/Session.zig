@@ -2951,6 +2951,58 @@ test "renameSessionAt updates meta name under a non-cwd project root" {
     try std.testing.expectError(error.InvalidSessionId, renameSessionAt(allocator, path_a, "../bad", "x"));
 }
 
+// Locks in the documented contract on `renameSessionAt`: it deliberately
+// drops the `session_rename` audit row because it cannot hold the owning
+// SessionHandle's `append_mutex` from outside the writer process. If a
+// future change makes the audit row load-bearing, this test fails first
+// and forces the contract to be revisited.
+test "renameSessionAt does not append a session_rename audit entry" {
+    const allocator = std.testing.allocator;
+
+    var project_a = std.testing.tmpDir(.{});
+    defer project_a.cleanup();
+    var project_b = std.testing.tmpDir(.{});
+    defer project_b.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+
+    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_a);
+
+    try project_a.dir.setAsCwd();
+    var id_owned: []u8 = undefined;
+    {
+        var mgr = try SessionManager.init(allocator);
+        var handle = try mgr.createSession("test-model");
+        id_owned = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+        handle.close();
+    }
+    defer allocator.free(id_owned);
+
+    try project_b.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const before = try loadEntriesAt(allocator, path_a, id_owned);
+    defer {
+        for (before) |e| freeEntry(e, allocator);
+        allocator.free(before);
+    }
+    const before_count = before.len;
+
+    try renameSessionAt(allocator, path_a, id_owned, "audit-drop-check");
+
+    const after = try loadEntriesAt(allocator, path_a, id_owned);
+    defer {
+        for (after) |e| freeEntry(e, allocator);
+        allocator.free(after);
+    }
+    try std.testing.expectEqual(before_count, after.len);
+    for (after) |e| {
+        try std.testing.expect(e.entry_type != .session_rename);
+    }
+}
+
 test "SessionManager.loadSession rejects ids that try to escape the sessions dir" {
     const allocator = std.testing.allocator;
 
