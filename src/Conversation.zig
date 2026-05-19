@@ -221,6 +221,46 @@ pub fn appendNode(self: *Conversation, parent: ?*Node, node_type: NodeType, cont
         self.notifyChildChanged();
         return node;
     }
+
+    return self.appendNonToolCallNode(parent, node_type, content);
+}
+
+/// Append a tool_call node carrying the provider's `tool_use_id` so the
+/// wire projection can echo the model's original id verbatim instead of
+/// minting `synth_N`. `tool_use_id` may be null for legacy callers that
+/// don't have a real id at hand; projection falls back to synth in that
+/// case. Use this from BufferSink (live stream) and `handleLoadedEntry`
+/// (JSONL replay) rather than the bare `appendNode` so tool ids survive
+/// the round-trip through the tree end-to-end.
+pub fn appendToolCallNode(
+    self: *Conversation,
+    parent: ?*Node,
+    tool_name: []const u8,
+    tool_use_id: ?[]const u8,
+) !*Node {
+    const node = try self.tree.appendNode(parent, .tool_call);
+    errdefer self.tree.removeNode(node);
+
+    node.custom_tag = try self.allocator.dupe(u8, tool_name);
+    errdefer if (node.custom_tag) |tag| {
+        self.allocator.free(tag);
+        node.custom_tag = null;
+    };
+
+    if (tool_use_id) |id| {
+        node.tool_use_id = try self.allocator.dupe(u8, id);
+    }
+
+    self.notifyChildChanged();
+    return node;
+}
+
+fn appendNonToolCallNode(
+    self: *Conversation,
+    parent: ?*Node,
+    node_type: NodeType,
+    content: []const u8,
+) !*Node {
     const handle = try self.buffer_registry.createText(@tagName(node_type));
     errdefer self.buffer_registry.remove(handle) catch {};
     const tb = try self.buffer_registry.asText(handle);
@@ -530,10 +570,12 @@ fn handleLoadedEntry(
         .user_message => _ = try self.appendNode(null, .user_message, entry.content),
         .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
         .tool_call => {
-            const node = try self.appendNode(null, .tool_call, entry.tool_name);
-            // Match the live BufferSink path: tool_calls reload collapsed
-            // so prior turns read as compact `[tool] foo` headers, with
-            // Ctrl-R as the opt-in to inspect the body.
+            // Carry the JSONL-persisted `tool_use_id` onto the tree so the
+            // wire projection echoes the model's original ids (matching
+            // what the live BufferSink path does for in-flight turns).
+            // Legacy rows without the field fall back to projection-side
+            // synth_N.
+            const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id);
             node.collapsed = true;
             last_tool_call.* = node;
         },
@@ -564,7 +606,7 @@ fn handleLoadedEntry(
         // delegation in the JSONL stream.
         .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
         .task_tool_use => {
-            const node = try self.appendNode(null, .tool_call, entry.tool_name);
+            const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id);
             node.collapsed = true;
             last_tool_call.* = node;
         },
@@ -998,10 +1040,21 @@ fn projectNode(
             // JSON is not preserved on the node, so the projection rebuilds
             // a permissive `{}` payload (matching ConversationHistory.rebuildMessages).
             const tool_name = node.custom_tag orelse "";
-            var scratch: [32]u8 = undefined;
-            const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{state.tool_id_counter});
-            state.tool_id_counter += 1;
-            const duped_id = try state.arena.dupe(u8, synthetic_id);
+            // Prefer the real provider id when the BufferSink (live) or
+            // JSONL replay populated it on the node. Falling back to
+            // synth_N is correct for legacy sessions that predate the
+            // typed `tool_use_id` field but is a real bug magnet on
+            // strict OpenAI-compatible providers (Kimi K2.6, Moonshot)
+            // because the next-turn request will mix synth-from-projection
+            // with real-from-live ids and the server rejects the pair.
+            const duped_id = if (node.tool_use_id) |id|
+                try state.arena.dupe(u8, id)
+            else blk: {
+                var scratch: [32]u8 = undefined;
+                const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{state.tool_id_counter});
+                state.tool_id_counter += 1;
+                break :blk try state.arena.dupe(u8, synthetic_id);
+            };
             const duped_name = try state.arena.dupe(u8, tool_name);
             const duped_input = try state.arena.dupe(u8, "{}");
             try state.assistant_blocks.append(state.arena, .{ .tool_use = .{
@@ -1667,6 +1720,92 @@ test "loadFromEntries builds node tree from session entries" {
     try std.testing.expectEqual(NodeType.tool_result, cb.tree.root_children.items[2].children.items[0].node_type);
 }
 
+test "loadFromEntries + toWireMessages round-trips real provider tool_use_id" {
+    // Resume path: a session JSONL row of `{ entry_type: tool_call,
+    // tool_name: "bash", tool_use_id: "bash:0" }` must land on the
+    // tree's typed `tool_use_id` field so the projection emits the
+    // model's original id on the next-turn request instead of minting
+    // `synth_0`. Without this the live agent loop appends new turns
+    // with real Kimi ids while projection rewrites history with synth
+    // ids, and strict providers (Moonshot/Kimi K2.6) reject the
+    // resulting wire as "tool_call_ids did not have response messages".
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(allocator, 0, "resume-real-id");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "run 2 in parallel", .timestamp = 0 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .tool_use_id = "bash:0", .timestamp = 1 },
+        .{ .entry_type = .tool_result, .content = "ok0", .tool_use_id = "bash:0", .timestamp = 2 },
+        .{ .entry_type = .tool_call, .tool_name = "read", .tool_use_id = "read:1", .timestamp = 3 },
+        .{ .entry_type = .tool_result, .content = "ok1", .tool_use_id = "read:1", .timestamp = 4 },
+    };
+
+    try cb.loadFromEntries(&entries);
+
+    const messages = try cb.toWireMessages(arena.allocator());
+
+    var saw_bash_0 = false;
+    var saw_read_1 = false;
+    var saw_bash_0_result = false;
+    var saw_read_1_result = false;
+    for (messages.items) |msg| {
+        for (msg.content) |block| {
+            switch (block) {
+                .tool_use => |tu| {
+                    if (std.mem.eql(u8, tu.id, "bash:0")) saw_bash_0 = true;
+                    if (std.mem.eql(u8, tu.id, "read:1")) saw_read_1 = true;
+                    if (std.mem.startsWith(u8, tu.id, "synth_")) return error.UnexpectedSynthId;
+                },
+                .tool_result => |tr| {
+                    if (std.mem.eql(u8, tr.tool_use_id, "bash:0")) saw_bash_0_result = true;
+                    if (std.mem.eql(u8, tr.tool_use_id, "read:1")) saw_read_1_result = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_bash_0);
+    try std.testing.expect(saw_read_1);
+    try std.testing.expect(saw_bash_0_result);
+    try std.testing.expect(saw_read_1_result);
+}
+
+test "loadFromEntries: legacy tool_call without tool_use_id still falls back to synth" {
+    // Pre-typed-field JSONL rows have no `tool_use_id`. Projection must
+    // keep the historical synth_N fallback so old sessions still resume
+    // cleanly; only when the field is present does the real id take
+    // priority.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(allocator, 0, "resume-legacy");
+    defer cb.deinit();
+
+    const entries = [_]Session.Entry{
+        .{ .entry_type = .user_message, .content = "run", .timestamp = 0 },
+        .{ .entry_type = .tool_call, .tool_name = "bash", .timestamp = 1 },
+        .{ .entry_type = .tool_result, .content = "ok", .timestamp = 2 },
+    };
+    try cb.loadFromEntries(&entries);
+
+    const messages = try cb.toWireMessages(arena.allocator());
+
+    var found_synth = false;
+    for (messages.items) |msg| {
+        for (msg.content) |block| {
+            if (block == .tool_use and std.mem.startsWith(u8, block.tool_use.id, "synth_")) {
+                found_synth = true;
+            }
+        }
+    }
+    try std.testing.expect(found_synth);
+}
+
 test "loadFromEntries surfaces thinking and thinking_redacted as collapsed nodes" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "thinking-load");
@@ -2277,6 +2416,69 @@ test "toWireMessages: tool_call/tool_result pairing emits assistant tool_use the
     try std.testing.expectEqual(@as(usize, 1), tool_msg.content.len);
     try std.testing.expectEqualStrings(synth_id, tool_msg.content[0].tool_result.tool_use_id);
     try std.testing.expectEqualStrings("ok", tool_msg.content[0].tool_result.content);
+}
+
+test "toWireMessages: preserves provider tool_use_id when set on node" {
+    // Regression: a Kimi K2.6 session in zag would fail next-turn requests
+    // with "tool_call_ids did not have response messages: bash:0, read:1, ..."
+    // because the conversation tree dropped the provider's tool_use_id on
+    // append (only the tool name landed on custom_tag), so projection had
+    // to synthesize fresh `synth_N` ids every submit. Once the live agent
+    // loop appended a fresh assistant turn whose tool_calls echoed back
+    // through to the provider, the in-flight wire mixed real and synth ids
+    // and the strict OpenAI-compatible validator rejected the request.
+    //
+    // Pin the contract: when the node carries a real provider id, the
+    // projection MUST emit it verbatim, on both the assistant tool_use
+    // block and the paired user tool_result block.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "use 3 tools in parallel");
+    // Three parallel tool_calls with real Kimi-style ids.
+    const c0 = try cb.appendToolCallNode(null, "bash", "bash:0");
+    _ = try cb.appendNode(c0, .tool_result, "ok0");
+    const c1 = try cb.appendToolCallNode(null, "read", "read:1");
+    _ = try cb.appendNode(c1, .tool_result, "ok1");
+    const c2 = try cb.appendToolCallNode(null, "read", "read:2");
+    _ = try cb.appendNode(c2, .tool_result, "ok2");
+
+    const messages = try cb.toWireMessages(arena.allocator());
+
+    // Walk the projection and collect every emitted tool_use id and every
+    // tool_result tool_use_id. Each tool_use must pair with a matching
+    // tool_result by id, and the ids must be the real provider strings.
+    const expected_ids = [_][]const u8{ "bash:0", "read:1", "read:2" };
+    var tool_use_ids: [3][]const u8 = undefined;
+    var tool_use_count: usize = 0;
+    var tool_result_ids: [3][]const u8 = undefined;
+    var tool_result_count: usize = 0;
+    for (messages.items) |msg| {
+        for (msg.content) |block| {
+            switch (block) {
+                .tool_use => |tu| {
+                    if (tool_use_count >= 3) return error.TooManyToolUses;
+                    tool_use_ids[tool_use_count] = tu.id;
+                    tool_use_count += 1;
+                },
+                .tool_result => |tr| {
+                    if (tool_result_count >= 3) return error.TooManyToolResults;
+                    tool_result_ids[tool_result_count] = tr.tool_use_id;
+                    tool_result_count += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), tool_use_count);
+    try std.testing.expectEqual(@as(usize, 3), tool_result_count);
+    for (expected_ids, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, tool_use_ids[i]);
+        try std.testing.expectEqualStrings(want, tool_result_ids[i]);
+    }
 }
 
 test "toWireMessages: status nodes are skipped from the projection" {

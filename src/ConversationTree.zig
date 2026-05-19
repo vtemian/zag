@@ -62,6 +62,15 @@ pub const Node = struct {
     /// holds tool_call metadata (tool name) until Phase D's typed
     /// metadata field replaces it. Owned when set; freed in `deinit`.
     custom_tag: ?[]const u8 = null,
+    /// Provider-issued tool_use_id for `tool_call` nodes (e.g. Kimi's
+    /// `<name>:<index>`, Anthropic's `toolu_01...`). Owned when set;
+    /// freed in `deinit`. Read by `Conversation.projectNode` so the
+    /// wire projection echoes the model's original ids back instead of
+    /// synthesizing `synth_N` placeholders that drift from what live
+    /// turns produce. Null for legacy nodes loaded from JSONL that
+    /// predates the field, in which case projection falls back to
+    /// synth ids.
+    tool_use_id: ?[]const u8 = null,
     /// Optional handle into the WindowManager's BufferRegistry. When
     /// set, this node's content lives in a TextBuffer (or ImageBuffer
     /// for image tool_result nodes) referenced by the handle. Tool_call
@@ -111,6 +120,7 @@ pub const Node = struct {
         }
         self.children.deinit(allocator);
         if (self.custom_tag) |tag| allocator.free(tag);
+        if (self.tool_use_id) |id| allocator.free(id);
         if (self.subagent_name) |name| allocator.free(name);
         if (self.subagent_prompt) |p| allocator.free(p);
     }

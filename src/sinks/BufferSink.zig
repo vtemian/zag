@@ -127,7 +127,12 @@ pub const BufferSink = struct {
                 // opening a tool call, otherwise later deltas mis-parent.
                 self.current_assistant_node = null;
                 self.current_thinking_node = null;
-                const node = self.buffer.appendNode(null, .tool_call, e.name) catch return;
+                // Pair the live provider id onto the node itself (Kimi's
+                // `<name>:<index>`, Anthropic's `toolu_*`, ...). The wire
+                // projection reads it back through `Conversation.projectNode`
+                // so the next-turn request echoes the model's original ids
+                // verbatim, keeping the live and projected paths consistent.
+                const node = self.buffer.appendToolCallNode(null, e.name, e.call_id) catch return;
                 node.collapsed = true;
                 self.last_tool_call = node;
                 if (e.call_id) |id| {
