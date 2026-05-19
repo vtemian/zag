@@ -78,6 +78,11 @@ cache: NodeLineCache,
 /// triggered this error" UIs and lets popup helpers operate on
 /// either buffer kind without branching.
 row_styles: std.AutoHashMapUnmanaged(u32, Theme.HighlightSlot) = .empty,
+/// Blank lines inserted between root-level nodes (turns) during
+/// rendering. Decoupled from `Theme.spacing.turn_gap` so that
+/// `lineCount` (no theme in the vtable) stays in sync with
+/// `getVisibleLines` without a cross-cutting signature change.
+turn_gap: u16 = 1,
 /// Owned BufferRegistry that holds the per-node TextBuffer (and
 /// ImageBuffer) storage for every content-bearing node in this
 /// conversation. Constructed in `init` and torn down in `deinit`;
@@ -326,9 +331,22 @@ pub fn getVisibleLines(
     var skipped: usize = 0;
     var collected: usize = 0;
 
-    for (self.tree.root_children.items) |node| {
+    for (self.tree.root_children.items, 0..) |node, i| {
         if (collected >= max_lines) break;
         try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected, &self.buffer_registry);
+
+        // Insert turn gap between root-level nodes (turns), but not after the last one.
+        if (i < self.tree.root_children.items.len - 1) {
+            for (0..self.turn_gap) |_| {
+                if (collected >= max_lines) break;
+                if (skipped < skip) {
+                    skipped += 1;
+                } else {
+                    try lines.append(frame_alloc, try Theme.emptyStyledLine(frame_alloc));
+                    collected += 1;
+                }
+            }
+        }
     }
 
     // Stamp row-background overrides keyed by absolute visible-row
@@ -433,8 +451,12 @@ fn collectVisibleLines(
 /// Count the total number of visible lines (including children of non-collapsed nodes).
 pub fn lineCount(self: *const Conversation) !usize {
     var count: usize = 0;
-    for (self.tree.root_children.items) |node| {
+    const root_items = self.tree.root_children.items;
+    for (root_items, 0..) |node, i| {
         count += try countVisibleLines(node, &self.renderer, &self.buffer_registry);
+        if (i < root_items.len - 1) {
+            count += self.turn_gap;
+        }
     }
     return count;
 }
