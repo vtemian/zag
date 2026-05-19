@@ -63,6 +63,108 @@ function M.open()
     })
     state.pane_id = pane_id
 
+    M._bind_keymaps()
+    M._render()
+end
+
+-- Bind buffer-local keymaps for sidebar navigation. Every binding
+-- carries `buffer = state.buffer_id` so it only fires when the sidebar
+-- buffer holds keyboard focus; the registry's two-pass lookup (see
+-- src/Keymap.zig: `lookup`) means the user's global `j`/`k` for pane
+-- focus still works in every other buffer. Each id is stashed in
+-- state.keymap_ids so M.close() can unbind them as a set.
+function M._bind_keymaps()
+    if not state.buffer_id then return end
+    local buf = state.buffer_id
+
+    local function add(spec)
+        spec.buffer = buf
+        spec.mode = spec.mode or "normal"
+        local id = zag.keymap(spec)
+        table.insert(state.keymap_ids, id)
+    end
+
+    add { key = "j",     fn = M._cursor_down }
+    add { key = "k",     fn = M._cursor_up }
+    add { key = "<CR>",  fn = M._activate }
+    add { key = "l",     fn = M._expand }
+    add { key = "h",     fn = M._collapse }
+    add { key = "q",     fn = M.close }
+    -- Keymap.zig has no multi-keystroke chord support today, so the
+    -- vim `gg` is unbindable. Capital G (a single Shift-G chord) is.
+    -- TODO: bind `gg` once Keymap.Registry grows a prefix table.
+    add { key = "<S-g>", fn = M._jump_last }
+end
+
+-- Move the cursor down one row, clamped to the last rendered row.
+-- Re-renders so the highlight tracks the cursor.
+function M._cursor_down()
+    local last = #state.last_render
+    if last == 0 then return end
+    if state.cursor_row < last then
+        state.cursor_row = state.cursor_row + 1
+    end
+    M._render()
+end
+
+-- Move the cursor up one row, clamped to row 1.
+function M._cursor_up()
+    if state.cursor_row > 1 then
+        state.cursor_row = state.cursor_row - 1
+    end
+    M._render()
+end
+
+-- Activate the row under the cursor. For session rows this should
+-- swap the host pane's bound session; the underlying
+-- `zag.sessions.open` is Task 1.4b and may not be wired yet, in which
+-- case we log a debug line and leave a TODO marker rather than crash.
+function M._activate()
+    local row = state.last_render[state.cursor_row]
+    if not row or row.kind ~= "session" then return end
+    -- TODO(1.4b): replace this guarded call with a direct
+    -- `zag.sessions.open(row.session_id, row.project)` once the
+    -- binding lands.
+    if zag.sessions and type(zag.sessions.open) == "function" then
+        zag.sessions.open(row.session_id, row.project)
+    else
+        zag.log.debug("sessions sidebar: activate %s (zag.sessions.open not wired yet)",
+            tostring(row.session_id))
+    end
+end
+
+-- Mark the highlighted session as expanded. The expanded set is
+-- keyed by session_id so it survives across re-renders triggered by
+-- SessionListChanged (Task 4.3).
+function M._expand()
+    local row = state.last_render[state.cursor_row]
+    if not row or row.kind ~= "session" then return end
+    state.expanded[row.session_id] = true
+    M._render()
+end
+
+-- Collapse the highlighted session by dropping its entry from
+-- state.expanded. We use `nil` rather than `false` so `next(expanded)`
+-- still reports an empty table.
+function M._collapse()
+    local row = state.last_render[state.cursor_row]
+    if not row or row.kind ~= "session" then return end
+    state.expanded[row.session_id] = nil
+    M._render()
+end
+
+-- Cursor to row 1. Bound to `gg` in vim, but Keymap.zig has no chord
+-- support yet, so we keep the handler for future use and bind only
+-- `G` for now (see _bind_keymaps).
+function M._jump_first()
+    state.cursor_row = 1
+    M._render()
+end
+
+-- Cursor to the last rendered row.
+function M._jump_last()
+    local last = #state.last_render
+    state.cursor_row = last > 0 and last or 1
     M._render()
 end
 

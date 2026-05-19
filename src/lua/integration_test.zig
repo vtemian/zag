@@ -707,6 +707,164 @@ test "sessions sidebar renders one row per session and filters by name" {
     );
 }
 
+// Task 4.2: navigation handlers move the cursor, clamp at the ends of
+// the rendered list, and `l`/`h` flip the per-session expanded flag.
+// We invoke the underlying handlers directly because the headless
+// harness has no TUI to inject keystrokes through; the keymap bindings
+// themselves are tested by the focused-buffer dispatch tests in
+// `Keymap.zig` and `WindowManager.zig`.
+test "sessions sidebar navigation handlers move and clamp the cursor" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_a = try mgr.createSession("test-model");
+    const a_id = try allocator.dupe(u8, h_a.id[0..h_a.id_len]);
+    defer allocator.free(a_id);
+    h_a.close();
+    var h_b = try mgr.createSession("test-model");
+    const b_id = try allocator.dupe(u8, h_b.id[0..h_b.id_len]);
+    defer allocator.free(b_id);
+    h_b.close();
+    var h_c = try mgr.createSession("test-model");
+    const c_id = try allocator.dupe(u8, h_c.id[0..h_c.id_len]);
+    defer allocator.free(c_id);
+    h_c.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(a_id);
+    engine.lua.setGlobal("_test_a_id");
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\assert(#st.last_render == 3,
+        \\       "expected 3 rendered rows, got " .. tostring(#st.last_render))
+        \\
+        \\-- Fresh state: cursor starts at row 1.
+        \\st.cursor_row = 1
+        \\sidebar._cursor_down()
+        \\assert(st.cursor_row == 2,
+        \\       "cursor_down from 1 should land on 2, got " .. tostring(st.cursor_row))
+        \\sidebar._cursor_down()
+        \\assert(st.cursor_row == 3,
+        \\       "cursor_down from 2 should land on 3, got " .. tostring(st.cursor_row))
+        \\
+        \\-- Clamp at the last row: j on the last row is a no-op.
+        \\sidebar._cursor_down()
+        \\assert(st.cursor_row == 3,
+        \\       "cursor_down should clamp at last row, got " .. tostring(st.cursor_row))
+        \\
+        \\sidebar._cursor_up()
+        \\assert(st.cursor_row == 2,
+        \\       "cursor_up from 3 should land on 2, got " .. tostring(st.cursor_row))
+        \\sidebar._cursor_up()
+        \\assert(st.cursor_row == 1,
+        \\       "cursor_up from 2 should land on 1, got " .. tostring(st.cursor_row))
+        \\
+        \\-- Clamp at row 1: k on the first row is a no-op.
+        \\sidebar._cursor_up()
+        \\assert(st.cursor_row == 1,
+        \\       "cursor_up should clamp at row 1, got " .. tostring(st.cursor_row))
+        \\
+        \\-- _jump_last lands on the last row regardless of where we are.
+        \\st.cursor_row = 1
+        \\sidebar._jump_last()
+        \\assert(st.cursor_row == 3,
+        \\       "_jump_last should land on the last row, got " .. tostring(st.cursor_row))
+        \\
+        \\-- _jump_first lands on row 1.
+        \\sidebar._jump_first()
+        \\assert(st.cursor_row == 1,
+        \\       "_jump_first should land on row 1, got " .. tostring(st.cursor_row))
+    );
+}
+
+test "sessions sidebar expand/collapse toggle state.expanded for the cursor row" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_a = try mgr.createSession("test-model");
+    const a_id = try allocator.dupe(u8, h_a.id[0..h_a.id_len]);
+    defer allocator.free(a_id);
+    h_a.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(a_id);
+    engine.lua.setGlobal("_test_a_id");
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 1
+        \\
+        \\-- l expands the session under the cursor.
+        \\sidebar._expand()
+        \\assert(st.expanded[_test_a_id] == true,
+        \\       "expand should set state.expanded[id] = true")
+        \\
+        \\-- h collapses it again.
+        \\sidebar._collapse()
+        \\assert(st.expanded[_test_a_id] == nil,
+        \\       "collapse should drop state.expanded[id]")
+        \\
+        \\-- _activate on a session row records its target. Until
+        \\-- zag.sessions.open lands (Task 1.4b) the handler logs and
+        \\-- returns; we just assert it does not raise.
+        \\local ok, err = pcall(sidebar._activate)
+        \\assert(ok, "activate must not raise: " .. tostring(err))
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
