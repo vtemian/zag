@@ -1532,6 +1532,9 @@ test "getVisibleLines with range skips off-screen nodes" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "range-test");
     defer cb.deinit();
+    // Pin the line index ↔ node index mapping; turn-gap interleaving is
+    // exercised by the dedicated turn_gap tests.
+    cb.turn_gap = 0;
 
     // Create 5 single-line nodes
     _ = try cb.appendNode(null, .user_message, "line0");
@@ -1561,6 +1564,9 @@ test "buffer interface returns line count" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "lc-test");
     defer cb.deinit();
+    // Test asserts that the vtable forwards node line counts; the turn-gap
+    // contribution is verified separately.
+    cb.turn_gap = 0;
 
     _ = try cb.appendNode(null, .user_message, "hello");
     _ = try cb.appendNode(null, .separator, "");
@@ -1629,6 +1635,9 @@ test "getVisibleLines reflects new nodes after appendNode" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "append-test");
     defer cb.deinit();
+    // This test pins cache invalidation on appendNode; the turn-gap row
+    // would muddy the simple "2 lines after appending second node" check.
+    cb.turn_gap = 0;
 
     _ = try cb.appendNode(null, .user_message, "first");
 
