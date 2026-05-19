@@ -120,6 +120,21 @@ function M._subscribe_hooks()
         if not state.buffer_id then return end
         M._render()
     end))
+    -- Re-pin the sidebar to ~30 cells after a terminal resize. The
+    -- layout preserves the split ratio across resizes, so without this
+    -- a wider terminal grows the sidebar and a narrower one shrinks it.
+    -- Recompute the same ratio M.open() computes (30 / cols, clamped to
+    -- [0.1, 0.4]) and apply via zag.layout.resize. The handler bails
+    -- early if the sidebar pane was torn down between fire and dispatch.
+    table.insert(state.hook_ids, zag.hook("LayoutResize", function(evt)
+        if not state.pane_id then return end
+        local cols = evt.cols or 0
+        if cols <= 0 then return end
+        local ratio = 30 / cols
+        if ratio < 0.1 then ratio = 0.1 end
+        if ratio > 0.4 then ratio = 0.4 end
+        pcall(zag.layout.resize, state.pane_id, ratio)
+    end))
 end
 
 -- Bind buffer-local keymaps for sidebar navigation. Every binding

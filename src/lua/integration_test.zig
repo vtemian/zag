@@ -1020,6 +1020,146 @@ test "sessions sidebar refreshes on every PaneFocused while sidebar is open" {
     );
 }
 
+// Task 8.1: a LayoutResize fire must re-pin the sidebar to ~30 cells
+// regardless of the new terminal width. The plugin recomputes the same
+// ratio M.open uses (30 / cols, clamped to [0.1, 0.4]) and calls
+// zag.layout.resize. The test stubs zag.layout.resize so the assertion
+// runs without a live WindowManager.
+test "sessions sidebar re-pins to ~30 cells on LayoutResize" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._subscribe_hooks()
+        \\local st = sidebar._state_for_test()
+        \\st.pane_id = "n1"
+        \\
+        \\-- Stub zag.layout.resize so the test runs without a live
+        \\-- WindowManager. Record the last (id, ratio) pair so the
+        \\-- assertion sees what the handler actually requested.
+        \\_G.resize_calls = 0
+        \\_G.last_id = nil
+        \\_G.last_ratio = nil
+        \\zag.layout.resize = function(id, ratio)
+        \\    _G.resize_calls = _G.resize_calls + 1
+        \\    _G.last_id = id
+        \\    _G.last_ratio = ratio
+        \\end
+    );
+
+    // Mid-range terminal: 30 / 120 = 0.25, within the clamp band.
+    var ev: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 120, .rows = 40 } };
+    _ = try engine.fireHook(&ev);
+
+    try runLua(&engine,
+        \\assert(_G.resize_calls == 1,
+        \\       "LayoutResize must trigger exactly one resize call, got "
+        \\       .. tostring(_G.resize_calls))
+        \\assert(_G.last_id == "n1",
+        \\       "resize must target the sidebar pane: " .. tostring(_G.last_id))
+        \\local expected = 30 / 120
+        \\assert(math.abs(_G.last_ratio - expected) < 1e-9,
+        \\       "ratio must be 30/cols at mid range, got "
+        \\       .. tostring(_G.last_ratio))
+    );
+
+    // Narrow terminal: 30 / 50 = 0.6, must clamp DOWN to 0.4.
+    var narrow: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 50, .rows = 24 } };
+    _ = try engine.fireHook(&narrow);
+
+    try runLua(&engine,
+        \\assert(math.abs(_G.last_ratio - 0.4) < 1e-9,
+        \\       "narrow terminal must clamp ratio to 0.4, got "
+        \\       .. tostring(_G.last_ratio))
+    );
+
+    // Wide terminal: 30 / 400 = 0.075, must clamp UP to 0.1.
+    var wide: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 400, .rows = 100 } };
+    _ = try engine.fireHook(&wide);
+
+    try runLua(&engine,
+        \\assert(math.abs(_G.last_ratio - 0.1) < 1e-9,
+        \\       "wide terminal must clamp ratio to 0.1, got "
+        \\       .. tostring(_G.last_ratio))
+    );
+}
+
+// Task 8.1: when the sidebar is closed (state.pane_id == nil), a
+// LayoutResize fire must NOT call zag.layout.resize. Without this
+// guard a stale handler would target a recycled or never-existed pane.
+test "sessions sidebar ignores LayoutResize when closed" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._subscribe_hooks()
+        \\local st = sidebar._state_for_test()
+        \\st.pane_id = nil  -- sidebar closed
+        \\
+        \\_G.resize_calls = 0
+        \\zag.layout.resize = function(id, ratio)
+        \\    _G.resize_calls = _G.resize_calls + 1
+        \\end
+    );
+
+    var ev: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 120, .rows = 40 } };
+    _ = try engine.fireHook(&ev);
+
+    try runLua(&engine,
+        \\assert(_G.resize_calls == 0,
+        \\       "LayoutResize must be a no-op when sidebar is closed, got "
+        \\       .. tostring(_G.resize_calls))
+    );
+}
+
 // Task 6.1: the row whose session id matches the currently-focused
 // conversation pane is marked with a "● " prefix glyph (visible in the
 // rendered line text) and tagged `is_current = true` on the row table.
