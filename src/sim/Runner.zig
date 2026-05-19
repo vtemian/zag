@@ -120,7 +120,7 @@ pub const Runner = struct {
         // arrives later. The optional trailing duration lets slow real-LLM
         // scenarios wait long enough for first-token latency without the
         // operator hardcoding a global default.
-        const parsed = Args.parsePatternAndTimeout(raw);
+        const parsed = try Args.parsePatternAndTimeout(raw);
         const timeout_ms = parsed.timeout_ms orelse default_timeout_ms;
         const deadline_ms = std.time.milliTimestamp() + timeout_ms;
         while (true) {
@@ -169,7 +169,7 @@ pub const Runner = struct {
     }
 
     pub fn executeWaitExit(self: *Runner, raw: []const u8, default_timeout_ms: u32) !void {
-        const timeout_ms = Args.parseOptionalTimeout(raw) orelse default_timeout_ms;
+        const timeout_ms = (try Args.parseOptionalTimeout(raw)) orelse default_timeout_ms;
         const deadline = std.time.milliTimestamp() + timeout_ms;
         while (true) {
             const remaining = @max(@as(i64, 0), deadline - std.time.milliTimestamp());

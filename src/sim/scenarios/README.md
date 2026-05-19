@@ -8,8 +8,9 @@ the way you would.
 ## Running
 
 ```bash
-zig build && zig build sim
-./zig-out/bin/zag-sim run src/sim/scenarios/<name>.zsm
+zig build                                               # build zag + zag-sim
+./zig-out/bin/zag-sim run src/sim/scenarios/<name>.zsm  # one scenario
+ZAG_E2E=1 zig build test-sim-e2e                        # every scenario, serially
 ```
 
 The harness inherits `$HOME`/`$PATH`/etc. from your shell, so zag picks up
@@ -17,7 +18,8 @@ The harness inherits `$HOME`/`$PATH`/etc. from your shell, so zag picks up
 in a normal terminal session.
 
 These scenarios are **not** on the default `zig build test` path — they
-spend real API tokens and depend on a live network. Run them by hand when
+spend real API tokens and depend on a live network. The `test-sim-e2e`
+step is a no-op unless you opt in with `ZAG_E2E=1`. Run them by hand when
 you suspect a regression in real-provider plumbing (auth, streaming, SSE
 parser, tool dispatch, conversation history, slash commands).
 
@@ -73,6 +75,10 @@ Each run drops the following into `$TMPDIR/zag-sim-<pid>-<ts>/` (or the
 
 ## When a real run crashes
 
-`src/sim/Replay.zig` can convert a session JSONL (under `~/.local/share/zag/`)
-into a `.zsm` that re-types the user turns. Drop the generated scenario into
-this directory to lock in a regression test.
+`src/sim/Replay.zig` can convert a session JSONL into a `.zsm` that re-types
+the user turns. Sessions live at `<cwd>/.zag/sessions/*.jsonl` (cwd-relative,
+written by `src/Session.zig`), so look in the directory you ran `zag` from.
+The simulator also drops a copy as `session.jsonl` in each run's artifact
+dir, which is usually faster than hunting for the right id under
+`.zag/sessions/`. Drop the generated scenario into this directory to lock
+in a regression test.

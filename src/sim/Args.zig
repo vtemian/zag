@@ -79,32 +79,43 @@ pub fn parseDurationMs(raw: []const u8) !u32 {
 /// Split a `wait_text` arg into pattern and optional trailing timeout.
 /// Accepts `/regex/`, `/regex/ 40s`, plain `substring`, or `substring 40s`.
 /// The pattern is returned with any `/.../` delimiters stripped so callers
-/// can grep on it directly. A missing or unparseable timeout returns null
-/// and the caller falls back to the scenario default.
+/// can grep on it directly. A missing trailing token returns timeout_ms=null
+/// and the caller falls back to the scenario default. A trailing token that
+/// fails to parse as a duration surfaces as an error, not a silent default
+/// fallback, so typos like `40secs` blow up loudly instead of pretending to
+/// be a 10s timeout.
 pub const PatternAndTimeout = struct { pattern: []const u8, timeout_ms: ?u32 };
 
-pub fn parsePatternAndTimeout(raw: []const u8) PatternAndTimeout {
+pub fn parsePatternAndTimeout(raw: []const u8) !PatternAndTimeout {
     var pattern: []const u8 = raw;
     var rest: []const u8 = "";
+    // For `/.../` shapes use the LAST `/` so patterns can legitimately
+    // contain a `/` (e.g. `/path/to/file/ 40s`). For bare substrings split
+    // on first whitespace; multi-word patterns aren't supported and never
+    // were.
     if (raw.len >= 2 and raw[0] == '/') {
-        if (std.mem.indexOfScalarPos(u8, raw, 1, '/')) |close| {
-            pattern = raw[1..close];
-            rest = std.mem.trimLeft(u8, raw[close + 1 ..], " \t");
+        if (std.mem.lastIndexOfScalar(u8, raw, '/')) |close| {
+            if (close > 0) {
+                pattern = raw[1..close];
+                rest = std.mem.trimLeft(u8, raw[close + 1 ..], " \t");
+            }
         }
     } else if (std.mem.indexOfAny(u8, raw, " \t")) |sp| {
         pattern = raw[0..sp];
         rest = std.mem.trimLeft(u8, raw[sp..], " \t");
     }
-    const timeout_ms: ?u32 = if (rest.len == 0) null else parseDurationMs(rest) catch null;
+    const timeout_ms: ?u32 = if (rest.len == 0) null else try parseDurationMs(rest);
     return .{ .pattern = pattern, .timeout_ms = timeout_ms };
 }
 
 /// Optional trailing timeout for verbs that take no pattern (`wait_exit`).
 /// Empty args returns null; the caller falls back to the scenario default.
-pub fn parseOptionalTimeout(raw: []const u8) ?u32 {
+/// A non-empty arg that doesn't parse as a duration is surfaced as an
+/// error so typos don't silently fall back to the default.
+pub fn parseOptionalTimeout(raw: []const u8) !?u32 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return null;
-    return parseDurationMs(trimmed) catch null;
+    return try parseDurationMs(trimmed);
 }
 
 test "parseSend literal + keysym" {
@@ -136,21 +147,21 @@ test "parseDurationMs all forms" {
 }
 
 test "parsePatternAndTimeout regex bare and with timeout" {
-    const bare = parsePatternAndTimeout("/hello/");
+    const bare = try parsePatternAndTimeout("/hello/");
     try std.testing.expectEqualStrings("hello", bare.pattern);
     try std.testing.expect(bare.timeout_ms == null);
 
-    const with_dur = parsePatternAndTimeout("/hello/ 40s");
+    const with_dur = try parsePatternAndTimeout("/hello/ 40s");
     try std.testing.expectEqualStrings("hello", with_dur.pattern);
     try std.testing.expectEqual(@as(u32, 40_000), with_dur.timeout_ms.?);
 }
 
 test "parsePatternAndTimeout substring bare and with timeout" {
-    const bare = parsePatternAndTimeout("welcome");
+    const bare = try parsePatternAndTimeout("welcome");
     try std.testing.expectEqualStrings("welcome", bare.pattern);
     try std.testing.expect(bare.timeout_ms == null);
 
-    const with_dur = parsePatternAndTimeout("welcome 250ms");
+    const with_dur = try parsePatternAndTimeout("welcome 250ms");
     try std.testing.expectEqualStrings("welcome", with_dur.pattern);
     try std.testing.expectEqual(@as(u32, 250), with_dur.timeout_ms.?);
 }
@@ -158,14 +169,29 @@ test "parsePatternAndTimeout substring bare and with timeout" {
 test "parsePatternAndTimeout slash without close is treated as bare pattern" {
     // Defensive: if the user forgot the closing slash, we don't crash; we
     // return the whole arg as the pattern and no timeout.
-    const p = parsePatternAndTimeout("/oops");
+    const p = try parsePatternAndTimeout("/oops");
     try std.testing.expectEqualStrings("/oops", p.pattern);
     try std.testing.expect(p.timeout_ms == null);
 }
 
+test "parsePatternAndTimeout pattern containing slashes" {
+    // Use the LAST `/` as the closing delimiter so patterns can carry a
+    // path-like substring without confusing the parser.
+    const p = try parsePatternAndTimeout("/path/to/file/ 30s");
+    try std.testing.expectEqualStrings("path/to/file", p.pattern);
+    try std.testing.expectEqual(@as(u32, 30_000), p.timeout_ms.?);
+}
+
+test "parsePatternAndTimeout invalid trailing duration errors" {
+    // A typo like `40secs` should surface as an error so the user knows the
+    // duration was ignored instead of quietly falling back to the default.
+    try std.testing.expectError(error.InvalidCharacter, parsePatternAndTimeout("/hello/ 40secs"));
+}
+
 test "parseOptionalTimeout" {
-    try std.testing.expectEqual(@as(u32, 30_000), parseOptionalTimeout("30s").?);
-    try std.testing.expectEqual(@as(u32, 500), parseOptionalTimeout("  500ms  ").?);
-    try std.testing.expect(parseOptionalTimeout("") == null);
-    try std.testing.expect(parseOptionalTimeout("   ") == null);
+    try std.testing.expectEqual(@as(u32, 30_000), (try parseOptionalTimeout("30s")).?);
+    try std.testing.expectEqual(@as(u32, 500), (try parseOptionalTimeout("  500ms  ")).?);
+    try std.testing.expect((try parseOptionalTimeout("")) == null);
+    try std.testing.expect((try parseOptionalTimeout("   ")) == null);
+    try std.testing.expectError(error.InvalidCharacter, parseOptionalTimeout("garbage"));
 }
