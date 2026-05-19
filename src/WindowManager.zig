@@ -760,16 +760,63 @@ pub fn doFocus(self: *WindowManager, dir: Layout.FocusDirection) void {
     self.layout.focusDirection(dir);
     self.compositor.layout_dirty = true;
     const next = self.layout.getFocusedLeaf();
-    notifyFocusSwap(prev, next);
+    self.notifyFocusSwap(prev, next);
 }
 
 /// Fire `onFocus(false)` on `prev` and `onFocus(true)` on `next` when the
-/// two are distinct. Extracted so every layout path that moves focus
-/// (navigation, split, close) routes through one place.
-fn notifyFocusSwap(prev: ?*Layout.LayoutNode.Leaf, next: ?*Layout.LayoutNode.Leaf) void {
+/// two are distinct, then publish a `PaneFocused` hook so plugins (the
+/// sessions sidebar, future floats, etc.) can react. Extracted so every
+/// layout path that moves focus (navigation, split, close) routes
+/// through one place.
+fn notifyFocusSwap(
+    self: *WindowManager,
+    prev: ?*Layout.LayoutNode.Leaf,
+    next: ?*Layout.LayoutNode.Leaf,
+) void {
     if (prev == next) return;
     if (prev) |prev_leaf| prev_leaf.view.onFocus(false);
     if (next) |next_leaf| next_leaf.view.onFocus(true);
+    self.firePaneFocused(prev, next);
+}
+
+/// Best-effort `PaneFocused` fire. Resolves each leaf to its stable
+/// pane handle via the buffer-pointer reverse lookup (the same path
+/// `pane_draft_change` takes) and pushes a `Hooks.HookPayload` through
+/// `LuaEngine.fireHook`. A missing engine, an unregistered leaf, or a
+/// hook failure are all logged and dropped: focus swap must not be
+/// blocked by a flaky plugin.
+fn firePaneFocused(
+    self: *WindowManager,
+    prev: ?*Layout.LayoutNode.Leaf,
+    next: ?*Layout.LayoutNode.Leaf,
+) void {
+    const engine = self.lua_engine orelse return;
+
+    // Format both handles inline to dodge the alloc that `formatId`
+    // would do. `"n" + u32 max digits = 11 chars`, so 16 is plenty.
+    var prev_buf: [16]u8 = undefined;
+    var next_buf: [16]u8 = undefined;
+    const prev_str = handleString(self, prev, &prev_buf);
+    const next_str = handleString(self, next, &next_buf);
+
+    var payload: Hooks.HookPayload = .{ .pane_focused = .{
+        .pane_handle = next_str,
+        .previous_handle = prev_str,
+    } };
+    _ = engine.fireHook(&payload) catch |err| {
+        log.warn("pane_focused hook fire failed: {}", .{err});
+    };
+}
+
+/// Resolve `leaf` to its stable pane handle string ("n{packed_u32}"),
+/// or `""` when there is no leaf or the registry / pane lookup drifts.
+/// Writes into `dest` and returns the slice covering the encoded bytes.
+fn handleString(self: *WindowManager, leaf: ?*Layout.LayoutNode.Leaf, dest: []u8) []const u8 {
+    const l = leaf orelse return "";
+    const pane = self.paneFromBufferPtr(l.buffer) orelse return "";
+    const handle = pane.handle orelse return "";
+    const packed_u32: u32 = @bitCast(handle);
+    return std.fmt.bufPrint(dest, "n{d}", .{packed_u32}) catch "";
 }
 
 /// Focus the leaf identified by `handle`. Stale or split-pointing handles
@@ -782,7 +829,7 @@ pub fn focusById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
     const prev = self.layout.getFocusedLeaf();
     self.layout.focused = node;
     self.compositor.layout_dirty = true;
-    notifyFocusSwap(prev, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(prev, self.layout.getFocusedLeaf());
 }
 
 /// Split the leaf identified by `handle` and return the handle of the
@@ -1338,7 +1385,7 @@ pub fn doSplit(self: *WindowManager, direction: Layout.SplitDirection) void {
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // The new pane is ready to be typed into. Drop back to insert mode so
     // the user can start a conversation without an extra `i` keystroke,
@@ -1402,7 +1449,7 @@ pub fn doSplitWithBuffer(
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
 
     // Non-agent panes stay in whatever mode the user was in; there is
     // no draft to type into.
@@ -1612,7 +1659,7 @@ pub fn enterSubagent(
         .leaf => &parent_node.leaf,
         .split => null,
     };
-    notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
+    self.notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
 }
 
 /// Try to create and attach a session to a pane. Returns the handle or
@@ -5589,6 +5636,198 @@ test "PaneDraftChange hook ref cleanup leaves no leaks on engine deinit" {
     // testing.allocator catches the leak if `Hook.pattern` or the
     // dispatcher's pending_cancel_reason isn't freed on deinit.
     f.wm.lua_engine = null;
+}
+
+test "PaneFocused fires on focus swap with prev and next pane handles" {
+    // Drive the swap through `focusById` (one of the five public paths
+    // that ends in `notifyFocusSwap`). After `doSplit` two leaves exist;
+    // focusing back to the original leaf must fire one PaneFocused event
+    // carrying both handles formatted as `NodeRegistry.formatId` strings.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    try wm.attachLayoutRegistry();
+    layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = wm;
+    wm.lua_engine = &engine;
+
+    // doSplit fires its own PaneFocused (root -> new pane); register the
+    // hook *after* the split so the test only observes the second swap.
+    wm.doSplit(.vertical);
+
+    const first_leaf = wm.layout.root.?.split.first;
+    const second_leaf = wm.layout.root.?.split.second;
+    const first_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == first_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    const second_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == second_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+    const first_id = try NodeRegistry.formatId(allocator, first_handle);
+    defer allocator.free(first_id);
+    const second_id = try NodeRegistry.formatId(allocator, second_handle);
+    defer allocator.free(second_id);
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\_G.last_pane = nil
+        \\_G.last_prev = nil
+        \\zag.hook("PaneFocused", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\  _G.last_pane = evt.pane_handle
+        \\  _G.last_prev = evt.previous_handle
+        \\end)
+    );
+
+    try wm.focusById(first_handle);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_pane");
+    try std.testing.expectEqualStrings(first_id, try engine.lua.toString(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_prev");
+    try std.testing.expectEqualStrings(second_id, try engine.lua.toString(-1));
+    engine.lua.pop(1);
+}
+
+test "PaneFocused pattern key scopes hook to a single pane handle" {
+    // A `pattern = "<handle>"` filter must only match swaps that land on
+    // that handle. Focusing back to a different leaf must NOT fire.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    try wm.attachLayoutRegistry();
+    layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = wm;
+    wm.lua_engine = &engine;
+
+    wm.doSplit(.vertical);
+
+    const first_leaf = wm.layout.root.?.split.first;
+    const first_handle = blk: {
+        for (wm.node_registry.slots.items, 0..) |slot, i| {
+            if (slot.node == first_leaf) break :blk NodeRegistry.Handle{
+                .index = @intCast(i),
+                .generation = slot.generation,
+            };
+        }
+        unreachable;
+    };
+
+    // Register a hook scoped to a fictitious handle. The real swap below
+    // lands on `first_handle`, which is NOT this pattern; no fire.
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\zag.hook("PaneFocused", { pattern = "n9999" }, function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\end)
+    );
+
+    try wm.focusById(first_handle);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
 }
 
 test "zag.providers.list reflects the endpoint registry" {
