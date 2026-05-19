@@ -126,6 +126,15 @@ pub fn runLoopStreaming(
     // compaction fire at the top of each iteration; zero on the first
     // turn so compaction never runs against an empty conversation.
     var last_input_tokens: u32 = 0;
+    // Predictive-estimator anchors: the last assistant turn's full
+    // Usage and its index in `messages`. Null on the first turn (no
+    // turn has run) and after aborted/errored turns (provider reported
+    // zero tokens; anchoring on that would understate the conversation
+    // size). Phase 1.4 swaps the compaction trigger over to consume
+    // these instead of `last_input_tokens`; kept in parallel here so
+    // this commit doesn't break the existing call site.
+    var last_usage_anchor: ?llm.Usage = null;
+    var last_usage_index: ?usize = null;
 
     // Compose `provider/model_id` once for the per-turn `Telemetry.model`
     // field. Telemetry borrows the slice; freeing here at the end of the
@@ -227,8 +236,25 @@ pub fn runLoopStreaming(
         try emitTokenUsage(response, allocator, queue);
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
-        // configured context window.
+        // configured context window. The full `Usage` snapshot anchors
+        // the predictive estimator in `estimateContextTokens`; we only
+        // anchor when the provider actually reported tokens, because a
+        // mid-stream cancel or error returns the response with zero
+        // counts and anchoring on that would mute compaction for the
+        // rest of the run.
         last_input_tokens = response.input_tokens;
+        if (response.input_tokens > 0 or response.output_tokens > 0) {
+            last_usage_anchor = .{
+                .input_tokens = response.input_tokens,
+                .output_tokens = response.output_tokens,
+                .cache_creation_tokens = response.cache_creation_tokens,
+                .cache_read_tokens = response.cache_read_tokens,
+            };
+            // `messages.append` at the top of this block (line ~226) put
+            // the assistant we just got at the tail of `messages.items`;
+            // its index is therefore `len - 1`.
+            last_usage_index = messages.items.len - 1;
+        }
 
         const tool_calls = try collectToolCalls(response.content, allocator);
         defer allocator.free(tool_calls);
