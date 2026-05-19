@@ -222,6 +222,14 @@ pub const LuaEngine = struct {
     /// "no strategy", so the agent never compacts. Released in
     /// `deinit`.
     compact_handler: ?i32 = null,
+    /// Reserve budget (tokens) held back from the model's context window
+    /// when `fireCompact` decides whether to fire. Mutable via Lua:
+    /// `zag.compact.set_reserve_tokens(n)`. Default matches
+    /// `agent.DEFAULT_RESERVE_TOKENS` (16384, mirroring pi-mono's
+    /// reserveTokens default at compaction.ts:114). A larger value
+    /// fires compaction earlier; smaller fires later. Zero disables
+    /// the room buffer (estimator still gates the call).
+    compact_reserve_tokens: u32 = @import("agent.zig").DEFAULT_RESERVE_TOKENS,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -10481,6 +10489,41 @@ test "zag.compact.strategy registers a single global handler" {
         \\zag.compact.strategy(function(ctx) return nil end)
     );
     try std.testing.expect(engine.compactHandler() != null);
+}
+
+test "zag.compact.set_reserve_tokens writes engine.compact_reserve_tokens" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Default seeded from agent.DEFAULT_RESERVE_TOKENS.
+    const agent = @import("agent.zig");
+    try std.testing.expectEqual(agent.DEFAULT_RESERVE_TOKENS, engine.compact_reserve_tokens);
+
+    try engine.lua.doString("zag.compact.set_reserve_tokens(8192)");
+    try std.testing.expectEqual(@as(u32, 8192), engine.compact_reserve_tokens);
+
+    // Zero is legal: disables the buffer, estimator still gates the call.
+    try engine.lua.doString("zag.compact.set_reserve_tokens(0)");
+    try std.testing.expectEqual(@as(u32, 0), engine.compact_reserve_tokens);
+}
+
+test "zag.compact.set_reserve_tokens rejects negative integers" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Lua's pcall lets us assert the Zig-side error surfaces as a Lua error
+    // without crashing the test.
+    try engine.lua.doString(
+        \\local ok, err = pcall(zag.compact.set_reserve_tokens, -1)
+        \\if ok then error("expected set_reserve_tokens(-1) to raise") end
+    );
+    // Engine value must remain the default after the rejected call.
+    const agent = @import("agent.zig");
+    try std.testing.expectEqual(agent.DEFAULT_RESERVE_TOKENS, engine.compact_reserve_tokens);
 }
 
 test "zag.compact.strategy re-registration unrefs old function" {

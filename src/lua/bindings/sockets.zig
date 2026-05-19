@@ -17,6 +17,7 @@
 //! dispatchers stay in LuaEngine.zig because `AgentRunner` calls them
 //! directly via the engine pointer.
 
+const std = @import("std");
 const zlua = @import("zlua");
 const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
@@ -44,12 +45,14 @@ pub fn registerLoopTable(lua: *Lua) void {
 }
 
 /// Register the `zag.compact` subtable on the `zag` table.
-/// Exposes `strategy`.
+/// Exposes `strategy` and `set_reserve_tokens`.
 /// Stack on entry/exit: [zag_table].
 pub fn registerCompactTable(lua: *Lua) void {
     lua.newTable();
     lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
     lua.setField(-2, "strategy");
+    lua.pushFunction(zlua.wrap(zagCompactSetReserveTokensFn));
+    lua.setField(-2, "set_reserve_tokens");
     lua.setField(-2, "compact");
 }
 
@@ -275,5 +278,32 @@ fn zagCompactStrategyFn(lua: *Lua) i32 {
         lua.unref(zlua.registry_index, old);
     }
     engine.compact_handler = fn_ref;
+    return 0;
+}
+
+/// Zig function backing `zag.compact.set_reserve_tokens(n)`.
+///
+/// Updates the room budget `fireCompact` holds back from the model's
+/// context window. Larger values fire compaction earlier (more slack,
+/// less likely to overshoot); smaller values fire later (closer to the
+/// cap). Zero disables the buffer but keeps the predictive estimator
+/// gating the call.
+///
+/// Negative integers raise a Lua error. Values beyond u32 are
+/// clamped to u32_max with a warning.
+fn zagCompactSetReserveTokensFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const n = lua.checkInteger(1);
+    if (n < 0) {
+        lua.raiseErrorStr(
+            "zag.compact.set_reserve_tokens: arg 1 must be non-negative",
+            .{},
+        );
+    }
+    const clamped: u32 = if (n > std.math.maxInt(u32))
+        std.math.maxInt(u32)
+    else
+        @intCast(n);
+    engine.compact_reserve_tokens = clamped;
     return 0;
 }

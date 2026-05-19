@@ -180,13 +180,14 @@ pub fn runLoopStreaming(
         // didn't supply a context window, or when the predictive
         // estimate still leaves more than `reserve_tokens` of room.
         // See `fireCompact` for the full no-op ladder.
+        const reserve_tokens = if (lua_engine) |e| e.compact_reserve_tokens else DEFAULT_RESERVE_TOKENS;
         if (try fireCompact(
             lua_engine,
             messages.items,
             last_usage_anchor,
             last_usage_index,
             model_spec.context_window,
-            DEFAULT_RESERVE_TOKENS,
+            reserve_tokens,
             allocator,
             queue,
             cancel,
