@@ -32,8 +32,14 @@
 //! avoids re-registering visited projects in the registry (which would
 //! be circular).
 //!
-//! Note: `zag.sessions.open(id)` is intentionally NOT installed here.
-//! That binding lives in Task 1.4b alongside the pane-swap logic.
+//!   * `zag.sessions.open(id, project_path?)` — split the focused
+//!     pane and bind the new leaf to the existing session `id`. v1
+//!     limitation: when `project_path` is supplied and differs from
+//!     the live cwd realpath, the call raises
+//!     `CrossProjectOpenNotSupported` because `SessionManager` resolves
+//!     `sessions_dir` against the process cwd. Cross-project opens
+//!     would need either a per-pane cwd or a `loadSessionAt` variant;
+//!     both are deferred to v2.
 
 const std = @import("std");
 const zlua = @import("zlua");
@@ -43,6 +49,7 @@ const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const Session = @import("../../Session.zig");
 const ProjectRegistry = @import("../../project_registry.zig");
 const Hooks = @import("../../Hooks.zig");
+const WindowManager = @import("../../WindowManager.zig");
 
 const log = std.log.scoped(.lua_sessions);
 
@@ -501,6 +508,62 @@ fn zagSessionsSubagentsFn(lua: *Lua) i32 {
     return 1;
 }
 
+/// `zag.sessions.open(id, project_path?)` — see top-of-file docstring.
+///
+/// Splits the focused leaf and binds the new pane to the existing
+/// session `id`. Cross-project opens are rejected up-front because
+/// `SessionManager.loadSession` resolves paths against the process
+/// cwd; opening a session from another project would silently load
+/// from the wrong directory.
+fn zagSessionsOpenFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.raiseErrorStr("zag.sessions.open: no window manager attached", .{});
+    };
+
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.sessions.open: id must be a string", .{});
+    }
+    const id = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.sessions.open: id must be a string", .{});
+    };
+
+    // When the caller hands us a project_path (the sidebar does, every
+    // row carries one) we verify it matches the cwd realpath. Sessions
+    // from other projects on disk are visible via `list()` but cannot
+    // be opened yet; see the top-of-file docstring for the v2 plan.
+    if (!lua.isNoneOrNil(2)) {
+        if (lua.typeOf(2) != .string) {
+            lua.raiseErrorStr("zag.sessions.open: project_path must be a string", .{});
+        }
+        const project = lua.toString(2) catch {
+            lua.raiseErrorStr("zag.sessions.open: project_path must be a string", .{});
+        };
+        const cwd_real = std.fs.cwd().realpathAlloc(engine.allocator, ".") catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.open: cwd realpath: {s}", .{@errorName(err)}) catch
+                "zag.sessions.open: cwd realpath failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        };
+        defer engine.allocator.free(cwd_real);
+        if (!std.mem.eql(u8, cwd_real, project)) {
+            lua.raiseErrorStr("zag.sessions.open: CrossProjectOpenNotSupported", .{});
+        }
+    }
+
+    _ = wm.splitFocusedWithSession(id) catch |err| switch (err) {
+        error.InvalidSessionId => lua.raiseErrorStr("zag.sessions.open: invalid session id", .{}),
+        error.SessionManagerUnavailable => lua.raiseErrorStr("zag.sessions.open: persistence disabled", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.open: {s}", .{@errorName(err)}) catch
+                "zag.sessions.open failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
+    };
+    return 0;
+}
+
 /// Register the `zag.sessions` subtable. Caller has the `zag` table at
 /// stack top; on return the `zag` table is still at stack top with
 /// `sessions` attached. Mirrors `registerLayoutTable`'s registration
@@ -517,5 +580,7 @@ pub fn registerOn(lua: *Lua) void {
     lua.setField(-2, "current");
     lua.pushFunction(zlua.wrap(zagSessionsSubagentsFn));
     lua.setField(-2, "subagents");
+    lua.pushFunction(zlua.wrap(zagSessionsOpenFn));
+    lua.setField(-2, "open");
     lua.setField(-2, "sessions"); // zag.sessions = sessions_table; [zag_table]
 }
