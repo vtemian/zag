@@ -1238,6 +1238,173 @@ test "estimateContextTokens regression: mid-turn tool_result blowup is caught" {
     try std.testing.expectEqual(@as(u32, 500), est.total);
 }
 
+/// Outcome of `findCutPoint`. `first_kept` is the index of the first
+/// message retained after compaction; everything strictly before it is
+/// fed to the summarizer. A future split-turn extension can populate
+/// `turn_start` for partial-turn handling (pi-mono's split-prefix
+/// behavior at compaction.ts:317-325) but Phase 1 keeps it null.
+pub const CutPointResult = struct {
+    first_kept: usize,
+    turn_start: ?usize = null,
+    is_split_turn: bool = false,
+};
+
+/// True when cutting `messages` such that `idx` is the first kept
+/// message would not orphan a tool_use/tool_result pair across the
+/// boundary. Mirrors pi-mono `findValidCutPoints` (compaction.ts:261-298)
+/// adapted to zag's "tool_result is a content block inside a user
+/// message" model: the danger is the same (preceding tool_use without
+/// its result, or trailing tool_result without its tool_use), just
+/// located at block granularity instead of message granularity.
+pub fn isValidCutPoint(messages: []const types.Message, idx: usize) bool {
+    if (idx == 0 or idx >= messages.len) return true;
+    const prev = messages[idx - 1];
+    if (prev.content.len > 0) {
+        switch (prev.content[prev.content.len - 1]) {
+            .tool_use => return false,
+            else => {},
+        }
+    }
+    const next = messages[idx];
+    if (next.content.len > 0) {
+        switch (next.content[0]) {
+            .tool_result => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Pick the cut point that keeps approximately `keep_recent_tokens`
+/// worth of trailing messages. Walks backwards from the end summing
+/// `estimateMessageTokens` and snaps forward to the nearest valid
+/// boundary once the budget is met. Falls back to keeping the entire
+/// history when nothing crosses the budget.
+pub fn findCutPoint(
+    messages: []const types.Message,
+    keep_recent_tokens: u32,
+) CutPointResult {
+    if (messages.len == 0) return .{ .first_kept = 0 };
+    var accumulated: u32 = 0;
+    var i: usize = messages.len;
+    while (i > 0) {
+        i -= 1;
+        accumulated += estimateMessageTokens(messages[i]);
+        if (accumulated >= keep_recent_tokens) {
+            var cut = i;
+            while (cut < messages.len and !isValidCutPoint(messages, cut)) {
+                cut += 1;
+            }
+            return .{ .first_kept = cut };
+        }
+    }
+    return .{ .first_kept = 0 };
+}
+
+test "isValidCutPoint allows cut at 0 and past end" {
+    const empty: [0]types.Message = .{};
+    try std.testing.expect(isValidCutPoint(&empty, 0));
+
+    const blocks = [_]types.ContentBlock{.{ .text = .{ .text = "x" } }};
+    const msgs = [_]types.Message{.{ .role = .user, .content = &blocks }};
+    try std.testing.expect(isValidCutPoint(&msgs, 0));
+    try std.testing.expect(isValidCutPoint(&msgs, 1));
+}
+
+test "isValidCutPoint refuses cut after assistant tool_use" {
+    const u_blocks = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const a_blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "let me check" } },
+        .{ .tool_use = .{ .id = "t1", .name = "read", .input_raw = "{}" } },
+    };
+    const r_blocks = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok", .is_error = false } },
+    };
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &u_blocks },
+        .{ .role = .assistant, .content = &a_blocks },
+        .{ .role = .user, .content = &r_blocks },
+    };
+    // Cut at idx 2 would put the tool_result alone on the kept side,
+    // orphaning the assistant's tool_use behind the summary boundary.
+    try std.testing.expect(!isValidCutPoint(&msgs, 2));
+    // Cut at idx 1 puts the assistant in the kept range; its tool_use
+    // and the tool_result move together. Valid.
+    try std.testing.expect(isValidCutPoint(&msgs, 1));
+}
+
+test "isValidCutPoint refuses cut before lone tool_result message" {
+    const a_blocks = [_]types.ContentBlock{
+        .{ .tool_use = .{ .id = "t1", .name = "read", .input_raw = "{}" } },
+    };
+    const r_blocks = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok", .is_error = false } },
+    };
+    const msgs = [_]types.Message{
+        .{ .role = .assistant, .content = &a_blocks },
+        .{ .role = .user, .content = &r_blocks },
+    };
+    // idx 1 is the user(tool_result). Both rules fail: previous ends
+    // with tool_use AND this starts with tool_result.
+    try std.testing.expect(!isValidCutPoint(&msgs, 1));
+}
+
+test "findCutPoint keeps entire history when budget exceeds size" {
+    const blocks_a = [_]types.ContentBlock{.{ .text = .{ .text = "abcd" } }}; // 1
+    const blocks_b = [_]types.ContentBlock{.{ .text = .{ .text = "efgh" } }}; // 1
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &blocks_a },
+        .{ .role = .assistant, .content = &blocks_b },
+    };
+    const cut = findCutPoint(&msgs, 1000);
+    try std.testing.expectEqual(@as(usize, 0), cut.first_kept);
+}
+
+test "findCutPoint snaps to nearest valid boundary past budget" {
+    var big: [400]u8 = undefined;
+    @memset(&big, 'x');
+    const blocks_a = [_]types.ContentBlock{.{ .text = .{ .text = &big } }}; // 100 tokens
+    const blocks_b = [_]types.ContentBlock{.{ .text = .{ .text = &big } }}; // 100
+    const blocks_c = [_]types.ContentBlock{.{ .text = .{ .text = &big } }}; // 100
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &blocks_a },
+        .{ .role = .assistant, .content = &blocks_b },
+        .{ .role = .user, .content = &blocks_c },
+    };
+    // keep_recent=150: walking from end, idx 2 accumulates 100 (under), idx 1
+    // accumulates 200 (over). Cut at idx 1.
+    const cut = findCutPoint(&msgs, 150);
+    try std.testing.expectEqual(@as(usize, 1), cut.first_kept);
+}
+
+test "findCutPoint snaps forward past invalid tool_use/tool_result boundary" {
+    const blocks_u1 = [_]types.ContentBlock{.{ .text = .{ .text = "first ask" } }};
+    const blocks_a = [_]types.ContentBlock{
+        .{ .tool_use = .{ .id = "t1", .name = "read", .input_raw = "{\"p\":\"a\"}" } },
+    };
+    var big: [800]u8 = undefined;
+    @memset(&big, 'x');
+    const blocks_r = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = &big, .is_error = false } },
+    };
+    const blocks_u2 = [_]types.ContentBlock{.{ .text = .{ .text = "follow up" } }};
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &blocks_u1 },
+        .{ .role = .assistant, .content = &blocks_a },
+        .{ .role = .user, .content = &blocks_r },
+        .{ .role = .user, .content = &blocks_u2 },
+    };
+    // Budget 220: walking back, idx 3 accumulates 3, idx 2 accumulates 203
+    // (still under), idx 1 accumulates 207 (still under), idx 0 accumulates
+    // 210 (still under)... actually big is 800 chars = 200 tokens. 3 + 200 +
+    // ~3 + 3 = 209. Below 220 - would keep everything.
+    // Use budget 5 so idx 3 alone (3 tokens) doesn't cross, idx 2 crosses.
+    // idx 2 is the user(tool_result) — invalid cut. Must snap forward to
+    // idx 3 (first valid kept index).
+    const cut = findCutPoint(&msgs, 5);
+    try std.testing.expectEqual(@as(usize, 3), cut.first_kept);
+}
+
 /// Fire `zag.compact.strategy` at the top of the next iteration when the
 /// predictive estimate of the upcoming request's input-token cost leaves
 /// fewer than `reserve_tokens` tokens of room before the model's
