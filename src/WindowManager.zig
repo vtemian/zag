@@ -4313,6 +4313,249 @@ test "zag.layout.split rejects a malformed buffer handle string" {
     engine.lua.pop(1);
 }
 
+test "zag.layout.split honors side = \"first\" by anchoring the new pane on the left" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    const bh = try wm.buffer_registry.createScratch("sessions");
+    const sidebar_buffer = try wm.buffer_registry.asBuffer(bh);
+    const buffer_id = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buffer_id);
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    // ratio = 0.2 puts the sidebar at ~16 cols on an 80-col screen
+    // when it lands on the left (side = "first" means the new pane
+    // is the first child and consumes the ratio).
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.new_id = zag.layout.split("{s}", "vertical", {{ buffer = "{s}", side = "first", ratio = 0.2 }})
+    , .{ pane_id, buffer_id }, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("new_id");
+    defer engine.lua.pop(1);
+    const new_id = try engine.lua.toString(-1);
+    const new_handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
+
+    // The sidebar buffer should be in the freshly-created leaf.
+    try std.testing.expectEqual(sidebar_buffer.ptr, new_node.leaf.buffer.ptr);
+
+    // The root is now a split; first child is the sidebar (new), second is the host (original root pane).
+    const root_node = wm.layout.root.?;
+    try std.testing.expect(root_node.* == .split);
+    try std.testing.expectEqual(new_node, root_node.split.first);
+    // The original root pane survived: its buffer pointer matches the
+    // conversation buffer attached to the test's `pane` value.
+    try std.testing.expectEqual(view.buf().ptr, root_node.split.second.leaf.buffer.ptr);
+}
+
+test "zag.layout.split rejects an unknown side value" {
+    std.testing.log_level = .err;
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\zag.layout.split("{s}", "vertical", {{ side = "middle" }})
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    const result = engine.lua.doString(script);
+    try std.testing.expectError(error.LuaRuntime, result);
+    engine.lua.pop(1);
+}
+
+test "sessions sidebar M.open creates a left pane and M.close removes it; state survives toggle" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    // Walk the layout tree from the Lua side to count panes. Single
+    // doString call so the local `sessions` and `count_panes` helpers
+    // stay in scope across the open/close/reopen assertions.
+    try engine.lua.doString(
+        \\local sessions = require("zag.builtin.sessions")
+        \\local function count_panes()
+        \\    local tree = zag.layout.tree()
+        \\    local n = 0
+        \\    for _, node in pairs(tree.nodes) do
+        \\        if node.kind == "pane" then n = n + 1 end
+        \\    end
+        \\    return n
+        \\end
+        \\
+        \\assert(count_panes() == 1, "expected exactly one pane before open, got " .. tostring(count_panes()))
+        \\
+        \\sessions.toggle()
+        \\assert(count_panes() == 2, "expected two panes after first toggle, got " .. tostring(count_panes()))
+        \\
+        \\sessions.toggle()
+        \\assert(count_panes() == 1, "expected one pane after close, got " .. tostring(count_panes()))
+        \\
+        \\sessions.toggle()
+        \\assert(count_panes() == 2, "expected two panes after reopen, got " .. tostring(count_panes()))
+        \\
+        \\-- A second open() must be a no-op, not stack a second pane.
+        \\sessions.open()
+        \\assert(count_panes() == 2, "open should be idempotent")
+        \\
+        \\-- A second close() after an explicit close must also be a no-op.
+        \\sessions.close()
+        \\assert(count_panes() == 1, "close should leave one pane")
+        \\sessions.close()
+        \\assert(count_panes() == 1, "close should be idempotent")
+    );
+}
+
 test "layout_split tool mounts scratch buffer by handle end-to-end" {
     const allocator = std.testing.allocator;
 
