@@ -1820,6 +1820,160 @@ fn synthesizeSummaryMessage(
     return .{ .role = .user, .content = blocks };
 }
 
+/// Read/modified file lists collected across compacted history.
+/// Phase 5 appends a `<files-touched>` block to the summary so the
+/// model doesn't waste a turn re-reading something it has already
+/// processed. Mirrors pi-mono's file-ops tracking at utils.ts:24-72.
+const FileOps = struct {
+    read: std.StringHashMapUnmanaged(void) = .empty,
+    modified: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *FileOps, allocator: Allocator) void {
+        var it_r = self.read.keyIterator();
+        while (it_r.next()) |k| allocator.free(k.*);
+        var it_m = self.modified.keyIterator();
+        while (it_m.next()) |k| allocator.free(k.*);
+        self.read.deinit(allocator);
+        self.modified.deinit(allocator);
+    }
+
+    fn ensureRead(self: *FileOps, allocator: Allocator, path: []const u8) !void {
+        if (self.read.contains(path)) return;
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        try self.read.put(allocator, owned, {});
+    }
+
+    fn ensureModified(self: *FileOps, allocator: Allocator, path: []const u8) !void {
+        if (self.modified.contains(path)) return;
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        try self.modified.put(allocator, owned, {});
+    }
+};
+
+/// Extract `"path"` from a tool_use's raw JSON input. Returns null on
+/// any parse failure: the tool may have been called with malformed
+/// args or with a different schema. We swallow rather than propagate
+/// because file-op tracking is best-effort metadata, not load-bearing.
+fn pathFromToolInput(input_raw: []const u8, allocator: Allocator) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input_raw, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const path_val = obj.get("path") orelse return null;
+    return switch (path_val) {
+        .string => |s| allocator.dupe(u8, s) catch null,
+        else => null,
+    };
+}
+
+/// Walk every assistant message in `messages` and collect file paths
+/// touched by the builtin file tools (`read`, `write`, `edit`). Returns
+/// an empty FileOps when nothing matched. Caller owns the returned
+/// FileOps and must call `deinit`.
+fn extractFileOps(messages: []const types.Message, allocator: Allocator) !FileOps {
+    var ops: FileOps = .{};
+    errdefer ops.deinit(allocator);
+    for (messages) |msg| {
+        if (msg.role != .assistant) continue;
+        for (msg.content) |block| switch (block) {
+            .tool_use => |tu| {
+                const path = pathFromToolInput(tu.input_raw, allocator) orelse continue;
+                defer allocator.free(path);
+                if (std.mem.eql(u8, tu.name, "read")) {
+                    try ops.ensureRead(allocator, path);
+                } else if (std.mem.eql(u8, tu.name, "write") or std.mem.eql(u8, tu.name, "edit")) {
+                    try ops.ensureModified(allocator, path);
+                }
+            },
+            else => {},
+        };
+    }
+    return ops;
+}
+
+/// Format the FileOps as appended trailer text for the summary.
+/// Empty sections are omitted so a session that only read files
+/// doesn't carry a "<files-modified>" header with no entries.
+fn formatFileOps(ops: *const FileOps, allocator: Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (ops.read.count() > 0 or ops.modified.count() > 0) {
+        try out.appendSlice(allocator, "\n\n## Files Touched\n");
+    }
+    if (ops.modified.count() > 0) {
+        try out.appendSlice(allocator, "### Modified\n");
+        var it = ops.modified.keyIterator();
+        while (it.next()) |k| {
+            try out.appendSlice(allocator, "- ");
+            try out.appendSlice(allocator, k.*);
+            try out.append(allocator, '\n');
+        }
+    }
+    if (ops.read.count() > 0) {
+        try out.appendSlice(allocator, "### Read (read-only)\n");
+        var it = ops.read.keyIterator();
+        while (it.next()) |k| {
+            // Don't list a file in both sections; modification wins.
+            if (ops.modified.contains(k.*)) continue;
+            try out.appendSlice(allocator, "- ");
+            try out.appendSlice(allocator, k.*);
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "extractFileOps captures read/write/edit paths from tool_use blocks" {
+    const alloc = std.testing.allocator;
+    const u_blocks = [_]types.ContentBlock{.{ .text = .{ .text = "do work" } }};
+    const a_blocks = [_]types.ContentBlock{
+        .{ .tool_use = .{ .id = "1", .name = "read", .input_raw = "{\"path\":\"src/a.zig\"}" } },
+        .{ .tool_use = .{ .id = "2", .name = "edit", .input_raw = "{\"path\":\"src/b.zig\"}" } },
+        .{ .tool_use = .{ .id = "3", .name = "write", .input_raw = "{\"path\":\"src/c.zig\"}" } },
+    };
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &u_blocks },
+        .{ .role = .assistant, .content = &a_blocks },
+    };
+    var ops = try extractFileOps(&msgs, alloc);
+    defer ops.deinit(alloc);
+    try std.testing.expect(ops.read.contains("src/a.zig"));
+    try std.testing.expect(ops.modified.contains("src/b.zig"));
+    try std.testing.expect(ops.modified.contains("src/c.zig"));
+    try std.testing.expectEqual(@as(u32, 1), ops.read.count());
+    try std.testing.expectEqual(@as(u32, 2), ops.modified.count());
+}
+
+test "formatFileOps produces a Files Touched block with Modified first" {
+    const alloc = std.testing.allocator;
+    var ops: FileOps = .{};
+    defer ops.deinit(alloc);
+    try ops.ensureRead(alloc, "read_only.zig");
+    try ops.ensureModified(alloc, "modified.zig");
+    const out = try formatFileOps(&ops, alloc);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "## Files Touched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "### Modified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "modified.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "read_only.zig") != null);
+    const mod_idx = std.mem.indexOf(u8, out, "### Modified").?;
+    const read_idx = std.mem.indexOf(u8, out, "### Read").?;
+    try std.testing.expect(mod_idx < read_idx);
+}
+
+test "formatFileOps returns an empty string when nothing was touched" {
+    const alloc = std.testing.allocator;
+    var ops: FileOps = .{};
+    defer ops.deinit(alloc);
+    const out = try formatFileOps(&ops, alloc);
+    defer alloc.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
 /// Extract a previous compaction summary from the head of a message
 /// slice, if one is present. Returns the inner summary text and the
 /// index of the first message *after* the wrapped summary. Returns
@@ -1968,6 +2122,20 @@ pub fn runDefaultSummarization(
     };
     defer allocator.free(summary_buf);
 
+    // Phase 5: walk the soon-to-be-summarized prefix for read/write/edit
+    // paths and append a "Files Touched" trailer so the model doesn't
+    // waste a turn re-reading work it has already done.
+    var ops = try extractFileOps(messages[summarize_start..cut.first_kept], allocator);
+    defer ops.deinit(allocator);
+    const trailer = try formatFileOps(&ops, allocator);
+    defer allocator.free(trailer);
+
+    const summary_with_trailer = if (trailer.len == 0)
+        try allocator.dupe(u8, summary_buf)
+    else
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ summary_buf, trailer });
+    defer allocator.free(summary_with_trailer);
+
     // Compose [summary_message, deep-copied retained suffix]. Deep-copy
     // because the caller's `installCompactReplacement` frees both the
     // outer slice and every nested allocation; sharing pointers with
@@ -1977,7 +2145,7 @@ pub fn runDefaultSummarization(
         for (out.items) |m| m.deinit(allocator);
         out.deinit(allocator);
     }
-    const summary_msg = try synthesizeSummaryMessage(summary_buf, allocator);
+    const summary_msg = try synthesizeSummaryMessage(summary_with_trailer, allocator);
     try out.append(allocator, summary_msg);
 
     for (messages[cut.first_kept..]) |m| {
