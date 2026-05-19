@@ -1678,6 +1678,47 @@ const SUMMARIZATION_SYSTEM_PROMPT =
     \\Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
 ;
 
+const UPDATE_SUMMARIZATION_PROMPT_TEMPLATE =
+    \\The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+    \\
+    \\Update the existing structured summary with new information. RULES:
+    \\- PRESERVE all existing information from the previous summary
+    \\- ADD new progress, decisions, and context from the new messages
+    \\- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+    \\- UPDATE "Next Steps" based on what was accomplished
+    \\- PRESERVE exact file paths, function names, and error messages
+    \\- If something is no longer relevant, you may remove it
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[Preserve existing goals, add new ones if the task expanded]
+    \\
+    \\## Constraints & Preferences
+    \\- [Preserve existing, add new ones discovered]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Include previously done items AND newly completed items]
+    \\
+    \\### In Progress
+    \\- [ ] [Current work - update based on progress]
+    \\
+    \\### Blocked
+    \\- [Current blockers - remove if resolved]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+    \\
+    \\## Next Steps
+    \\1. [Update based on current state]
+    \\
+    \\## Critical Context
+    \\- [Preserve important context, add new if needed]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
 const SUMMARIZATION_PROMPT_TEMPLATE =
     \\The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
     \\
@@ -1779,6 +1820,57 @@ fn synthesizeSummaryMessage(
     return .{ .role = .user, .content = blocks };
 }
 
+/// Extract a previous compaction summary from the head of a message
+/// slice, if one is present. Returns the inner summary text and the
+/// index of the first message *after* the wrapped summary. Returns
+/// null when no wrapped summary lives at messages[0]; we don't scan
+/// further because compaction summaries are only ever injected at the
+/// front by `runDefaultSummarization`.
+const PriorSummary = struct {
+    /// Inner summary text (between `<summary>\n` and `\n</summary>`).
+    /// Borrowed from the messages slice.
+    text: []const u8,
+    /// Index of the first message after the wrapped summary. Callers
+    /// summarize from this index instead of 0 so the existing summary
+    /// isn't fed to itself.
+    next_index: usize,
+};
+
+fn extractPriorSummary(messages: []const types.Message) ?PriorSummary {
+    if (messages.len == 0) return null;
+    const first = messages[0];
+    if (first.role != .user or first.content.len == 0) return null;
+    const body = switch (first.content[0]) {
+        .text => |t| t.text,
+        else => return null,
+    };
+    if (!std.mem.startsWith(u8, body, COMPACTION_SUMMARY_PREFIX)) return null;
+    if (!std.mem.endsWith(u8, body, COMPACTION_SUMMARY_SUFFIX)) return null;
+    const inner_start = COMPACTION_SUMMARY_PREFIX.len;
+    const inner_end = body.len - COMPACTION_SUMMARY_SUFFIX.len;
+    if (inner_end <= inner_start) return null;
+    return .{
+        .text = body[inner_start..inner_end],
+        .next_index = 1,
+    };
+}
+
+test "extractPriorSummary recognises a wrapped summary at the front" {
+    const alloc = std.testing.allocator;
+    const msg = try synthesizeSummaryMessage("PRIOR FACTS", alloc);
+    defer msg.deinit(alloc);
+    const msgs = [_]types.Message{msg};
+    const got = extractPriorSummary(&msgs).?;
+    try std.testing.expectEqualStrings("PRIOR FACTS", got.text);
+    try std.testing.expectEqual(@as(usize, 1), got.next_index);
+}
+
+test "extractPriorSummary returns null on regular user messages" {
+    const blocks = [_]types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    const msgs = [_]types.Message{.{ .role = .user, .content = &blocks }};
+    try std.testing.expectEqual(@as(?PriorSummary, null), extractPriorSummary(&msgs));
+}
+
 /// Zig-side structured summarization, used as the fallback after a Lua
 /// compact strategy either declines (returns nil) or shrinks too little
 /// to fit. Picks a cut point with `findCutPoint(keep_recent_tokens)`,
@@ -1787,6 +1879,14 @@ fn synthesizeSummaryMessage(
 /// retained_suffix`. All allocations are on `allocator` and transferred
 /// to the caller via the returned slice; the caller installs them with
 /// `installCompactReplacement`.
+///
+/// Iterative behavior: when `messages[0]` is itself a wrapped prior
+/// summary (from an earlier compaction), the function switches to
+/// pi-mono's UPDATE_SUMMARIZATION_PROMPT and threads the previous
+/// summary into the user prompt as a `<previous-summary>` block. The
+/// summarizer is instructed to preserve existing facts while folding
+/// in new conversation progress, so iterated compactions accumulate
+/// rather than overwriting.
 ///
 /// Returns null when there is nothing meaningful to summarize (cut
 /// point at 0 = retain everything). Errors propagate from the provider
@@ -1803,10 +1903,25 @@ pub fn runDefaultSummarization(
     const cut = findCutPoint(messages, keep_recent_tokens);
     if (cut.first_kept == 0) return null;
 
-    const serialized = try serializeForSummary(messages[0..cut.first_kept], allocator);
+    // Detect a prior compaction summary at the head; switch to the
+    // UPDATE prompt and feed the previous summary in for iterative
+    // refinement. The summarize range still ends at the cut point, but
+    // starts at `next_index` so we don't re-summarize the summary.
+    const prior = extractPriorSummary(messages);
+    const summarize_start: usize = if (prior) |p| p.next_index else 0;
+    if (summarize_start >= cut.first_kept) return null;
+
+    const serialized = try serializeForSummary(
+        messages[summarize_start..cut.first_kept],
+        allocator,
+    );
     defer allocator.free(serialized);
 
-    const user_prompt = try std.fmt.allocPrint(
+    const user_prompt = if (prior) |p| try std.fmt.allocPrint(
+        allocator,
+        "<conversation>\n{s}\n</conversation>\n\n<previous-summary>\n{s}\n</previous-summary>\n\n{s}",
+        .{ serialized, p.text, UPDATE_SUMMARIZATION_PROMPT_TEMPLATE },
+    ) else try std.fmt.allocPrint(
         allocator,
         "<conversation>\n{s}\n</conversation>\n\n{s}",
         .{ serialized, SUMMARIZATION_PROMPT_TEMPLATE },
