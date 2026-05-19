@@ -7,15 +7,25 @@
 //!     updated_ms, message_count, project}` rows aggregated across every
 //!     project recorded in `ProjectRegistry`, sorted by `updated_ms`
 //!     descending.
-//!   * `zag.sessions.rename(id, new_name)` — find which project owns
-//!     `id`, update its `meta.json`. Raises on missing id.
-//!   * `zag.sessions.delete(id)` — remove `.jsonl` + `.meta.json` for
-//!     the session in its owning project.
+//!   * `zag.sessions.rename(id, new_name, project_path?)` — update the
+//!     `meta.json` for `id` in `project_path`. When `project_path` is
+//!     omitted, walks the registry to find the owning project. Raises
+//!     on missing id or unknown project_path.
+//!   * `zag.sessions.delete(id, project_path?)` — remove `.jsonl` +
+//!     `.meta.json` for the session. Same lookup semantics as rename;
+//!     a delete of an already-absent id is a no-op.
 //!   * `zag.sessions.current()` — id string of the session bound to the
 //!     focused conversation pane, or `nil`.
-//!   * `zag.sessions.subagents(id)` — array of `{call_id, tool_input,
-//!     timestamp_ms}` rows for each `task_start` entry in `id`'s
-//!     JSONL.
+//!   * `zag.sessions.subagents(id, project_path?)` — array of
+//!     `{call_id, tool_input, timestamp_ms}` rows for each `task_start`
+//!     entry in `id`'s JSONL. Same lookup semantics as rename.
+//!
+//! The optional `project_path` argument lets callers (typically the
+//! sessions sidebar, which already has `row.project` from `list()`)
+//! skip the full-registry scan. When supplied it is validated against
+//! the registry plus the live cwd realpath; an unknown path raises
+//! rather than being treated as authoritative, so the Lua surface
+//! cannot be tricked into mutating arbitrary on-disk paths.
 //!
 //! Cross-project lookup walks `ProjectRegistry.listProjects()` and probes
 //! each project root via `Session.listSessionsAt`; the standalone helper
@@ -220,7 +230,70 @@ fn findProjectForId(allocator: std.mem.Allocator, id: []const u8) !?[]u8 {
     return null;
 }
 
-/// `zag.sessions.rename(id, new_name)` — see top-of-file docstring.
+/// Validate that `project_path` is known to the registry or matches the
+/// live cwd realpath. Returns `error.UnknownProject` if neither matches.
+/// Callers pass project_path through from Lua; without this gate the
+/// binding would happily mutate arbitrary on-disk paths supplied by a
+/// plugin.
+fn verifyProjectRegistered(allocator: std.mem.Allocator, project_path: []const u8) !void {
+    // cwd realpath wins fast: the sidebar's most common case is renaming
+    // a session in the current project, and that almost always matches
+    // here without touching the registry file at all.
+    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_real| {
+        defer allocator.free(cwd_real);
+        if (std.mem.eql(u8, cwd_real, project_path)) return;
+    } else |_| {}
+
+    const config_dir = resolveConfigDir(allocator) catch |err| switch (err) {
+        // No HOME: only the cwd check above is available, and it has
+        // already failed. Treat as unknown rather than silently allow.
+        error.EnvironmentVariableNotFound => return error.UnknownProject,
+        else => return err,
+    };
+    defer allocator.free(config_dir);
+
+    var registry = ProjectRegistry.init(allocator, config_dir) catch |err| {
+        log.warn("project registry open failed during verify: {s}", .{@errorName(err)});
+        return error.UnknownProject;
+    };
+    defer registry.deinit();
+
+    const projects = try registry.listProjects();
+    defer {
+        for (projects) |p| allocator.free(p.path);
+        allocator.free(projects);
+    }
+    for (projects) |p| {
+        if (std.mem.eql(u8, p.path, project_path)) return;
+    }
+    return error.UnknownProject;
+}
+
+/// Resolve the owning project for `id`, optionally taking a caller-
+/// supplied hint at Lua arg `arg_index`. When the hint is a string,
+/// validate it via `verifyProjectRegistered` and return a duped copy.
+/// When the hint is absent/nil, fall back to the full-registry scan.
+/// Returns null when no project owns `id` (only possible on the
+/// fallback path; the hint path raises `UnknownProject` before
+/// reaching here).
+fn resolveProjectFor(
+    lua: *Lua,
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    arg_index: i32,
+) !?[]u8 {
+    if (lua.isNoneOrNil(arg_index)) {
+        return findProjectForId(allocator, id);
+    }
+    if (lua.typeOf(arg_index) != .string) {
+        return error.InvalidProjectArg;
+    }
+    const hint = lua.toString(arg_index) catch return error.InvalidProjectArg;
+    try verifyProjectRegistered(allocator, hint);
+    return try allocator.dupe(u8, hint);
+}
+
+/// `zag.sessions.rename(id, new_name, project_path?)` — see top-of-file docstring.
 fn zagSessionsRenameFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
 
@@ -237,11 +310,15 @@ fn zagSessionsRenameFn(lua: *Lua) i32 {
         lua.raiseErrorStr("zag.sessions.rename: name must be a string", .{});
     };
 
-    const project_owned = findProjectForId(engine.allocator, id) catch |err| {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.rename: {s}", .{@errorName(err)}) catch
-            "zag.sessions.rename: lookup failed";
-        lua.raiseErrorStr("%s", .{msg.ptr});
+    const project_owned = resolveProjectFor(lua, engine.allocator, id, 3) catch |err| switch (err) {
+        error.UnknownProject => lua.raiseErrorStr("zag.sessions.rename: unknown project", .{}),
+        error.InvalidProjectArg => lua.raiseErrorStr("zag.sessions.rename: project_path must be a string", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.rename: {s}", .{@errorName(err)}) catch
+                "zag.sessions.rename: lookup failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
     };
     if (project_owned == null) {
         lua.raiseErrorStr("zag.sessions.rename: unknown session id", .{});
@@ -260,7 +337,7 @@ fn zagSessionsRenameFn(lua: *Lua) i32 {
     return 0;
 }
 
-/// `zag.sessions.delete(id)` — see top-of-file docstring.
+/// `zag.sessions.delete(id, project_path?)` — see top-of-file docstring.
 fn zagSessionsDeleteFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
 
@@ -271,11 +348,15 @@ fn zagSessionsDeleteFn(lua: *Lua) i32 {
         lua.raiseErrorStr("zag.sessions.delete: id must be a string", .{});
     };
 
-    const project_owned = findProjectForId(engine.allocator, id) catch |err| {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.delete: {s}", .{@errorName(err)}) catch
-            "zag.sessions.delete: lookup failed";
-        lua.raiseErrorStr("%s", .{msg.ptr});
+    const project_owned = resolveProjectFor(lua, engine.allocator, id, 2) catch |err| switch (err) {
+        error.UnknownProject => lua.raiseErrorStr("zag.sessions.delete: unknown project", .{}),
+        error.InvalidProjectArg => lua.raiseErrorStr("zag.sessions.delete: project_path must be a string", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.delete: {s}", .{@errorName(err)}) catch
+                "zag.sessions.delete: lookup failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
     };
     if (project_owned == null) {
         // Match SessionManager.deleteSession's idempotency contract: a
@@ -325,7 +406,7 @@ fn pushUlidString(lua: *Lua, ulid_bytes: [26]u8) void {
     _ = lua.pushString(ulid_bytes[0..]);
 }
 
-/// `zag.sessions.subagents(id)` — see top-of-file docstring.
+/// `zag.sessions.subagents(id, project_path?)` — see top-of-file docstring.
 fn zagSessionsSubagentsFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
 
@@ -336,11 +417,15 @@ fn zagSessionsSubagentsFn(lua: *Lua) i32 {
         lua.raiseErrorStr("zag.sessions.subagents: id must be a string", .{});
     };
 
-    const project_owned = findProjectForId(engine.allocator, id) catch |err| {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.subagents: {s}", .{@errorName(err)}) catch
-            "zag.sessions.subagents: lookup failed";
-        lua.raiseErrorStr("%s", .{msg.ptr});
+    const project_owned = resolveProjectFor(lua, engine.allocator, id, 2) catch |err| switch (err) {
+        error.UnknownProject => lua.raiseErrorStr("zag.sessions.subagents: unknown project", .{}),
+        error.InvalidProjectArg => lua.raiseErrorStr("zag.sessions.subagents: project_path must be a string", .{}),
+        else => {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.subagents: {s}", .{@errorName(err)}) catch
+                "zag.sessions.subagents: lookup failed";
+            lua.raiseErrorStr("%s", .{msg.ptr});
+        },
     };
     if (project_owned == null) {
         lua.raiseErrorStr("zag.sessions.subagents: unknown session id", .{});

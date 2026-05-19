@@ -405,6 +405,95 @@ test "zag.sessions.rename rejects an unknown id with a clear error" {
     );
 }
 
+// Covers the optional `project_path` 3rd argument that lets callers
+// skip the full-registry scan when they already know the owning
+// project (typically the value passed back from `zag.sessions.list`).
+// The behavioral assertion is that rename still succeeds; the perf win
+// (no registry walk, no realpath, no listSessionsAt per project) is
+// the reason for the parameter.
+test "zag.sessions.rename accepts a project_path hint and updates the meta" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    handle.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local sessions = zag.sessions.list()
+        \\assert(#sessions == 1)
+        \\local row = sessions[1]
+        \\assert(type(row.project) == "string" and #row.project > 0,
+        \\       "row.project must be a non-empty string")
+        \\zag.sessions.rename(row.id, "fast-renamed", row.project)
+        \\local again = zag.sessions.list()
+        \\assert(#again == 1)
+        \\assert(again[1].name == "fast-renamed",
+        \\       "name not propagated: " .. tostring(again[1].name))
+    );
+}
+
+// A project_path that the registry has never seen must be rejected
+// rather than silently treated as authoritative. Otherwise callers
+// could be tricked into mutating arbitrary on-disk paths through the
+// Lua surface.
+test "zag.sessions.rename rejects an unknown project_path hint" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(id);
+    handle.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    _ = engine.lua.pushString(id);
+    engine.lua.setGlobal("_test_session_id");
+
+    try runLua(&engine,
+        \\local ok, err = pcall(function()
+        \\    zag.sessions.rename(_test_session_id, "x", "/nonexistent/project/path")
+        \\end)
+        \\assert(not ok, "expected pcall to fail")
+        \\assert(tostring(err):find("unknown project") ~= nil,
+        \\       "expected 'unknown project' in: " .. tostring(err))
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
