@@ -936,11 +936,15 @@ test "sessions sidebar refreshes on SessionListChanged" {
     );
 }
 
-// Task 4.3: PaneFocused refresh only when the sidebar pane is the
-// focus target. A focus swap to any other pane must be ignored — the
-// sidebar already re-renders on SessionListChanged; refreshing on
-// every focus swap would be redundant noise.
-test "sessions sidebar refreshes on PaneFocused only when sidebar is the target" {
+// Task 4.3 + 6.1: PaneFocused refresh on ANY focus swap while the
+// sidebar is open. Task 4.3 originally narrowed this to "only when the
+// sidebar pane is the target" because the only refresh trigger was the
+// cross-process list-mutation case. Task 6.1 expanded the contract: the
+// "current-session highlight" must follow the focused conversation
+// pane, so every focus swap (in EITHER direction) must trigger a
+// re-render. The render is cheap (O(n_sessions + n_visible_subagents))
+// so firing on every swap is fine.
+test "sessions sidebar refreshes on every PaneFocused while sidebar is open" {
     const allocator = testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -984,7 +988,8 @@ test "sessions sidebar refreshes on PaneFocused only when sidebar is the target"
         \\st.render_count = 0
     );
 
-    // Fire PaneFocused for a non-sidebar pane: render_count must NOT bump.
+    // Focus swap to a non-sidebar pane: must trigger a refresh so the
+    // current-session highlight can track the new focused pane.
     var other: Hooks.HookPayload = .{ .pane_focused = .{
         .pane_handle = "n2",
         .previous_handle = "",
@@ -994,13 +999,12 @@ test "sessions sidebar refreshes on PaneFocused only when sidebar is the target"
     try runLua(&engine,
         \\local sidebar = require("zag.builtin.sessions")
         \\local st = sidebar._state_for_test()
-        \\assert(st.render_count == 0,
-        \\       "PaneFocused on a non-sidebar pane must not refresh, count="
+        \\assert(st.render_count == 1,
+        \\       "PaneFocused on a non-sidebar pane must refresh exactly once, count="
         \\       .. tostring(st.render_count))
     );
 
-    // Fire PaneFocused for the sidebar's own pane_id: render_count
-    // must increment exactly once.
+    // Focus swap back to the sidebar itself: also a refresh.
     var self_focus: Hooks.HookPayload = .{ .pane_focused = .{
         .pane_handle = "n1",
         .previous_handle = "n2",
@@ -1010,9 +1014,126 @@ test "sessions sidebar refreshes on PaneFocused only when sidebar is the target"
     try runLua(&engine,
         \\local sidebar = require("zag.builtin.sessions")
         \\local st = sidebar._state_for_test()
-        \\assert(st.render_count == 1,
-        \\       "PaneFocused on the sidebar pane must refresh exactly once, count="
+        \\assert(st.render_count == 2,
+        \\       "PaneFocused on the sidebar pane must refresh exactly once more, count="
         \\       .. tostring(st.render_count))
+    );
+}
+
+// Task 6.1: the row whose session id matches the currently-focused
+// conversation pane is marked with a "● " prefix glyph (visible in the
+// rendered line text) and tagged `is_current = true` on the row table.
+// Non-current rows get a two-space prefix so the session name column
+// stays aligned regardless of which row (if any) is current.
+test "sessions sidebar marks the current-session row with a glyph" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_a = try mgr.createSession("test-model");
+    const id_a_len = h_a.id_len;
+    const id_a = try allocator.dupe(u8, h_a.id[0..id_a_len]);
+    defer allocator.free(id_a);
+    try h_a.rename("alpha");
+    h_a.close();
+
+    var h_b = try mgr.createSession("test-model");
+    const id_b_len = h_b.id_len;
+    const id_b = try allocator.dupe(u8, h_b.id[0..id_b_len]);
+    defer allocator.free(id_b);
+    try h_b.rename("beta");
+    h_b.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    // Attach the sidebar to a buffer with no current-session override
+    // active. Every row should get the two-space "non-current" prefix
+    // and `is_current = false`.
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\_G._sidebar_buf = buf
+        \\-- Defensive: prior tests may have left an override active in
+        \\-- this engine's module-level state.
+        \\sidebar._set_current_for_test(nil)
+        \\sidebar._set_filter_for_test("")
+        \\local rows = sidebar._state_for_test().last_render
+        \\for _, r in ipairs(rows) do
+        \\    assert(r.is_current == false,
+        \\           "row " .. tostring(r.session_id) .. " should not be current")
+        \\    assert(r.label:sub(1, 2) == "  ",
+        \\           "row label should start with two spaces: " .. tostring(r.label))
+        \\end
+        \\local lines = zag.buffer.get_lines(buf)
+        \\for _, line in ipairs(lines) do
+        \\    assert(line:sub(1, 3) ~= "● ",
+        \\           "no row should carry the ● marker without a current id")
+        \\end
+    );
+
+    // Force the current-session override to `id_b`. The "beta" row
+    // should now carry the marker; "alpha" should not.
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\sidebar._set_current_for_test("{s}")
+        \\local rows = sidebar._state_for_test().last_render
+        \\local marked = nil
+        \\local unmarked_count = 0
+        \\for _, r in ipairs(rows) do
+        \\    if r.kind == "session" then
+        \\        if r.is_current then
+        \\            assert(marked == nil, "more than one row marked current")
+        \\            marked = r
+        \\        else
+        \\            unmarked_count = unmarked_count + 1
+        \\        end
+        \\    end
+        \\end
+        \\assert(marked ~= nil, "no row marked current")
+        \\assert(marked.session_id == "{s}",
+        \\       "wrong row marked current: " .. tostring(marked.session_id))
+        \\assert(marked.label:sub(1, 4) == "● ",
+        \\       "current row label should start with ● : " .. tostring(marked.label))
+        \\assert(unmarked_count >= 1, "expected at least one non-current row")
+        \\local lines = zag.buffer.get_lines(_G._sidebar_buf)
+        \\local found = false
+        \\for _, line in ipairs(lines) do
+        \\    if line:sub(1, 4) == "● " then found = true end
+        \\end
+        \\assert(found, "rendered buffer should contain a ● line")
+    , .{ id_b, id_b }, 0);
+    defer allocator.free(script);
+    try runLua(&engine, script);
+
+    // Clearing the override drops the marker again.
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\sidebar._set_current_for_test(nil)
+        \\local rows = sidebar._state_for_test().last_render
+        \\for _, r in ipairs(rows) do
+        \\    assert(r.is_current == false,
+        \\           "clearing override should drop is_current")
+        \\end
     );
 }
 

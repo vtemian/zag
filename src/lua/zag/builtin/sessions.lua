@@ -22,10 +22,15 @@ local state = {
     filter = "",          -- substring filter (empty = no filter)
     mode = "normal",      -- "normal" | "filter" | "rename" | "confirm_delete"
     rename_buf = "",      -- in-progress new name
-    last_render = {},     -- array of { kind, session_id?, depth, label } for keymap dispatch
+    last_render = {},     -- array of { kind, session_id?, depth, label, is_current } for keymap dispatch
     hook_ids = {},        -- registered hook ids, removed on close
     keymap_ids = {},      -- registered buffer-local keymap ids
     render_count = 0,     -- test-only counter: bumped on every _render call
+    current_session_id = nil, -- test seam (Task 6.1): force-override the
+                              -- "current" row resolution to bypass the
+                              -- zag.layout.tree() lookup. Production sets
+                              -- this to nil; _resolve_current_session_id
+                              -- falls back to the tree walk.
 }
 
 function M.toggle()
@@ -72,11 +77,14 @@ end
 -- Subscribe to the two events that should refresh the sidebar:
 --   * SessionListChanged: any session was created/renamed/deleted in
 --     this zag process. Re-render to pick up the new label set.
---   * PaneFocused: the user just focused INTO the sidebar pane. Refresh
---     to catch list mutations made by a different zag process while the
---     sidebar pane was unfocused. We deliberately ignore focus swaps
---     that target other panes — refreshing on every pane swap would be
---     noisy and serves no purpose.
+--   * PaneFocused: focus moved to ANY pane (including the sidebar
+--     itself). Re-rendering catches both the cross-process list
+--     mutation case (when the sidebar regains focus) AND the Task 6.1
+--     "current-session highlight" case: when the user swaps to a
+--     conversation pane bound to session X, the sidebar's "● X" row
+--     should light up; when they swap to one bound to Y, it should
+--     move. Render is O(n_sessions + n_visible_subagents) so firing
+--     on every focus swap is cheap.
 --
 -- Each registered id is appended to `state.hook_ids` so `M.close()`
 -- can tear them down as a set. The handlers guard on `state.buffer_id`
@@ -91,11 +99,9 @@ function M._subscribe_hooks()
         if not state.buffer_id then return end
         M._render()
     end))
-    table.insert(state.hook_ids, zag.hook("PaneFocused", function(evt)
+    table.insert(state.hook_ids, zag.hook("PaneFocused", function(_evt)
         if not state.buffer_id then return end
-        if evt.pane_handle == state.pane_id then
-            M._render()
-        end
+        M._render()
     end))
 end
 
@@ -283,12 +289,59 @@ function M._collect_rows()
     return rows
 end
 
+-- Resolve which session id (if any) is bound to the focused
+-- conversation pane right now. Returns nil when:
+--   * No window manager is attached (headless tests; `zag.layout.tree`
+--     raises) — the pcall keeps us silent rather than erroring the
+--     render path.
+--   * The focused pane IS the sidebar itself. The sidebar shows a
+--     scratch buffer, not a session, so highlighting its own row as
+--     "current" would be meaningless.
+--   * The focused pane has no conversation/session_handle (scratch
+--     buffer, model picker, etc.) — `zag.pane.session_id` returns nil
+--     in that case.
+--
+-- `state.current_session_id` is a test-only override (set by
+-- `_set_current_for_test`) that bypasses the tree lookup so headless
+-- integration tests can exercise the highlight path without a
+-- WindowManager.
+local function _resolve_current_session_id()
+    if state.current_session_id ~= nil then
+        return state.current_session_id
+    end
+    local ok, tree = pcall(zag.layout.tree)
+    if not ok or not tree or not tree.focus then return nil end
+    if tree.focus == state.pane_id then return nil end
+    local sid_ok, sid = pcall(zag.pane.session_id, tree.focus)
+    if not sid_ok then return nil end
+    return sid
+end
+
 function M._render()
     if not state.buffer_id then return end
 
     state.render_count = state.render_count + 1
     local rows = M._collect_rows()
     state.last_render = rows
+
+    -- Compute the "current" session id once per render and tag matching
+    -- session rows with the ●/space marker glyph. The glyph survives
+    -- theme swaps and reads correctly even when the second style fails
+    -- to paint (e.g. a theme that overrides `current_line` to invisible).
+    -- Belt-and-suspenders per the plan: glyph + style.
+    local current_id = _resolve_current_session_id()
+    for _, r in ipairs(rows) do
+        if r.kind == "session" and current_id ~= nil and r.session_id == current_id then
+            r.is_current = true
+            r.label = "● " .. r.label
+        else
+            r.is_current = false
+            -- Preserve column alignment for non-current rows so the
+            -- session name stays in the same screen column regardless
+            -- of whether any row is the current one.
+            r.label = "  " .. r.label
+        end
+    end
 
     local lines = {}
     for _, r in ipairs(rows) do
@@ -316,6 +369,17 @@ function M._render()
         state.cursor_row = 1
     elseif state.cursor_row > #rows then
         state.cursor_row = #rows
+    end
+
+    -- Paint the current-session highlight FIRST so the cursor's
+    -- `selection` style wins on overlap (the row painted last takes
+    -- precedence in the row-style override path). `current_line` is
+    -- distinct from `selection` in the default theme (different bg)
+    -- and is the cursorline equivalent in src/Theme.zig HighlightSlot.
+    for i, r in ipairs(rows) do
+        if r.is_current then
+            zag.buffer.set_row_style(state.buffer_id, i + cursor_offset, "current_line")
+        end
     end
 
     local highlight_row = state.cursor_row + cursor_offset
@@ -365,6 +429,17 @@ end
 -- keymaps for a simple substring assertion.
 function M._set_filter_for_test(s)
     state.filter = s or ""
+    M._render()
+end
+
+-- Test-only seam (Task 6.1). Forces `_resolve_current_session_id`
+-- to return `id` on the next render, bypassing the `zag.layout.tree`
+-- lookup. Headless integration tests don't have a WindowManager
+-- bound and so can't drive focus through real panes; this lets them
+-- assert on the rendered "● <name>" marker. Pass nil to clear the
+-- override and re-enable the live tree lookup.
+function M._set_current_for_test(id)
+    state.current_session_id = id
     M._render()
 end
 
