@@ -156,6 +156,14 @@ pub const Highlights = struct {
     /// Defaults to the same muted look as `status`; themes that want
     /// to call subagents out distinctly can swap this slot.
     subagent_placeholder: CellStyle,
+    /// Tool-call block rule line (`──── edit src/foo.zig ────`).
+    /// Defaults to a dim foreground so the rule reads as chrome, not
+    /// content.
+    tool_rule: CellStyle,
+    /// `+` line in a tool-call diff. Defaults to success green.
+    diff_add: CellStyle,
+    /// `-` line in a tool-call diff. Defaults to error red.
+    diff_remove: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.

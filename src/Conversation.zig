@@ -225,18 +225,19 @@ pub fn appendNode(self: *Conversation, parent: ?*Node, node_type: NodeType, cont
     return self.appendNonToolCallNode(parent, node_type, content);
 }
 
-/// Append a tool_call node carrying the provider's `tool_use_id` so the
-/// wire projection can echo the model's original id verbatim instead of
-/// minting `synth_N`. `tool_use_id` may be null for legacy callers that
-/// don't have a real id at hand; projection falls back to synth in that
-/// case. Use this from BufferSink (live stream) and `handleLoadedEntry`
-/// (JSONL replay) rather than the bare `appendNode` so tool ids survive
-/// the round-trip through the tree end-to-end.
+/// Append a tool_call node carrying the provider's `tool_use_id` and
+/// raw `tool_input_raw` JSON. Both fields are optional: projection
+/// falls back to `synth_N` when the id is missing, and the renderer
+/// falls back to the generic `[tool] <name>` header when the input
+/// is missing. Use this from `BufferSink` (live stream) and
+/// `handleLoadedEntry` (JSONL replay) rather than the bare
+/// `appendNode` so ids and inputs survive the round-trip end-to-end.
 pub fn appendToolCallNode(
     self: *Conversation,
     parent: ?*Node,
     tool_name: []const u8,
     tool_use_id: ?[]const u8,
+    tool_input_raw: ?[]const u8,
 ) !*Node {
     const node = try self.tree.appendNode(parent, .tool_call);
     errdefer self.tree.removeNode(node);
@@ -249,6 +250,14 @@ pub fn appendToolCallNode(
 
     if (tool_use_id) |id| {
         node.tool_use_id = try self.allocator.dupe(u8, id);
+    }
+    errdefer if (node.tool_use_id) |id| {
+        self.allocator.free(id);
+        node.tool_use_id = null;
+    };
+
+    if (tool_input_raw) |raw| {
+        node.tool_input_raw = try self.allocator.dupe(u8, raw);
     }
 
     self.notifyChildChanged();
@@ -575,7 +584,8 @@ fn handleLoadedEntry(
             // what the live BufferSink path does for in-flight turns).
             // Legacy rows without the field fall back to projection-side
             // synth_N.
-            const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id);
+            const tool_input_arg: ?[]const u8 = if (entry.tool_input.len > 0) entry.tool_input else null;
+            const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id, tool_input_arg);
             node.collapsed = true;
             last_tool_call.* = node;
         },
@@ -606,7 +616,8 @@ fn handleLoadedEntry(
         // delegation in the JSONL stream.
         .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
         .task_tool_use => {
-            const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id);
+            const tool_input_arg: ?[]const u8 = if (entry.tool_input.len > 0) entry.tool_input else null;
+            const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id, tool_input_arg);
             node.collapsed = true;
             last_tool_call.* = node;
         },
@@ -2439,11 +2450,11 @@ test "toWireMessages: preserves provider tool_use_id when set on node" {
 
     _ = try cb.appendNode(null, .user_message, "use 3 tools in parallel");
     // Three parallel tool_calls with real Kimi-style ids.
-    const c0 = try cb.appendToolCallNode(null, "bash", "bash:0");
+    const c0 = try cb.appendToolCallNode(null, "bash", "bash:0", null);
     _ = try cb.appendNode(c0, .tool_result, "ok0");
-    const c1 = try cb.appendToolCallNode(null, "read", "read:1");
+    const c1 = try cb.appendToolCallNode(null, "read", "read:1", null);
     _ = try cb.appendNode(c1, .tool_result, "ok1");
-    const c2 = try cb.appendToolCallNode(null, "read", "read:2");
+    const c2 = try cb.appendToolCallNode(null, "read", "read:2", null);
     _ = try cb.appendNode(c2, .tool_result, "ok2");
 
     const messages = try cb.toWireMessages(arena.allocator());

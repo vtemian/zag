@@ -71,6 +71,15 @@ pub const Node = struct {
     /// predates the field, in which case projection falls back to
     /// synth ids.
     tool_use_id: ?[]const u8 = null,
+    /// Raw JSON arguments the model emitted with this tool_call
+    /// (e.g. `{"path":"src/foo.zig"}` for `read`,
+    /// `{"command":"zig build"}` for `bash`). Owned when set; freed
+    /// in `deinit`. Read by `NodeRenderer` so per-tool renderers can
+    /// surface the actual file path, command, or diff inline instead
+    /// of the placeholder `[tool] <name>` header. Null for legacy
+    /// rows that predate the field, in which case the renderer falls
+    /// back to the generic header.
+    tool_input_raw: ?[]const u8 = null,
     /// Optional handle into the WindowManager's BufferRegistry. When
     /// set, this node's content lives in a TextBuffer (or ImageBuffer
     /// for image tool_result nodes) referenced by the handle. Tool_call
@@ -121,6 +130,7 @@ pub const Node = struct {
         self.children.deinit(allocator);
         if (self.custom_tag) |tag| allocator.free(tag);
         if (self.tool_use_id) |id| allocator.free(id);
+        if (self.tool_input_raw) |input| allocator.free(input);
         if (self.subagent_name) |name| allocator.free(name);
         if (self.subagent_prompt) |p| allocator.free(p);
     }

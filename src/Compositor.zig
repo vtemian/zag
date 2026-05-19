@@ -723,7 +723,11 @@ fn drawFramesPass(self: *Compositor, node: *const Layout.LayoutNode, focused: *c
 
 /// Draw a single rounded rectangle with an embedded title on the top edge.
 fn drawPaneFrame(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, focused: bool) void {
-    self.drawRoundedBox(leaf.rect, focused, leaf.buffer.getName(), .rounded);
+    const name = leaf.buffer.getName();
+    // The root session label is noise in the chrome; skip it. Other
+    // buffer names (scratch, subagents, etc.) are still useful.
+    const title = if (std.mem.eql(u8, name, "session")) null else name;
+    self.drawRoundedBox(leaf.rect, focused, title, .rounded);
 }
 
 /// Border glyph quartet plus edges, parameterized so floats can render
@@ -954,11 +958,11 @@ fn drawPanePrompt(
 
 /// Draw the pane's title embedded in the top border.
 ///
-/// Focused layout (W=20, name "session"):  `╭─ [session] ──────╮`
+/// Focused layout (W=20, name "scratch"):  `╭─ [scratch] ──────╮`
 ///   reserved = 6 cells (2 corners + 2 dashes + 2 inverse caps)
 ///   available name glyphs = W - reserved
 ///
-/// Unfocused layout:  `╭── session ───────╮`
+/// Unfocused layout:  `╭── scratch ───────╮`
 ///   reserved = 4 cells (2 corners + 2 spaces)
 ///
 /// When `available < 1`, the title is skipped (solid top border).

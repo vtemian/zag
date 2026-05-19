@@ -132,7 +132,10 @@ pub const BufferSink = struct {
                 // projection reads it back through `Conversation.projectNode`
                 // so the next-turn request echoes the model's original ids
                 // verbatim, keeping the live and projected paths consistent.
-                const node = self.buffer.appendToolCallNode(null, e.name, e.call_id) catch return;
+                // `input_raw` (raw JSON arguments) is carried alongside so
+                // the renderer can surface the actual edit/command/path
+                // inline instead of the generic `[tool] <name>` header.
+                const node = self.buffer.appendToolCallNode(null, e.name, e.call_id, e.input_raw) catch return;
                 node.collapsed = true;
                 self.last_tool_call = node;
                 if (e.call_id) |id| {
