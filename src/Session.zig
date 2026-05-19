@@ -156,6 +156,22 @@ fn isZeroUlid(id: ulid.Ulid) bool {
     return true;
 }
 
+/// Reject ids that would let a caller escape the sessions directory or
+/// name a parent directory. `createSession` generates ids from `generateId`
+/// (hex digits only), so this guard is for callers that arrived from a
+/// less-trusted surface (Lua bindings, future IPC).
+fn isValidSessionId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    if (id.len > 32) return false;
+    for (id) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Session metadata stored in the companion .meta.json file.
 /// Uses fixed-size char arrays to avoid heap allocation.
 pub const Meta = struct {
@@ -378,6 +394,32 @@ pub const SessionManager = struct {
 
         const id = list[0].idSlice();
         return try self.allocator.dupe(u8, id);
+    }
+
+    /// Remove a session's `.jsonl` and `.meta.json` from disk. Idempotent
+    /// when neither file exists. Caller is responsible for closing any open
+    /// SessionHandle for this id first; deleting under an open fd leaks the
+    /// handle and the JSONL file remains writable through it until close.
+    pub fn deleteSession(self: *SessionManager, id: []const u8) !void {
+        _ = self;
+        if (!isValidSessionId(id)) return error.InvalidSessionId;
+
+        var jsonl_path_buf: [256]u8 = undefined;
+        const jsonl_path = std.fmt.bufPrint(&jsonl_path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
+            return error.PathTooLong;
+        var meta_path_buf: [256]u8 = undefined;
+        const meta_path = std.fmt.bufPrint(&meta_path_buf, sessions_dir ++ "/{s}.meta.json", .{id}) catch
+            return error.PathTooLong;
+
+        const cwd = std.fs.cwd();
+        cwd.deleteFile(jsonl_path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+        cwd.deleteFile(meta_path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
     }
 
     /// Load an existing session or fall back to creating a new one.
@@ -2493,4 +2535,65 @@ test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
     try std.testing.expectEqual(EntryType.session_start, loaded[0].entry_type);
     try std.testing.expectEqualStrings("valid", loaded[1].content);
     try std.testing.expectEqualStrings("after", loaded[2].content);
+}
+
+test "SessionManager.deleteSession removes both .jsonl and .meta.json and is idempotent" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(id);
+    handle.close();
+
+    // Sanity: the session is listed before deletion.
+    {
+        const before = try mgr.listSessions();
+        defer allocator.free(before);
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+    }
+
+    try mgr.deleteSession(id);
+
+    const after = try mgr.listSessions();
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+
+    // Idempotent: a second delete on the same id is a no-op.
+    try mgr.deleteSession(id);
+
+    // The underlying files must actually be gone.
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{id});
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(jsonl_path, .{}));
+
+    var meta_path_buf: [256]u8 = undefined;
+    const meta_path = try std.fmt.bufPrint(&meta_path_buf, ".zag/sessions/{s}.meta.json", .{id});
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(meta_path, .{}));
+}
+
+test "SessionManager.deleteSession rejects ids that try to escape the sessions dir" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    var mgr = try SessionManager.init(allocator);
+
+    try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession("../etc/passwd"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession("foo/bar"));
+    try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession(""));
 }
