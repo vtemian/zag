@@ -1,17 +1,21 @@
-# Mid-turn ESC cancel and recovery. We send a deliberately long-running
-# prompt, ESC before it finishes streaming, then issue a different,
-# trivial bash tool call. The second turn proves the agent loop
-# recovered: a regression in the cancel + reminder-queue path would
-# either leave the second prompt unsent or trip up the streaming
-# state machine.
+# Mid-turn Ctrl+C cancel and recovery. We send a deliberately
+# long-running prompt, fire <C-c> while the model is still streaming,
+# then issue a different, trivial bash tool call. The second turn
+# proves the agent loop recovered: a regression in the cancel +
+# reminder-queue path would either leave the second prompt unsent or
+# trip up the streaming state machine.
+#
+# Ctrl+C is the real cancel hotkey in zag (see EventOrchestrator.zig).
+# Esc only enters normal mode in the modal keymap, it does NOT abort a
+# running agent.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "Write a 500-word essay about the history of pseudo-terminals on UNIX. Be thorough." <Enter>
-# Let the model start streaming a bit, then yank it.
+# Let the model start streaming a bit, then cancel the turn.
 wait_idle 4s
-send <Esc>
+send <C-c>
 wait_idle 1s
 send "Forget that. Just run bash 'echo zag-recover-token-T7'." <Enter>
 wait_idle 25s

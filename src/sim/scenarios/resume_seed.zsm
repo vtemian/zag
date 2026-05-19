@@ -1,0 +1,19 @@
+# Resume pair: seed step.
+#
+# Plants a deterministic user message into a fresh session, lets the
+# turn complete so the session JSONL has both the user message and an
+# assistant reply, then /quit cleanly. The session writes to
+# `.zag/sessions/` relative to the cwd from which you ran `zag-sim`.
+#
+# Run `resume_last.zsm` immediately after this one (same cwd) to verify
+# the seed message renders when zag re-opens via `--last`. The pair is
+# best-effort: if any other zag instance writes a session between the
+# two runs, `--last` may pick that one up instead.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "zag-resume-seed-token-FT4" <Enter>
+wait_idle 20s
+send "/quit" <Enter>
+wait_exit

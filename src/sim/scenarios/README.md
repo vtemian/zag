@@ -32,16 +32,16 @@ parser, tool dispatch, conversation history, slash commands).
 | `tool_reuse_sequence.zsm`       | Same tool fired repeatedly across one conversation |
 | `tool_deep_conversation.zsm`    | Multi-turn flow that creates, reads, edits, and shells out |
 | `multi_turn_context.zsm`        | Turn N+1 references a fact established in turn N |
-| `mid_turn_interrupt.zsm`        | ESC mid-stream cancels, follow-up prompt recovers |
+| `mid_turn_interrupt.zsm`        | Ctrl+C mid-stream cancels, follow-up prompt recovers |
 | `slash_quit.zsm`                | `/quit` exits cleanly, zero LLM cost |
-| `slash_new.zsm`                 | `/new` resets the conversation to a fresh state |
-| `resume_last.zsm`               | `zag --last` re-renders the most recent prior session |
+| `resume_seed.zsm`               | Plants a deterministic seed message and quits (writes a session) |
+| `resume_last.zsm`               | `zag --last` re-renders the seed message; run right after `resume_seed.zsm` |
 
 ## Conventions
 
 - We **don't** `expect_text` on model output (LLMs are non-deterministic). We
-  assert on tool output, slash command banners, and UI affordances that are
-  deterministic.
+  assert on tool output, user message echoes, slash command banners, and UI
+  affordances that are deterministic.
 - `wait_idle` durations are sized for first-token latency + a short reply.
   Bump them if your default model is slow.
 - `snapshot <label>` writes the final grid into the run's artifact dir so you
