@@ -648,9 +648,9 @@ fn serviceRoundTripEvent(
             req.done.set();
             return true;
         },
-        .compact_request_v2 => |req| {
+        .compact_request => |req| {
             if (engine) |eng| {
-                eng.handleCompactRequestV2(req) catch |err| {
+                eng.handleCompactRequest(req) catch |err| {
                     req.error_name = @errorName(err);
                 };
             }
@@ -762,7 +762,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
                 r.error_name = "drained_during_shutdown";
                 r.done.set();
             },
-            .compact_request_v2 => |r| {
+            .compact_request => |r| {
                 r.error_name = "drained_during_shutdown";
                 r.done.set();
             },
@@ -1014,7 +1014,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         .tool_transform_request,
         .tool_gate_request,
         .loop_detect_request,
-        .compact_request_v2,
+        .compact_request,
         => unreachable,
     }
 }

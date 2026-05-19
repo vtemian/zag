@@ -213,7 +213,7 @@ pub const LuaEngine = struct {
     /// without intervention. Released in `deinit`.
     loop_detect_handler: ?i32 = null,
     /// Single global compaction-strategy handler registered via
-    /// `zag.compact.strategy_v2(fn)`. The strategy runs at the top of
+    /// `zag.compact.strategy(fn)`. The strategy runs at the top of
     /// each agent iteration when the predictive estimate trips the
     /// room-based threshold. Sees a full-fidelity message snapshot
     /// (every ContentBlock variant preserved) and returns one of:
@@ -221,7 +221,7 @@ pub const LuaEngine = struct {
     /// run; `{cancel = true}` to opt out of the fallback for this
     /// turn; or `{messages = {...}, summary = "..."}` to install a
     /// custom replacement. Released in `deinit`.
-    compact_handler_v2: ?i32 = null,
+    compact_handler: ?i32 = null,
     /// Reserve budget (tokens) held back from the model's context window
     /// when `fireCompact` decides whether to fire. Mutable via Lua:
     /// `zag.compact.set_reserve_tokens(n)`. Default matches
@@ -613,9 +613,9 @@ pub const LuaEngine = struct {
         }
         // Same release dance for the single global compaction strategy
         // handler (set by `zag.compact.strategy(fn)`).
-        if (self.compact_handler_v2) |fn_ref| {
+        if (self.compact_handler) |fn_ref| {
             self.lua.unref(zlua.registry_index, fn_ref);
-            self.compact_handler_v2 = null;
+            self.compact_handler = null;
         }
         self.lua.deinit();
     }
@@ -1737,7 +1737,7 @@ pub const LuaEngine = struct {
     /// ("text", "tool_use", "tool_result", "thinking",
     /// "redacted_thinking") plus the variant-specific data. Caller
     /// pops nothing; the resulting array sits at stack top on return.
-    fn pushFullMessageSnapshot(lua: *Lua, messages: []const types.Message) !void {
+    fn pushMessageSnapshot(lua: *Lua, messages: []const types.Message) !void {
         lua.newTable();
         for (messages, 0..) |msg, idx| {
             lua.newTable();
@@ -1805,11 +1805,11 @@ pub const LuaEngine = struct {
 
     /// Decode a single full-fidelity message table off the top of the
     /// stack into an owned `types.Message`. Counterpart to
-    /// `pushFullMessageSnapshot`. The expected shape is
+    /// `pushMessageSnapshot`. The expected shape is
     /// `{role = ..., content = {{type = "text", text = "..."}, ...}}`.
     /// On any structural error the function returns a specific error
     /// and the caller's `errdefer` pops the entry.
-    fn decodeFullMessage(lua: *Lua, allocator: Allocator) !types.Message {
+    fn decodeMessage(lua: *Lua, allocator: Allocator) !types.Message {
         errdefer lua.pop(1);
         if (lua.typeOf(-1) != .table) return error.CompactEntryNotTable;
 
@@ -1864,14 +1864,14 @@ pub const LuaEngine = struct {
                 return error.CompactEntryMissingContent;
             lua.pop(1);
 
-            blocks[i] = try decodeFullBlock(lua, allocator, type_tag);
+            blocks[i] = try decodeBlock(lua, allocator, type_tag);
         }
         return .{ .role = role, .content = blocks };
     }
 
     /// Decode one typed content block by tag. The block table is at -1
     /// on entry and remains at -1 on return (the caller pops it).
-    fn decodeFullBlock(lua: *Lua, allocator: Allocator, type_tag: []const u8) !types.ContentBlock {
+    fn decodeBlock(lua: *Lua, allocator: Allocator, type_tag: []const u8) !types.ContentBlock {
         if (std.mem.eql(u8, type_tag, "text")) {
             _ = lua.getField(-1, "text");
             defer lua.pop(1);
@@ -1948,11 +1948,11 @@ pub const LuaEngine = struct {
     ///     `.replace` with messages duped into `req.allocator`.
     /// A plain numerically-indexed array is also accepted as
     /// "messages-only replacement" for symmetry with v1.
-    pub fn handleCompactRequestV2(
+    pub fn handleCompactRequest(
         self: *LuaEngine,
-        req: *agent_events.CompactRequestV2,
+        req: *agent_events.CompactRequest,
     ) anyerror!void {
-        const fn_ref = self.compact_handler_v2 orelse return;
+        const fn_ref = self.compact_handler orelse return;
 
         const lua = self.lua;
         _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
@@ -1967,7 +1967,7 @@ pub const LuaEngine = struct {
         lua.setField(-2, "tokens_used");
         lua.pushInteger(@intCast(req.tokens_max));
         lua.setField(-2, "tokens_max");
-        try pushFullMessageSnapshot(lua, req.messages);
+        try pushMessageSnapshot(lua, req.messages);
         lua.setField(-2, "messages");
 
         lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
@@ -2028,7 +2028,7 @@ pub const LuaEngine = struct {
         }
         for (0..len) |idx| {
             _ = lua.rawGetIndex(msg_table_idx, @intCast(idx + 1));
-            const msg = try decodeFullMessage(lua, req.allocator);
+            const msg = try decodeMessage(lua, req.allocator);
             errdefer msg.deinit(req.allocator);
             try collected.append(req.allocator, msg);
             lua.pop(1);
@@ -2051,8 +2051,8 @@ pub const LuaEngine = struct {
     }
 
     /// Test-only accessor for the compact strategy handler ref.
-    pub fn compactHandlerV2(self: *const LuaEngine) ?i32 {
-        return self.compact_handler_v2;
+    pub fn compactHandler(self: *const LuaEngine) ?i32 {
+        return self.compact_handler;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -10646,60 +10646,60 @@ test "zag.loop.default emits reminder at the 5-call threshold" {
 
 // -- Compaction strategy tests ---------------------------------------------
 
-test "zag.compact.strategy_v2 registers and unregisters" {
+test "zag.compact.strategy registers and unregisters" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    try std.testing.expect(engine.compactHandlerV2() == null);
-    try engine.lua.doString("zag.compact.strategy_v2(function(ctx) return nil end)");
-    try std.testing.expect(engine.compactHandlerV2() != null);
+    try std.testing.expect(engine.compactHandler() == null);
+    try engine.lua.doString("zag.compact.strategy(function(ctx) return nil end)");
+    try std.testing.expect(engine.compactHandler() != null);
 
-    try engine.lua.doString("zag.compact.strategy_v2(nil)");
-    try std.testing.expect(engine.compactHandlerV2() == null);
+    try engine.lua.doString("zag.compact.strategy(nil)");
+    try std.testing.expect(engine.compactHandler() == null);
 }
 
-test "handleCompactRequestV2 nil return leaves outcome as use_default" {
+test "handleCompactRequest nil return leaves outcome as use_default" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    try engine.lua.doString("zag.compact.strategy_v2(function(ctx) return nil end)");
+    try engine.lua.doString("zag.compact.strategy(function(ctx) return nil end)");
 
     var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
     const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
-    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequestV2(&req);
+    try engine.handleCompactRequest(&req);
     try std.testing.expect(req.outcome == .use_default);
 }
 
-test "handleCompactRequestV2 honours {cancel = true}" {
+test "handleCompactRequest honours {cancel = true}" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    try engine.lua.doString("zag.compact.strategy_v2(function(ctx) return { cancel = true } end)");
+    try engine.lua.doString("zag.compact.strategy(function(ctx) return { cancel = true } end)");
 
     var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
     const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
-    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequestV2(&req);
+    try engine.handleCompactRequest(&req);
     try std.testing.expect(req.outcome == .cancel);
 }
 
-test "handleCompactRequestV2 accepts {messages, summary} replacement" {
+test "handleCompactRequest accepts {messages, summary} replacement" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString(
-        \\zag.compact.strategy_v2(function(ctx)
+        \\zag.compact.strategy(function(ctx)
         \\  return {
         \\    messages = {
         \\      { role = "user", content = {{ type = "text", text = "compacted" }} },
@@ -10711,9 +10711,9 @@ test "handleCompactRequestV2 accepts {messages, summary} replacement" {
 
     var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "long history" } }};
     const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
-    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequestV2(&req);
+    try engine.handleCompactRequest(&req);
     switch (req.outcome) {
         .replace => |r| {
             try std.testing.expectEqual(@as(usize, 1), r.messages.len);
@@ -10725,7 +10725,7 @@ test "handleCompactRequestV2 accepts {messages, summary} replacement" {
     }
 }
 
-test "handleCompactRequestV2 preserves tool_use block fidelity in the snapshot" {
+test "handleCompactRequest preserves tool_use block fidelity in the snapshot" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
@@ -10735,7 +10735,7 @@ test "handleCompactRequestV2 preserves tool_use block fidelity in the snapshot" 
     // first message, so a successful round-trip proves the v2 push
     // serialized the tool_use variant rather than dropping it.
     try engine.lua.doString(
-        \\zag.compact.strategy_v2(function(ctx)
+        \\zag.compact.strategy(function(ctx)
         \\  local m = ctx.messages[1]
         \\  local tag = m.content[2].type
         \\  return {
@@ -10751,9 +10751,9 @@ test "handleCompactRequestV2 preserves tool_use block fidelity in the snapshot" 
         .{ .tool_use = .{ .id = "t1", .name = "read", .input_raw = "{}" } },
     };
     const messages = [_]types.Message{.{ .role = .assistant, .content = &blocks }};
-    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequestV2(&req);
+    try engine.handleCompactRequest(&req);
     switch (req.outcome) {
         .replace => |r| {
             try std.testing.expectEqualStrings("saw=tool_use", r.messages[0].content[0].text.text);
@@ -10834,9 +10834,9 @@ test "loadBuiltinPlugins eager-loads zag.compact.* entries" {
     defer engine.deinit();
     engine.storeSelfPointer();
 
-    try std.testing.expect(engine.compactHandlerV2() == null);
+    try std.testing.expect(engine.compactHandler() == null);
     engine.loadBuiltinPlugins();
-    try std.testing.expect(engine.compactHandlerV2() != null);
+    try std.testing.expect(engine.compactHandler() != null);
 }
 
 test "zag.compact.default is a registered no-op returning nil" {
@@ -10851,7 +10851,7 @@ test "zag.compact.default is a registered no-op returning nil" {
     engine.storeSelfPointer();
 
     try engine.lua.doString("require('zag.compact.default')");
-    try std.testing.expect(engine.compactHandlerV2() != null);
+    try std.testing.expect(engine.compactHandler() != null);
 
     var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
     var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "answer" } }};
@@ -10859,9 +10859,9 @@ test "zag.compact.default is a registered no-op returning nil" {
         .{ .role = .user, .content = &b1 },
         .{ .role = .assistant, .content = &b2 },
     };
-    var req = agent_events.CompactRequestV2.init(&messages, 850, 1000, alloc);
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequestV2(&req);
+    try engine.handleCompactRequest(&req);
     try std.testing.expect(req.error_name == null);
     try std.testing.expect(req.outcome == .use_default);
 }

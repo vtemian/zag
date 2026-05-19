@@ -202,7 +202,7 @@ pub fn runLoopStreaming(
         // estimate still leaves more than `reserve_tokens` of room.
         // See `fireCompact` for the full no-op ladder.
         const reserve_tokens = if (lua_engine) |e| e.compact_reserve_tokens else DEFAULT_RESERVE_TOKENS;
-        const compact_outcome = try fireCompactUnified(
+        const compact_outcome = try fireCompact(
             lua_engine,
             messages.items,
             last_usage_anchor,
@@ -297,7 +297,7 @@ pub fn runLoopStreaming(
                     .{
                         post.total,
                         model_spec.context_window,
-                        if (compaction_was_cancelled) " (strategy_v2 cancelled fallbacks)" else " after every fallback",
+                        if (compaction_was_cancelled) " (strategy cancelled fallbacks)" else " after every fallback",
                     },
                 );
                 return error.ContextWindowExceeded;
@@ -455,7 +455,7 @@ fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
         agent_events.JitContextRequest => .{ .jit_context_request = req },
         agent_events.ToolTransformRequest => .{ .tool_transform_request = req },
         agent_events.LoopDetectRequest => .{ .loop_detect_request = req },
-        agent_events.CompactRequestV2 => .{ .compact_request_v2 = req },
+        agent_events.CompactRequest => .{ .compact_request = req },
         else => @compileError("marshalRequest does not handle " ++ @typeName(T)),
     };
 }
@@ -1531,7 +1531,7 @@ pub const CompactionFireOutcome = union(enum) {
     replaced: []types.Message,
 };
 
-/// Fire `zag.compact.strategy_v2` at the top of each iteration when
+/// Fire `zag.compact.strategy` at the top of each iteration when
 /// the predictive estimate trips the room-based threshold. Sees a
 /// full-fidelity message snapshot (every ContentBlock variant survives
 /// the round-trip) and decodes the structured return into one of the
@@ -1549,7 +1549,7 @@ pub const CompactionFireOutcome = union(enum) {
 /// agent loop's Zig fallback chain still runs in those cases — the
 /// strategy hook is a customization point on top of the default, not
 /// the only way compaction happens.
-pub fn fireCompactUnified(
+pub fn fireCompact(
     lua_engine: ?*LuaEngine.LuaEngine,
     messages: []const types.Message,
     last_usage: ?llm.Usage,
@@ -1561,7 +1561,7 @@ pub fn fireCompactUnified(
     cancel: *agent_events.CancelFlag,
 ) !CompactionFireOutcome {
     const engine = lua_engine orelse return .skipped;
-    if (engine.compact_handler_v2 == null) return .skipped;
+    if (engine.compact_handler == null) return .skipped;
     if (tokens_max == 0) {
         // Surface the disabled-state loudly: production callers always
         // have a context_window; only headless / test paths run with
@@ -1580,8 +1580,8 @@ pub fn fireCompactUnified(
     // (compaction.ts:195-199).
     if (est.total + reserve_tokens <= tokens_max) return .skipped;
 
-    var req = agent_events.CompactRequestV2.init(messages, est.total, tokens_max, allocator);
-    marshalRequest(agent_events.CompactRequestV2, &req, queue, cancel) catch |err| switch (err) {
+    var req = agent_events.CompactRequest.init(messages, est.total, tokens_max, allocator);
+    marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
         error.EventQueueFull => return .skipped,
         error.Cancelled => return error.Cancelled,
     };

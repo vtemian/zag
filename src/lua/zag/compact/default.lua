@@ -8,6 +8,6 @@
 -- replacement at `~/.config/zag/lua/zag/compact/default.lua` is the
 -- natural extension path.
 
-zag.compact.strategy_v2(function(_ctx)
+zag.compact.strategy(function(_ctx)
   return nil
 end)

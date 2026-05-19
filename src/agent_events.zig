@@ -98,12 +98,12 @@ pub const AgentEvent = union(enum) {
     /// request is caller-owned.
     loop_detect_request: *LoopDetectRequest,
     /// Round-trip: the agent thread asks main to invoke the global
-    /// compaction strategy registered via `zag.compact.strategy_v2(fn)`
+    /// compaction strategy registered via `zag.compact.strategy(fn)`
     /// when the predictive estimate trips the room-based threshold.
     /// Preserves full content-block fidelity through the snapshot
     /// (tool_use, tool_result, thinking, redacted_thinking) and accepts
     /// a structured return shape (use_default / cancel / replace).
-    compact_request_v2: *CompactRequestV2,
+    compact_request: *CompactRequest,
 
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
@@ -213,7 +213,7 @@ pub const AgentEvent = union(enum) {
             // outcome. Skipping a compaction is safe because the agent
             // loop's Zig fallback chain still runs (structured summary →
             // drop-oldest → refuse).
-            .compact_request_v2 => |req| {
+            .compact_request => |req| {
                 req.error_name = "drained_without_dispatch";
                 req.done.set();
             },
@@ -762,7 +762,7 @@ pub const LoopDetectRequest = struct {
     }
 };
 
-/// Outcome of a Phase-6 `zag.compact.strategy_v2` handler. Richer than
+/// Outcome of a Phase-6 `zag.compact.strategy` handler. Richer than
 /// the v1 contract (nil / array): the plugin can opt out of compaction
 /// (`cancel`), explicitly request the Zig fallback (`use_default`), or
 /// supply a full replacement plus an optional summary string for
@@ -780,7 +780,7 @@ pub const LoopDetectRequest = struct {
 ///   - `.replace` — install the supplied messages in place of the
 ///     existing history. `summary` is stored for telemetry but the
 ///     agent doesn't read it back today.
-pub const CompactV2Outcome = union(enum) {
+pub const CompactStrategyOutcome = union(enum) {
     use_default,
     cancel,
     replace: struct {
@@ -795,11 +795,11 @@ pub const CompactV2Outcome = union(enum) {
 };
 
 /// v2 of the compaction round-trip. Sent on the queue whenever a
-/// `strategy_v2` handler is registered. The main thread runs the
+/// `strategy` handler is registered. The main thread runs the
 /// handler with a full-fidelity message snapshot (tool_use, tool_result,
 /// thinking, redacted_thinking blocks survive — pi-mono parity), reads
 /// the structured return, and writes `outcome`.
-pub const CompactRequestV2 = struct {
+pub const CompactRequest = struct {
     /// Read-only snapshot of the current conversation history. Full
     /// content blocks survive the round-trip; the main thread reads
     /// every block kind under `done` and must not retain pointers past
@@ -820,7 +820,7 @@ pub const CompactRequestV2 = struct {
     done: std.Thread.ResetEvent = .{},
     /// Default to "use default" so a missing handler / nil return /
     /// dispatch-side error all flow into the Zig fallback chain.
-    outcome: CompactV2Outcome = .use_default,
+    outcome: CompactStrategyOutcome = .use_default,
     /// `@errorName` of whatever went wrong on the main thread. Borrowed
     /// from rodata; do not free.
     error_name: ?[]const u8 = null,
@@ -830,7 +830,7 @@ pub const CompactRequestV2 = struct {
         tokens_used: u32,
         tokens_max: u32,
         allocator: Allocator,
-    ) CompactRequestV2 {
+    ) CompactRequest {
         return .{
             .messages = messages,
             .tokens_used = tokens_used,
@@ -842,7 +842,7 @@ pub const CompactRequestV2 = struct {
     /// Release any heap allocations carried by `outcome`. Safe to call
     /// multiple times; subsequent calls see `.use_default` (the post-
     /// free sentinel) and are no-ops.
-    pub fn freeOutcome(self: *CompactRequestV2) void {
+    pub fn freeOutcome(self: *CompactRequest) void {
         switch (self.outcome) {
             .replace => |r| {
                 for (r.messages) |msg| msg.deinit(self.allocator);
@@ -857,7 +857,7 @@ pub const CompactRequestV2 = struct {
     /// Protocol alias: `marshalRequest` looks up `freeResult` by name.
     /// Forwarding keeps the round-trip generic without leaking the
     /// outcome-vs-result naming distinction into the dispatcher.
-    pub fn freeResult(self: *CompactRequestV2) void {
+    pub fn freeResult(self: *CompactRequest) void {
         self.freeOutcome();
     }
 };
