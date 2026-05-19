@@ -126,6 +126,11 @@ pub const HookPayload = union(EventKind) {
     },
     session_list_changed: struct {
         /// What kind of mutation happened to the session list.
+        /// v1 only fires `.renamed` and `.deleted` from the Lua binding
+        /// surface (`lua/bindings/sessions.zig`). `.created` is reserved
+        /// for a future Lua-callable session-create path; production code
+        /// never constructs it today, so Lua handlers branching on
+        /// `evt.change == "created"` are dead until that lands.
         change: enum { created, renamed, deleted },
         /// Identifier of the affected session (ULID string). Borrowed
         /// from the caller; valid for the duration of the hook fire only.

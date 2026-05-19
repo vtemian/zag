@@ -394,6 +394,9 @@ fn zagSessionsDeleteFn(lua: *Lua) i32 {
     if (project_owned == null) {
         // Match SessionManager.deleteSession's idempotency contract: a
         // delete of an already-absent session is a no-op, not an error.
+        // Log at debug so a typo'd id is observable in trace output
+        // rather than silently swallowed.
+        log.debug("zag.sessions.delete: no project owns id '{s}' (already deleted, or typo)", .{id});
         return 0;
     }
     defer engine.allocator.free(project_owned.?);
