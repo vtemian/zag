@@ -732,11 +732,29 @@ pub fn deinit(self: *WindowManager) void {
 // -- Window management -------------------------------------------------------
 
 /// Resize screen and layout, then notify every leaf's buffer of its new rect.
+/// After leaves have been notified, publish a `LayoutResize` hook so plugins
+/// (the sessions sidebar uses it to re-pin its width to ~30 cells) can react.
 pub fn handleResize(self: *WindowManager, cols: u16, rows: u16) !void {
     try self.screen.resize(cols, rows);
     self.layout.recalculate(cols, rows);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
+    self.fireLayoutResize(cols, rows);
+}
+
+/// Best-effort `LayoutResize` fire. Allocates nothing and is safe to call
+/// even when no Lua engine is attached (tests, headless harness). A hook
+/// failure is logged and dropped: resize must not be blocked by a flaky
+/// plugin.
+fn fireLayoutResize(self: *WindowManager, cols: u16, rows: u16) void {
+    const engine = self.lua_engine orelse return;
+    var payload: Hooks.HookPayload = .{ .layout_resize = .{
+        .cols = cols,
+        .rows = rows,
+    } };
+    _ = engine.fireHook(&payload) catch |err| {
+        log.warn("layout_resize hook fire failed: {}", .{err});
+    };
 }
 
 /// Walk all visible leaves and forward each leaf's current rect to the
@@ -6198,6 +6216,86 @@ test "PaneFocused pattern key scopes hook to a single pane handle" {
 
     _ = try engine.lua.getGlobal("fired_count");
     try std.testing.expectEqual(@as(i64, 0), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+}
+
+test "LayoutResize fires from handleResize with new cols and rows" {
+    // The sessions sidebar uses `LayoutResize` to re-pin its width to
+    // ~30 cells after a terminal resize. The hook must fire exactly once
+    // per `handleResize` and carry the post-recalculate dimensions.
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    try wm.attachLayoutRegistry();
+    layout.recalculate(screen.width, screen.height);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = wm;
+    wm.lua_engine = &engine;
+
+    try engine.lua.doString(
+        \\_G.fired_count = 0
+        \\_G.last_cols = nil
+        \\_G.last_rows = nil
+        \\zag.hook("LayoutResize", function(evt)
+        \\  _G.fired_count = (_G.fired_count or 0) + 1
+        \\  _G.last_cols = evt.cols
+        \\  _G.last_rows = evt.rows
+        \\end)
+    );
+
+    try wm.handleResize(120, 40);
+
+    _ = try engine.lua.getGlobal("fired_count");
+    try std.testing.expectEqual(@as(i64, 1), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_cols");
+    try std.testing.expectEqual(@as(i64, 120), try engine.lua.toInteger(-1));
+    engine.lua.pop(1);
+
+    _ = try engine.lua.getGlobal("last_rows");
+    try std.testing.expectEqual(@as(i64, 40), try engine.lua.toInteger(-1));
     engine.lua.pop(1);
 }
 

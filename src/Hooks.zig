@@ -21,6 +21,7 @@ pub const EventKind = enum {
     pane_draft_change,
     session_list_changed,
     pane_focused,
+    layout_resize,
 };
 
 /// Map a Lua-facing event name like "ToolPre" to an EventKind.
@@ -38,6 +39,7 @@ pub fn parseEventName(name: []const u8) ?EventKind {
         .{ "PaneDraftChange", .pane_draft_change },
         .{ "SessionListChanged", .session_list_changed },
         .{ "PaneFocused", .pane_focused },
+        .{ "LayoutResize", .layout_resize },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) return entry[1];
@@ -140,6 +142,12 @@ pub const HookPayload = union(EventKind) {
         /// after startup). Borrowed; valid for the duration of the hook
         /// fire only.
         previous_handle: []const u8,
+    },
+    layout_resize: struct {
+        /// New terminal width in cells, post-recalculate.
+        cols: u16,
+        /// New terminal height in cells, post-recalculate.
+        rows: u16,
     },
 
     pub fn kind(self: HookPayload) EventKind {
@@ -301,7 +309,13 @@ test "parseEventName maps all known event strings" {
     try std.testing.expectEqual(Hooks.EventKind.pane_draft_change, Hooks.parseEventName("PaneDraftChange").?);
     try std.testing.expectEqual(Hooks.EventKind.session_list_changed, Hooks.parseEventName("SessionListChanged").?);
     try std.testing.expectEqual(Hooks.EventKind.pane_focused, Hooks.parseEventName("PaneFocused").?);
+    try std.testing.expectEqual(Hooks.EventKind.layout_resize, Hooks.parseEventName("LayoutResize").?);
     try std.testing.expect(Hooks.parseEventName("Nope") == null);
+}
+
+test "HookPayload kind() returns layout_resize tag" {
+    const p: HookPayload = .{ .layout_resize = .{ .cols = 120, .rows = 40 } };
+    try std.testing.expectEqual(EventKind.layout_resize, p.kind());
 }
 
 test "HookRequest carries payload and signals done" {

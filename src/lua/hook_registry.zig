@@ -523,6 +523,10 @@ pub const HookDispatcher = struct {
                 setTableString(lua, "pane_handle", p.pane_handle);
                 setTableString(lua, "previous_handle", p.previous_handle);
             },
+            .layout_resize => |p| {
+                setTableInt(lua, "cols", @intCast(p.cols));
+                setTableInt(lua, "rows", @intCast(p.rows));
+            },
         }
     }
 
