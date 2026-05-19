@@ -230,6 +230,12 @@ pub const LuaEngine = struct {
     /// fires compaction earlier; smaller fires later. Zero disables
     /// the room buffer (estimator still gates the call).
     compact_reserve_tokens: u32 = @import("agent.zig").DEFAULT_RESERVE_TOKENS,
+    /// Approximate token budget the Zig default summarizer retains
+    /// past the cut point. Larger values keep more recent context;
+    /// smaller values shrink the surviving suffix harder. Mutable via
+    /// `zag.compact.set_keep_recent_tokens(n)`. Default matches
+    /// pi-mono's keepRecentTokens (compaction.ts:115).
+    compact_keep_recent_tokens: u32 = @import("agent.zig").DEFAULT_KEEP_RECENT_TOKENS,
     /// Borrowed pointer to the Provider currently driving the agent
     /// loop. `runLoopStreaming` sets this on entry and clears it on
     /// exit (defer); the pointer must outlive any in-flight
@@ -10772,89 +10778,33 @@ test "loadBuiltinPlugins eager-loads zag.compact.* entries" {
     try std.testing.expect(engine.compactHandler() != null);
 }
 
-test "zag.compact.default elides older assistant messages" {
-    // Five-message conversation:
-    //   [1] user      "first ask"      (older turn)
-    //   [2] assistant "first answer"   (older turn -> elided)
-    //   [3] user      "second ask"     (older turn anchor still in past)
-    //   [4] assistant "second answer"  (older turn -> elided)
-    //   [5] user      "current ask"    (most recent user; survives)
-    // The strategy keeps every user message intact and replaces every
-    // assistant message before index 5 with the elision marker.
+test "zag.compact.default is a registered no-op returning nil" {
+    // Phase 3b moved the structured summarization into Zig; the Lua
+    // default keeps the hook slot non-null (so fireCompact doesn't
+    // short-circuit) but always returns nil, deferring to
+    // runDefaultSummarization. Users overriding this file in
+    // ~/.config/zag/lua/zag/compact/ still get full control: their
+    // handler runs first and the Zig fallback only fires when they
+    // return nil or shrink too little.
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     try engine.lua.doString("require('zag.compact.default')");
+    try std.testing.expect(engine.compactHandler() != null);
 
-    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "first ask" } }};
-    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "first answer" } }};
-    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "second ask" } }};
-    var b4 = [_]types.ContentBlock{.{ .text = .{ .text = "second answer" } }};
-    var b5 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "answer" } }};
     const messages = [_]types.Message{
         .{ .role = .user, .content = &b1 },
         .{ .role = .assistant, .content = &b2 },
-        .{ .role = .user, .content = &b3 },
-        .{ .role = .assistant, .content = &b4 },
-        .{ .role = .user, .content = &b5 },
     };
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeResult();
     try engine.handleCompactRequest(&req);
     try std.testing.expect(req.error_name == null);
-    try std.testing.expect(req.result != null);
-
-    const out = req.result.?;
-    try std.testing.expectEqual(@as(usize, 5), out.len);
-
-    try std.testing.expectEqual(types.Role.user, out[0].role);
-    try std.testing.expectEqualStrings("first ask", out[0].content[0].text.text);
-
-    try std.testing.expectEqual(types.Role.assistant, out[1].role);
-    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "<elided") != null);
-
-    try std.testing.expectEqual(types.Role.user, out[2].role);
-    try std.testing.expectEqualStrings("second ask", out[2].content[0].text.text);
-
-    try std.testing.expectEqual(types.Role.assistant, out[3].role);
-    try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "<elided") != null);
-
-    try std.testing.expectEqual(types.Role.user, out[4].role);
-    try std.testing.expectEqualStrings("current ask", out[4].content[0].text.text);
-}
-
-test "zag.compact.default keeps a trailing assistant after the latest user" {
-    // When the latest message is a fresh assistant reply to the current
-    // user turn, that assistant survives because it sits AFTER the most
-    // recent user index. Older assistants are still elided.
-    const alloc = std.testing.allocator;
-    var engine = try LuaEngine.init(alloc);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString("require('zag.compact.default')");
-
-    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "older ask" } }};
-    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "older answer" } }};
-    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
-    var b4 = [_]types.ContentBlock{.{ .text = .{ .text = "current answer" } }};
-    const messages = [_]types.Message{
-        .{ .role = .user, .content = &b1 },
-        .{ .role = .assistant, .content = &b2 },
-        .{ .role = .user, .content = &b3 },
-        .{ .role = .assistant, .content = &b4 },
-    };
-    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
-    defer req.freeResult();
-    try engine.handleCompactRequest(&req);
-    try std.testing.expect(req.result != null);
-
-    const out = req.result.?;
-    try std.testing.expectEqual(@as(usize, 4), out.len);
-    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "<elided") != null);
-    try std.testing.expectEqualStrings("current answer", out[3].content[0].text.text);
+    try std.testing.expect(req.result == null);
 }
 
 test "zag.compact.default passes through when no user message exists" {

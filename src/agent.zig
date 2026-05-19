@@ -31,6 +31,11 @@ pub const default_agent_name = "zag";
 /// Lua-tunable knob via `zag.compact.set_reserve_tokens`.
 pub const DEFAULT_RESERVE_TOKENS: u32 = 16384;
 
+/// Default token budget kept past the cut point by the Zig default
+/// summarizer. Matches pi-mono's `keepRecentTokens` default at
+/// compaction.ts:115. Tunable via `zag.compact.set_keep_recent_tokens`.
+pub const DEFAULT_KEEP_RECENT_TOKENS: u32 = 20000;
+
 /// Sentinel `ModelSpec` for callers that don't have a real one (unit tests
 /// and some headless harnesses without a populated registry). Production
 /// turns must NEVER pass this: the dispatcher in `zag.prompt.init` matches
@@ -218,15 +223,46 @@ pub fn runLoopStreaming(
             last_usage_index = null;
         }
 
-        // Pre-flight cap with inline fallback. The Lua strategy may have
-        // declined (e.g. no handler / EventQueueFull / shrank less than
-        // needed). Re-estimate; if we'd still overshoot, walk the cut
-        // helper and drop oldest messages until we fit. Only refuse the
-        // turn when even the cut-down history can't make room — at
-        // which point the user message itself is the bug.
+        // Pre-flight cap with three-stage fallback. The Lua strategy may
+        // have declined or shrunk less than needed. Try Zig-side
+        // structured summarization next; only fall back to drop-oldest
+        // when the summarizer itself fails (network/auth/etc.). Refuse
+        // the turn only when even the trimmed history overflows.
         if (model_spec.context_window > 0) {
             var post = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
             if (post.total > model_spec.context_window) {
+                // Stage 2: Zig-default structured summarization. Synchronous
+                // provider.call on the agent thread; the user is already
+                // waiting on the next turn, so blocking briefly here is OK.
+                const keep_recent: u32 = if (lua_engine) |e|
+                    e.compact_keep_recent_tokens
+                else
+                    DEFAULT_KEEP_RECENT_TOKENS;
+                if (runDefaultSummarization(
+                    messages.items,
+                    provider,
+                    keep_recent,
+                    allocator,
+                )) |maybe_replacement| {
+                    if (maybe_replacement) |replacement| {
+                        log.info(
+                            "Zig default summarization replaced {d} messages with structured summary",
+                            .{messages.items.len - (replacement.len - 1)},
+                        );
+                        try installCompactReplacement(messages, allocator, replacement);
+                        last_usage_anchor = null;
+                        last_usage_index = null;
+                        post = estimateContextTokens(messages.items, null, null);
+                    }
+                } else |err| {
+                    log.warn(
+                        "Zig default summarization failed ({s}); falling back to drop-oldest",
+                        .{@errorName(err)},
+                    );
+                }
+            }
+            if (post.total > model_spec.context_window) {
+                // Stage 3: drop-oldest. Lossy but deterministic.
                 const budget: u32 = if (model_spec.context_window > reserve_tokens)
                     model_spec.context_window - reserve_tokens
                 else
@@ -244,7 +280,7 @@ pub fn runLoopStreaming(
                 }
                 if (post.total > model_spec.context_window) {
                     log.err(
-                        "context overflow: estimated {d} tokens still exceeds model window {d} after compaction and fallback; refusing to send",
+                        "context overflow: estimated {d} tokens still exceeds model window {d} after every fallback; refusing to send",
                         .{ post.total, model_spec.context_window },
                     );
                     return error.ContextWindowExceeded;
@@ -1621,6 +1657,283 @@ test "dropOldestMessages with drop_count >= len clears the list" {
     try list.append(alloc, .{ .role = .user, .content = blocks });
     try dropOldestMessages(&list, alloc, 5);
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+/// Prefix wrapping a Zig-default compaction summary when it's injected
+/// back into the message history. Mirrors pi-mono's
+/// `COMPACTION_SUMMARY_PREFIX` (messages.ts:4). The model treats the
+/// summary as system-style context the user supplied at the start of
+/// the new conversation window.
+const COMPACTION_SUMMARY_PREFIX =
+    \\The conversation history before this point was compacted into the following summary:
+    \\
+    \\<summary>
+    \\
+;
+const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+
+const SUMMARIZATION_SYSTEM_PROMPT =
+    \\You are a context summarization assistant. Read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
+    \\
+    \\Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
+;
+
+const SUMMARIZATION_PROMPT_TEMPLATE =
+    \\The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+    \\
+    \\## Constraints & Preferences
+    \\- [Any constraints, preferences, or requirements mentioned by user]
+    \\- [Or "(none)" if none were mentioned]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Completed tasks/changes]
+    \\
+    \\### In Progress
+    \\- [ ] [Current work]
+    \\
+    \\### Blocked
+    \\- [Issues preventing progress, if any]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale]
+    \\
+    \\## Next Steps
+    \\1. [Ordered list of what should happen next]
+    \\
+    \\## Critical Context
+    \\- [Any data, examples, or references needed to continue]
+    \\- [Or "(none)" if not applicable]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
+/// Serialize a slice of messages into a single XML-ish string for the
+/// summarizer prompt. Tool blocks are flattened to their text portions
+/// because the summarizer doesn't need wire-level structure. Caller
+/// owns the returned slice.
+fn serializeForSummary(
+    messages: []const types.Message,
+    allocator: Allocator,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    for (messages) |msg| {
+        const role_tag = switch (msg.role) {
+            .user => "user",
+            .assistant => "assistant",
+        };
+        try out.appendSlice(allocator, "<");
+        try out.appendSlice(allocator, role_tag);
+        try out.appendSlice(allocator, ">\n");
+        for (msg.content) |block| switch (block) {
+            .text => |t| try out.appendSlice(allocator, t.text),
+            .tool_use => |tu| {
+                try out.appendSlice(allocator, "[tool_use: ");
+                try out.appendSlice(allocator, tu.name);
+                try out.appendSlice(allocator, " ");
+                try out.appendSlice(allocator, tu.input_raw);
+                try out.appendSlice(allocator, "]");
+            },
+            .tool_result => |tr| {
+                try out.appendSlice(allocator, "[tool_result: ");
+                try out.appendSlice(allocator, tr.content);
+                try out.appendSlice(allocator, "]");
+            },
+            .thinking => |t| {
+                try out.appendSlice(allocator, "[thinking: ");
+                try out.appendSlice(allocator, t.text);
+                try out.appendSlice(allocator, "]");
+            },
+            .redacted_thinking => try out.appendSlice(allocator, "[redacted_thinking]"),
+        };
+        try out.appendSlice(allocator, "\n</");
+        try out.appendSlice(allocator, role_tag);
+        try out.appendSlice(allocator, ">\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a `Message` holding a single text block whose content is the
+/// summary wrapped in the COMPACTION_SUMMARY prefix/suffix. The block's
+/// text slice is heap-allocated on `allocator` and owned by the
+/// returned `Message`.
+fn synthesizeSummaryMessage(
+    summary_text: []const u8,
+    allocator: Allocator,
+) !types.Message {
+    const wrapped = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}{s}",
+        .{ COMPACTION_SUMMARY_PREFIX, summary_text, COMPACTION_SUMMARY_SUFFIX },
+    );
+    errdefer allocator.free(wrapped);
+    const blocks = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(blocks);
+    blocks[0] = .{ .text = .{ .text = wrapped } };
+    return .{ .role = .user, .content = blocks };
+}
+
+/// Zig-side structured summarization, used as the fallback after a Lua
+/// compact strategy either declines (returns nil) or shrinks too little
+/// to fit. Picks a cut point with `findCutPoint(keep_recent_tokens)`,
+/// summarizes everything before via a one-shot `provider.call`, and
+/// returns a replacement message slice composed of `[summary] +
+/// retained_suffix`. All allocations are on `allocator` and transferred
+/// to the caller via the returned slice; the caller installs them with
+/// `installCompactReplacement`.
+///
+/// Returns null when there is nothing meaningful to summarize (cut
+/// point at 0 = retain everything). Errors propagate from the provider
+/// call (auth, network, etc.); callers in the agent loop catch and
+/// fall through to the drop-oldest fallback so a transient summary
+/// failure doesn't kill the turn.
+pub fn runDefaultSummarization(
+    messages: []const types.Message,
+    provider: llm.Provider,
+    keep_recent_tokens: u32,
+    allocator: Allocator,
+) !?[]types.Message {
+    if (messages.len == 0) return null;
+    const cut = findCutPoint(messages, keep_recent_tokens);
+    if (cut.first_kept == 0) return null;
+
+    const serialized = try serializeForSummary(messages[0..cut.first_kept], allocator);
+    defer allocator.free(serialized);
+
+    const user_prompt = try std.fmt.allocPrint(
+        allocator,
+        "<conversation>\n{s}\n</conversation>\n\n{s}",
+        .{ serialized, SUMMARIZATION_PROMPT_TEMPLATE },
+    );
+    defer allocator.free(user_prompt);
+
+    const user_blocks = try allocator.alloc(types.ContentBlock, 1);
+    user_blocks[0] = .{ .text = .{ .text = user_prompt } };
+    defer allocator.free(user_blocks);
+
+    const req_messages = [_]types.Message{
+        .{ .role = .user, .content = user_blocks },
+    };
+
+    const req: llm.Request = .{
+        .system_stable = SUMMARIZATION_SYSTEM_PROMPT,
+        .system_volatile = "",
+        .messages = &req_messages,
+        .tool_definitions = &.{},
+        .allocator = allocator,
+    };
+
+    const response = try provider.call(&req);
+    defer response.deinit(allocator);
+
+    // Pull the summary text out of the response. Models that return
+    // multiple text blocks get them concatenated; non-text blocks
+    // (tool_use, thinking) are dropped — the summarizer prompt asked
+    // for a structured text answer, not tools.
+    var total: usize = 0;
+    for (response.content) |b| switch (b) {
+        .text => |t| total += t.text.len,
+        else => {},
+    };
+    if (total == 0) return null;
+    const summary_buf = try allocator.alloc(u8, total);
+    var off: usize = 0;
+    for (response.content) |b| switch (b) {
+        .text => |t| {
+            @memcpy(summary_buf[off .. off + t.text.len], t.text);
+            off += t.text.len;
+        },
+        else => {},
+    };
+    defer allocator.free(summary_buf);
+
+    // Compose [summary_message, deep-copied retained suffix]. Deep-copy
+    // because the caller's `installCompactReplacement` frees both the
+    // outer slice and every nested allocation; sharing pointers with
+    // the original `messages` slice would double-free.
+    var out: std.ArrayList(types.Message) = .empty;
+    errdefer {
+        for (out.items) |m| m.deinit(allocator);
+        out.deinit(allocator);
+    }
+    const summary_msg = try synthesizeSummaryMessage(summary_buf, allocator);
+    try out.append(allocator, summary_msg);
+
+    for (messages[cut.first_kept..]) |m| {
+        const dup_blocks = try allocator.alloc(types.ContentBlock, m.content.len);
+        errdefer allocator.free(dup_blocks);
+        for (m.content, 0..) |block, i| {
+            dup_blocks[i] = try dupContentBlock(block, allocator);
+        }
+        try out.append(allocator, .{ .role = m.role, .content = dup_blocks });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Deep-copy a single ContentBlock so the new copy owns every backing
+/// string slice on `allocator`. Mirrors the per-variant ownership in
+/// `ContentBlock.freeOwned` (types.zig:82-101) so a later `deinit`
+/// frees exactly what this allocated.
+fn dupContentBlock(block: types.ContentBlock, allocator: Allocator) !types.ContentBlock {
+    return switch (block) {
+        .text => |t| .{ .text = .{ .text = try allocator.dupe(u8, t.text) } },
+        .tool_use => |tu| .{ .tool_use = .{
+            .id = try allocator.dupe(u8, tu.id),
+            .name = try allocator.dupe(u8, tu.name),
+            .input_raw = try allocator.dupe(u8, tu.input_raw),
+        } },
+        .tool_result => |tr| .{ .tool_result = .{
+            .tool_use_id = try allocator.dupe(u8, tr.tool_use_id),
+            .content = try allocator.dupe(u8, tr.content),
+            .is_error = tr.is_error,
+        } },
+        .thinking => |t| .{ .thinking = .{
+            .text = try allocator.dupe(u8, t.text),
+            .signature = if (t.signature) |s| try allocator.dupe(u8, s) else null,
+            .provider = t.provider,
+            .id = if (t.id) |id| try allocator.dupe(u8, id) else null,
+        } },
+        .redacted_thinking => |r| .{ .redacted_thinking = .{ .data = try allocator.dupe(u8, r.data) } },
+    };
+}
+
+test "serializeForSummary flattens tool blocks and roles" {
+    const alloc = std.testing.allocator;
+    const blocks_u = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const blocks_a = [_]types.ContentBlock{
+        .{ .text = .{ .text = "thinking..." } },
+        .{ .tool_use = .{ .id = "t1", .name = "read", .input_raw = "{}" } },
+    };
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &blocks_u },
+        .{ .role = .assistant, .content = &blocks_a },
+    };
+    const out = try serializeForSummary(&msgs, alloc);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<user>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "</user>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<assistant>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "thinking...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[tool_use: read") != null);
+}
+
+test "synthesizeSummaryMessage wraps the summary with prefix/suffix" {
+    const alloc = std.testing.allocator;
+    const msg = try synthesizeSummaryMessage("the summary", alloc);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqual(types.Role.user, msg.role);
+    try std.testing.expectEqual(@as(usize, 1), msg.content.len);
+    const text = msg.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, text, "compacted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "the summary") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "</summary>"));
 }
 
 /// Inspect a freshly built tool-result content slice and report

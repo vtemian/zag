@@ -53,6 +53,8 @@ pub fn registerCompactTable(lua: *Lua) void {
     lua.setField(-2, "strategy");
     lua.pushFunction(zlua.wrap(zagCompactSetReserveTokensFn));
     lua.setField(-2, "set_reserve_tokens");
+    lua.pushFunction(zlua.wrap(zagCompactSetKeepRecentTokensFn));
+    lua.setField(-2, "set_keep_recent_tokens");
     lua.setField(-2, "compact");
 }
 
@@ -305,5 +307,28 @@ fn zagCompactSetReserveTokensFn(lua: *Lua) i32 {
     else
         @intCast(n);
     engine.compact_reserve_tokens = clamped;
+    return 0;
+}
+
+/// Zig function backing `zag.compact.set_keep_recent_tokens(n)`.
+///
+/// Updates the budget the Zig default summarizer retains past the cut
+/// point. Smaller values shrink the kept suffix more aggressively;
+/// larger values keep more recent context but leave less room for the
+/// summary itself.
+fn zagCompactSetKeepRecentTokensFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const n = lua.checkInteger(1);
+    if (n < 0) {
+        lua.raiseErrorStr(
+            "zag.compact.set_keep_recent_tokens: arg 1 must be non-negative",
+            .{},
+        );
+    }
+    const clamped: u32 = if (n > std.math.maxInt(u32))
+        std.math.maxInt(u32)
+    else
+        @intCast(n);
+    engine.compact_keep_recent_tokens = clamped;
     return 0;
 }

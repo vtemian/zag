@@ -166,10 +166,12 @@ test "find returns the entry for the popup-list helper" {
 test "find returns the entry for the default compaction strategy" {
     const e = find("zag.compact.default").?;
     try std.testing.expectEqualStrings("zag.compact.default", e.name);
-    // Default strategy calls `zag.compact.strategy` and elides
-    // assistant messages older than the most recent user turn.
+    // Phase 3b: default strategy registers a no-op (returns nil) so
+    // the agent loop's Zig fallback (runDefaultSummarization) owns
+    // the real summarization. The hook registration call itself must
+    // still appear.
     try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.compact.strategy") != null);
-    try std.testing.expect(std.mem.indexOf(u8, e.code, "<elided") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "return nil") != null);
 }
 
 test {

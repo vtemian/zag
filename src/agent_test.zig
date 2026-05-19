@@ -2554,20 +2554,20 @@ test "HE10.5 integration: eager-loaded zag.loop.default fires reminder via fireL
     try std.testing.expectEqual(Reminder.Scope.next_turn, snap[0].scope);
 }
 
-test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompact" {
-    //   1. `loadBuiltinPlugins` eager-loads `zag.compact.default`, the
-    //      real stdlib strategy that elides every assistant message
-    //      strictly before the most recent user message.
-    //   2. `fireCompact` is the same entry point the agent loop calls
-    //      at the top of each turn once usage crosses 80%; it pushes a
-    //      `CompactRequest` onto the queue and waits on the result.
-    //   3. The pump thread drains the queue via
-    //      `AgentRunner.dispatchHookRequests`, exercising the marshal
-    //      path end-to-end.
-    //   4. After the round-trip, every old assistant text must be
-    //      replaced with the elision marker while every user message
-    //      survives intact. This locks in the contract between the
-    //      Zig compaction trigger and the stdlib strategy.
+test "HE10.5 integration: eager-loaded zag.compact.default yields to the Zig fallback" {
+    //   1. `loadBuiltinPlugins` eager-loads `zag.compact.default`, which
+    //      Phase 3b rewrote into a no-op that always returns nil. The
+    //      Zig agent loop's `runDefaultSummarization` is now the real
+    //      summarizer; the Lua hook exists only as the
+    //      registered-but-passive customization point for users who
+    //      want to override.
+    //   2. `fireCompact` still does the full round-trip: builds the
+    //      CompactRequest, pumps it through dispatchHookRequests, and
+    //      observes the strategy's return value. A nil return is the
+    //      correct contract today.
+    //   3. The integration shape exercises the marshal path so a
+    //      regression that breaks the Lua dispatcher would surface here
+    //      even though the default strategy itself is trivial.
     const AgentRunner = @import("AgentRunner.zig");
     const alloc = std.testing.allocator;
 
@@ -2576,6 +2576,8 @@ test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompac
     engine.storeSelfPointer();
     engine.loadBuiltinPlugins();
 
+    // The default plugin still registers a handler; that's load-bearing
+    // because fireCompact short-circuits when no handler is set.
     try std.testing.expect(engine.compactHandler() != null);
 
     var queue = try agent_events.EventQueue.initBounded(alloc, 16);
@@ -2598,53 +2600,21 @@ test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompac
         pump_thread.join();
     }
 
-    // Five-message conversation: two older user/assistant pairs plus a
-    // current user turn. The default strategy keeps every user
-    // message intact and replaces both older assistant bodies with
-    // the elision marker.
     var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "first ask" } }};
     var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "first answer" } }};
-    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "second ask" } }};
-    var b4 = [_]types.ContentBlock{.{ .text = .{ .text = "second answer" } }};
-    var b5 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "current ask" } }};
     const messages = [_]types.Message{
         .{ .role = .user, .content = &b1 },
         .{ .role = .assistant, .content = &b2 },
         .{ .role = .user, .content = &b3 },
-        .{ .role = .assistant, .content = &b4 },
-        .{ .role = .user, .content = &b5 },
     };
 
-    // 850/1000 = 85% sits above the 80% fire threshold so `fireCompact`
-    // does the round-trip rather than bypassing it.
-    const replacement = try agent.fireCompact(&engine, &messages, llm.Usage{ .input_tokens = 850 }, messages.len - 1, 1000, 200, alloc, &queue, &cancel);
-    try std.testing.expect(replacement != null);
-    defer {
-        for (replacement.?) |m| m.deinit(alloc);
-        alloc.free(replacement.?);
-    }
-
-    const out = replacement.?;
-    try std.testing.expectEqual(@as(usize, 5), out.len);
-
-    // User messages survive intact at every original position.
-    try std.testing.expectEqual(types.Role.user, out[0].role);
-    try std.testing.expectEqualStrings("first ask", out[0].content[0].text.text);
-    try std.testing.expectEqual(types.Role.user, out[2].role);
-    try std.testing.expectEqualStrings("second ask", out[2].content[0].text.text);
-    try std.testing.expectEqual(types.Role.user, out[4].role);
-    try std.testing.expectEqualStrings("current ask", out[4].content[0].text.text);
-
-    // Both older assistant bodies are gone, replaced by the elision
-    // marker. The original strings must not appear anywhere in the
-    // replacement; otherwise the strategy quietly skipped the elision.
-    try std.testing.expectEqual(types.Role.assistant, out[1].role);
-    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "<elided") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out[1].content[0].text.text, "first answer") == null);
-
-    try std.testing.expectEqual(types.Role.assistant, out[3].role);
-    try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "<elided") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "second answer") == null);
+    // The default strategy returns nil, so fireCompact must hand back
+    // null. The Zig fallback path in runLoopStreaming kicks in for the
+    // real reduction; that path lives inside the loop and isn't
+    // reachable from this fixture-only test.
+    const replacement = try agent.fireCompact(&engine, &messages, llm.Usage{ .input_tokens = 850 }, 1, 1000, 200, alloc, &queue, &cancel);
+    try std.testing.expect(replacement == null);
 }
 
 test "HE10.6 regression: predictive estimator catches mid-turn tool_result blowup" {
@@ -2671,7 +2641,17 @@ test "HE10.6 regression: predictive estimator catches mid-turn tool_result blowu
     var engine = try LuaEngine.LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
-    engine.loadBuiltinPlugins();
+
+    // The Phase 3b default strategy is a no-op (returns nil), so we
+    // can't observe "did the trigger fire" via the replacement alone.
+    // Register a custom strategy that returns a sentinel (single
+    // assistant message) so a fired trigger produces a non-null
+    // result; a skipped trigger still produces nil.
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return { { role = "assistant", content = "FIRED" } }
+        \\end)
+    );
     try std.testing.expect(engine.compactHandler() != null);
 
     var queue = try agent_events.EventQueue.initBounded(alloc, 16);
@@ -2734,6 +2714,7 @@ test "HE10.6 regression: predictive estimator catches mid-turn tool_result blowu
         for (replacement.?) |m| m.deinit(alloc);
         alloc.free(replacement.?);
     }
+    try std.testing.expectEqualStrings("FIRED", replacement.?[0].content[0].text.text);
 }
 
 // -- Cancel-path UAF regression tests --------------------------------------
