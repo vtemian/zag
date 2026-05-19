@@ -553,21 +553,23 @@ function M._delete_enter()
     })
 end
 
--- Activate the row under the cursor. For session rows this should
--- swap the host pane's bound session; the underlying
--- `zag.sessions.open` is Task 1.4b and may not be wired yet, in which
--- case we log a debug line and leave a TODO marker rather than crash.
+-- Activate the row under the cursor. For session rows this splits
+-- the host pane and binds the new leaf to the highlighted session via
+-- `zag.sessions.open`. Errors are downgraded to a log line so a
+-- cross-project click (v1 limitation) does not punch a Lua exception
+-- through to the user.
 function M._activate()
     local row = state.last_render[state.cursor_row]
     if not row or row.kind ~= "session" then return end
-    -- TODO(1.4b): replace this guarded call with a direct
-    -- `zag.sessions.open(row.session_id, row.project)` once the
-    -- binding lands.
-    if zag.sessions and type(zag.sessions.open) == "function" then
-        zag.sessions.open(row.session_id, row.project)
-    else
-        zag.log.debug("sessions sidebar: activate %s (zag.sessions.open not wired yet)",
+    if not (zag.sessions and type(zag.sessions.open) == "function") then
+        zag.log.debug("sessions sidebar: activate %s (zag.sessions.open missing)",
             tostring(row.session_id))
+        return
+    end
+    local ok, err = pcall(zag.sessions.open, row.session_id, row.project)
+    if not ok then
+        zag.log.warn("sessions sidebar: open %s failed: %s",
+            tostring(row.session_id), tostring(err))
     end
 end
 
