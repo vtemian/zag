@@ -647,6 +647,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // summary tokens. Free and continue.
                     gpa.free(text);
                 },
+                .compaction_event => {
+                    // Telemetry-only structured event; trajectory
+                    // captures it via the AgentRunner observer arm.
+                    // No allocations to free here.
+                },
                 .thinking_delta => |td| {
                     defer gpa.free(td.text);
                     capture.addThinkingDelta(td.text) catch |err| {

@@ -116,6 +116,40 @@ pub const AgentEvent = union(enum) {
     /// a structured return shape (use_default / cancel / replace).
     compact_request: *CompactRequest,
 
+    /// One-way structured event emitted at the end of each compaction
+    /// cycle. Carries the outcome (which stage of the fallback chain
+    /// resolved the trigger) plus before/after message counts so
+    /// downstream consumers (telemetry sinks, future /perf dashboards,
+    /// trajectory writers) can render the event without grepping logs
+    /// or string-parsing AgentEvent.info bodies.
+    ///
+    /// The outcome string is one of: "replace", "use_default",
+    /// "cancel", "summarized", "drop_oldest", "refused", "skipped".
+    /// Borrowed from rodata; do not free.
+    compaction_event: CompactionEvent,
+
+    /// Payload for a compaction_event. Emitted at the end of each
+    /// compaction cycle in `runLoopStreaming`. Borrowed strings live
+    /// on rodata (outcome is one of a fixed string set); the agent
+    /// loop never frees them. Counts are session-scope.
+    pub const CompactionEvent = struct {
+        /// Stable string tag for which stage resolved the trigger.
+        /// "replace" | "use_default" | "cancel" | "summarized" |
+        /// "drop_oldest" | "refused" | "skipped". Borrowed from rodata.
+        outcome: []const u8,
+        /// Message count before compaction ran.
+        messages_before: u32,
+        /// Message count after compaction (or after the cascade, if
+        /// drop-oldest or refuse fired).
+        messages_after: u32,
+        /// Token estimate the trigger saw at fire time. Useful for
+        /// understanding why compaction ran.
+        estimate_tokens: u32 = 0,
+        /// Optional `@errorName` slice if the cycle hit a failure
+        /// path (refused, strategy error). Borrowed from rodata.
+        error_name: ?[]const u8 = null,
+    };
+
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
         /// The registered tool name.
@@ -162,7 +196,9 @@ pub const AgentEvent = union(enum) {
             .err => |s| allocator.free(s),
             // Hook/Lua round-trips hold borrowed pointers; caller owns
             // the request struct and its payload. No bytes to free here.
-            .thinking_stop, .done, .reset_assistant_text => {},
+            // compaction_event borrows its outcome string from rodata
+            // and never owns allocations.
+            .thinking_stop, .done, .reset_assistant_text, .compaction_event => {},
             // A dropped hook request leaves the firing thread parked
             // awaiting `done`; signal so it proceeds with `cancelled =
             // false` (the default) and the hook is treated as a no-op.
@@ -1370,4 +1406,56 @@ test "LoopDetectRequest.freeResult abort variant has no payload" {
     req.result = .abort;
     req.freeResult();
     try std.testing.expect(req.result == null);
+}
+
+test "compaction_event round-trips through the queue with no allocations" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 4);
+    defer queue.deinit();
+
+    try queue.push(.{ .compaction_event = .{
+        .outcome = "summarized",
+        .messages_before = 12,
+        .messages_after = 4,
+        .estimate_tokens = 245760,
+    } });
+
+    var buf: [4]AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    switch (buf[0]) {
+        .compaction_event => |ev| {
+            try std.testing.expectEqualStrings("summarized", ev.outcome);
+            try std.testing.expectEqual(@as(u32, 12), ev.messages_before);
+            try std.testing.expectEqual(@as(u32, 4), ev.messages_after);
+            try std.testing.expectEqual(@as(u32, 245760), ev.estimate_tokens);
+            try std.testing.expect(ev.error_name == null);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+    // freeOwned is a no-op for this variant — strings live on rodata.
+    // Hitting it shouldn't allocate or crash.
+    buf[0].freeOwned(std.testing.allocator);
+}
+
+test "compaction_event with error_name surfaces the refused stage cleanly" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 4);
+    defer queue.deinit();
+
+    try queue.push(.{ .compaction_event = .{
+        .outcome = "refused",
+        .messages_before = 8,
+        .messages_after = 8,
+        .estimate_tokens = 300000,
+        .error_name = "ContextWindowExceeded",
+    } });
+
+    var buf: [4]AgentEvent = undefined;
+    _ = queue.drain(&buf);
+    switch (buf[0]) {
+        .compaction_event => |ev| {
+            try std.testing.expectEqualStrings("refused", ev.outcome);
+            try std.testing.expectEqualStrings("ContextWindowExceeded", ev.error_name.?);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
 }

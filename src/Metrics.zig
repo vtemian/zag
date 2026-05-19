@@ -66,6 +66,18 @@ var drain_count: u64 = 0;
 /// is intentional; the struct field mirrors this running counter.
 var peak_memory_bytes: u64 = 0;
 
+/// Compaction event counters. Bumped at the corresponding spots in the
+/// agent loop / strategy dispatcher so `/perf`-style consumers can see
+/// how often each stage fired without grepping logs. Module-level, not
+/// per-frame, because compaction is a session-scope event.
+var compaction_fires_total: u64 = 0;
+var compaction_outcome_replace: u64 = 0;
+var compaction_outcome_use_default: u64 = 0;
+var compaction_outcome_cancel: u64 = 0;
+var compaction_zig_summary_ran: u64 = 0;
+var compaction_drop_oldest_ran: u64 = 0;
+var compaction_refused_overflow: u64 = 0;
+
 /// Monotonic session start time, captured on first frameStart().
 var session_start: ?std.time.Instant = null;
 
@@ -283,6 +295,51 @@ pub inline fn recordTickWork(dur_us: u64) void {
     if (dur_us > max_tick_work_us) max_tick_work_us = dur_us;
 }
 
+/// Stable string tag for a compaction strategy outcome. Keeps the
+/// Metrics module decoupled from `agent_events.CompactStrategyOutcome`
+/// (importing it would create a circular dep through agent_events ->
+/// types -> ... -> Metrics). Callers translate at the call site.
+pub const CompactionOutcomeTag = enum {
+    replace,
+    use_default,
+    cancel,
+};
+
+/// Record one compaction strategy fire and its outcome. Called from
+/// `runLoopStreaming` after the strategy returns. No-op when metrics
+/// are compile-time disabled.
+pub inline fn recordCompactionFire(outcome: CompactionOutcomeTag) void {
+    if (!enabled) return;
+    compaction_fires_total += 1;
+    switch (outcome) {
+        .replace => compaction_outcome_replace += 1,
+        .use_default => compaction_outcome_use_default += 1,
+        .cancel => compaction_outcome_cancel += 1,
+    }
+}
+
+/// Record that the Zig default summarizer (`runDefaultSummarization`)
+/// ran the LLM call as a fallback after the Lua strategy declined.
+pub inline fn recordCompactionZigSummary() void {
+    if (!enabled) return;
+    compaction_zig_summary_ran += 1;
+}
+
+/// Record that the inline drop-oldest fallback ran (Lua strategy +
+/// Zig summarizer both didn't shrink enough).
+pub inline fn recordCompactionDropOldest() void {
+    if (!enabled) return;
+    compaction_drop_oldest_ran += 1;
+}
+
+/// Record that even after every fallback stage the request still
+/// would have overflowed the context window; the agent loop refused
+/// to send.
+pub inline fn recordCompactionRefused() void {
+    if (!enabled) return;
+    compaction_refused_overflow += 1;
+}
+
 /// Record the duration of the event drain phase within a single tick.
 /// Tracked separately from tick work so the user can tell whether a
 /// long tick was caused by drain (per-event handlers, hooks, persist
@@ -344,6 +401,33 @@ pub const Stats = struct {
     /// Maximum drain duration observed in a single tick, microseconds.
     max_drain_us: u64,
 };
+
+/// Compaction telemetry snapshot. Returned by `getCompactionStats()`.
+/// All counters are session-scope; `/perf` consumers sample on demand.
+pub const CompactionStats = struct {
+    fires_total: u64,
+    outcome_replace: u64,
+    outcome_use_default: u64,
+    outcome_cancel: u64,
+    zig_summary_ran: u64,
+    drop_oldest_ran: u64,
+    refused_overflow: u64,
+};
+
+/// Snapshot the current compaction counters. Returns zeros when
+/// metrics are compile-time disabled (the counters never increment in
+/// that mode), so callers can render unconditionally.
+pub fn getCompactionStats() CompactionStats {
+    return .{
+        .fires_total = compaction_fires_total,
+        .outcome_replace = compaction_outcome_replace,
+        .outcome_use_default = compaction_outcome_use_default,
+        .outcome_cancel = compaction_outcome_cancel,
+        .zig_summary_ran = compaction_zig_summary_ran,
+        .drop_oldest_ran = compaction_drop_oldest_ran,
+        .refused_overflow = compaction_refused_overflow,
+    };
+}
 
 /// Compute aggregate stats from the ring buffer on demand.
 pub fn getStats() Stats {
@@ -505,6 +589,13 @@ pub fn init() void {
     peak_memory_bytes = 0;
     session_start = null;
     counting_state = null;
+    compaction_fires_total = 0;
+    compaction_outcome_replace = 0;
+    compaction_outcome_use_default = 0;
+    compaction_outcome_cancel = 0;
+    compaction_zig_summary_ran = 0;
+    compaction_drop_oldest_ran = 0;
+    compaction_refused_overflow = 0;
 }
 
 /// Wraps an allocator to count allocations and frees per frame.
@@ -682,6 +773,61 @@ test "recordTickWork tracks max and average across ticks" {
     try std.testing.expectEqual(@as(u64, 3), stats.tick_count);
     try std.testing.expectEqual(@as(u64, 1500), stats.max_tick_work_us);
     try std.testing.expectEqual(@as(u64, (500 + 1500 + 800) / 3), stats.avg_tick_work_us);
+}
+
+test "recordCompactionFire tallies outcomes per category" {
+    // Counters are no-ops in the default build (enabled = false); the
+    // module-level state stays at its initialized zero and the test
+    // can verify that path. Under `-Dmetrics=true` the same calls
+    // bump the per-outcome counters and getCompactionStats reflects
+    // the totals.
+    if (!enabled) return;
+    init();
+
+    recordCompactionFire(.replace);
+    recordCompactionFire(.replace);
+    recordCompactionFire(.use_default);
+    recordCompactionFire(.cancel);
+
+    const stats = getCompactionStats();
+    try std.testing.expectEqual(@as(u64, 4), stats.fires_total);
+    try std.testing.expectEqual(@as(u64, 2), stats.outcome_replace);
+    try std.testing.expectEqual(@as(u64, 1), stats.outcome_use_default);
+    try std.testing.expectEqual(@as(u64, 1), stats.outcome_cancel);
+    try std.testing.expectEqual(@as(u64, 0), stats.zig_summary_ran);
+    try std.testing.expectEqual(@as(u64, 0), stats.drop_oldest_ran);
+    try std.testing.expectEqual(@as(u64, 0), stats.refused_overflow);
+}
+
+test "compaction cascade counters increment independently" {
+    if (!enabled) return;
+    init();
+
+    recordCompactionZigSummary();
+    recordCompactionZigSummary();
+    recordCompactionDropOldest();
+    recordCompactionRefused();
+
+    const stats = getCompactionStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.zig_summary_ran);
+    try std.testing.expectEqual(@as(u64, 1), stats.drop_oldest_ran);
+    try std.testing.expectEqual(@as(u64, 1), stats.refused_overflow);
+    // fires_total tracks strategy-fire calls only; cascade-stage
+    // recorders don't bump it.
+    try std.testing.expectEqual(@as(u64, 0), stats.fires_total);
+}
+
+test "getCompactionStats returns zeros when metrics are disabled" {
+    // Compile-time disabled path: counters never increment, snapshot
+    // returns all zeros regardless of how many record* calls fired.
+    if (enabled) return;
+    recordCompactionFire(.replace);
+    recordCompactionZigSummary();
+    recordCompactionRefused();
+    const stats = getCompactionStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.fires_total);
+    try std.testing.expectEqual(@as(u64, 0), stats.zig_summary_ran);
+    try std.testing.expectEqual(@as(u64, 0), stats.refused_overflow);
 }
 
 test "recordDrain tracks drain time independently of tick work" {

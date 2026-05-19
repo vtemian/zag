@@ -704,7 +704,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 19) {
+    if (variant_count != 20) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -770,6 +770,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
             // drain in `shutdown` calls `freeOwned` on each.
             .text_delta,
             .compaction_summary_delta,
+            .compaction_event,
             .thinking_delta,
             .thinking_stop,
             .tool_start,
@@ -960,6 +961,16 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             // loop fires these so downstream code (telemetry, future
             // /perf dashboard) can observe streaming progress.
             defer allocator.free(text);
+        },
+        .compaction_event => |ev| {
+            // Structured per-cycle event. Today: log at .info for
+            // operational visibility. The renderer / trajectory
+            // writer will consume the same variant when they grow a
+            // typed event consumer.
+            log.info(
+                "compaction outcome={s} messages_before={d} messages_after={d} estimate_tokens={d}",
+                .{ ev.outcome, ev.messages_before, ev.messages_after, ev.estimate_tokens },
+            );
         },
         .thinking_stop => {
             self.sink.push(.thinking_stop);

@@ -12,6 +12,7 @@ const Harness = @import("Harness.zig");
 const prompt = @import("prompt.zig");
 const skills_mod = @import("skills.zig");
 const LuaEngine = @import("LuaEngine.zig");
+const Metrics = @import("Metrics.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -202,6 +203,14 @@ pub fn runLoopStreaming(
         // estimate still leaves more than `reserve_tokens` of room.
         // See `fireCompact` for the full no-op ladder.
         const reserve_tokens = if (lua_engine) |e| e.compact_reserve_tokens else DEFAULT_RESERVE_TOKENS;
+
+        // Snapshot pre-compaction state for the telemetry event we emit
+        // at the end of the cascade. `pre_estimate` captures the
+        // estimate fireCompact will use; useful for understanding why
+        // a fire happened (or didn't).
+        const messages_before: u32 = @intCast(messages.items.len);
+        const pre_estimate = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
+
         const compact_outcome = try fireCompact(
             lua_engine,
             messages.items,
@@ -214,13 +223,18 @@ pub fn runLoopStreaming(
             cancel,
         );
         var compaction_was_cancelled = false;
+        // Tag tracking for the compaction_event emitted at cascade
+        // end. Set by the strategy outcome; overwritten if a later
+        // fallback stage runs ("summarized", "drop_oldest", "refused").
+        var compact_outcome_tag: []const u8 = "skipped";
         switch (compact_outcome) {
             .skipped => {},
             .cancelled => {
-                // v2 strategy explicitly opted out; skip Zig default
+                // Strategy explicitly opted out; skip Zig default
                 // summarization and drop-oldest below. Pre-flight cap
                 // still catches outright overflows.
                 compaction_was_cancelled = true;
+                compact_outcome_tag = "cancel";
             },
             .replaced => |replacement| {
                 try installCompactReplacement(messages, allocator, replacement);
@@ -230,6 +244,7 @@ pub fn runLoopStreaming(
                 // new shape, so the next iteration must walk from scratch.
                 last_usage_anchor = null;
                 last_usage_index = null;
+                compact_outcome_tag = "replace";
             },
         }
 
@@ -262,6 +277,8 @@ pub fn runLoopStreaming(
                     cancel,
                 )) |maybe_replacement| {
                     if (maybe_replacement) |replacement| {
+                        Metrics.recordCompactionZigSummary();
+                        compact_outcome_tag = "summarized";
                         log.info(
                             "Zig default summarization replaced {d} messages with structured summary",
                             .{messages.items.len - (replacement.len - 1)},
@@ -286,6 +303,8 @@ pub fn runLoopStreaming(
                     1;
                 const cut = findCutPoint(messages.items, budget);
                 if (cut.first_kept > 0) {
+                    Metrics.recordCompactionDropOldest();
+                    compact_outcome_tag = "drop_oldest";
                     log.warn(
                         "inline drop-oldest fallback: dropping {d} of {d} messages to fit context",
                         .{ cut.first_kept, messages.items.len },
@@ -297,6 +316,16 @@ pub fn runLoopStreaming(
                 }
             }
             if (post.total > model_spec.context_window) {
+                Metrics.recordCompactionRefused();
+                // Emit a final compaction_event with .refused before
+                // returning the error so telemetry sees the failure.
+                queue.pushWithBackpressure(.{ .compaction_event = .{
+                    .outcome = "refused",
+                    .messages_before = messages_before,
+                    .messages_after = @intCast(messages.items.len),
+                    .estimate_tokens = post.total,
+                    .error_name = "ContextWindowExceeded",
+                } }, agent_events.default_backpressure_ms) catch {};
                 log.err(
                     "context overflow: estimated {d} tokens still exceeds model window {d}{s}; refusing to send",
                     .{
@@ -307,6 +336,21 @@ pub fn runLoopStreaming(
                 );
                 return error.ContextWindowExceeded;
             }
+        }
+
+        // Emit a structured compaction_event whenever the cascade
+        // produced a non-skipped outcome. Lets downstream consumers
+        // (telemetry sinks, future /perf dashboards, trajectory
+        // writers) see what happened without parsing log lines. Skip
+        // the no-op case to avoid flooding consumers with per-turn
+        // noise.
+        if (!std.mem.eql(u8, compact_outcome_tag, "skipped")) {
+            queue.pushWithBackpressure(.{ .compaction_event = .{
+                .outcome = compact_outcome_tag,
+                .messages_before = messages_before,
+                .messages_after = @intCast(messages.items.len),
+                .estimate_tokens = pre_estimate.total,
+            } }, agent_events.default_backpressure_ms) catch {};
         }
 
         // Mark the turn as in-flight so `EventOrchestrator.onUserInputSubmitted`
@@ -1565,6 +1609,9 @@ pub fn fireCompact(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
 ) !CompactionFireOutcome {
+    var fire_span = Metrics.span("fireCompact");
+    defer fire_span.end();
+
     const engine = lua_engine orelse return .skipped;
     if (engine.compact_handler == null) return .skipped;
     if (tokens_max == 0) {
@@ -1596,9 +1643,16 @@ pub fn fireCompact(
         return .skipped;
     }
     return switch (req.outcome) {
-        .use_default => .skipped,
-        .cancel => .cancelled,
+        .use_default => blk: {
+            Metrics.recordCompactionFire(.use_default);
+            break :blk .skipped;
+        },
+        .cancel => blk: {
+            Metrics.recordCompactionFire(.cancel);
+            break :blk .cancelled;
+        },
         .replace => |r| blk: {
+            Metrics.recordCompactionFire(.replace);
             // Transfer ownership of the messages slice; clear the
             // outcome so freeOutcome becomes a no-op for the data we
             // just adopted. `summary` is dropped today (telemetry-only
@@ -2093,6 +2147,9 @@ pub fn runDefaultSummarization(
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
 ) !?[]types.Message {
+    var sum_span = Metrics.span("runDefaultSummarization");
+    defer sum_span.end();
+
     if (messages.len == 0) return null;
     const cut = findCutPoint(messages, keep_recent_tokens);
     if (cut.first_kept == 0) return null;

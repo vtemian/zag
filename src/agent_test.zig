@@ -321,6 +321,7 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
             switch (ev) {
                 .text_delta => |s| allocator.free(s),
                 .compaction_summary_delta => |s| allocator.free(s),
+                .compaction_event => {},
                 .thinking_delta => |td| allocator.free(td.text),
                 .tool_start => |s| {
                     allocator.free(s.name);
