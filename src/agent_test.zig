@@ -2647,6 +2647,95 @@ test "HE10.5 integration: eager-loaded zag.compact.default elides via fireCompac
     try std.testing.expect(std.mem.indexOf(u8, out[3].content[0].text.text, "second answer") == null);
 }
 
+test "HE10.6 regression: predictive estimator catches mid-turn tool_result blowup" {
+    //   This is the 500k-token bug reproduced in miniature. Under the old
+    //   80%-of-window trigger, fireCompact only looked at the previous
+    //   turn's reported input_tokens. A large tool_result attached to the
+    //   *current* user turn landed after that snapshot, so the estimator
+    //   couldn't see it and let an oversized request escape to the
+    //   provider, which rejected it with "request exceeded model token
+    //   limit".
+    //
+    //   New behavior: estimateContextTokens sums the anchored Usage plus
+    //   a char heuristic for every message appended after, so the giant
+    //   tool_result raises the estimate above the room-based threshold
+    //   even when input_tokens alone is well below it.
+    //
+    //   Scenario: context_window=1000, reserve_tokens=200 (threshold=800).
+    //   Last assistant reported input_tokens=500 (well under the old 80%
+    //   threshold of 800). User then attaches a 1400-char tool_result =
+    //   350 tokens. Total estimate = 850 > 800: must fire.
+    const AgentRunner = @import("AgentRunner.zig");
+    const alloc = std.testing.allocator;
+
+    var engine = try LuaEngine.LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.loadBuiltinPlugins();
+    try std.testing.expect(engine.compactHandler() != null);
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    const Pump = struct {
+        fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) {
+                AgentRunner.dispatchHookRequests(q, eng, null);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            AgentRunner.dispatchHookRequests(q, eng, null);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const pump_thread = try std.Thread.spawn(.{}, Pump.pump, .{ &queue, &engine, &stop });
+    defer {
+        stop.store(true, .release);
+        pump_thread.join();
+    }
+
+    // Anchor turn (assistant) + a user message carrying a fat tool_result.
+    // The 1400-char body sits squarely in the danger zone the old trigger
+    // ignored: it landed AFTER the last reported usage, so input_tokens
+    // alone showed only 500.
+    var anchor_blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "user opener" } },
+    };
+    var assistant_blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "anchor turn" } },
+    };
+    var big_buf: [1400]u8 = undefined;
+    @memset(&big_buf, 'x');
+    var tail_blocks = [_]types.ContentBlock{
+        .{ .tool_result = .{ .tool_use_id = "tu_1", .content = &big_buf, .is_error = false } },
+    };
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &anchor_blocks },
+        .{ .role = .assistant, .content = &assistant_blocks },
+        .{ .role = .user, .content = &tail_blocks },
+    };
+
+    const anchor: llm.Usage = .{ .input_tokens = 500 };
+    // Old trigger (80% of 1000 = 800) would see anchor 500 and skip.
+    // New trigger: est = 500 + ceil(1400/4) = 850 > (1000-200) = 800. Fires.
+    const replacement = try agent.fireCompact(
+        &engine,
+        &messages,
+        anchor,
+        1, // anchor index = assistant
+        1000, // tokens_max (context_window)
+        200, // reserve_tokens
+        alloc,
+        &queue,
+        &cancel,
+    );
+    try std.testing.expect(replacement != null);
+    defer {
+        for (replacement.?) |m| m.deinit(alloc);
+        alloc.free(replacement.?);
+    }
+}
+
 // -- Cancel-path UAF regression tests --------------------------------------
 //
 // Each `fireX` helper must, on cancel observed mid-round-trip, wait for the
