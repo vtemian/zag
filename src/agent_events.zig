@@ -26,6 +26,17 @@ pub const default_backpressure_ms: u32 = 100;
 pub const AgentEvent = union(enum) {
     /// Partial text from the LLM response.
     text_delta: []const u8,
+    /// Partial text from an in-flight compaction summary. Distinct
+    /// from `.text_delta` because the UI should NOT render this as
+    /// the model's reply — it's transient work the agent is doing
+    /// to shrink history before the next real turn. Renderers may
+    /// dim, italic, or surface in a side panel; today they can also
+    /// ignore the variant entirely and just free the bytes. Emitted
+    /// by `runDefaultSummarization` when it streams via
+    /// `provider.callStreaming`; the Lua-side default summarizer
+    /// (which goes through `zag.llm.complete` and the worker pool)
+    /// is synchronous today and does not emit these deltas.
+    compaction_summary_delta: []const u8,
     /// Partial extended-thinking text. Duped by the agent-side stream
     /// adapter so the payload outlives the provider's SSE buffer. The
     /// `provider` tag travels alongside the text so JSONL persistence
@@ -136,6 +147,7 @@ pub const AgentEvent = union(enum) {
     pub fn freeOwned(self: AgentEvent, allocator: Allocator) void {
         switch (self) {
             .text_delta => |s| allocator.free(s),
+            .compaction_summary_delta => |s| allocator.free(s),
             .thinking_delta => |td| allocator.free(td.text),
             .tool_start => |t| {
                 allocator.free(t.name);

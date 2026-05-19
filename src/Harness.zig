@@ -640,6 +640,13 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     break;
                 },
                 .reset_assistant_text => {},
+                .compaction_summary_delta => |text| {
+                    // Headless eval drops compaction-summary streaming
+                    // deltas; the final compacted history is what the
+                    // trajectory captures, not the intermediate
+                    // summary tokens. Free and continue.
+                    gpa.free(text);
+                },
                 .thinking_delta => |td| {
                     defer gpa.free(td.text);
                     capture.addThinkingDelta(td.text) catch |err| {

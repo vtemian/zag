@@ -243,9 +243,12 @@ pub fn runLoopStreaming(
         if (model_spec.context_window > 0) {
             var post = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
             if (post.total > model_spec.context_window and !compaction_was_cancelled) {
-                // Stage 2: Zig-default structured summarization. Synchronous
-                // provider.call on the agent thread; the user is already
-                // waiting on the next turn, so blocking briefly here is OK.
+                // Stage 2: Zig-default structured summarization. Streams
+                // via `provider.callStreaming` on the agent thread; the
+                // user is already waiting on the next turn so blocking
+                // briefly here is fine, and the streaming deltas keep
+                // the UI alive ("compacting...") instead of looking
+                // frozen for the duration of the round-trip.
                 const keep_recent: u32 = if (lua_engine) |e|
                     e.compact_keep_recent_tokens
                 else
@@ -255,6 +258,8 @@ pub fn runLoopStreaming(
                     provider,
                     keep_recent,
                     allocator,
+                    queue,
+                    cancel,
                 )) |maybe_replacement| {
                     if (maybe_replacement) |replacement| {
                         log.info(
@@ -2085,6 +2090,8 @@ pub fn runDefaultSummarization(
     provider: llm.Provider,
     keep_recent_tokens: u32,
     allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
 ) !?[]types.Message {
     if (messages.len == 0) return null;
     const cut = findCutPoint(messages, keep_recent_tokens);
@@ -2123,37 +2130,84 @@ pub fn runDefaultSummarization(
         .{ .role = .user, .content = user_blocks },
     };
 
-    const req: llm.Request = .{
+    // Streaming callback: accumulate the summary text locally AND push
+    // each delta onto the agent event queue as `.compaction_summary_delta`
+    // so the UI can display "compacting..." progress. Non-text events
+    // (thinking, tool_start, etc.) are dropped — the summarizer prompt
+    // asks for structured text, not tools.
+    var summary_buf: std.ArrayList(u8) = .empty;
+    defer summary_buf.deinit(allocator);
+    const StreamCtx = struct {
+        buf: *std.ArrayList(u8),
+        queue: *agent_events.EventQueue,
+        allocator: Allocator,
+    };
+    var stream_ctx: StreamCtx = .{ .buf = &summary_buf, .queue = queue, .allocator = allocator };
+
+    const stream_req: llm.StreamRequest = .{
         .system_stable = SUMMARIZATION_SYSTEM_PROMPT,
         .system_volatile = "",
         .messages = &req_messages,
         .tool_definitions = &.{},
         .allocator = allocator,
+        .callback = .{
+            .ctx = &stream_ctx,
+            .on_event = struct {
+                fn handle(opaque_ctx: *anyopaque, event: llm.StreamEvent) void {
+                    const ctx: *StreamCtx = @ptrCast(@alignCast(opaque_ctx));
+                    switch (event) {
+                        .text_delta => |t| {
+                            // Accumulate locally for the final summary
+                            // assembly. Failure here is fatal to the
+                            // streaming pass (we can't recover the
+                            // partial text); fail-soft by skipping the
+                            // delta and letting the response slice
+                            // carry the full text as a backup. The
+                            // worst case is an empty local buf and
+                            // total == 0 below, which returns null and
+                            // lets the agent loop's drop-oldest take
+                            // over.
+                            ctx.buf.appendSlice(ctx.allocator, t) catch return;
+                            // Side-channel the delta to the UI. Dupe
+                            // because the callback's slice is owned by
+                            // the SSE parser's scratch buffer.
+                            const duped = ctx.allocator.dupe(u8, t) catch return;
+                            ctx.queue.pushWithBackpressure(
+                                .{ .compaction_summary_delta = duped },
+                                agent_events.default_backpressure_ms,
+                            ) catch {
+                                ctx.allocator.free(duped);
+                            };
+                        },
+                        else => {},
+                    }
+                }
+            }.handle,
+        },
+        .cancel = cancel,
     };
 
-    const response = try provider.call(&req);
+    const response = try provider.callStreaming(&stream_req);
     defer response.deinit(allocator);
 
-    // Pull the summary text out of the response. Models that return
-    // multiple text blocks get them concatenated; non-text blocks
-    // (tool_use, thinking) are dropped — the summarizer prompt asked
-    // for a structured text answer, not tools.
-    var total: usize = 0;
-    for (response.content) |b| switch (b) {
-        .text => |t| total += t.text.len,
-        else => {},
-    };
-    if (total == 0) return null;
-    const summary_buf = try allocator.alloc(u8, total);
-    var off: usize = 0;
-    for (response.content) |b| switch (b) {
-        .text => |t| {
-            @memcpy(summary_buf[off .. off + t.text.len], t.text);
-            off += t.text.len;
-        },
-        else => {},
-    };
-    defer allocator.free(summary_buf);
+    // Prefer the locally-accumulated text. If the streaming callback
+    // produced nothing (provider sent the full response as a single
+    // non-streamed text block on the LlmResponse), fall back to the
+    // response's content blocks so we don't silently lose the summary.
+    if (summary_buf.items.len == 0) {
+        var total: usize = 0;
+        for (response.content) |b| switch (b) {
+            .text => |t| total += t.text.len,
+            else => {},
+        };
+        if (total == 0) return null;
+        try summary_buf.ensureTotalCapacity(allocator, total);
+        for (response.content) |b| switch (b) {
+            .text => |t| summary_buf.appendSliceAssumeCapacity(t.text),
+            else => {},
+        };
+    }
+    const summary_buf_slice = summary_buf.items;
 
     // Phase 5: walk the soon-to-be-summarized prefix for read/write/edit
     // paths and append a "Files Touched" trailer so the model doesn't
@@ -2164,9 +2218,9 @@ pub fn runDefaultSummarization(
     defer allocator.free(trailer);
 
     const summary_with_trailer = if (trailer.len == 0)
-        try allocator.dupe(u8, summary_buf)
+        try allocator.dupe(u8, summary_buf_slice)
     else
-        try std.fmt.allocPrint(allocator, "{s}{s}", .{ summary_buf, trailer });
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ summary_buf_slice, trailer });
     defer allocator.free(summary_with_trailer);
 
     // Compose [summary_message, deep-copied retained suffix]. Deep-copy

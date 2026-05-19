@@ -704,7 +704,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 18) {
+    if (variant_count != 19) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -769,6 +769,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
             // Payload-bearing events stay in the ring; the post-join
             // drain in `shutdown` calls `freeOwned` on each.
             .text_delta,
+            .compaction_summary_delta,
             .thinking_delta,
             .thinking_stop,
             .tool_start,
@@ -951,6 +952,14 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         .thinking_delta => |td| {
             defer allocator.free(td.text);
             self.sink.push(.{ .thinking_delta = .{ .text = td.text } });
+        },
+        .compaction_summary_delta => |text| {
+            // For now: free the bytes; no sink event yet. The
+            // renderer plumbing will add an event variant when the UI
+            // design for "compacting..." progress lands. The agent
+            // loop fires these so downstream code (telemetry, future
+            // /perf dashboard) can observe streaming progress.
+            defer allocator.free(text);
         },
         .thinking_stop => {
             self.sink.push(.thinking_stop);

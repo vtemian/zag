@@ -320,6 +320,7 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
         for (buf[0..count]) |ev| {
             switch (ev) {
                 .text_delta => |s| allocator.free(s),
+                .compaction_summary_delta => |s| allocator.free(s),
                 .thinking_delta => |td| allocator.free(td.text),
                 .tool_start => |s| {
                     allocator.free(s.name);
@@ -2597,6 +2598,113 @@ test "HE10.6 regression: predictive estimator catches mid-turn tool_result blowu
         },
         else => return error.TestUnexpectedOutcome,
     }
+}
+
+// Streaming stub provider that emits a predetermined sequence of
+// text_delta events from `callStreaming`. Used by the
+// runDefaultSummarization streaming test below.
+const StreamingSummaryProvider = struct {
+    deltas: []const []const u8,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "streaming_summary_stub",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *StreamingSummaryProvider = @ptrCast(@alignCast(ptr));
+        for (self.deltas) |d| {
+            req.callback.on_event(req.callback.ctx, .{ .text_delta = d });
+        }
+        // No content in the response — the caller should reconstruct
+        // from the streaming callback. This exercises the "streaming
+        // produced text, response.content empty" path, which is the
+        // common case for streaming-only providers.
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 1,
+            .output_tokens = 1,
+        };
+    }
+
+    fn provider(self: *StreamingSummaryProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "runDefaultSummarization streams deltas to queue and assembles summary" {
+    const allocator = std.testing.allocator;
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 32);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stub = StreamingSummaryProvider{
+        .deltas = &[_][]const u8{ "## Goal\n", "port pi-mono", "\n## Done" },
+    };
+    const provider = stub.provider();
+
+    // Three-message fixture; keep_recent small so we cut after msg[0].
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "long ask 1" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "long answer 1" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "short ask 2" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b1 },
+        .{ .role = .assistant, .content = &b2 },
+        .{ .role = .user, .content = &b3 },
+    };
+
+    const maybe_replacement = try agent.runDefaultSummarization(
+        &messages,
+        provider,
+        1, // tiny budget so the cut sits past msg[0]
+        allocator,
+        &queue,
+        &cancel,
+    );
+    try std.testing.expect(maybe_replacement != null);
+    const replacement = maybe_replacement.?;
+    defer {
+        for (replacement) |m| m.deinit(allocator);
+        allocator.free(replacement);
+    }
+
+    // The summary message is wrapped with the COMPACTION_SUMMARY
+    // prefix/suffix sentinels so the next iteration can extract it.
+    const summary_text = replacement[0].content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, summary_text, "<summary>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_text, "</summary>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_text, "## Goal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_text, "port pi-mono") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_text, "## Done") != null);
+
+    // The queue should have received one compaction_summary_delta per
+    // emitted text_delta. Drain and tally.
+    var buf: [16]agent_events.AgentEvent = undefined;
+    var delta_count: usize = 0;
+    while (true) {
+        const count = queue.drain(&buf);
+        if (count == 0) break;
+        for (buf[0..count]) |ev| {
+            switch (ev) {
+                .compaction_summary_delta => |t| {
+                    delta_count += 1;
+                    allocator.free(t);
+                },
+                else => ev.freeOwned(allocator),
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), delta_count);
 }
 
 // -- Cancel-path UAF regression tests --------------------------------------
