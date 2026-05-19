@@ -1599,6 +1599,385 @@ test "sessions sidebar filter commit keeps filter applied and exits mode" {
     );
 }
 
+// Task 7.2: rename mode. `r` on a session row swaps the sidebar into a
+// "rename" mode whose printable-input dispatch shares the same handlers
+// as filter mode (single printable-char dispatcher branching on
+// state.mode). On <CR> the buffer is committed via
+// `zag.sessions.rename(id, new_name, project)`; on <Esc> the partial
+// buffer is discarded and the sidebar returns to normal mode.
+test "sessions sidebar r enters rename mode pre-filled with the current name" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 1
+        \\
+        \\sidebar._rename_enter_for_test()
+        \\assert(st.mode == "rename",
+        \\       "r must put sidebar in rename mode, got " .. tostring(st.mode))
+        \\assert(st.rename_buf == "alpha",
+        \\       "rename_buf must pre-fill with current name, got " .. tostring(st.rename_buf))
+        \\assert(st.rename_target ~= nil and st.rename_target.session_id == _test_alpha_id,
+        \\       "rename_target must capture session id")
+    );
+}
+
+test "sessions sidebar rename input extends the rename buffer" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 1
+        \\
+        \\sidebar._rename_enter_for_test()
+        \\-- Verify the shared printable-input dispatcher branches on
+        \\-- state.mode: in rename mode the same `_filter_input_for_test`
+        \\-- seam must append to rename_buf, not state.filter.
+        \\sidebar._filter_input_for_test("z")
+        \\assert(st.rename_buf == "alphaz",
+        \\       "rename_buf should be 'alphaz', got " .. tostring(st.rename_buf))
+        \\assert(st.filter == "",
+        \\       "filter must not change in rename mode, got " .. tostring(st.filter))
+    );
+}
+
+test "sessions sidebar rename backspace pops a char from rename buffer" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 1
+        \\
+        \\sidebar._rename_enter_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\assert(st.rename_buf == "alph",
+        \\       "rename_buf should be 'alph', got " .. tostring(st.rename_buf))
+        \\
+        \\-- Pop everything; further backspaces clamp at empty.
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\assert(st.rename_buf == "",
+        \\       "rename_buf should clamp at empty, got " .. tostring(st.rename_buf))
+        \\assert(st.mode == "rename",
+        \\       "backspace on empty rename_buf must stay in mode, got " .. tostring(st.mode))
+    );
+}
+
+test "sessions sidebar rename commit invokes zag.sessions.rename and exits" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 1
+        \\
+        \\sidebar._rename_enter_for_test()
+        \\-- Replace "alpha" with "renamed".
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_input_for_test("r")
+        \\sidebar._filter_input_for_test("e")
+        \\sidebar._filter_input_for_test("n")
+        \\sidebar._filter_input_for_test("a")
+        \\sidebar._filter_input_for_test("m")
+        \\sidebar._filter_input_for_test("e")
+        \\sidebar._filter_input_for_test("d")
+        \\sidebar._rename_commit_for_test()
+        \\
+        \\assert(st.mode == "normal",
+        \\       "commit must exit rename mode, got " .. tostring(st.mode))
+        \\assert(st.rename_buf == "",
+        \\       "rename_buf must clear after commit, got " .. tostring(st.rename_buf))
+        \\assert(st.rename_target == nil,
+        \\       "rename_target must clear after commit")
+        \\
+        \\local list = zag.sessions.list()
+        \\assert(#list == 1, "expected 1 session, got " .. tostring(#list))
+        \\assert(list[1].name == "renamed",
+        \\       "session name must reflect commit, got " .. tostring(list[1].name))
+    );
+}
+
+test "sessions sidebar rename escape discards the buffer and keeps the name" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\st.cursor_row = 1
+        \\
+        \\sidebar._rename_enter_for_test()
+        \\sidebar._filter_input_for_test("z")
+        \\sidebar._filter_input_for_test("z")
+        \\sidebar._rename_escape_for_test()
+        \\
+        \\assert(st.mode == "normal",
+        \\       "escape must exit rename mode, got " .. tostring(st.mode))
+        \\assert(st.rename_buf == "",
+        \\       "rename_buf must clear after escape, got " .. tostring(st.rename_buf))
+        \\assert(st.rename_target == nil,
+        \\       "rename_target must clear after escape")
+        \\
+        \\local list = zag.sessions.list()
+        \\assert(list[1].name == "alpha",
+        \\       "name must not change on escape, got " .. tostring(list[1].name))
+    );
+}
+
+test "sessions sidebar r on a subagent row is a no-op" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\-- Inject a synthetic subagent row at cursor position so the
+        \\-- guard "kind == 'session'" path can be exercised without
+        \\-- needing a real task_start entry on disk.
+        \\st.last_render = {
+        \\    { kind = "session",  session_id = _test_alpha_id, project = nil, name = "alpha", depth = 0, label = "alpha" },
+        \\    { kind = "subagent", session_id = _test_alpha_id, project = nil, depth = 1, label = "  └ child" },
+        \\}
+        \\st.cursor_row = 2
+        \\
+        \\sidebar._rename_enter_for_test()
+        \\assert(st.mode == "normal",
+        \\       "r on subagent row must not change mode, got " .. tostring(st.mode))
+        \\assert(st.rename_target == nil,
+        \\       "rename_target must stay nil on subagent row")
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

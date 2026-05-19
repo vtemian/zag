@@ -22,6 +22,7 @@ local state = {
     filter = "",          -- substring filter (empty = no filter)
     mode = "normal",      -- "normal" | "filter" | "rename" | "confirm_delete"
     rename_buf = "",      -- in-progress new name
+    rename_target = nil,  -- { session_id, project } captured at rename_enter
     last_render = {},     -- array of { kind, session_id?, depth, label, is_current } for keymap dispatch
     hook_ids = {},        -- registered hook ids, removed on close
     keymap_ids = {},      -- registered buffer-local keymap ids
@@ -164,6 +165,13 @@ function M._bind_keymaps()
     add { key = "/",     fn = M._filter_enter }
     add { key = "<BS>",  fn = M._filter_backspace }
     add { key = "<Esc>", fn = M._filter_escape }
+    -- Rename mode (Task 7.2). `r` in normal mode swaps into rename
+    -- mode for the cursor row's session; the printable dispatcher
+    -- branches on state.mode so the same input loop appends to
+    -- state.rename_buf rather than state.filter. `r` in filter mode
+    -- is treated as filter input (so the user can type names
+    -- containing 'r' into the filter without losing this binding).
+    add { key = "r",     fn = M._r_pressed }
 end
 
 -- The printable-char set accepted in filter mode. Substring-match over
@@ -241,13 +249,27 @@ function M._g_pressed()
 end
 
 -- `<CR>` dispatcher. In filter mode: commit (exit, keep filter).
--- In normal mode: activate the row under the cursor.
+-- In rename mode: commit the rename. In normal mode: activate the row
+-- under the cursor.
 function M._enter_pressed()
     if state.mode == "filter" then
         M._filter_commit()
         return
     end
+    if state.mode == "rename" then
+        M._rename_commit()
+        return
+    end
     M._activate()
+end
+
+-- `r` dispatcher. In normal mode on a session row: enter rename mode.
+-- In filter mode: treat as a literal printable input. In rename mode:
+-- append to rename_buf (same printable-input path).
+function M._r_pressed()
+    if state.mode == "filter" then return M._filter_input("r") end
+    if state.mode == "rename" then return M._filter_input("r") end
+    M._rename_enter()
 end
 
 -- Filter-mode entry. `/` swaps the sidebar into filter mode and
@@ -260,38 +282,61 @@ function M._filter_enter()
     M._render()
 end
 
--- Append a single printable char to state.filter. No-op outside
--- filter mode so the same binding is safe in normal mode (a stray
--- "z" keypress in the sidebar does nothing instead of corrupting
--- the filter). ASCII bytes only; multibyte session names render
--- but cannot be filter-typed in v1.
+-- Shared printable-input dispatcher. Branches on state.mode so a
+-- single keymap binding loop (see `_bind_keymaps`) can feed both filter
+-- and rename buffers without duplicating the printables table. No-op
+-- in normal mode so a stray "z" keypress in the sidebar does nothing.
+-- ASCII bytes only; multibyte session names render but cannot be
+-- typed into either buffer in v1.
 function M._filter_input(ch)
-    if state.mode ~= "filter" then return end
-    state.filter = state.filter .. ch
-    M._render()
-end
-
--- Pop the last byte of state.filter. ASCII-only v1 assumption: we
--- drop one byte rather than one grapheme. Multibyte session names
--- can't be filter-typed yet (see `_filter_input`), so byte-pop is
--- safe. Backspace on an empty filter stays in filter mode and is
--- a no-op (does NOT exit; <Esc> is the exit key).
-function M._filter_backspace()
-    if state.mode ~= "filter" then return end
-    if #state.filter > 0 then
-        state.filter = state.filter:sub(1, -2)
+    if state.mode == "filter" then
+        state.filter = state.filter .. ch
+        M._render()
+        return
     end
-    M._render()
+    if state.mode == "rename" then
+        state.rename_buf = state.rename_buf .. ch
+        M._render()
+        return
+    end
 end
 
--- Cancel filter mode: discard the in-progress filter and return to
--- normal mode. Outside filter mode this is a no-op (no global Esc
--- binding to fall through to on the sidebar's normal-mode surface).
+-- Shared backspace dispatcher. ASCII-only v1 assumption: we drop one
+-- byte rather than one grapheme. Backspace on an empty buffer stays in
+-- the current mode and is a no-op (does NOT exit; <Esc> is the exit
+-- key for both filter and rename).
+function M._filter_backspace()
+    if state.mode == "filter" then
+        if #state.filter > 0 then
+            state.filter = state.filter:sub(1, -2)
+        end
+        M._render()
+        return
+    end
+    if state.mode == "rename" then
+        if #state.rename_buf > 0 then
+            state.rename_buf = state.rename_buf:sub(1, -2)
+        end
+        M._render()
+        return
+    end
+end
+
+-- Shared escape dispatcher. Cancel filter or rename and return to
+-- normal mode, discarding any in-progress buffer. Outside both modes
+-- this is a no-op (no global Esc binding to fall through to on the
+-- sidebar's normal-mode surface).
 function M._filter_escape()
-    if state.mode ~= "filter" then return end
-    state.mode = "normal"
-    state.filter = ""
-    M._render()
+    if state.mode == "filter" then
+        state.mode = "normal"
+        state.filter = ""
+        M._render()
+        return
+    end
+    if state.mode == "rename" then
+        M._rename_escape()
+        return
+    end
 end
 
 -- Commit filter mode: exit but keep state.filter applied. The user
@@ -299,6 +344,67 @@ end
 function M._filter_commit()
     if state.mode ~= "filter" then return end
     state.mode = "normal"
+    M._render()
+end
+
+-- Enter rename mode for the cursor row. Only fires in normal mode and
+-- only when the highlighted row is a session (subagent rows have no
+-- name to rename, the row label is a synthesized prompt snippet). The
+-- rename buffer pre-fills with the session's current display name so
+-- the user can edit incrementally rather than retyping from scratch.
+-- `state.rename_target` snapshots the id+project at entry time so a
+-- mid-rename SessionListChanged re-render that shifts rows can't
+-- redirect the commit to a different session.
+function M._rename_enter()
+    if state.mode ~= "normal" then return end
+    local row = state.last_render[state.cursor_row]
+    if not row or row.kind ~= "session" then return end
+    state.rename_target = {
+        session_id = row.session_id,
+        project = row.project,
+    }
+    state.rename_buf = row.name or ""
+    state.mode = "rename"
+    M._render()
+end
+
+-- Commit the rename: call into the Zig binding with the captured
+-- target. Errors (unknown id, invalid name) are caught and logged; on
+-- failure we still exit rename mode rather than trap the user. The
+-- partial buffer is lost but the original name is intact and the error
+-- surfaces in the log — the more forgiving UX per the plan.
+function M._rename_commit()
+    if state.mode ~= "rename" then return end
+    local target = state.rename_target
+    if target == nil then
+        -- Defensive: rename mode without a target is a programming
+        -- error. Reset to normal so the user isn't trapped.
+        state.mode = "normal"
+        state.rename_buf = ""
+        M._render()
+        return
+    end
+    local ok, err = pcall(zag.sessions.rename, target.session_id, state.rename_buf, target.project)
+    if not ok then
+        zag.log.warn("sessions sidebar: rename(%s) failed: %s",
+            tostring(target.session_id), tostring(err))
+    end
+    state.mode = "normal"
+    state.rename_target = nil
+    state.rename_buf = ""
+    -- The SessionListChanged hook fired by a successful rename will
+    -- trigger a re-render with the new name on its own; render now
+    -- anyway so the prompt line clears immediately on failure.
+    M._render()
+end
+
+-- Cancel rename mode without persisting. The partial buffer is
+-- dropped and the cursor stays on the original row.
+function M._rename_escape()
+    if state.mode ~= "rename" then return end
+    state.mode = "normal"
+    state.rename_target = nil
+    state.rename_buf = ""
     M._render()
 end
 
@@ -479,7 +585,20 @@ function M._render()
     -- to paint (e.g. a theme that overrides `current_line` to invisible).
     -- Belt-and-suspenders per the plan: glyph + style.
     local current_id = _resolve_current_session_id()
+    local rename_target = state.mode == "rename" and state.rename_target or nil
     for _, r in ipairs(rows) do
+        -- Rename overlay: replace the target session row's label with
+        -- the in-progress buffer plus a `_` cursor marker. Sibling
+        -- session rows continue to render normally. We do this BEFORE
+        -- the current-session prefix so the rename text is what the
+        -- user sees as the edit target, while the marker prefix still
+        -- communicates "this is the active session".
+        if rename_target ~= nil
+            and r.kind == "session"
+            and r.session_id == rename_target.session_id
+        then
+            r.label = "[" .. state.rename_buf .. "_]"
+        end
         if r.kind == "session" and current_id ~= nil and r.session_id == current_id then
             r.is_current = true
             r.label = "● " .. r.label
@@ -593,6 +712,14 @@ function M._filter_input_for_test(ch) M._filter_input(ch) end
 function M._filter_backspace_for_test() M._filter_backspace() end
 function M._filter_escape_for_test() M._filter_escape() end
 function M._filter_commit_for_test() M._filter_commit() end
+
+-- Task 7.2 test seams. The keymap layer can't be driven headlessly
+-- (the input parser is bound to a Terminal), so tests call these
+-- wrappers in place of pressing r / <CR> / <Esc>. Each forwards
+-- directly to the underlying handler.
+function M._rename_enter_for_test() M._rename_enter() end
+function M._rename_commit_for_test() M._rename_commit() end
+function M._rename_escape_for_test() M._rename_escape() end
 
 -- Test-only seam (Task 6.1). Forces `_resolve_current_session_id`
 -- to return `id` on the next render, bypassing the `zag.layout.tree`
