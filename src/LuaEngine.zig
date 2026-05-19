@@ -289,6 +289,14 @@ pub const LuaEngine = struct {
         /// is borrowed; the `fireHook` caller owns the payload and
         /// keeps it alive across the drain loop.
         hook_payload: ?*Hooks.HookPayload = null,
+        /// When non-null, this task is running a compaction strategy.
+        /// On final `.ok` resume, the top-of-stack return is decoded
+        /// into `req.outcome` via `decodeCompactStrategyReturn`. Same
+        /// lifetime contract as `hook_payload`: borrowed pointer,
+        /// caller (`handleCompactRequest`) keeps the request alive
+        /// across the drain loop. Mutually exclusive with
+        /// `hook_payload`; never both set on the same task.
+        compact_request: ?*agent_events.CompactRequest = null,
         /// Wall-clock timestamp (ms since epoch) when this task was
         /// spawned. Only meaningful when `budget_ms` is non-null; the
         /// hook drain uses `now - started_at_ms` against `budget_ms`
@@ -1944,17 +1952,100 @@ pub const LuaEngine = struct {
         return try allocator.dupe(u8, raw);
     }
 
-    /// Phase 6 v2 dispatch. Pushes a full-fidelity message snapshot
-    /// (text / tool_use / tool_result / thinking / redacted_thinking
-    /// blocks all carry their fields into Lua) plus the token usage
-    /// scalars, runs the registered handler, and decodes the structured
-    /// return. Three return shapes:
-    ///   - `nil` or `{use_default = true}` → outcome stays `.use_default`
-    ///   - `{cancel = true}` → outcome becomes `.cancel`
-    ///   - `{messages = [...], summary = "..."}` → outcome becomes
-    ///     `.replace` with messages duped into `req.allocator`.
-    /// A plain numerically-indexed array is also accepted as
-    /// "messages-only replacement" for symmetry with v1.
+    /// Decode the strategy's top-of-stack return value (sitting on
+    /// `co`'s stack at index -1) into a `CompactStrategyOutcome`. Used
+    /// by `resumeTask`'s `.ok` arm when retiring a compact-strategy
+    /// coroutine. Does NOT pop; the caller retires the task, which
+    /// pops all return values via `co.pop(num_results)`.
+    ///
+    /// Three return shapes:
+    ///   - nil / non-table / `{use_default = true}` → `.use_default`
+    ///   - `{cancel = true}` → `.cancel`
+    ///   - `{messages = [...], summary = "..."}` (or a bare numerically-
+    ///     indexed array of messages) → `.replace`
+    fn decodeCompactStrategyReturn(
+        co: *Lua,
+        allocator: Allocator,
+    ) anyerror!agent_events.CompactStrategyOutcome {
+        if (co.isNil(-1)) return .use_default;
+        if (co.typeOf(-1) != .table) {
+            log.warn(
+                "compact strategy returned non-table (type {s}); treating as use_default",
+                .{@tagName(co.typeOf(-1))},
+            );
+            return .use_default;
+        }
+
+        // Signal fields take precedence over the messages array.
+        _ = co.getField(-1, "cancel");
+        const want_cancel = co.toBoolean(-1);
+        co.pop(1);
+        if (want_cancel) return .cancel;
+
+        _ = co.getField(-1, "use_default");
+        const want_default = co.toBoolean(-1);
+        co.pop(1);
+        if (want_default) return .use_default;
+
+        // Replacement path. Plugin may set `messages = {...}` with an
+        // optional `summary = "..."`, OR pass a plain numerically-
+        // indexed array of messages.
+        _ = co.getField(-1, "messages");
+        const has_messages_field = co.typeOf(-1) == .table;
+        if (!has_messages_field) co.pop(1);
+
+        const len = co.rawLen(-1);
+        var collected: std.ArrayList(types.Message) = .empty;
+        errdefer {
+            for (collected.items) |m| m.deinit(allocator);
+            collected.deinit(allocator);
+        }
+        for (0..len) |idx| {
+            _ = co.rawGetIndex(-1, @intCast(idx + 1));
+            const msg = try decodeMessage(co, allocator);
+            errdefer msg.deinit(allocator);
+            try collected.append(allocator, msg);
+            co.pop(1);
+        }
+        if (has_messages_field) co.pop(1); // pop the messages subtable
+
+        // Optional summary string. At this point the return table is
+        // at the top of the stack (we popped the messages subtable if
+        // we got it via getField).
+        var owned_summary: ?[]const u8 = null;
+        _ = co.getField(-1, "summary");
+        if (co.typeOf(-1) == .string) {
+            const raw = co.toString(-1) catch "";
+            owned_summary = allocator.dupe(u8, raw) catch null;
+        }
+        co.pop(1);
+
+        return .{ .replace = .{
+            .messages = try collected.toOwnedSlice(allocator),
+            .summary = owned_summary,
+        } };
+    }
+
+    /// Run the compaction strategy on a fresh coroutine so it can call
+    /// yielding primitives (`zag.llm.complete`, `zag.fs.read`,
+    /// `zag.cmd`, etc.). The strategy sees a full-fidelity message
+    /// snapshot and returns one of three structured shapes; the return
+    /// is decoded into `req.outcome` during the `.ok` resume in
+    /// `resumeTask` via `decodeCompactStrategyReturn`.
+    ///
+    /// When the engine has no async runtime initialized (some tests,
+    /// headless paths), we cannot spawn a coroutine — fall back to a
+    /// direct `protectedCall` on the main lua state. Yielding
+    /// primitives will fail in that path with a clear Lua error
+    /// (`must be called inside zag.async/hook/keymap`); the strategy
+    /// has to handle that itself (typically by returning nil so the
+    /// Zig fallback chain runs).
+    ///
+    /// `done` timing contract: `AgentRunner.dispatchHookRequests` calls
+    /// `req.done.set()` AFTER this function returns. The drain loop
+    /// here completes when the coroutine retires, at which point
+    /// `req.outcome` has been written by `resumeTask`. The agent thread
+    /// observes the finalized outcome.
     pub fn handleCompactRequest(
         self: *LuaEngine,
         req: *agent_events.CompactRequest,
@@ -1965,10 +2056,12 @@ pub const LuaEngine = struct {
         _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
         if (!lua.isFunction(-1)) {
             lua.pop(1);
-            log.warn("compact_v2 strategy: registry slot is not a function", .{});
+            log.warn("compact strategy: registry slot is not a function", .{});
             return;
         }
 
+        // Build the context table on the main stack. spawnCoroutineForCompact
+        // moves [fn, ctx] to the new thread via xMove.
         lua.newTable();
         lua.pushInteger(@intCast(req.tokens_used));
         lua.setField(-2, "tokens_used");
@@ -1977,84 +2070,46 @@ pub const LuaEngine = struct {
         try pushMessageSnapshot(lua, req.messages);
         lua.setField(-2, "messages");
 
-        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
-            const err_msg = lua.toString(-1) catch "<unprintable>";
-            log.warn("compact_v2 strategy raised: {s}", .{err_msg});
-            lua.pop(1);
+        if (self.async_runtime == null) {
+            // Legacy synchronous path for engines without an async
+            // runtime. Calls to zag.llm.complete from inside the
+            // strategy will fail; the strategy should handle that and
+            // return nil. Mirrors the fireHookSync fallback in fireHook.
+            lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+                const err_msg = lua.toString(-1) catch "<unprintable>";
+                log.warn("compact strategy raised: {s}", .{err_msg});
+                lua.pop(1);
+                return error.LuaHandlerError;
+            };
+            defer lua.pop(1);
+            req.outcome = decodeCompactStrategyReturn(lua, req.allocator) catch |err| blk: {
+                log.warn("compact strategy decode failed: {s}", .{@errorName(err)});
+                break :blk .use_default;
+            };
+            return;
+        }
+
+        const thread_ref = self.spawnCoroutineForCompact(1, null, req) catch |err| {
+            log.warn("compact strategy spawn failed: {s}", .{@errorName(err)});
+            // spawnCoroutineForCompact cleans up its own allocations on
+            // error; the [fn, ctx] pair was already moved off the main
+            // stack so nothing to pop here.
             return error.LuaHandlerError;
         };
-        defer lua.pop(1);
 
-        if (lua.isNil(-1)) {
-            req.outcome = .use_default;
-            return;
+        // Drain loop: pump completions until the task retires. resumeTask
+        // writes req.outcome on `.ok` before retire, so when the task
+        // exits self.tasks we know the outcome is final.
+        while (self.tasks.contains(thread_ref)) {
+            const runtime = self.async_runtime orelse unreachable;
+            if (runtime.completions.pop()) |job| {
+                try self.resumeFromJob(job);
+            } else {
+                // No completion available yet. 1ms idle matches fireHook's
+                // drain cadence (src/lua/hook_registry.zig:215).
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
         }
-        if (lua.typeOf(-1) != .table) {
-            log.warn(
-                "compact_v2 strategy returned non-table (type {s}); treating as use_default",
-                .{@tagName(lua.typeOf(-1))},
-            );
-            return;
-        }
-
-        // Detect signal fields first; they trump the messages array.
-        _ = lua.getField(-1, "cancel");
-        const want_cancel = lua.toBoolean(-1);
-        lua.pop(1);
-        if (want_cancel) {
-            req.outcome = .cancel;
-            return;
-        }
-
-        _ = lua.getField(-1, "use_default");
-        const want_default = lua.toBoolean(-1);
-        lua.pop(1);
-        if (want_default) {
-            req.outcome = .use_default;
-            return;
-        }
-
-        // Replacement path. The plugin may either set `messages = {...}`
-        // explicitly with an optional `summary = "..."`, OR pass a plain
-        // numerically-indexed array of messages directly. We probe for
-        // the named field first, then fall through to the array form.
-        _ = lua.getField(-1, "messages");
-        const has_messages_field = lua.typeOf(-1) == .table;
-        if (!has_messages_field) lua.pop(1);
-
-        const msg_table_idx: i32 = if (has_messages_field) -1 else -1;
-        // When `has_messages_field` is true the messages array sits at
-        // -1 (we just pushed via getField); otherwise the return table
-        // itself at -1 IS the array.
-        const len = lua.rawLen(msg_table_idx);
-
-        var collected: std.ArrayList(types.Message) = .empty;
-        errdefer {
-            for (collected.items) |m| m.deinit(req.allocator);
-            collected.deinit(req.allocator);
-        }
-        for (0..len) |idx| {
-            _ = lua.rawGetIndex(msg_table_idx, @intCast(idx + 1));
-            const msg = try decodeMessage(lua, req.allocator);
-            errdefer msg.deinit(req.allocator);
-            try collected.append(req.allocator, msg);
-            lua.pop(1);
-        }
-        if (has_messages_field) lua.pop(1); // pop the messages table
-
-        // Optional summary string.
-        var owned_summary: ?[]const u8 = null;
-        _ = lua.getField(-1, "summary");
-        if (lua.typeOf(-1) == .string) {
-            const raw = lua.toString(-1) catch "";
-            owned_summary = req.allocator.dupe(u8, raw) catch null;
-        }
-        lua.pop(1);
-
-        req.outcome = .{ .replace = .{
-            .messages = try collected.toOwnedSlice(req.allocator),
-            .summary = owned_summary,
-        } };
     }
 
     /// Test-only accessor for the compact strategy handler ref.
@@ -2663,8 +2718,33 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null);
+    }
+
+    /// Spawn variant that also accepts a `compact_request` pointer. The
+    /// strategy's return value is decoded into `req.outcome` during the
+    /// final `.ok` resume — see `decodeCompactStrategyReturn`. This is
+    /// the entry point `handleCompactRequest` uses; hook callers stay
+    /// on `spawnCoroutineTagged` which passes null.
+    fn spawnCoroutineForCompact(
+        self: *LuaEngine,
+        nargs: i32,
+        parent_scope: ?*async_scope.Scope,
+        req: *agent_events.CompactRequest,
+    ) !i32 {
+        return self.spawnCoroutineFull(nargs, parent_scope, null, req);
+    }
+
+    fn spawnCoroutineFull(
+        self: *LuaEngine,
+        nargs: i32,
+        parent_scope: ?*async_scope.Scope,
+        hook_payload: ?*Hooks.HookPayload,
+        compact_request: ?*agent_events.CompactRequest,
+    ) !i32 {
         // Init-once latch check: dwarfed by the `lua.newThread` + `Scope.init` allocations that follow on the same path, so no measurable hot-path cost.
         std.debug.assert(self.async_runtime != null); // initAsync must have run
+        std.debug.assert(hook_payload == null or compact_request == null); // mutually exclusive tags
 
         const parent = parent_scope orelse self.root_scope.?;
         const scope = try async_scope.Scope.init(self.allocator, parent);
@@ -2687,6 +2767,7 @@ pub const LuaEngine = struct {
             .thread_ref = thread_ref,
             .scope = scope,
             .hook_payload = hook_payload,
+            .compact_request = compact_request,
             .started_at_ms = if (hook_payload != null) std.time.milliTimestamp() else 0,
             .budget_ms = if (hook_payload != null) self.hook_dispatcher.hook_budget_ms else null,
         };
@@ -2730,6 +2811,20 @@ pub const LuaEngine = struct {
                             log.warn("hook return apply failed (kind={s}, task={d}): {}, discarding mutations", .{
                                 @tagName(hp.kind()), task.thread_ref, err,
                             });
+                        };
+                    }
+                } else if (task.compact_request) |req| {
+                    // Compact-strategy retire path. The strategy's return
+                    // value lives at the coroutine's stack top; decode
+                    // it into req.outcome before retire pops the slot.
+                    // Decode errors fail-soft to `.use_default` so the
+                    // agent loop's Zig fallback still runs.
+                    if (num_results >= 1) {
+                        req.outcome = decodeCompactStrategyReturn(task.co, req.allocator) catch |err| blk: {
+                            log.warn("compact strategy return decode failed (task={d}): {}", .{
+                                task.thread_ref, err,
+                            });
+                            break :blk .use_default;
                         };
                     }
                 }
@@ -10871,6 +10966,138 @@ test "zag.compact.default is a registered no-op returning nil" {
     try engine.handleCompactRequest(&req);
     try std.testing.expect(req.error_name == null);
     try std.testing.expect(req.outcome == .use_default);
+}
+
+// Stub provider for the compact-strategy-on-coroutine integration test.
+// Mirrors the call vtable that `zag.llm.complete`'s worker
+// (src/lua/primitives/llm.zig) invokes. Returns a single text block
+// with `response_text`.
+const StubCompactProvider = struct {
+    response_text: []const u8,
+
+    const vtable: @import("llm.zig").Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "stub_compact",
+    };
+
+    fn callImpl(
+        ptr: *anyopaque,
+        req: *const @import("llm.zig").Request,
+    ) @import("llm.zig").ProviderError!types.LlmResponse {
+        const self: *StubCompactProvider = @ptrCast(@alignCast(ptr));
+        const text = try req.allocator.dupe(u8, self.response_text);
+        errdefer req.allocator.free(text);
+        const blocks = try req.allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        return .{
+            .content = blocks,
+            .stop_reason = .end_turn,
+            .input_tokens = 1,
+            .output_tokens = @intCast(self.response_text.len),
+        };
+    }
+
+    fn callStreamingImpl(
+        _: *anyopaque,
+        _: *const @import("llm.zig").StreamRequest,
+    ) @import("llm.zig").ProviderError!types.LlmResponse {
+        unreachable; // Not used in the compact-coroutine test path.
+    }
+
+    fn provider(self: *StubCompactProvider) @import("llm.zig").Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "handleCompactRequest strategy can yield on zag.llm.complete" {
+    // The migration's payoff: a strategy that calls zag.llm.complete
+    // suspends its coroutine, the worker pool runs the LLM call, the
+    // main thread's drain loop in handleCompactRequest pumps the
+    // completion back, the strategy resumes with the response, and
+    // its structured return lands in req.outcome.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubCompactProvider{ .response_text = "STUB SUMMARY" };
+    const provider = stub.provider();
+    engine.current_provider = &provider;
+    engine.current_model_spec = .{ .provider_name = "stub", .model_id = "stub-1" };
+    defer {
+        engine.current_provider = null;
+        engine.current_model_spec = null;
+    }
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  local resp, err = zag.llm.complete({
+        \\    system = "summarize",
+        \\    messages = {{ role = "user", content = "history" }},
+        \\  })
+        \\  if not resp then
+        \\    return nil
+        \\  end
+        \\  return {
+        \\    messages = { { role = "user", content = {{ type = "text", text = resp.text }} } },
+        \\    summary = resp.text,
+        \\  }
+        \\end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try engine.handleCompactRequest(&req);
+
+    switch (req.outcome) {
+        .replace => |r| {
+            try std.testing.expectEqual(@as(usize, 1), r.messages.len);
+            try std.testing.expectEqualStrings(
+                "STUB SUMMARY",
+                r.messages[0].content[0].text.text,
+            );
+            try std.testing.expect(r.summary != null);
+            try std.testing.expectEqualStrings("STUB SUMMARY", r.summary.?);
+        },
+        else => return error.TestUnexpectedOutcome,
+    }
+}
+
+test "handleCompactRequest synchronous strategy still works without async runtime" {
+    // Strategies that don't call yielding primitives must still work
+    // when the engine has no async runtime (some tests, headless paths).
+    // The legacy protectedCall fallback in handleCompactRequest covers
+    // this case.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    // Deliberately NO initAsync — exercise the legacy path.
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  return {
+        \\    messages = { { role = "user", content = {{ type = "text", text = "sync ok" }} } },
+        \\  }
+        \\end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try engine.handleCompactRequest(&req);
+    switch (req.outcome) {
+        .replace => |r| try std.testing.expectEqualStrings("sync ok", r.messages[0].content[0].text.text),
+        else => return error.TestUnexpectedOutcome,
+    }
 }
 
 test "zag.loop.default treats a streak reset as a non-event" {
