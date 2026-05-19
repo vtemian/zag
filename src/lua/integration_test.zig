@@ -312,6 +312,23 @@ test "zag.sessions.current returns nil when no window manager is bound" {
     );
 }
 
+test "zag.pane.session_id returns nil when no window manager is bound" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Headless engine has no wm; the binding swallows the missing wm
+    // and an unknown handle string the same way so the sidebar can read
+    // after a pane-close race without crashing.
+    try runLua(&engine,
+        \\assert(type(zag.pane.session_id) == "function", "session_id missing")
+        \\assert(zag.pane.session_id("n9999") == nil,
+        \\       "expected nil for unknown handle on headless engine")
+    );
+}
+
 test "zag.sessions.subagents returns task_start rows for a session" {
     const allocator = testing.allocator;
 

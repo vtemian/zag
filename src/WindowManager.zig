@@ -5201,6 +5201,110 @@ test "zag.pane.replace_draft_range raises with helpful message on overflow" {
     try std.testing.expectEqual(MAX_DRAFT - 1, f.wm.root_pane.draft_len);
 }
 
+test "zag.pane.session_id returns the bound session id for a conversation pane" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+
+    // The PickerFixture's root_pane is conversation-backed but
+    // session-less. Attach a real SessionHandle pointing at a temp
+    // JSONL file so the binding has something to read.
+    std.fs.cwd().makePath(".zag/sessions") catch {};
+    const session_id = "panebind_test_0123456789abcdef0";
+    var jsonl_path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
+    defer std.fs.cwd().deleteFile(jsonl_path) catch {};
+    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    var handle = Session.SessionHandle{
+        .id_len = @intCast(session_id.len),
+        .file = file,
+        .meta = .{},
+        .allocator = allocator,
+    };
+    @memcpy(handle.id[0..session_id.len], session_id);
+    defer handle.close();
+    f.conversation.session_handle = &handle;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.sid = zag.pane.session_id("{s}")
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("sid");
+    defer engine.lua.pop(1);
+    try std.testing.expectEqualStrings(session_id, try engine.lua.toString(-1));
+}
+
+test "zag.pane.session_id returns nil for a session-less conversation pane" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+
+    // PickerFixture's root_pane conversation has session_handle = null
+    // (scratch-equivalent for this binding's lookup chain). The sidebar
+    // never highlights a row for a session-less pane. The assert lives
+    // inside Lua because `getGlobal` raises on nil slots (so reading
+    // `_G.sid` back to Zig and checking isNil would always fail).
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    const root_handle = try f.wm.handleForNode(f.layout.root.?);
+    const pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(pane_id);
+
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\local sid = zag.pane.session_id("{s}")
+        \\assert(sid == nil, "expected nil for session-less pane, got " .. tostring(sid))
+    , .{pane_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+}
+
+test "zag.pane.session_id returns nil for an unknown handle string" {
+    const allocator = std.testing.allocator;
+    var f: PickerFixture = undefined;
+    try buildPickerFixture(allocator, &f);
+    defer f.deinit();
+    var test_viewport: Viewport = .{};
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.conversation.buf(), .view = f.conversation.view(), .viewport = &test_viewport });
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    // `n9999` is well-formed but not registered; the binding must not
+    // raise so a sidebar reading after a pane-close race remains safe.
+    try engine.lua.doString(
+        \\local sid = zag.pane.session_id("n9999")
+        \\assert(sid == nil, "expected nil for unknown handle, got " .. tostring(sid))
+    );
+}
+
 test "PaneDraftChange fires on root pane draft mutation" {
     const allocator = std.testing.allocator;
     var f: PickerFixture = undefined;

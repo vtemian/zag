@@ -1019,6 +1019,54 @@ fn zagPaneReplaceDraftRangeFn(lua: *Lua) i32 {
     return 0;
 }
 
+/// `zag.pane.session_id(pane_id)`: return the session id (string) the
+/// pane's conversation is bound to, or `nil` when the pane has no
+/// conversation (scratch buffer), no session handle, or the handle
+/// string does not resolve to a live pane. Mirrors the
+/// `zag.sessions.current()` chain but lets the sidebar look up a
+/// specific pane after a `PaneFocused` hook rather than always reading
+/// the live focused pane.
+///
+/// Stale/unknown handles return nil rather than raising so callers
+/// reading after a focus change remain resilient to a pane that has
+/// already been closed mid-event.
+fn zagPaneSessionIdFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.pushNil();
+        return 1;
+    };
+
+    // Lenient parse: the sidebar may call us with whatever handle the
+    // PaneFocused event carried, and that pane may have already been
+    // closed. Treat malformed/stale strings the same as "no session
+    // here" rather than raising on the caller.
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.pane.session_id: id must be a string", .{});
+    }
+    const id = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.pane.session_id: id must be a string", .{});
+    };
+    const handle = NodeRegistry.parseId(id) catch {
+        lua.pushNil();
+        return 1;
+    };
+    const pane = wm.paneFromHandle(handle) catch {
+        lua.pushNil();
+        return 1;
+    };
+    const conv = pane.conversation orelse {
+        lua.pushNil();
+        return 1;
+    };
+    const sh = conv.session_handle orelse {
+        lua.pushNil();
+        return 1;
+    };
+    _ = lua.pushString(sh.id[0..sh.id_len]);
+    return 1;
+}
+
 /// Register the `zag.layout` subtable. Caller has the `zag` table at
 /// stack top; on return the `zag` table is still at stack top with
 /// `layout` attached. Mirrors the original registration order from
@@ -1063,5 +1111,7 @@ pub fn registerPaneTable(lua: *Lua) void {
     lua.setField(-2, "get_draft");
     lua.pushFunction(zlua.wrap(zagPaneReplaceDraftRangeFn));
     lua.setField(-2, "replace_draft_range");
+    lua.pushFunction(zlua.wrap(zagPaneSessionIdFn));
+    lua.setField(-2, "session_id");
     lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
 }
