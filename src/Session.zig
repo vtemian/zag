@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
+const ProjectRegistry = @import("project_registry.zig");
 
 const Session = @This();
 
@@ -210,6 +211,35 @@ pub const Meta = struct {
     }
 };
 
+/// Resolve `$HOME/.config/zag` and register the current cwd in the global
+/// project registry. Mirrors `auth_wizard.buildPaths`'s resolution rule
+/// (HOME plus `.config/zag`) so the sidebar agrees with auth.json on
+/// where the per-user config directory lives.
+///
+/// The cwd is canonicalized with `realpath` before insertion so the same
+/// project reached via a symlink alias or with a trailing slash collapses
+/// to a single registry entry; if realpath fails (e.g. the cwd was
+/// removed between getCwdAlloc and realpathAlloc, rare but possible) the
+/// raw cwd string is used as a fallback rather than abandoning the call.
+fn recordCwdInRegistry(allocator: Allocator) !void {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+
+    const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zag" });
+    defer allocator.free(config_dir);
+
+    const raw_cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(raw_cwd);
+
+    const canonical_cwd = std.fs.realpathAlloc(allocator, raw_cwd) catch raw_cwd;
+    defer if (canonical_cwd.ptr != raw_cwd.ptr) allocator.free(canonical_cwd);
+
+    var registry = try ProjectRegistry.init(allocator, config_dir);
+    defer registry.deinit();
+
+    try registry.register(canonical_cwd, std.time.milliTimestamp());
+}
+
 /// Manages session creation, loading, and listing.
 pub const SessionManager = struct {
     /// Allocator for temporary operations (directory iteration, sorting).
@@ -222,6 +252,16 @@ pub const SessionManager = struct {
             log.err("failed to create sessions dir: {}", .{e});
             return e;
         };
+
+        // Best-effort: record this cwd in the global project registry so
+        // the sessions sidebar can aggregate runs across every project
+        // zag has ever been launched in. A bad HOME, missing config dir,
+        // permission denied, or a malformed registry must not prevent
+        // session bring-up: log and continue.
+        recordCwdInRegistry(allocator) catch |e| {
+            log.warn("project_registry update skipped: {s}", .{@errorName(e)});
+        };
+
         return .{ .allocator = allocator };
     }
 
@@ -2596,4 +2636,93 @@ test "SessionManager.deleteSession rejects ids that try to escape the sessions d
     try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession("../etc/passwd"));
     try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession("foo/bar"));
     try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession(""));
+}
+
+test "SessionManager.init records cwd in the global project registry" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    // Point the registry at a per-test home. SessionManager.init resolves
+    // the registry path as `$HOME/.config/zag/projects.json`, so swapping
+    // HOME for the duration of the test isolates the registry from the
+    // developer's real ~/.config/zag and from other tests.
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try SessionManager.init(allocator);
+    _ = &mgr;
+
+    // The registry file must exist at the expected path and contain the
+    // realpath'd cwd we just chdir'd into.
+    const registry_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/projects.json", .{fake_home});
+    defer allocator.free(registry_path);
+
+    const data = try std.fs.cwd().readFileAlloc(allocator, registry_path, 64 * 1024);
+    defer allocator.free(data);
+
+    // The cwd recorded in the registry is the canonicalized one. macOS
+    // tmpDir paths land under /private/var/..., and `tmp.dir.setAsCwd()`
+    // followed by `realpathAlloc(".")` returns that canonical form, so
+    // the registry entry must match `fake_home` byte-for-byte.
+    try std.testing.expect(std.mem.indexOf(u8, data, fake_home) != null);
+}
+
+test "SessionManager.init succeeds when HOME is unset" {
+    // A missing HOME must not prevent SessionManager.init from
+    // succeeding: the sidebar feature is best effort, session creation
+    // is not. The registry call hits error.EnvironmentVariableNotFound
+    // and is swallowed.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+
+    _ = unsetenv("HOME");
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try SessionManager.init(allocator);
+    _ = &mgr;
+}
+
+// `setenv(3)` / `unsetenv(3)` are POSIX. Zig 0.15's std does not expose a
+// portable `setEnvVar`, so tests reach for the C entry points directly.
+// This is test-only; production code reads HOME via `getEnvVarOwned`.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
+    var value_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (value.len + 1 > value_buf.len) return;
+    @memcpy(value_buf[0..value.len], value);
+    value_buf[value.len] = 0;
+    _ = setenv(name.ptr, value_buf[0..value.len :0].ptr, 1);
+}
+
+fn restoreEnvForTest(name: [:0]const u8, prev: ?[]const u8) void {
+    if (prev) |p| {
+        setEnvForTest(name, p);
+    } else {
+        _ = unsetenv(name.ptr);
+    }
 }
