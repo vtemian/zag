@@ -137,6 +137,7 @@ Plugin modules load from `~/.config/zag/lua/?.lua` via `require()`.
 - Don't use runtime dispatch when comptime selection works
 - Don't skip `errdefer`. Every allocation in an init chain needs cleanup on failure
 - Don't put type names in variable names (`model_str`, `perf_buf`, `err_buf`, `provider_result`). Name by domain role, not storage type. The type system carries type info; names carry semantic info.
+- Don't mock LLM providers. The simulator (`src/sim/`) drives `zag` end-to-end against the user's real configured provider; `.zsm` scenarios cost real tokens and we want it that way. Local socket fixtures for testing pure protocol code (OAuth issuer, sink event order) are fine and not LLM mocks.
 
 ## Architecture
 ```
@@ -248,22 +249,20 @@ src/
       http.zig               zag.http one-shot request primitive
       http_stream.zig        zag.http.stream chunked-body primitive
 
-  sim/                       TUI simulator: scripted mock-server runs
+  sim/                       TUI simulator: real-provider scenario runs
     main.zig                 zag-sim entry point
     Args.zig                 CLI argument parser
     Artifacts.zig            run output layout (logs, transcripts, replays)
-    ConfigScaffold.zig       generated config.lua / auth.json for sim runs
     Dsl.zig                  scenario DSL parser (zsm files)
     Grid.zig                 PTY grid snapshot diffing
-    MockScript.zig           recorded provider responses
-    MockServer.zig            local HTTP server replaying mock scripts
     Pty.zig                  PTY spawn and IO
-    Replay.zig               replay-gen subcommand (record real run to scenario)
+    Replay.zig               replay-gen subcommand (session JSONL to scenario)
     Runner.zig               scenario executor
     Scenario.zig             parsed scenario representation
     Spawn.zig                zag binary launcher under PTY
     Summary.zig              pass/fail summary writer
     phase1_e2e_test.zig      end-to-end smoke test
+    scenarios/               .zsm scenarios hitting the user's real provider
 ```
 
 ## Commit messages

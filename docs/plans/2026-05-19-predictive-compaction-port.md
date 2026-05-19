@@ -433,7 +433,7 @@ When `tokens_max == 0` (model registry missing `context_window`), log a one-time
 **Manual dogfood:**
 - After each phase: run `zig build run` in this repo, paste a 50k-token blob, observe whether the next turn either compacts or refuses cleanly.
 
-**No mocks for the LLM call** (per project CLAUDE.md: "NEVER implement mocks in end to end tests"). Use the existing `Harness.zig` headless path or the `sim/` mock-server fixtures.
+**No mocks for the LLM call** (per project CLAUDE.md). Use the existing `Harness.zig` headless path or write a real-provider `.zsm` scenario under `src/sim/scenarios/`.
 
 ---
 

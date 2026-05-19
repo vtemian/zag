@@ -1,0 +1,16 @@
+# `zag --last` re-renders the most recent session. This scenario is
+# best-effort: it assumes a recent prior session exists in
+# ~/.local/share/zag/sessions/. The most reliable way to use it is to
+# run `slash_quit.zsm` or any other scenario first, then run this one
+# back-to-back so the prior session is the freshest on disk.
+#
+# We anchor on the welcome banner being absent (resume mode skips it)
+# and on the presence of some prior-turn artifact in the grid. The
+# `wait_text />/` line is a weak signal that the prompt is ready; if
+# zag's prompt glyph changes, update this.
+
+spawn ./zig-out/bin/zag --last
+wait_idle 2s
+snapshot resumed
+send "/quit" <Enter>
+wait_exit

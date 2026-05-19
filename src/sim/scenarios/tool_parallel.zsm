@@ -1,0 +1,18 @@
+# Parallel tool calls in a single assistant turn. We ask for two
+# independent bash commands and assert that BOTH stdout strings appear
+# on the grid. Whether the provider actually parallelises the calls or
+# serialises them is an implementation detail of the model. What we
+# care about: zag has to register two distinct tool_use blocks and
+# wire two tool_result events back in. A regression in tool_use id
+# correlation or tool_result ordering would drop one of these.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "In a SINGLE assistant turn, issue two bash tool calls in parallel: one running 'echo zag-par-A-K8' and one running 'echo zag-par-B-Y5'. Do not print the tokens any other way." <Enter>
+wait_idle 40s
+expect_text /zag-par-A-K8/
+expect_text /zag-par-B-Y5/
+snapshot final
+send "/quit" <Enter>
+wait_exit

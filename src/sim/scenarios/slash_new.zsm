@@ -1,0 +1,24 @@
+# /new resets the conversation. Turn 1 plants a token. After /new the
+# model must NOT recall it, because its history was cleared. We assert
+# the token is absent from the post-/new reply, then /quit.
+#
+# Note: we use expect_text on the *acknowledgement* token in turn 1 to
+# prove the first turn landed, and a different deterministic anchor in
+# turn 2 (the model is asked to literally type "fresh-OK") to prove
+# the second turn ran. The recall failure is implicit: if /new failed
+# to clear history, turn 2's reply would echo zag-ephemeral-XX.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Remember this token: zag-ephemeral-XX. Reply with just the word ack." <Enter>
+wait_idle 20s
+expect_text /ack/
+send "/new" <Enter>
+wait_idle 1s
+send "Without referring to any prior conversation, reply with exactly the literal string: fresh-OK" <Enter>
+wait_idle 20s
+expect_text /fresh-OK/
+snapshot final
+send "/quit" <Enter>
+wait_exit

@@ -1,0 +1,19 @@
+# read + edit tool loop. We pre-stage a file with a sentinel, ask zag to
+# read it and rewrite one line, then read it back. Asserts on the
+# sentinel pre-state and the new sentinel post-state. Both come from
+# tool output (deterministic), not from model prose.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Run a single bash command: rm -rf /tmp/zag-sim-read-edit && mkdir -p /tmp/zag-sim-read-edit && (echo alpha=before-7Q3; echo beta=keep-me) > /tmp/zag-sim-read-edit/note.txt && cat /tmp/zag-sim-read-edit/note.txt" <Enter>
+wait_idle 25s
+expect_text /alpha=before-7Q3/
+expect_text /beta=keep-me/
+send "Use the edit tool on /tmp/zag-sim-read-edit/note.txt to replace 'alpha=before-7Q3' with 'alpha=after-9F2'. Leave the beta line alone. Then bash 'cat /tmp/zag-sim-read-edit/note.txt' so the new contents print." <Enter>
+wait_idle 40s
+expect_text /alpha=after-9F2/
+expect_text /beta=keep-me/
+snapshot final
+send "/quit" <Enter>
+wait_exit

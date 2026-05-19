@@ -1,0 +1,9 @@
+# Cheapest scenario in the suite: spawn zag, /quit, watch it exit
+# cleanly. Spends zero LLM tokens. Catches regressions in startup,
+# config load, modal input, command registry, and the shutdown path.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "/quit" <Enter>
+wait_exit

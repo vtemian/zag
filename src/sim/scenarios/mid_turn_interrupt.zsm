@@ -1,0 +1,21 @@
+# Mid-turn ESC cancel and recovery. We send a deliberately long-running
+# prompt, ESC before it finishes streaming, then issue a different,
+# trivial bash tool call. The second turn proves the agent loop
+# recovered: a regression in the cancel + reminder-queue path would
+# either leave the second prompt unsent or trip up the streaming
+# state machine.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Write a 500-word essay about the history of pseudo-terminals on UNIX. Be thorough." <Enter>
+# Let the model start streaming a bit, then yank it.
+wait_idle 4s
+send <Esc>
+wait_idle 1s
+send "Forget that. Just run bash 'echo zag-recover-token-T7'." <Enter>
+wait_idle 25s
+expect_text /zag-recover-token-T7/
+snapshot final
+send "/quit" <Enter>
+wait_exit

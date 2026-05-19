@@ -1,0 +1,15 @@
+# Same tool reused several times in one conversation. Catches
+# regressions where the second or third call to the same tool drops
+# its tool_use_id, double-frees, or hits a registry caching bug.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Make three SEPARATE bash tool calls (not chained with && or ;): first 'echo zag-seq-1-A2', then 'echo zag-seq-2-B4', then 'echo zag-seq-3-C6'. They can be in one turn or spread across turns, but each must be its own tool call." <Enter>
+wait_idle 60s
+expect_text /zag-seq-1-A2/
+expect_text /zag-seq-2-B4/
+expect_text /zag-seq-3-C6/
+snapshot final
+send "/quit" <Enter>
+wait_exit
