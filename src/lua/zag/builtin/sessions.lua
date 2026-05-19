@@ -68,13 +68,21 @@ function M.open()
     state.buffer_id = buffer_id
 
     -- side = "first" anchors the new pane on the left; the host pane
-    -- becomes the right child of the freshly-created split. ratio = 0.2
-    -- gives the sidebar roughly 20% of the available width; Task 8.2
-    -- will refine this to a column-count based ratio.
+    -- becomes the right child of the freshly-created split. Size the
+    -- sidebar to roughly 30 cells regardless of terminal width and
+    -- clamp into [0.1, 0.4] so a pathologically narrow terminal can't
+    -- collapse the sidebar to 0 cells and a very wide terminal can't
+    -- let it dominate the layout. The `cols or 100` fallback keeps the
+    -- division safe if a future binding regression strips the field.
+    local cols = tree.cols or 100
+    local target_cells = 30
+    local ratio = target_cells / cols
+    if ratio < 0.1 then ratio = 0.1 end
+    if ratio > 0.4 then ratio = 0.4 end
     local pane_id = zag.layout.split(host, "vertical", {
         buffer = buffer_id,
         side = "first",
-        ratio = 0.2,
+        ratio = ratio,
     })
     state.pane_id = pane_id
 
