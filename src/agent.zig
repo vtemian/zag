@@ -953,6 +953,114 @@ pub fn fireLoopDetect(
     return out;
 }
 
+/// Conservative char-based token estimate for one message. Mirrors
+/// pi-mono's per-role heuristic (~4 chars per token, rounded up) so the
+/// agent can predict the next request's size *before* sending it. Used
+/// only by the compaction trigger; provider-reported `Usage` remains the
+/// source of truth for telemetry and cost.
+///
+/// Counts every char-bearing field on every `ContentBlock` variant:
+/// text body, tool_use name + raw JSON args, tool_result content,
+/// thinking text, redacted_thinking ciphertext. Role doesn't matter —
+/// the work happens at the block level. New variants land as compile
+/// errors until added here.
+pub fn estimateMessageTokens(msg: types.Message) u32 {
+    var chars: usize = 0;
+    for (msg.content) |block| {
+        chars += switch (block) {
+            .text => |t| t.text.len,
+            .tool_use => |tu| tu.name.len + tu.input_raw.len,
+            .tool_result => |tr| tr.content.len,
+            .thinking => |t| t.text.len,
+            .redacted_thinking => |r| r.data.len,
+        };
+    }
+    const tokens = (chars + 3) / 4;
+    return @intCast(tokens);
+}
+
+test "estimateMessageTokens text block counts ceil(chars/4)" {
+    const blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "abcdefgh" } }, // 8 chars -> 2 tokens
+    };
+    const msg: types.Message = .{ .role = .user, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 2), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens empty message returns zero" {
+    const msg: types.Message = .{ .role = .user, .content = &[_]types.ContentBlock{} };
+    try std.testing.expectEqual(@as(u32, 0), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens rounds up partial tokens" {
+    const blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "abcde" } }, // 5 chars -> ceil(5/4) = 2 tokens
+    };
+    const msg: types.Message = .{ .role = .assistant, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 2), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens tool_use counts name + input_raw" {
+    const blocks = [_]types.ContentBlock{
+        .{
+            .tool_use = .{
+                .id = "call_1",
+                .name = "read", // 4 chars
+                .input_raw = "{\"path\":\"a.zig\"}", // 16 chars
+            },
+        },
+    };
+    // Total 20 chars -> 5 tokens. id is NOT counted (provider-internal).
+    const msg: types.Message = .{ .role = .assistant, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 5), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens tool_result counts content only" {
+    var big: [1000]u8 = undefined;
+    @memset(&big, 'x');
+    const blocks = [_]types.ContentBlock{
+        .{ .tool_result = .{
+            .tool_use_id = "call_1",
+            .content = &big,
+            .is_error = false,
+        } },
+    };
+    const msg: types.Message = .{ .role = .user, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 250), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens thinking counts text only" {
+    const blocks = [_]types.ContentBlock{
+        .{
+            .thinking = .{
+                .text = "x" ** 100, // 100 chars -> 25 tokens
+                .signature = "sig_data_not_counted",
+                .provider = .anthropic,
+            },
+        },
+    };
+    const msg: types.Message = .{ .role = .assistant, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 25), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens redacted_thinking counts ciphertext" {
+    const blocks = [_]types.ContentBlock{
+        .{ .redacted_thinking = .{ .data = "x" ** 40 } },
+    };
+    const msg: types.Message = .{ .role = .assistant, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 10), estimateMessageTokens(msg));
+}
+
+test "estimateMessageTokens sums multi-block message" {
+    const blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "1234" } }, // 4
+        .{ .tool_use = .{ .id = "x", .name = "ab", .input_raw = "cd" } }, // 4
+    };
+    // 4 + 4 = 8 chars -> 2 tokens
+    const msg: types.Message = .{ .role = .assistant, .content = &blocks };
+    try std.testing.expectEqual(@as(u32, 2), estimateMessageTokens(msg));
+}
+
 /// Fire `zag.compact.strategy` at the top of the next iteration when
 /// the running token estimate crosses the 80% high-water mark of the
 /// model's context window. Returns the replacement message slice
