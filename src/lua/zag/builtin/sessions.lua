@@ -200,12 +200,62 @@ function M._jump_last()
     M._render()
 end
 
+-- Best-effort extraction of a short prompt snippet from a subagent
+-- task_start's raw JSON tool_input. We have no Lua-side JSON decoder,
+-- so we pull the `prompt` field with a Lua pattern. If the pattern
+-- fails (malformed JSON, prompt absent, JSON-escaped quotes inside the
+-- value), we fall back to the raw JSON. Either way the result is
+-- truncated to `max_chars` graphemes-approximated-as-bytes; that's
+-- close enough for an ASCII-dominant prompt and avoids a width.lua
+-- dependency for a 40-char label.
+local function _short_prompt(tool_input, max_chars)
+    local raw = tool_input or ""
+    -- Match `"prompt"` (optional whitespace) `:` (optional whitespace)
+    -- then a quoted string with no embedded escaped quotes. Sufficient
+    -- for the vast majority of task_start payloads; on failure we fall
+    -- back to the raw blob.
+    local snippet = raw:match('"prompt"%s*:%s*"([^"]+)"') or raw
+    if #snippet > max_chars then
+        snippet = snippet:sub(1, max_chars) .. "…"
+    end
+    return snippet
+end
+
+-- Pull subagent child rows for an expanded session. Returns an array
+-- of subagent rows in arrival order. Defensive: the binding can fail
+-- (project rm-rf'd between list and read, malformed JSONL), in which
+-- case we log and return an empty list so the parent session row
+-- still renders. Returns nil-safe: an empty result is `{}` not nil.
+local function _collect_subagents(session)
+    local ok, subs = pcall(zag.sessions.subagents, session.id, session.project)
+    if not ok then
+        zag.log.warn("sessions sidebar: subagents(%s) failed: %s",
+            tostring(session.id), tostring(subs))
+        return {}
+    end
+    subs = subs or {}
+    local rows = {}
+    for _, sub in ipairs(subs) do
+        table.insert(rows, {
+            kind = "subagent",
+            session_id = session.id,
+            project = session.project,
+            call_id = sub.call_id,
+            depth = 1,
+            label = "  └ " .. _short_prompt(sub.tool_input, 40),
+        })
+    end
+    return rows
+end
+
 -- Walk the registered sessions and return an array of row tables.
 -- Each row carries the data the keymap dispatcher (Task 4.2) needs to
--- act on the cursor's current line, plus the rendered label. Phase 5
--- adds expanded-subagent rows; today we surface only the session
--- header even when state.expanded[id] is set, so the ▾ glyph is the
--- only visible affordance for the upcoming expansion.
+-- act on the cursor's current line, plus the rendered label. When a
+-- session row has state.expanded[id] truthy, the iterator emits one
+-- indented child row per subagent task_start entry directly after the
+-- parent. The substring filter intentionally narrows on session names
+-- only — child rows under a matching parent are always shown, never
+-- filtered themselves. Keeps the filter cognitively simple.
 function M._collect_rows()
     local rows = {}
     local sessions = zag.sessions.list()
@@ -223,6 +273,11 @@ function M._collect_rows()
                 depth = 0,
                 label = glyph .. " " .. display,
             })
+            if state.expanded[s.id] then
+                for _, child in ipairs(_collect_subagents(s)) do
+                    table.insert(rows, child)
+                end
+            end
         end
     end
     return rows

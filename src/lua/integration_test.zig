@@ -1016,6 +1016,111 @@ test "sessions sidebar refreshes on PaneFocused only when sidebar is the target"
     );
 }
 
+// Task 5.1 (sidebar half): when a session row is expanded, the rows
+// iterator emits an indented child row per subagent task_start entry.
+// Collapsing drops them back. The filter (Task 4.1) intentionally
+// applies only to session names, never to child rows under an expanded
+// parent, so we don't even exercise it here — that decision is
+// documented in `_collect_rows`.
+test "sessions sidebar renders subagent children under an expanded session" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h = try mgr.createSession("test-model");
+    const sid = try allocator.dupe(u8, h.id[0..h.id_len]);
+    defer allocator.free(sid);
+    // Synthetic task_start: same shape Task.zig writes when a subagent
+    // is spawned — a JSON blob with at least a `prompt` field.
+    _ = try h.appendEntry(.{
+        .entry_type = .task_start,
+        .content = "{\"agent\":\"general\",\"prompt\":\"investigate the foo bar baz issue thoroughly\"}",
+        .timestamp = 1000,
+    });
+    h.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(sid);
+    engine.lua.setGlobal("_test_sid");
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\-- Collapsed: only the session row is rendered.
+        \\assert(#st.last_render == 1,
+        \\       "expected 1 row collapsed, got " .. tostring(#st.last_render))
+        \\assert(st.last_render[1].kind == "session",
+        \\       "first row should be session, got " .. tostring(st.last_render[1].kind))
+        \\
+        \\-- Expand the session and re-render.
+        \\st.expanded[_test_sid] = true
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\assert(#st.last_render == 2,
+        \\       "expected 2 rows expanded, got " .. tostring(#st.last_render))
+        \\local child = st.last_render[2]
+        \\assert(child.kind == "subagent",
+        \\       "second row should be subagent, got " .. tostring(child.kind))
+        \\assert(child.depth == 1,
+        \\       "child depth should be 1, got " .. tostring(child.depth))
+        \\assert(child.session_id == _test_sid,
+        \\       "child should carry parent session_id")
+        \\assert(type(child.call_id) == "string" and #child.call_id == 26,
+        \\       "child.call_id should be a 26-char ULID")
+        \\assert(child.label:find("└", 1, true) ~= nil,
+        \\       "child label should contain the └ glyph, got " .. tostring(child.label))
+        \\-- The prompt snippet should land in the label (we don't pin the
+        \\-- exact ellipsis position; just confirm a prefix of the prompt is there).
+        \\assert(child.label:find("investigate", 1, true) ~= nil,
+        \\       "child label should contain prompt prefix, got " .. tostring(child.label))
+        \\
+        \\-- Collapse back: rows iterator drops the child.
+        \\st.expanded[_test_sid] = nil
+        \\sidebar._set_filter_for_test("")
+        \\assert(#st.last_render == 1,
+        \\       "expected 1 row after collapse, got " .. tostring(#st.last_render))
+        \\
+        \\-- _expand/_collapse/_activate must guard against non-session
+        \\-- rows: cursor parked on a subagent row should be a no-op.
+        \\st.expanded[_test_sid] = true
+        \\sidebar._set_filter_for_test("")
+        \\st.cursor_row = 2 -- subagent row
+        \\local ok_e = pcall(sidebar._expand)
+        \\assert(ok_e, "_expand on subagent must not raise")
+        \\local ok_c = pcall(sidebar._collapse)
+        \\assert(ok_c, "_collapse on subagent must not raise")
+        \\-- Subagent row's parent still expanded; nothing flipped.
+        \\assert(st.expanded[_test_sid] == true,
+        \\       "_collapse on a subagent row must not collapse the parent")
+        \\local ok_a = pcall(sidebar._activate)
+        \\assert(ok_a, "_activate on subagent must not raise")
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
