@@ -657,6 +657,15 @@ fn serviceRoundTripEvent(
             req.done.set();
             return true;
         },
+        .compact_request_v2 => |req| {
+            if (engine) |eng| {
+                eng.handleCompactRequestV2(req) catch |err| {
+                    req.error_name = @errorName(err);
+                };
+            }
+            req.done.set();
+            return true;
+        },
         else => return false,
     }
 }
@@ -704,7 +713,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 18) {
+    if (variant_count != 19) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -763,6 +772,10 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
                 r.done.set();
             },
             .compact_request => |r| {
+                r.error_name = "drained_during_shutdown";
+                r.done.set();
+            },
+            .compact_request_v2 => |r| {
                 r.error_name = "drained_during_shutdown";
                 r.done.set();
             },
@@ -1015,6 +1028,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         .tool_gate_request,
         .loop_detect_request,
         .compact_request,
+        .compact_request_v2,
         => unreachable,
     }
 }

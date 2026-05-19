@@ -366,6 +366,10 @@ fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
+                .compact_request_v2 => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
                 .thinking_stop, .done, .reset_assistant_text => {},
             }
         }

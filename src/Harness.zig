@@ -681,6 +681,10 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     req.error_name = "drained_without_dispatch";
                     req.done.set();
                 },
+                .compact_request_v2 => |req| {
+                    req.error_name = "drained_without_dispatch";
+                    req.done.set();
+                },
             }
         }
     }

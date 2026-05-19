@@ -202,7 +202,7 @@ pub fn runLoopStreaming(
         // estimate still leaves more than `reserve_tokens` of room.
         // See `fireCompact` for the full no-op ladder.
         const reserve_tokens = if (lua_engine) |e| e.compact_reserve_tokens else DEFAULT_RESERVE_TOKENS;
-        if (try fireCompact(
+        const compact_outcome = try fireCompactUnified(
             lua_engine,
             messages.items,
             last_usage_anchor,
@@ -212,25 +212,37 @@ pub fn runLoopStreaming(
             allocator,
             queue,
             cancel,
-        )) |replacement| {
-            try installCompactReplacement(messages, allocator, replacement);
-            // Compaction rewrote history; invalidate the usage anchor.
-            // The provider's last usage report described the pre-compact
-            // conversation and no longer maps onto the new shape, so the
-            // next iteration must walk from scratch (anchor=null → char
-            // heuristic across all retained messages).
-            last_usage_anchor = null;
-            last_usage_index = null;
+        );
+        var compaction_was_cancelled = false;
+        switch (compact_outcome) {
+            .skipped => {},
+            .cancelled => {
+                // v2 strategy explicitly opted out; skip Zig default
+                // summarization and drop-oldest below. Pre-flight cap
+                // still catches outright overflows.
+                compaction_was_cancelled = true;
+            },
+            .replaced => |replacement| {
+                try installCompactReplacement(messages, allocator, replacement);
+                // Compaction rewrote history; invalidate the usage anchor.
+                // The provider's last usage report described the
+                // pre-compact conversation and no longer maps onto the
+                // new shape, so the next iteration must walk from scratch.
+                last_usage_anchor = null;
+                last_usage_index = null;
+            },
         }
 
         // Pre-flight cap with three-stage fallback. The Lua strategy may
         // have declined or shrunk less than needed. Try Zig-side
         // structured summarization next; only fall back to drop-oldest
         // when the summarizer itself fails (network/auth/etc.). Refuse
-        // the turn only when even the trimmed history overflows.
+        // the turn only when even the trimmed history overflows. v2
+        // `.cancel` opts out of stages 2 and 3 but the pre-flight refuse
+        // still applies so an overflow can't escape.
         if (model_spec.context_window > 0) {
             var post = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
-            if (post.total > model_spec.context_window) {
+            if (post.total > model_spec.context_window and !compaction_was_cancelled) {
                 // Stage 2: Zig-default structured summarization. Synchronous
                 // provider.call on the agent thread; the user is already
                 // waiting on the next turn, so blocking briefly here is OK.
@@ -261,7 +273,7 @@ pub fn runLoopStreaming(
                     );
                 }
             }
-            if (post.total > model_spec.context_window) {
+            if (post.total > model_spec.context_window and !compaction_was_cancelled) {
                 // Stage 3: drop-oldest. Lossy but deterministic.
                 const budget: u32 = if (model_spec.context_window > reserve_tokens)
                     model_spec.context_window - reserve_tokens
@@ -278,13 +290,17 @@ pub fn runLoopStreaming(
                     last_usage_index = null;
                     post = estimateContextTokens(messages.items, null, null);
                 }
-                if (post.total > model_spec.context_window) {
-                    log.err(
-                        "context overflow: estimated {d} tokens still exceeds model window {d} after every fallback; refusing to send",
-                        .{ post.total, model_spec.context_window },
-                    );
-                    return error.ContextWindowExceeded;
-                }
+            }
+            if (post.total > model_spec.context_window) {
+                log.err(
+                    "context overflow: estimated {d} tokens still exceeds model window {d}{s}; refusing to send",
+                    .{
+                        post.total,
+                        model_spec.context_window,
+                        if (compaction_was_cancelled) " (strategy_v2 cancelled fallbacks)" else " after every fallback",
+                    },
+                );
+                return error.ContextWindowExceeded;
             }
         }
 
@@ -440,6 +456,7 @@ fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
         agent_events.ToolTransformRequest => .{ .tool_transform_request = req },
         agent_events.LoopDetectRequest => .{ .loop_detect_request = req },
         agent_events.CompactRequest => .{ .compact_request = req },
+        agent_events.CompactRequestV2 => .{ .compact_request_v2 = req },
         else => @compileError("marshalRequest does not handle " ++ @typeName(T)),
     };
 }
@@ -1496,6 +1513,125 @@ test "findCutPoint snaps forward past invalid tool_use/tool_result boundary" {
     // idx 3 (first valid kept index).
     const cut = findCutPoint(&msgs, 5);
     try std.testing.expectEqual(@as(usize, 3), cut.first_kept);
+}
+
+/// Outcome of a unified compaction round-trip (v1 or v2). The agent
+/// loop interprets each variant after-the-fact:
+///   - `.skipped`: no trigger fired, or v1 strategy returned nil, or
+///     v2 returned `{use_default = true}`. Fall through to the Zig
+///     default summarization fallback chain.
+///   - `.cancelled`: v2 explicitly opted out via `{cancel = true}`.
+///     Skip the Zig fallback and drop-oldest stages; the pre-flight
+///     cap still refuses outright overflows.
+///   - `.replaced`: history was rewritten in place; the agent loop
+///     invalidates `last_usage_anchor` because the previous Usage
+///     report no longer maps onto the new history shape.
+pub const CompactionFireOutcome = union(enum) {
+    skipped,
+    cancelled,
+    replaced: []types.Message,
+};
+
+/// Unified entry point that prefers the v2 strategy when registered
+/// and otherwise routes to v1. Centralises the dispatch so
+/// `runLoopStreaming` doesn't grow another conditional branch every
+/// time a new hook variant lands.
+pub fn fireCompactUnified(
+    lua_engine: ?*LuaEngine.LuaEngine,
+    messages: []const types.Message,
+    last_usage: ?llm.Usage,
+    last_usage_index: ?usize,
+    tokens_max: u32,
+    reserve_tokens: u32,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !CompactionFireOutcome {
+    const engine = lua_engine orelse return .skipped;
+    if (engine.compact_handler_v2 != null) {
+        return fireCompactV2(
+            engine,
+            messages,
+            last_usage,
+            last_usage_index,
+            tokens_max,
+            reserve_tokens,
+            allocator,
+            queue,
+            cancel,
+        );
+    }
+    const replacement = try fireCompact(
+        lua_engine,
+        messages,
+        last_usage,
+        last_usage_index,
+        tokens_max,
+        reserve_tokens,
+        allocator,
+        queue,
+        cancel,
+    );
+    return if (replacement) |r| .{ .replaced = r } else .skipped;
+}
+
+/// v2 variant. Same threshold logic as v1 (predictive estimate +
+/// room-based check) but the round-trip uses `CompactRequestV2` so
+/// the strategy sees full-fidelity blocks and can return any of the
+/// three structured outcomes. On any marshal-side error we fall back
+/// to `.skipped` so the agent loop's Zig fallback still runs.
+fn fireCompactV2(
+    engine: *LuaEngine.LuaEngine,
+    messages: []const types.Message,
+    last_usage: ?llm.Usage,
+    last_usage_index: ?usize,
+    tokens_max: u32,
+    reserve_tokens: u32,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+    // engine is currently only used as a "v2 handler is registered" gate
+    // (the gate fires before we reach this function). It's kept on the
+    // signature so future revisions can read per-engine knobs (e.g. a
+    // v2-specific reserve_tokens) without touching every call site.
+) !CompactionFireOutcome {
+    _ = engine;
+    if (tokens_max == 0) {
+        if (llm.cost.shouldWarnForModel("__zag_compact_disabled__")) {
+            log.warn(
+                "compaction disabled: model has no context_window; oversized requests will reach the provider unchecked",
+                .{},
+            );
+        }
+        return .skipped;
+    }
+    const est = estimateContextTokens(messages, last_usage, last_usage_index);
+    if (est.total + reserve_tokens <= tokens_max) return .skipped;
+
+    var req = agent_events.CompactRequestV2.init(messages, est.total, tokens_max, allocator);
+    marshalRequest(agent_events.CompactRequestV2, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return .skipped,
+        error.Cancelled => return error.Cancelled,
+    };
+    if (req.error_name) |name| {
+        log.warn("compact_v2 strategy handler failed: {s}", .{name});
+        req.freeOutcome();
+        return .skipped;
+    }
+    return switch (req.outcome) {
+        .use_default => .skipped,
+        .cancel => .cancelled,
+        .replace => |r| blk: {
+            // Transfer ownership of the messages slice; clear the
+            // outcome so freeOutcome becomes a no-op for the data we
+            // just adopted. The summary is dropped (telemetry-only and
+            // we don't have a sink for it today).
+            const moved = r.messages;
+            if (r.summary) |s| req.allocator.free(s);
+            req.outcome = .use_default;
+            break :blk .{ .replaced = moved };
+        },
+    };
 }
 
 /// Fire `zag.compact.strategy` at the top of the next iteration when the

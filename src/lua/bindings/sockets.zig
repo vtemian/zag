@@ -51,6 +51,8 @@ pub fn registerCompactTable(lua: *Lua) void {
     lua.newTable();
     lua.pushFunction(zlua.wrap(zagCompactStrategyFn));
     lua.setField(-2, "strategy");
+    lua.pushFunction(zlua.wrap(zagCompactStrategyV2Fn));
+    lua.setField(-2, "strategy_v2");
     lua.pushFunction(zlua.wrap(zagCompactSetReserveTokensFn));
     lua.setField(-2, "set_reserve_tokens");
     lua.pushFunction(zlua.wrap(zagCompactSetKeepRecentTokensFn));
@@ -280,6 +282,48 @@ fn zagCompactStrategyFn(lua: *Lua) i32 {
         lua.unref(zlua.registry_index, old);
     }
     engine.compact_handler = fn_ref;
+    return 0;
+}
+
+/// Zig function backing `zag.compact.strategy_v2(fn)`. Same lifetime
+/// semantics as v1: a single global ref slot, last registration wins,
+/// nil clears. The handler receives a full-fidelity message snapshot
+/// (every ContentBlock variant survives the round-trip) and may
+/// return:
+///   - `nil` or `{use_default = true}` to let the Zig default
+///     summarization run as the fallback;
+///   - `{cancel = true}` to skip both the Zig default and drop-oldest
+///     for this iteration (the pre-flight cap still refuses overflows);
+///   - `{messages = {{role, content = {{type, ...}, ...}}, ...},
+///     summary = "..."}` to install a custom replacement plus an
+///     optional summary string the agent keeps for telemetry.
+fn zagCompactStrategyV2Fn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+
+    if (lua.isNil(1)) {
+        if (engine.compact_handler_v2) |old| {
+            lua.unref(zlua.registry_index, old);
+            engine.compact_handler_v2 = null;
+        }
+        return 0;
+    }
+    if (!lua.isFunction(1)) {
+        lua.raiseErrorStr(
+            "zag.compact.strategy_v2: arg 1 must be a function or nil",
+            .{},
+        );
+    }
+    lua.pushValue(1);
+    const fn_ref = lua.ref(zlua.registry_index) catch {
+        lua.raiseErrorStr(
+            "zag.compact.strategy_v2: failed to ref handler",
+            .{},
+        );
+    };
+    if (engine.compact_handler_v2) |old| {
+        lua.unref(zlua.registry_index, old);
+    }
+    engine.compact_handler_v2 = fn_ref;
     return 0;
 }
 

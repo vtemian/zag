@@ -222,6 +222,15 @@ pub const LuaEngine = struct {
     /// "no strategy", so the agent never compacts. Released in
     /// `deinit`.
     compact_handler: ?i32 = null,
+    /// v2 of the compaction strategy. Same lifecycle as `compact_handler`
+    /// but the round-trip preserves full content-block fidelity (text,
+    /// tool_use, tool_result, thinking, redacted_thinking survive into
+    /// Lua and back) and the return shape allows opting out of the
+    /// fallback chain (`{cancel = true}`) or explicitly invoking it
+    /// (`{use_default = true}`). When both v1 and v2 are registered the
+    /// agent loop prefers v2; v1 stays available for older configs.
+    /// Released in `deinit`.
+    compact_handler_v2: ?i32 = null,
     /// Reserve budget (tokens) held back from the model's context window
     /// when `fireCompact` decides whether to fire. Mutable via Lua:
     /// `zag.compact.set_reserve_tokens(n)`. Default matches
@@ -616,6 +625,10 @@ pub const LuaEngine = struct {
         if (self.compact_handler) |fn_ref| {
             self.lua.unref(zlua.registry_index, fn_ref);
             self.compact_handler = null;
+        }
+        if (self.compact_handler_v2) |fn_ref| {
+            self.lua.unref(zlua.registry_index, fn_ref);
+            self.compact_handler_v2 = null;
         }
         self.lua.deinit();
     }
@@ -1732,6 +1745,211 @@ pub const LuaEngine = struct {
     /// Lossy by design: the strategy decides what stays and emits
     /// replacement summary text rather than mutating block-shaped
     /// history. Returns void; the table is left on top of the stack.
+    /// Push a full-fidelity message snapshot for the v2 compaction
+    /// hook. Each block becomes a Lua table with a `type` field
+    /// ("text", "tool_use", "tool_result", "thinking",
+    /// "redacted_thinking") plus the variant-specific data. Caller
+    /// pops nothing; the resulting array sits at stack top on return.
+    fn pushFullMessageSnapshot(lua: *Lua, messages: []const types.Message) !void {
+        lua.newTable();
+        for (messages, 0..) |msg, idx| {
+            lua.newTable();
+            const role: []const u8 = switch (msg.role) {
+                .user => "user",
+                .assistant => "assistant",
+            };
+            _ = lua.pushString(role);
+            lua.setField(-2, "role");
+
+            lua.newTable(); // content array
+            for (msg.content, 0..) |block, b_idx| {
+                lua.newTable();
+                switch (block) {
+                    .text => |t| {
+                        _ = lua.pushString("text");
+                        lua.setField(-2, "type");
+                        _ = lua.pushString(t.text);
+                        lua.setField(-2, "text");
+                    },
+                    .tool_use => |tu| {
+                        _ = lua.pushString("tool_use");
+                        lua.setField(-2, "type");
+                        _ = lua.pushString(tu.id);
+                        lua.setField(-2, "id");
+                        _ = lua.pushString(tu.name);
+                        lua.setField(-2, "name");
+                        _ = lua.pushString(tu.input_raw);
+                        lua.setField(-2, "input_raw");
+                    },
+                    .tool_result => |tr| {
+                        _ = lua.pushString("tool_result");
+                        lua.setField(-2, "type");
+                        _ = lua.pushString(tr.tool_use_id);
+                        lua.setField(-2, "tool_use_id");
+                        _ = lua.pushString(tr.content);
+                        lua.setField(-2, "content");
+                        lua.pushBoolean(tr.is_error);
+                        lua.setField(-2, "is_error");
+                    },
+                    .thinking => |t| {
+                        _ = lua.pushString("thinking");
+                        lua.setField(-2, "type");
+                        _ = lua.pushString(t.text);
+                        lua.setField(-2, "text");
+                        if (t.signature) |s| {
+                            _ = lua.pushString(s);
+                            lua.setField(-2, "signature");
+                        }
+                    },
+                    .redacted_thinking => |r| {
+                        _ = lua.pushString("redacted_thinking");
+                        lua.setField(-2, "type");
+                        _ = lua.pushString(r.data);
+                        lua.setField(-2, "data");
+                    },
+                }
+                lua.rawSetIndex(-2, @intCast(b_idx + 1));
+            }
+            lua.setField(-2, "content");
+
+            lua.rawSetIndex(-2, @intCast(idx + 1));
+        }
+    }
+
+    /// Decode a single full-fidelity message table off the top of the
+    /// stack into an owned `types.Message`. Counterpart to
+    /// `pushFullMessageSnapshot`. The expected shape is
+    /// `{role = ..., content = {{type = "text", text = "..."}, ...}}`.
+    /// On any structural error the function returns a specific error
+    /// and the caller's `errdefer` pops the entry.
+    fn decodeFullMessage(lua: *Lua, allocator: Allocator) !types.Message {
+        errdefer lua.pop(1);
+        if (lua.typeOf(-1) != .table) return error.CompactEntryNotTable;
+
+        _ = lua.getField(-1, "role");
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .string) return error.CompactEntryMissingRole;
+        const role_value = lua.toString(-1) catch return error.CompactEntryReadFailed;
+        const role: types.Role = if (std.mem.eql(u8, role_value, "user"))
+            .user
+        else if (std.mem.eql(u8, role_value, "assistant"))
+            .assistant
+        else
+            return error.CompactEntryUnknownRole;
+
+        _ = lua.getField(-2, "content");
+        defer lua.pop(1);
+
+        // Accept either an array of typed blocks (preferred, full
+        // fidelity) or a bare string for callers porting from v1.
+        if (lua.typeOf(-1) == .string) {
+            const raw = lua.toString(-1) catch return error.CompactEntryReadFailed;
+            const owned = try allocator.dupe(u8, raw);
+            errdefer allocator.free(owned);
+            const blocks = try allocator.alloc(types.ContentBlock, 1);
+            errdefer allocator.free(blocks);
+            blocks[0] = .{ .text = .{ .text = owned } };
+            return .{ .role = role, .content = blocks };
+        }
+        if (lua.typeOf(-1) != .table) return error.CompactEntryMissingContent;
+
+        const len = lua.rawLen(-1);
+        const blocks = try allocator.alloc(types.ContentBlock, len);
+        errdefer {
+            // Best-effort cleanup: only blocks we've already populated
+            // own heap memory. The slot tracker keeps the invariant.
+            for (blocks) |b| b.freeOwned(allocator);
+            allocator.free(blocks);
+        }
+        // Initialise every slot to a known-empty text block first so
+        // an error mid-loop still produces a valid free-able array.
+        for (blocks) |*b| b.* = .{ .text = .{ .text = "" } };
+
+        for (0..len) |i| {
+            _ = lua.rawGetIndex(-1, @intCast(i + 1));
+            defer lua.pop(1);
+            if (lua.typeOf(-1) != .table) return error.CompactEntryMissingContent;
+
+            _ = lua.getField(-1, "type");
+            const type_tag = if (lua.typeOf(-1) == .string)
+                lua.toString(-1) catch return error.CompactEntryReadFailed
+            else
+                return error.CompactEntryMissingContent;
+            lua.pop(1);
+
+            blocks[i] = try decodeFullBlock(lua, allocator, type_tag);
+        }
+        return .{ .role = role, .content = blocks };
+    }
+
+    /// Decode one typed content block by tag. The block table is at -1
+    /// on entry and remains at -1 on return (the caller pops it).
+    fn decodeFullBlock(lua: *Lua, allocator: Allocator, type_tag: []const u8) !types.ContentBlock {
+        if (std.mem.eql(u8, type_tag, "text")) {
+            _ = lua.getField(-1, "text");
+            defer lua.pop(1);
+            const raw = if (lua.typeOf(-1) == .string)
+                lua.toString(-1) catch ""
+            else
+                "";
+            return .{ .text = .{ .text = try allocator.dupe(u8, raw) } };
+        }
+        if (std.mem.eql(u8, type_tag, "tool_use")) {
+            const id = try luaFieldDup(lua, "id", allocator);
+            errdefer allocator.free(id);
+            const name = try luaFieldDup(lua, "name", allocator);
+            errdefer allocator.free(name);
+            const input_raw = try luaFieldDup(lua, "input_raw", allocator);
+            return .{ .tool_use = .{ .id = id, .name = name, .input_raw = input_raw } };
+        }
+        if (std.mem.eql(u8, type_tag, "tool_result")) {
+            const tu_id = try luaFieldDup(lua, "tool_use_id", allocator);
+            errdefer allocator.free(tu_id);
+            const content = try luaFieldDup(lua, "content", allocator);
+            errdefer allocator.free(content);
+            _ = lua.getField(-1, "is_error");
+            const is_err = lua.toBoolean(-1);
+            lua.pop(1);
+            return .{ .tool_result = .{ .tool_use_id = tu_id, .content = content, .is_error = is_err } };
+        }
+        if (std.mem.eql(u8, type_tag, "thinking")) {
+            const text = try luaFieldDup(lua, "text", allocator);
+            errdefer allocator.free(text);
+            _ = lua.getField(-1, "signature");
+            const sig_owned: ?[]const u8 = if (lua.typeOf(-1) == .string) blk: {
+                const raw = lua.toString(-1) catch "";
+                break :blk try allocator.dupe(u8, raw);
+            } else null;
+            lua.pop(1);
+            return .{ .thinking = .{
+                .text = text,
+                .signature = sig_owned,
+                .provider = .anthropic,
+                .id = null,
+            } };
+        }
+        if (std.mem.eql(u8, type_tag, "redacted_thinking")) {
+            const data = try luaFieldDup(lua, "data", allocator);
+            return .{ .redacted_thinking = .{ .data = data } };
+        }
+        return error.CompactEntryUnknownRole;
+    }
+
+    /// Convenience: read a string field on the table at stack top and
+    /// dupe it onto `allocator`. Errors when the field is missing or
+    /// not a string so callers get a clean error.* propagation.
+    fn luaFieldDup(lua: *Lua, name: []const u8, allocator: Allocator) ![]const u8 {
+        // getField needs a sentinel-terminated C string; the names we
+        // pass are short literals so a 32-byte buffer is enough.
+        var buf: [32]u8 = undefined;
+        const slot = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return error.CompactEntryReadFailed;
+        _ = lua.getField(-1, slot);
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .string) return error.CompactEntryMissingContent;
+        const raw = lua.toString(-1) catch return error.CompactEntryReadFailed;
+        return try allocator.dupe(u8, raw);
+    }
+
     fn pushCompactMessageSnapshot(
         lua: *Lua,
         messages: []const types.Message,
@@ -1908,9 +2126,127 @@ pub const LuaEngine = struct {
         req.result = try collected.toOwnedSlice(req.allocator);
     }
 
+    /// Phase 6 v2 dispatch. Pushes a full-fidelity message snapshot
+    /// (text / tool_use / tool_result / thinking / redacted_thinking
+    /// blocks all carry their fields into Lua) plus the token usage
+    /// scalars, runs the registered handler, and decodes the structured
+    /// return. Three return shapes:
+    ///   - `nil` or `{use_default = true}` → outcome stays `.use_default`
+    ///   - `{cancel = true}` → outcome becomes `.cancel`
+    ///   - `{messages = [...], summary = "..."}` → outcome becomes
+    ///     `.replace` with messages duped into `req.allocator`.
+    /// A plain numerically-indexed array is also accepted as
+    /// "messages-only replacement" for symmetry with v1.
+    pub fn handleCompactRequestV2(
+        self: *LuaEngine,
+        req: *agent_events.CompactRequestV2,
+    ) anyerror!void {
+        const fn_ref = self.compact_handler_v2 orelse return;
+
+        const lua = self.lua;
+        _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
+        if (!lua.isFunction(-1)) {
+            lua.pop(1);
+            log.warn("compact_v2 strategy: registry slot is not a function", .{});
+            return;
+        }
+
+        lua.newTable();
+        lua.pushInteger(@intCast(req.tokens_used));
+        lua.setField(-2, "tokens_used");
+        lua.pushInteger(@intCast(req.tokens_max));
+        lua.setField(-2, "tokens_max");
+        try pushFullMessageSnapshot(lua, req.messages);
+        lua.setField(-2, "messages");
+
+        lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
+            const err_msg = lua.toString(-1) catch "<unprintable>";
+            log.warn("compact_v2 strategy raised: {s}", .{err_msg});
+            lua.pop(1);
+            return error.LuaHandlerError;
+        };
+        defer lua.pop(1);
+
+        if (lua.isNil(-1)) {
+            req.outcome = .use_default;
+            return;
+        }
+        if (lua.typeOf(-1) != .table) {
+            log.warn(
+                "compact_v2 strategy returned non-table (type {s}); treating as use_default",
+                .{@tagName(lua.typeOf(-1))},
+            );
+            return;
+        }
+
+        // Detect signal fields first; they trump the messages array.
+        _ = lua.getField(-1, "cancel");
+        const want_cancel = lua.toBoolean(-1);
+        lua.pop(1);
+        if (want_cancel) {
+            req.outcome = .cancel;
+            return;
+        }
+
+        _ = lua.getField(-1, "use_default");
+        const want_default = lua.toBoolean(-1);
+        lua.pop(1);
+        if (want_default) {
+            req.outcome = .use_default;
+            return;
+        }
+
+        // Replacement path. The plugin may either set `messages = {...}`
+        // explicitly with an optional `summary = "..."`, OR pass a plain
+        // numerically-indexed array of messages directly. We probe for
+        // the named field first, then fall through to the array form.
+        _ = lua.getField(-1, "messages");
+        const has_messages_field = lua.typeOf(-1) == .table;
+        if (!has_messages_field) lua.pop(1);
+
+        const msg_table_idx: i32 = if (has_messages_field) -1 else -1;
+        // When `has_messages_field` is true the messages array sits at
+        // -1 (we just pushed via getField); otherwise the return table
+        // itself at -1 IS the array.
+        const len = lua.rawLen(msg_table_idx);
+
+        var collected: std.ArrayList(types.Message) = .empty;
+        errdefer {
+            for (collected.items) |m| m.deinit(req.allocator);
+            collected.deinit(req.allocator);
+        }
+        for (0..len) |idx| {
+            _ = lua.rawGetIndex(msg_table_idx, @intCast(idx + 1));
+            const msg = try decodeFullMessage(lua, req.allocator);
+            errdefer msg.deinit(req.allocator);
+            try collected.append(req.allocator, msg);
+            lua.pop(1);
+        }
+        if (has_messages_field) lua.pop(1); // pop the messages table
+
+        // Optional summary string.
+        var owned_summary: ?[]const u8 = null;
+        _ = lua.getField(-1, "summary");
+        if (lua.typeOf(-1) == .string) {
+            const raw = lua.toString(-1) catch "";
+            owned_summary = req.allocator.dupe(u8, raw) catch null;
+        }
+        lua.pop(1);
+
+        req.outcome = .{ .replace = .{
+            .messages = try collected.toOwnedSlice(req.allocator),
+            .summary = owned_summary,
+        } };
+    }
+
     /// Test-only accessor for the single global compact strategy handler ref.
     pub fn compactHandler(self: *const LuaEngine) ?i32 {
         return self.compact_handler;
+    }
+
+    /// Test-only accessor for the v2 handler ref.
+    pub fn compactHandlerV2(self: *const LuaEngine) ?i32 {
+        return self.compact_handler_v2;
     }
 
     /// Paired with `active_render_engine`. `renderPromptLayers` sets both
@@ -10515,6 +10851,122 @@ test "zag.compact.strategy registers a single global handler" {
         \\zag.compact.strategy(function(ctx) return nil end)
     );
     try std.testing.expect(engine.compactHandler() != null);
+}
+
+test "zag.compact.strategy_v2 registers and unregisters" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try std.testing.expect(engine.compactHandlerV2() == null);
+    try engine.lua.doString("zag.compact.strategy_v2(function(ctx) return nil end)");
+    try std.testing.expect(engine.compactHandlerV2() != null);
+
+    try engine.lua.doString("zag.compact.strategy_v2(nil)");
+    try std.testing.expect(engine.compactHandlerV2() == null);
+}
+
+test "handleCompactRequestV2 nil return leaves outcome as use_default" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.compact.strategy_v2(function(ctx) return nil end)");
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    defer req.freeOutcome();
+    try engine.handleCompactRequestV2(&req);
+    try std.testing.expect(req.outcome == .use_default);
+}
+
+test "handleCompactRequestV2 honours {cancel = true}" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.compact.strategy_v2(function(ctx) return { cancel = true } end)");
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    defer req.freeOutcome();
+    try engine.handleCompactRequestV2(&req);
+    try std.testing.expect(req.outcome == .cancel);
+}
+
+test "handleCompactRequestV2 accepts {messages, summary} replacement" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.compact.strategy_v2(function(ctx)
+        \\  return {
+        \\    messages = {
+        \\      { role = "user", content = {{ type = "text", text = "compacted" }} },
+        \\    },
+        \\    summary = "the prior story in brief",
+        \\  }
+        \\end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "long history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    defer req.freeOutcome();
+    try engine.handleCompactRequestV2(&req);
+    switch (req.outcome) {
+        .replace => |r| {
+            try std.testing.expectEqual(@as(usize, 1), r.messages.len);
+            try std.testing.expectEqualStrings("compacted", r.messages[0].content[0].text.text);
+            try std.testing.expect(r.summary != null);
+            try std.testing.expectEqualStrings("the prior story in brief", r.summary.?);
+        },
+        else => return error.TestUnexpectedOutcome,
+    }
+}
+
+test "handleCompactRequestV2 preserves tool_use block fidelity in the snapshot" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Strategy echoes back the type tag of the second block from the
+    // first message, so a successful round-trip proves the v2 push
+    // serialized the tool_use variant rather than dropping it.
+    try engine.lua.doString(
+        \\zag.compact.strategy_v2(function(ctx)
+        \\  local m = ctx.messages[1]
+        \\  local tag = m.content[2].type
+        \\  return {
+        \\    messages = {
+        \\      { role = "user", content = {{ type = "text", text = "saw=" .. tag }} },
+        \\    },
+        \\  }
+        \\end)
+    );
+
+    const blocks = [_]types.ContentBlock{
+        .{ .text = .{ .text = "do it" } },
+        .{ .tool_use = .{ .id = "t1", .name = "read", .input_raw = "{}" } },
+    };
+    const messages = [_]types.Message{.{ .role = .assistant, .content = &blocks }};
+    var req = agent_events.CompactRequestV2.init(&messages, 100, 1000, alloc);
+    defer req.freeOutcome();
+    try engine.handleCompactRequestV2(&req);
+    switch (req.outcome) {
+        .replace => |r| {
+            try std.testing.expectEqualStrings("saw=tool_use", r.messages[0].content[0].text.text);
+        },
+        else => return error.TestUnexpectedOutcome,
+    }
 }
 
 test "zag.llm.complete is registered as a callable on the zag table" {

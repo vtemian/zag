@@ -107,6 +107,15 @@ pub const AgentEvent = union(enum) {
     /// caller-owned.
     compact_request: *CompactRequest,
 
+    /// Round-trip: the v2 variant of the compaction strategy hook,
+    /// registered via `zag.compact.strategy_v2(fn)`. Preserves full
+    /// content-block fidelity through the snapshot (tool_use,
+    /// tool_result, thinking, redacted_thinking) and accepts a
+    /// structured return shape (use_default / cancel / replace). When
+    /// both v1 and v2 handlers are registered, fireCompact takes the
+    /// v2 path; v1 stays available for older configs.
+    compact_request_v2: *CompactRequestV2,
+
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
         /// The registered tool name.
@@ -215,6 +224,13 @@ pub const AgentEvent = union(enum) {
             // is safe because compaction is advisory: the worst case is
             // the next turn hits the provider context limit.
             .compact_request => |req| {
+                req.error_name = "drained_without_dispatch";
+                req.done.set();
+            },
+            // Same rationale as v1: signal done with the default
+            // `.use_default` outcome so the agent loop's Zig fallback
+            // still runs.
+            .compact_request_v2 => |req| {
                 req.error_name = "drained_without_dispatch";
                 req.done.set();
             },
@@ -844,6 +860,106 @@ pub const CompactRequest = struct {
         for (list) |msg| msg.deinit(self.allocator);
         self.allocator.free(list);
         self.result = null;
+    }
+};
+
+/// Outcome of a Phase-6 `zag.compact.strategy_v2` handler. Richer than
+/// the v1 contract (nil / array): the plugin can opt out of compaction
+/// (`cancel`), explicitly request the Zig fallback (`use_default`), or
+/// supply a full replacement plus an optional summary string for
+/// audit trails (`replace`).
+///
+/// The agent loop interprets each variant as:
+///   - `.use_default` — proceed with the existing post-strategy chain
+///     (re-estimate; if still over, run Zig default summarization;
+///     then drop-oldest; then refuse). This is the same as the v1 nil
+///     return path.
+///   - `.cancel` — skip both the Zig default and drop-oldest fallbacks
+///     for this iteration. The pre-flight cap can still refuse the
+///     turn if the request would overflow. Use case: plugin wants to
+///     handle compaction asynchronously on a later turn.
+///   - `.replace` — install the supplied messages in place of the
+///     existing history. `summary` is stored for telemetry but the
+///     agent doesn't read it back today.
+pub const CompactV2Outcome = union(enum) {
+    use_default,
+    cancel,
+    replace: struct {
+        /// Replacement message slice. Each Message and its content
+        /// blocks are heap-allocated on the v2 request's allocator
+        /// and freed by `freeOutcome`.
+        messages: []types.Message,
+        /// Optional summary text the plugin produced. Allocated on
+        /// the v2 request's allocator and freed by `freeOutcome`.
+        summary: ?[]const u8 = null,
+    },
+};
+
+/// v2 of the compaction round-trip. Sent on the queue whenever a
+/// `strategy_v2` handler is registered. The main thread runs the
+/// handler with a full-fidelity message snapshot (tool_use, tool_result,
+/// thinking, redacted_thinking blocks survive — pi-mono parity), reads
+/// the structured return, and writes `outcome`.
+pub const CompactRequestV2 = struct {
+    /// Read-only snapshot of the current conversation history. Full
+    /// content blocks survive the round-trip; the main thread reads
+    /// every block kind under `done` and must not retain pointers past
+    /// `done.set()`. The agent thread owns the underlying slice.
+    messages: []const types.Message,
+    /// Predicted input tokens of the upcoming request. Passed to the
+    /// strategy as part of the context table.
+    tokens_used: u32,
+    /// Maximum tokens the active model accepts in one request. Zero
+    /// when the caller has no rate card; fireCompact short-circuits
+    /// before sending in that case.
+    tokens_max: u32,
+    /// Allocator used to dupe replacement messages and summary text
+    /// into `outcome`.
+    allocator: Allocator,
+    /// Signalled by the main thread when `outcome` (or `error_name`)
+    /// has been finalized.
+    done: std.Thread.ResetEvent = .{},
+    /// Default to "use default" so a missing handler / nil return /
+    /// dispatch-side error all flow into the Zig fallback chain.
+    outcome: CompactV2Outcome = .use_default,
+    /// `@errorName` of whatever went wrong on the main thread. Borrowed
+    /// from rodata; do not free.
+    error_name: ?[]const u8 = null,
+
+    pub fn init(
+        messages: []const types.Message,
+        tokens_used: u32,
+        tokens_max: u32,
+        allocator: Allocator,
+    ) CompactRequestV2 {
+        return .{
+            .messages = messages,
+            .tokens_used = tokens_used,
+            .tokens_max = tokens_max,
+            .allocator = allocator,
+        };
+    }
+
+    /// Release any heap allocations carried by `outcome`. Safe to call
+    /// multiple times; subsequent calls see `.use_default` (the post-
+    /// free sentinel) and are no-ops.
+    pub fn freeOutcome(self: *CompactRequestV2) void {
+        switch (self.outcome) {
+            .replace => |r| {
+                for (r.messages) |msg| msg.deinit(self.allocator);
+                self.allocator.free(r.messages);
+                if (r.summary) |s| self.allocator.free(s);
+            },
+            else => {},
+        }
+        self.outcome = .use_default;
+    }
+
+    /// Protocol alias: `marshalRequest` looks up `freeResult` by name.
+    /// Forwarding keeps the round-trip generic without leaking the
+    /// outcome-vs-result naming distinction into the dispatcher.
+    pub fn freeResult(self: *CompactRequestV2) void {
+        self.freeOutcome();
     }
 };
 
