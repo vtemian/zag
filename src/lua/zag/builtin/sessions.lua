@@ -122,17 +122,64 @@ function M._bind_keymaps()
         table.insert(state.keymap_ids, id)
     end
 
-    add { key = "j",     fn = M._cursor_down }
-    add { key = "k",     fn = M._cursor_up }
-    add { key = "<CR>",  fn = M._activate }
-    add { key = "l",     fn = M._expand }
-    add { key = "h",     fn = M._collapse }
-    add { key = "q",     fn = M.close }
+    -- Filter mode (Task 7.1). Keymap.zig has no `filter` Mode variant
+    -- and no "any printable char" wildcard, so we bind every printable
+    -- char as a buffer-local normal-mode keymap whose handler branches
+    -- on `state.mode`. In normal mode the printable bindings are
+    -- no-ops UNLESS the char also has a structural binding (j, k, l,
+    -- h, q, G) — those are registered AFTER the printable loop, which
+    -- by the Registry's overwrite-in-place semantics replaces the
+    -- printable handler with the structural one. The structural
+    -- handlers then dispatch on `state.mode` themselves so the user can
+    -- type "j"/"k"/etc. into a filter without losing j/k navigation in
+    -- normal mode.
+    --
+    -- See "Option A vs B" in the commit message for why we don't grow
+    -- Keymap.Mode to include `filter`.
+    for _, ch in ipairs(M._filter_printables) do
+        local c = ch
+        add { key = c, fn = function() M._filter_input(c) end }
+    end
+
+    -- Structural keys: registered AFTER the printable loop so they
+    -- displace the printable handler for their character. Each one
+    -- dispatches on state.mode to decide normal-mode behavior vs
+    -- filter-mode "append this char to the filter".
+    add { key = "j",     fn = M._j_pressed }
+    add { key = "k",     fn = M._k_pressed }
+    add { key = "<CR>",  fn = M._enter_pressed }
+    add { key = "l",     fn = M._l_pressed }
+    add { key = "h",     fn = M._h_pressed }
+    add { key = "q",     fn = M._q_pressed }
     -- Keymap.zig has no multi-keystroke chord support today, so the
     -- vim `gg` is unbindable. Capital G (a single Shift-G chord) is.
     -- TODO: bind `gg` once Keymap.Registry grows a prefix table.
-    add { key = "<S-g>", fn = M._jump_last }
+    add { key = "<S-g>", fn = M._g_pressed }
+
+    -- Filter-mode entry/exit + edit keys. `/` is unambiguous (no
+    -- structural binding). <BS> and <Esc> branch on state.mode: in
+    -- normal mode they are no-ops on the sidebar (a global <Esc>
+    -- binding in the user's config still fires via Pass 2 of the
+    -- registry lookup if any exists).
+    add { key = "/",     fn = M._filter_enter }
+    add { key = "<BS>",  fn = M._filter_backspace }
+    add { key = "<Esc>", fn = M._filter_escape }
 end
+
+-- The printable-char set accepted in filter mode. Substring-match over
+-- session names: ASCII letters, digits, space, hyphen, underscore, dot.
+-- ASCII-only on purpose: <BS> pops a single byte (see _filter_backspace)
+-- and the filter compare is byte-level lowercasing. Multibyte session
+-- names will render fine but can't be typed into the filter; that's a
+-- v1 limitation called out in the plan.
+M._filter_printables = {
+    "a","b","c","d","e","f","g","h","i","j","k","l","m",
+    "n","o","p","q","r","s","t","u","v","w","x","y","z",
+    "A","B","C","D","E","F","G","H","I","J","K","L","M",
+    "N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+    "0","1","2","3","4","5","6","7","8","9",
+    " ","-","_",".",
+}
 
 -- Move the cursor down one row, clamped to the last rendered row.
 -- Re-renders so the highlight tracks the cursor.
@@ -150,6 +197,108 @@ function M._cursor_up()
     if state.cursor_row > 1 then
         state.cursor_row = state.cursor_row - 1
     end
+    M._render()
+end
+
+-- Per-key dispatchers that branch on `state.mode`. The pattern: in
+-- filter mode the structural keys whose character is also a filter
+-- input (j, k, l, h, q, g, G) append themselves to the filter, so the
+-- user can type "alpha-q" or whatever into the filter without losing
+-- j/k navigation in normal mode. <CR> is special: it commits the
+-- filter rather than literally typing a newline.
+
+function M._j_pressed()
+    if state.mode == "filter" then return M._filter_input("j") end
+    M._cursor_down()
+end
+
+function M._k_pressed()
+    if state.mode == "filter" then return M._filter_input("k") end
+    M._cursor_up()
+end
+
+function M._l_pressed()
+    if state.mode == "filter" then return M._filter_input("l") end
+    M._expand()
+end
+
+function M._h_pressed()
+    if state.mode == "filter" then return M._filter_input("h") end
+    M._collapse()
+end
+
+function M._q_pressed()
+    if state.mode == "filter" then return M._filter_input("q") end
+    M.close()
+end
+
+function M._g_pressed()
+    -- Shift-G arrives as upper-case 'G' from the input parser. In
+    -- filter mode we feed that exact byte into the filter; in normal
+    -- mode it jumps to the last row.
+    if state.mode == "filter" then return M._filter_input("G") end
+    M._jump_last()
+end
+
+-- `<CR>` dispatcher. In filter mode: commit (exit, keep filter).
+-- In normal mode: activate the row under the cursor.
+function M._enter_pressed()
+    if state.mode == "filter" then
+        M._filter_commit()
+        return
+    end
+    M._activate()
+end
+
+-- Filter-mode entry. `/` swaps the sidebar into filter mode and
+-- clears any prior filter so the prompt starts empty. The render
+-- path picks up state.mode and prepends the prompt line.
+function M._filter_enter()
+    if state.mode == "filter" then return end
+    state.mode = "filter"
+    state.filter = ""
+    M._render()
+end
+
+-- Append a single printable char to state.filter. No-op outside
+-- filter mode so the same binding is safe in normal mode (a stray
+-- "z" keypress in the sidebar does nothing instead of corrupting
+-- the filter). ASCII bytes only; multibyte session names render
+-- but cannot be filter-typed in v1.
+function M._filter_input(ch)
+    if state.mode ~= "filter" then return end
+    state.filter = state.filter .. ch
+    M._render()
+end
+
+-- Pop the last byte of state.filter. ASCII-only v1 assumption: we
+-- drop one byte rather than one grapheme. Multibyte session names
+-- can't be filter-typed yet (see `_filter_input`), so byte-pop is
+-- safe. Backspace on an empty filter stays in filter mode and is
+-- a no-op (does NOT exit; <Esc> is the exit key).
+function M._filter_backspace()
+    if state.mode ~= "filter" then return end
+    if #state.filter > 0 then
+        state.filter = state.filter:sub(1, -2)
+    end
+    M._render()
+end
+
+-- Cancel filter mode: discard the in-progress filter and return to
+-- normal mode. Outside filter mode this is a no-op (no global Esc
+-- binding to fall through to on the sidebar's normal-mode surface).
+function M._filter_escape()
+    if state.mode ~= "filter" then return end
+    state.mode = "normal"
+    state.filter = ""
+    M._render()
+end
+
+-- Commit filter mode: exit but keep state.filter applied. The user
+-- is back to j/k navigation over the narrowed list.
+function M._filter_commit()
+    if state.mode ~= "filter" then return end
+    state.mode = "normal"
     M._render()
 end
 
@@ -431,6 +580,19 @@ function M._set_filter_for_test(s)
     state.filter = s or ""
     M._render()
 end
+
+-- Test seams for Task 7.1 filter-mode handlers. The headless harness
+-- can't drive real keystrokes through the input parser, so tests call
+-- these wrappers in place of the keymap dispatch path. Each just
+-- forwards to the underlying handler with no extra logic; the seam
+-- exists purely to give tests a stable, version-controlled name to
+-- depend on. Production code routes through the `_pressed` dispatchers
+-- registered in `_bind_keymaps`.
+function M._filter_enter_for_test() M._filter_enter() end
+function M._filter_input_for_test(ch) M._filter_input(ch) end
+function M._filter_backspace_for_test() M._filter_backspace() end
+function M._filter_escape_for_test() M._filter_escape() end
+function M._filter_commit_for_test() M._filter_commit() end
 
 -- Test-only seam (Task 6.1). Forces `_resolve_current_session_id`
 -- to return `id` on the next render, bypassing the `zag.layout.tree`

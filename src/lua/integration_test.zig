@@ -1242,6 +1242,363 @@ test "sessions sidebar renders subagent children under an expanded session" {
     );
 }
 
+// Task 7.1: filter mode. `/` swaps the sidebar into a "filter" mode
+// where printable chars append to state.filter, <BS> pops, <Esc>
+// cancels (clears filter and exits), <CR> commits (exits but keeps the
+// filter applied). The render path prepends a "/<state.filter>_" prompt
+// line while filter mode is active. Headless tests drive the handlers
+// through the `_filter_*_for_test` seams since the keymap layer needs a
+// live input parser.
+test "sessions sidebar / enters filter mode and renders the prompt" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+    var h_beta = try mgr.createSession("test-model");
+    const beta_id = try allocator.dupe(u8, h_beta.id[0..h_beta.id_len]);
+    defer allocator.free(beta_id);
+    h_beta.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+    _ = engine.lua.pushString(beta_id);
+    engine.lua.setGlobal("_test_beta_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\zag.sessions.rename(_test_beta_id, "beta")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\assert(st.mode == "normal", "fresh sidebar should be normal mode")
+        \\
+        \\sidebar._filter_enter_for_test()
+        \\assert(st.mode == "filter",
+        \\       "/ must put sidebar in filter mode, got " .. tostring(st.mode))
+        \\assert(st.filter == "", "filter must start empty")
+        \\
+        \\local lines = zag.buffer.get_lines(buf)
+        \\-- Two session rows + one filter prompt line at the top.
+        \\assert(#lines == 3, "expected 3 lines (prompt + 2 rows), got " .. tostring(#lines))
+        \\assert(lines[1]:sub(1, 1) == "/",
+        \\       "prompt line must start with /, got " .. tostring(lines[1]))
+    );
+}
+
+test "sessions sidebar filter input appends chars and narrows the list" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+    var h_beta = try mgr.createSession("test-model");
+    const beta_id = try allocator.dupe(u8, h_beta.id[0..h_beta.id_len]);
+    defer allocator.free(beta_id);
+    h_beta.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+    _ = engine.lua.pushString(beta_id);
+    engine.lua.setGlobal("_test_beta_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\zag.sessions.rename(_test_beta_id, "beta")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\sidebar._filter_enter_for_test()
+        \\sidebar._filter_input_for_test("a")
+        \\sidebar._filter_input_for_test("l")
+        \\
+        \\local st = sidebar._state_for_test()
+        \\assert(st.filter == "al",
+        \\       "filter should be 'al', got " .. tostring(st.filter))
+        \\
+        \\local lines = zag.buffer.get_lines(buf)
+        \\-- Prompt line + one session row (alpha) only.
+        \\assert(#lines == 2,
+        \\       "expected prompt + 1 row, got " .. tostring(#lines) ..
+        \\       " :: " .. table.concat(lines, "|"))
+        \\assert(lines[1] == "/al",
+        \\       "prompt line should be '/al', got " .. tostring(lines[1]))
+        \\assert(lines[2]:find("alpha", 1, true) ~= nil,
+        \\       "remaining row must contain alpha, got " .. tostring(lines[2]))
+    );
+}
+
+test "sessions sidebar filter backspace pops a char and re-broadens" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+    var h_beta = try mgr.createSession("test-model");
+    const beta_id = try allocator.dupe(u8, h_beta.id[0..h_beta.id_len]);
+    defer allocator.free(beta_id);
+    h_beta.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+    _ = engine.lua.pushString(beta_id);
+    engine.lua.setGlobal("_test_beta_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\zag.sessions.rename(_test_beta_id, "beta")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\sidebar._filter_enter_for_test()
+        \\sidebar._filter_input_for_test("a")
+        \\sidebar._filter_input_for_test("l")
+        \\sidebar._filter_backspace_for_test()
+        \\
+        \\local st = sidebar._state_for_test()
+        \\assert(st.filter == "a",
+        \\       "filter should be 'a' after backspace, got " .. tostring(st.filter))
+        \\
+        \\-- Backspace on empty filter must stay empty (no underflow).
+        \\sidebar._filter_backspace_for_test()
+        \\sidebar._filter_backspace_for_test()
+        \\assert(st.filter == "",
+        \\       "filter should clamp at empty, got " .. tostring(st.filter))
+        \\assert(st.mode == "filter",
+        \\       "backspace on empty must not exit filter mode, got " .. tostring(st.mode))
+        \\
+        \\local lines = zag.buffer.get_lines(buf)
+        \\-- Empty filter: prompt line + both rows.
+        \\assert(#lines == 3,
+        \\       "expected prompt + 2 rows after clearing, got " .. tostring(#lines))
+    );
+}
+
+test "sessions sidebar filter escape clears filter and exits the mode" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+    var h_beta = try mgr.createSession("test-model");
+    const beta_id = try allocator.dupe(u8, h_beta.id[0..h_beta.id_len]);
+    defer allocator.free(beta_id);
+    h_beta.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+    _ = engine.lua.pushString(beta_id);
+    engine.lua.setGlobal("_test_beta_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\zag.sessions.rename(_test_beta_id, "beta")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\sidebar._filter_enter_for_test()
+        \\sidebar._filter_input_for_test("a")
+        \\sidebar._filter_input_for_test("l")
+        \\sidebar._filter_escape_for_test()
+        \\
+        \\local st = sidebar._state_for_test()
+        \\assert(st.mode == "normal",
+        \\       "escape must return to normal mode, got " .. tostring(st.mode))
+        \\assert(st.filter == "",
+        \\       "escape must clear the filter, got " .. tostring(st.filter))
+        \\
+        \\local lines = zag.buffer.get_lines(buf)
+        \\-- Two session rows, no prompt line.
+        \\assert(#lines == 2,
+        \\       "expected 2 rows post-escape, got " .. tostring(#lines))
+        \\local has_alpha, has_beta = false, false
+        \\for _, l in ipairs(lines) do
+        \\    if l:find("alpha", 1, true) then has_alpha = true end
+        \\    if l:find("beta", 1, true) then has_beta = true end
+        \\end
+        \\assert(has_alpha and has_beta,
+        \\       "escape must restore the full list: " .. table.concat(lines, "|"))
+    );
+}
+
+test "sessions sidebar filter commit keeps filter applied and exits mode" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var h_alpha = try mgr.createSession("test-model");
+    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
+    defer allocator.free(alpha_id);
+    h_alpha.close();
+    var h_beta = try mgr.createSession("test-model");
+    const beta_id = try allocator.dupe(u8, h_beta.id[0..h_beta.id_len]);
+    defer allocator.free(beta_id);
+    h_beta.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(alpha_id);
+    engine.lua.setGlobal("_test_alpha_id");
+    _ = engine.lua.pushString(beta_id);
+    engine.lua.setGlobal("_test_beta_id");
+
+    try runLua(&engine,
+        \\zag.sessions.rename(_test_alpha_id, "alpha")
+        \\zag.sessions.rename(_test_beta_id, "beta")
+        \\
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_filter_for_test("")
+        \\
+        \\sidebar._filter_enter_for_test()
+        \\sidebar._filter_input_for_test("a")
+        \\sidebar._filter_input_for_test("l")
+        \\sidebar._filter_commit_for_test()
+        \\
+        \\local st = sidebar._state_for_test()
+        \\assert(st.mode == "normal",
+        \\       "commit must return to normal mode, got " .. tostring(st.mode))
+        \\assert(st.filter == "al",
+        \\       "commit must preserve the filter, got " .. tostring(st.filter))
+        \\
+        \\local lines = zag.buffer.get_lines(buf)
+        \\-- No prompt line; only the matching session row.
+        \\assert(#lines == 1,
+        \\       "expected 1 row post-commit, got " .. tostring(#lines))
+        \\assert(lines[1]:find("alpha", 1, true) ~= nil,
+        \\       "remaining row must contain alpha, got " .. tostring(lines[1]))
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
