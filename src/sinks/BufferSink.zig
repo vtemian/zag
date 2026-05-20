@@ -189,6 +189,16 @@ pub const BufferSink = struct {
                 self.current_thinking_node = null;
                 _ = self.buffer.appendNode(null, .err, e.text) catch return;
             },
+            .compaction_summary_delta, .compaction_event => {
+                // Surfaced to the AgentRunner sink as part of the
+                // compaction telemetry plumbing. BufferSink doesn't
+                // render these today — visual choice (transient
+                // status line, dim text in a footer, side panel) is
+                // pending; the event surface is observable so the UI
+                // layer can subscribe without a churn round-trip.
+                // Sinks that DO render (TUI status bar) can hook in
+                // by switching on these variants.
+            },
         }
     }
 

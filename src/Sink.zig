@@ -29,6 +29,25 @@ pub const Event = union(enum) {
     },
     run_end,
     error_event: struct { text: []const u8 },
+    /// Streaming progress text from an in-flight compaction summary.
+    /// Distinct from assistant_delta because compaction work is NOT
+    /// the model's actual reply — sinks should render this as
+    /// transient progress (dim, italic, side panel) so the user sees
+    /// the agent is doing maintenance without confusing it for a
+    /// turn. Sinks that don't care (Collector, Null) drop these.
+    compaction_summary_delta: struct { text: []const u8 },
+    /// One-shot structured event emitted at the end of a compaction
+    /// cycle. Outcome string is one of: "replace", "cancel",
+    /// "summarized", "drop_oldest", "refused". Sinks can clear any
+    /// transient "compacting..." indicator here and surface a brief
+    /// "compacted N → M (outcome)" status.
+    compaction_event: struct {
+        outcome: []const u8,
+        messages_before: u32,
+        messages_after: u32,
+        estimate_tokens: u32 = 0,
+        error_name: ?[]const u8 = null,
+    },
 };
 
 pub const Sink = struct {

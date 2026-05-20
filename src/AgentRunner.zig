@@ -955,22 +955,30 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             self.sink.push(.{ .thinking_delta = .{ .text = td.text } });
         },
         .compaction_summary_delta => |text| {
-            // For now: free the bytes; no sink event yet. The
-            // renderer plumbing will add an event variant when the UI
-            // design for "compacting..." progress lands. The agent
-            // loop fires these so downstream code (telemetry, future
-            // /perf dashboard) can observe streaming progress.
             defer allocator.free(text);
+            // Forward to the sink so downstream renderers can display
+            // transient "compacting..." progress. Sinks that don't
+            // care (Collector, Null) drop the variant; BufferSink and
+            // the TUI's main sink can route to a status line / dim
+            // text / side panel — visual choice belongs to each sink.
+            self.sink.push(.{ .compaction_summary_delta = .{ .text = text } });
         },
         .compaction_event => |ev| {
-            // Structured per-cycle event. Today: log at .info for
-            // operational visibility. The renderer / trajectory
-            // writer will consume the same variant when they grow a
-            // typed event consumer.
+            // Structured per-cycle event. Log for ops visibility AND
+            // forward to the sink so the renderer can clear any
+            // transient "compacting..." indicator + show a brief
+            // "compacted N → M (outcome)" status.
             log.info(
                 "compaction outcome={s} messages_before={d} messages_after={d} estimate_tokens={d}",
                 .{ ev.outcome, ev.messages_before, ev.messages_after, ev.estimate_tokens },
             );
+            self.sink.push(.{ .compaction_event = .{
+                .outcome = ev.outcome,
+                .messages_before = ev.messages_before,
+                .messages_after = ev.messages_after,
+                .estimate_tokens = ev.estimate_tokens,
+                .error_name = ev.error_name,
+            } });
         },
         .thinking_stop => {
             self.sink.push(.thinking_stop);
@@ -1086,6 +1094,14 @@ const MockSink = struct {
             } },
             .run_end => .run_end,
             .error_event => |ev| .{ .error_event = .{ .text = self.dupe(ev.text) } },
+            .compaction_summary_delta => |ev| .{ .compaction_summary_delta = .{ .text = self.dupe(ev.text) } },
+            .compaction_event => |ev| .{ .compaction_event = .{
+                .outcome = self.dupe(ev.outcome),
+                .messages_before = ev.messages_before,
+                .messages_after = ev.messages_after,
+                .estimate_tokens = ev.estimate_tokens,
+                .error_name = self.dupeOpt(ev.error_name),
+            } },
         };
         self.events.append(self.alloc, captured) catch {};
     }
@@ -1142,6 +1158,47 @@ test "persistAgentEvent is a no-op without an attached session handle" {
 
     try std.testing.expect(scb.session_handle == null);
     try std.testing.expect(!scb.persist_failed);
+}
+
+test "handleAgentEvent forwards compaction_summary_delta and compaction_event to the sink" {
+    // Renderer plumbing: the agent loop pushes both variants onto the
+    // queue; AgentRunner forwards them to the sink so a UI renderer
+    // (or any plugin sink) can route them however it wants. BufferSink
+    // currently no-ops on these — visual choice is pending — but the
+    // event surface must be observable.
+    const allocator = std.testing.allocator;
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    runner.handleAgentEvent(
+        .{ .compaction_summary_delta = try allocator.dupe(u8, "## Goal") },
+        allocator,
+    );
+    runner.handleAgentEvent(.{ .compaction_event = .{
+        .outcome = "summarized",
+        .messages_before = 12,
+        .messages_after = 4,
+        .estimate_tokens = 245760,
+    } }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
+    try std.testing.expectEqual(
+        SinkEvent.compaction_summary_delta,
+        std.meta.activeTag(mock.events.items[0]),
+    );
+    try std.testing.expectEqualStrings("## Goal", mock.events.items[0].compaction_summary_delta.text);
+    try std.testing.expectEqual(
+        SinkEvent.compaction_event,
+        std.meta.activeTag(mock.events.items[1]),
+    );
+    const ev = mock.events.items[1].compaction_event;
+    try std.testing.expectEqualStrings("summarized", ev.outcome);
+    try std.testing.expectEqual(@as(u32, 12), ev.messages_before);
+    try std.testing.expectEqual(@as(u32, 4), ev.messages_after);
 }
 
 test "handleAgentEvent .reset_assistant_text pushes assistant_reset" {
