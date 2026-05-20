@@ -11157,6 +11157,246 @@ test "handleCompactRequest synchronous strategy still works without async runtim
     }
 }
 
+// -- Phase 5 test backfill -------------------------------------------------
+// Three deleted v1 tests are now structurally covered by the existing
+// strategy_v2-era tests above (nil-return → use_default,
+// replace-returns-shape, tool_use-block-fidelity). The seven gap tests
+// below close the holes Agent D identified.
+
+test "handleCompactRequest sync strategy raising Lua error surfaces LuaHandlerError" {
+    // Phase 5 backfill (v1 port): the deleted "returns null and warns
+    // on strategy error" test, ported onto the strategy_v2 contract
+    // along its legacy sync path. The coroutine variant has different
+    // error semantics (logged + retired with outcome stay-default);
+    // see the next test.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) error("boom") end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try std.testing.expectError(error.LuaHandlerError, engine.handleCompactRequest(&req));
+    // Outcome stays at its initialised default; the agent loop's
+    // fallback chain still runs when error_name is set on the request
+    // surface by the dispatch wrapper (AgentRunner translates the
+    // returned error to req.error_name).
+    try std.testing.expect(req.outcome == .use_default);
+}
+
+test "handleCompactRequest async strategy raising Lua error does not deadlock" {
+    // The coroutine path's retire-on-error keeps the drain loop
+    // unblocked: handleCompactRequest returns cleanly with outcome
+    // staying at its initialised default. The error is logged but
+    // not surfaced as a Zig error because the coroutine retired —
+    // there is no protectedCall site to translate. The agent loop's
+    // Zig fallback chain takes over when it sees .use_default.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx) error("boom") end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.outcome == .use_default);
+}
+
+test "handleCompactRequest treats malformed return as use_default" {
+    // Strategy returns an integer instead of nil / table. Decoder
+    // logs a warn and falls back to .use_default so the agent loop's
+    // safety chain still runs. This is the "rejects invalid outcome
+    // shape" gap.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString("zag.compact.strategy(function(ctx) return 42 end)");
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "ask" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try engine.handleCompactRequest(&req);
+    try std.testing.expect(req.outcome == .use_default);
+}
+
+test "zag.compact.set_keep_recent_tokens reads back through get_keep_recent_tokens" {
+    // The default Lua strategy reads the budget through
+    // get_keep_recent_tokens to pick a cut point. Verifying the
+    // round-trip here proves the knob is observable from Lua and that
+    // its value survives whatever encoding the binding does.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try engine.lua.doString(
+        \\local before = zag.compact.get_keep_recent_tokens()
+        \\zag.compact.set_keep_recent_tokens(4242)
+        \\local after = zag.compact.get_keep_recent_tokens()
+        \\assert(before > 0, "default should be non-zero")
+        \\assert(after == 4242, "set should be observable through get")
+    );
+
+    try std.testing.expectEqual(@as(u32, 4242), engine.compact_keep_recent_tokens);
+}
+
+test "runDefaultSummarization detects prior summary and switches to UPDATE prompt" {
+    // Iterative-update path: when messages[0] is wrapped with the
+    // compaction summary sentinels, the Zig fallback should switch
+    // from SUMMARIZATION_PROMPT_TEMPLATE to
+    // UPDATE_SUMMARIZATION_PROMPT_TEMPLATE and thread the previous
+    // summary into the user prompt as a <previous-summary> block.
+    //
+    // Stub provider captures the StreamRequest's user prompt so the
+    // assertion can verify the UPDATE-shape directly.
+    const agent_module = @import("agent.zig");
+    const PromptCaptureProvider = struct {
+        captured_user_prompt: []u8 = &.{},
+        allocator: Allocator,
+
+        const vtable: @import("llm.zig").Provider.VTable = .{
+            .call = callImpl,
+            .call_streaming = callStreamingImpl,
+            .name = "prompt_capture",
+        };
+
+        fn callImpl(_: *anyopaque, _: *const @import("llm.zig").Request) @import("llm.zig").ProviderError!types.LlmResponse {
+            unreachable;
+        }
+
+        fn callStreamingImpl(
+            ptr: *anyopaque,
+            req: *const @import("llm.zig").StreamRequest,
+        ) @import("llm.zig").ProviderError!types.LlmResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (req.messages.len >= 1) {
+                const block = req.messages[0].content[0];
+                switch (block) {
+                    .text => |t| {
+                        self.captured_user_prompt = self.allocator.dupe(u8, t.text) catch &.{};
+                    },
+                    else => {},
+                }
+            }
+            // Emit one text_delta so the streaming callback path runs;
+            // return content empty so the caller falls back to the
+            // streamed accumulator.
+            req.callback.on_event(req.callback.ctx, .{ .text_delta = "updated summary" });
+            return .{
+                .content = &.{},
+                .stop_reason = .end_turn,
+                .input_tokens = 1,
+                .output_tokens = 1,
+            };
+        }
+
+        fn provider(self: *@This()) @import("llm.zig").Provider {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var capture: PromptCaptureProvider = .{ .allocator = alloc };
+    defer alloc.free(capture.captured_user_prompt);
+    const provider = capture.provider();
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    // Build a prior-summary message at the head, plus a few trailing
+    // messages so findCutPoint has something to summarize.
+    const prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+    const suffix = "\n</summary>";
+    const inner = "PRIOR FACTS GO HERE";
+    const wrapped = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ prefix, inner, suffix });
+    defer alloc.free(wrapped);
+
+    var b0 = [_]types.ContentBlock{.{ .text = .{ .text = wrapped } }};
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "new ask" } }};
+    var b2 = [_]types.ContentBlock{.{ .text = .{ .text = "new answer" } }};
+    var b3 = [_]types.ContentBlock{.{ .text = .{ .text = "current turn" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &b0 },
+        .{ .role = .user, .content = &b1 },
+        .{ .role = .assistant, .content = &b2 },
+        .{ .role = .user, .content = &b3 },
+    };
+
+    const maybe_replacement = try agent_module.runDefaultSummarization(
+        &messages,
+        provider,
+        1, // tiny budget so the cut sits past msg[1]
+        alloc,
+        &queue,
+        &cancel,
+    );
+    try std.testing.expect(maybe_replacement != null);
+    const replacement = maybe_replacement.?;
+    defer {
+        for (replacement) |m| m.deinit(alloc);
+        alloc.free(replacement);
+    }
+
+    // The provider's user prompt must include the previous-summary
+    // wrapper AND the inner prior facts text.
+    try std.testing.expect(std.mem.indexOf(u8, capture.captured_user_prompt, "<previous-summary>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.captured_user_prompt, "PRIOR FACTS GO HERE") != null);
+
+    // Drain queue so the test allocator doesn't see leaked delta bytes.
+    var buf: [16]agent_events.AgentEvent = undefined;
+    while (true) {
+        const n = queue.drain(&buf);
+        if (n == 0) break;
+        for (buf[0..n]) |ev| ev.freeOwned(alloc);
+    }
+}
+
+test "CompactRequest freeOutcome is idempotent" {
+    // Calling freeOutcome twice on a .replace outcome must not
+    // double-free. After the first call the outcome is reset to
+    // .use_default; the second call sees that sentinel and returns
+    // without touching memory.
+    const alloc = std.testing.allocator;
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "x" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
+
+    // Allocate a real .replace payload owned by the request's allocator.
+    const replacement = try alloc.alloc(types.Message, 1);
+    const text = try alloc.dupe(u8, "summary");
+    const blocks = try alloc.alloc(types.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = text } };
+    replacement[0] = .{ .role = .user, .content = blocks };
+    const summary_owned = try alloc.dupe(u8, "audit");
+    req.outcome = .{ .replace = .{ .messages = replacement, .summary = summary_owned } };
+
+    req.freeOutcome();
+    try std.testing.expect(req.outcome == .use_default);
+    req.freeOutcome(); // must not crash or double-free
+    try std.testing.expect(req.outcome == .use_default);
+}
+
 test "zag.loop.default treats a streak reset as a non-event" {
     // The agent owns streak accounting: a different tool input collapses
     // identical_streak back to 1. The default detector must stay silent
