@@ -1281,7 +1281,7 @@ test "sessions sidebar marks the current-session row with a glyph" {
 // iterator emits an indented child row per subagent task_start entry.
 // Collapsing drops them back. The filter (Task 4.1) intentionally
 // applies only to session names, never to child rows under an expanded
-// parent, so we don't even exercise it here — that decision is
+// parent, so we don't even exercise it here; that decision is
 // documented in `_collect_rows`.
 test "sessions sidebar renders subagent children under an expanded session" {
     const allocator = testing.allocator;
@@ -1305,7 +1305,7 @@ test "sessions sidebar renders subagent children under an expanded session" {
     const sid = try allocator.dupe(u8, h.id[0..h.id_len]);
     defer allocator.free(sid);
     // Synthetic task_start: same shape Task.zig writes when a subagent
-    // is spawned — a JSON blob with at least a `prompt` field.
+    // is spawned, a JSON blob with at least a `prompt` field.
     _ = try h.appendEntry(.{
         .entry_type = .task_start,
         .content = "{\"agent\":\"general\",\"prompt\":\"investigate the foo bar baz issue thoroughly\"}",

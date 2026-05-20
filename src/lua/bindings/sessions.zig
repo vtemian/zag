@@ -3,20 +3,20 @@
 //! Read-only enumeration and mutation surface consumed by the sessions
 //! sidebar plugin. The full surface is:
 //!
-//!   * `zag.sessions.list()` — array of `{id, name, model, created_ms,
+//!   * `zag.sessions.list()`: array of `{id, name, model, created_ms,
 //!     updated_ms, message_count, project}` rows aggregated across every
 //!     project recorded in `ProjectRegistry`, sorted by `updated_ms`
 //!     descending.
-//!   * `zag.sessions.rename(id, new_name, project_path?)` — update the
+//!   * `zag.sessions.rename(id, new_name, project_path?)`:update the
 //!     `meta.json` for `id` in `project_path`. When `project_path` is
 //!     omitted, walks the registry to find the owning project. Raises
 //!     on missing id or unknown project_path.
-//!   * `zag.sessions.delete(id, project_path?)` — remove `.jsonl` +
+//!   * `zag.sessions.delete(id, project_path?)`:remove `.jsonl` +
 //!     `.meta.json` for the session. Same lookup semantics as rename;
 //!     a delete of an already-absent id is a no-op.
-//!   * `zag.sessions.current()` — id string of the session bound to the
+//!   * `zag.sessions.current()`:id string of the session bound to the
 //!     focused conversation pane, or `nil`.
-//!   * `zag.sessions.subagents(id, project_path?)` — array of
+//!   * `zag.sessions.subagents(id, project_path?)`:array of
 //!     `{call_id, tool_input, timestamp_ms}` rows for each `task_start`
 //!     entry in `id`'s JSONL. Same lookup semantics as rename.
 //!
@@ -32,7 +32,7 @@
 //! avoids re-registering visited projects in the registry (which would
 //! be circular).
 //!
-//!   * `zag.sessions.open(id, project_path?)` — split the focused
+//!   * `zag.sessions.open(id, project_path?)`:split the focused
 //!     pane and bind the new leaf to the existing session `id`. v1
 //!     limitation: when `project_path` is supplied and differs from
 //!     the live cwd realpath, the call raises
@@ -49,7 +49,6 @@ const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const Session = @import("../../Session.zig");
 const ProjectRegistry = @import("../../project_registry.zig");
 const Hooks = @import("../../Hooks.zig");
-const WindowManager = @import("../../WindowManager.zig");
 
 const log = std.log.scoped(.lua_sessions);
 
@@ -229,7 +228,7 @@ fn pushRow(lua: *Lua, row: Row) void {
     lua.setField(-2, "project");
 }
 
-/// `zag.sessions.list()` — see top-of-file docstring.
+/// `zag.sessions.list()`:see top-of-file docstring.
 fn zagSessionsListFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
     var collection = collectRows(engine.allocator) catch |err| {
@@ -325,7 +324,7 @@ fn resolveProjectFor(
     return try allocator.dupe(u8, hint);
 }
 
-/// `zag.sessions.rename(id, new_name, project_path?)` — see top-of-file docstring.
+/// `zag.sessions.rename(id, new_name, project_path?)`:see top-of-file docstring.
 fn zagSessionsRenameFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
 
@@ -370,7 +369,7 @@ fn zagSessionsRenameFn(lua: *Lua) i32 {
     return 0;
 }
 
-/// `zag.sessions.delete(id, project_path?)` — see top-of-file docstring.
+/// `zag.sessions.delete(id, project_path?)`:see top-of-file docstring.
 fn zagSessionsDeleteFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
 
@@ -414,7 +413,7 @@ fn zagSessionsDeleteFn(lua: *Lua) i32 {
     return 0;
 }
 
-/// `zag.sessions.current()` — see top-of-file docstring.
+/// `zag.sessions.current()`:see top-of-file docstring.
 fn zagSessionsCurrentFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
     const wm = engine.window_manager orelse {
@@ -443,7 +442,7 @@ fn pushUlidString(lua: *Lua, ulid_bytes: [26]u8) void {
     _ = lua.pushString(ulid_bytes[0..]);
 }
 
-/// `zag.sessions.subagents(id, project_path?)` — see top-of-file docstring.
+/// `zag.sessions.subagents(id, project_path?)`:see top-of-file docstring.
 fn zagSessionsSubagentsFn(lua: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(lua);
 
@@ -511,7 +510,7 @@ fn zagSessionsSubagentsFn(lua: *Lua) i32 {
     return 1;
 }
 
-/// `zag.sessions.open(id, project_path?)` — see top-of-file docstring.
+/// `zag.sessions.open(id, project_path?)`:see top-of-file docstring.
 ///
 /// Splits the focused leaf and binds the new pane to the existing
 /// session `id`. Cross-project opens are rejected up-front because

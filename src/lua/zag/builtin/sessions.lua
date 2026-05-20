@@ -53,7 +53,7 @@ end
 function M.open()
     if state.pane_id then return end
 
-    -- The currently focused pane becomes the "host" — when the user
+    -- The currently focused pane becomes the "host". When the user
     -- later picks a session from the sidebar (Task 1.4b), the bound
     -- session swaps into this pane rather than the sidebar itself.
     local tree = zag.layout.tree()
@@ -159,7 +159,7 @@ function M._bind_keymaps()
     -- char as a buffer-local normal-mode keymap whose handler branches
     -- on `state.mode`. In normal mode the printable bindings are
     -- no-ops UNLESS the char also has a structural binding (j, k, l,
-    -- h, q, G) — those are registered AFTER the printable loop, which
+    -- h, q, G); those are registered AFTER the printable loop, which
     -- by the Registry's overwrite-in-place semantics replaces the
     -- printable handler with the structural one. The structural
     -- handlers then dispatch on `state.mode` themselves so the user can
@@ -424,7 +424,7 @@ end
 -- target. Errors (unknown id, invalid name) are caught and logged; on
 -- failure we still exit rename mode rather than trap the user. The
 -- partial buffer is lost but the original name is intact and the error
--- surfaces in the log — the more forgiving UX per the plan.
+-- surfaces in the log; the more forgiving UX per the plan.
 function M._rename_commit()
     if state.mode ~= "rename" then return end
     local target = state.rename_target
@@ -475,7 +475,7 @@ end
 --
 -- Caveat called out in the plan's risk register: if the session
 -- being deleted is currently displayed in some conversation pane, we
--- don't know — the binding has no "is this session bound to any pane"
+-- don't know: the binding has no "is this session bound to any pane"
 -- query in v1. The pane will keep displaying the now-stale session
 -- (still readable in-memory; the on-disk files are gone). Live with
 -- it for v1.
@@ -495,7 +495,7 @@ function M._delete_enter()
     -- helper invokes it with the chosen item; "yes" deletes, "no"
     -- cancels. Failures from `zag.sessions.delete` (FS error, session
     -- in use, etc.) are caught here so the sidebar never crashes on
-    -- a transient delete failure — the error surfaces in the log.
+    -- a transient delete failure; the error surfaces in the log.
     local function on_commit(item)
         if item and item.word == "yes" then
             local ok, err = pcall(zag.sessions.delete, target.session_id, target.project)
@@ -531,8 +531,8 @@ function M._delete_enter()
     if pane == nil then return end
 
     local items = {
-        { word = "yes", abbr = "yes — delete " .. target.name },
-        { word = "no",  abbr = "no — cancel" },
+        { word = "yes", abbr = "yes, delete " .. target.name },
+        { word = "no",  abbr = "no, cancel" },
     }
 
     pcall(popup.open, {
@@ -662,7 +662,7 @@ end
 -- session row has state.expanded[id] truthy, the iterator emits one
 -- indented child row per subagent task_start entry directly after the
 -- parent. The substring filter intentionally narrows on session names
--- only — child rows under a matching parent are always shown, never
+-- only; child rows under a matching parent are always shown, never
 -- filtered themselves. Keeps the filter cognitively simple.
 function M._collect_rows()
     local rows = {}
@@ -694,13 +694,13 @@ end
 -- Resolve which session id (if any) is bound to the focused
 -- conversation pane right now. Returns nil when:
 --   * No window manager is attached (headless tests; `zag.layout.tree`
---     raises) — the pcall keeps us silent rather than erroring the
+--     raises); the pcall keeps us silent rather than erroring the
 --     render path.
 --   * The focused pane IS the sidebar itself. The sidebar shows a
 --     scratch buffer, not a session, so highlighting its own row as
 --     "current" would be meaningless.
 --   * The focused pane has no conversation/session_handle (scratch
---     buffer, model picker, etc.) — `zag.pane.session_id` returns nil
+--     buffer, model picker, etc.); `zag.pane.session_id` returns nil
 --     in that case.
 --
 -- `state.current_session_id` is a test-only override (set by
@@ -870,7 +870,7 @@ function M._rename_escape_for_test() M._rename_escape() end
 
 -- Task 7.3 test seams. The confirm popup is owned by
 -- `zag.popup.list`, which needs a real WindowManager to render its
--- float — headless engines can't bind one. The plugin still walks
+-- float; headless engines can't bind one. The plugin still walks
 -- `state.pending_delete = { target, on_commit, on_cancel }` before
 -- opening the popup, so tests use these seams to drive each branch
 -- without touching the popup helper itself.
