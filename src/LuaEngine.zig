@@ -248,6 +248,16 @@ pub const LuaEngine = struct {
     /// telemetry and (eventually) to honour per-model overrides in
     /// `zag.llm.complete`. Cleared alongside `current_provider`.
     current_model_spec: ?@import("llm.zig").ModelSpec = null,
+    /// Borrowed pointer to the agent loop's event queue. Set by
+    /// `runLoopStreaming` at agent-loop entry and cleared at exit,
+    /// same lifetime contract as `current_provider`. Consumed by
+    /// `zag.llm.complete` when the caller opts in to streaming
+    /// progress: the worker uses `callStreaming` and pushes
+    /// `compaction_summary_delta` events onto this queue so the UI
+    /// can render live progress. Null when no agent loop is attached
+    /// (some tests, headless paths) — the streaming option is then
+    /// a no-op and the call behaves as the synchronous default.
+    current_event_queue: ?*@import("agent_events.zig").EventQueue = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
 
@@ -11056,10 +11066,22 @@ const StubCompactProvider = struct {
     }
 
     fn callStreamingImpl(
-        _: *anyopaque,
-        _: *const @import("llm.zig").StreamRequest,
+        ptr: *anyopaque,
+        req: *const @import("llm.zig").StreamRequest,
     ) @import("llm.zig").ProviderError!types.LlmResponse {
-        unreachable; // Not used in the compact-coroutine test path.
+        // Used by the streaming path of zag.llm.complete. Emits the
+        // canned response as a single text_delta, then returns the
+        // standard "no content, end_turn" shape — the worker's
+        // streamed-accumulator fallback assembles the real text from
+        // the emitted delta.
+        const self: *StubCompactProvider = @ptrCast(@alignCast(ptr));
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = self.response_text });
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 1,
+            .output_tokens = 1,
+        };
     }
 
     fn provider(self: *StubCompactProvider) @import("llm.zig").Provider {
@@ -11370,6 +11392,80 @@ test "runDefaultSummarization detects prior summary and switches to UPDATE promp
         if (n == 0) break;
         for (buf[0..n]) |ev| ev.freeOwned(alloc);
     }
+}
+
+test "zag.llm.complete with stream=true emits compaction_summary_delta to attached queue" {
+    // Lua-side streaming opt-in. The default Lua strategy passes
+    // stream=true; the worker's callStreaming path pushes one delta
+    // per emitted text_delta onto the engine's current_event_queue.
+    // The strategy still receives the full assembled text at the end.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubCompactProvider{ .response_text = "STREAM ME" };
+    const provider = stub.provider();
+    engine.current_provider = &provider;
+    defer engine.current_provider = null;
+
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+    engine.current_event_queue = &queue;
+    defer engine.current_event_queue = null;
+
+    // Register a strategy that opts into streaming and returns the
+    // received text wrapped as a replacement. Mirrors what the real
+    // default Lua strategy does.
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  local resp = zag.llm.complete({
+        \\    system = "x",
+        \\    messages = {{ role = "user", content = "history" }},
+        \\    stream = true,
+        \\  })
+        \\  return {
+        \\    messages = { { role = "user", content = {{ type = "text", text = resp.text }} } },
+        \\  }
+        \\end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    try engine.handleCompactRequest(&req);
+
+    // Strategy got the assembled text.
+    switch (req.outcome) {
+        .replace => |r| try std.testing.expectEqualStrings(
+            "STREAM ME",
+            r.messages[0].content[0].text.text,
+        ),
+        else => return error.TestUnexpectedOutcome,
+    }
+
+    // The queue saw at least one compaction_summary_delta event with
+    // the streamed text. Drain and verify.
+    var buf: [16]agent_events.AgentEvent = undefined;
+    var found_delta = false;
+    while (true) {
+        const n = queue.drain(&buf);
+        if (n == 0) break;
+        for (buf[0..n]) |ev| {
+            switch (ev) {
+                .compaction_summary_delta => |t| {
+                    if (std.mem.indexOf(u8, t, "STREAM ME") != null) found_delta = true;
+                    alloc.free(t);
+                },
+                else => ev.freeOwned(alloc),
+            }
+        }
+    }
+    try std.testing.expect(found_delta);
 }
 
 test "CompactRequest freeOutcome is idempotent" {

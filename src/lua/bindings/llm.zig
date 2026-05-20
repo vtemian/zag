@@ -70,6 +70,21 @@ pub fn zagLlmCompleteFn(co: *Lua) i32 {
     }
     co.pop(1);
 
+    // stream (optional bool). When true AND an event queue is attached
+    // to the engine, the worker uses provider.callStreaming and pushes
+    // compaction_summary_delta events to the queue. The synchronous
+    // result is still posted to the completion queue.
+    var progress_queue: ?*@import("../../agent_events.zig").EventQueue = null;
+    _ = co.getField(1, "stream");
+    const want_stream = co.toBoolean(-1);
+    co.pop(1);
+    if (want_stream) {
+        progress_queue = engine.current_event_queue;
+        // Silently no-op when no queue is attached (some tests,
+        // headless paths). The strategy still gets the full text;
+        // it just doesn't see live progress.
+    }
+
     // messages (required array of {role, content}).
     _ = co.getField(1, "messages");
     if (co.typeOf(-1) != .table) {
@@ -129,6 +144,7 @@ pub fn zagLlmCompleteFn(co: *Lua) i32 {
             .max_tokens = max_tokens,
             .provider = provider,
             .model_id = model_id,
+            .progress_queue = progress_queue,
         } },
         .thread_ref = task.thread_ref,
         .scope = task.scope,

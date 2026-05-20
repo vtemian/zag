@@ -321,6 +321,18 @@ pub const LlmCompleteSpec = struct {
     /// Model id for telemetry; borrowed. Empty when no model is
     /// attached.
     model_id: []const u8 = "",
+    /// Optional progress channel for streaming. When non-null the
+    /// worker uses `provider.callStreaming` instead of `provider.call`
+    /// and pushes one `AgentEvent.compaction_summary_delta` per
+    /// streamed text_delta onto this queue. The final result is still
+    /// posted via the completion queue the same way as the non-
+    /// streaming path. Null means "synchronous; no progress events"
+    /// — the default for backward compat.
+    ///
+    /// Pointer is borrowed from `LuaEngine.current_event_queue`; the
+    /// agent loop pins the queue for the duration of the run. The
+    /// worker must not retain it past the call.
+    progress_queue: ?*@import("../agent_events.zig").EventQueue = null,
 };
 
 /// Success payload for an `llm_complete` job. `text` is the

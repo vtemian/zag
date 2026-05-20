@@ -138,10 +138,12 @@ pub fn runLoopStreaming(
     if (lua_engine) |engine| {
         engine.current_provider = &provider;
         engine.current_model_spec = model_spec;
+        engine.current_event_queue = queue;
     }
     defer if (lua_engine) |engine| {
         engine.current_provider = null;
         engine.current_model_spec = null;
+        engine.current_event_queue = null;
     };
 
     // Loop-detector state: track the most recent (name, input) pair and a

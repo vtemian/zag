@@ -14,6 +14,15 @@
 //! the worker pool joins on shutdown, so the borrow is safe for the
 //! call duration. A stale or null pointer at submit time is rejected
 //! by the binding before reaching the worker.
+//!
+//! Streaming mode: when `spec.progress_queue` is non-null the worker
+//! uses `callStreaming` instead of `call` and pushes one
+//! `AgentEvent.compaction_summary_callback` per streamed text_delta
+//! onto the queue. The final response is still returned through the
+//! completion queue; deltas are progress-only and the strategy still
+//! sees the complete text at the end. Other content (tool_use,
+//! thinking, etc.) is dropped from the deltas — they're for live UI
+//! feedback during compaction, not structured output.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,6 +30,7 @@ const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
 const types = @import("../../types.zig");
 const llm = @import("../../llm.zig");
+const agent_events = @import("../../agent_events.zig");
 
 const log = std.log.scoped(.lua_llm);
 
@@ -43,6 +53,43 @@ fn setLlmErr(alloc: Allocator, job: *Job, err: anyerror) void {
         else => .http_error,
     };
     job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
+}
+
+/// Streaming callback context: holds the queue and the allocator so
+/// the worker can dupe each delta onto a heap slice (the SSE parser's
+/// scratch buffer borrows the slice; we need ownership for the
+/// queue's freeOwned path). Also accumulates the full text locally
+/// so the final response can be assembled from streamed deltas when
+/// the provider doesn't also include the full content on the
+/// `LlmResponse`.
+const StreamCtx = struct {
+    queue: *agent_events.EventQueue,
+    allocator: Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    cancel: std.atomic.Value(bool) = .init(false),
+};
+
+fn onStreamEvent(opaque_ctx: *anyopaque, event: llm.StreamEvent) void {
+    const ctx: *StreamCtx = @ptrCast(@alignCast(opaque_ctx));
+    switch (event) {
+        .text_delta => |t| {
+            // Local accumulation for the final summary text. A failure
+            // here means the worker can't continue building the
+            // response; cancel to short-circuit the stream cleanly.
+            ctx.buf.appendSlice(ctx.allocator, t) catch {
+                ctx.cancel.store(true, .release);
+                return;
+            };
+            const duped = ctx.allocator.dupe(u8, t) catch return;
+            ctx.queue.pushWithBackpressure(
+                .{ .compaction_summary_delta = duped },
+                agent_events.default_backpressure_ms,
+            ) catch {
+                ctx.allocator.free(duped);
+            };
+        },
+        else => {},
+    }
 }
 
 pub fn executeLlmComplete(alloc: Allocator, job: *Job) void {
@@ -80,43 +127,80 @@ pub fn executeLlmComplete(alloc: Allocator, job: *Job) void {
         messages[i] = .{ .role = role, .content = blocks };
     }
 
-    const req: llm.Request = .{
-        .system_stable = spec.system,
-        .system_volatile = "",
-        .messages = messages,
-        .tool_definitions = &.{},
-        .allocator = alloc,
-    };
+    var response: types.LlmResponse = undefined;
+    var stream_ctx: StreamCtx = undefined;
+    var have_stream = false;
 
-    const response = spec.provider.call(&req) catch |err| {
-        setLlmErr(alloc, job, err);
-        return;
-    };
+    if (spec.progress_queue) |progress_queue| {
+        // Streaming path. Build a StreamRequest and dispatch through
+        // callStreaming; the callback above pushes deltas + accumulates.
+        stream_ctx = .{ .queue = progress_queue, .allocator = alloc };
+        have_stream = true;
+        const stream_req: llm.StreamRequest = .{
+            .system_stable = spec.system,
+            .system_volatile = "",
+            .messages = messages,
+            .tool_definitions = &.{},
+            .allocator = alloc,
+            .callback = .{
+                .ctx = &stream_ctx,
+                .on_event = onStreamEvent,
+            },
+            .cancel = &stream_ctx.cancel,
+        };
+        response = spec.provider.callStreaming(&stream_req) catch |err| {
+            stream_ctx.buf.deinit(alloc);
+            setLlmErr(alloc, job, err);
+            return;
+        };
+    } else {
+        const req: llm.Request = .{
+            .system_stable = spec.system,
+            .system_volatile = "",
+            .messages = messages,
+            .tool_definitions = &.{},
+            .allocator = alloc,
+        };
+        response = spec.provider.call(&req) catch |err| {
+            setLlmErr(alloc, job, err);
+            return;
+        };
+    }
     defer response.deinit(alloc);
+    defer if (have_stream) stream_ctx.buf.deinit(alloc);
 
-    // Assemble the response text from every .text content block.
-    // Tool_use / thinking blocks are dropped: this primitive is for
-    // straight completions and the caller doesn't expect structured
-    // output. If the response has zero text, we still return the empty
-    // string rather than an error.
-    var total: usize = 0;
-    for (response.content) |block| switch (block) {
-        .text => |t| total += t.text.len,
-        else => {},
-    };
-    const buf = alloc.alloc(u8, total) catch {
-        job.err_tag = .io_error;
-        job.err_detail = alloc.dupe(u8, "OOM") catch null;
-        return;
-    };
-    var off: usize = 0;
-    for (response.content) |block| switch (block) {
-        .text => |t| {
-            @memcpy(buf[off .. off + t.text.len], t.text);
-            off += t.text.len;
-        },
-        else => {},
-    };
+    // Prefer the streamed accumulator when present; the response
+    // content slice is typically empty for streaming-only providers.
+    // Falls back to walking response.content for the synchronous path
+    // and for providers that also return the full content on the
+    // LlmResponse.
+    var buf: []u8 = undefined;
+    if (have_stream and stream_ctx.buf.items.len > 0) {
+        buf = alloc.dupe(u8, stream_ctx.buf.items) catch {
+            job.err_tag = .io_error;
+            job.err_detail = alloc.dupe(u8, "OOM") catch null;
+            return;
+        };
+    } else {
+        var total: usize = 0;
+        for (response.content) |block| switch (block) {
+            .text => |t| total += t.text.len,
+            else => {},
+        };
+        buf = alloc.alloc(u8, total) catch {
+            job.err_tag = .io_error;
+            job.err_detail = alloc.dupe(u8, "OOM") catch null;
+            return;
+        };
+        var off: usize = 0;
+        for (response.content) |block| switch (block) {
+            .text => |t| {
+                @memcpy(buf[off .. off + t.text.len], t.text);
+                off += t.text.len;
+            },
+            else => {},
+        };
+    }
 
     job.result = .{ .llm_complete = .{
         .text = buf,

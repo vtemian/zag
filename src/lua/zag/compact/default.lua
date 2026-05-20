@@ -243,6 +243,11 @@ zag.compact.strategy(function(ctx)
   local resp, err = zag.llm.complete({
     system = prompts.SYSTEM,
     messages = { { role = "user", content = user_prompt } },
+    -- Opt in to streaming: each text_delta arrives on the agent's
+    -- event queue as a compaction_summary_delta so the UI can render
+    -- live "compacting..." progress while the worker call is in
+    -- flight. The final response text is still returned here.
+    stream = true,
   })
   if not resp or type(resp) ~= "table" or type(resp.text) ~= "string" or #resp.text == 0 then
     -- Network / auth / decode failure. Return nil so the Zig fallback
