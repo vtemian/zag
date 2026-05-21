@@ -67,19 +67,23 @@ function M.open()
     local buffer_id = zag.buffer.create { kind = "scratch", name = "sessions" }
     state.buffer_id = buffer_id
 
-    -- side = "first" anchors the new pane on the left; the host pane
-    -- becomes the right child of the freshly-created split. Size the
-    -- sidebar to roughly 30 cells regardless of terminal width and
-    -- clamp into [0.1, 0.4] so a pathologically narrow terminal can't
-    -- collapse the sidebar to 0 cells and a very wide terminal can't
-    -- let it dominate the layout. The `cols or 100` fallback keeps the
-    -- division safe if a future binding regression strips the field.
+    -- side = "first" anchors the new pane on the left; the rest of
+    -- the layout tree becomes the right child of the freshly-created
+    -- root-level split. Going through `split_root` (rather than the
+    -- focused-leaf `split`) means the sidebar spans full screen height
+    -- even when the user has the layout broken into multiple panes.
+    -- Size the sidebar to roughly 30 cells regardless of terminal
+    -- width and clamp into [0.1, 0.4] so a pathologically narrow
+    -- terminal can't collapse the sidebar to 0 cells and a very wide
+    -- terminal can't let it dominate the layout. The `cols or 100`
+    -- fallback keeps the division safe if a future binding regression
+    -- strips the field.
     local cols = tree.cols or 100
     local target_cells = 30
     local ratio = target_cells / cols
     if ratio < 0.1 then ratio = 0.1 end
     if ratio > 0.4 then ratio = 0.4 end
-    local pane_id = zag.layout.split(host, "vertical", {
+    local pane_id = zag.layout.split_root("vertical", {
         buffer = buffer_id,
         side = "first",
         ratio = ratio,
