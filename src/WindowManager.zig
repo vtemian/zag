@@ -908,6 +908,71 @@ pub fn splitByIdSide(
     return error.HandleMissing;
 }
 
+/// Top-level wrapper variant: split the ENTIRE current root rather
+/// than any focused leaf. The supplied `attached` buffer lands as the
+/// `side` child of a fresh root-level Split; the previous root (be it
+/// a leaf or another split) becomes the sibling untouched. Used by
+/// the sessions sidebar so it always spans full screen height, even
+/// when the user has the layout broken into multiple inner panes.
+///
+/// Mirrors `splitByIdSide` for the binding surface: the PaneEntry for
+/// the attached buffer is heap-allocated so the Layout leaf can borrow
+/// its viewport at a stable address. Returns the new leaf's handle.
+pub fn splitRootSide(
+    self: *WindowManager,
+    direction: Layout.SplitDirection,
+    attached: AttachedSurface,
+    side: Layout.Side,
+    ratio: f32,
+) !NodeRegistry.Handle {
+    const prev_focus = self.layout.getFocusedLeaf();
+
+    const pane: Pane = .{
+        .buffer = attached.buffer,
+        .view = attached.view,
+        .conversation = null,
+        .runner = null,
+        .wm = self,
+    };
+
+    const entry = try self.allocator.create(PaneEntry);
+    errdefer self.allocator.destroy(entry);
+    entry.* = .{ .pane = pane };
+
+    try self.extra_panes.append(self.allocator, entry);
+    errdefer _ = self.extra_panes.pop();
+
+    try self.layout.splitRoot(
+        direction,
+        ratio,
+        .{ .buffer = attached.buffer, .view = attached.view, .viewport = &entry.pane.viewport },
+        side,
+    );
+
+    // splitRoot leaves focus on the new leaf. Stamp its handle on the
+    // pane entry so draft-change hooks fire with the correct id.
+    if (self.layout.focused) |new_leaf| {
+        if (self.handleForNode(new_leaf)) |handle| {
+            entry.pane.handle = handle;
+        } else |err| {
+            log.warn("attached root-split leaf missing from registry: {}", .{err});
+        }
+    }
+
+    self.layout.recalculate(self.screen.width, self.screen.height);
+    self.compositor.layout_dirty = true;
+    self.notifyLeafRects();
+    self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+
+    const new_node = self.layout.focused orelse return error.FocusLost;
+    for (self.node_registry.slots.items, 0..) |slot, i| {
+        if (slot.node == new_node) {
+            return .{ .index = @intCast(i), .generation = slot.generation };
+        }
+    }
+    return error.HandleMissing;
+}
+
 /// Close the leaf or float identified by `target`. When `caller` is
 /// non-null and refers to the same pane, the call fails with
 /// `error.ClosingActivePane` so a plugin tool cannot pull the rug out
@@ -4547,6 +4612,117 @@ test "zag.layout.split honors side = \"first\" by anchoring the new pane on the 
     // The original root pane survived: its buffer pointer matches the
     // conversation buffer attached to the test's `pane` value.
     try std.testing.expectEqual(view.buf().ptr, root_node.split.second.leaf.buffer.ptr);
+}
+
+test "zag.layout.split_root creates a full-height left pane regardless of focus" {
+    const allocator = std.testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = &engine,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    engine.window_manager = wm;
+    engine.buffer_registry = &wm.buffer_registry;
+
+    // Seed a two-pane layout: split the root into [root | scratch_a]
+    // via the regular focused-leaf split path. The focused leaf after
+    // this is the freshly created right pane; the bug being fixed is
+    // that under the old `split` path the sidebar would nest under it
+    // instead of wrapping the whole tree.
+    const bh_a = try wm.buffer_registry.createScratch("scratch_a");
+    const buffer_a_id = try BufferRegistry.formatId(allocator, bh_a);
+    defer allocator.free(buffer_a_id);
+    const root_handle = try wm.handleForNode(wm.layout.root.?);
+    const root_pane_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_pane_id);
+    const seed_script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.scratch_a_id = zag.layout.split("{s}", "vertical", {{ buffer = "{s}" }})
+    , .{ root_pane_id, buffer_a_id }, 0);
+    defer allocator.free(seed_script);
+    try engine.lua.doString(seed_script);
+
+    // Snapshot the inner split node (current root) so we can assert
+    // splitRoot preserves it as a child of the new outer split
+    // rather than rebuilding it.
+    const inner_split = wm.layout.root.?;
+    try std.testing.expect(inner_split.* == .split);
+
+    const bh = try wm.buffer_registry.createScratch("sidebar");
+    const sidebar_buffer = try wm.buffer_registry.asBuffer(bh);
+    const buffer_id = try BufferRegistry.formatId(allocator, bh);
+    defer allocator.free(buffer_id);
+    const script = try std.fmt.allocPrintSentinel(allocator,
+        \\_G.new_id = zag.layout.split_root("vertical", {{ buffer = "{s}", side = "first", ratio = 0.2 }})
+    , .{buffer_id}, 0);
+    defer allocator.free(script);
+    try engine.lua.doString(script);
+
+    _ = try engine.lua.getGlobal("new_id");
+    defer engine.lua.pop(1);
+    const new_id = try engine.lua.toString(-1);
+    const new_handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
+
+    try std.testing.expectEqual(sidebar_buffer.ptr, new_node.leaf.buffer.ptr);
+
+    // The new outer root is a split; the sidebar is the first child
+    // and the pre-existing inner split is the second child untouched.
+    // Layout shape MUST be [sidebar, original_root], not nested
+    // [..., [sidebar, ...]].
+    const outer = wm.layout.root.?;
+    try std.testing.expect(outer.* == .split);
+    try std.testing.expectEqual(new_node, outer.split.first);
+    try std.testing.expectEqual(inner_split, outer.split.second);
+    try std.testing.expect(outer.split.second.* == .split);
+
+    // Rect check: ratio = 0.2 of 80 cols = 16; sidebar spans full
+    // content height (screen height 24 minus the 1-row status line).
+    try std.testing.expectEqual(@as(u16, 0), new_node.leaf.rect.x);
+    try std.testing.expectEqual(@as(u16, 0), new_node.leaf.rect.y);
+    try std.testing.expectEqual(@as(u16, 16), new_node.leaf.rect.width);
+    try std.testing.expectEqual(@as(u16, 23), new_node.leaf.rect.height);
 }
 
 test "zag.layout.split rejects an unknown side value" {

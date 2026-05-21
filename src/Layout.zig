@@ -613,6 +613,60 @@ pub fn splitHorizontalSide(self: *Layout, ratio: f32, surface: Surface, side: Si
     try self.splitFocused(.horizontal, ratio, surface, side);
 }
 
+/// Wrap the entire current root in a new split that pairs it with a
+/// freshly attached leaf. Unlike `splitFocused` (which nests the new
+/// leaf inside whichever leaf currently holds focus), `splitRoot`
+/// always produces a top-level split: the existing tree, whatever its
+/// shape, becomes one child of the new split. The sessions sidebar is
+/// the motivating caller: it wants to span the full screen height as
+/// a left column regardless of which inner pane is focused.
+///
+/// `side` picks which slot the new leaf occupies. `.first` places it
+/// on the left (vertical) or top (horizontal); `.second` places it on
+/// the right or bottom. The `ratio` is always the proportion of the
+/// first child.
+///
+/// Focus moves to the new leaf to mirror `splitFocused`. Callers that
+/// need the prior focus restored snapshot it themselves. Rect fields
+/// stay zero until the next `recalculate(cols, rows)` call.
+pub fn splitRoot(self: *Layout, direction: SplitDirection, ratio: f32, new_surface: Surface, side: Side) !void {
+    const r = self.root orelse return error.NoRoot;
+
+    const new_leaf = try self.allocator.create(LayoutNode);
+    errdefer self.allocator.destroy(new_leaf);
+
+    new_leaf.* = .{ .leaf = .{
+        .buffer = new_surface.buffer,
+        .view = new_surface.view,
+        .viewport = new_surface.viewport,
+        .rect = r.getRect(),
+    } };
+    try self.trackRegister(new_leaf);
+
+    const split = try self.allocator.create(LayoutNode);
+    errdefer self.allocator.destroy(split);
+
+    const first_child: *LayoutNode = switch (side) {
+        .first => new_leaf,
+        .second => r,
+    };
+    const second_child: *LayoutNode = switch (side) {
+        .first => r,
+        .second => new_leaf,
+    };
+    split.* = .{ .split = .{
+        .direction = direction,
+        .ratio = ratio,
+        .first = first_child,
+        .second = second_child,
+        .rect = r.getRect(),
+    } };
+    try self.trackRegister(split);
+
+    self.root = split;
+    self.focused = new_leaf;
+}
+
 /// Close the focused window. If the root is a single leaf, this is a no-op.
 /// The closed pane's buffer is NOT freed (ownership stays with the caller).
 pub fn closeWindow(self: *Layout) void {
@@ -2056,4 +2110,96 @@ test "resizeSplit clamps ratio to valid open interval" {
     try layout.splitVertical(0.5, dummy_surface);
     try std.testing.expectError(error.InvalidRatio, layout.resizeSplit(layout.root.?, 0.0));
     try std.testing.expectError(error.InvalidRatio, layout.resizeSplit(layout.root.?, 1.0));
+}
+
+test "splitRoot wraps the existing root in a new split" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var cb1 = try Conversation.init(allocator, 0, "host");
+    defer cb1.deinit();
+    var cb2 = try Conversation.init(allocator, 1, "sidebar");
+    defer cb2.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
+    layout.recalculate(80, 24);
+
+    const original_root = layout.root.?;
+
+    try layout.splitRoot(.vertical, 0.2, .{
+        .buffer = cb2.buf(),
+        .view = cb2.view(),
+        .viewport = &test_viewport,
+    }, .first);
+    layout.recalculate(80, 24);
+
+    const root = layout.root.?;
+    try std.testing.expect(root.* == .split);
+    const split = root.split;
+    try std.testing.expectEqual(SplitDirection.vertical, split.direction);
+
+    // .first: the sidebar leaf occupies the first slot, the original
+    // root pointer is preserved as the second child.
+    try std.testing.expect(split.first.* == .leaf);
+    try std.testing.expectEqualStrings("sidebar", split.first.leaf.buffer.getName());
+    try std.testing.expectEqual(original_root, split.second);
+    try std.testing.expectEqualStrings("host", split.second.leaf.buffer.getName());
+
+    // ratio = 0.2 of 80 cols = 16; sidebar gets the left strip.
+    try std.testing.expectEqual(@as(u16, 0), split.first.leaf.rect.x);
+    try std.testing.expectEqual(@as(u16, 16), split.first.leaf.rect.width);
+    try std.testing.expectEqual(@as(u16, 16), split.second.leaf.rect.x);
+    try std.testing.expectEqual(@as(u16, 64), split.second.leaf.rect.width);
+
+    // Focus follows the freshly attached pane.
+    try std.testing.expectEqualStrings("sidebar", layout.getFocusedLeaf().?.buffer.getName());
+}
+
+test "splitRoot wraps an existing split in another split" {
+    const allocator = std.testing.allocator;
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var cb1 = try Conversation.init(allocator, 0, "left");
+    defer cb1.deinit();
+    var cb2 = try Conversation.init(allocator, 1, "right");
+    defer cb2.deinit();
+    var cb3 = try Conversation.init(allocator, 2, "sidebar");
+    defer cb3.deinit();
+    var test_viewport: Viewport = .{};
+
+    try layout.setRoot(.{ .buffer = cb1.buf(), .view = cb1.view(), .viewport = &test_viewport });
+    layout.recalculate(80, 24);
+
+    try layout.splitVertical(0.5, .{
+        .buffer = cb2.buf(),
+        .view = cb2.view(),
+        .viewport = &test_viewport,
+    });
+    layout.recalculate(80, 24);
+
+    // Now root is a split with left/right children. Capture the
+    // pointer so we can assert it ends up as the new outer split's
+    // second child untouched.
+    const inner_split = layout.root.?;
+    try std.testing.expect(inner_split.* == .split);
+
+    try layout.splitRoot(.vertical, 0.2, .{
+        .buffer = cb3.buf(),
+        .view = cb3.view(),
+        .viewport = &test_viewport,
+    }, .first);
+    layout.recalculate(80, 24);
+
+    const outer = layout.root.?;
+    try std.testing.expect(outer.* == .split);
+    const outer_split = outer.split;
+    try std.testing.expect(outer_split.first.* == .leaf);
+    try std.testing.expectEqualStrings("sidebar", outer_split.first.leaf.buffer.getName());
+    // The pre-existing split must be the second child as a whole;
+    // splitRoot must not have recreated it.
+    try std.testing.expectEqual(inner_split, outer_split.second);
+    try std.testing.expect(outer_split.second.* == .split);
 }

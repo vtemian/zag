@@ -206,6 +206,137 @@ fn zagLayoutSplitFn(lua: *Lua) i32 {
     return 1;
 }
 
+/// `zag.layout.split_root(direction, opts?)`: wrap the ENTIRE current
+/// layout tree in a new split, attaching a freshly bound pane on the
+/// chosen side. Unlike `zag.layout.split`, which nests the new pane
+/// inside whichever leaf was passed in, `split_root` always lands the
+/// new pane at the top of the tree so a sidebar spans the full screen
+/// height regardless of inner splits.
+///
+/// `direction`: "horizontal" or "vertical".
+/// `opts.side`: "first" (left/top, default) or "second" (right/bottom).
+///              Default differs from `split` because the only caller
+///              today (sessions sidebar) wants a left column.
+/// `opts.buffer`: required "b<u32>" handle string. The new pane borrows
+///                the buffer; the BufferRegistry keeps it alive.
+/// `opts.ratio`: optional 0.0 < ratio < 1.0 for the first child. Falls
+///               back to the layout-level default (0.5) when omitted.
+///
+/// Returns the new pane's "n<u32>" handle string.
+fn zagLayoutSplitRootFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.raiseErrorStr("zag.layout.split_root: no window manager bound", .{});
+    };
+
+    if (lua.typeOf(1) != .string) {
+        lua.raiseErrorStr("zag.layout.split_root: direction must be a string", .{});
+    }
+    const dir = lua.toString(1) catch {
+        lua.raiseErrorStr("zag.layout.split_root: direction must be a string", .{});
+    };
+    const direction: Layout.SplitDirection = if (std.mem.eql(u8, dir, "vertical"))
+        .vertical
+    else if (std.mem.eql(u8, dir, "horizontal"))
+        .horizontal
+    else {
+        lua.raiseErrorStr("zag.layout.split_root: direction must be \"horizontal\" or \"vertical\"", .{});
+    };
+
+    var attached: ?WindowManager.AttachedSurface = null;
+    var side: Layout.Side = .first;
+    var ratio: f32 = 0.5;
+
+    if (lua.isTable(2)) {
+        _ = lua.getField(2, "side");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const s = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.split_root: side must be a string", .{});
+                };
+                if (std.mem.eql(u8, s, "first")) {
+                    side = .first;
+                } else if (std.mem.eql(u8, s, "second")) {
+                    side = .second;
+                } else {
+                    lua.raiseErrorStr("zag.layout.split_root: side must be \"first\" or \"second\"", .{});
+                }
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.split_root: side must be a string", .{});
+            },
+        }
+        lua.pop(1);
+
+        _ = lua.getField(2, "ratio");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .number => {
+                const n = lua.toNumber(-1) catch {
+                    lua.raiseErrorStr("zag.layout.split_root: ratio must be a number", .{});
+                };
+                if (n <= 0.0 or n >= 1.0) {
+                    lua.raiseErrorStr("zag.layout.split_root: ratio must be in (0, 1)", .{});
+                }
+                ratio = @floatCast(n);
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.split_root: ratio must be a number", .{});
+            },
+        }
+        lua.pop(1);
+
+        _ = lua.getField(2, "buffer");
+        defer lua.pop(1);
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {
+                lua.raiseErrorStr("zag.layout.split_root: buffer handle is required", .{});
+            },
+            .string => {
+                const raw = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.layout.split_root: buffer handle must be a string", .{});
+                };
+                const bh = BufferRegistry.parseId(raw) catch {
+                    lua.raiseErrorStr("zag.layout.split_root: invalid buffer handle", .{});
+                };
+                const buffer_registry = engine.buffer_registry orelse {
+                    lua.raiseErrorStr("zag.layout.split_root: no buffer registry bound", .{});
+                };
+                const resolved_buffer = buffer_registry.asBuffer(bh) catch {
+                    lua.raiseErrorStr("zag.layout.split_root: stale buffer handle", .{});
+                };
+                const resolved_view = buffer_registry.asView(bh) catch {
+                    lua.raiseErrorStr("zag.layout.split_root: stale buffer handle", .{});
+                };
+                attached = .{ .buffer = resolved_buffer, .view = resolved_view };
+            },
+            else => {
+                lua.raiseErrorStr("zag.layout.split_root: buffer must be a handle string", .{});
+            },
+        }
+    } else {
+        lua.raiseErrorStr("zag.layout.split_root: opts table with buffer handle is required", .{});
+    }
+
+    const a = attached orelse {
+        lua.raiseErrorStr("zag.layout.split_root: buffer handle is required", .{});
+    };
+
+    const new_handle = wm.splitRootSide(direction, a, side, ratio) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.layout.split_root: {s}", .{@errorName(err)}) catch "zag.layout.split_root failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+
+    const new_id = NodeRegistry.formatId(engine.allocator, new_handle) catch {
+        lua.raiseErrorStr("zag.layout.split_root: id format failed", .{});
+    };
+    defer engine.allocator.free(new_id);
+    _ = lua.pushString(new_id);
+    return 1;
+}
+
 /// `zag.layout.close(id)`: close the leaf or float identified by
 /// `id`. Plugin-level calls run on the main thread as user code, so
 /// they bypass the caller-pane guard (no caller pane exists here).
@@ -1117,6 +1248,8 @@ pub fn registerLayoutTable(lua: *Lua) void {
     lua.setField(-2, "focus");
     lua.pushFunction(zlua.wrap(zagLayoutSplitFn));
     lua.setField(-2, "split");
+    lua.pushFunction(zlua.wrap(zagLayoutSplitRootFn));
+    lua.setField(-2, "split_root");
     lua.pushFunction(zlua.wrap(zagLayoutFloatFn));
     lua.setField(-2, "float");
     lua.pushFunction(zlua.wrap(zagLayoutFloatMoveFn));
