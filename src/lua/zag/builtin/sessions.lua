@@ -922,10 +922,17 @@ zag.command {
 -- `<leader>` prefix or multi-key chord sequences, so the NERDTree-style
 -- `<leader>e` from the plan is approximated as `<C-e>` until a leader
 -- mechanism lands. Users can rebind in their config.lua.
-zag.keymap {
-    mode = "normal",
-    key = "<C-e>",
-    fn = M.toggle,
-}
+--
+-- Bound in BOTH modes: zag boots in `insert` (the prompt is focused),
+-- so a normal-only binding would force the user to press Esc first
+-- before the sidebar could toggle. `<C-e>` is otherwise unbound in
+-- both modes, so the dual registration is collision-free.
+for _, mode in ipairs({ "normal", "insert" }) do
+    zag.keymap {
+        mode = mode,
+        key = "<C-e>",
+        fn = M.toggle,
+    }
+end
 
 return M
