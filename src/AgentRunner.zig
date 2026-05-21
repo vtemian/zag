@@ -172,13 +172,26 @@ pub fn shutdown(self: *AgentRunner) void {
         self.agent_thread = null;
     }
     if (self.queue_active) {
+        // The agent thread queues payloads allocated through
+        // `wire_arena` (see `submit`), so freeing them through
+        // `self.allocator` (the gpa) is cross-allocator UB and trips
+        // the DebugAllocator's canary check as "Invalid free" during
+        // quit-time drain. Mirror `drainEvents`' allocator pick: route
+        // through the arena when one is live (arena free is a no-op;
+        // the bytes get reclaimed by the arena.deinit in `deinit`),
+        // and only fall back to `self.allocator` for tests that
+        // scaffold queue_active without going through `submit`.
+        const drain_alloc: Allocator = if (self.wire_arena) |*arena|
+            arena.allocator()
+        else
+            self.allocator;
         var scratch: [64]agent_events.AgentEvent = undefined;
         var freed: usize = 0;
         while (true) {
             const drained = self.event_queue.drain(&scratch);
             if (drained == 0) break;
             for (scratch[0..drained]) |event| {
-                event.freeOwned(self.allocator);
+                event.freeOwned(drain_alloc);
                 freed += 1;
             }
         }
@@ -2108,4 +2121,46 @@ test "drainPendingRoundTrips signals done and stamps shutdown reason" {
         "drained_during_shutdown",
         fake_req.error_name orelse "",
     );
+}
+
+test "shutdown frees arena-owned residual events through the arena, not the gpa" {
+    // Regression: the agent thread is spawned with wire_arena.allocator()
+    // (see `submit`), so every payload it queues is arena-owned. The
+    // normal drain path in `drainEvents` routes freeOwned through the
+    // arena. Before this test, `shutdown` did not — it called
+    // `event.freeOwned(self.allocator)` directly, which under the
+    // DebugAllocator panics with "Invalid free" on the cross-allocator
+    // pointer. Mirrors the production crash chain
+    // main.deinit -> orchestrator.deinit -> shutdownAgents -> shutdown
+    // when an .err event is still sitting in the queue at quit time.
+    const allocator = std.testing.allocator;
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
+    defer runner.deinit();
+
+    // Reproduce `submit`'s arena + queue wiring without spawning a real
+    // agent thread. queue_active gates the shutdown drain branch; the
+    // agent_thread branch stays untouched because we never spawn one.
+    runner.wire_arena = std.heap.ArenaAllocator.init(allocator);
+    const arena_alloc = runner.wire_arena.?.allocator();
+    runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 8);
+    runner.queue_active = true;
+
+    // Push one payload-bearing event per arm freed in `freeOwned`, all
+    // arena-allocated to mirror the production producer.
+    try runner.event_queue.push(.{ .err = try arena_alloc.dupe(u8, "cancelled") });
+    try runner.event_queue.push(.{ .text_delta = try arena_alloc.dupe(u8, "hello") });
+    try runner.event_queue.push(.{ .info = try arena_alloc.dupe(u8, "tokens: 42") });
+    try runner.event_queue.push(.{ .tool_start = .{
+        .name = try arena_alloc.dupe(u8, "bash"),
+        .call_id = try arena_alloc.dupe(u8, "toolu_1"),
+        .input_raw = try arena_alloc.dupe(u8, "{\"cmd\":\"ls\"}"),
+    } });
+
+    // Pre-fix: panics in DebugAllocator.free with "Invalid free".
+    // Post-fix: arena free is a no-op; arena.deinit reclaims the bytes.
+    runner.shutdown();
+
+    try std.testing.expect(!runner.queue_active);
 }
