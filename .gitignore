@@ -1,4 +1,5 @@
 .zig-cache/
+.zig-cache-local/
 zig-out/
 .idea/
 .zag/
