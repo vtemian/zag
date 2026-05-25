@@ -575,7 +575,8 @@ fn collectFloatDrafts(
             const h = focused_handle orelse break :blk false;
             break :blk h.index == f.handle.index and h.generation == f.handle.generation;
         };
-        out[count] = .{ .float = f, .draft = pane.getDraft(), .focused = is_focused };
+        const draft = pane.getDraft();
+        out[count] = .{ .float = f, .draft = draft, .draft_cursor = draft.len, .focused = is_focused };
         count += 1;
     }
     return out[0..count];
@@ -600,7 +601,8 @@ fn collectLeafDrafts(
             .split => continue,
         };
         const pane = self.window_manager.paneFromBufferPtr(leaf_ptr.buffer) orelse continue;
-        drafts_buf[count] = .{ .leaf = leaf_ptr, .draft = pane.getDraft() };
+        const draft = pane.getDraft();
+        drafts_buf[count] = .{ .leaf = leaf_ptr, .draft = draft, .draft_cursor = draft.len };
         count += 1;
     }
     return drafts_buf[0..count];

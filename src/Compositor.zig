@@ -99,6 +99,7 @@ pub const InputState = struct {
 pub const LeafDraft = struct {
     leaf: *const Layout.LayoutNode.Leaf,
     draft: []const u8,
+    draft_cursor: usize = 0,
 };
 
 /// Per-frame float drawing input. Parallel to `LeafDraft`, kept on a
@@ -114,6 +115,7 @@ pub const FloatDraft = struct {
     /// scratch-backed pickers that never grow drafts, but the field
     /// stays so slice 2's focus routing has a place to drop drafts).
     draft: []const u8 = "",
+    draft_cursor: usize = 0,
     /// Whether this float currently owns input focus. Drives the
     /// border-highlight contrast (slice 2 polish; slice 1 always passes
     /// `true` for the modal picker case).
@@ -852,8 +854,10 @@ fn drawPanePromptsPass(
     switch (node.*) {
         .leaf => {
             const is_focused = (node == focused);
-            const draft = draftForLeaf(leaf_drafts, &node.leaf);
-            self.drawPanePrompt(&node.leaf, is_focused, draft, input);
+            const entry = draftForLeaf(leaf_drafts, &node.leaf);
+            const draft = if (entry) |e| e.draft else null;
+            const draft_cursor = if (entry) |e| e.draft_cursor else 0;
+            self.drawPanePrompt(&node.leaf, is_focused, draft, draft_cursor, input);
         },
         .split => |s| {
             self.drawPanePromptsPass(s.first, focused, leaf_drafts, input);
@@ -869,9 +873,9 @@ fn drawPanePromptsPass(
 fn draftForLeaf(
     leaf_drafts: []const LeafDraft,
     leaf: *const Layout.LayoutNode.Leaf,
-) ?[]const u8 {
+) ?LeafDraft {
     for (leaf_drafts) |entry| {
-        if (entry.leaf == leaf) return entry.draft;
+        if (entry.leaf == leaf) return entry;
     }
     return null;
 }
@@ -885,6 +889,7 @@ fn drawPanePrompt(
     leaf: *const Layout.LayoutNode.Leaf,
     focused: bool,
     draft_opt: ?[]const u8,
+    draft_cursor: usize,
     input: InputState,
 ) void {
     const rect = leaf.rect;
@@ -942,13 +947,27 @@ fn drawPanePrompt(
         right_edge - after_prompt - 1
     else
         0;
-    const shown = if (draft.len <= available) draft else draft[0..available];
 
-    const end_col = self.screen.writeStr(prompt_row, after_prompt, shown, text.screen_style, text.fg);
+    // Horizontal scroll so the cursor stays visible within the prompt.
+    var visible_start: usize = 0;
+    if (draft.len > available) {
+        if (draft_cursor >= available) {
+            visible_start = draft_cursor - available + 1;
+        }
+    }
+    const visible_end = @min(draft.len, visible_start + available);
+    const shown = draft[visible_start..visible_end];
 
+    _ = self.screen.writeStr(prompt_row, after_prompt, shown, text.screen_style, text.fg);
+
+    // `draft_cursor - visible_start` is bounded by `available`, which is
+    // bounded by `right_edge - after_prompt - 1`; the cast to u16 cannot
+    // overflow on any real terminal.
+    const cursor_offset: u16 = @intCast(draft_cursor - visible_start);
+    const cursor_col = after_prompt + cursor_offset;
     // Cursor cell: only on the focused pane in insert mode.
-    if (focused and input.mode == .insert and end_col < right_edge) {
-        const cell = self.screen.getCell(prompt_row, end_col);
+    if (focused and input.mode == .insert and cursor_col < right_edge) {
+        const cell = self.screen.getCell(prompt_row, cursor_col);
         cell.codepoint = ' ';
         cell.style = .{};
         cell.fg = self.theme.colors.fg;
@@ -1585,7 +1604,7 @@ test "focused pane renders its draft with a block cursor at end" {
     layout.recalculate(40, 8);
 
     const drafts = [_]Compositor.LeafDraft{
-        .{ .leaf = &layout.root.?.leaf, .draft = "hi" },
+        .{ .leaf = &layout.root.?.leaf, .draft = "hi", .draft_cursor = 2 },
     };
     compositor.composite(&layout, &drafts, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
@@ -1625,14 +1644,14 @@ test "cursor bg does not bleed across keystrokes" {
     const leaf = &layout.root.?.leaf;
 
     // Frame 1: user types "hi". Cursor lands at col 6 with accent bg.
-    var drafts1 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi" }};
+    var drafts1 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi", .draft_cursor = 2 }};
     compositor.composite(&layout, &drafts1, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
 
     // Frame 2: user types one more char. New cursor at col 7. The cell
     // at col 6 now holds the glyph `s` (from "his") and MUST have
     // default bg - no accent smear.
-    var drafts2 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "his" }};
+    var drafts2 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "his", .draft_cursor = 3 }};
     compositor.composite(&layout, &drafts2, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
     try std.testing.expectEqual(@as(u21, 's'), screen.getCellConst(5, 6).codepoint);
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
@@ -1641,7 +1660,7 @@ test "cursor bg does not bleed across keystrokes" {
 
     // Frame 3: delete back to "hi". Col 7's old cursor cell must also
     // reset to default bg - nothing trailing off the right of the draft.
-    var drafts3 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi" }};
+    var drafts3 = [_]Compositor.LeafDraft{.{ .leaf = leaf, .draft = "hi", .draft_cursor = 2 }};
     compositor.composite(&layout, &drafts3, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
     try std.testing.expect(std.meta.eql(screen.getCellConst(5, 7).bg, Screen.Color.default));
     try std.testing.expect(!std.meta.eql(screen.getCellConst(5, 6).bg, Screen.Color.default));
