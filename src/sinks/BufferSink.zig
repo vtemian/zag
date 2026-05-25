@@ -80,6 +80,7 @@ pub const BufferSink = struct {
         const self: *BufferSink = @ptrCast(@alignCast(ptr));
         switch (event) {
             .run_start => |e| {
+                self.buffer.clearStatusNodes();
                 _ = self.buffer.appendUserNode(e.user_text) catch return;
                 self.current_assistant_node = null;
                 self.current_thinking_node = null;
@@ -213,6 +214,28 @@ pub const BufferSink = struct {
 test "BufferSink run_start appends a user node" {
     var cb = try Conversation.init(std.testing.allocator, 0, "test");
     defer cb.deinit();
+
+    var bs = BufferSink.init(std.testing.allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .run_start = .{ .user_text = "hello" } });
+
+    try std.testing.expectEqual(@as(usize, 1), cb.tree.root_children.items.len);
+    const node = cb.tree.root_children.items[0];
+    try std.testing.expectEqual(Conversation.NodeType.user_message, node.node_type);
+    const tb = try cb.buffer_registry.asText(node.buffer_id.?);
+    try std.testing.expectEqualStrings("hello", tb.bytesView());
+}
+
+test "BufferSink run_start clears welcome status nodes" {
+    var cb = try Conversation.init(std.testing.allocator, 0, "test");
+    defer cb.deinit();
+
+    // Simulate welcome banner posted at startup
+    _ = try cb.appendNode(null, .status, "Welcome to zag");
+    _ = try cb.appendNode(null, .status, "model: test");
+    try std.testing.expectEqual(@as(usize, 2), cb.tree.root_children.items.len);
 
     var bs = BufferSink.init(std.testing.allocator, &cb);
     defer bs.deinit();

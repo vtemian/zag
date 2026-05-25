@@ -781,6 +781,20 @@ pub fn appendUserNode(self: *Conversation, text: []const u8) !*Node {
     return self.appendNode(null, .user_message, text);
 }
 
+/// Remove all root-level status nodes. Used to clear the welcome banner
+/// once the user submits their first message.
+pub fn clearStatusNodes(self: *Conversation) void {
+    // Iterate backwards so removal doesn't shift indices under us.
+    var i: usize = self.tree.root_children.items.len;
+    while (i > 0) {
+        i -= 1;
+        const node = self.tree.root_children.items[i];
+        if (node.node_type == .status) {
+            self.tree.removeNode(node);
+        }
+    }
+}
+
 /// Allocate a child Conversation, append it to `subagents`, append a
 /// `.subagent_link` node to the tree referencing the child by its new
 /// index, and return the child pointer. The child's `parent` and
