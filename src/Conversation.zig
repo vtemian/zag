@@ -130,6 +130,12 @@ parent_subagent_id: u32 = 0,
 /// during replay. Borrows a Node owned by `self.tree`; reset to null
 /// on entry/exit of the load so it never outlives the borrowed tree.
 replay_last_tool_call: ?*Node = null,
+/// Map from provider-issued `tool_use_id` to the pending `tool_call`
+/// node, mirroring what `BufferSink` does for live events. Parallel
+/// tool execution can persist results out of order; without this map
+/// `handleLoadedEntry` mis-parents tool_results onto the linear
+/// `last_tool_call` and the resulting wire breaks on resume.
+replay_pending_tool_calls: std.StringHashMapUnmanaged(*Node) = .{},
 
 /// Create a new empty buffer with the given id and name. The buffer
 /// owns the node tree, the inline `BufferRegistry`, and the session
@@ -178,6 +184,14 @@ pub fn deinit(self: *Conversation) void {
     }
     self.subagents.deinit(self.allocator);
     self.buffer_registry.deinit();
+    // Free any keys left in the replay scratch map (should be empty
+    // after a clean load, but defends against partial loads and
+    // future callers that forget to clear).
+    var it = self.replay_pending_tool_calls.iterator();
+    while (it.next()) |kv| {
+        self.allocator.free(kv.key_ptr.*);
+    }
+    self.replay_pending_tool_calls.deinit(self.allocator);
     self.row_styles.deinit(self.allocator);
     self.allocator.free(self.name);
 }
@@ -530,11 +544,9 @@ pub fn readText(
     return .{ .text = joined, .total_lines = total, .truncated = truncated };
 }
 
-/// Populate the node tree from loaded JSONL entries. The tool_result
-/// parenting uses a local walker rather than the runner's correlation map
-/// because this path runs during session restore, before any agent has
-/// been spawned; JSONL entries are always in chronological order so the
-/// most recently seen tool_call is the right parent.
+/// Populate the node tree from loaded JSONL entries. Mirrors the live
+/// `BufferSink` correlation map so parallel tool results that were
+/// persisted out of order still parent onto the correct tool_call.
 pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !void {
     // Each Conversation along the path (root + every subagent that
     // ever emits an event) needs its own `last_tool_call` window so
@@ -543,6 +555,11 @@ pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !voi
     // directly to the Conversation for the duration of the load and
     // tear it down at the end.
     self.replay_last_tool_call = null;
+    var it = self.replay_pending_tool_calls.iterator();
+    while (it.next()) |kv| {
+        self.allocator.free(kv.key_ptr.*);
+    }
+    self.replay_pending_tool_calls.clearRetainingCapacity();
     defer self.clearReplayChains();
 
     for (entries) |entry| {
@@ -580,11 +597,16 @@ fn routeReplayEntry(
     try child.routeReplayEntry(path[1..], entry);
 }
 
-/// Reset `replay_last_tool_call` on this Conversation and every
-/// subagent below it. Recursive so deeply nested replays leave no
-/// dangling pointer behind once the borrowed nodes go out of scope.
+/// Reset `replay_last_tool_call` and `replay_pending_tool_calls` on
+/// this Conversation and every subagent below it. Recursive so deeply
+/// nested replays leave no dangling pointer or leaked key behind.
 fn clearReplayChains(self: *Conversation) void {
     self.replay_last_tool_call = null;
+    var map_it = self.replay_pending_tool_calls.iterator();
+    while (map_it.next()) |kv| {
+        self.allocator.free(kv.key_ptr.*);
+    }
+    self.replay_pending_tool_calls.clearRetainingCapacity();
     for (self.subagents.items) |child| child.clearReplayChains();
 }
 
@@ -610,9 +632,28 @@ fn handleLoadedEntry(
             const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id, tool_input_arg);
             node.collapsed = true;
             last_tool_call.* = node;
+            if (entry.tool_use_id) |id| {
+                const owned = try self.allocator.dupe(u8, id);
+                const gop = try self.replay_pending_tool_calls.getOrPut(self.allocator, owned);
+                if (gop.found_existing) {
+                    self.allocator.free(owned);
+                } else {
+                    gop.key_ptr.* = owned;
+                }
+                gop.value_ptr.* = node;
+            }
         },
         .tool_result => {
-            _ = try self.appendNode(last_tool_call.*, .tool_result, entry.content);
+            const parent = blk: {
+                if (entry.tool_use_id) |id| {
+                    if (self.replay_pending_tool_calls.fetchRemove(id)) |kv| {
+                        self.allocator.free(kv.key);
+                        break :blk kv.value;
+                    }
+                }
+                break :blk last_tool_call.*;
+            } orelse return;
+            _ = try self.appendNode(parent, .tool_result, entry.content);
         },
         .info => _ = try self.appendNode(null, .status, entry.content),
         .err => _ = try self.appendNode(null, .err, entry.content),
@@ -642,9 +683,28 @@ fn handleLoadedEntry(
             const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id, tool_input_arg);
             node.collapsed = true;
             last_tool_call.* = node;
+            if (entry.tool_use_id) |id| {
+                const owned = try self.allocator.dupe(u8, id);
+                const gop = try self.replay_pending_tool_calls.getOrPut(self.allocator, owned);
+                if (gop.found_existing) {
+                    self.allocator.free(owned);
+                } else {
+                    gop.key_ptr.* = owned;
+                }
+                gop.value_ptr.* = node;
+            }
         },
         .task_tool_result => {
-            _ = try self.appendNode(last_tool_call.*, .tool_result, entry.content);
+            const parent = blk: {
+                if (entry.tool_use_id) |id| {
+                    if (self.replay_pending_tool_calls.fetchRemove(id)) |kv| {
+                        self.allocator.free(kv.key);
+                        break :blk kv.value;
+                    }
+                }
+                break :blk last_tool_call.*;
+            } orelse return;
+            _ = try self.appendNode(parent, .tool_result, entry.content);
         },
         .thinking => {
             const node = try self.appendNode(null, .thinking, entry.content);
