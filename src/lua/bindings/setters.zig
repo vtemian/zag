@@ -68,8 +68,8 @@ fn zagSetDefaultModelFn(lua: *Lua) !i32 {
 }
 
 /// Zig function backing `zag.set_bash_sandbox_level(level)`.
-/// Valid levels: `"strict"` (default, sandbox on) and `"permissive"`
-/// (sandbox off; logs a warning so the opt-out is visible). Unknown
+/// Valid levels: `"permissive"` (default, no sandbox) and `"strict"`
+/// (sandbox on; macOS seatbelt + Linux landlock/seccomp). Unknown
 /// levels and non-string args raise a Lua runtime error. When the
 /// engine has no `bash_config` bound (e.g. engine-only tests that
 /// don't wire main.zig), the handler is a no-op on the flag side and
@@ -96,7 +96,6 @@ fn zagSetBashSandboxLevelFn(lua: *Lua) !i32 {
         if (engine.bash_config) |cfg| cfg.permissive = false;
     } else if (std.mem.eql(u8, level, "permissive")) {
         if (engine.bash_config) |cfg| cfg.permissive = true;
-        log.warn("bash sandbox set to permissive; commands run unconfined", .{});
     } else {
         log.warn("zag.set_bash_sandbox_level: unknown level '{s}'", .{level});
         return error.LuaError;

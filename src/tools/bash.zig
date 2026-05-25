@@ -1,6 +1,13 @@
-//! Bash tool: execute shell commands with a sandbox.
+//! Bash tool: execute shell commands.
 //!
-//! Threat model:
+//! Default mode: permissive (no sandbox). The bash tool runs commands
+//! with the same privileges as the zag process. The agent is trusted
+//! to execute arbitrary code by construction, so this matches the
+//! straightforward expectation. Strict mode is opt-in via
+//! zag.set_bash_sandbox_level("strict") in config.lua and enforces
+//! the threat model below.
+//!
+//! Threat model (strict mode only):
 //! * Secret exfiltration: denies reads of ~/.ssh, ~/.aws, ~/.gnupg,
 //!   ~/.netrc, the entire ~/.config tree (broad-deny so future zag-stored
 //!   credentials at ~/.config/zag/auth.json are covered without per-path
@@ -12,13 +19,11 @@
 //!   the write scope.
 //! * Network tunneling: outbound network denied except loopback on macOS;
 //!   outbound AF_INET/AF_INET6 socket creation denied entirely on Linux
-//!   via seccomp-bpf (closed in Phase C). Loopback TCP/UDP is also denied
-//!   on Linux as a side effect of socket-family filtering; AF_UNIX local
-//!   sockets (docker.sock, psql.sock) remain allowed. Linux users who
-//!   need outbound network or loopback can opt out with
-//!   zag.set_bash_sandbox_level("permissive").
+//!   via seccomp-bpf. Loopback TCP/UDP is also denied on Linux as a side
+//!   effect of socket-family filtering; AF_UNIX local sockets
+//!   (docker.sock, psql.sock) remain allowed.
 //!
-//! Platform support:
+//! Platform support (strict mode):
 //! * macOS: sandbox-exec with a generated seatbelt profile (see
 //!   buildSeatbeltProfile).
 //! * Linux: kernel Landlock LSM for filesystem isolation plus seccomp-bpf
@@ -28,11 +33,6 @@
 //!   back to the other plus a logged warning; both failing falls back to
 //!   unsandboxed.
 //! * Other platforms: unsandboxed with a logged warning.
-//!
-//! Opt-out:
-//! * zag.set_bash_sandbox_level("permissive") in config.lua disables the
-//!   sandbox entirely. Intended for users who audit prompts themselves.
-//!   Logs a warning line on activation.
 //!
 //! Returns stdout, stderr, and exit code. While the child runs, polls the
 //! `cancel` flag at a 50ms cadence and kills the child on request so the
@@ -47,14 +47,15 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.tool_bash);
 
 /// Sandbox knobs reachable from Lua. The engine borrows a pointer; bash
-/// reads the flag at execute time. Default is strict (sandbox on).
+/// reads the flag at execute time. Default is permissive (no sandbox);
+/// strict mode is opt-in via zag.set_bash_sandbox_level("strict").
 pub const Config = struct {
-    permissive: bool = false,
+    permissive: bool = true,
 };
 
 /// Set by `LuaEngine` after binding so `execute` can branch on the flag
 /// without a per-call lookup. `null` means no engine bound the config;
-/// in that case we default to the safe path (strict sandbox on macOS).
+/// in that case we default to permissive, matching the Config default.
 var bound_config: ?*Config = null;
 
 /// Bind the sandbox config struct. Pass `null` to clear; pass a stable
@@ -97,7 +98,7 @@ pub fn execute(
     //
     // Lifetime: Child.init borrows the argv slices. We free the heap-owned
     // slots via freeSandboxArgv after the function's last wait().
-    const permissive = if (bound_config) |c| c.permissive else false;
+    const permissive = if (bound_config) |c| c.permissive else true;
     const sandbox: ?SandboxArgv = sandbox_blk: {
         if (permissive) break :sandbox_blk null;
 
@@ -621,11 +622,18 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
 }
 
-test "execute denies reading ~/.ssh on macOS" {
+test "execute denies reading ~/.ssh on macOS in strict mode" {
     // The agent tries to read the current user's ~/.ssh. If it works,
     // the sandbox failed. If the read is blocked, the output should
     // not contain anything resembling a private-key header.
+    //
+    // Sandbox is opt-in since 2026-05-25; bind a strict config so the
+    // test exercises the seatbelt path explicitly.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var strict: Config = .{ .permissive = false };
+    bindConfig(&strict);
+    defer bindConfig(null);
 
     const allocator = std.testing.allocator;
     const result = try execute("{\"command\":\"cat ~/.ssh/id_rsa 2>&1 || true\"}", allocator, null);
@@ -671,18 +679,25 @@ test "buildLinuxArgv produces self-re-exec argv shape" {
     try std.testing.expect(std.fs.path.isAbsolute(sb.argv[0]));
 }
 
-test "execute denies reading ~/.ssh on Linux" {
+test "execute denies reading ~/.ssh on Linux in strict mode" {
     // End-to-end check, gated on landlock availability. NOTE: zig's
     // test runner replaces main(), so the --__sandbox-helper branch
     // does not fire here; this test exercises argv plumbing and the
     // spawn/wait machinery but does NOT install landlock. Real
     // sandbox denial is verified manually against the built zag binary
     // (see docs/plans/2026-05-15-bash-sandbox-linux.md done-when).
+    //
+    // Sandbox is opt-in since 2026-05-25; bind a strict config so the
+    // argv-plumbing path runs.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     switch (landlock.probeAbi()) {
         .supported => {},
         .unsupported => return error.SkipZigTest,
     }
+
+    var strict: Config = .{ .permissive = false };
+    bindConfig(&strict);
+    defer bindConfig(null);
 
     const allocator = std.testing.allocator;
     const result = try execute("{\"command\":\"cat ~/.ssh/id_rsa 2>&1 || true\"}", allocator, null);

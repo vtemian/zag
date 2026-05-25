@@ -4416,19 +4416,29 @@ test "zag.set_thinking_effort rejects unknown levels" {
     );
 }
 
-test "zag.set_bash_sandbox_level(permissive) flips bash_config" {
+test "bash_tool.Config defaults to permissive" {
+    // Regression pin: the bash sandbox is opt-IN since 2026-05-25; the
+    // default Config must be permissive so an unconfigured user gets the
+    // straightforward no-sandbox behavior.
+    const cfg: bash_tool.Config = .{};
+    try std.testing.expect(cfg.permissive);
+}
+
+test "zag.set_bash_sandbox_level toggles bash_config in both directions" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
 
     var bash_config: bash_tool.Config = .{};
     engine.bash_config = &bash_config;
-
-    try engine.lua.doString("zag.set_bash_sandbox_level('permissive')");
+    // Default is permissive after the 2026-05-25 flip.
     try std.testing.expect(bash_config.permissive);
 
     try engine.lua.doString("zag.set_bash_sandbox_level('strict')");
     try std.testing.expect(!bash_config.permissive);
+
+    try engine.lua.doString("zag.set_bash_sandbox_level('permissive')");
+    try std.testing.expect(bash_config.permissive);
 }
 
 test "zag.set_bash_sandbox_level rejects unknown level" {
