@@ -1119,10 +1119,27 @@ fn projectNode(
 
             // tool_result children of this tool_call land in the user
             // message paired against the synth id we just minted.
+            var saw_result = false;
             for (node.children.items) |child| {
                 if (child.node_type == .tool_result) {
+                    saw_result = true;
                     try self.projectToolResult(state, child);
                 }
+            }
+            // Cancelled mid-execution: the tree carries the tool_call but
+            // no tool_result child. Strict OpenAI-compatible validators
+            // (Kimi, Moonshot, GPT itself) reject the next-turn request
+            // because every assistant tool_call must be answered. Synthesize
+            // a marker tool_result so the wire is well-formed and the model
+            // knows the call did not complete.
+            if (!saw_result) {
+                try state.flushAssistant();
+                state.last_tool_use_id = null;
+                try state.tool_result_blocks.append(state.arena, .{ .tool_result = .{
+                    .tool_use_id = duped_id,
+                    .content = try state.arena.dupe(u8, "[interrupted: tool did not complete]"),
+                    .is_error = true,
+                } });
             }
         },
         .tool_result => {
@@ -2472,6 +2489,101 @@ test "toWireMessages: tool_call/tool_result pairing emits assistant tool_use the
     try std.testing.expectEqual(@as(usize, 1), tool_msg.content.len);
     try std.testing.expectEqualStrings(synth_id, tool_msg.content[0].tool_result.tool_use_id);
     try std.testing.expectEqualStrings("ok", tool_msg.content[0].tool_result.content);
+}
+
+test "toWireMessages: orphan tool_call gets synthetic cancelled tool_result" {
+    // Regression: cancelling a turn mid-tool-execution leaves the tree with
+    // a tool_call node and no tool_result child. The next submit rebuilds
+    // wire_messages via toWireMessages (see AgentRunner.submit), and strict
+    // OpenAI-compatible providers reject the request with
+    //   "tool_call_ids did not have response messages: bash:0, bash:1"
+    // because the assistant message carries tool_uses that nothing answers.
+    //
+    // Pin the contract: every emitted tool_use MUST be followed by a
+    // matching tool_result block (synthetic when the tree has none), so
+    // the wire stays well-formed across cancellation boundaries.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "run two bash calls");
+    // Two parallel tool_calls with no tool_result children (cancelled).
+    _ = try cb.appendToolCallNode(null, "bash", "bash:0", null);
+    _ = try cb.appendToolCallNode(null, "bash", "bash:1", null);
+
+    const messages = try cb.toWireMessages(arena.allocator());
+
+    // Walk the projection: every tool_use must be paired by id with an
+    // is_error tool_result. The exact message split (one combined
+    // assistant+user vs. interleaved) is a serialization detail; the wire
+    // contract is "every tool_use_id appears in a following tool_result".
+    var use_ids: [2][]const u8 = undefined;
+    var use_count: usize = 0;
+    var result_ids: [2][]const u8 = undefined;
+    var result_count: usize = 0;
+    for (messages.items) |msg| {
+        for (msg.content) |block| switch (block) {
+            .tool_use => |tu| {
+                use_ids[use_count] = tu.id;
+                use_count += 1;
+            },
+            .tool_result => |tr| {
+                try std.testing.expect(tr.is_error);
+                result_ids[result_count] = tr.tool_use_id;
+                result_count += 1;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 2), use_count);
+    try std.testing.expectEqual(@as(usize, 2), result_count);
+    try std.testing.expectEqualStrings("bash:0", use_ids[0]);
+    try std.testing.expectEqualStrings("bash:1", use_ids[1]);
+    try std.testing.expectEqualStrings("bash:0", result_ids[0]);
+    try std.testing.expectEqualStrings("bash:1", result_ids[1]);
+}
+
+test "toWireMessages: mixed orphan and completed tool_calls still pair" {
+    // Partial cancel: one tool finished, the next was killed. Both must be
+    // paired on the wire.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+
+    _ = try cb.appendNode(null, .user_message, "do two things");
+    const c0 = try cb.appendToolCallNode(null, "bash", "bash:0", null);
+    _ = try cb.appendNode(c0, .tool_result, "ok0");
+    _ = try cb.appendToolCallNode(null, "bash", "bash:1", null); // orphan
+
+    const messages = try cb.toWireMessages(arena.allocator());
+
+    var use_ids: [2][]const u8 = undefined;
+    var use_count: usize = 0;
+    var result_ids: [2][]const u8 = undefined;
+    var result_count: usize = 0;
+    for (messages.items) |msg| {
+        for (msg.content) |block| switch (block) {
+            .tool_use => |tu| {
+                use_ids[use_count] = tu.id;
+                use_count += 1;
+            },
+            .tool_result => |tr| {
+                result_ids[result_count] = tr.tool_use_id;
+                result_count += 1;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 2), use_count);
+    try std.testing.expectEqual(@as(usize, 2), result_count);
+    try std.testing.expectEqualStrings("bash:0", use_ids[0]);
+    try std.testing.expectEqualStrings("bash:1", use_ids[1]);
+    try std.testing.expectEqualStrings("bash:0", result_ids[0]);
+    try std.testing.expectEqualStrings("bash:1", result_ids[1]);
 }
 
 test "toWireMessages: preserves provider tool_use_id when set on node" {
