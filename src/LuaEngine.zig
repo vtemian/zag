@@ -2890,6 +2890,23 @@ pub const LuaEngine = struct {
 
         _ = self.tasks.remove(task.thread_ref);
         self.lua.unref(zlua.registry_index, task.thread_ref);
+
+        // Re-parent any still-live children to the root scope so that
+        // fire-and-forget spawn / detach can outlive their parent without
+        // triggering the Scope orphan invariant.
+        if (task.scope.children.items.len > 0) {
+            const root = self.root_scope.?;
+            task.scope.mu.lock();
+            defer task.scope.mu.unlock();
+            root.mu.lock();
+            defer root.mu.unlock();
+            for (task.scope.children.items) |child| {
+                child.parent = root;
+                root.children.append(self.allocator, child) catch {};
+            }
+            task.scope.children.items.len = 0;
+        }
+
         task.scope.deinit();
         self.allocator.destroy(task);
 
