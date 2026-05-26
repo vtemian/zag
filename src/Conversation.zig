@@ -772,6 +772,14 @@ fn refineFromTaskStart(self: *Conversation, payload: []const u8) !void {
     _ = try self.spawnSubagent(name, prompt);
 }
 
+/// Replace the buffer name. Frees the old name and dupes `new_name`.
+pub fn rename(self: *Conversation, new_name: []const u8) !void {
+    const owned = try self.allocator.dupe(u8, new_name);
+    errdefer self.allocator.free(owned);
+    self.allocator.free(self.name);
+    self.name = owned;
+}
+
 /// Replace this child's placeholder name with `name`, and patch the
 /// parent's `subagent_link` node so the renderer's "[subagent: <name>]"
 /// header reflects reality. Called from refineFromTaskStart on both the

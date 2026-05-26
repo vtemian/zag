@@ -486,11 +486,11 @@ extra_panes: std.ArrayList(*PaneEntry) = .empty,
 extra_floats: std.ArrayList(*PaneEntry) = .empty,
 /// Counter for creating new buffers when splitting windows.
 next_buffer_id: u32 = 1,
-/// Rolling label counter for scratch panes. First split produces
-/// `scratch 1`; increments each time `createSplitPane` runs.
+/// Rolling label counter for split panes. First split produces
+/// `chat 1`; increments each time `createSplitPane` runs.
 next_scratch_id: u32 = 1,
 /// One-shot status message rendered on the input/status row, cleared on
-/// the next key event. Used for announces like `split to scratch 2`.
+/// the next key event. Used for announces like `split to chat 2`.
 transient_status: [64]u8 = undefined,
 /// Number of valid bytes in `transient_status`; zero means no message is active.
 transient_status_len: u8 = 0,
@@ -1573,7 +1573,7 @@ pub fn modeAfterSplit() Keymap.Mode {
 /// Format the `split -> scratch N` one-shot announce into `dest`.
 /// Returns the byte length written, or 0 if `dest` can't fit the message.
 pub fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
-    const written = std.fmt.bufPrint(dest, "split \u{2192} scratch {d}", .{scratch_id}) catch {
+    const written = std.fmt.bufPrint(dest, "split \u{2192} chat {d}", .{scratch_id}) catch {
         return 0;
     };
     return @intCast(written.len);
@@ -1592,7 +1592,7 @@ pub fn setPasteTruncatedStatus(self: *WindowManager, dropped: usize) void {
 /// composed `Pane`.
 pub fn createSplitPane(self: *WindowManager) !Pane {
     var name_scratch: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+    const name = std.fmt.bufPrint(&name_scratch, "chat {d}", .{self.next_scratch_id}) catch "chat";
 
     const cb = try self.allocator.create(Conversation);
     errdefer self.allocator.destroy(cb);
@@ -1675,7 +1675,7 @@ pub fn openSessionPane(self: *WindowManager, id: []const u8) !Pane {
     const mgr = &(self.session_mgr.* orelse return error.SessionManagerUnavailable);
 
     var name_scratch: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_scratch, "scratch {d}", .{self.next_scratch_id}) catch "scratch";
+    const name = std.fmt.bufPrint(&name_scratch, "chat {d}", .{self.next_scratch_id}) catch "chat";
 
     const cb = try self.allocator.create(Conversation);
     errdefer self.allocator.destroy(cb);
@@ -1719,8 +1719,7 @@ pub fn openSessionPane(self: *WindowManager, id: []const u8) !Pane {
     // Adopt the session's display name when present so the sidebar's
     // current-session highlight matches the title bar.
     if (sh.meta.name_len > 0) {
-        self.allocator.free(cb.name);
-        cb.name = try self.allocator.dupe(u8, sh.meta.nameSlice());
+        try cb.rename(sh.meta.nameSlice());
     }
 
     const pane: Pane = .{
@@ -2599,9 +2598,15 @@ fn autoNameSession(self: *WindowManager, pane: Pane) void {
     // append_mutex and bails if a concurrent rename already set a
     // name. Closes the TOCTOU window the previous read-then-rename
     // pattern left open.
-    _ = sh.renameIfUnnamed(name) catch |err| {
+    const did_rename = sh.renameIfUnnamed(name) catch |err| {
         log.warn("session rename failed: {}", .{err});
+        return;
     };
+    if (did_rename) {
+        conversation.rename(name) catch |err| {
+            log.warn("conversation rename failed: {}", .{err});
+        };
+    }
 }
 
 /// Build a session name from the user's first message: take up to five
@@ -2743,13 +2748,13 @@ fn testCommandRegistry(allocator: Allocator) !CommandRegistry {
 test "formatSplitAnnounce writes the standard announce for id 1" {
     var buf: [64]u8 = undefined;
     const len = formatSplitAnnounce(&buf, 1);
-    try std.testing.expectEqualStrings("split \u{2192} scratch 1", buf[0..len]);
+    try std.testing.expectEqualStrings("split \u{2192} chat 1", buf[0..len]);
 }
 
 test "formatSplitAnnounce handles three-digit ids" {
     var buf: [64]u8 = undefined;
     const len = formatSplitAnnounce(&buf, 999);
-    try std.testing.expectEqualStrings("split \u{2192} scratch 999", buf[0..len]);
+    try std.testing.expectEqualStrings("split \u{2192} chat 999", buf[0..len]);
 }
 
 test "formatSplitAnnounce returns zero when destination is too small" {

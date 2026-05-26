@@ -199,7 +199,13 @@ fn runChild(
     var child_runner = AgentRunner.init(allocator, child_sink.sink(), child_conv);
     defer child_runner.deinit();
     child_runner.wake_fd = ctx.wake_fd;
-    child_runner.lua_engine = ctx.lua_engine;
+    // Do NOT wire the Lua engine into the child runner. Lua is pinned
+    // to the main thread; runChild drains the child queue on the
+    // parent's agent thread (not the main thread), so dispatchHookRequests
+    // would call into the Lua state from two threads concurrently,
+    // corrupting the GC. Subagents run with Zig-only paths until a
+    // proxy-to-main-thread mechanism is added.
+    child_runner.lua_engine = null;
     // No window_manager wired: subagents do not mutate the window
     // tree. Layout requests get serviced as errors via the round-trip
     // dispatcher's no-WM branch, which matches the legacy collector
@@ -237,7 +243,7 @@ fn runChild(
     try child_runner.submit(.{
         .allocator = ctx.allocator,
         .wake_write_fd = ctx.wake_fd orelse 0,
-        .lua_engine = ctx.lua_engine,
+        .lua_engine = null,
         .provider = ctx.provider,
         .model_spec = child_model_spec,
         .registry = &child_registry,
