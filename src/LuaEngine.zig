@@ -925,21 +925,20 @@ pub const LuaEngine = struct {
         return 1;
     }
 
-    /// `zag.detach(fn, args...)`: fire-and-forget spawn. Same scope
-    /// parenting rules as `zag.spawn`, but returns nothing; the caller
-    /// has no handle and cannot cancel or join the child.
+    /// `zag.detach(fn, args...)`: fire-and-forget spawn. Returns nothing;
+    /// the caller has no handle and cannot cancel or join the child.
+    /// The detached coroutine is parented to the root scope so its
+    /// lifetime is independent of the caller's scope.
     fn zagDetachFn(co: *Lua) i32 {
         const engine = getEngineFromState(co);
         const nargs = co.getTop() - 1;
         if (nargs < 0) co.raiseErrorStr("zag.detach: missing fn", .{});
         if (!co.isFunction(1)) co.raiseErrorStr("zag.detach: arg 1 must be function", .{});
 
-        const parent: ?*async_scope.Scope = if (engine.taskForCoroutine(co)) |t| t.scope else null;
-
         if (co != engine.lua) {
             co.xMove(engine.lua, nargs + 1);
         }
-        _ = engine.spawnCoroutine(nargs, parent) catch |err| {
+        _ = engine.spawnCoroutine(nargs, null) catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.detach failed: {s}", .{@errorName(err)}) catch "zag.detach failed";
             co.raiseErrorStr("%s", .{msg.ptr});
