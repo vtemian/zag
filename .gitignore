@@ -7,3 +7,5 @@ zag-trace.json
 .worktrees/
 .claude/
 /test_*
+artifacts/
+docs/plans/
