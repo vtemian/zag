@@ -10726,6 +10726,20 @@ test "loadBuiltinPlugins eager-loads zag.loop.* entries" {
     try std.testing.expect(engine.loopDetectHandler() != null);
 }
 
+test "loadBuiltinPlugins registers the default general subagent" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Empty before bootstrap; the `task` tool would be gated off here.
+    try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
+    engine.loadBuiltinPlugins();
+    // The shipped delegate makes delegation work with zero user config:
+    // a non-empty registry is what `tools.registerTaskTool` gates on.
+    try std.testing.expect(engine.subagentRegistry().lookup("general") != null);
+}
+
 test "zag.loop.default does not act before the 5-call threshold" {
     const alloc = std.testing.allocator;
     var engine = try LuaEngine.init(alloc);
