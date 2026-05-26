@@ -534,6 +534,158 @@ fn nodeOwnMetrics(
     return m;
 }
 
+const RowPlan = struct {
+    total_rows: u32,
+    /// Logical line index (as counted by getVisibleLines/lineCount,
+    /// including turn-gap blank lines) where the visible window starts.
+    skip: usize,
+    /// Physical rows to clip from the top of the first window line.
+    leading_skip_rows: u16,
+};
+
+/// Pre-order accumulator shared by the two passes. Mirrors the line
+/// ordering of getVisibleLines: a node's own lines, then (if not
+/// collapsed) each child's subtree; turn-gap blanks inserted between
+/// root nodes by the caller.
+const RowWalk = struct {
+    cum_rows: u32 = 0, // physical rows emitted so far
+    cum_logical: usize = 0, // logical lines emitted so far
+};
+
+const WindowStart = struct { skip: usize, leading_skip_rows: u16 };
+
+/// Compute total_rows and map a physical scroll offset to a logical
+/// `skip` + `leading_skip_rows`. O(node-count) with a warm metrics memo;
+/// touches a node's lines only on a memo miss or for the single boundary
+/// node's per-line walk.
+fn rowPlan(
+    self: *Conversation,
+    scratch_alloc: Allocator,
+    theme: *const Theme,
+    content_width: u16,
+    visible_rows: u16,
+    scroll_rows: u32,
+) !RowPlan {
+    if (content_width == 0 or visible_rows == 0) {
+        return .{ .total_rows = 0, .skip = 0, .leading_skip_rows = 0 };
+    }
+
+    // Pass 1: total physical rows.
+    var total: u32 = 0;
+    const roots = self.tree.root_children.items;
+    for (roots, 0..) |node, i| {
+        total += try self.subtreeWrapped(node, scratch_alloc, theme, content_width);
+        if (i < roots.len - 1) total += self.turn_gap; // blank rows
+    }
+
+    if (total == 0) return .{ .total_rows = 0, .skip = 0, .leading_skip_rows = 0 };
+
+    // Physical-row window (identical math to defaultGetWindow).
+    const visible_end_rows: u32 = total - @min(scroll_rows, total);
+    const visible_start_rows: u32 = if (visible_end_rows > visible_rows)
+        visible_end_rows - visible_rows
+    else
+        0;
+
+    if (visible_start_rows == 0) {
+        return .{ .total_rows = total, .skip = 0, .leading_skip_rows = 0 };
+    }
+
+    // Pass 2: walk to the boundary, accumulating physical rows + logical lines.
+    var walk = RowWalk{};
+    for (roots, 0..) |node, i| {
+        if (try self.locateWindowStart(node, scratch_alloc, theme, content_width, visible_start_rows, &walk)) |found| {
+            return .{ .total_rows = total, .skip = found.skip, .leading_skip_rows = found.leading_skip_rows };
+        }
+        if (i < roots.len - 1) {
+            // turn-gap blank rows: each is one physical row and one logical line.
+            var g: u16 = 0;
+            while (g < self.turn_gap) : (g += 1) {
+                if (walk.cum_rows >= visible_start_rows) {
+                    return .{ .total_rows = total, .skip = walk.cum_logical, .leading_skip_rows = 0 };
+                }
+                walk.cum_rows += 1;
+                walk.cum_logical += 1;
+            }
+        }
+    }
+
+    // Window starts at/after the tail (defensive): clamp to end.
+    return .{ .total_rows = total, .skip = walk.cum_logical, .leading_skip_rows = 0 };
+}
+
+/// Sum of a node subtree's wrapped rows (own + non-collapsed children),
+/// using the memoized per-node own counts.
+fn subtreeWrapped(
+    self: *Conversation,
+    node: *const Node,
+    scratch_alloc: Allocator,
+    theme: *const Theme,
+    content_width: u16,
+) !u32 {
+    const m = try self.nodeOwnMetrics(node, scratch_alloc, theme, content_width);
+    var total = m.wrapped_rows;
+    if (!node.collapsed) {
+        for (node.children.items) |child| {
+            total += try self.subtreeWrapped(child, scratch_alloc, theme, content_width);
+        }
+    }
+    return total;
+}
+
+/// Pre-order walk of one subtree. If `visible_start_rows` falls within
+/// this subtree, returns the logical skip + sub-line clip; otherwise
+/// advances `walk` past the whole subtree and returns null.
+fn locateWindowStart(
+    self: *Conversation,
+    node: *const Node,
+    scratch_alloc: Allocator,
+    theme: *const Theme,
+    content_width: u16,
+    visible_start_rows: u32,
+    walk: *RowWalk,
+) !?WindowStart {
+    const m = try self.nodeOwnMetrics(node, scratch_alloc, theme, content_width);
+
+    // Does the boundary land in THIS node's own lines?
+    if (visible_start_rows < walk.cum_rows + m.wrapped_rows) {
+        const into_node_rows: u32 = visible_start_rows - walk.cum_rows;
+        // Per-line walk of this node's own lines to find the exact line.
+        var lines_buf: std.ArrayList(Theme.StyledLine) = .empty;
+        defer lines_buf.deinit(scratch_alloc);
+        const owned_lines: []const Theme.StyledLine = if (self.cache.get(node)) |cached| cached else blk: {
+            try self.renderer.render(node, &lines_buf, scratch_alloc, theme, &self.buffer_registry);
+            break :blk lines_buf.items;
+        };
+        var row_acc: u32 = 0;
+        for (owned_lines, 0..) |line, idx| {
+            const parts = try lineSpansAsBytes(line, scratch_alloc);
+            const rows = width.wrappedRowCountMulti(parts, content_width);
+            if (into_node_rows < row_acc + rows) {
+                return .{
+                    .skip = walk.cum_logical + idx,
+                    .leading_skip_rows = @intCast(into_node_rows - row_acc),
+                };
+            }
+            row_acc += rows;
+        }
+        // Defensive: boundary == node end; fall through to advancing past it.
+    }
+
+    // Boundary not in this node's own lines: advance past own lines.
+    walk.cum_rows += m.wrapped_rows;
+    walk.cum_logical += m.logical_lines;
+
+    if (!node.collapsed) {
+        for (node.children.items) |child| {
+            if (try self.locateWindowStart(child, scratch_alloc, theme, content_width, visible_start_rows, walk)) |found| {
+                return found;
+            }
+        }
+    }
+    return null;
+}
+
 /// Append text to an existing node's content. Used for streaming: text
 /// deltas accumulate into one node's TextBuffer. Tool_call nodes do
 /// not carry a `buffer_id` and never receive streaming deltas, so
@@ -3244,4 +3396,42 @@ test "nodeOwnMetrics memoizes own wrapped+logical and is stable across calls" {
     try std.testing.expectEqual(m1.wrapped_rows, m2.wrapped_rows);
     try std.testing.expectEqual(m1.logical_lines, m2.logical_lines);
     try std.testing.expect(cb.cache.getMetrics(node, 10) != null);
+}
+
+test "rowPlan: total_rows and window mapping match a hand-computed layout" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 1; // one blank row between root nodes
+
+    const theme = Theme.defaultTheme();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Two root nodes, each 1 logical line, each wrapping to 1 row at width 40.
+    _ = try cb.appendNode(null, .user_message, "first");
+    _ = try cb.appendNode(null, .assistant_text, "second");
+    // Layout rows: [first][gap][second] => total_rows = 3.
+
+    const plan = try cb.rowPlan(arena.allocator(), &theme, 40, 2, 0); // visible_rows=2, scroll=0
+    try std.testing.expectEqual(@as(u32, 3), plan.total_rows);
+    // Bottom-anchored: visible window covers rows [1,3); starts at the gap
+    // row (logical line index 1), leading_skip_rows = 0.
+    try std.testing.expectEqual(@as(usize, 1), plan.skip);
+    try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
+}
+
+test "rowPlan: content shorter than viewport starts at top" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 0;
+    const theme = Theme.defaultTheme();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try cb.appendNode(null, .user_message, "hi");
+    const plan = try cb.rowPlan(arena.allocator(), &theme, 40, 10, 0);
+    try std.testing.expectEqual(@as(u32, 1), plan.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), plan.skip);
+    try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
 }
