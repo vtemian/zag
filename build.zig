@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         "lua_sandbox",
         "Restrict Lua plugins: strip os/io/debug/package/require etc.",
     ) orelse false;
+    const sim_enabled = b.option(bool, "sim", "Build zag-sim") orelse true;
 
     // Shared build options module for comptime feature flags
     const build_options = b.addOptions();
@@ -57,83 +58,85 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // --- zag-sim ------------------------------------------------------------
-    const sim_mod = b.createModule(.{
-        .root_source_file = b.path("src/sim/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    sim_mod.addImport("build_options", build_options.createModule());
-    if (b.lazyDependency("ghostty", .{})) |dep| {
-        sim_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-    }
-    sim_mod.link_libc = true;
-    if (target.result.os.tag == .linux) {
-        sim_mod.linkSystemLibrary("util", .{});
-    }
+    if (sim_enabled) {
+        const sim_mod = b.createModule(.{
+            .root_source_file = b.path("src/sim/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        sim_mod.addImport("build_options", build_options.createModule());
+        if (b.lazyDependency("ghostty", .{})) |dep| {
+            sim_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        }
+        sim_mod.link_libc = true;
+        if (target.result.os.tag == .linux) {
+            sim_mod.linkSystemLibrary("util", .{});
+        }
 
-    const sim_exe = b.addExecutable(.{
-        .name = "zag-sim",
-        .root_module = sim_mod,
-    });
-    b.installArtifact(sim_exe);
+        const sim_exe = b.addExecutable(.{
+            .name = "zag-sim",
+            .root_module = sim_mod,
+        });
+        b.installArtifact(sim_exe);
 
-    const sim_run_cmd = b.addRunArtifact(sim_exe);
-    sim_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| sim_run_cmd.addArgs(args);
-    const sim_run_step = b.step("sim", "Run zag-sim");
-    sim_run_step.dependOn(&sim_run_cmd.step);
+        const sim_run_cmd = b.addRunArtifact(sim_exe);
+        sim_run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| sim_run_cmd.addArgs(args);
+        const sim_run_step = b.step("sim", "Run zag-sim");
+        sim_run_step.dependOn(&sim_run_cmd.step);
 
-    const sim_tests = b.addTest(.{ .root_module = sim_mod });
-    const run_sim_tests = b.addRunArtifact(sim_tests);
-    const sim_test_step = b.step("test-sim", "Run zag-sim unit + non-zag tests");
-    sim_test_step.dependOn(&run_sim_tests.step);
+        const sim_tests = b.addTest(.{ .root_module = sim_mod });
+        const run_sim_tests = b.addRunArtifact(sim_tests);
+        const sim_test_step = b.step("test-sim", "Run zag-sim unit + non-zag tests");
+        sim_test_step.dependOn(&run_sim_tests.step);
 
-    // --- test-sim-e2e -------------------------------------------------------
-    // Real-provider scenarios need the user's ~/.config/zag/auth.json and
-    // burn real API tokens, so they're gated behind `ZAG_E2E=1`. Without
-    // that env, the step is a no-op so CI and casual `zig build test-sim-e2e`
-    // invocations don't silently spend money or fail on missing creds. With
-    // ZAG_E2E=1, every .zsm under src/sim/scenarios/ runs in series, with
-    // the resume_seed -> resume_last pair chained explicitly so the second
-    // step sees the session the first one wrote.
-    const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag (set ZAG_E2E=1)");
-    sim_e2e_step.dependOn(b.getInstallStep());
+        // --- test-sim-e2e -------------------------------------------------------
+        // Real-provider scenarios need the user's ~/.config/zag/auth.json and
+        // burn real API tokens, so they're gated behind `ZAG_E2E=1`. Without
+        // that env, the step is a no-op so CI and casual `zig build test-sim-e2e`
+        // invocations don't silently spend money or fail on missing creds. With
+        // ZAG_E2E=1, every .zsm under src/sim/scenarios/ runs in series, with
+        // the resume_seed -> resume_last pair chained explicitly so the second
+        // step sees the session the first one wrote.
+        const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag (set ZAG_E2E=1)");
+        sim_e2e_step.dependOn(b.getInstallStep());
 
-    const zag_e2e = std.process.getEnvVarOwned(b.allocator, "ZAG_E2E") catch null;
-    if (zag_e2e) |val| {
-        defer b.allocator.free(val);
-        if (std.mem.eql(u8, val, "1")) {
-            // Scenarios that don't depend on previous state. Order does not
-            // matter; we serialise via the chain below to keep token spend
-            // predictable and avoid hammering the provider in parallel.
-            const independent_scenarios = [_][]const u8{
-                "src/sim/scenarios/slash_quit.zsm",
-                "src/sim/scenarios/real_smoke_hello.zsm",
-                "src/sim/scenarios/tool_use_bash.zsm",
-                "src/sim/scenarios/tool_use_read_edit.zsm",
-                "src/sim/scenarios/tool_parallel.zsm",
-                "src/sim/scenarios/tool_reuse_sequence.zsm",
-                "src/sim/scenarios/tool_deep_conversation.zsm",
-                "src/sim/scenarios/multi_turn_context.zsm",
-                "src/sim/scenarios/mid_turn_interrupt.zsm",
-            };
-            var prev_step: *std.Build.Step = b.getInstallStep();
-            for (independent_scenarios) |path| {
-                const cmd = b.addRunArtifact(sim_exe);
-                cmd.addArgs(&.{ "run", path });
-                cmd.step.dependOn(prev_step);
-                prev_step = &cmd.step;
+        const zag_e2e = std.process.getEnvVarOwned(b.allocator, "ZAG_E2E") catch null;
+        if (zag_e2e) |val| {
+            defer b.allocator.free(val);
+            if (std.mem.eql(u8, val, "1")) {
+                // Scenarios that don't depend on previous state. Order does not
+                // matter; we serialise via the chain below to keep token spend
+                // predictable and avoid hammering the provider in parallel.
+                const independent_scenarios = [_][]const u8{
+                    "src/sim/scenarios/slash_quit.zsm",
+                    "src/sim/scenarios/real_smoke_hello.zsm",
+                    "src/sim/scenarios/tool_use_bash.zsm",
+                    "src/sim/scenarios/tool_use_read_edit.zsm",
+                    "src/sim/scenarios/tool_parallel.zsm",
+                    "src/sim/scenarios/tool_reuse_sequence.zsm",
+                    "src/sim/scenarios/tool_deep_conversation.zsm",
+                    "src/sim/scenarios/multi_turn_context.zsm",
+                    "src/sim/scenarios/mid_turn_interrupt.zsm",
+                };
+                var prev_step: *std.Build.Step = b.getInstallStep();
+                for (independent_scenarios) |path| {
+                    const cmd = b.addRunArtifact(sim_exe);
+                    cmd.addArgs(&.{ "run", path });
+                    cmd.step.dependOn(prev_step);
+                    prev_step = &cmd.step;
+                }
+                // resume_seed must run before resume_last (same cwd, same
+                // .zag/sessions/ dir). Chain them on top of the independent
+                // scenarios.
+                const seed_cmd = b.addRunArtifact(sim_exe);
+                seed_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_seed.zsm" });
+                seed_cmd.step.dependOn(prev_step);
+                const last_cmd = b.addRunArtifact(sim_exe);
+                last_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_last.zsm" });
+                last_cmd.step.dependOn(&seed_cmd.step);
+                sim_e2e_step.dependOn(&last_cmd.step);
             }
-            // resume_seed must run before resume_last (same cwd, same
-            // .zag/sessions/ dir). Chain them on top of the independent
-            // scenarios.
-            const seed_cmd = b.addRunArtifact(sim_exe);
-            seed_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_seed.zsm" });
-            seed_cmd.step.dependOn(prev_step);
-            const last_cmd = b.addRunArtifact(sim_exe);
-            last_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_last.zsm" });
-            last_cmd.step.dependOn(&seed_cmd.step);
-            sim_e2e_step.dependOn(&last_cmd.step);
         }
     }
 

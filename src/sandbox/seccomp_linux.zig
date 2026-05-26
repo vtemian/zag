@@ -48,6 +48,14 @@ pub const BPF_JEQ: u16 = 0x10;
 pub const BPF_K: u16 = 0x00;
 pub const BPF_RET: u16 = 0x06;
 
+// seccomp action values (hard-coded because linux.seccomp.RET is not
+// available for all cross-compilation targets in Zig 0.15.2).
+const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
+const SECCOMP_RET_ERRNO: u32 = 0x00050000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
+const SECCOMP_SET_MODE_FILTER: u32 = 2;
+const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
+
 // Offsets inside `struct seccomp_data` we care about. From
 // std.os.linux.seccomp.data layout: nr (c_int) at 0, arch (u32) at 4,
 // instruction_pointer (u64) at 8, args[6] (u64) starting at 16.
@@ -77,14 +85,20 @@ pub const InstallError = error{
 /// Filter is inherited across execve so the bash child enforces it.
 pub fn installSocketFamilyFilter() InstallError!void {
     if (comptime builtin.os.tag != .linux) return error.Unsupported;
-    const arch_current: u32 = @intFromEnum(linux.AUDIT.ARCH.current);
+    // Work around Zig 0.15.2 stdlib bug: linux.AUDIT.ARCH.current
+    // references elf.EM.FRV which is missing for some targets.
+    const arch_current: u32 = switch (builtin.cpu.arch) {
+        .x86_64 => 0xC000003E,
+        .aarch64 => 0xC00000B7,
+        else => @intFromEnum(linux.AUDIT.ARCH.current),
+    };
     const sys_socket: u32 = @intFromEnum(linux.SYS.socket);
     const af_inet: u32 = linux.AF.INET;
     const af_inet6: u32 = linux.AF.INET6;
 
-    const ret_allow: u32 = linux.seccomp.RET.ALLOW;
-    const ret_eacces: u32 = linux.seccomp.RET.ERRNO | @as(u32, @intFromEnum(linux.E.ACCES));
-    const ret_kill: u32 = linux.seccomp.RET.KILL_PROCESS;
+    const ret_allow: u32 = SECCOMP_RET_ALLOW;
+    const ret_eacces: u32 = SECCOMP_RET_ERRNO | @as(u32, @intFromEnum(linux.E.ACCES));
+    const ret_kill: u32 = SECCOMP_RET_KILL_PROCESS;
 
     // Instruction layout (PC: action — jt/jf targets):
     //   0  LD  arch                          -> A = data.arch
@@ -127,8 +141,8 @@ pub fn installSocketFamilyFilter() InstallError!void {
 
     const seccomp_rc: isize = @bitCast(linux.syscall3(
         .seccomp,
-        linux.seccomp.SET_MODE_FILTER,
-        linux.seccomp.FILTER_FLAG.TSYNC,
+        SECCOMP_SET_MODE_FILTER,
+        SECCOMP_FILTER_FLAG_TSYNC,
         @intFromPtr(&prog),
     ));
     if (seccomp_rc < 0) {
@@ -150,7 +164,11 @@ test "filter constants resolve on linux targets" {
     // Resolve the comptime constants the filter depends on. No install
     // here (the test runner has no NNP and we don't want to lock down
     // the test process anyway).
-    const arch_current: u32 = @intFromEnum(linux.AUDIT.ARCH.current);
+    const arch_current: u32 = switch (builtin.cpu.arch) {
+        .x86_64 => 0xC000003E,
+        .aarch64 => 0xC00000B7,
+        else => @intFromEnum(linux.AUDIT.ARCH.current),
+    };
     try std.testing.expect(arch_current != 0);
     const sys_socket: u32 = @intFromEnum(linux.SYS.socket);
     try std.testing.expect(sys_socket != 0);
