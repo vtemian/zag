@@ -359,14 +359,21 @@ pub const EventQueue = struct {
     /// the ring is full, wait up to `max_wait_ms` for the consumer to drain
     /// a slot before giving up. Returns `error.EventDropped` if the budget
     /// expires; in that case `dropped` is incremented, the event's owned
-    /// bytes are freed, and a warn-level log records the drop so it isn't
-    /// silent. Thread-safe.
+    /// bytes are freed via `allocator`, and a warn-level log records the
+    /// drop so it isn't silent. Thread-safe.
+    ///
+    /// Like `tryPush`, `allocator` must be the one that produced the event's
+    /// owned bytes, which is NOT necessarily the queue's own allocator: the
+    /// agent thread allocates payloads from the per-turn wire arena while the
+    /// queue storage lives on the persistent heap allocator. Freeing through
+    /// the wrong one is cross-allocator UB.
     ///
     /// Uses the `drained` condition variable so a consumer freeing capacity
     /// wakes the producer within microseconds rather than after a fixed
     /// polling interval.
     pub fn pushWithBackpressure(
         self: *EventQueue,
+        allocator: Allocator,
         event: AgentEvent,
         max_wait_ms: u32,
     ) error{EventDropped}!void {
@@ -382,7 +389,7 @@ pub const EventQueue = struct {
                     "event queue drop after {d}ms backpressure: kind={s}",
                     .{ max_wait_ms, @tagName(event) },
                 );
-                event.freeOwned(self.allocator);
+                event.freeOwned(allocator);
                 return error.EventDropped;
             }
             const remaining_ns = deadline_ns - elapsed_ns;
@@ -1117,7 +1124,7 @@ test "pushWithBackpressure waits for drain and succeeds" {
     drainer.go.set();
 
     const payload = try alloc.dupe(u8, "after-drain");
-    try queue.pushWithBackpressure(.{ .info = payload }, 5_000);
+    try queue.pushWithBackpressure(alloc, .{ .info = payload }, 5_000);
 
     // Poll for the drainer to finish; bounded by the join() in defer so a
     // busted wake-up would hang the test rather than silently passing.
@@ -1147,7 +1154,40 @@ test "pushWithBackpressure drops after budget, no leak" {
     }
 
     const payload = try alloc.dupe(u8, "doomed");
-    const err = queue.pushWithBackpressure(.{ .info = payload }, 10);
+    const err = queue.pushWithBackpressure(alloc, .{ .info = payload }, 10);
+    try std.testing.expectError(error.EventDropped, err);
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
+}
+
+test "pushWithBackpressure drop frees through the producer allocator, not the queue allocator" {
+    // Regression: agent-thread producers allocate event payloads from the
+    // per-turn wire arena, while the queue's own storage is owned by the
+    // persistent heap allocator. The drop path used to free the payload
+    // through the queue allocator, so dropping an arena-owned payload freed
+    // an arena pointer through the heap allocator and the DebugAllocator
+    // aborted with "Invalid free". Mirrors the streaming crash chain
+    // streamEventToQueue -> pushWithBackpressure when a thinking_delta burst
+    // saturates the queue.
+    const queue_alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(queue_alloc, 2);
+    defer queue.deinit();
+    defer {
+        var buf: [4]AgentEvent = undefined;
+        const n = queue.drain(&buf);
+        for (buf[0..n]) |ev| ev.freeOwned(queue_alloc);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const producer = arena.allocator();
+
+    for (0..2) |_| {
+        const owned = try queue_alloc.dupe(u8, "x");
+        try queue.push(.{ .info = owned });
+    }
+
+    const payload = try producer.dupe(u8, "doomed");
+    const err = queue.pushWithBackpressure(producer, .{ .info = payload }, 10);
     try std.testing.expectError(error.EventDropped, err);
     try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
 }
