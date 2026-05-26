@@ -51,6 +51,22 @@ layout_dirty: bool = true,
 /// cache is bypassed when `-Dmetrics=true` is active because the metrics
 /// digits themselves shift every frame.
 last_status_key: StatusKey = .{},
+/// Float rects drawn on the previous frame. A float that moved, resized,
+/// or vanished without a layout change (cursor-anchored floats re-resolve
+/// every tick via `Layout.recalculateFloats`, which never sets
+/// `layout_dirty`) leaves cells the float pass never clears - it only
+/// clears rects floats occupy *now* - and the Screen diff can only erase
+/// a cell the compositor overwrites. Comparing against this snapshot lets
+/// `composite` force a full redraw so vacated cells repaint the tile
+/// content underneath instead of freezing as a ghost.
+prev_float_rects: [max_tracked_floats]Layout.Rect = undefined,
+prev_float_count: usize = 0,
+
+/// Cap on floats whose previous-frame rect is tracked for ghost
+/// detection. Matches `EventOrchestrator.max_visible_floats`; realistic
+/// layouts hold 0-3 floats. A frame with more floats than this falls back
+/// to forcing a full redraw, which is correct if coarse.
+const max_tracked_floats: usize = 32;
 
 const StatusKey = struct {
     mode: Keymap.Mode = .normal,
@@ -132,6 +148,13 @@ pub fn composite(
     float_drafts: []const FloatDraft,
     input: InputState,
 ) void {
+    // A float that moved, resized, or disappeared since last frame leaves
+    // cells no clear path covers (see `prev_float_rects`). Force a full
+    // redraw so the vacated cells repaint the tile content underneath.
+    // Must precede the `layout_dirty` read below.
+    if (self.floatRectsChanged(float_drafts)) self.layout_dirty = true;
+    self.recordFloatRects(float_drafts);
+
     // Reset per-frame arena: the previous frame's output lists and any
     // spans arrays allocated for non-cached buffer paths are released
     // in bulk. Cache-owned allocations live on `self.allocator` and are
@@ -212,6 +235,28 @@ pub fn composite(
         defer s.end();
         self.drawFloats(float_drafts, input);
     }
+}
+
+/// True if this frame's float rects differ from the previous frame's, in
+/// count or in any rect. A frame holding more floats than
+/// `max_tracked_floats` always reports changed (the overflow can't be
+/// compared, so a full redraw is the safe answer).
+fn floatRectsChanged(self: *const Compositor, float_drafts: []const FloatDraft) bool {
+    if (float_drafts.len != self.prev_float_count) return true;
+    if (float_drafts.len > max_tracked_floats) return true;
+    for (float_drafts, 0..) |fd, i| {
+        if (!std.meta.eql(fd.float.rect, self.prev_float_rects[i])) return true;
+    }
+    return false;
+}
+
+/// Snapshot this frame's float rects for next frame's `floatRectsChanged`
+/// comparison. Counts past `max_tracked_floats` are clamped to the cap,
+/// which keeps the next frame reporting changed (its count won't match).
+fn recordFloatRects(self: *Compositor, float_drafts: []const FloatDraft) void {
+    const n = @min(float_drafts.len, max_tracked_floats);
+    for (float_drafts[0..n], 0..) |fd, i| self.prev_float_rects[i] = fd.float.rect;
+    self.prev_float_count = n;
 }
 
 /// Draw content for all leaves (used on layout change / full redraw).
@@ -1976,6 +2021,59 @@ test "non-focused float draws with the plain border highlight" {
 
     const plain = Theme.resolve(theme.highlights.border, &theme);
     try std.testing.expect(std.meta.eql(screen.getCellConst(rect.y, rect.x).fg, plain.fg));
+}
+
+test "moving a float without a layout change clears its old cells" {
+    // Regression for float ghosting: a cursor-anchored float re-resolves
+    // its rect every tick (EventOrchestrator.recalculateFloats) without
+    // touching `layout_dirty`. The float pass only clears the rect a
+    // float occupies *now*, and the Screen diff can only erase a cell the
+    // compositor overwrites, so the cells a moved float vacated froze as
+    // a permanent ghost. composite() must notice the float-rect change
+    // and force a full redraw so the vacated cells repaint the tile
+    // underneath.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var root_cb = try Conversation.init(allocator, 0, "root");
+    defer root_cb.deinit();
+    _ = try root_cb.appendNode(null, .user_message, "hi");
+    var float_cb = try Conversation.init(allocator, 1, "float");
+    defer float_cb.deinit();
+    _ = try float_cb.appendNode(null, .user_message, "float");
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = root_cb.buf(), .view = root_cb.view(), .viewport = &test_viewport });
+    layout.recalculate(40, 12);
+
+    // Frame 1: float at the right (cols 20..35). Its top-right rounded
+    // corner lands at (2, 35).
+    const rect_a: Layout.Rect = .{ .x = 20, .y = 2, .width = 16, .height = 6 };
+    const old_corner_x = rect_a.x + rect_a.width - 1; // 35
+    _ = try layout.addFloat(.{ .buffer = float_cb.buf(), .view = float_cb.view(), .viewport = &test_viewport }, rect_a, .{ .border = .rounded, .title = "f" });
+    const drafts_a = [_]Compositor.FloatDraft{.{ .float = layout.floats.items[0], .focused = true }};
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &drafts_a, .{ .mode = .normal });
+    try std.testing.expectEqual(theme.borders.top_right, screen.getCellConst(rect_a.y, old_corner_x).codepoint);
+
+    // Frame 2: the float moves left (cols 4..19) the way a cursor-anchored
+    // float would, with no layout change signalled. The old corner at
+    // (2, 35) is outside the new rect and outside any tile content, so it
+    // must clear to empty space.
+    layout.floats.items[0].rect = .{ .x = 4, .y = 2, .width = 16, .height = 6 };
+    compositor.layout_dirty = false;
+    const drafts_b = [_]Compositor.FloatDraft{.{ .float = layout.floats.items[0], .focused = true }};
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &drafts_b, .{ .mode = .normal });
+
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(rect_a.y, old_corner_x).codepoint);
+    // Sanity: the float still draws at its new position.
+    try std.testing.expectEqual(theme.borders.top_right, screen.getCellConst(2, 4 + 16 - 1).codepoint);
 }
 
 test "tiny pane (height 3) skips the prompt reservation" {
