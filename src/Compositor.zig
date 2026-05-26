@@ -1952,8 +1952,14 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     // 3 physical rows (5 + 5 + 1), so total_rows = 30. visible_rows = 6,
     // scroll = 0 -> visible_start_rows = 24. Walking lines of 3 rows,
     // cum reaches 24 exactly after lines 0-7 (8 lines x 3 rows). Line 8
-    // is the first where cum + rows > visible_start_rows, so skip = 8 and
+    // is the first where cum + rows > visible_start_rows, with
     // leading_skip_rows = 24 - 24 = 0.
+    //
+    // Conversation overrides View.getWindow with a windowed projection:
+    // the plan's `lines` are rebased so the window starts at index 0
+    // (skip = 0, take = window length) rather than carrying the whole
+    // transcript and indexing into it. The bottom-anchoring math is still
+    // pinned via total_rows + leading_skip_rows.
     const plan = try planScroll(
         cb.view(),
         &theme,
@@ -1965,8 +1971,12 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     );
     try std.testing.expectEqual(@as(u32, 30), plan.total_rows);
     try std.testing.expectEqual(@as(u16, 6), plan.visible_rows);
-    try std.testing.expectEqual(@as(usize, 8), plan.skip);
+    try std.testing.expectEqual(@as(usize, 0), plan.skip);
     try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
+    // Windowed: only the visible window (visible_rows + slack) is
+    // materialized, not all 10 logical lines.
+    try std.testing.expect(plan.lines.items.len <= 8);
+    try std.testing.expect(plan.take <= 8);
 }
 
 test "planScroll: scroll past total clamps to zero rows" {

@@ -1594,6 +1594,55 @@ pub fn buf(self: *Conversation) Buffer {
     return .{ .ptr = self, .vtable = &vtable };
 }
 
+/// Windowed, cached implementation of View.getWindow. Computes
+/// total_rows + scroll mapping in O(node-count) via `rowPlan`, then
+/// projects ONLY the visible window through the existing
+/// `getVisibleLines(skip, visible_rows + slack)`. Returns a ScrollPlan
+/// whose `lines` already start at the window (skip = 0, take = len);
+/// `leading_skip_rows` clips the partial first line.
+pub fn getWindow(
+    self: *Conversation,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
+    theme: *const Theme,
+    content_width: u16,
+    visible_rows: u16,
+    scroll_rows: u32,
+) !View.ScrollPlan {
+    const rp = try self.rowPlan(frame_alloc, theme, content_width, visible_rows, scroll_rows);
+    // Blank when scrolled entirely off the top, matching the
+    // materialize-all `View.defaultGetWindow` contract exactly (the
+    // viewport clamps scroll_offset to total_rows-1 on the next frame).
+    // Keeping the two paths bit-identical here is what lets the Part E
+    // differential test compare their visible output directly.
+    if (rp.total_rows == 0 or visible_rows == 0 or content_width == 0 or scroll_rows >= rp.total_rows) {
+        return .{
+            .total_rows = rp.total_rows,
+            .skip = 0,
+            .take = 0,
+            .leading_skip_rows = 0,
+            .visible_rows = visible_rows,
+            .lines = .empty,
+        };
+    }
+
+    // +2 slack: one for the partial top line clipped by leading_skip_rows,
+    // one guard row. A single line can wrap to >= visible_rows physical
+    // rows, in which case fewer logical lines suffice; the draw loop
+    // early-exits at max_row regardless.
+    const max_lines: usize = @as(usize, visible_rows) + 2;
+    const lines = try self.getVisibleLines(frame_alloc, cache_alloc, theme, rp.skip, max_lines);
+
+    return .{
+        .total_rows = rp.total_rows,
+        .skip = 0,
+        .take = lines.items.len,
+        .leading_skip_rows = rp.leading_skip_rows,
+        .visible_rows = visible_rows,
+        .lines = lines,
+    };
+}
+
 /// Return the View interface for this buffer. Today every
 /// Conversation has exactly one View, backed by the same `*Self`
 /// pointer; future phases may attach additional Views over the same
@@ -1620,6 +1669,7 @@ const view_vtable: View.VTable = .{
     .onResize = viewOnResize,
     .onFocus = viewOnFocus,
     .onMouse = viewOnMouse,
+    .getWindow = viewGetWindow,
 };
 
 fn viewGetVisibleLines(ptr: *anyopaque, frame_alloc: Allocator, cache_alloc: Allocator, theme: *const Theme, skip: usize, max_lines: usize) anyerror!std.ArrayList(Theme.StyledLine) {
@@ -1650,6 +1700,19 @@ fn viewOnFocus(ptr: *anyopaque, focused: bool) void {
 fn viewOnMouse(ptr: *anyopaque, ev: input.MouseEvent, local_x: u16, local_y: u16) View.HandleResult {
     const self: *Conversation = @ptrCast(@alignCast(ptr));
     return self.onMouse(ev, local_x, local_y);
+}
+
+fn viewGetWindow(
+    ptr: *anyopaque,
+    frame_alloc: Allocator,
+    cache_alloc: Allocator,
+    theme: *const Theme,
+    content_width: u16,
+    visible_rows: u16,
+    scroll_rows: u32,
+) anyerror!View.ScrollPlan {
+    const self: *Conversation = @ptrCast(@alignCast(ptr));
+    return self.getWindow(frame_alloc, cache_alloc, theme, content_width, visible_rows, scroll_rows);
 }
 
 fn bufGetName(ptr: *anyopaque) []const u8 {
@@ -3434,4 +3497,27 @@ test "rowPlan: content shorter than viewport starts at top" {
     try std.testing.expectEqual(@as(u32, 1), plan.total_rows);
     try std.testing.expectEqual(@as(usize, 0), plan.skip);
     try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
+}
+
+test "getWindow returns only the visible window, not the whole transcript" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 0;
+    const theme = Theme.defaultTheme();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // 200 single-line nodes; viewport shows 5 rows.
+    var n: usize = 0;
+    while (n < 200) : (n += 1) {
+        _ = try cb.appendNode(null, .assistant_text, "line");
+    }
+
+    const v = cb.view();
+    const plan = try v.getWindow(arena.allocator(), allocator, &theme, 40, 5, 0);
+    try std.testing.expectEqual(@as(u32, 200), plan.total_rows);
+    // Window-only: far fewer than 200 lines materialized (visible_rows + slack).
+    try std.testing.expect(plan.lines.items.len <= 8);
+    try std.testing.expect(plan.take <= 8);
 }
