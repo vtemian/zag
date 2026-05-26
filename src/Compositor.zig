@@ -331,11 +331,10 @@ fn drawBufferIntoRect(
     const visible_rows = content_max_row -| content_y;
     const content_width: u16 = if (content_max_col > content_x) content_max_col - content_x else 0;
 
-    const plan = planScroll(
-        view,
-        self.theme,
+    const plan = view.getWindow(
         self.frame_arena.allocator(),
         self.allocator,
+        self.theme,
         content_width,
         visible_rows,
         viewport.scroll_offset,
