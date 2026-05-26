@@ -27,6 +27,7 @@ const tools = @import("tools.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
 const subagents_mod = @import("subagents.zig");
+const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
 const trace = @import("Metrics.zig");
@@ -249,6 +250,11 @@ pub const SpawnDeps = struct {
     /// `--instruction-file`) keeps it alive across the run. Empty
     /// string is acceptable for tests and `--no-session` runs.
     session_id: []const u8 = "",
+    /// Registry of in-flight child runners (owned by EventOrchestrator). Wired
+    /// into the published TaskContext so the built-in `task` tool registers its
+    /// child for main-thread draining. Null disables registration (the task
+    /// tool then drains on its own thread with no engine).
+    child_registry: ?*ChildRunnerRegistry = null,
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -307,6 +313,7 @@ pub fn submit(
             .task_depth = self.task_depth,
             .wake_fd = deps.wake_write_fd,
             .parent_conv = self.conversation,
+            .child_registry = deps.child_registry,
         };
     }
 
