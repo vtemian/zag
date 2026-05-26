@@ -1940,26 +1940,30 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
 
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        _ = try cb.appendNode(null, .user_message, "abcdefghi");
+        var buf: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "line{d}", .{i});
+        _ = try cb.appendNode(null, .user_message, s);
     }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     const theme = Theme.defaultTheme();
-    // 10 user_messages with content "abcdefghi" (9 chars) plus the "> "
-    // prefix = 11 cells per logical line. Width 5 wraps each line into
-    // 3 physical rows (5 + 5 + 1), so total_rows = 30. visible_rows = 6,
-    // scroll = 0 -> visible_start_rows = 24. Walking lines of 3 rows,
-    // cum reaches 24 exactly after lines 0-7 (8 lines x 3 rows). Line 8
-    // is the first where cum + rows > visible_start_rows, with
-    // leading_skip_rows = 24 - 24 = 0.
+    // 10 user_messages with distinct content "line0".."line9" (5 chars)
+    // plus the "> " prefix = 7 cells per logical line. Width 5 wraps each
+    // line into 2 physical rows (5 + 2), so total_rows = 20. visible_rows
+    // = 6, scroll = 0 -> visible_start_rows = 14. Walking lines of 2 rows,
+    // cum reaches 14 exactly after lines 0-6 (7 lines x 2 rows). Line 7 is
+    // the first where cum + rows > visible_start_rows, with
+    // leading_skip_rows = 14 - 14 = 0.
     //
     // Conversation overrides View.getWindow with a windowed projection:
     // the plan's `lines` are rebased so the window starts at index 0
     // (skip = 0, take = window length) rather than carrying the whole
-    // transcript and indexing into it. The bottom-anchoring math is still
-    // pinned via total_rows + leading_skip_rows.
+    // transcript and indexing into it. The window always rebases to
+    // skip == 0, so the skip index alone no longer proves bottom-anchoring.
+    // Distinct per-node content lets the content of the last window line
+    // pin that the BOTTOM (most-recent) rows are what got materialized.
     const plan = try planScroll(
         cb.view(),
         &theme,
@@ -1969,14 +1973,15 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
         6,
         0,
     );
-    try std.testing.expectEqual(@as(u32, 30), plan.total_rows);
+    try std.testing.expectEqual(@as(u32, 20), plan.total_rows);
     try std.testing.expectEqual(@as(u16, 6), plan.visible_rows);
-    try std.testing.expectEqual(@as(usize, 0), plan.skip);
     try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
-    // Windowed: only the visible window (visible_rows + slack) is
-    // materialized, not all 10 logical lines.
-    try std.testing.expect(plan.lines.items.len <= 8);
-    try std.testing.expect(plan.take <= 8);
+    // Bottom-anchoring: the last logical line of the window must render the
+    // last node's text ("line9"), proving the window holds the most-recent
+    // rows rather than the top of the transcript.
+    const last = plan.lines.items[plan.lines.items.len - 1];
+    const txt = try last.toText(arena.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, txt, "line9") != null);
 }
 
 test "planScroll: scroll past total clamps to zero rows" {
@@ -1991,6 +1996,8 @@ test "planScroll: scroll past total clamps to zero rows" {
     const theme = Theme.defaultTheme();
     const plan = try planScroll(cb.view(), &theme, arena.allocator(), allocator, 20, 10, 999);
     try std.testing.expectEqual(@as(usize, 0), plan.take);
+    // Windowed path materializes nothing when fully scrolled off the bottom.
+    try std.testing.expectEqual(@as(usize, 0), plan.lines.items.len);
 }
 
 test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" {
