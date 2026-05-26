@@ -70,8 +70,8 @@ $(addprefix package-,$(TARGETS)): package-%: release-%
 	@echo "Created $(ARTIFACT_DIR)/zag-$(VERSION)-$*.tar.gz"
 
 .PHONY: checksums
-checksums: package
-	@cd $(ARTIFACT_DIR) && sha256sum zag-$(VERSION)-*.tar.gz > checksums.txt
+checksums:
+	@cd $(ARTIFACT_DIR) && sha256sum zag-*.tar.gz > checksums.txt
 	@echo "Created $(ARTIFACT_DIR)/checksums.txt"
 
 # ---------------------------------------------------------------------------

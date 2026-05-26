@@ -16,22 +16,14 @@ jobs:
         include:
           - target: x86_64-linux-musl
             os: ubuntu-latest
-            archive: zag-${{ github.ref_name }}-x86_64-linux-musl.tar.gz
           - target: aarch64-linux-musl
             os: ubuntu-latest
-            archive: zag-${{ github.ref_name }}-aarch64-linux-musl.tar.gz
           - target: x86_64-macos
             os: macos-latest
-            archive: zag-${{ github.ref_name }}-x86_64-macos.tar.gz
           - target: aarch64-macos
             os: macos-latest
-            archive: zag-${{ github.ref_name }}-aarch64-macos.tar.gz
           # Windows is blocked on file_log.zig using POSIX APIs.
           # Add x86_64-windows-gnu here once that is ported.
-          # - target: x86_64-windows-gnu
-          #   os: ubuntu-latest
-          #   archive: zag-${{ github.ref_name }}-x86_64-windows-gnu.zip
-          #   binary: zag.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -44,37 +36,22 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe -Dsim=false
-
-      - name: Package (Unix)
-        if: ${{ !contains(matrix.target, 'windows') }}
-        run: |
-          mkdir dist
-          cp zig-out/bin/zag dist/
-          cp LICENSE dist/ || true
-          cp README.md dist/ || true
-          tar czf ${{ matrix.archive }} -C dist .
-
-      - name: Package (Windows)
-        if: ${{ contains(matrix.target, 'windows') }}
-        run: |
-          mkdir dist
-          cp zig-out/bin/zag.exe dist/
-          cp LICENSE dist/ || true
-          cp README.md dist/ || true
-          cd dist && zip -r ../${{ matrix.archive }} .
+      - name: Build and package
+        run: make package-${{ matrix.target }} VERSION=${{ github.ref_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: zag-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: artifacts/zag-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -82,14 +59,10 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
-        run: |
-          cd artifacts
-          sha256sum * > ../checksums.txt
+        run: make checksums ARTIFACT_DIR=artifacts
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/*
-            checksums.txt
+          files: artifacts/*
           generate_release_notes: true
