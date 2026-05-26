@@ -402,7 +402,6 @@ pub fn runLoopStreaming(
 
         const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
-        try emitTokenUsage(response, allocator, queue);
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
         // configured context window. Only anchor when the provider
@@ -823,32 +822,6 @@ pub fn callLlm(
         }
         return fallback;
     };
-}
-
-/// Push token usage info to the UI queue. When the response reports any
-/// cache-creation or cache-read tokens we append `, CW cw, CR cr` so the
-/// downstream parser can populate all four `llm.cost.Usage` fields.
-/// Old two-field form is preserved when both cache counts are zero so
-/// providers that don't cache don't grow the line.
-pub fn emitTokenUsage(response: types.LlmResponse, allocator: Allocator, queue: *agent_events.EventQueue) !void {
-    const has_cache = response.cache_creation_tokens > 0 or response.cache_read_tokens > 0;
-    const msg = if (has_cache)
-        try std.fmt.allocPrint(
-            allocator,
-            "tokens: {d} in, {d} out, {d} cw, {d} cr",
-            .{ response.input_tokens, response.output_tokens, response.cache_creation_tokens, response.cache_read_tokens },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "tokens: {d} in, {d} out",
-            .{ response.input_tokens, response.output_tokens },
-        );
-    // pushWithBackpressure waits up to default_backpressure_ms for a slot
-    // before giving up, logging a warn, freeing `msg` via freeOwned, and
-    // bumping the dropped counter. Losing a token-usage line is cosmetic,
-    // so swallow error.EventDropped.
-    queue.pushWithBackpressure(.{ .info = msg }, agent_events.default_backpressure_ms) catch {};
 }
 
 /// Extract tool_use blocks from a response into an owned slice.

@@ -519,7 +519,6 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         pending_synth.deinit(gpa);
     }
 
-    var pending_usage: ?llm.Usage = null;
     var agent_err: ?[]const u8 = null;
     defer if (agent_err) |e| gpa.free(e);
 
@@ -600,22 +599,9 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 },
                 .info => |text| {
                     defer gpa.free(text);
-                    if (Trajectory.parseTokenInfo(text)) |u| {
-                        pending_usage = .{
-                            .input_tokens = u.input,
-                            .output_tokens = u.output,
-                            .cache_creation_tokens = u.cache_creation,
-                            .cache_read_tokens = u.cache_read,
-                        };
-                    }
                 },
                 .done => {
-                    const metrics: Trajectory.TurnMetrics = if (pending_usage) |u| .{
-                        .prompt_tokens = u.input_tokens,
-                        .completion_tokens = u.output_tokens,
-                        .cached_tokens = if (u.cache_read_tokens > 0) u.cache_read_tokens else null,
-                        .cost_usd = llm.cost.estimateCost(deps.endpoint_registry, deps.model_id, u),
-                    } else .{};
+                    const metrics: Trajectory.TurnMetrics = .{};
                     capture.endTurn(metrics) catch |err| {
                         log.warn("capture endTurn failed: {s}", .{@errorName(err)});
                     };
