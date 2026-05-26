@@ -40,26 +40,22 @@ name: []const u8,
 /// etc.; the mutation methods on `Conversation` (`appendNode`,
 /// `clear`, ...) delegate through to this tree for backward compat.
 ///
-/// Threading policy: the tree is single-thread-mutated. All writes
-/// flow from the agent thread that owns this Conversation's `AgentRunner`
-/// (or, for child Conversations spawned by `task.zig`, the parent's agent
-/// thread while it sits inside `runChild` draining child events into the
-/// child's `BufferSink`). The UI thread reads the tree during rendering
-/// without synchronization. For the parent Conversation that's safe
-/// because the agent thread parks while the orchestrator drains its
-/// queue on the UI thread; for a child Conversation that the user has
-/// drilled into via `WindowManager.enterSubagent` the parent's agent
-/// thread may still be appending nodes while the UI thread renders the
-/// drill-down pane.
+/// Threading policy: the tree is single-thread-mutated. Writes flow
+/// through the `AgentRunner`'s `BufferSink` during the orchestrator's
+/// drain, which runs on the UI thread for panes and, since the child
+/// runners moved to main-thread draining, for child Conversations spawned
+/// by `task.zig` too (the orchestrator drains registered child runners via
+/// `ChildRunnerRegistry`). The UI thread reads the tree during rendering
+/// without synchronization, which is safe because drain and render share
+/// the same UI thread within one tick: a child drilled into via
+/// `WindowManager.enterSubagent` is written by that same drain, not by a
+/// separate agent thread, so the drill-down render is a same-thread read.
 ///
-/// We accept torn reads of the slice header on a resizing ArrayList
-/// for the placeholder/status rendering today: the worst case is a
-/// stale length or a tail node read mid-resize, which manifests as a
-/// slightly-out-of-date status line that the next render frame fixes.
-/// A future Phase F (or a live-status feature) should either add a
-/// seqlock around the child's tree, restrict drill-in until the child's
-/// runner has joined, or subscribe the drill-down pane to the child's
-/// BufferSink dirty events for synchronized live updates.
+/// The one exception is the orchestrator-less `runChild` fallback (headless
+/// harness), where child events are drained on the calling agent thread.
+/// That path runs with no live UI renderer reading the tree, so the
+/// cross-thread torn-read / seqlock concerns the old parent-agent-thread
+/// child drain raised no longer apply.
 tree: ConversationTree,
 /// Allocator used for all buffer-owned allocations (name, cache). The
 /// tree holds its own copy of the same allocator.
@@ -106,14 +102,14 @@ last_persisted_id: ?ulid.Ulid = null,
 /// recursively walks this list, frees each child's tree+registry+name,
 /// and destroys the heap slot.
 ///
-/// Threading policy: child Conversations may be in use by their own
-/// runners (or by the parent's agent thread inside `runChild`) while
-/// the parent renders the `subagent_link` line on the UI thread.
-/// `NodeRenderer.subagentStatus` reads `child.tree.root_children` to
-/// derive the live status string. That read is unsynchronized; the
-/// worst case is a stale or torn status string, which the next render
-/// pass corrects. See the threading-policy note on `tree` above for
-/// the broader rationale.
+/// Threading policy: child Conversations are drained on the UI thread
+/// (the orchestrator drains registered child runners via
+/// `ChildRunnerRegistry`), the same thread that renders the
+/// `subagent_link` line. `NodeRenderer.subagentStatus` reads
+/// `child.tree.root_children` to derive the live status string; that read
+/// is now same-thread as the writes, not the cross-thread read it was when
+/// `runChild` drained on the parent's agent thread. See the threading-policy
+/// note on `tree` above for the broader rationale.
 subagents: std.ArrayList(*Conversation) = .empty,
 /// Backlink to the parent Conversation, or null for root. Used by
 /// commit 2 so a child's `persistEvent` can delegate through the parent

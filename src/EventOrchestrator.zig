@@ -385,10 +385,12 @@ fn tick(
         }
 
         // Drain in-flight subagent runners on the main thread, same as panes.
-        // This is where child Lua round-trips (hooks, prompt layers, gates,
-        // compaction) get serviced under the shared engine. Children stay
-        // registered across ticks until they emit .done, so multi-tick async
-        // Lua flows (e.g. the compaction coroutine) resume correctly.
+        // This is where child Lua round-trips (hooks, prompt layers, tool
+        // gates, loop detection, JIT context) get serviced under the shared
+        // engine. Children stay registered across ticks until they emit .done,
+        // so multi-tick async Lua flows (e.g. a Lua tool that awaits
+        // zag.llm.complete) resume correctly. Compaction does not fire for
+        // subagents (child context_window is 0; see runChild).
         self.child_runner_registry.drainAll();
     }
 
