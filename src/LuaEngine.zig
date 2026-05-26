@@ -5390,13 +5390,14 @@ test "zag.race returns fastest value and reports winning index" {
     defer eng.deinitAsync();
 
     // Middle worker is the shortest; it should win and losers get cancelled
-    // before they return their strings.
+    // before they return their strings. Use generous gaps so scheduling jitter
+    // on slow CI runners cannot accidentally flip the winner.
     try eng.lua.doString(
         \\function test_race()
         \\  local v, err, idx = zag.race({
-        \\    function() zag.sleep(50); return "slow" end,
-        \\    function() zag.sleep(5); return "fast" end,
-        \\    function() zag.sleep(100); return "slower" end,
+        \\    function() zag.sleep(300); return "slow" end,
+        \\    function() zag.sleep(10); return "fast" end,
+        \\    function() zag.sleep(600); return "slower" end,
         \\  })
         \\  _race_winner = v
         \\  _race_err_is_nil = (err == nil)
