@@ -18,6 +18,7 @@ const Session = @import("Session.zig");
 const input = @import("input.zig");
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
+const width = @import("width.zig");
 
 const Conversation = @This();
 
@@ -484,6 +485,53 @@ fn countVisibleLines(node: *const Node, renderer: *const NodeRenderer, registry:
         }
     }
     return count;
+}
+
+/// Local copy of View.lineSpansAsBytes; duplicated to avoid a
+/// Conversation -> View build dependency for a 3-line helper.
+fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, line.spans.len);
+    for (line.spans, 0..) |span, idx| out[idx] = span.text;
+    return out;
+}
+
+/// Geometry of a single node's *own* render (excluding children) at
+/// `content_width`. Reads the memo; on miss, obtains the node's own
+/// StyledLines (cache hit, else a transient render into `scratch_alloc`
+/// — typically the frame arena) to sum wrapped rows, records logical
+/// lines from `lineCountForNode`, memoizes, and returns. The transient
+/// render is NOT persisted as a lines entry, keeping off-screen memory
+/// flat; only the per-node row counts are cached.
+fn nodeOwnMetrics(
+    self: *Conversation,
+    node: *const Node,
+    scratch_alloc: Allocator,
+    theme: *const Theme,
+    content_width: u16,
+) !NodeLineCache.RowMetrics {
+    if (self.cache.getMetrics(node, content_width)) |m| return m;
+
+    const logical: u32 = @intCast(self.renderer.lineCountForNode(node, &self.buffer_registry));
+
+    var wrapped: u32 = 0;
+    if (self.cache.get(node)) |cached| {
+        for (cached) |line| {
+            const parts = try lineSpansAsBytes(line, scratch_alloc);
+            wrapped += width.wrappedRowCountMulti(parts, content_width);
+        }
+    } else {
+        var scratch: std.ArrayList(Theme.StyledLine) = .empty;
+        defer scratch.deinit(scratch_alloc);
+        try self.renderer.render(node, &scratch, scratch_alloc, theme, &self.buffer_registry);
+        for (scratch.items) |line| {
+            const parts = try lineSpansAsBytes(line, scratch_alloc);
+            wrapped += width.wrappedRowCountMulti(parts, content_width);
+        }
+    }
+
+    const m = NodeLineCache.RowMetrics{ .wrapped_rows = wrapped, .logical_lines = logical };
+    try self.cache.putMetrics(node.id, node.content_version, content_width, m);
+    return m;
 }
 
 /// Append text to an existing node's content. Used for streaming: text
@@ -3171,4 +3219,29 @@ test "NodeLineCache rotates spans pointer on put-replace" {
     // UB-by-contract to dereference. We discard it to make the borrow
     // explicit in the test and document the lifetime constraint.
     _ = text1_first;
+}
+
+test "nodeOwnMetrics memoizes own wrapped+logical and is stable across calls" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 0;
+
+    const theme = Theme.defaultTheme();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // A single assistant_text node with a line that wraps at width 10.
+    const node = (try cb.appendNode(null, .assistant_text, "abcdefghij klmno")); // 16 cells
+
+    const m1 = try cb.nodeOwnMetrics(node, arena.allocator(), &theme, 10);
+    // Logical lines: 1 (no embedded newline). Wrapped at width 10: 2 rows.
+    try std.testing.expectEqual(@as(u32, 1), m1.logical_lines);
+    try std.testing.expectEqual(@as(u32, 2), m1.wrapped_rows);
+
+    // Second call must hit the memo and return identical values.
+    const m2 = try cb.nodeOwnMetrics(node, arena.allocator(), &theme, 10);
+    try std.testing.expectEqual(m1.wrapped_rows, m2.wrapped_rows);
+    try std.testing.expectEqual(m1.logical_lines, m2.logical_lines);
+    try std.testing.expect(cb.cache.getMetrics(node, 10) != null);
 }
