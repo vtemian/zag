@@ -21,6 +21,7 @@ const input = @import("input.zig");
 const Screen = @import("Screen.zig");
 const Terminal = @import("Terminal.zig");
 const AgentRunner = @import("AgentRunner.zig");
+const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const Conversation = @import("Conversation.zig");
 const Layout = @import("Layout.zig");
 const Viewport = @import("Viewport.zig");
@@ -93,6 +94,10 @@ registry: *const tools.Registry,
 /// Window, pane, and frame-local UI state. Layout/compositor/root_pane
 /// live here so the orchestrator stays a pure event coordinator.
 window_manager: WindowManager = undefined,
+
+/// In-flight child runners spawned by the `task` tool. Drained on the main
+/// thread each tick so subagent Lua round-trips never touch the VM off-thread.
+child_runner_registry: ChildRunnerRegistry = undefined,
 
 // -- Construction ------------------------------------------------------------
 
@@ -168,6 +173,7 @@ pub fn init(cfg: Config) !EventOrchestrator {
         .skills = cfg.skills,
     });
     errdefer self.window_manager.deinit();
+    self.child_runner_registry = ChildRunnerRegistry.init(cfg.allocator);
     return self;
 }
 
@@ -190,6 +196,9 @@ pub fn deinit(self: *EventOrchestrator) void {
     // hold live pointers into every pane's buffer. Only after those are
     // joined is it safe to let WindowManager.deinit free pane storage.
     self.shutdownAgents();
+    // shutdownAgents drives every in-flight child to completion, so the
+    // registry is empty here; deinit only frees its backing ArrayList.
+    self.child_runner_registry.deinit();
     self.window_manager.deinit();
 }
 
@@ -374,6 +383,15 @@ fn tick(
         for (self.window_manager.extra_panes.items) |entry| {
             self.window_manager.drainPane(&entry.pane);
         }
+
+        // Drain in-flight subagent runners on the main thread, same as panes.
+        // This is where child Lua round-trips (hooks, prompt layers, tool
+        // gates, loop detection, JIT context) get serviced under the shared
+        // engine. Children stay registered across ticks until they emit .done,
+        // so multi-tick async Lua flows (e.g. a Lua tool that awaits
+        // zag.llm.complete) resume correctly. Compaction does not fire for
+        // subagents (child context_window is 0; see runChild).
+        self.child_runner_registry.drainAll();
     }
 
     // Auto-close sweep: walk floats once per tick and close any whose
@@ -1064,11 +1082,19 @@ fn onUserInputSubmitted(
         .registry = self.registry,
         .subagents = if (self.lua_engine) |eng| eng.subagentRegistry() else null,
         .session_id = session_id,
+        .child_registry = &self.child_runner_registry,
     });
 }
 
-/// Shutdown all agent threads (root + every extra pane). Called from deinit()
-/// so the error-return path from run() cannot skip it.
+/// Shutdown all agent threads (root + every extra pane), after first driving
+/// any in-flight subagent runners to completion. Called from deinit() so the
+/// error-return path from run() cannot skip it.
+///
+/// Ordering matters: a parent agent thread parked in `runChild` only unblocks
+/// when the main thread sets its child's `done`. If we joined the parents
+/// before draining their children, the join would hang. So: (1) cancel panes,
+/// (2) drive children to .done (which signals the parked runChild calls; the
+/// now-cancelled parent loops then exit), (3) join panes.
 pub fn shutdownAgents(self: *EventOrchestrator) void {
     // Stack-allocated so shutdown itself cannot fail on OOM. 32 is
     // far beyond any realistic TUI split count; if a user somehow
@@ -1092,7 +1118,32 @@ pub fn shutdownAgents(self: *EventOrchestrator) void {
             len += 1;
         }
     }
+
+    // Cancel panes first so that, once their parked runChild calls return,
+    // the parent loops observe cancellation and exit instead of starting a
+    // new turn.
+    for (buf[0..len]) |r| r.cancelAgent();
+
+    // Drive every in-flight child (at any nesting depth) to .done before
+    // joining the panes, or a parent parked in runChild would deadlock the
+    // join.
+    self.drainChildrenToCompletion();
+
     AgentRunner.shutdownAll(buf[0..len]);
+}
+
+/// Fixed-point loop: cancel + drain all registered children until the registry
+/// is empty. Main-thread only (`drainAll` dispatches Lua). Terminates because
+/// cancel propagates and `threadMain` always pushes `.done`.
+fn drainChildrenToCompletion(self: *EventOrchestrator) void {
+    while (!self.child_runner_registry.isEmpty()) {
+        self.child_runner_registry.cancelAll();
+        self.child_runner_registry.drainAll();
+        // Yield so a parent agent thread woken by a child's `done` can return
+        // from runChild and let its (cancelled) loop push `.done` before the
+        // next pass, instead of busy-spinning on a not-yet-finished parent.
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
 }
 
 /// Compile-time cap on the shutdown runner list; see shutdownAgents.

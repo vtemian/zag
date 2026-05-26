@@ -41,6 +41,7 @@ const llm = @import("llm.zig");
 const Session = @import("Session.zig");
 const LuaEngine_mod = @import("LuaEngine.zig");
 const Conversation = @import("Conversation.zig");
+const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 
 /// Per-thread context consumed by the `task` tool. Set by AgentRunner
 /// before spawning the agent thread and republished by parallel tool
@@ -92,6 +93,12 @@ pub const TaskContext = struct {
     /// child's `persistEvent` chain delegates through the parent's
     /// session handle for single-rooted JSONL persistence.
     parent_conv: *Conversation,
+    /// Registry of in-flight child runners owned by the EventOrchestrator.
+    /// `runChild` registers the child here so the main thread drains it
+    /// (the only thread allowed to touch Lua). Null in tests / headless
+    /// harnesses with no orchestrator; `runChild` falls back to draining on
+    /// the calling thread with a null engine in that case (Zig-only path).
+    child_registry: ?*ChildRunnerRegistry = null,
 };
 
 /// Threadlocal slot holding the active `TaskContext` for the current
