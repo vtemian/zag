@@ -27,6 +27,7 @@ const tools = @import("tools.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
 const subagents_mod = @import("subagents.zig");
+const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
 const trace = @import("Metrics.zig");
@@ -249,6 +250,11 @@ pub const SpawnDeps = struct {
     /// `--instruction-file`) keeps it alive across the run. Empty
     /// string is acceptable for tests and `--no-session` runs.
     session_id: []const u8 = "",
+    /// Registry of in-flight child runners (owned by EventOrchestrator). Wired
+    /// into the published TaskContext so the built-in `task` tool registers its
+    /// child for main-thread draining. Null disables registration (the task
+    /// tool then drains on its own thread with no engine).
+    child_registry: ?*ChildRunnerRegistry = null,
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -307,6 +313,7 @@ pub fn submit(
             .task_depth = self.task_depth,
             .wake_fd = deps.wake_write_fd,
             .parent_conv = self.conversation,
+            .child_registry = deps.child_registry,
         };
     }
 
@@ -1958,6 +1965,62 @@ test "drainEvents joins thread and deinits queue on .done" {
 
     try std.testing.expect(result.finished);
     try std.testing.expect(result.any_drained);
+    try std.testing.expect(runner.agent_thread == null);
+    try std.testing.expect(!runner.queue_active);
+}
+
+test "ChildRunnerRegistry.drainAll finishes a child, signals done, removes entry" {
+    // The cross-thread handshake Option D relies on: a child runner is drained
+    // by a different thread than the one parked on `done`. Here the test thread
+    // plays the main thread (drainAll) and a worker thread plays the parked
+    // runChild (waits on `done`). Uses the same manual scaffold as the
+    // "drainEvents joins thread..." test above: a real queue and a trivial
+    // agent thread that exits, with a `.done` already queued.
+    const allocator = std.testing.allocator;
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
+    defer runner.deinit();
+
+    runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    runner.queue_active = true;
+    const Noop = struct {
+        fn run() void {}
+    };
+    runner.agent_thread = try std.Thread.spawn(.{}, Noop.run, .{});
+    try runner.event_queue.push(.done);
+
+    var registry = ChildRunnerRegistry.init(allocator);
+    defer registry.deinit();
+
+    var child_done: std.Thread.ResetEvent = .{};
+    try registry.register(.{ .runner = &runner, .done = &child_done });
+
+    // Worker thread parks on `done`, exactly as runChild would. It must wake
+    // only after the test thread's drainAll() finishes the child.
+    const Waiter = struct {
+        fn run(done: *std.Thread.ResetEvent, woke: *std.atomic.Value(bool)) void {
+            done.wait();
+            woke.store(true, .release);
+        }
+    };
+    var woke = std.atomic.Value(bool).init(false);
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &child_done, &woke });
+
+    // Main-thread drain loop, exactly as EventOrchestrator.tick would run it.
+    var spins: usize = 0;
+    while (!child_done.isSet()) {
+        registry.drainAll();
+        if (child_done.timedWait(10 * std.time.ns_per_ms)) |_| break else |_| {}
+        spins += 1;
+        try std.testing.expect(spins < 1000); // guard against a hung handshake
+    }
+    waiter.join();
+
+    try std.testing.expect(child_done.isSet());
+    try std.testing.expect(woke.load(.acquire));
+    try std.testing.expect(registry.isEmpty());
+    // drainAll drove the same teardown drainEvents does directly.
     try std.testing.expect(runner.agent_thread == null);
     try std.testing.expect(!runner.queue_active);
 }
