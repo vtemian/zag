@@ -199,13 +199,16 @@ fn runChild(
     var child_runner = AgentRunner.init(allocator, child_sink.sink(), child_conv);
     defer child_runner.deinit();
     child_runner.wake_fd = ctx.wake_fd;
-    // Wire the real Lua engine into the child. Safe now that the MAIN thread
-    // drains the child's queue (see registration below): dispatchHookRequests
-    // runs only on the main thread, for panes and children alike, so the Lua
-    // VM is never touched from two threads at once. `submit` copies this into
-    // self.lua_engine; setting it here keeps the field correct before submit
-    // for any pre-submit drain (none today, but defensive).
-    child_runner.lua_engine = ctx.lua_engine;
+    // The child gets the real Lua engine ONLY when a child_registry is present,
+    // because the engine is safe to wire iff the MAIN thread drains the child's
+    // queue (dispatchHookRequests must run on the main thread, never this agent
+    // thread). With a registry, the orchestrator drains the child on the main
+    // thread; without one (orchestrator-less harness / headless), we fall back
+    // to draining on this thread, which is only safe with a null engine. Tying
+    // the engine to the registry makes the unsafe "engine without a main-thread
+    // drainer" combination impossible by construction rather than by comment.
+    const child_engine = if (ctx.child_registry != null) ctx.lua_engine else null;
+    child_runner.lua_engine = child_engine;
     // No window_manager wired: subagents do not mutate the window
     // tree. Layout requests get serviced as errors via the round-trip
     // dispatcher's no-WM branch, which matches the legacy collector
@@ -243,7 +246,7 @@ fn runChild(
     try child_runner.submit(.{
         .allocator = ctx.allocator,
         .wake_write_fd = ctx.wake_fd orelse 0,
-        .lua_engine = ctx.lua_engine,
+        .lua_engine = child_engine,
         .provider = ctx.provider,
         .model_spec = child_model_spec,
         .registry = &child_registry,
@@ -260,10 +263,9 @@ fn runChild(
     // park here until the main thread reports the child finished.
     //
     // When `ctx.child_registry` is null (test harness / headless with no
-    // orchestrator), fall back to draining on this thread. That path is only
-    // safe with no engine wired; a real engine without an orchestrator has no
-    // safe main thread to drain on, so registration is required for the Lua
-    // path. Headless callers that wire an engine must also wire a registry.
+    // orchestrator), fall back to draining on this thread. The child engine was
+    // forced to null above in that case, so the fallback drain is Zig-only and
+    // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
         var child_done: std.Thread.ResetEvent = .{};
         try registry.register(.{ .runner = &child_runner, .done = &child_done });
@@ -277,9 +279,9 @@ fn runChild(
             if (child_done.timedWait(50 * std.time.ns_per_ms)) |_| break else |_| {}
         }
     } else {
-        // Orchestrator-less fallback: drain on this thread. Lua arms no-op
-        // when the engine is null; wiring an engine without a registry is
-        // unsupported (the dispatch would be off the main thread).
+        // Orchestrator-less fallback: drain on this thread. The child engine is
+        // null here (forced above when child_registry is null), so the round-
+        // trip Lua arms no-op and nothing touches the VM off the main thread.
         while (true) {
             if (parent_cancel) |pc| {
                 if (pc.load(.acquire)) child_runner.cancelAgent();
