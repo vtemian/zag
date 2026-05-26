@@ -1,11 +1,13 @@
 -- zag.subagents.filesystem: filesystem loader for Lua subagents.
 --
--- Opt-in stdlib module that scans three directories for `*.md` files,
--- parses YAML frontmatter via `zag.parse_frontmatter`, and registers
--- each valid entry with `zag.subagent.register`. Per-file errors log a
--- warning and skip; one malformed agent never breaks the whole load.
+-- Auto-loaded on startup by `loadBuiltinPlugins`: scans three directories
+-- for `*.md` files, parses YAML frontmatter via `zag.parse_frontmatter`,
+-- and registers each valid entry with `zag.subagent.register`. Per-file
+-- errors log a warning and skip; one malformed agent never breaks the
+-- whole load. A user drops an agent `.md` in a scanned root and it is
+-- discovered with no `require` needed.
 --
--- Default roots (scanned on `require` in order):
+-- Default roots (scanned on startup in order):
 --   1. <cwd>/.zag/agents
 --   2. <cwd>/.agents/agents
 --   3. ~/.config/zag/agents

@@ -475,10 +475,11 @@ pub const LuaEngine = struct {
     }
 
     /// Require every embedded `zag.builtin.*`, `zag.layers.*`,
-    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, and the `zag.prompt`
-    /// dispatcher so the side effects (slash command registrations,
-    /// keymap bindings, prompt layer registrations, JIT context
-    /// handlers, loop detector handlers, compaction strategy handlers)
+    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, the `zag.prompt`
+    /// dispatcher, and the `zag.subagents.filesystem` loader so the side
+    /// effects (slash command registrations, keymap bindings, prompt
+    /// layer registrations, JIT context handlers, loop detector handlers,
+    /// compaction strategy handlers, and filesystem-discovered subagents)
     /// land in the engine's registries. Must be called before
     /// `loadUserConfig` so a user's
     /// overrides win via the command registry's last-write-wins
@@ -504,7 +505,8 @@ pub const LuaEngine = struct {
             const is_loop = std.mem.startsWith(u8, entry.name, "zag.loop.");
             const is_compact = std.mem.startsWith(u8, entry.name, "zag.compact.");
             const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
-            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher) continue;
+            const is_subagent_loader = std.mem.eql(u8, entry.name, "zag.subagents.filesystem");
+            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher and !is_subagent_loader) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -10738,6 +10740,21 @@ test "loadBuiltinPlugins registers the default general subagent" {
     // The shipped delegate makes delegation work with zero user config:
     // a non-empty registry is what `tools.registerTaskTool` gates on.
     try std.testing.expect(engine.subagentRegistry().lookup("general") != null);
+}
+
+test "loadBuiltinPlugins auto-requires the filesystem subagent loader" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    engine.loadBuiltinPlugins();
+    // Without auto-load a user would have to `require` it before a dropped
+    // agent `.md` is discovered. Proof it ran: package.loaded is populated.
+    try engine.lua.doString("_fs_loaded = package.loaded['zag.subagents.filesystem'] ~= nil");
+    _ = try engine.lua.getGlobal("_fs_loaded");
+    defer engine.lua.pop(1);
+    try std.testing.expect(engine.lua.toBoolean(-1));
 }
 
 test "zag.loop.default does not act before the 5-call threshold" {
