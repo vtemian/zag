@@ -110,10 +110,6 @@ Choose one of these shapes.
 ## Implementation notes
 - <likely files/subsystems>
 - <risks/open design choices>
-
-## Acceptance criteria
-- [ ] <observable result>
-- [ ] <test/sim/manual verification>
 ````
 
 #### Bug
@@ -135,10 +131,6 @@ Choose one of these shapes.
 
 ## Context
 <logs, session, files, suspected subsystem>
-
-## Acceptance criteria
-- [ ] <bug no longer reproduces>
-- [ ] <regression coverage if feasible>
 ````
 
 #### Exploration / design spike
@@ -158,7 +150,7 @@ Choose one of these shapes.
 - `<file>`: <why relevant>
 
 ## Deliverable
-- [ ] <short design note, prototype, or decision>
+<short design note, prototype, or decision>
 ````
 
 ### 4. Draft the issue locally in the reply
