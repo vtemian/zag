@@ -3522,6 +3522,21 @@ test "getWindow returns only the visible window, not the whole transcript" {
     try std.testing.expect(plan.take <= 8);
 }
 
+test "getWindow on an empty conversation returns an empty plan" {
+    const allocator = std.testing.allocator;
+    const theme = Theme.defaultTheme();
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const plan = try cb.view().getWindow(arena.allocator(), allocator, &theme, 40, 10, 0);
+    try std.testing.expectEqual(@as(u32, 0), plan.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), plan.take);
+    try std.testing.expectEqual(@as(usize, 0), plan.lines.items.len);
+}
+
 test "getWindow matches defaultGetWindow across widths and scroll offsets" {
     const allocator = std.testing.allocator;
     const theme = Theme.defaultTheme();
