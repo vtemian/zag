@@ -3521,3 +3521,74 @@ test "getWindow returns only the visible window, not the whole transcript" {
     try std.testing.expect(plan.lines.items.len <= 8);
     try std.testing.expect(plan.take <= 8);
 }
+
+test "getWindow matches defaultGetWindow across widths and scroll offsets" {
+    const allocator = std.testing.allocator;
+    const theme = Theme.defaultTheme();
+
+    // Mixed node types, a multiline node ('\n'), a node whose single line
+    // wraps hard at small widths, and enough nodes that turn_gap=1 matters.
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 1;
+
+    _ = try cb.appendNode(null, .user_message, "short question");
+    _ = try cb.appendNode(null, .assistant_text, "a fairly long answer line that will wrap at small widths\nsecond line\nthird");
+    _ = try cb.appendNode(null, .tool_call, "bash");
+    _ = try cb.appendNode(null, .assistant_text, "wrap " ** 30);
+    _ = try cb.appendNode(null, .user_message, "follow up");
+    _ = try cb.appendNode(null, .assistant_text, "tail one\ntail two");
+
+    // The two getWindow paths return DIFFERENT-shaped plans:
+    //   defaultGetWindow: lines = ALL logical lines, skip = real logical
+    //     start, take = total_logical - skip.
+    //   Conversation.getWindow: lines = ONLY the window (already starting at
+    //     the logical start), skip = 0, take = lines.len.
+    // A naive concat over [skip, skip+take) would diverge on trailing lines
+    // the windowed path never fetched. So compare only the DRAWN region: the
+    // logical lines that contribute at least one visible physical row.
+    const Helper = struct {
+        fn drawnLines(plan: View.ScrollPlan, content_width: u16, visible_rows: u16, a: Allocator) ![][]const u8 {
+            var out: std.ArrayList([]const u8) = .empty;
+            const slice = plan.lines.items[plan.skip..];
+            // The first line's top is clipped by leading_skip_rows.
+            var phys: i64 = -@as(i64, plan.leading_skip_rows);
+            for (slice) |line| {
+                try out.append(a, try line.toText(a));
+                const parts = try lineSpansAsBytes(line, a);
+                phys += width.wrappedRowCountMulti(parts, content_width);
+                if (phys >= visible_rows) break;
+            }
+            return out.toOwnedSlice(a);
+        }
+    };
+
+    const widths = [_]u16{ 12, 20, 40, 80 };
+    const visibles = [_]u16{ 3, 5, 10 };
+    for (widths) |w| {
+        for (visibles) |vis| {
+            var scroll: u32 = 0;
+            while (scroll <= 60) : (scroll += 7) {
+                var arena_got = std.heap.ArenaAllocator.init(allocator);
+                defer arena_got.deinit();
+                var arena_want = std.heap.ArenaAllocator.init(allocator);
+                defer arena_want.deinit();
+
+                const v = cb.view();
+                const got = try v.getWindow(arena_got.allocator(), allocator, &theme, w, vis, scroll);
+                const want = try View.defaultGetWindow(v, arena_want.allocator(), allocator, &theme, w, vis, scroll);
+
+                try std.testing.expectEqual(want.total_rows, got.total_rows);
+                try std.testing.expectEqual(want.leading_skip_rows, got.leading_skip_rows);
+
+                const got_lines = try Helper.drawnLines(got, w, vis, arena_got.allocator());
+                const want_lines = try Helper.drawnLines(want, w, vis, arena_want.allocator());
+
+                try std.testing.expectEqual(want_lines.len, got_lines.len);
+                for (want_lines, got_lines) |wl, gl| {
+                    try std.testing.expectEqualStrings(wl, gl);
+                }
+            }
+        }
+    }
+}
