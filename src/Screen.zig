@@ -102,6 +102,14 @@ cluster_index: std.ArrayList(ClusterIndex),
 /// full redraw, since the terminal received an unknown partial prefix
 /// of the dropped frame.
 write_timed_out: bool = false,
+/// Set when the terminal's on-screen contents can no longer be trusted
+/// (after a resize, or a dropped frame from `write_timed_out`). On the
+/// next render the diff cannot rely on `previous`, which gets blanked to
+/// force every populated cell to repaint; but blanking `previous` makes
+/// now-empty cells match it and the diff skips them, so the terminal
+/// keeps whatever stale glyphs sat there. The render erases the whole
+/// display first when this is set, so those vacated cells cannot ghost.
+force_full_clear: bool = false,
 
 const empty_cell = Cell{};
 
@@ -167,6 +175,10 @@ pub fn resize(self: *Screen, width: u16, height: u16) !void {
     self.previous = new_previous;
     self.width = width;
     self.height = height;
+    // The emulator reflows or clamps the old frame on resize; `previous`
+    // (now blank) no longer mirrors the terminal, so the next render must
+    // erase before painting.
+    self.force_full_clear = true;
     self.render_buf.clearRetainingCapacity();
     self.cluster_bytes.clearRetainingCapacity();
     self.cluster_index.clearRetainingCapacity();
@@ -402,6 +414,7 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
     if (self.write_timed_out) {
         @memset(self.previous, empty_cell);
         self.write_timed_out = false;
+        self.force_full_clear = true;
     }
 
     self.render_buf.clearRetainingCapacity();
@@ -414,6 +427,16 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         defer diff_span.endWithArgs(.{ .cells_changed = cells_changed });
 
         try writer.writeAll("\x1b[?2026h");
+
+        // When the terminal's contents can't be trusted (resize, dropped
+        // frame), reset SGR and erase the whole display so cells the diff
+        // is about to skip (now-empty, matching the blanked `previous`)
+        // can't keep stale glyphs. The per-run cursor moves below
+        // re-establish position, so erasing to home is safe.
+        if (self.force_full_clear) {
+            try writer.writeAll("\x1b[0m\x1b[2J");
+            self.force_full_clear = false;
+        }
 
         var last_style: ?Style = null;
         var last_fg: ?Color = null;
@@ -1369,6 +1392,74 @@ test "render after write_timed_out forces full redraw" {
     // Because the flag wiped `previous` to empty cells at entry, every 'Q'
     // is now dirty and the frame re-emits the content.
     try std.testing.expect(std.mem.indexOf(u8, output, "Q") != null);
+}
+
+test "forced full redraw erases the display so vacated cells cannot ghost" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 8, 1);
+    defer screen.deinit();
+
+    // Frame 1: a wide line the terminal now physically shows. After this
+    // render `previous` mirrors the terminal: all eight columns hold 'W'.
+    for (screen.current) |*cell| cell.codepoint = 'W';
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        defer read_end.close();
+        try screen.render(write_end);
+        write_end.close();
+        var scratch: [1024]u8 = undefined;
+        _ = try readPipe(read_end, &scratch);
+    }
+
+    // The prior write timed out: the terminal's true contents are no longer
+    // known, so the next frame wipes `previous` to force a full redraw.
+    screen.write_timed_out = true;
+
+    // Frame 2 draws only a short line; columns 2..7 are now blank. With
+    // `previous` blanked, those columns are space-vs-space and the diff
+    // skips them, so the terminal keeps the stale 'W' cells unless the
+    // frame explicitly erases the display first.
+    screen.clear();
+    screen.getCell(0, 0).codepoint = 'h';
+    screen.getCell(0, 1).codepoint = 'i';
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+    try screen.render(write_end);
+    write_end.close();
+    var scratch: [1024]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // A forced full redraw cannot trust the terminal's prior contents, so
+    // it must erase the whole display before painting; otherwise the
+    // vacated columns ghost.
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[2J") != null);
+}
+
+test "normal changed-cell frame does not erase the whole display" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 8, 1);
+    defer screen.deinit();
+
+    // A plain content change with no forced repaint must rely on the diff,
+    // never a full-screen erase: erasing every frame would defeat the
+    // double-buffer diff and repaint the world on every keystroke.
+    screen.getCell(0, 0).codepoint = 'h';
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+    try screen.render(write_end);
+    write_end.close();
+    var scratch: [1024]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[2J") == null);
 }
 
 test "writeStr: ZWJ family emoji occupies 2 cells" {
