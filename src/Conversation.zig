@@ -24,6 +24,22 @@ const Conversation = @This();
 
 const log = std.log.scoped(.conversation);
 
+/// Visual delimiter rendered between root-level conversation turns.
+/// Replaces the old blank gap line so user input and assistant output
+/// are clearly separated. Length (36) fills a good portion of typical
+/// pane widths without excessive wrapping; the `md_hr` highlight dims
+/// it so it reads as chrome, not content.
+const turn_delimiter = "────────────────────────────────────";
+
+/// Physical rows consumed by one turn-gap line. The first gap line is
+/// the delimiter rule (may wrap); remaining gap lines are blank (1 row).
+fn turnGapRows(gap_idx: u16, content_width: u16) u32 {
+    if (gap_idx == 0) {
+        return width.wrappedRowCountMulti(&[_][]const u8{turn_delimiter}, content_width);
+    }
+    return 1;
+}
+
 /// Re-export of the tree's node type enum, so external call sites that
 /// named it `Conversation.NodeType` keep compiling during the
 /// migration. Prefer `ConversationTree.NodeType` for new code.
@@ -348,12 +364,17 @@ pub fn getVisibleLines(
 
         // Insert turn gap between root-level nodes (turns), but not after the last one.
         if (i < self.tree.root_children.items.len - 1) {
-            for (0..self.turn_gap) |_| {
+            for (0..self.turn_gap) |g| {
                 if (collected >= max_lines) break;
                 if (skipped < skip) {
                     skipped += 1;
                 } else {
-                    try lines.append(frame_alloc, try Theme.emptyStyledLine(frame_alloc));
+                    // First gap line is a visual delimiter; remainder are blank.
+                    const line = if (g == 0)
+                        try Theme.singleSpanLine(frame_alloc, turn_delimiter, theme.highlights.md_hr)
+                    else
+                        try Theme.emptyStyledLine(frame_alloc);
+                    try lines.append(frame_alloc, line);
                     collected += 1;
                 }
             }
@@ -571,7 +592,12 @@ fn rowPlan(
     const roots = self.tree.root_children.items;
     for (roots, 0..) |node, i| {
         total += try self.subtreeWrapped(node, scratch_alloc, theme, content_width);
-        if (i < roots.len - 1) total += self.turn_gap; // blank rows
+        if (i < roots.len - 1) {
+            var g: u16 = 0;
+            while (g < self.turn_gap) : (g += 1) {
+                total += turnGapRows(g, content_width);
+            }
+        }
     }
 
     if (total == 0) return .{ .total_rows = 0, .skip = 0, .leading_skip_rows = 0 };
@@ -594,13 +620,14 @@ fn rowPlan(
             return .{ .total_rows = total, .skip = found.skip, .leading_skip_rows = found.leading_skip_rows };
         }
         if (i < roots.len - 1) {
-            // turn-gap blank rows: each is one physical row and one logical line.
+            // turn-gap rows: first line is a delimiter (may wrap), rest are blank.
             var g: u16 = 0;
             while (g < self.turn_gap) : (g += 1) {
+                const rows = turnGapRows(g, content_width);
                 if (walk.cum_rows >= visible_start_rows) {
                     return .{ .total_rows = total, .skip = walk.cum_logical, .leading_skip_rows = 0 };
                 }
-                walk.cum_rows += 1;
+                walk.cum_rows += rows;
                 walk.cum_logical += 1;
             }
         }
