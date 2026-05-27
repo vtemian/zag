@@ -1776,6 +1776,10 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
+test {
+    _ = @import("Gutter.zig");
+}
+
 test "init and deinit" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "test");
