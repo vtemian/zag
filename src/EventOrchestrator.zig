@@ -438,6 +438,8 @@ fn tick(
     // A scratch-focused pane has no runner; the status row should read
     // "idle" there, not spin a nonexistent agent.
     const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
+    const elapsed_ms: u64 = if (focused.runner) |r| r.elapsedMs() else 0;
+    const output_tokens: u32 = if (focused.runner) |r| r.outputTokens() else 0;
     const status = if (self.window_manager.transient_status_len > 0)
         self.window_manager.transient_status[0..self.window_manager.transient_status_len]
     else if (agent_running) blk: {
@@ -464,6 +466,8 @@ fn tick(
         .status = status,
         .agent_running = agent_running,
         .spinner_frame = self.window_manager.spinner_frame,
+        .elapsed_ms = elapsed_ms,
+        .output_tokens = output_tokens,
     });
     self.screen.render(self.stdout_file) catch |err| switch (err) {
         // Backpressure on the terminal fd: frame is dropped, the next

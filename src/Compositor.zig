@@ -94,8 +94,8 @@ pub fn deinit(self: *Compositor) void {
 
 /// Global UI state passed to the compositor each frame.
 pub const InputState = struct {
-    /// Current editing mode; rendered as the `[INSERT]`/`[NORMAL]`
-    /// label in the bottom status row.
+    /// Current editing mode; rendered as the `►► INSERT`/`►► NORMAL`
+    /// footer marker in the bottom status row.
     mode: Keymap.Mode,
     /// One-shot status message (split announces, agent lastInfo, etc.).
     /// Replaces the focused pane's prompt row when non-empty.
@@ -104,6 +104,10 @@ pub const InputState = struct {
     /// to the status on the focused pane's prompt row).
     agent_running: bool = false,
     spinner_frame: u8 = 0,
+    /// Elapsed ms for the focused running pane (0 when idle).
+    elapsed_ms: u64 = 0,
+    /// Output tokens for the focused running pane (0 when none yet).
+    output_tokens: u32 = 0,
 };
 
 /// Per-frame leaf -> draft mapping. The owner (EventOrchestrator) builds
@@ -784,6 +788,17 @@ fn draftForLeaf(
     return null;
 }
 
+/// Format the transient working-line text into `buf`. Shows elapsed
+/// seconds, and appends a `· ↓ N tokens` segment only when `tokens > 0`.
+/// Pure and unit-testable; the marker glyph is an ASCII `* ` followed by
+/// the word, an ellipsis (U+2026), and the parenthesized metrics.
+fn workingLineText(buf: []u8, secs: u64, tokens: u32) []const u8 {
+    if (tokens > 0) {
+        return std.fmt.bufPrint(buf, "* Working\u{2026} ({d}s \u{00B7} \u{2193} {d} tokens)", .{ secs, tokens }) catch "* Working\u{2026}";
+    }
+    return std.fmt.bufPrint(buf, "* Working\u{2026} ({d}s)", .{secs}) catch "* Working\u{2026}";
+}
+
 /// Paint one pane's prompt row. No-op when the pane is too short/narrow.
 /// On the focused pane, `input.status` replaces the prompt whenever it's
 /// non-empty (split announces, `lastInfo`, "streaming..."), with an
@@ -811,6 +826,22 @@ fn drawPanePrompt(
     // never touches `bg`, so once a cell was painted with accent bg
     // for the cursor block it keeps that bg until we explicitly reset it.
     self.screen.clearRect(prompt_row, content_x, right_edge - content_x, 1);
+
+    // Working line: drawn on the row above the prompt for the focused
+    // running pane, when the pane is tall enough to spare the row. Cleared
+    // first so a stale line never ghosts; the buffer redraw covers this row
+    // when the agent is idle.
+    if (focused and input.agent_running and rect.height >= 5) {
+        const work_row = prompt_row - 1;
+        const span: u16 = right_edge - content_x;
+        self.screen.clearRect(work_row, content_x, span, 1);
+        const ws = Theme.resolve(self.theme.highlights.working_line, self.theme);
+        var scratch: [96]u8 = undefined;
+        const secs = input.elapsed_ms / 1000;
+        const text = workingLineText(&scratch, secs, input.output_tokens);
+        const shown = if (text.len <= span) text else text[0..span];
+        _ = self.screen.writeStr(work_row, content_x, shown, ws.screen_style, ws.fg);
+    }
 
     // Focused pane: if a global status toast is set, it takes over the
     // prompt row entirely (with an optional spinner). This preserves the
@@ -1027,8 +1058,15 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
         cell.bg = resolved.bg;
     }
 
-    // Mode indicator at column 0 so the current mode is impossible to miss.
-    var col: u16 = self.paintModeLabel(last_row, mode);
+    // Footer marker + mode word at column 0, styled with the footer slot.
+    const footer = Theme.resolve(self.theme.highlights.footer, self.theme);
+    var col: u16 = self.screen.writeStr(last_row, 0, "\u{25BA}\u{25BA} ", footer.screen_style, footer.fg);
+    const mode_word: []const u8 = switch (mode) {
+        .insert => "INSERT",
+        .normal => "NORMAL",
+    };
+    col = self.screen.writeStr(last_row, col, mode_word, footer.screen_style, footer.fg);
+    col = self.screen.writeStr(last_row, col, " \u{00B7} ", footer.screen_style, footer.fg);
 
     // Show focused buffer name
     const leaf = switch (focused.*) {
@@ -1036,13 +1074,13 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
         .split => return,
     };
 
-    col = self.screen.writeStr(last_row, col, leaf.buffer.getName(), resolved.screen_style, resolved.fg);
-    col = self.screen.writeStr(last_row, col, " | ", resolved.screen_style, resolved.fg);
+    col = self.screen.writeStr(last_row, col, leaf.buffer.getName(), footer.screen_style, footer.fg);
+    col = self.screen.writeStr(last_row, col, " \u{00B7} ", footer.screen_style, footer.fg);
 
     // Show pane rect info
     var info_scratch: [64]u8 = undefined;
     const info = std.fmt.bufPrint(&info_scratch, "{d}x{d}", .{ leaf.rect.width, leaf.rect.height }) catch return;
-    col = self.screen.writeStr(last_row, col, info, resolved.screen_style, resolved.fg);
+    col = self.screen.writeStr(last_row, col, info, footer.screen_style, footer.fg);
 
     // Dropped-event counter: visible only when backpressure actually hit.
     // Resolved from the focused leaf's Buffer via the orchestrator's pane
@@ -1054,7 +1092,7 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
             if (dropped > 0) {
                 var drops_scratch: [32]u8 = undefined;
                 const drops_label = std.fmt.bufPrint(&drops_scratch, " [drops: {d}]", .{dropped}) catch return;
-                col = self.screen.writeStr(last_row, col, drops_label, resolved.screen_style, resolved.fg);
+                col = self.screen.writeStr(last_row, col, drops_label, footer.screen_style, footer.fg);
             }
         }
     }
@@ -1073,20 +1111,6 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
         const label_col = self.screen.width -| @as(u16, @intCast(label.len)) -| 1;
         _ = self.screen.writeStr(last_row, label_col, label, resolved.screen_style, resolved.fg);
     }
-}
-
-/// Paint the `[INSERT]`/`[NORMAL]` label at column 0 of `row` using the
-/// mode-specific highlight. Returns the next free column after the label.
-fn paintModeLabel(self: *Compositor, row: u16, mode: Keymap.Mode) u16 {
-    const label: []const u8 = switch (mode) {
-        .insert => "[INSERT] ",
-        .normal => "[NORMAL] ",
-    };
-    const resolved = switch (mode) {
-        .insert => Theme.resolve(self.theme.highlights.mode_insert, self.theme),
-        .normal => Theme.resolve(self.theme.highlights.mode_normal, self.theme),
-    };
-    return self.screen.writeStr(row, 0, label, resolved.screen_style, resolved.fg);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -1205,12 +1229,13 @@ test "composite draws status line on last row" {
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
-    // Last row is now the sole status line: `[INSERT] mybuf | 40x9`
-    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'I'), screen.getCellConst(9, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, ']'), screen.getCellConst(9, 7).codepoint);
-    // Name `mybuf` begins at col 9 (after `[INSERT] `).
-    try std.testing.expectEqual(@as(u21, 'm'), screen.getCellConst(9, 9).codepoint);
+    // Last row is now the footer: `►► INSERT · mybuf · 40x9`
+    try std.testing.expectEqual(@as(u21, 0x25BA), screen.getCellConst(9, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 0x25BA), screen.getCellConst(9, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'I'), screen.getCellConst(9, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'T'), screen.getCellConst(9, 8).codepoint);
+    // Name `mybuf` begins at col 12 (after `►► INSERT · `).
+    try std.testing.expectEqual(@as(u21, 'm'), screen.getCellConst(9, 12).codepoint);
     // No prompt glyph on the status row.
     var saw_prompt = false;
     for (0..screen.width) |c| {
@@ -1284,8 +1309,9 @@ test "drawStatusLine paints the mode indicator at column 0" {
     const focused = layout.focused orelse layout.root.?;
     compositor.drawStatusLine(focused, .normal);
 
-    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(9, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(9, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 0x25BA), screen.getCellConst(9, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 0x25BA), screen.getCellConst(9, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(9, 3).codepoint);
 }
 
 test "status row in normal mode shows mode label and buffer name only" {
@@ -1307,10 +1333,17 @@ test "status row in normal mode shows mode label and buffer name only" {
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .normal });
 
     const last_row = screen.height - 1;
-    try std.testing.expectEqual(@as(u21, '['), screen.getCellConst(last_row, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(last_row, 1).codepoint);
-    // No `-- NORMAL --` hint on the status row.
+    try std.testing.expectEqual(@as(u21, 0x25BA), screen.getCellConst(last_row, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 0x25BA), screen.getCellConst(last_row, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'N'), screen.getCellConst(last_row, 3).codepoint);
+    // No `-- NORMAL --` hint on the footer row.
     try std.testing.expect(screen.getCellConst(last_row, 9).codepoint != '-');
+}
+
+test "working line text omits tokens when zero" {
+    var b: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("* Working\u{2026} (12s)", workingLineText(&b, 12, 0));
+    try std.testing.expectEqualStrings("* Working\u{2026} (12s \u{00B7} \u{2193} 1500 tokens)", workingLineText(&b, 12, 1500));
 }
 
 test "composite draws rounded frame around a single pane" {
