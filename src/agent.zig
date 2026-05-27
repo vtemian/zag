@@ -2716,6 +2716,7 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
             break :blk .{ .text_delta = duped };
         },
         .tool_start => |t| .{ .tool_start = .{ .name = alloc.dupe(u8, t) catch return } },
+        .usage => |u| .{ .usage = .{ .output_tokens = u.output_tokens } },
         .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
         .done => return,
         .err => |t| .{ .err = alloc.dupe(u8, t) catch return },

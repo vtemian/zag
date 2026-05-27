@@ -120,6 +120,11 @@ pub const StreamEvent = union(enum) {
     thinking_stop,
     /// A tool call was started by the LLM (content is the tool name).
     tool_start: []const u8,
+    /// Running output-token count for the in-flight response. Emitted by
+    /// providers whose SSE stream carries a cumulative usage figure
+    /// (Anthropic's `message_delta`). Carries no heap payload; consumers
+    /// surface it as a live UI counter and persist nothing.
+    usage: struct { output_tokens: u32 },
     /// Informational message (token counts, etc.).
     info: []const u8,
     /// Agent loop completed successfully.

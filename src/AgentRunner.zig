@@ -745,7 +745,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 20) {
+    if (variant_count != 21) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -817,6 +817,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
             .tool_start,
             .tool_result,
             .info,
+            .usage,
             .done,
             .err,
             .reset_assistant_text,
@@ -1052,6 +1053,11 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             @memcpy(self.last_info[0..len], text[0..len]);
             self.last_info_len = @intCast(len);
         },
+        .usage => |u| {
+            // Live output-token count for the working line. UI-only: not a
+            // conversation node, not persisted, not forwarded to the sink.
+            self.output_tokens.store(u.output_tokens, .release);
+        },
         .done => {
             if (self.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .agent_done = {} };
@@ -1222,6 +1228,33 @@ test "elapsedMs and outputTokens reflect per-turn state" {
     // Output-token counter reads back what the streaming path stored.
     runner.output_tokens.store(1500, .release);
     try std.testing.expectEqual(@as(u32, 1500), runner.outputTokens());
+}
+
+test "handleAgentEvent .usage stores the running output-token count" {
+    // The streaming path delivers a `.usage` event each time the provider
+    // reports a cumulative output-token figure; the real handler stores it
+    // into the atomic the working line reads. No sink event, no node, no
+    // persistence — purely the UI counter.
+    const allocator = std.testing.allocator;
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), runner.outputTokens());
+
+    runner.handleAgentEvent(.{ .usage = .{ .output_tokens = 42 } }, allocator);
+    try std.testing.expectEqual(@as(u32, 42), runner.outputTokens());
+
+    // A later, larger count overwrites the earlier one (the figure is
+    // cumulative, so the handler stores the latest reading verbatim).
+    runner.handleAgentEvent(.{ .usage = .{ .output_tokens = 100 } }, allocator);
+    try std.testing.expectEqual(@as(u32, 100), runner.outputTokens());
+
+    // The counter is UI-only: nothing reaches the sink.
+    try std.testing.expectEqual(@as(usize, 0), mock.events.items.len);
 }
 
 test "handleAgentEvent forwards compaction_summary_delta and compaction_event to the sink" {

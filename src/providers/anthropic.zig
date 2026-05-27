@@ -787,7 +787,13 @@ fn processSseEvent(
         }
         if (obj.get("usage")) |usage| {
             const usage_obj = usage.object;
-            if (usage_obj.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
+            if (usage_obj.get("output_tokens")) |ot| {
+                output_tokens.* = @intCast(ot.integer);
+                // Surface the running count so the UI working line can show
+                // live output-token progress; the final LlmResponse still
+                // carries the authoritative total.
+                callback.on_event(callback.ctx, .{ .usage = .{ .output_tokens = output_tokens.* } });
+            }
         }
     }
 }
@@ -1208,6 +1214,42 @@ test "processSseEvent handles message_delta with stop_reason" {
 
     try std.testing.expectEqual(.tool_use, stop_reason);
     try std.testing.expectEqual(@as(u32, 42), output_tokens);
+}
+
+test "processSseEvent emits a usage StreamEvent from message_delta output_tokens" {
+    const allocator = std.testing.allocator;
+
+    var blocks: std.ArrayList(StreamingBlock) = .empty;
+    defer blocks.deinit(allocator);
+
+    var stop_reason: types.StopReason = .end_turn;
+    var input_tokens: u32 = 0;
+    var output_tokens: u32 = 0;
+    var cache_creation_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
+
+    const Watcher = struct {
+        usage_count: u32 = 0,
+        last_output_tokens: u32 = 0,
+        fn onEvent(ctx: *anyopaque, event: llm.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .usage => |u| {
+                    self.usage_count += 1;
+                    self.last_output_tokens = u.output_tokens;
+                },
+                else => {},
+            }
+        }
+    };
+    var watcher: Watcher = .{};
+    const callback: llm.StreamCallback = .{ .ctx = &watcher, .on_event = &Watcher.onEvent };
+
+    const data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":128}}";
+    try processSseEvent("message_delta", data, allocator, &blocks, &stop_reason, &input_tokens, &output_tokens, &cache_creation_tokens, &cache_read_tokens, callback);
+
+    try std.testing.expectEqual(@as(u32, 1), watcher.usage_count);
+    try std.testing.expectEqual(@as(u32, 128), watcher.last_output_tokens);
 }
 
 test "processSseEvent skips ping events" {

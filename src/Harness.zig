@@ -600,6 +600,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 .info => |text| {
                     defer gpa.free(text);
                 },
+                .usage => {
+                    // Live output-token counter for the interactive working
+                    // line; headless eval captures the authoritative total
+                    // from the final response, so nothing to do here.
+                },
                 .done => {
                     const metrics: Trajectory.TurnMetrics = .{};
                     capture.endTurn(metrics) catch |err| {

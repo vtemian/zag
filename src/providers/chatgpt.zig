@@ -1298,6 +1298,9 @@ const EventRecorder = struct {
                 .kind = .tool_start,
                 .payload = self.allocator.dupe(u8, t) catch return,
             },
+            // ChatGPT's stream carries no running usage figure, so this
+            // recorder never sees `.usage`; ignore it to stay exhaustive.
+            .usage => return,
             .info => |t| .{
                 .kind = .info,
                 .payload = self.allocator.dupe(u8, t) catch return,
@@ -1997,6 +2000,7 @@ const RecordingCallback = struct {
         const tagged: RecordedEvent = switch (ev) {
             .text_delta => |t| .{ .kind = .text_delta, .payload = self.alloc.dupe(u8, t) catch return },
             .tool_start => |t| .{ .kind = .tool_start, .payload = self.alloc.dupe(u8, t) catch return },
+            .usage => return,
             .info => |t| .{ .kind = .info, .payload = self.alloc.dupe(u8, t) catch return },
             .done => .{ .kind = .done, .payload = self.alloc.dupe(u8, "") catch return },
             .err => |t| .{ .kind = .err, .payload = self.alloc.dupe(u8, t) catch return },
