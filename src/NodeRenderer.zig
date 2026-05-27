@@ -27,17 +27,9 @@ const NodeRenderer = @This();
 /// asserts its `indent_count` fits within this buffer so the slice access
 /// is in-bounds.
 const Prefixes = struct {
-    const user = "> ";
     const tool_call = "[tool] ";
-    const err = "error: ";
     const separator = "---";
     const indent_pad_max = " " ** 64;
-    /// Collapsed thinking header: leading marker, static label. Using
-    /// ASCII "> " / "v " glyphs keeps the renderer terminal-safe without
-    /// depending on font support for the triangle code points.
-    const thinking_collapsed = "> thinking (folded, Ctrl-R to expand)";
-    const thinking_expanded_header = "v thinking";
-    const thinking_redacted = "> thinking (redacted)";
     /// Indent on the hidden-body hint line under a collapsed tool_call.
     /// Width matches "[tool] " so the hint visually sits under the tool name.
     const tool_collapsed_hint_prefix = "       ";
@@ -725,7 +717,7 @@ fn renderDefault(
     switch (node.node_type) {
         .user_message => {
             const style = theme.highlights.user_message;
-            try splitAndAppend(lines, allocator, content, style, Prefixes.user, style);
+            try splitAndAppend(lines, allocator, content, style, null, null);
             return;
         },
         .assistant_text => {
@@ -777,7 +769,7 @@ fn renderDefault(
         },
         .err => {
             const style = theme.highlights.err;
-            try lines.append(allocator, try twoSpanLine(allocator, Prefixes.err, style, content, style));
+            try splitAndAppend(lines, allocator, content, style, null, null);
             return;
         },
         .separator => {
@@ -791,10 +783,10 @@ fn renderDefault(
             // conversation, so it should read as de-emphasised.
             const style = theme.highlights.tool_result;
             if (node.collapsed) {
-                try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_collapsed, style));
+                try lines.append(allocator, try Theme.singleSpanLine(allocator, "thinking (folded, Ctrl-R to expand)", style));
                 return;
             }
-            try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_expanded_header, style));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, "thinking", style));
             if (content.len == 0) return;
             // Body lines: split on newlines and render each in the same
             // dim style. Skipping markdown parse keeps the output visually
@@ -805,7 +797,7 @@ fn renderDefault(
         },
         .thinking_redacted => {
             const style = theme.highlights.tool_result;
-            try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.thinking_redacted, style));
+            try lines.append(allocator, try Theme.singleSpanLine(allocator, "thinking (redacted)", style));
             return;
         },
         .subagent_link => {
@@ -863,10 +855,10 @@ test "renderDefault user_message" {
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("> hello", text);
+    try std.testing.expectEqualStrings("hello", text);
 }
 
-test "renderDefault user_message has two spans with user_message style" {
+test "renderDefault user_message emits a single bare span with user_message style" {
     const allocator = std.testing.allocator;
     var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
@@ -880,12 +872,10 @@ test "renderDefault user_message has two spans with user_message style" {
     try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
     const line = lines.items[0];
-    try std.testing.expectEqual(@as(usize, 2), line.spans.len);
-    try std.testing.expectEqualStrings("> ", line.spans[0].text);
-    try std.testing.expectEqualStrings("hello", line.spans[1].text);
+    try std.testing.expectEqual(@as(usize, 1), line.spans.len);
+    try std.testing.expectEqualStrings("hello", line.spans[0].text);
     // user_message style should be bold
     try std.testing.expect(line.spans[0].style.bold);
-    try std.testing.expect(line.spans[1].style.bold);
 }
 
 test "renderDefault assistant_text" {
@@ -989,11 +979,11 @@ test "renderDefault err" {
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("error: something failed", text);
+    try std.testing.expectEqualStrings("something failed", text);
 
     // err style should be bold
+    try std.testing.expectEqual(@as(usize, 1), lines.items[0].spans.len);
     try std.testing.expect(lines.items[0].spans[0].style.bold);
-    try std.testing.expect(lines.items[0].spans[1].style.bold);
 }
 
 test "renderDefault separator" {
@@ -1137,8 +1127,7 @@ test "renderDefault thinking collapsed emits one header line" {
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "thinking") != null);
-    try std.testing.expect(std.mem.startsWith(u8, text, ">"));
+    try std.testing.expectEqualStrings("thinking (folded, Ctrl-R to expand)", text);
 
     const renderer = NodeRenderer.initDefault();
     try std.testing.expectEqual(@as(usize, 1), renderer.lineCountForNode(node, &cb.buffer_registry));
@@ -1162,7 +1151,7 @@ test "renderDefault thinking expanded emits header plus body lines" {
 
     const header = try lines.items[0].toText(allocator);
     defer allocator.free(header);
-    try std.testing.expect(std.mem.startsWith(u8, header, "v thinking"));
+    try std.testing.expectEqualStrings("thinking", header);
 
     const body0 = try lines.items[1].toText(allocator);
     defer allocator.free(body0);

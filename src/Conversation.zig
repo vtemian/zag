@@ -1822,7 +1822,7 @@ test "getVisibleLines returns rendered lines" {
     try std.testing.expect(lines.items.len >= 2);
     const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
-    try std.testing.expectEqualStrings("> hello", line0);
+    try std.testing.expectEqualStrings("hello", line0);
 }
 
 test "row_styles round trip: set, render, clear" {
@@ -1915,11 +1915,11 @@ test "getVisibleLines with range skips off-screen nodes" {
 
     const text0 = try lines.items[0].toText(allocator);
     defer allocator.free(text0);
-    try std.testing.expectEqualStrings("> line1", text0);
+    try std.testing.expectEqualStrings("line1", text0);
 
     const text1 = try lines.items[1].toText(allocator);
     defer allocator.free(text1);
-    try std.testing.expectEqualStrings("> line2", text1);
+    try std.testing.expectEqualStrings("line2", text1);
 }
 
 test "buffer interface returns line count" {
@@ -1990,7 +1990,7 @@ test "getVisibleLines reflects new content after appendToNode" {
 
     const text = try lines2.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("> hello world", text);
+    try std.testing.expectEqualStrings("hello world", text);
 }
 
 test "getVisibleLines reflects new nodes after appendNode" {

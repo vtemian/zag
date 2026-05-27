@@ -1174,9 +1174,11 @@ test "composite writes buffer content at leaf rect with padding" {
 
     const pad_h = theme.spacing.padding_h;
     // Frame shifts content by +1 row / +1 col; content row is 1, content col is 1 + pad_h.
-    try std.testing.expectEqual(@as(u21, '>'), screen.getCellConst(1, 1 + pad_h).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 1 + pad_h + 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
+    // NodeRenderer now emits bare content (no `> ` chrome); the gutter marker is
+    // applied at frame time by Conversation.collectVisibleLines.
+    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h).codepoint);
+    try std.testing.expectEqual(@as(u21, 'e'), screen.getCellConst(1, 1 + pad_h + 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'l'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 }
 
 test "composite draws status line on last row" {
@@ -1243,7 +1245,8 @@ test "composite skips clean buffer leaves" {
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
+    // Bare content: "hello" starts at 1+pad_h, so col 1+pad_h+2 is 'l'.
+    try std.testing.expectEqual(@as(u21, 'l'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 
     // Manually overwrite a cell to detect if the leaf is redrawn.
     screen.getCell(1, 1 + pad_h + 2).codepoint = 'Z';
@@ -1806,7 +1809,7 @@ test "scratch leaf still renders correctly with a float overhead" {
     layout.recalculate(40, 12);
 
     // Float in the lower-right; the tile content at (1, 1+pad_h+2)
-    // must still resolve to 'h' from the user message.
+    // must still resolve to the bare user message ("hello" -> 'l' at +2).
     _ = try layout.addFloat(.{ .buffer = float_cb.buf(), .view = float_cb.view(), .viewport = &test_viewport }, .{ .x = 20, .y = 4, .width = 18, .height = 6 }, .{});
 
     const float_drafts = [_]Compositor.FloatDraft{
@@ -1815,7 +1818,7 @@ test "scratch leaf still renders correctly with a float overhead" {
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &float_drafts, .{ .mode = .insert });
 
     const pad_h = theme.spacing.padding_h;
-    try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
+    try std.testing.expectEqual(@as(u21, 'l'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 }
 
 test "focused float draws with the focused border highlight" {
@@ -1999,11 +2002,10 @@ test "planScroll: short content fits, no scroll" {
 }
 
 test "planScroll: long line wraps and scroll math is in physical rows" {
-    // Depends on NodeRenderer's "> " prefix for user_message: 60 content chars
-    // plus the 2-char prefix = 62 cells, which at width 20 occupy 4 physical
-    // rows (20 + 20 + 20 + 2). A renderer change to that prefix would break
-    // this test deliberately so the assertion has to be revisited alongside
-    // the prefix change.
+    // NodeRenderer emits bare user_message content (the marker moved to the
+    // gutter): 60 content chars at width 20 occupy 3 physical rows
+    // (20 + 20 + 20). The gutter's per-depth width reduction is applied by
+    // Conversation's metrics passes, not by planScroll's bare measurement.
     const allocator = std.testing.allocator;
     var cb = try @import("Conversation.zig").init(allocator, 0, "test");
     defer cb.deinit();
@@ -2024,7 +2026,7 @@ test "planScroll: long line wraps and scroll math is in physical rows" {
         10,
         0,
     );
-    try std.testing.expectEqual(@as(u32, 4), plan.total_rows);
+    try std.testing.expectEqual(@as(u32, 3), plan.total_rows);
 }
 
 test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
@@ -2046,13 +2048,12 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
     defer arena.deinit();
 
     const theme = Theme.defaultTheme();
-    // 10 user_messages with distinct content "line0".."line9" (5 chars)
-    // plus the "> " prefix = 7 cells per logical line. Width 5 wraps each
-    // line into 2 physical rows (5 + 2), so total_rows = 20. visible_rows
-    // = 6, scroll = 0 -> visible_start_rows = 14. Walking lines of 2 rows,
-    // cum reaches 14 exactly after lines 0-6 (7 lines x 2 rows). Line 7 is
-    // the first where cum + rows > visible_start_rows, with
-    // leading_skip_rows = 14 - 14 = 0.
+    // 10 user_messages with distinct bare content "line0".."line9" (5 chars;
+    // the marker moved to the gutter). Width 5 fits each logical line in 1
+    // physical row, so total_rows = 10. visible_rows = 6, scroll = 0 ->
+    // visible_start_rows = 4. Walking lines of 1 row, cum reaches 4 exactly
+    // after lines 0-3 (4 lines x 1 row). Line 4 is the first where
+    // cum + rows > visible_start_rows, with leading_skip_rows = 4 - 4 = 0.
     //
     // Conversation overrides View.getWindow with a windowed projection:
     // the plan's `lines` are rebased so the window starts at index 0
@@ -2070,7 +2071,7 @@ test "planScroll: scrolling past the wrapped tail keeps recent rows visible" {
         6,
         0,
     );
-    try std.testing.expectEqual(@as(u32, 20), plan.total_rows);
+    try std.testing.expectEqual(@as(u32, 10), plan.total_rows);
     try std.testing.expectEqual(@as(u16, 6), plan.visible_rows);
     try std.testing.expectEqual(@as(u16, 0), plan.leading_skip_rows);
     // Bottom-anchoring: the last logical line of the window must render the
@@ -2479,11 +2480,13 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
     compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
 
-    // content_y = outer.y + 1 + padding_v(0) = 1. visible_rows=3, so
-    // content rows occupy 1..3. The bottom visible row is row 3, holding
-    // line 4's tail "45678" (cols 2..6).
+    // NodeRenderer emits bare content now ("12345678", 8 chars; the marker
+    // moved to the gutter). At pane_width 5 each line wraps to "12345"/"678".
+    // content_y = outer.y + 1 + padding_v(0) = 1. visible_rows=3, so content
+    // rows occupy 1..3. The bottom visible row is row 3, holding line 4's
+    // tail "678" (cols 2..4).
     const bottom_row: u16 = 3;
-    try std.testing.expectEqual(@as(u21, '4'), screen.getCellConst(bottom_row, 2).codepoint);
-    try std.testing.expectEqual(@as(u21, '5'), screen.getCellConst(bottom_row, 3).codepoint);
-    try std.testing.expectEqual(@as(u21, '8'), screen.getCellConst(bottom_row, 6).codepoint);
+    try std.testing.expectEqual(@as(u21, '6'), screen.getCellConst(bottom_row, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, '7'), screen.getCellConst(bottom_row, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, '8'), screen.getCellConst(bottom_row, 4).codepoint);
 }
