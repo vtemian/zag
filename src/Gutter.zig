@@ -44,7 +44,10 @@ pub fn prefix(
     }
 
     if (depth == 0) {
-        const m = switch (marker) {
+        // The marker belongs to the node's first line only; continuation
+        // lines (a multi-line user message, a tool_call's inline rich body)
+        // align under it with a blank gutter rather than repeating the glyph.
+        const m = if (!first_line) blank_seg else switch (marker) {
             .user => user_marker,
             .tool_call => tool_marker,
             .none => blank_seg,
@@ -70,6 +73,19 @@ test "depth-0 user marker" {
     const got = try prefix(a, 0, true, &.{}, .user, true);
     defer a.free(got);
     try std.testing.expectEqualStrings("\u{203A} ", got);
+}
+
+test "depth-0 continuation lines align under the marker, not repeat it" {
+    const a = std.testing.allocator;
+    // A multi-line user message: marker on the first line, blank gutter on
+    // the rest so the body aligns under the marker.
+    const user_cont = try prefix(a, 0, true, &.{}, .user, false);
+    defer a.free(user_cont);
+    try std.testing.expectEqualStrings("  ", user_cont);
+    // Same for a tool_call's inline rich body (e.g. bash output lines).
+    const tool_cont = try prefix(a, 0, true, &.{}, .tool_call, false);
+    defer a.free(tool_cont);
+    try std.testing.expectEqualStrings("  ", tool_cont);
 }
 
 test "depth-1 last child uses corner" {
