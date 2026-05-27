@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Conversation = @import("Conversation.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
+const Gutter = @import("Gutter.zig");
 const Theme = @import("Theme.zig");
 const Node = Conversation.Node;
 const NodeType = Conversation.NodeType;
@@ -530,30 +531,62 @@ fn appendToolHeader(
     try lines.append(allocator, .{ .spans = spans });
 }
 
+/// Leading-span text for the `body_index`-th body line of a tool_call.
+/// The first body line gets the corner connector (`└ `); every later
+/// line gets a two-space pad so the body content aligns under it. The
+/// returned slice is static, satisfying the StyledSpan borrowed-text
+/// contract; callers style it with `theme.highlights.tree_connector`.
+fn bodyBranchPrefix(body_index: usize) []const u8 {
+    return if (body_index == 0) Gutter.branch_last else Gutter.blank_seg;
+}
+
 /// Emit the inline `… +N lines (Ctrl-R to expand)` hint used for both the
 /// collapsed-tool hint and the bash/read truncation suffix. `hidden` is the
 /// number of hidden/truncated lines; the digit slice borrows the static
 /// `digit_strings` table (or `digit_overflow_label` when out of range).
+///
+/// When `body_index` is non-null the hint is a tool-call body line: it
+/// gets a leading branch-prefix span (`└ ` for the first body line, `  `
+/// otherwise) styled `tree_connector`. The counter is bumped by the
+/// caller after this returns. When null, the hint is emitted bare (the
+/// collapsed-tool hint under a generic header carries no branch).
 fn appendInlineExpandHint(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     style: Theme.CellStyle,
     hidden: usize,
+    theme: *const Theme,
+    body_index: ?usize,
 ) !void {
     const digits: []const u8 = if (hidden < digit_strings.len) digit_strings[hidden] else digit_overflow_label;
-    const spans = try allocator.alloc(StyledSpan, 3);
-    spans[0] = .{ .text = "\u{2026} +", .style = style };
-    spans[1] = .{ .text = digits, .style = style };
-    spans[2] = .{ .text = " lines (Ctrl-R to expand)", .style = style };
+    const has_branch = body_index != null;
+    const span_count: usize = if (has_branch) 4 else 3;
+    const spans = try allocator.alloc(StyledSpan, span_count);
+    var i: usize = 0;
+    if (body_index) |idx| {
+        spans[i] = .{ .text = bodyBranchPrefix(idx), .style = theme.highlights.tree_connector };
+        i += 1;
+    }
+    spans[i] = .{ .text = "\u{2026} +", .style = style };
+    spans[i + 1] = .{ .text = digits, .style = style };
+    spans[i + 2] = .{ .text = " lines (Ctrl-R to expand)", .style = style };
     try lines.append(allocator, .{ .spans = spans });
 }
 
 /// Split `content` on newlines and emit one StyledLine per segment,
 /// each with a marker prefix (e.g. `+ `, `- `, ` `). Returns the
 /// number of lines appended.
+///
+/// Every emitted line is a tool-call body line: it gets a leading
+/// branch-prefix span (`└ ` for the first body line of the node, `  `
+/// otherwise) styled `tree_connector`, ahead of the marker and content
+/// spans. `body_index` tracks the running body-line count across all
+/// emitters for the node and is advanced for each line appended.
 fn appendMarkedLines(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
+    theme: *const Theme,
+    body_index: *usize,
     content: []const u8,
     marker: []const u8,
     marker_style: Theme.CellStyle,
@@ -567,11 +600,13 @@ fn appendMarkedLines(
         const nl = std.mem.indexOfScalar(u8, rest, '\n');
         const segment = if (nl) |n| rest[0..n] else rest;
         const owned = try allocator.dupe(u8, segment);
-        const spans = try allocator.alloc(StyledSpan, 2);
-        spans[0] = .{ .text = marker, .style = marker_style };
-        spans[1] = .{ .text = owned, .style = body_style, .owned = true };
+        const spans = try allocator.alloc(StyledSpan, 3);
+        spans[0] = .{ .text = bodyBranchPrefix(body_index.*), .style = theme.highlights.tree_connector };
+        spans[1] = .{ .text = marker, .style = marker_style };
+        spans[2] = .{ .text = owned, .style = body_style, .owned = true };
         try lines.append(allocator, .{ .spans = spans });
         emitted += 1;
+        body_index.* += 1;
         rest = if (nl) |n| rest[n + 1 ..] else &.{};
     }
     return emitted;
@@ -591,8 +626,9 @@ fn renderEditBlock(
 
     const remove_style = theme.highlights.diff_remove;
     const add_style = theme.highlights.diff_add;
-    _ = try appendMarkedLines(lines, allocator, old_text, Prefixes.diff_remove_marker, remove_style, remove_style, null);
-    _ = try appendMarkedLines(lines, allocator, new_text, Prefixes.diff_add_marker, add_style, add_style, null);
+    var body_index: usize = 0;
+    _ = try appendMarkedLines(lines, allocator, theme, &body_index, old_text, Prefixes.diff_remove_marker, remove_style, remove_style, null);
+    _ = try appendMarkedLines(lines, allocator, theme, &body_index, new_text, Prefixes.diff_add_marker, add_style, add_style, null);
 
     return true;
 }
@@ -608,9 +644,12 @@ fn renderWriteBlock(
 
     try appendToolHeader(lines, allocator, theme, "write", path);
 
+    var body_index: usize = 0;
     _ = try appendMarkedLines(
         lines,
         allocator,
+        theme,
+        &body_index,
         content,
         Prefixes.tool_body_indent,
         theme.highlights.tool_result,
@@ -634,9 +673,12 @@ fn renderBashBlock(
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
+    var body_index: usize = 0;
     const emitted = try appendMarkedLines(
         lines,
         allocator,
+        theme,
+        &body_index,
         result_bytes,
         Prefixes.tool_body_indent,
         theme.highlights.tool_result,
@@ -644,7 +686,7 @@ fn renderBashBlock(
         bash_inline_lines,
     );
     if (result_lines > emitted) {
-        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted);
+        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted, theme, body_index);
     }
     return true;
 }
@@ -663,9 +705,12 @@ fn renderReadBlock(
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
+    var body_index: usize = 0;
     const emitted = try appendMarkedLines(
         lines,
         allocator,
+        theme,
+        &body_index,
         result_bytes,
         Prefixes.tool_body_indent,
         theme.highlights.tool_result,
@@ -673,7 +718,7 @@ fn renderReadBlock(
         read_inline_lines,
     );
     if (result_lines > emitted) {
-        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted);
+        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted, theme, body_index);
     }
     return true;
 }
@@ -756,7 +801,7 @@ fn renderDefault(
             }
             const hidden = hiddenToolResultLineCount(node, registry);
             if (hidden == 0) return;
-            try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, hidden);
+            try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, hidden, theme, 0);
             return;
         },
         .tool_result => {
@@ -1273,10 +1318,12 @@ test "rendering a collapsed tool_call with a tool_result child does not leak und
         defer Theme.freeStyledLines(&lines, allocator);
         try renderDefault(call, &lines, allocator, &theme, &cb.buffer_registry);
         try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-        // Confirm the inline hint line carries the expected count token.
+        // Confirm the inline hint line carries the expected count token. It is
+        // the node's first (and only) body line, so it gets the corner connector.
         const hint_text = try lines.items[1].toText(allocator);
         defer allocator.free(hint_text);
-        try std.testing.expectEqualStrings("\u{2026} +3 lines (Ctrl-R to expand)", hint_text);
+        try std.testing.expectEqualStrings("\u{2514} \u{2026} +3 lines (Ctrl-R to expand)", hint_text);
+        try std.testing.expectEqualStrings("\u{2514} ", lines.items[1].spans[0].text);
         call.markDirty();
     }
 }
@@ -1359,13 +1406,19 @@ test "renderDefault edit tool_call emits diff block" {
     defer allocator.free(header);
     try std.testing.expectEqualStrings("Edit(src/foo.zig)", header);
 
+    // First body line (first removed) carries the corner connector `└ `;
+    // every later body line aligns under it with a two-space pad.
     const removed = try lines.items[1].toText(allocator);
     defer allocator.free(removed);
-    try std.testing.expectEqualStrings("- line a", removed);
+    try std.testing.expectEqualStrings("\u{2514} - line a", removed);
+    // The branch-prefix span is separate and styled `tree_connector`.
+    try std.testing.expectEqualStrings("\u{2514} ", lines.items[1].spans[0].text);
+    try std.testing.expect(std.meta.eql(lines.items[1].spans[0].style.fg, theme.highlights.tree_connector.fg));
 
     const added = try lines.items[3].toText(allocator);
     defer allocator.free(added);
-    try std.testing.expectEqualStrings("+ line a", added);
+    try std.testing.expectEqualStrings("  + line a", added);
+    try std.testing.expectEqualStrings("  ", lines.items[3].spans[0].text);
 
     // Line count must match what renderDefault produced (else viewport
     // math goes wrong inside collectVisibleLines).
@@ -1399,13 +1452,66 @@ test "renderDefault bash tool_call shows command and truncated output" {
     defer allocator.free(header);
     try std.testing.expectEqualStrings("Bash(ls -la)", header);
 
+    // First body line carries the corner connector.
+    const body0 = try lines.items[1].toText(allocator);
+    defer allocator.free(body0);
+    try std.testing.expectEqualStrings("\u{2514}  line1", body0);
+    try std.testing.expectEqualStrings("\u{2514} ", lines.items[1].spans[0].text);
+
     const truncated = try lines.items[7].toText(allocator);
     defer allocator.free(truncated);
-    // 8 result lines, 6 shown -> "… +2 lines (Ctrl-R to expand)".
-    try std.testing.expectEqualStrings("\u{2026} +2 lines (Ctrl-R to expand)", truncated);
+    // 8 result lines, 6 shown -> "… +2 lines (Ctrl-R to expand)". The hint is
+    // the 7th body line, so it aligns under the connector with a two-space pad.
+    try std.testing.expectEqualStrings("  \u{2026} +2 lines (Ctrl-R to expand)", truncated);
+    try std.testing.expectEqualStrings("  ", lines.items[7].spans[0].text);
 
     const renderer = NodeRenderer.initDefault();
     try std.testing.expectEqual(@as(usize, 8), renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "renderDefault bash tool_call renders body as a branch off the header" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "bash", "bash:0", "{\"command\":\"echo hi\"}");
+    _ = try cb.appendNode(node, .tool_result, "line1\nline2\nline3");
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+    // Header + 3 body lines, no truncation hint (3 <= bash_inline_lines).
+    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
+
+    // Header carries no branch prefix; the gutter supplies its `● ` marker.
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Bash(echo hi)", header);
+
+    // First body line: corner connector `└ ` span styled tree_connector,
+    // then the body-indent marker and content.
+    const b0 = try lines.items[1].toText(allocator);
+    defer allocator.free(b0);
+    try std.testing.expectEqualStrings("\u{2514}  line1", b0);
+    try std.testing.expectEqualStrings("\u{2514} ", lines.items[1].spans[0].text);
+    try std.testing.expect(std.meta.eql(lines.items[1].spans[0].style.fg, theme.highlights.tree_connector.fg));
+
+    // Subsequent body lines: two-space pad aligning under the connector.
+    const b1 = try lines.items[2].toText(allocator);
+    defer allocator.free(b1);
+    try std.testing.expectEqualStrings("   line2", b1);
+    try std.testing.expectEqualStrings("  ", lines.items[2].spans[0].text);
+
+    const b2 = try lines.items[3].toText(allocator);
+    defer allocator.free(b2);
+    try std.testing.expectEqualStrings("   line3", b2);
+    try std.testing.expectEqualStrings("  ", lines.items[3].spans[0].text);
+
+    // Line count is unchanged by the added prefix span.
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(@as(usize, 4), renderer.lineCountForNode(node, &cb.buffer_registry));
 }
 
 test "renderDefault read tool_call falls back when tool_input_raw is missing" {
