@@ -94,6 +94,10 @@ pub const Node = struct {
     /// Incremented on every content mutation. `NodeLineCache` checks
     /// this against its stored `Entry.version` to decide hit vs. miss.
     content_version: u32 = 0,
+    /// True when this tool_result represents an error (is_error from the
+    /// provider tool result). Drives the parent tool_call's bullet color.
+    /// Only meaningful when node_type == .tool_result.
+    tool_result_is_error: bool = false,
 
     /// Index into the owning Conversation's `subagents` list. Valid
     /// only when `node_type == .subagent_link`.

@@ -849,7 +849,8 @@ fn handleLoadedEntry(
                 }
                 break :blk last_tool_call.*;
             } orelse return;
-            _ = try self.appendNode(parent, .tool_result, entry.content);
+            const result_node = try self.appendNode(parent, .tool_result, entry.content);
+            result_node.tool_result_is_error = entry.is_error;
         },
         .info => _ = try self.appendNode(null, .status, entry.content),
         .err => _ = try self.appendNode(null, .err, entry.content),
@@ -900,7 +901,8 @@ fn handleLoadedEntry(
                 }
                 break :blk last_tool_call.*;
             } orelse return;
-            _ = try self.appendNode(parent, .tool_result, entry.content);
+            const result_node = try self.appendNode(parent, .tool_result, entry.content);
+            result_node.tool_result_is_error = entry.is_error;
         },
         .thinking => {
             const node = try self.appendNode(null, .thinking, entry.content);

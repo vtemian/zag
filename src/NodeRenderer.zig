@@ -137,6 +137,21 @@ pub fn nodeBytes(node: *const Node, registry: *const BufferRegistry) []const u8 
     return node.custom_tag orelse &.{};
 }
 
+/// Bullet state for a tool_call node, driving the gutter bullet color.
+/// `.running` when no tool_result child exists yet, `.err` when any
+/// tool_result child is an error, else `.ok`.
+pub const BulletState = enum { running, ok, err };
+
+pub fn toolBulletState(node: *const Node) BulletState {
+    var saw_result = false;
+    for (node.children.items) |child| {
+        if (child.node_type != .tool_result) continue;
+        saw_result = true;
+        if (child.tool_result_is_error) return .err;
+    }
+    return if (saw_result) .ok else .running;
+}
+
 /// Returns true when the node carries a `buffer_id` that resolves to an
 /// ImageBuffer. Used by the tool_result render path to switch from text
 /// rendering to a placeholder line. Returns false for inline-content
@@ -823,6 +838,21 @@ fn appendTestNode(
     content: []const u8,
 ) !*Node {
     return cb.appendNode(parent, node_type, content);
+}
+
+test "toolBulletState reflects result presence and error" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const tc = try cb.appendToolCallNode(null, "bash", "t1", "{\"command\":\"x\"}");
+    try std.testing.expectEqual(BulletState.running, toolBulletState(tc));
+
+    const res = try cb.appendNode(tc, .tool_result, "ok");
+    try std.testing.expectEqual(BulletState.ok, toolBulletState(tc));
+
+    res.tool_result_is_error = true;
+    try std.testing.expectEqual(BulletState.err, toolBulletState(tc));
 }
 
 test "renderDefault user_message" {

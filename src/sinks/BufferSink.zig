@@ -170,7 +170,8 @@ pub const BufferSink = struct {
                     }
                     break :blk self.last_tool_call;
                 } orelse return;
-                _ = self.buffer.appendNode(parent, .tool_result, e.content) catch return;
+                const result_node = self.buffer.appendNode(parent, .tool_result, e.content) catch return;
+                result_node.tool_result_is_error = e.is_error;
                 // Bump the parent so the cached one-line tool_call rendering
                 // refreshes into the collapsed-with-hint two-line rendering
                 // now that a non-empty tool_result child exists.
