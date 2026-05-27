@@ -545,31 +545,23 @@ fn bodyBranchPrefix(body_index: usize) []const u8 {
 /// number of hidden/truncated lines; the digit slice borrows the static
 /// `digit_strings` table (or `digit_overflow_label` when out of range).
 ///
-/// When `body_index` is non-null the hint is a tool-call body line: it
-/// gets a leading branch-prefix span (`└ ` for the first body line, `  `
-/// otherwise) styled `tree_connector`. The counter is bumped by the
-/// caller after this returns. When null, the hint is emitted bare (the
-/// collapsed-tool hint under a generic header carries no branch).
+/// The hint is a tool-call body line, so it gets a leading branch-prefix
+/// span (`└ ` for the first body line of the node, `  ` otherwise) styled
+/// `tree_connector`, ahead of the `… +N lines` text.
 fn appendInlineExpandHint(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     style: Theme.CellStyle,
     hidden: usize,
     theme: *const Theme,
-    body_index: ?usize,
+    body_index: usize,
 ) !void {
     const digits: []const u8 = if (hidden < digit_strings.len) digit_strings[hidden] else digit_overflow_label;
-    const has_branch = body_index != null;
-    const span_count: usize = if (has_branch) 4 else 3;
-    const spans = try allocator.alloc(StyledSpan, span_count);
-    var i: usize = 0;
-    if (body_index) |idx| {
-        spans[i] = .{ .text = bodyBranchPrefix(idx), .style = theme.highlights.tree_connector };
-        i += 1;
-    }
-    spans[i] = .{ .text = "\u{2026} +", .style = style };
-    spans[i + 1] = .{ .text = digits, .style = style };
-    spans[i + 2] = .{ .text = " lines (Ctrl-R to expand)", .style = style };
+    const spans = try allocator.alloc(StyledSpan, 4);
+    spans[0] = .{ .text = bodyBranchPrefix(body_index), .style = theme.highlights.tree_connector };
+    spans[1] = .{ .text = "\u{2026} +", .style = style };
+    spans[2] = .{ .text = digits, .style = style };
+    spans[3] = .{ .text = " lines (Ctrl-R to expand)", .style = style };
     try lines.append(allocator, .{ .spans = spans });
 }
 
