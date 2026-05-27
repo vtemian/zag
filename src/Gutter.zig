@@ -39,7 +39,7 @@ pub fn prefix(
 
     var a: u16 = 0;
     while (a < depth) : (a += 1) {
-        const piped = a != 0 and a <= ancestor_is_last.len and !ancestor_is_last[a];
+        const piped = a != 0 and a < ancestor_is_last.len and !ancestor_is_last[a];
         try buf.appendSlice(arena, if (piped) pipe_seg else blank_seg);
     }
 
@@ -95,4 +95,13 @@ test "depth-2 draws ancestor pipe when middle ancestor is not last" {
     const got = try prefix(a, 2, true, &.{ true, false }, .none, true);
     defer a.free(got);
     try std.testing.expectEqualStrings("  \u{2502} \u{2514} ", got);
+}
+
+test "short ancestor slice degrades to blank instead of reading out of bounds" {
+    const a = std.testing.allocator;
+    // ancestor_is_last is shorter than depth (malformed caller context).
+    // The bound check must keep levels without info blank rather than panic.
+    const got = try prefix(a, 2, true, &.{true}, .none, true);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("    \u{2514} ", got);
 }
