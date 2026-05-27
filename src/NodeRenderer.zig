@@ -27,13 +27,8 @@ const NodeRenderer = @This();
 /// asserts its `indent_count` fits within this buffer so the slice access
 /// is in-bounds.
 const Prefixes = struct {
-    const tool_call = "[tool] ";
     const separator = "---";
     const indent_pad_max = " " ** 64;
-    /// Indent on the hidden-body hint line under a collapsed tool_call.
-    /// Width matches "[tool] " so the hint visually sits under the tool name.
-    const tool_collapsed_hint_prefix = "       ";
-    const tool_collapsed_hint_suffix = " lines hidden (Ctrl-R to expand)";
     /// Placeholder for an image-backed tool_result. Inline image
     /// embedding in the conversation view is a Phase D concern; for now
     /// we emit a single styled line so the user knows a binary payload
@@ -46,30 +41,11 @@ const Prefixes = struct {
     const subagent_close = "] ";
     const subagent_unnamed = "<unnamed>";
 
-    /// Rule run for pi-mono-style tool-call block headers and footers.
-    /// Length matches the typical opening dash run plus padding; we
-    /// emit the literal `──── ` prefix and `─` suffix runs by slicing
-    /// into this constant so each rendered line borrows static text
-    /// (no per-render allocation for the chrome).
-    const rule_short = "────";
-    /// Dash run for the footer line under a tool-call block. 36 dashes
-    /// is enough for most code-edit headers without wrapping in a
-    /// reasonably sized pane; the renderer slices the prefix it needs.
-    const rule_long = "────────────────────────────────────";
-    const rule_space = " ";
-
     /// Prefix for body lines under a rich tool-call block. Indents
-    /// the body one column so the rule lines visually contain the
-    /// block.
+    /// the body one column.
     const tool_body_indent = " ";
     const diff_add_marker = "+ ";
     const diff_remove_marker = "- ";
-    /// Shell prompt marker shown on a `bash` tool-call header instead
-    /// of the bare tool name.
-    const bash_prompt = "$ ";
-    /// Truncation footer for `bash` and `read` blocks when the body
-    /// exceeds the inline display cap.
-    const tool_truncated_suffix = " (Ctrl-R for full output)";
 };
 
 /// Body-line cap for tool-call blocks whose body is unbounded. `bash`
@@ -395,13 +371,13 @@ fn splitAndAppendIndented(
 /// the legacy line-count rule.
 ///
 /// Must stay in lockstep with `renderRichToolCall`'s output shape:
-///   - 1 header rule line
+///   - 1 `Name(arg)` header line
 ///   - body lines:
 ///       * `edit`: lineCount(old_text) + lineCount(new_text)
 ///       * `write`: lineCount(content)
 ///       * `bash` / `read`: min(lineCount(result), inline_cap), plus
-///         1 truncation footer when the cap was hit
-///   - 1 footer rule line
+///         1 inline truncation hint when the cap was hit
+///   - no footer
 ///
 /// Uses a stack-allocated allocator-friendly parse path because the
 /// caller (`lineCountForNode`) doesn't have an allocator to spend on
@@ -428,31 +404,31 @@ fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?us
         if (jsonString(&root, "path") == null) return null;
         const old_text = jsonString(&root, "old_text") orelse "";
         const new_text = jsonString(&root, "new_text") orelse "";
-        return 2 + lineCount(old_text) + lineCount(new_text);
+        return 1 + lineCount(old_text) + lineCount(new_text);
     } else if (std.mem.eql(u8, tool_name, "write")) {
         if (jsonString(&root, "path") == null) return null;
         const content = jsonString(&root, "content") orelse "";
-        return 2 + lineCount(content);
+        return 1 + lineCount(content);
     } else if (std.mem.eql(u8, tool_name, "bash")) {
         if (jsonString(&root, "command") == null) return null;
-        return 2 + bodyLineCount(node, registry, bash_inline_lines);
+        return 1 + bodyLineCount(node, registry, bash_inline_lines);
     } else if (std.mem.eql(u8, tool_name, "read")) {
         if (jsonString(&root, "path") == null) return null;
-        return 2 + bodyLineCount(node, registry, read_inline_lines);
+        return 1 + bodyLineCount(node, registry, read_inline_lines);
     }
     return null;
 }
 
 /// Body line count for bash/read: the tool_result child's content
-/// capped at `inline_lines`, plus 1 for the truncation footer when
-/// the cap was hit. Matches what `appendMarkedLines` + the truncation
-/// suffix emit in the renderer.
+/// capped at `inline_lines`, plus 1 for the inline truncation hint when
+/// the cap was hit. Matches what `appendMarkedLines` +
+/// `appendInlineExpandHint` emit in the renderer.
 fn bodyLineCount(node: *const Node, registry: *const BufferRegistry, inline_lines: usize) usize {
     const result = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result);
     if (result_lines == 0) return 0;
     if (result_lines <= inline_lines) return result_lines;
-    return inline_lines + 1; // capped body plus 1 truncation footer
+    return inline_lines + 1; // capped body plus 1 inline truncation hint
 }
 
 /// Pi-mono-style rich rendering for the four built-in tool_call types.
@@ -498,35 +474,63 @@ fn jsonString(root: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
-/// Emit the opening `──── <label> ────` line. `label` is duped into
-/// `allocator` and flagged `owned` so the cache (or test cleanup)
-/// frees it when the line is dropped; static prefix/suffix bytes
-/// borrow against `Prefixes`.
-fn appendRuleHeader(
+/// Best-effort primary argument for a generic tool header: the first
+/// string-valued field in the input JSON object. Returns "" when the value
+/// is not an object or has no string field. The returned slice borrows the
+/// parsed JSON, so callers must use it before tearing down the parse.
+fn firstJsonStringValue(value: std.json.Value) []const u8 {
+    if (value != .object) return "";
+    var it = value.object.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* == .string) return kv.value_ptr.*.string;
+    }
+    return "";
+}
+
+/// Emit a `Name(arg)` tool-call header line. The leading bullet is supplied
+/// by the gutter at composite time; this is the label only. The composed
+/// label is duped into `allocator` and flagged `owned` so the cache (or
+/// test cleanup) frees it when the line is dropped.
+fn appendToolHeader(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
-    label: []const u8,
+    name: []const u8,
+    arg: []const u8,
 ) !void {
-    const owned_label = try allocator.dupe(u8, label);
-    const rule = theme.highlights.tool_rule;
     const accent = theme.highlights.tool_call;
-    const spans = try allocator.alloc(StyledSpan, 5);
-    spans[0] = .{ .text = Prefixes.rule_short, .style = rule };
-    spans[1] = .{ .text = Prefixes.rule_space, .style = rule };
-    spans[2] = .{ .text = owned_label, .style = accent, .owned = true };
-    spans[3] = .{ .text = Prefixes.rule_space, .style = rule };
-    spans[4] = .{ .text = Prefixes.rule_short, .style = rule };
+    var label: std.ArrayList(u8) = .empty;
+    defer label.deinit(allocator);
+    // Capitalize the first letter of the tool name.
+    if (name.len > 0) {
+        try label.append(allocator, std.ascii.toUpper(name[0]));
+        try label.appendSlice(allocator, name[1..]);
+    }
+    try label.append(allocator, '(');
+    try label.appendSlice(allocator, arg);
+    try label.append(allocator, ')');
+    const owned = try allocator.dupe(u8, label.items);
+    const spans = try allocator.alloc(StyledSpan, 1);
+    spans[0] = .{ .text = owned, .style = accent, .owned = true };
     try lines.append(allocator, .{ .spans = spans });
 }
 
-/// Emit the closing footer rule line.
-fn appendRuleFooter(
+/// Emit the inline `… +N lines (Ctrl-R to expand)` hint used for both the
+/// collapsed-tool hint and the bash/read truncation suffix. `hidden` is the
+/// number of hidden/truncated lines; the digit slice borrows the static
+/// `digit_strings` table (or `digit_overflow_label` when out of range).
+fn appendInlineExpandHint(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
-    theme: *const Theme,
+    style: Theme.CellStyle,
+    hidden: usize,
 ) !void {
-    try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.rule_long, theme.highlights.tool_rule));
+    const digits: []const u8 = if (hidden < digit_strings.len) digit_strings[hidden] else digit_overflow_label;
+    const spans = try allocator.alloc(StyledSpan, 3);
+    spans[0] = .{ .text = "\u{2026} +", .style = style };
+    spans[1] = .{ .text = digits, .style = style };
+    spans[2] = .{ .text = " lines (Ctrl-R to expand)", .style = style };
+    try lines.append(allocator, .{ .spans = spans });
 }
 
 /// Split `content` on newlines and emit one StyledLine per segment,
@@ -568,18 +572,13 @@ fn renderEditBlock(
     const old_text = jsonString(root, "old_text") orelse "";
     const new_text = jsonString(root, "new_text") orelse "";
 
-    var label_buf: std.ArrayList(u8) = .empty;
-    defer label_buf.deinit(allocator);
-    try label_buf.appendSlice(allocator, "edit ");
-    try label_buf.appendSlice(allocator, path);
-    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+    try appendToolHeader(lines, allocator, theme, "edit", path);
 
     const remove_style = theme.highlights.diff_remove;
     const add_style = theme.highlights.diff_add;
     _ = try appendMarkedLines(lines, allocator, old_text, Prefixes.diff_remove_marker, remove_style, remove_style, null);
     _ = try appendMarkedLines(lines, allocator, new_text, Prefixes.diff_add_marker, add_style, add_style, null);
 
-    try appendRuleFooter(lines, allocator, theme);
     return true;
 }
 
@@ -592,11 +591,7 @@ fn renderWriteBlock(
     const path = jsonString(root, "path") orelse return false;
     const content = jsonString(root, "content") orelse "";
 
-    var label_buf: std.ArrayList(u8) = .empty;
-    defer label_buf.deinit(allocator);
-    try label_buf.appendSlice(allocator, "write ");
-    try label_buf.appendSlice(allocator, path);
-    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+    try appendToolHeader(lines, allocator, theme, "write", path);
 
     _ = try appendMarkedLines(
         lines,
@@ -607,7 +602,6 @@ fn renderWriteBlock(
         theme.highlights.assistant_text,
         null,
     );
-    try appendRuleFooter(lines, allocator, theme);
     return true;
 }
 
@@ -621,12 +615,7 @@ fn renderBashBlock(
 ) !bool {
     const cmd = jsonString(root, "command") orelse return false;
 
-    var label_buf: std.ArrayList(u8) = .empty;
-    defer label_buf.deinit(allocator);
-    try label_buf.appendSlice(allocator, "bash ");
-    try label_buf.appendSlice(allocator, Prefixes.bash_prompt);
-    try label_buf.appendSlice(allocator, cmd);
-    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+    try appendToolHeader(lines, allocator, theme, "bash", cmd);
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
@@ -640,9 +629,8 @@ fn renderBashBlock(
         bash_inline_lines,
     );
     if (result_lines > emitted) {
-        try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.tool_truncated_suffix, theme.highlights.tool_result));
+        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted);
     }
-    try appendRuleFooter(lines, allocator, theme);
     return true;
 }
 
@@ -656,11 +644,7 @@ fn renderReadBlock(
 ) !bool {
     const path = jsonString(root, "path") orelse return false;
 
-    var label_buf: std.ArrayList(u8) = .empty;
-    defer label_buf.deinit(allocator);
-    try label_buf.appendSlice(allocator, "read ");
-    try label_buf.appendSlice(allocator, path);
-    try appendRuleHeader(lines, allocator, theme, label_buf.items);
+    try appendToolHeader(lines, allocator, theme, "read", path);
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
@@ -674,9 +658,8 @@ fn renderReadBlock(
         read_inline_lines,
     );
     if (result_lines > emitted) {
-        try lines.append(allocator, try Theme.singleSpanLine(allocator, Prefixes.tool_truncated_suffix, theme.highlights.tool_result));
+        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted);
     }
-    try appendRuleFooter(lines, allocator, theme);
     return true;
 }
 
@@ -743,19 +726,22 @@ fn renderDefault(
             // expands the full untruncated body underneath.
             if (try renderRichToolCall(node, lines, allocator, theme, registry)) return;
 
-            const style = theme.highlights.tool_call;
-            try lines.append(allocator, try twoSpanLine(allocator, Prefixes.tool_call, style, content, style));
+            // Generic `Name(arg)` header. The tool name is the node's
+            // content (custom_tag); the arg is the first string-valued
+            // field of the input JSON. Parse inline so the arg slice stays
+            // alive while `appendToolHeader` dupes it into an owned span.
+            {
+                var parsed = if (node.tool_input_raw) |raw|
+                    std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null
+                else
+                    null;
+                defer if (parsed) |*p| p.deinit();
+                const arg: []const u8 = if (parsed) |p| firstJsonStringValue(p.value) else "";
+                try appendToolHeader(lines, allocator, theme, content, arg);
+            }
             const hidden = hiddenToolResultLineCount(node, registry);
             if (hidden == 0) return;
-            // Static-lifetime digit slice keeps the span's borrowed-text
-            // contract intact without an allocation per render.
-            const digits: []const u8 = if (hidden < digit_strings.len) digit_strings[hidden] else digit_overflow_label;
-            const hint_style = theme.highlights.tool_result;
-            const spans = try allocator.alloc(StyledSpan, 3);
-            spans[0] = .{ .text = Prefixes.tool_collapsed_hint_prefix, .style = hint_style };
-            spans[1] = .{ .text = digits, .style = hint_style };
-            spans[2] = .{ .text = Prefixes.tool_collapsed_hint_suffix, .style = hint_style };
-            try lines.append(allocator, .{ .spans = spans });
+            try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, hidden);
             return;
         },
         .tool_result => {
@@ -913,12 +899,12 @@ test "renderDefault tool_call" {
 
     const text = try lines.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("[tool] bash", text);
+    // No tool_input_raw on this node, so the generic `Name(arg)` header
+    // fires with an empty arg and a capitalized tool name.
+    try std.testing.expectEqualStrings("Bash()", text);
 
-    // Two spans: prefix and name, both with tool_call style
-    try std.testing.expectEqual(@as(usize, 2), lines.items[0].spans.len);
-    try std.testing.expectEqualStrings("[tool] ", lines.items[0].spans[0].text);
-    try std.testing.expectEqualStrings("bash", lines.items[0].spans[1].text);
+    // Single owned span styled tool_call.
+    try std.testing.expectEqual(@as(usize, 1), lines.items[0].spans.len);
 }
 
 test "renderDefault tool_result shows full content" {
@@ -1257,10 +1243,10 @@ test "rendering a collapsed tool_call with a tool_result child does not leak und
         defer Theme.freeStyledLines(&lines, allocator);
         try renderDefault(call, &lines, allocator, &theme, &cb.buffer_registry);
         try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-        // Confirm the hint line carries the expected count token.
+        // Confirm the inline hint line carries the expected count token.
         const hint_text = try lines.items[1].toText(allocator);
         defer allocator.free(hint_text);
-        try std.testing.expect(std.mem.indexOf(u8, hint_text, "3 lines hidden") != null);
+        try std.testing.expectEqualStrings("\u{2026} +3 lines (Ctrl-R to expand)", hint_text);
         call.markDirty();
     }
 }
@@ -1336,13 +1322,12 @@ test "renderDefault edit tool_call emits diff block" {
     defer Theme.freeStyledLines(&lines, allocator);
     try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
-    // Header rule + 2 `-` lines + 3 `+` lines + footer rule = 7 lines.
-    try std.testing.expectEqual(@as(usize, 7), lines.items.len);
+    // Name(arg) header + 2 `-` lines + 3 `+` lines = 6 lines (no footer rule).
+    try std.testing.expectEqual(@as(usize, 6), lines.items.len);
 
     const header = try lines.items[0].toText(allocator);
     defer allocator.free(header);
-    try std.testing.expect(std.mem.indexOf(u8, header, "edit src/foo.zig") != null);
-    try std.testing.expect(std.mem.startsWith(u8, header, "────"));
+    try std.testing.expectEqualStrings("Edit(src/foo.zig)", header);
 
     const removed = try lines.items[1].toText(allocator);
     defer allocator.free(removed);
@@ -1352,14 +1337,10 @@ test "renderDefault edit tool_call emits diff block" {
     defer allocator.free(added);
     try std.testing.expectEqualStrings("+ line a", added);
 
-    const footer = try lines.items[6].toText(allocator);
-    defer allocator.free(footer);
-    try std.testing.expect(std.mem.startsWith(u8, footer, "────"));
-
     // Line count must match what renderDefault produced (else viewport
     // math goes wrong inside collectVisibleLines).
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 7), renderer.lineCountForNode(node, &cb.buffer_registry));
+    try std.testing.expectEqual(@as(usize, 6), renderer.lineCountForNode(node, &cb.buffer_registry));
 }
 
 test "renderDefault bash tool_call shows command and truncated output" {
@@ -1380,19 +1361,21 @@ test "renderDefault bash tool_call shows command and truncated output" {
     defer Theme.freeStyledLines(&lines, allocator);
     try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
 
-    // Header + 6 capped body lines + 1 truncation footer + closing rule = 9.
-    try std.testing.expectEqual(@as(usize, 9), lines.items.len);
+    // Name(arg) header + 6 capped body lines + 1 inline truncation hint = 8
+    // (no closing rule).
+    try std.testing.expectEqual(@as(usize, 8), lines.items.len);
 
     const header = try lines.items[0].toText(allocator);
     defer allocator.free(header);
-    try std.testing.expect(std.mem.indexOf(u8, header, "bash $ ls -la") != null);
+    try std.testing.expectEqualStrings("Bash(ls -la)", header);
 
     const truncated = try lines.items[7].toText(allocator);
     defer allocator.free(truncated);
-    try std.testing.expect(std.mem.indexOf(u8, truncated, "Ctrl-R") != null);
+    // 8 result lines, 6 shown -> "… +2 lines (Ctrl-R to expand)".
+    try std.testing.expectEqualStrings("\u{2026} +2 lines (Ctrl-R to expand)", truncated);
 
     const renderer = NodeRenderer.initDefault();
-    try std.testing.expectEqual(@as(usize, 9), renderer.lineCountForNode(node, &cb.buffer_registry));
+    try std.testing.expectEqual(@as(usize, 8), renderer.lineCountForNode(node, &cb.buffer_registry));
 }
 
 test "renderDefault read tool_call falls back when tool_input_raw is missing" {
@@ -1401,7 +1384,7 @@ test "renderDefault read tool_call falls back when tool_input_raw is missing" {
     defer cb.deinit();
 
     // Legacy node: no tool_input_raw → renderRichToolCall returns false,
-    // and the legacy `[tool] <name>` header fires.
+    // and the generic `Name(arg)` header fires with an empty arg.
     const node = try cb.appendNode(null, .tool_call, "read");
 
     const theme = Theme.defaultTheme();
@@ -1412,5 +1395,66 @@ test "renderDefault read tool_call falls back when tool_input_raw is missing" {
     try std.testing.expect(lines.items.len >= 1);
     const header = try lines.items[0].toText(allocator);
     defer allocator.free(header);
-    try std.testing.expectEqualStrings("[tool] read", header);
+    try std.testing.expectEqualStrings("Read()", header);
+}
+
+test "renderRichToolCall bash header is Name(arg)" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    const node = try cb.appendToolCallNode(null, "bash", "t1", "{\"command\":\"zig build\"}");
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    _ = try renderRichToolCall(node, &lines, allocator, &theme, &cb.buffer_registry);
+    const head = try lines.items[0].toText(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqualStrings("Bash(zig build)", head);
+}
+
+test "generic tool_call header uses first JSON string arg" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+    // `grep` is not a rich-block tool, so the generic header fires. The
+    // first string field of the input becomes the parenthesized arg.
+    const node = try cb.appendToolCallNode(null, "grep", "t1", "{\"pattern\":\"needle\",\"path\":\"src\"}");
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    const head = try lines.items[0].toText(allocator);
+    defer allocator.free(head);
+    try std.testing.expectEqualStrings("Grep(needle)", head);
+}
+
+test "lineCountForNode matches render() for collapsed tool_call with multi-line result" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // Collapsed generic tool_call (no rich block) with a multi-line result:
+    // the off-by-one guard for the dropped footer rule. render() emits a
+    // Name(arg) header plus one inline collapse hint; lineCountForNode must
+    // agree with the actual line count.
+    const call = try cb.appendNode(null, .tool_call, "grep");
+    _ = try cb.appendNode(call, .tool_result, "hit one\nhit two\nhit three\nhit four");
+    call.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(call, &lines, allocator, &theme, &cb.buffer_registry);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(call, &cb.buffer_registry));
+
+    // And for a rich (bash) block with a truncating result.
+    const bash = try cb.appendToolCallNode(null, "bash", "b1", "{\"command\":\"ls\"}");
+    _ = try cb.appendNode(bash, .tool_result, "a\nb\nc\nd\ne\nf\ng\nh");
+    bash.collapsed = true;
+    var rich_lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&rich_lines, allocator);
+    try renderDefault(bash, &rich_lines, allocator, &theme, &cb.buffer_registry);
+    try std.testing.expectEqual(rich_lines.items.len, renderer.lineCountForNode(bash, &cb.buffer_registry));
 }
