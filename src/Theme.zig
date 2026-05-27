@@ -61,6 +61,7 @@ pub const HighlightSlot = enum {
     current_line,
     err,
     warning,
+    user_message_bar,
 };
 
 /// Parse a slot name as a string. Returns null for unknown names so
@@ -84,6 +85,7 @@ pub fn resolveSlot(slot: HighlightSlot, theme: *const Theme) CellStyle {
         .current_line => theme.highlights.current_line,
         .err => theme.highlights.err,
         .warning => theme.highlights.warning,
+        .user_message_bar => theme.highlights.user_message_bar,
     };
 }
 
@@ -164,6 +166,22 @@ pub const Highlights = struct {
     diff_add: CellStyle,
     /// `-` line in a tool-call diff. Defaults to error red.
     diff_remove: CellStyle,
+    /// Full-width bar behind a user-typed message. Has a `bg` so the
+    /// `user_message_bar` HighlightSlot can paint the row.
+    user_message_bar: CellStyle,
+    /// Filled bullet on a tool-call header while the tool is still running
+    /// (no tool_result child yet). Dim/muted.
+    tool_bullet_running: CellStyle,
+    /// Filled bullet on a tool-call header whose tool_result is not an error.
+    tool_bullet_ok: CellStyle,
+    /// Filled bullet on a tool-call header whose tool_result is an error.
+    tool_bullet_error: CellStyle,
+    /// Tree connector and ancestor-pipe glyphs in the gutter. Dim chrome.
+    tree_connector: CellStyle,
+    /// The transient "working" line shown above the prompt while the agent runs.
+    working_line: CellStyle,
+    /// Footer marker and hints on the bottom status row.
+    footer: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.
@@ -386,6 +404,13 @@ pub fn defaultTheme() Theme {
             .tool_rule = .{ .fg = dim },
             .diff_add = .{ .fg = success },
             .diff_remove = .{ .fg = err_color },
+            .user_message_bar = .{ .bg = code_bg, .bold = true },
+            .tool_bullet_running = .{ .fg = dim },
+            .tool_bullet_ok = .{ .fg = success },
+            .tool_bullet_error = .{ .fg = err_color },
+            .tree_connector = .{ .fg = dim },
+            .working_line = .{ .fg = accent },
+            .footer = .{ .fg = muted },
         },
         .spacing = .{
             .turn_gap = 1,
