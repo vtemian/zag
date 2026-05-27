@@ -246,6 +246,17 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
             continue;
         }
 
+        // C0/C1 control characters are width 0 but are NOT grapheme
+        // extenders. Absorbing one bakes its raw byte into the cluster's
+        // emitted UTF-8 (`Screen.clusterBytes`), and a control like LF, CR,
+        // or TAB written verbatim to the terminal moves the cursor and
+        // leaves a ghost the diff renderer can't see. Leave it for the next
+        // cluster, where the width-0 base path drops it without writing.
+        if (isControl(next)) {
+            iter.i = saved;
+            break;
+        }
+
         // Generic combining / zero-width absorbs.
         if (codepointWidth(next) == 0) continue;
 
@@ -255,6 +266,13 @@ pub fn nextCluster(iter: *std.unicode.Utf8Iterator) ?Cluster {
     }
 
     return .{ .base = first, .width = base_width, .byte_len = iter.i - start };
+}
+
+/// C0 controls + DEL + C1 controls. These are width 0 but must never be
+/// absorbed into a grapheme cluster: their raw bytes would be emitted
+/// verbatim and desync the terminal.
+fn isControl(cp: u21) bool {
+    return cp < 0x20 or (cp >= 0x7F and cp <= 0x9F);
 }
 
 fn isRegionalIndicator(cp: u21) bool {
@@ -278,6 +296,39 @@ test "nextCluster: plain ASCII is width 1, one codepoint per cluster" {
     const b = nextCluster(&iter).?;
     try testing.expectEqual(@as(u21, 'i'), b.base);
     try testing.expectEqual(@as(u2, 1), b.width);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: control char after visible char is not absorbed" {
+    // A C0 control following a visible char must start its own cluster,
+    // not fold into the preceding one - otherwise its raw byte is emitted
+    // verbatim to the terminal and desyncs the cursor.
+    var iter = iterOf("e\n\nb");
+    const e = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'e'), e.base);
+    try testing.expectEqual(@as(u2, 1), e.width);
+    try testing.expectEqual(@as(usize, 1), e.byte_len);
+
+    const nl1 = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, '\n'), nl1.base);
+    try testing.expectEqual(@as(u2, 0), nl1.width);
+
+    const nl2 = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u2, 0), nl2.width);
+
+    const b = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'b'), b.base);
+    try testing.expect(nextCluster(&iter) == null);
+}
+
+test "nextCluster: combining mark after visible char is still absorbed" {
+    // Guard the control-char fix didn't break real grapheme extension:
+    // a combining acute (U+0301) must still fold into the base 'e'.
+    var iter = iterOf("e\u{0301}");
+    const c = nextCluster(&iter).?;
+    try testing.expectEqual(@as(u21, 'e'), c.base);
+    try testing.expectEqual(@as(u2, 1), c.width);
+    try testing.expectEqual(@as(usize, 3), c.byte_len); // 'e' + 2-byte U+0301
     try testing.expect(nextCluster(&iter) == null);
 }
 
