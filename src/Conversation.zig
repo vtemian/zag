@@ -96,6 +96,14 @@ row_styles: std.AutoHashMapUnmanaged(u32, Theme.HighlightSlot) = .empty,
 /// `lineCount` (no theme in the vtable) stays in sync with
 /// `getVisibleLines` without a cross-cutting signature change.
 turn_gap: u16 = 1,
+/// Backing store for the turn-delimiter line's single span, reused
+/// across calls so the line returned from `getVisibleLines` borrows
+/// buffer-owned memory (matching the cache-owned-spans contract) rather
+/// than allocating a fresh spans array on `frame_alloc` every frame.
+/// The fresh allocation leaked whenever `frame_alloc` was not an arena
+/// (e.g. tests passing a tracking allocator). The style is stamped from
+/// the active theme on each use.
+delimiter_span: [1]Theme.StyledSpan = .{.{ .text = turn_delimiter, .style = .{} }},
 /// Owned BufferRegistry that holds the per-node TextBuffer (and
 /// ImageBuffer) storage for every content-bearing node in this
 /// conversation. Constructed in `init` and torn down in `deinit`;
@@ -369,11 +377,13 @@ pub fn getVisibleLines(
                 if (skipped < skip) {
                     skipped += 1;
                 } else {
-                    // First gap line is a visual delimiter; remainder are blank.
-                    const line = if (g == 0)
-                        try Theme.singleSpanLine(frame_alloc, turn_delimiter, theme.highlights.md_hr)
-                    else
-                        try Theme.emptyStyledLine(frame_alloc);
+                    // First gap line is a visual delimiter; remainder are
+                    // blank. The delimiter borrows the buffer-owned span
+                    // (no per-frame allocation); blanks carry no spans.
+                    const line = if (g == 0) blk: {
+                        self.delimiter_span[0].style = theme.highlights.md_hr;
+                        break :blk Theme.StyledLine{ .spans = self.delimiter_span[0..] };
+                    } else try Theme.emptyStyledLine(frame_alloc);
                     try lines.append(frame_alloc, line);
                     collected += 1;
                 }
@@ -624,8 +634,16 @@ fn rowPlan(
             var g: u16 = 0;
             while (g < self.turn_gap) : (g += 1) {
                 const rows = turnGapRows(g, content_width);
-                if (walk.cum_rows >= visible_start_rows) {
-                    return .{ .total_rows = total, .skip = walk.cum_logical, .leading_skip_rows = 0 };
+                // Boundary inside this (possibly wrapped) gap line: stop
+                // here with the sub-row clip. Checking against the line's
+                // end keeps `cum_rows` from overshooting `visible_start_rows`
+                // (which would underflow the next node's locateWindowStart).
+                if (visible_start_rows < walk.cum_rows + rows) {
+                    return .{
+                        .total_rows = total,
+                        .skip = walk.cum_logical,
+                        .leading_skip_rows = @intCast(visible_start_rows - walk.cum_rows),
+                    };
                 }
                 walk.cum_rows += rows;
                 walk.cum_logical += 1;
