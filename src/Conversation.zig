@@ -19,6 +19,7 @@ const input = @import("input.zig");
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
 const width = @import("width.zig");
+const Gutter = @import("Gutter.zig");
 
 const Conversation = @This();
 
@@ -344,7 +345,8 @@ pub fn getVisibleLines(
 
     for (self.tree.root_children.items, 0..) |node, i| {
         if (collected >= max_lines) break;
-        try collectVisibleLines(node, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected, &self.buffer_registry);
+        const is_last = i == self.tree.root_children.items.len - 1;
+        try collectVisibleLines(node, 0, is_last, &.{}, frame_alloc, &self.cache, &self.renderer, &lines, theme, skip, max_lines, &skipped, &collected, &self.buffer_registry);
 
         // Insert turn gap between root-level nodes (turns), but not after the last one.
         if (i < self.tree.root_children.items.len - 1) {
@@ -383,8 +385,35 @@ pub fn getVisibleLines(
 /// mismatch discards the cache entry before any borrowed slice is
 /// dereferenced. The output list backing uses `frame_alloc` and shares
 /// spans pointers with the cache.
+/// Wrap one bare rendered line with its gutter prefix span into the frame
+/// arena. `line_idx` is the node-local line index (0 == first line) so the
+/// connector vs continuation glyph is chosen correctly. Bare span pointers
+/// are reused (borrowed); only the spans array and the gutter text are
+/// frame-arena allocated. The gutter span is `owned = false`: the frame
+/// arena reclaims it, so `StyledLine.deinit` must never free it.
+fn decorate(
+    frame_alloc: Allocator,
+    bare: Theme.StyledLine,
+    line_idx: usize,
+    depth: u16,
+    is_last: bool,
+    ancestor_is_last: []const bool,
+    marker: Gutter.Marker,
+    gutter_style: Theme.CellStyle,
+    row_style: ?Theme.HighlightSlot,
+) !Theme.StyledLine {
+    const gutter_text = try Gutter.prefix(frame_alloc, depth, is_last, ancestor_is_last, marker, line_idx == 0);
+    const spans = try frame_alloc.alloc(Theme.StyledSpan, bare.spans.len + 1);
+    spans[0] = .{ .text = gutter_text, .style = gutter_style, .owned = false };
+    @memcpy(spans[1..], bare.spans);
+    return .{ .spans = spans, .row_style = row_style };
+}
+
 fn collectVisibleLines(
     node: *const Node,
+    depth: u16,
+    is_last: bool,
+    ancestor_is_last: []const bool,
     frame_alloc: Allocator,
     cache: *NodeLineCache,
     renderer: *const NodeRenderer,
@@ -400,6 +429,19 @@ fn collectVisibleLines(
 
     const node_lines = renderer.lineCountForNode(node, registry);
 
+    // Gutter decoration context, fixed for this node across all its lines.
+    const marker: Gutter.Marker = switch (node.node_type) {
+        .user_message => .user,
+        .tool_call => .tool_call,
+        else => .none,
+    };
+    const gutter_style: Theme.CellStyle = if (node.node_type == .tool_call) switch (NodeRenderer.toolBulletState(node)) {
+        .running => theme.highlights.tool_bullet_running,
+        .ok => theme.highlights.tool_bullet_ok,
+        .err => theme.highlights.tool_bullet_error,
+    } else theme.highlights.tree_connector;
+    const row_style: ?Theme.HighlightSlot = if (node.node_type == .user_message) .user_message_bar else null;
+
     if (skipped.* + node_lines <= skip) {
         skipped.* += node_lines;
     } else {
@@ -408,8 +450,9 @@ fn collectVisibleLines(
             const available = if (skip_from_node < cached.len) cached.len - skip_from_node else 0;
             const take = @min(available, max_lines - collected.*);
 
-            for (cached[skip_from_node .. skip_from_node + take]) |cached_line| {
-                try lines.append(frame_alloc, cached_line);
+            for (cached[skip_from_node .. skip_from_node + take], 0..) |cached_line, k| {
+                const decorated = try decorate(frame_alloc, cached_line, skip_from_node + k, depth, is_last, ancestor_is_last, marker, gutter_style, row_style);
+                try lines.append(frame_alloc, decorated);
             }
 
             skipped.* += node_lines;
@@ -441,8 +484,9 @@ fn collectVisibleLines(
                 const available = produced - first;
                 const budget = max_lines - collected.*;
                 const take = @min(available, budget);
-                for (cached[first .. first + take]) |cached_line| {
-                    try lines.append(frame_alloc, cached_line);
+                for (cached[first .. first + take], 0..) |cached_line, k| {
+                    const decorated = try decorate(frame_alloc, cached_line, first + k, depth, is_last, ancestor_is_last, marker, gutter_style, row_style);
+                    try lines.append(frame_alloc, decorated);
                 }
             }
 
@@ -452,9 +496,15 @@ fn collectVisibleLines(
     }
 
     if (!node.collapsed) {
-        for (node.children.items) |child| {
+        var child_anc_buf: [32]bool = undefined;
+        const anc_len = @min(ancestor_is_last.len, child_anc_buf.len - 1);
+        @memcpy(child_anc_buf[0..anc_len], ancestor_is_last[0..anc_len]);
+        child_anc_buf[anc_len] = is_last;
+        const child_anc = child_anc_buf[0 .. anc_len + 1];
+        const n = node.children.items.len;
+        for (node.children.items, 0..) |child, ci| {
             if (collected.* >= max_lines) return;
-            try collectVisibleLines(child, frame_alloc, cache, renderer, lines, theme, skip, max_lines, skipped, collected, registry);
+            try collectVisibleLines(child, depth + 1, ci == n - 1, child_anc, frame_alloc, cache, renderer, lines, theme, skip, max_lines, skipped, collected, registry);
         }
     }
 }
@@ -491,6 +541,25 @@ fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u
     return out;
 }
 
+/// A run of ASCII spaces long enough to stand in for any gutter prefix.
+/// The deepest node depth the recursion threads is bounded by the
+/// `[32]bool` ancestor buffer, so the widest gutter is `gutterCols(32)`.
+const gutter_spacer = " " ** (Gutter.gutterCols(32));
+
+/// Like `lineSpansAsBytes`, but prepends a `gutter_cols`-wide spacer as
+/// the first part so wrap measurement matches the rendered output. The
+/// renderer draws the gutter as a one-time prefix on the first physical
+/// row (continuations restart at `content_x`), so measuring a single
+/// leading spacer of the gutter's column width against the FULL content
+/// width is the exact mirror of `drawStyledLineWrapped` — and of
+/// `defaultGetWindow`, which measures the decorated line at full width.
+fn lineSpansAsBytesGutter(line: Theme.StyledLine, gutter_cols: u16, alloc: Allocator) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, line.spans.len + 1);
+    out[0] = gutter_spacer[0..gutter_cols];
+    for (line.spans, 0..) |span, idx| out[idx + 1] = span.text;
+    return out;
+}
+
 /// Geometry of a single node's *own* render (excluding children) at
 /// `content_width`. Reads the memo; on miss, obtains the node's own
 /// StyledLines (cache hit, else a transient render into `scratch_alloc`
@@ -501,10 +570,20 @@ fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u
 fn nodeOwnMetrics(
     self: *Conversation,
     node: *const Node,
+    depth: u16,
     scratch_alloc: Allocator,
     theme: *const Theme,
     content_width: u16,
 ) !NodeLineCache.RowMetrics {
+    // The rendered line is `gutter + content`, where the gutter is a
+    // one-time prefix on the first physical row only (continuations
+    // restart at content_x). Measuring a single gutter-width spacer
+    // prepended to the content, against the FULL content_width, is the
+    // exact mirror of `drawStyledLineWrapped` and `defaultGetWindow`.
+    // Depth is stable per node, so keying the memo on content_width is
+    // sound: node.id already disambiguates depth.
+    const gutter = Gutter.gutterCols(depth);
+
     if (self.cache.getMetrics(node, content_width)) |m| return m;
 
     const logical: u32 = @intCast(self.renderer.lineCountForNode(node, &self.buffer_registry));
@@ -512,7 +591,7 @@ fn nodeOwnMetrics(
     var wrapped: u32 = 0;
     if (self.cache.get(node)) |cached| {
         for (cached) |line| {
-            const parts = try lineSpansAsBytes(line, scratch_alloc);
+            const parts = try lineSpansAsBytesGutter(line, gutter, scratch_alloc);
             wrapped += width.wrappedRowCountMulti(parts, content_width);
         }
     } else {
@@ -520,7 +599,7 @@ fn nodeOwnMetrics(
         defer scratch.deinit(scratch_alloc);
         try self.renderer.render(node, &scratch, scratch_alloc, theme, &self.buffer_registry);
         for (scratch.items) |line| {
-            const parts = try lineSpansAsBytes(line, scratch_alloc);
+            const parts = try lineSpansAsBytesGutter(line, gutter, scratch_alloc);
             wrapped += width.wrappedRowCountMulti(parts, content_width);
         }
     }
@@ -570,7 +649,7 @@ fn rowPlan(
     var total: u32 = 0;
     const roots = self.tree.root_children.items;
     for (roots, 0..) |node, i| {
-        total += try self.subtreeWrapped(node, scratch_alloc, theme, content_width);
+        total += try self.subtreeWrapped(node, 0, scratch_alloc, theme, content_width);
         if (i < roots.len - 1) total += self.turn_gap; // blank rows
     }
 
@@ -590,7 +669,7 @@ fn rowPlan(
     // Pass 2: walk to the boundary, accumulating physical rows + logical lines.
     var walk = RowWalk{};
     for (roots, 0..) |node, i| {
-        if (try self.locateWindowStart(node, scratch_alloc, theme, content_width, visible_start_rows, &walk)) |found| {
+        if (try self.locateWindowStart(node, 0, scratch_alloc, theme, content_width, visible_start_rows, &walk)) |found| {
             return .{ .total_rows = total, .skip = found.skip, .leading_skip_rows = found.leading_skip_rows };
         }
         if (i < roots.len - 1) {
@@ -615,15 +694,16 @@ fn rowPlan(
 fn subtreeWrapped(
     self: *Conversation,
     node: *const Node,
+    depth: u16,
     scratch_alloc: Allocator,
     theme: *const Theme,
     content_width: u16,
 ) !u32 {
-    const m = try self.nodeOwnMetrics(node, scratch_alloc, theme, content_width);
+    const m = try self.nodeOwnMetrics(node, depth, scratch_alloc, theme, content_width);
     var total = m.wrapped_rows;
     if (!node.collapsed) {
         for (node.children.items) |child| {
-            total += try self.subtreeWrapped(child, scratch_alloc, theme, content_width);
+            total += try self.subtreeWrapped(child, depth + 1, scratch_alloc, theme, content_width);
         }
     }
     return total;
@@ -635,13 +715,18 @@ fn subtreeWrapped(
 fn locateWindowStart(
     self: *Conversation,
     node: *const Node,
+    depth: u16,
     scratch_alloc: Allocator,
     theme: *const Theme,
     content_width: u16,
     visible_start_rows: u32,
     walk: *RowWalk,
 ) !?WindowStart {
-    const m = try self.nodeOwnMetrics(node, scratch_alloc, theme, content_width);
+    const m = try self.nodeOwnMetrics(node, depth, scratch_alloc, theme, content_width);
+
+    // Gutter prefix width for this node's rendered lines; measured the
+    // same way as nodeOwnMetrics (one-time spacer, full content_width).
+    const gutter = Gutter.gutterCols(depth);
 
     // Does the boundary land in THIS node's own lines?
     if (visible_start_rows < walk.cum_rows + m.wrapped_rows) {
@@ -655,7 +740,7 @@ fn locateWindowStart(
         };
         var row_acc: u32 = 0;
         for (owned_lines, 0..) |line, idx| {
-            const parts = try lineSpansAsBytes(line, scratch_alloc);
+            const parts = try lineSpansAsBytesGutter(line, gutter, scratch_alloc);
             const rows = width.wrappedRowCountMulti(parts, content_width);
             if (into_node_rows < row_acc + rows) {
                 return .{
@@ -674,7 +759,7 @@ fn locateWindowStart(
 
     if (!node.collapsed) {
         for (node.children.items) |child| {
-            if (try self.locateWindowStart(child, scratch_alloc, theme, content_width, visible_start_rows, walk)) |found| {
+            if (try self.locateWindowStart(child, depth + 1, scratch_alloc, theme, content_width, visible_start_rows, walk)) |found| {
                 return found;
             }
         }
@@ -724,17 +809,21 @@ pub fn readText(
     const skip = if (max_lines >= total) 0 else total - max_lines;
     const truncated = skip > 0;
 
-    var styled = try self.getVisibleLines(alloc, self.allocator, theme, skip, max_lines);
-    defer styled.deinit(alloc);
+    // `getVisibleLines` decorates each line with a frame-arena-owned gutter
+    // span (owned = false), so the frame allocator must be an arena that
+    // reclaims those allocations wholesale. Use a transient arena and copy
+    // the joined result out into the caller's allocator.
+    var frame_arena = std.heap.ArenaAllocator.init(alloc);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
+
+    var styled = try self.getVisibleLines(frame_alloc, self.allocator, theme, skip, max_lines);
+    defer styled.deinit(frame_alloc);
 
     var parts: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (parts.items) |p| alloc.free(p);
-        parts.deinit(alloc);
-    }
     for (styled.items) |line| {
-        const line_text = try line.toText(alloc);
-        try parts.append(alloc, line_text);
+        const line_text = try line.toText(frame_alloc);
+        try parts.append(frame_alloc, line_text);
     }
     const joined = try std.mem.join(alloc, "\n", parts.items);
     return .{ .text = joined, .total_lines = total, .truncated = truncated };
@@ -1778,10 +1867,6 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-test {
-    _ = @import("Gutter.zig");
-}
-
 test "init and deinit" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "test");
@@ -1818,13 +1903,17 @@ test "getVisibleLines returns rendered lines" {
     _ = try cb.appendNode(null, .separator, "");
 
     const theme = Theme.defaultTheme();
-    var lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines.deinit(allocator);
+    // getVisibleLines decorates each line with a frame-arena-owned gutter
+    // span (owned = false), so the frame allocator must be an arena.
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    var lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, std.math.maxInt(usize));
 
     try std.testing.expect(lines.items.len >= 2);
     const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
-    try std.testing.expectEqualStrings("hello", line0);
+    // A root user_message gains the `\u{203A} ` marker gutter prefix.
+    try std.testing.expectEqualStrings("\u{203A} hello", line0);
 }
 
 test "row_styles round trip: set, render, clear" {
@@ -1839,18 +1928,24 @@ test "row_styles round trip: set, render, clear" {
     try cb.setRowStyle(1, .err);
 
     const theme = Theme.defaultTheme();
-    var lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines.deinit(allocator);
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
+
+    const lines = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     try std.testing.expect(lines.items.len >= 2);
+    // Explicit row_styles (set via setRowStyle) override the per-node
+    // gutter default (user_message_bar), so the stamped slots win.
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, .selection), lines.items[0].row_style);
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, .err), lines.items[1].row_style);
 
     cb.clearRowStyle(0);
     cb.clearRowStyle(99); // unset row, must not raise
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
-    try std.testing.expect(lines2.items[0].row_style == null);
+    const lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
+    // Row 0's explicit override is cleared; the user_message node's gutter
+    // default (user_message_bar) shows through again.
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .user_message_bar), lines2.items[0].row_style);
     try std.testing.expectEqual(@as(?Theme.HighlightSlot, .err), lines2.items[1].row_style);
 }
 
@@ -1910,18 +2005,19 @@ test "getVisibleLines with range skips off-screen nodes" {
     const theme = Theme.defaultTheme();
 
     // Request only lines 1..3 (skip line0, take 2, skip line3+line4)
-    var lines = try cb.getVisibleLines(allocator, allocator, &theme, 1, 2);
-    defer lines.deinit(allocator);
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    var lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 1, 2);
 
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
 
     const text0 = try lines.items[0].toText(allocator);
     defer allocator.free(text0);
-    try std.testing.expectEqualStrings("line1", text0);
+    try std.testing.expectEqualStrings("\u{203A} line1", text0);
 
     const text1 = try lines.items[1].toText(allocator);
     defer allocator.free(text1);
-    try std.testing.expectEqualStrings("line2", text1);
+    try std.testing.expectEqualStrings("\u{203A} line2", text1);
 }
 
 test "buffer interface returns line count" {
@@ -1951,17 +2047,18 @@ test "getVisibleLines returns consistent results when content unchanged" {
     _ = try cb.appendNode(null, .assistant_text, "world");
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
     // First call
-    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines1.deinit(allocator);
+    var lines1 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     const text1 = try lines1.items[0].toText(allocator);
     defer allocator.free(text1);
 
     // Second call (should use cache)
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
+    var lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     const text2 = try lines2.items[0].toText(allocator);
     defer allocator.free(text2);
@@ -1978,21 +2075,22 @@ test "getVisibleLines reflects new content after appendToNode" {
     const node = try cb.appendNode(null, .user_message, "hello");
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
     // Populate cache
-    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    lines1.deinit(allocator);
+    _ = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     // Mutate: append to node
     try cb.appendToNode(node, " world");
 
     // Cache should be invalidated for this node
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
+    var lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     const text = try lines2.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("hello world", text);
+    try std.testing.expectEqualStrings("\u{203A} hello world", text);
 }
 
 test "getVisibleLines reflects new nodes after appendNode" {
@@ -2006,19 +2104,20 @@ test "getVisibleLines reflects new nodes after appendNode" {
     _ = try cb.appendNode(null, .user_message, "first");
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
     // Populate cache
-    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    const lines1 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     const lines1_len = lines1.items.len;
-    lines1.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), lines1_len);
 
     // Add new node
     _ = try cb.appendNode(null, .user_message, "second");
 
     // Should include both nodes
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
+    const lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     try std.testing.expectEqual(@as(usize, 2), lines2.items.len);
 }
 
@@ -2035,21 +2134,24 @@ test "getVisibleLines output survives node content realloc" {
     const node = try cb.appendNode(null, .assistant_text, "hi");
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
-    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    lines1.deinit(allocator);
+    _ = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     // Force capacity growth with a large append.
     const big = "z" ** 4096;
     try cb.appendToNode(node, big);
 
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
+    var lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
 
     const text = try lines2.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "hiz"));
-    try std.testing.expectEqual(@as(usize, 2 + big.len), text.len);
+    // assistant_text gets a two-space (`.none` marker) gutter, then content.
+    try std.testing.expect(std.mem.startsWith(u8, text, "  hiz"));
+    // 2 gutter cols + "hi" (2) + big.
+    try std.testing.expectEqual(@as(usize, 2 + 2 + big.len), text.len);
 }
 
 test "clear invalidates line cache" {
@@ -2060,16 +2162,17 @@ test "clear invalidates line cache" {
     _ = try cb.appendNode(null, .user_message, "hello");
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
-    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    const lines1 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     const lines1_len = lines1.items.len;
-    lines1.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), lines1_len);
 
     cb.clear();
 
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
+    const lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     try std.testing.expectEqual(@as(usize, 0), lines2.items.len);
 }
 
@@ -2535,15 +2638,16 @@ test "getVisibleLines reflects collapsed-to-expanded toggle" {
     tnode.collapsed = true;
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
-    var collapsed_lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer collapsed_lines.deinit(allocator);
+    const collapsed_lines = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     try std.testing.expectEqual(@as(usize, 1), collapsed_lines.items.len);
 
     _ = cb.toggleAllFoldableCollapsed();
 
-    var expanded_lines = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer expanded_lines.deinit(allocator);
+    const expanded_lines = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     // header + 2 body lines
     try std.testing.expectEqual(@as(usize, 3), expanded_lines.items.len);
 }
@@ -2716,8 +2820,9 @@ test "tool_result with image data routes through ImageBuffer" {
     // Renderer falls back to a placeholder line for image-backed
     // tool_result; full inline rendering is a later concern.
     const theme = Theme.defaultTheme();
-    var lines = try cb.getVisibleLines(std.testing.allocator, std.testing.allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines.deinit(std.testing.allocator);
+    var frame_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), std.testing.allocator, &theme, 0, std.math.maxInt(usize));
 
     var saw_placeholder = false;
     for (lines.items) |line| {
@@ -3386,10 +3491,16 @@ test "NodeLineCache rotates spans pointer on put-replace" {
     // collectVisibleLines copies StyledLine headers into a frame arena,
     // sharing the spans pointer with the cache entry.
     //
-    // Asserts spans.ptr rotates across a content_version bump: a future
-    // change that reuses the same spans allocation across versions trips
-    // this. testing.allocator's leak detector backstops from the other
-    // direction (double-free or missed free on replace).
+    // Asserts the cache-owned content span rotates across a content_version
+    // bump: a future change that reuses the same TextBuffer allocation
+    // across versions trips this. testing.allocator's leak detector backstops
+    // from the other direction (double-free or missed free on replace).
+    //
+    // getVisibleLines decorates each line by prepending a frame-arena gutter
+    // span and copying the cache-owned bare spans after it (index >= 1). The
+    // gutter span (index 0) is per-frame, so the cache-rotation signal lives
+    // on the first CONTENT span (index 1), whose text borrows the node's
+    // TextBuffer bytes.
     //
     // We do NOT hold the first frame snapshot across the second
     // getVisibleLines call. Doing so would be UB-by-contract once put
@@ -3401,21 +3512,29 @@ test "NodeLineCache rotates spans pointer on put-replace" {
     const node = try cb.appendNode(null, .assistant_text, "first content\n");
 
     const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
 
-    var lines1 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
+    const lines1 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     try std.testing.expect(lines1.items.len >= 1);
-    try std.testing.expect(lines1.items[0].spans.len >= 1);
-    const spans1_ptr = @intFromPtr(lines1.items[0].spans.ptr);
-    const text1_first = lines1.items[0].spans[0].text;
-    lines1.deinit(allocator);
+    // Index 0 is the gutter span; index 1 is the first cache-owned content span.
+    try std.testing.expect(lines1.items[0].spans.len >= 2);
+    const text1_first = lines1.items[0].spans[1].text;
+    // The cache-owned spans slice for this node, captured before the bump.
+    const cached1 = cb.cache.get(node).?;
+    const spans1_ptr = @intFromPtr(cached1[0].spans.ptr);
 
     try cb.appendToNode(node, "second content\n");
 
-    var lines2 = try cb.getVisibleLines(allocator, allocator, &theme, 0, std.math.maxInt(usize));
-    defer lines2.deinit(allocator);
+    const lines2 = try cb.getVisibleLines(frame_alloc, allocator, &theme, 0, std.math.maxInt(usize));
     try std.testing.expect(lines2.items.len >= 1);
-    try std.testing.expect(lines2.items[0].spans.len >= 1);
-    const spans2_ptr = @intFromPtr(lines2.items[0].spans.ptr);
+    try std.testing.expect(lines2.items[0].spans.len >= 2);
+    // The content_version bump forces cache.put to free the old spans array
+    // and allocate a fresh one (put-replace), so the cache-owned spans
+    // pointer must rotate.
+    const cached2 = cb.cache.get(node).?;
+    const spans2_ptr = @intFromPtr(cached2[0].spans.ptr);
 
     try std.testing.expect(spans1_ptr != spans2_ptr);
 
@@ -3448,16 +3567,19 @@ test "nodeOwnMetrics memoizes own wrapped+logical and is stable across calls" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    // A single assistant_text node with a line that wraps at width 10.
+    // A single assistant_text node with a line that wraps. At content_width
+    // 10 and depth 0 the gutter is a one-time 2-col prefix: row 0 holds the
+    // 2-col gutter + 8 content chars, row 1 holds the remaining 8. So the
+    // content wraps to 2 rows. The metrics memo is keyed on content_width.
     const node = (try cb.appendNode(null, .assistant_text, "abcdefghij klmno")); // 16 cells
 
-    const m1 = try cb.nodeOwnMetrics(node, arena.allocator(), &theme, 10);
-    // Logical lines: 1 (no embedded newline). Wrapped at width 10: 2 rows.
+    const m1 = try cb.nodeOwnMetrics(node, 0, arena.allocator(), &theme, 10);
+    // Logical lines: 1 (no embedded newline). Wrapped with gutter at 10: 2 rows.
     try std.testing.expectEqual(@as(u32, 1), m1.logical_lines);
     try std.testing.expectEqual(@as(u32, 2), m1.wrapped_rows);
 
     // Second call must hit the memo and return identical values.
-    const m2 = try cb.nodeOwnMetrics(node, arena.allocator(), &theme, 10);
+    const m2 = try cb.nodeOwnMetrics(node, 0, arena.allocator(), &theme, 10);
     try std.testing.expectEqual(m1.wrapped_rows, m2.wrapped_rows);
     try std.testing.expectEqual(m1.logical_lines, m2.logical_lines);
     try std.testing.expect(cb.cache.getMetrics(node, 10) != null);
@@ -3609,3 +3731,85 @@ test "getWindow matches defaultGetWindow across widths and scroll offsets" {
         }
     }
 }
+
+test "getVisibleLines decorates user message with bar and marker" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hi");
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 100);
+    try std.testing.expect(lines.items.len >= 1);
+    // First span is the `\u{203A} ` user marker gutter; the row carries the
+    // user_message_bar background slot.
+    try std.testing.expectEqualStrings("\u{203A} ", lines.items[0].spans[0].text);
+    try std.testing.expectEqual(Theme.HighlightSlot.user_message_bar, lines.items[0].row_style.?);
+}
+
+test "getVisibleLines decorates tool_result child with branch connector" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    const call = try cb.appendToolCallNode(null, "bash", "t1", "{\"command\":\"ls\"}");
+    _ = try cb.appendNode(call, .tool_result, "output line");
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 100);
+    // Line 0 is the tool_call header (depth 0, `\u{25CF} ` tool marker).
+    try std.testing.expectEqualStrings("\u{25CF} ", lines.items[0].spans[0].text);
+    // The tool_result child sits at depth 1, so its gutter prefix span is
+    // the root ancestor blank ("  ") followed by the `\u{2514} ` corner
+    // connector (sole/last child): "  \u{2514} ".
+    var saw_corner = false;
+    for (lines.items) |line| {
+        if (std.mem.eql(u8, line.spans[0].text, "  \u{2514} ")) {
+            saw_corner = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_corner);
+}
+
+test "gutter-reduced wrapping width keeps rowPlan and getWindow consistent" {
+    // A tool_result child sits at depth 1, so its rendered lines carry a
+    // 4-col gutter (gutterCols(1)). At a content width chosen so the child's
+    // single logical line wraps WITH the gutter but not without it, rowPlan
+    // (gutter-aware metrics) and getVisibleLines (decorated render) must agree
+    // on the total physical row count. The differential getWindow test above
+    // is the broad guard; this pins the specific gutter-wrap interaction.
+    const allocator = std.testing.allocator;
+    const theme = Theme.defaultTheme();
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 0;
+
+    const call = try cb.appendToolCallNode(null, "bash", "t1", "{\"command\":\"ls\"}");
+    // 30-char body line. At content_width 32 the BARE line fits one physical
+    // row (30 <= 32), but the depth-1 gutter (4 cols) leaves only 28 content
+    // cols on the first row, forcing the last 2 chars onto a second row. The
+    // metrics passes must account for that gutter cost to stay consistent
+    // with the decorated render.
+    _ = try cb.appendNode(call, .tool_result, "x" ** 30);
+
+    const content_width: u16 = 32;
+
+    var arena_got = std.heap.ArenaAllocator.init(allocator);
+    defer arena_got.deinit();
+    var arena_want = std.heap.ArenaAllocator.init(allocator);
+    defer arena_want.deinit();
+
+    const v = cb.view();
+    const got = try v.getWindow(arena_got.allocator(), allocator, &theme, content_width, 100, 0);
+    const want = try View.defaultGetWindow(v, arena_want.allocator(), allocator, &theme, content_width, 100, 0);
+
+    try std.testing.expectEqual(want.total_rows, got.total_rows);
+
+    // The child's long line must actually wrap with the gutter: total_rows is
+    // strictly greater than the logical line count (header + body lines).
+    const logical = try cb.lineCount();
+    try std.testing.expect(got.total_rows > @as(u32, @intCast(logical)));
+}
+
