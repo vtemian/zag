@@ -435,7 +435,11 @@ fn collectVisibleLines(
         .tool_call => .tool_call,
         else => .none,
     };
-    const gutter_style: Theme.CellStyle = if (node.node_type == .tool_call) switch (NodeRenderer.toolBulletState(node)) {
+    // A tool_call shows its state bullet only at depth 0, where the gutter
+    // glyph IS the marker. Deeper tool_calls draw a tree connector instead
+    // of a marker, so they take the dim connector style like any other
+    // nested node.
+    const gutter_style: Theme.CellStyle = if (node.node_type == .tool_call and depth == 0) switch (NodeRenderer.toolBulletState(node)) {
         .running => theme.highlights.tool_bullet_running,
         .ok => theme.highlights.tool_bullet_ok,
         .err => theme.highlights.tool_bullet_error,
@@ -541,10 +545,20 @@ fn lineSpansAsBytes(line: Theme.StyledLine, alloc: Allocator) ![]const []const u
     return out;
 }
 
-/// A run of ASCII spaces long enough to stand in for any gutter prefix.
-/// The deepest node depth the recursion threads is bounded by the
-/// `[32]bool` ancestor buffer, so the widest gutter is `gutterCols(32)`.
-const gutter_spacer = " " ** (Gutter.gutterCols(32));
+/// Deepest node depth the gutter spacer is sized for. `depth` is an
+/// unbounded recursion counter (NOT capped by the `[32]bool` ancestor
+/// buffer, which only bounds the ancestor-flags slice length), so
+/// `lineSpansAsBytesGutter` clamps the measured spacer to this width.
+/// Real conversation depth is bounded well under this by subagent nesting
+/// (`max_task_depth` is 8) plus a few tool/thinking layers, so the clamp
+/// is defensive rather than a live limit.
+const max_gutter_depth = 32;
+
+/// A run of ASCII spaces wide enough to stand in for the gutter prefix at
+/// `max_gutter_depth`. `lineSpansAsBytesGutter` clamps to this length so a
+/// deeper-than-expected tree under-measures slightly instead of slicing
+/// out of bounds.
+const gutter_spacer = " " ** (Gutter.gutterCols(max_gutter_depth));
 
 /// Like `lineSpansAsBytes`, but prepends a `gutter_cols`-wide spacer as
 /// the first part so wrap measurement matches the rendered output. The
@@ -555,7 +569,8 @@ const gutter_spacer = " " ** (Gutter.gutterCols(32));
 /// `defaultGetWindow`, which measures the decorated line at full width.
 fn lineSpansAsBytesGutter(line: Theme.StyledLine, gutter_cols: u16, alloc: Allocator) ![]const []const u8 {
     const out = try alloc.alloc([]const u8, line.spans.len + 1);
-    out[0] = gutter_spacer[0..gutter_cols];
+    const cols = @min(gutter_cols, gutter_spacer.len);
+    out[0] = gutter_spacer[0..cols];
     for (line.spans, 0..) |span, idx| out[idx + 1] = span.text;
     return out;
 }
@@ -817,8 +832,11 @@ pub fn readText(
     defer frame_arena.deinit();
     const frame_alloc = frame_arena.allocator();
 
-    var styled = try self.getVisibleLines(frame_alloc, self.allocator, theme, skip, max_lines);
-    defer styled.deinit(frame_alloc);
+    // No per-line deinit: the gutter spans are arena-owned and some content
+    // spans are cache-owned (owned = true), so freeing through the arena
+    // would be a cross-allocator free. `frame_arena.deinit()` reclaims every
+    // arena allocation wholesale; cache-owned spans are not ours to free.
+    const styled = try self.getVisibleLines(frame_alloc, self.allocator, theme, skip, max_lines);
 
     var parts: std.ArrayList([]const u8) = .empty;
     for (styled.items) |line| {
