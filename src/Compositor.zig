@@ -1179,6 +1179,57 @@ test "composite writes buffer content at leaf rect with padding" {
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
 }
 
+test "multi-line bash command emits no raw control bytes" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 60, 16);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    // A bash command whose JSON `command` value contains real newlines,
+    // the shape of a `git commit -m "subject\n\nbody..."` invocation.
+    const input =
+        \\{"command":"git commit -m \"subject line\n\nbody paragraph here\nthird line\""}
+    ;
+    const node = try cb.appendToolCallNode(null, "bash", "bash:0", input);
+    _ = try cb.appendNode(node, .tool_result, "ok");
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var vp: Viewport = .{};
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &vp });
+    layout.recalculate(60, 16);
+
+    compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [16384]u8 = undefined;
+    var total: usize = 0;
+    while (total < scratch.len) {
+        const n = std.posix.read(read_end.handle, scratch[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const output = scratch[0..total];
+
+    // zag positions every cell with an explicit CUP and never emits a bare
+    // LF/CR; a raw control byte here would move the real terminal's cursor
+    // and leave a ghost the diff renderer cannot see or repair.
+    for (output) |b| {
+        if (b < 0x20 and b != 0x1b) return error.RawControlByteEmitted;
+    }
+}
+
 test "composite draws status line on last row" {
     const allocator = std.testing.allocator;
     var screen = try Screen.init(allocator, 40, 10);
