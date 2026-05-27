@@ -100,6 +100,13 @@ last_info: [128]u8 = .{0} ** 128,
 /// Length of the last info message.
 last_info_len: u8 = 0,
 
+/// Millisecond timestamp when the current turn's agent thread spawned.
+/// Null between turns. Read by the compositor for the working line.
+turn_started_ms: ?i64 = null,
+/// Output tokens produced in the current turn. Bumped by the streaming
+/// path; read by the working line. Zero until usage arrives.
+output_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
 /// Last `ConversationTree.generation` the compositor observed for this
 /// pane. Used by `Compositor.drawDirtyLeaves` to tell apart a genuine
 /// tree mutation from a view-state-only dirty (scroll, focus, etc.).
@@ -294,6 +301,8 @@ pub fn submit(
     self.queue_active = true;
     self.lua_engine = deps.lua_engine;
     self.cancel_flag.store(false, .release);
+    self.turn_started_ms = std.time.milliTimestamp();
+    self.output_tokens.store(0, .release);
 
     // Populate the TaskContext the agent thread publishes into the
     // threadlocal slot so the built-in `task` tool can reach back to
@@ -525,6 +534,18 @@ pub fn shutdownAll(runners: []const *AgentRunner) void {
 /// the last `.info` event. Empty until an info event has been handled.
 pub fn lastInfo(self: *const AgentRunner) []const u8 {
     return self.last_info[0..self.last_info_len];
+}
+
+/// Milliseconds since the current turn's agent thread spawned, or 0 when idle.
+pub fn elapsedMs(self: *const AgentRunner) u64 {
+    const start = self.turn_started_ms orelse return 0;
+    const now = std.time.milliTimestamp();
+    return if (now > start) @intCast(now - start) else 0;
+}
+
+/// Output tokens produced in the current turn.
+pub fn outputTokens(self: *const AgentRunner) u32 {
+    return self.output_tokens.load(.acquire);
 }
 
 /// Whether the event queue currently holds initialized storage (i.e.,
@@ -861,6 +882,8 @@ pub fn drainEvents(self: *AgentRunner) DrainResult {
                 self.agent_thread = null;
                 self.event_queue.deinit();
                 self.queue_active = false;
+                self.turn_started_ms = null;
+                self.output_tokens.store(0, .release);
                 result.finished = true;
             }
         }
@@ -1178,6 +1201,27 @@ test "persistAgentEvent is a no-op without an attached session handle" {
 
     try std.testing.expect(scb.session_handle == null);
     try std.testing.expect(!scb.persist_failed);
+}
+
+test "elapsedMs and outputTokens reflect per-turn state" {
+    const allocator = std.testing.allocator;
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
+    defer runner.deinit();
+
+    // Idle: no turn started.
+    try std.testing.expect(runner.turn_started_ms == null);
+    try std.testing.expectEqual(@as(u64, 0), runner.elapsedMs());
+    try std.testing.expectEqual(@as(u32, 0), runner.outputTokens());
+
+    // A turn that started in the past reports a positive elapsed time.
+    runner.turn_started_ms = std.time.milliTimestamp() - 50;
+    try std.testing.expect(runner.elapsedMs() >= 50);
+
+    // Output-token counter reads back what the streaming path stored.
+    runner.output_tokens.store(1500, .release);
+    try std.testing.expectEqual(@as(u32, 1500), runner.outputTokens());
 }
 
 test "handleAgentEvent forwards compaction_summary_delta and compaction_event to the sink" {
