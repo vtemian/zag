@@ -935,6 +935,11 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
             });
         },
         .tool_start => |ev| {
+            // Skip the streaming preview (null call_id): persisting it writes
+            // a duplicate, unpaired tool_call row that breaks wire
+            // reconstruction on resume. Only the full pre-execution event,
+            // which carries the provider-issued call id, is persisted.
+            if (ev.call_id == null) return;
             // Pair tool_call rows with their tool_result via the
             // provider-issued call id; otherwise parallel tool calls,
             // retries, and subagent dispatches cannot be replayed
@@ -1031,6 +1036,12 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             defer allocator.free(ev.name);
             defer if (ev.input_raw) |raw| allocator.free(raw);
             defer if (ev.call_id) |id| allocator.free(id);
+            // A streaming-preview tool_start (null call_id) carries no id and
+            // no input, so it cannot render usefully or pair with a result.
+            // The full pre-execution tool_start (with call_id) is the
+            // node-bearing event; skip the preview to avoid a duplicate,
+            // unpaired tool_call node.
+            if (ev.call_id == null) return;
             self.sink.push(.{ .tool_use = .{
                 .name = ev.name,
                 .call_id = ev.call_id,
@@ -1257,6 +1268,35 @@ test "handleAgentEvent .usage stores the running output-token count" {
     try std.testing.expectEqual(@as(usize, 0), mock.events.items.len);
 }
 
+test "handleAgentEvent ignores the streaming-preview tool_start" {
+    // A tool call yields TWO tool_start events: a streaming preview (name
+    // only, null call_id) when the provider first sees the function name,
+    // then a full pre-execution event (name + call_id + input). The preview
+    // carries no id and no input, so it can neither render usefully nor pair
+    // with a result; it must NOT create a tool_call node. Only the full
+    // event reaches the sink, so one tool call yields one node.
+    const allocator = std.testing.allocator;
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var mock = MockSink.init(allocator);
+    defer mock.deinit();
+    var runner = AgentRunner.init(allocator, mock.sink(), &scb);
+    defer runner.deinit();
+
+    // Streaming preview: must not reach the sink.
+    runner.handleAgentEvent(.{ .tool_start = .{ .name = try allocator.dupe(u8, "bash") } }, allocator);
+    try std.testing.expectEqual(@as(usize, 0), mock.events.items.len);
+
+    // Full pre-execution event: exactly one tool_use sink event.
+    runner.handleAgentEvent(.{ .tool_start = .{
+        .name = try allocator.dupe(u8, "bash"),
+        .call_id = try allocator.dupe(u8, "bash:0"),
+        .input_raw = try allocator.dupe(u8, "{\"command\":\"echo hi\"}"),
+    } }, allocator);
+    try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
+    try std.testing.expect(mock.events.items[0] == .tool_use);
+}
+
 test "handleAgentEvent forwards compaction_summary_delta and compaction_event to the sink" {
     // Renderer plumbing: the agent loop pushes both variants onto the
     // queue; AgentRunner forwards them to the sink so a UI renderer
@@ -1438,8 +1478,12 @@ test "tool_start after thinking_delta emits both sink events in order" {
         .text = try allocator.dupe(u8, "plan"),
         .provider = .anthropic,
     } }, allocator);
+    // A full pre-execution tool_start (with call_id) is the node-bearing
+    // event; a name-only preview is intentionally suppressed elsewhere.
     runner.handleAgentEvent(.{ .tool_start = .{
         .name = try allocator.dupe(u8, "bash"),
+        .call_id = try allocator.dupe(u8, "bash:0"),
+        .input_raw = try allocator.dupe(u8, "{}"),
     } }, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
