@@ -440,8 +440,13 @@ fn collectVisibleLines(
     const node_lines = renderer.lineCountForNode(node, registry);
 
     // Gutter decoration context, fixed for this node across all its lines.
+    // User-message rows are marked by the full-width `user_message_bar`
+    // background applied via `row_style` below. The `\u{203A}` glyph the
+    // Gutter would otherwise prepend duplicates the live prompt's glyph
+    // and reads as a stacked prompt when the two rows sit adjacent.
+    // The Gutter still owns `.user` for any future caller that wants
+    // the depth-0 glyph back; we just stop selecting it here.
     const marker: Gutter.Marker = switch (node.node_type) {
-        .user_message => .user,
         .tool_call => .tool_call,
         else => .none,
     };
@@ -2003,8 +2008,9 @@ test "getVisibleLines returns rendered lines" {
     try std.testing.expect(lines.items.len >= 2);
     const line0 = try lines.items[0].toText(allocator);
     defer allocator.free(line0);
-    // A root user_message gains the `\u{203A} ` marker gutter prefix.
-    try std.testing.expectEqualStrings("\u{203A} hello", line0);
+    // The user_message row carries a blank two-cell gutter pad; the
+    // user_message_bar background marks the row instead of a glyph.
+    try std.testing.expectEqualStrings("  hello", line0);
 }
 
 test "row_styles round trip: set, render, clear" {
@@ -2104,11 +2110,11 @@ test "getVisibleLines with range skips off-screen nodes" {
 
     const text0 = try lines.items[0].toText(allocator);
     defer allocator.free(text0);
-    try std.testing.expectEqualStrings("\u{203A} line1", text0);
+    try std.testing.expectEqualStrings("  line1", text0);
 
     const text1 = try lines.items[1].toText(allocator);
     defer allocator.free(text1);
-    try std.testing.expectEqualStrings("\u{203A} line2", text1);
+    try std.testing.expectEqualStrings("  line2", text1);
 }
 
 test "buffer interface returns line count" {
@@ -2181,7 +2187,7 @@ test "getVisibleLines reflects new content after appendToNode" {
 
     const text = try lines2.items[0].toText(allocator);
     defer allocator.free(text);
-    try std.testing.expectEqualStrings("\u{203A} hello world", text);
+    try std.testing.expectEqualStrings("  hello world", text);
 }
 
 test "getVisibleLines reflects new nodes after appendNode" {
@@ -3823,6 +3829,86 @@ test "getWindow matches defaultGetWindow across widths and scroll offsets" {
     }
 }
 
+test "consecutive sibling tool_calls have a turn_gap row between them" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    // Two sibling tool_calls at root, no children, no thinking
+    // between. `appendToolCallNode` already dupes the tool name into
+    // `custom_tag` and `Node.deinit` frees it, so the test does not
+    // touch that field itself.
+    _ = try cb.appendToolCallNode(null, "Bash", null, null);
+    _ = try cb.appendToolCallNode(null, "Bash", null, null);
+
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 16);
+
+    // Expect: [tool_1, gap, tool_2] = at least 3 lines, with the
+    // middle one having empty spans.
+    try std.testing.expect(lines.items.len >= 3);
+    var saw_gap = false;
+    for (lines.items[1 .. lines.items.len - 1]) |line| {
+        if (line.spans.len == 0) {
+            saw_gap = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_gap);
+}
+
+test "turn_gap row carries null row_style even when adjacent to user_message" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+    // Two root siblings: thinking, then user_message. Expect one gap
+    // row in between with null row_style.
+    _ = try cb.appendNode(null, .thinking, "ponder");
+    _ = try cb.appendNode(null, .user_message, "hello");
+
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 16);
+
+    // Find the gap row: the first line whose spans are empty OR whose
+    // text content is whitespace-only and not part of either node.
+    var saw_gap = false;
+    for (lines.items) |line| {
+        if (line.spans.len == 0) {
+            try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), line.row_style);
+            saw_gap = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_gap);
+}
+
+test "decorate emits a blank gutter on user_message rows" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "hello");
+
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 8);
+
+    try std.testing.expect(lines.items.len >= 1);
+    const first = lines.items[0];
+    try std.testing.expect(first.spans.len >= 1);
+    // The gutter span is spans[0]. With the fix, it must be the blank
+    // two-cell pad, NOT the "\u{203A} " user_marker.
+    const gutter_text = first.spans[0].text;
+    try std.testing.expectEqualStrings("  ", gutter_text);
+    // The user_message_bar background MUST still be applied so the
+    // row reads as a user message via background contrast alone.
+    try std.testing.expectEqual(@as(?Theme.HighlightSlot, .user_message_bar), first.row_style);
+}
+
 test "getVisibleLines decorates user message with bar and marker" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 0, "test");
@@ -3833,9 +3919,10 @@ test "getVisibleLines decorates user message with bar and marker" {
     defer frame_arena.deinit();
     const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 100);
     try std.testing.expect(lines.items.len >= 1);
-    // First span is the `\u{203A} ` user marker gutter; the row carries the
-    // user_message_bar background slot.
-    try std.testing.expectEqualStrings("\u{203A} ", lines.items[0].spans[0].text);
+    // First span is the blank two-cell gutter pad; the row carries the
+    // user_message_bar background slot, which is what marks it as a
+    // user message now that the `\u{203A}` glyph is gone.
+    try std.testing.expectEqualStrings("  ", lines.items[0].spans[0].text);
     try std.testing.expectEqual(Theme.HighlightSlot.user_message_bar, lines.items[0].row_style.?);
 }
 

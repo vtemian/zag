@@ -1239,10 +1239,13 @@ test "composite writes buffer content at leaf rect with padding" {
 
     const pad_h = theme.spacing.padding_h;
     // Frame shifts content by +1 row / +1 col; content row is 1, content col is 1 + pad_h.
-    // A root user_message now carries a 2-col `\u{203A} ` marker gutter applied
-    // at frame time by Conversation.collectVisibleLines, so the content text
-    // starts two columns to the right of the gutter.
-    try std.testing.expectEqual(@as(u21, 0x203A), screen.getCellConst(1, 1 + pad_h).codepoint);
+    // A root user_message carries a blank 2-col gutter pad applied at frame
+    // time by Conversation.collectVisibleLines (the `\u{203A}` glyph was
+    // dropped so the live prompt does not read as a stacked transcript
+    // prompt); the content text still starts two columns to the right of
+    // that pad.
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 1 + pad_h).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(1, 1 + pad_h + 1).codepoint);
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 1 + pad_h + 2).codepoint);
     try std.testing.expectEqual(@as(u21, 'e'), screen.getCellConst(1, 1 + pad_h + 3).codepoint);
     try std.testing.expectEqual(@as(u21, 'l'), screen.getCellConst(1, 1 + pad_h + 4).codepoint);
