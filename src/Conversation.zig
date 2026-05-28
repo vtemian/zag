@@ -3829,6 +3829,36 @@ test "getWindow matches defaultGetWindow across widths and scroll offsets" {
     }
 }
 
+test "consecutive sibling tool_calls have a turn_gap row between them" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    // Two sibling tool_calls at root, no children, no thinking
+    // between. `appendToolCallNode` already dupes the tool name into
+    // `custom_tag` and `Node.deinit` frees it, so the test does not
+    // touch that field itself.
+    _ = try cb.appendToolCallNode(null, "Bash", null, null);
+    _ = try cb.appendToolCallNode(null, "Bash", null, null);
+
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 16);
+
+    // Expect: [tool_1, gap, tool_2] = at least 3 lines, with the
+    // middle one having empty spans.
+    try std.testing.expect(lines.items.len >= 3);
+    var saw_gap = false;
+    for (lines.items[1 .. lines.items.len - 1]) |line| {
+        if (line.spans.len == 0) {
+            saw_gap = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_gap);
+}
+
 test "turn_gap row carries null row_style even when adjacent to user_message" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 1, "test");
