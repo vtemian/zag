@@ -311,6 +311,18 @@ pub fn main() !void {
         break :blk null;
     };
 
+    // Register the real cwd in the global project registry so the
+    // sessions sidebar can aggregate runs across every project zag has
+    // been launched in. Done here (and not inside `SessionManager.init`)
+    // because tests run inside throwaway tmpdir cwds and previously
+    // poured tmpdir paths into the user's real registry.
+    if (session_mgr != null) {
+        Session.recordCwdInRegistry(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => log.warn("project_registry update skipped: {s}", .{@errorName(err)}),
+        };
+    }
+
     var resolved_last_id: ?[]const u8 = null;
     defer if (resolved_last_id) |id| allocator.free(id);
 

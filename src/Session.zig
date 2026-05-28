@@ -216,12 +216,23 @@ pub const Meta = struct {
 /// (HOME plus `.config/zag`) so the sidebar agrees with auth.json on
 /// where the per-user config directory lives.
 ///
+/// Production-only: `main.zig` and `Harness.zig` call this on real-zag
+/// startup. `SessionManager.init` deliberately does NOT, because
+/// register-on-init plus test fixtures that swap cwd into a tmpdir was
+/// silently writing throwaway tmpdir paths into the user's real
+/// `~/.config/zag/projects.json` (every `zig build test` run added one
+/// entry per session-using test; pollution accumulated until the sidebar
+/// was probing 7000+ phantom projects per render, causing multi-second
+/// input lag). Tests that DO need the registration step (see
+/// `SessionManager.init records cwd in the global project registry`)
+/// call it explicitly after pointing `HOME` at a per-test directory.
+///
 /// The cwd is canonicalized with `realpath` before insertion so the same
 /// project reached via a symlink alias or with a trailing slash collapses
 /// to a single registry entry; if realpath fails (e.g. the cwd was
 /// removed between getCwdAlloc and realpathAlloc, rare but possible) the
 /// raw cwd string is used as a fallback rather than abandoning the call.
-fn recordCwdInRegistry(allocator: Allocator) !void {
+pub fn recordCwdInRegistry(allocator: Allocator) !void {
     const home = try std.process.getEnvVarOwned(allocator, "HOME");
     defer allocator.free(home);
 
@@ -246,21 +257,19 @@ pub const SessionManager = struct {
     allocator: Allocator,
 
     /// Create a SessionManager. Ensures the sessions directory exists.
+    ///
+    /// Does NOT touch the global project registry. Production startup
+    /// (`main.zig`, `Harness.zig`) calls `Session.recordCwdInRegistry`
+    /// explicitly so the sidebar can aggregate sessions across every
+    /// real project zag has been launched in; tests that operate inside
+    /// `std.testing.tmpDir` cwd skip the registration so they don't
+    /// silently write tmpdir paths into the user's real
+    /// `~/.config/zag/projects.json`.
     pub fn init(allocator: Allocator) !SessionManager {
         const cwd = std.fs.cwd();
         cwd.makePath(sessions_dir) catch |e| {
             log.err("failed to create sessions dir: {}", .{e});
             return e;
-        };
-
-        // Best-effort: record this cwd in the global project registry so
-        // the sessions sidebar can aggregate runs across every project
-        // zag has ever been launched in. A bad HOME, missing config dir,
-        // permission denied, or a malformed registry must not prevent
-        // session bring-up: log and continue.
-        recordCwdInRegistry(allocator) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            else => log.warn("project_registry update skipped: {s}", .{@errorName(e)}),
         };
 
         return .{ .allocator = allocator };
@@ -3039,7 +3048,14 @@ test "SessionManager.deleteSession rejects ids that try to escape the sessions d
     try std.testing.expectError(error.InvalidSessionId, mgr.deleteSession(""));
 }
 
-test "SessionManager.init records cwd in the global project registry" {
+test "recordCwdInRegistry persists the canonicalized cwd" {
+    // Production startup (`main.zig`, `Harness.zig`) calls this
+    // explicitly so the sessions sidebar can aggregate runs across
+    // every project zag has been launched in. Tests must opt in by
+    // setting HOME to a per-test directory; otherwise they would
+    // silently scribble tmpdir paths into the user's real registry,
+    // which is exactly the regression that motivated splitting this
+    // call out of `SessionManager.init`.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -3050,10 +3066,6 @@ test "SessionManager.init records cwd in the global project registry" {
     try tmp.dir.setAsCwd();
     defer restoreCwd(orig_cwd);
 
-    // Point the registry at a per-test home. SessionManager.init resolves
-    // the registry path as `$HOME/.config/zag/projects.json`, so swapping
-    // HOME for the duration of the test isolates the registry from the
-    // developer's real ~/.config/zag and from other tests.
     const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(fake_home);
 
@@ -3063,8 +3075,7 @@ test "SessionManager.init records cwd in the global project registry" {
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
 
-    var mgr = try SessionManager.init(allocator);
-    _ = &mgr;
+    try recordCwdInRegistry(allocator);
 
     // The registry file must exist at the expected path and contain the
     // realpath'd cwd we just chdir'd into.
@@ -3081,11 +3092,51 @@ test "SessionManager.init records cwd in the global project registry" {
     try std.testing.expect(std.mem.indexOf(u8, data, fake_home) != null);
 }
 
+test "SessionManager.init leaves the global registry alone" {
+    // The opposite-direction contract: a plain `SessionManager.init`
+    // must NOT write anything into `$HOME/.config/zag/`. This is the
+    // invariant that lets the 30+ session tests run safely without
+    // each one having to remember to override HOME.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try SessionManager.init(allocator);
+    _ = &mgr;
+
+    // No `$HOME/.config/zag` should have been created. The tmp dir
+    // doubles as fake_home, so we look for the `.config` subtree.
+    const probe = std.fs.cwd().openDir(".config", .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    var dir = probe;
+    defer dir.close();
+    try std.testing.expect(false); // reached only if .config was created
+}
+
 test "SessionManager.init succeeds when HOME is unset" {
-    // A missing HOME must not prevent SessionManager.init from
-    // succeeding: the sidebar feature is best effort, session creation
-    // is not. The registry call hits error.EnvironmentVariableNotFound
-    // and is swallowed.
+    // Init must succeed even with no HOME. With the registry write
+    // moved out of init, HOME isn't read at all here, but the test
+    // stays as a regression guard: a future re-introduction of
+    // env-var reads inside init would break the no-HOME headless case
+    // (the harness can run in environments where HOME is intentionally
+    // stripped, e.g. some CI sandboxes).
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

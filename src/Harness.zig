@@ -414,6 +414,18 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     else
         null;
 
+    // Production-only registry write (paired with `main.zig`'s call).
+    // Keeps the harness from writing to `~/.config/zag/projects.json`
+    // when run with `--no-session`, and keeps `SessionManager.init`
+    // itself out of the registry-write business so tests that swap cwd
+    // into a tmpdir don't silently pollute the real registry.
+    if (session_mgr != null) {
+        Session.recordCwdInRegistry(gpa) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => log.warn("project_registry update skipped: {s}", .{@errorName(err)}),
+        };
+    }
+
     var session_handle = if (session_mgr) |*mgr| mgr.loadOrCreate(null, provider.model_id) else null;
     defer if (session_handle) |*sh| sh.close();
 
