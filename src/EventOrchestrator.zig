@@ -99,6 +99,14 @@ window_manager: WindowManager = undefined,
 /// thread each tick so subagent Lua round-trips never touch the VM off-thread.
 child_runner_registry: ChildRunnerRegistry = undefined,
 
+/// Last whole-second value rendered into the working line. Used by the
+/// heartbeat path in `tick` to force a composite when the displayed
+/// second would change even though no pane mutated. `null` when no
+/// working-line render has happened yet, or when no agent is running
+/// (reset on transition to idle so the next agent start prints a fresh
+/// second instead of comparing against stale state).
+last_rendered_working_secs: ?u64 = null,
+
 // -- Construction ------------------------------------------------------------
 
 /// Initial configuration, bundled so init() has a sane call site. Each
@@ -339,7 +347,14 @@ fn tick(
     // on the next syscall in this tick. Logging every EINTR would spam the
     // status log on every terminal resize.
     const parser = self.window_manager.inputParser();
-    const poll_timeout: i32 = parser.pollTimeoutMs(std.time.milliTimestamp()) orelse -1;
+    // Heartbeat: while any AgentRunner is alive, cap the poll wait at
+    // 250 ms so the working-line counter and any other time-driven UI
+    // ticks at 4 Hz even when events are silent or filtered. When
+    // nothing is running, fall back to the parser's escape-timeout (or
+    // -1 = block forever) so idle CPU stays at zero.
+    const parser_timeout = parser.pollTimeoutMs(std.time.milliTimestamp());
+    const heartbeat_ms: ?i32 = if (self.anyAgentRunning()) 250 else null;
+    const poll_timeout = pollTimeoutWithHeartbeat(parser_timeout, heartbeat_ms);
     _ = posix.poll(&fds, poll_timeout) catch {};
 
     // Time the rest of the tick so a multi-second main-thread blockage
@@ -458,13 +473,34 @@ fn tick(
     // Floats live in `extra_floats`, a sibling of `extra_panes`; a
     // plugin that mutates a float's buffer between user events must
     // trigger a redraw the same way a tile does.
+    // Read focused-runner state once, before the dirty check, so the
+    // same elapsed_ms feeds both the heartbeat decision and the
+    // composite call below. These calls are cheap (one optional deref
+    // + one std.time.milliTimestamp at most) so paying for them on the
+    // skipped-frame path is negligible.
+    const focused = self.window_manager.getFocusedPane();
+    const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
+    const elapsed_ms: u64 = if (focused.runner) |r| r.elapsedMs() else 0;
+    const output_tokens: u32 = if (focused.runner) |r| r.outputTokens() else 0;
+
+    // The working line's displayed second has changed since the last
+    // render. Force a composite even if no pane is otherwise dirty so
+    // the counter advances during silent waits.
+    const current_secs: u64 = elapsed_ms / 1000;
+    const time_dirty = agent_running and (self.last_rendered_working_secs == null or
+        self.last_rendered_working_secs.? != current_secs);
+
     const any_dirty = self.anyPaneDirty();
-
-    // Skip composite+render when nothing visual changed
     const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
-        (maybe_event != null and maybe_event.? != .mouse);
+        (maybe_event != null and maybe_event.? != .mouse) or time_dirty;
 
-    if (!frame_dirty) return;
+    if (!frame_dirty) {
+        // Reset the tracker on the idle path so the next agent run
+        // doesn't compare against a stale second from the previous
+        // turn. No-op when already null.
+        if (!agent_running) self.last_rendered_working_secs = null;
+        return;
+    }
 
     trace.frameStart();
     var frame_span = trace.span("frame");
@@ -473,16 +509,12 @@ fn tick(
         trace.frameEnd();
     }
 
-    const focused = self.window_manager.getFocusedPane();
-    // A scratch-focused pane has no runner; running state defaults to false.
-    const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
-    const elapsed_ms: u64 = if (focused.runner) |r| r.elapsedMs() else 0;
-    const output_tokens: u32 = if (focused.runner) |r| r.outputTokens() else 0;
     // Only transient status toasts (split announces) reach the prompt row;
     // running state is shown by the working line above the prompt.
     const status = if (self.window_manager.transient_status_len > 0)
         self.window_manager.transient_status[0..self.window_manager.transient_status_len]
-    else "";
+    else
+        "";
     var leaves_buf: [max_visible_leaves]*Layout.LayoutNode = undefined;
     var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
     var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
@@ -505,12 +537,17 @@ fn tick(
         .elapsed_ms = elapsed_ms,
         .output_tokens = output_tokens,
     });
+    var rendered_to_terminal = true;
     self.screen.render(self.stdout_file) catch |err| switch (err) {
         // Backpressure on the terminal fd: frame is dropped, the next
-        // tick will redraw from scratch.
-        error.WriteTimeout => {},
+        // tick will redraw from scratch. Leave last_rendered_working_secs
+        // unchanged so the heartbeat re-fires on the next tick.
+        error.WriteTimeout => rendered_to_terminal = false,
         else => return err,
     };
+    if (rendered_to_terminal) {
+        self.last_rendered_working_secs = if (agent_running) current_secs else null;
+    }
 }
 
 /// Stack-allocated cap for the visible-leaves buffer used per frame to
