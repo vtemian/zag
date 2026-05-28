@@ -62,6 +62,7 @@ pub const HighlightSlot = enum {
     err,
     warning,
     user_message_bar,
+    sidebar_current_session,
 };
 
 /// Parse a slot name as a string. Returns null for unknown names so
@@ -72,6 +73,7 @@ pub fn parseHighlightSlot(s: []const u8) ?HighlightSlot {
     if (std.mem.eql(u8, s, "current_line")) return .current_line;
     if (std.mem.eql(u8, s, "error")) return .err;
     if (std.mem.eql(u8, s, "warning")) return .warning;
+    if (std.mem.eql(u8, s, "sidebar_current_session")) return .sidebar_current_session;
     return null;
 }
 
@@ -86,6 +88,7 @@ pub fn resolveSlot(slot: HighlightSlot, theme: *const Theme) CellStyle {
         .err => theme.highlights.err,
         .warning => theme.highlights.warning,
         .user_message_bar => theme.highlights.user_message_bar,
+        .sidebar_current_session => theme.highlights.sidebar_current_session,
     };
 }
 
@@ -182,6 +185,13 @@ pub const Highlights = struct {
     working_line: CellStyle,
     /// Footer marker and hints on the bottom status row.
     footer: CellStyle,
+    /// Row background for the session in the sidebar that is bound to
+    /// the focused (or last-focused, when the sidebar itself is
+    /// focused) conversation pane. Defaults to a muted dark-green tint
+    /// so the active row reads as "this is what you're looking at"
+    /// without overpowering the cursor's `selection` highlight when
+    /// the two overlap.
+    sidebar_current_session: CellStyle,
 };
 
 /// Spacing tokens controlling vertical and horizontal gaps in the UI.
@@ -357,6 +367,12 @@ pub fn defaultTheme() Theme {
     // Cursorline background: a step above the default surface, distinct
     // from selection so both can coexist on the same row visually.
     const current_line_bg = Screen.Color{ .rgb = .{ .r = 30, .g = 33, .b = 44 } };
+    // Sidebar "this is the active session" background: muted dark
+    // green, dim enough that the default fg text reads against it but
+    // clearly distinct from the panel surface. Distinct from
+    // `selection_bg` so a cursor that lands on the active row reads as
+    // selection-on-active rather than the two collapsing visually.
+    const sidebar_current_bg = Screen.Color{ .rgb = .{ .r = 36, .g = 64, .b = 38 } };
 
     return .{
         .colors = .{
@@ -411,6 +427,7 @@ pub fn defaultTheme() Theme {
             .tree_connector = .{ .fg = dim },
             .working_line = .{ .fg = accent },
             .footer = .{ .fg = muted },
+            .sidebar_current_session = .{ .bg = sidebar_current_bg, .bold = true },
         },
         .spacing = .{
             .turn_gap = 1,

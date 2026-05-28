@@ -853,17 +853,24 @@ function M._collect_rows()
     return rows
 end
 
--- Resolve which session id (if any) is bound to the focused
--- conversation pane right now. Returns nil when:
+-- Resolve which session id (if any) the user is currently looking at.
+-- The marker has to keep working WHEN the sidebar itself is focused
+-- (the common case: user opens C-e to switch sessions, then navigates
+-- the list); the focused pane is the sidebar's scratch buffer and has
+-- no session, so we fall back to `state.host_pane`, which captures the
+-- pane that was focused at open() time. After an activate-replace, a
+-- fresh open() resnapshots the host_pane to the now-only conversation
+-- leaf, so the highlight tracks the visible session correctly across
+-- session swaps too.
+--
+-- Returns nil when:
 --   * No window manager is attached (headless tests; `zag.layout.tree`
 --     raises); the pcall keeps us silent rather than erroring the
 --     render path.
---   * The focused pane IS the sidebar itself. The sidebar shows a
---     scratch buffer, not a session, so highlighting its own row as
---     "current" would be meaningless.
---   * The focused pane has no conversation/session_handle (scratch
---     buffer, model picker, etc.); `zag.pane.session_id` returns nil
---     in that case.
+--   * Neither focus nor host_pane resolves to a session-bound pane
+--     (initial bringup before any conversation pane exists, scratch
+--     buffer focused, model picker, etc.). `zag.pane.session_id`
+--     returns nil in that case.
 --
 -- `state.current_session_id` is a test-only override (set by
 -- `_set_current_for_test`) that bypasses the tree lookup so headless
@@ -874,9 +881,18 @@ local function _resolve_current_session_id()
         return state.current_session_id
     end
     local ok, tree = pcall(zag.layout.tree)
-    if not ok or not tree or not tree.focus then return nil end
-    if tree.focus == state.pane_id then return nil end
-    local sid_ok, sid = pcall(zag.pane.session_id, tree.focus)
+    if not ok or not tree then return nil end
+
+    -- Prefer the focused leaf when it isn't the sidebar itself.
+    local target = nil
+    if tree.focus and tree.focus ~= state.pane_id then
+        target = tree.focus
+    elseif state.host_pane and state.host_pane ~= state.pane_id then
+        target = state.host_pane
+    end
+    if not target then return nil end
+
+    local sid_ok, sid = pcall(zag.pane.session_id, target)
     if not sid_ok then return nil end
     return sid
 end
@@ -950,12 +966,13 @@ function M._render()
 
     -- Paint the current-session highlight FIRST so the cursor's
     -- `selection` style wins on overlap (the row painted last takes
-    -- precedence in the row-style override path). `current_line` is
-    -- distinct from `selection` in the default theme (different bg)
-    -- and is the cursorline equivalent in src/Theme.zig HighlightSlot.
+    -- precedence in the row-style override path). `sidebar_current_session`
+    -- is a dedicated green-tinted background defined in src/Theme.zig
+    -- so the active row is clearly distinct from the panel surface and
+    -- from the cursor's selection highlight.
     for i, r in ipairs(rows) do
         if r.is_current then
-            zag.buffer.set_row_style(state.buffer_id, i + cursor_offset, "current_line")
+            zag.buffer.set_row_style(state.buffer_id, i + cursor_offset, "sidebar_current_session")
         end
     end
 
