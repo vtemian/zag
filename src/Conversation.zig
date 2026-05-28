@@ -3903,4 +3903,3 @@ test "gutter-reduced wrapping width keeps rowPlan and getWindow consistent" {
     const logical = try cb.lineCount();
     try std.testing.expect(got.total_rows > @as(u32, @intCast(logical)));
 }
-
