@@ -712,19 +712,22 @@ end
 
 -- Sidebar row layout for sessions:
 --
---     "{cursor}{glyph} {date} {name}"
---      ^^      ^      ^      ^
---      |      ▸/▾    relative age (2-4 cells, padded to 3) - " 2h"
---      |             auto-derived from `s.updated_ms`, fixed-width
---      |             so names stay column-aligned across rows.
+--     "{glyph} {date} {name}"
+--      ^      ^      ^
+--      |     relative age (2-4 cells, padded to 3) - " 2h"
+--      |     auto-derived from `s.updated_ms`, fixed-width so names
+--      |     stay column-aligned across rows.
 --      |
---     "  " for normal rows / "● " for the row whose session is bound
---     to the focused conversation pane. Added by `_render`, not here.
+--     ▸/▾ expand-state chevron. The active-session bullet (`● `) and
+--     the leading 2-space cursor pad were removed when the green
+--     `sidebar_current_session` row background became the active
+--     marker; the row no longer needs a textual prefix to read as
+--     "this is the one you're looking at".
 --
 -- Total width budget in an N-cell panel:
---     2 (cursor) + 2 (glyph + space) + 3 (date col) + 1 (gap) + name
---     = name budget is N - 8. The ellipsis costs one cell, so the
---     truncation byte cap is (N - 8) - 1. Names of exactly (N - 8)
+--     2 (glyph + space) + 3 (date col) + 1 (gap) + name
+--     = name budget is N - 6. The ellipsis costs one cell, so the
+--     truncation byte cap is (N - 6) - 1. Names of exactly (N - 6)
 --     bytes still fit intact because the cap only kicks in when
 --     truncation would happen.
 --
@@ -732,7 +735,7 @@ end
 -- (see `_filter_printables`) and the on-disk deriver lands names at
 -- 32 bytes worst-case using word-boundary rewind, so byte truncation
 -- can never land mid-codepoint.
-local PREFIX_CELLS = 8 -- cursor(2) + glyph(2) + date(3) + gap(1)
+local PREFIX_CELLS = 6 -- glyph(2) + date(3) + gap(1)
 local LABEL_MAX_CELLS = SIDEBAR_TARGET_CELLS - PREFIX_CELLS
 local TRUNCATED_NAME_BYTES = LABEL_MAX_CELLS - 1
 local DATE_COL_WIDTH = 3
@@ -907,36 +910,27 @@ function M._render()
     local rows = M._collect_rows()
     state.last_render = rows
 
-    -- Compute the "current" session id once per render and tag matching
-    -- session rows with the ●/space marker glyph. The glyph survives
-    -- theme swaps and reads correctly even when the second style fails
-    -- to paint (e.g. a theme that overrides `current_line` to invisible).
-    -- Belt-and-suspenders per the plan: glyph + style.
+    -- Compute the "current" session id once per render and tag the
+    -- matching row with `is_current`. The marker is drawn purely via
+    -- the `sidebar_current_session` row background defined in
+    -- `src/Theme.zig`; the textual `● ` bullet and the leading
+    -- 2-space cursor pad that previously prefixed every row were
+    -- dropped now that the green highlight reads clearly on its own.
     local current_id = _resolve_current_session_id()
     local rename_target = state.mode == "rename" and state.rename_target or nil
     for _, r in ipairs(rows) do
         -- Rename overlay: replace the target session row's label with
         -- the in-progress buffer plus a `_` cursor marker. Sibling
-        -- session rows continue to render normally. We do this BEFORE
-        -- the current-session prefix so the rename text is what the
-        -- user sees as the edit target, while the marker prefix still
-        -- communicates "this is the active session".
+        -- session rows continue to render normally.
         if rename_target ~= nil
             and r.kind == "session"
             and r.session_id == rename_target.session_id
         then
             r.label = "[" .. state.rename_buf .. "_]"
         end
-        if r.kind == "session" and current_id ~= nil and r.session_id == current_id then
-            r.is_current = true
-            r.label = "● " .. r.label
-        else
-            r.is_current = false
-            -- Preserve column alignment for non-current rows so the
-            -- session name stays in the same screen column regardless
-            -- of whether any row is the current one.
-            r.label = "  " .. r.label
-        end
+        r.is_current = r.kind == "session"
+            and current_id ~= nil
+            and r.session_id == current_id
     end
 
     local lines = {}

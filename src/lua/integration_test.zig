@@ -1221,18 +1221,20 @@ test "sessions sidebar marks the current-session row with a glyph" {
         \\for _, r in ipairs(rows) do
         \\    assert(r.is_current == false,
         \\           "row " .. tostring(r.session_id) .. " should not be current")
-        \\    assert(r.label:sub(1, 2) == "  ",
-        \\           "row label should start with two spaces: " .. tostring(r.label))
-        \\end
-        \\local lines = zag.buffer.get_lines(buf)
-        \\for _, line in ipairs(lines) do
-        \\    assert(line:sub(1, 3) ~= "● ",
-        \\           "no row should carry the ● marker without a current id")
+        \\    -- The textual `● ` bullet and the 2-space cursor pad
+        \\    -- were removed when the green row-bg became the active
+        \\    -- marker. Every row now starts at the `▸ ` glyph.
+        \\    -- `▸` / `▾` are each 3 UTF-8 bytes (U+25B8 / U+25BE).
+        \\    local head = r.label:sub(1, 3)
+        \\    assert(head == "▸" or head == "▾",
+        \\           "row label should start with the expand glyph: " .. tostring(r.label))
         \\end
     );
 
-    // Force the current-session override to `id_b`. The "beta" row
-    // should now carry the marker; "alpha" should not.
+    // Force the current-session override to `id_b`. Only the `beta`
+    // row should be flagged `is_current`; the green row background is
+    // applied by `set_row_style`, which the Lua-level state can't see,
+    // so the contract here is the flag plus the unique-marker invariant.
     const script = try std.fmt.allocPrintSentinel(allocator,
         \\local sidebar = require("zag.builtin.sessions")
         \\sidebar._set_current_for_test("{s}")
@@ -1252,15 +1254,7 @@ test "sessions sidebar marks the current-session row with a glyph" {
         \\assert(marked ~= nil, "no row marked current")
         \\assert(marked.session_id == "{s}",
         \\       "wrong row marked current: " .. tostring(marked.session_id))
-        \\assert(marked.label:sub(1, 4) == "● ",
-        \\       "current row label should start with ● : " .. tostring(marked.label))
         \\assert(unmarked_count >= 1, "expected at least one non-current row")
-        \\local lines = zag.buffer.get_lines(_G._sidebar_buf)
-        \\local found = false
-        \\for _, line in ipairs(lines) do
-        \\    if line:sub(1, 4) == "● " then found = true end
-        \\end
-        \\assert(found, "rendered buffer should contain a ● line")
     , .{ id_b, id_b }, 0);
     defer allocator.free(script);
     try runLua(&engine, script);
@@ -1342,18 +1336,19 @@ test "sessions sidebar truncates long labels with ellipsis" {
         \\assert(short_row ~= nil, "short row missing")
         \\assert(long_row ~= nil, "long row missing")
         \\
-        \\-- Short label fits intact: cursor (2) + glyph+space (2) +
-        \\-- date col padded to 3 ('now') + 1 space + name.
-        \\assert(short_row.label == "  ▸ now alpha",
+        \\-- Short label fits intact: glyph+space (2) + date col padded
+        \\-- to 3 ('now') + 1 space + name. No leading cursor pad
+        \\-- since the green row-bg is the active marker.
+        \\assert(short_row.label == "▸ now alpha",
         \\       "short label unexpected: " .. tostring(short_row.label))
         \\
-        \\-- Long label truncates the name to the first 31 bytes plus
+        \\-- Long label truncates the name to the first 33 bytes plus
         \\-- a single '…' codepoint; the prefix layout matches the
-        \\-- short-label row. 31 + 1 ellipsis cell + 8-cell prefix
-        \\-- (cursor + glyph + date + gap) lands at exactly 40 cells,
-        \\-- the sidebar's target panel width.
-        \\local want = "  ▸ now "
-        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 31)
+        \\-- short-label row. 33 + 1 ellipsis cell + 6-cell prefix
+        \\-- (glyph + date + gap) lands at exactly 40 cells, the
+        \\-- sidebar's target panel width.
+        \\local want = "▸ now "
+        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 33)
         \\    .. "…"
         \\assert(long_row.label == want,
         \\       "long label unexpected:\n  got " .. tostring(long_row.label)
