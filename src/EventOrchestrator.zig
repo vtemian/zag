@@ -696,6 +696,12 @@ fn collectLeafDrafts(
             .split => continue,
         };
         const pane = self.window_manager.paneFromBufferPtr(leaf_ptr.buffer) orelse continue;
+        // Scratch-backed panes (sessions sidebar, future tree views) have
+        // no Conversation and therefore no prompt to draft into. Skipping
+        // them here also tells the compositor not to reserve a prompt row
+        // for those leaves (see `leafHasPrompt` in `Compositor.zig`), so
+        // the sidebar uses its full interior height.
+        if (pane.conversation == null) continue;
         const draft = pane.getDraft();
         drafts_buf[count] = .{ .leaf = leaf_ptr, .draft = draft, .draft_cursor = draft.len };
         count += 1;

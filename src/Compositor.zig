@@ -181,7 +181,7 @@ pub fn composite(
         {
             var s = trace.span("leaves");
             defer s.end();
-            self.drawAllLeaves(root);
+            self.drawAllLeaves(root, leaf_drafts);
         }
         {
             var s = trace.span("frames");
@@ -194,7 +194,7 @@ pub fn composite(
         {
             var s = trace.span("leaves");
             defer s.end();
-            self.drawDirtyLeaves(root);
+            self.drawDirtyLeaves(root, leaf_drafts);
         }
     }
 
@@ -262,33 +262,47 @@ fn recordFloatRects(self: *Compositor, float_drafts: []const FloatDraft) void {
     self.prev_float_count = n;
 }
 
+/// True when this leaf carries a Conversation prompt (and therefore
+/// gets a reserved prompt row at the bottom). Scratch-backed leaves
+/// like the sessions sidebar are absent from `leaf_drafts` per
+/// `EventOrchestrator.collectLeafDrafts`; that absence is the cue to
+/// give them their full interior height.
+fn leafHasPrompt(leaf_drafts: []const LeafDraft, leaf: *const Layout.LayoutNode.Leaf) bool {
+    for (leaf_drafts) |entry| {
+        if (entry.leaf == leaf) return true;
+    }
+    return false;
+}
+
 /// Draw content for all leaves (used on layout change / full redraw).
-fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
+fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_drafts: []const LeafDraft) void {
     switch (node.*) {
         .leaf => |leaf| {
-            self.drawBufferContent(&leaf);
+            self.drawBufferContent(&leaf, leafHasPrompt(leaf_drafts, &leaf));
             leaf.viewport.clearDirty(leaf.buffer.contentVersion());
             self.syncTreeSnapshot(leaf.buffer);
         },
         .split => |split| {
-            self.drawAllLeaves(split.first);
-            self.drawAllLeaves(split.second);
+            self.drawAllLeaves(split.first, leaf_drafts);
+            self.drawAllLeaves(split.second, leaf_drafts);
         },
     }
 }
 
 /// Draw content only for leaves whose buffer is dirty.
 /// Clears the leaf rect before redrawing to remove stale content.
-fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
+fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_drafts: []const LeafDraft) void {
     switch (node.*) {
         .leaf => |leaf| {
             if (leaf.viewport.isDirty(leaf.buffer.contentVersion())) {
                 // Clear only the interior; the frame survives across
                 // dirty-leaf updates so we don't need to redraw it.
                 // Mirror the prompt-row reservation in drawBufferContent so
-                // content-dirty clears don't wipe the per-pane prompt.
+                // content-dirty clears don't wipe the per-pane prompt
+                // (when one is present).
+                const has_prompt = leafHasPrompt(leaf_drafts, &leaf);
                 if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
-                    const reserve: u16 = if (leaf.rect.height >= 4) 1 else 0;
+                    const reserve: u16 = if (has_prompt and leaf.rect.height >= 4) 1 else 0;
                     self.screen.clearRect(
                         leaf.rect.y + 1,
                         leaf.rect.x + 1,
@@ -296,14 +310,14 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode) void {
                         leaf.rect.height - 2 - reserve,
                     );
                 }
-                self.drawBufferContent(&leaf);
+                self.drawBufferContent(&leaf, has_prompt);
                 leaf.viewport.clearDirty(leaf.buffer.contentVersion());
                 self.syncTreeSnapshot(leaf.buffer);
             }
         },
         .split => |split| {
-            self.drawDirtyLeaves(split.first);
-            self.drawDirtyLeaves(split.second);
+            self.drawDirtyLeaves(split.first, leaf_drafts);
+            self.drawDirtyLeaves(split.second, leaf_drafts);
         },
     }
 }
@@ -343,8 +357,13 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
 /// NodeRenderer, then writes each span into the screen grid with its
 /// resolved style. Shrinks the rect by 1 cell on each side to leave room
 /// for the pane's frame, then applies padding_h/padding_v from the theme.
-fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf) void {
-    self.drawBufferIntoRect(leaf.view, leaf.viewport, leaf.rect, true);
+///
+/// `has_prompt` mirrors the orchestrator's view of the leaf: true for
+/// Conversation-backed panes (one row of the interior is reserved for
+/// the `›` prompt line), false for scratch-backed leaves like the
+/// sessions sidebar (which get the full interior height instead).
+fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, has_prompt: bool) void {
+    self.drawBufferIntoRect(leaf.view, leaf.viewport, leaf.rect, has_prompt);
 }
 
 /// Render `buf` into `outer`, where `outer` is the chrome-inclusive
