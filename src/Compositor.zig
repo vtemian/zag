@@ -181,7 +181,7 @@ pub fn composite(
         {
             var s = trace.span("leaves");
             defer s.end();
-            self.drawAllLeaves(root, leaf_drafts);
+            self.drawAllLeaves(root, leaf_drafts, input.agent_running);
         }
         {
             var s = trace.span("frames");
@@ -194,7 +194,7 @@ pub fn composite(
         {
             var s = trace.span("leaves");
             defer s.end();
-            self.drawDirtyLeaves(root, leaf_drafts);
+            self.drawDirtyLeaves(root, leaf_drafts, input.agent_running);
         }
     }
 
@@ -275,23 +275,28 @@ fn leafHasPrompt(leaf_drafts: []const LeafDraft, leaf: *const Layout.LayoutNode.
 }
 
 /// Draw content for all leaves (used on layout change / full redraw).
-fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_drafts: []const LeafDraft) void {
+fn drawAllLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_drafts: []const LeafDraft, agent_running: bool) void {
     switch (node.*) {
         .leaf => |leaf| {
-            self.drawBufferContent(&leaf, leafHasPrompt(leaf_drafts, &leaf));
+            // Only the focused pane's agent-running state drives the
+            // working-line reservation. Non-focused leaves never paint
+            // a working line (drawPanePrompt gates on `focused`).
+            const has_prompt = leafHasPrompt(leaf_drafts, &leaf);
+            const leaf_running = if (has_prompt) agent_running else false;
+            self.drawBufferContent(&leaf, has_prompt, leaf_running);
             leaf.viewport.clearDirty(leaf.buffer.contentVersion());
             self.syncTreeSnapshot(leaf.buffer);
         },
         .split => |split| {
-            self.drawAllLeaves(split.first, leaf_drafts);
-            self.drawAllLeaves(split.second, leaf_drafts);
+            self.drawAllLeaves(split.first, leaf_drafts, agent_running);
+            self.drawAllLeaves(split.second, leaf_drafts, agent_running);
         },
     }
 }
 
 /// Draw content only for leaves whose buffer is dirty.
 /// Clears the leaf rect before redrawing to remove stale content.
-fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_drafts: []const LeafDraft) void {
+fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_drafts: []const LeafDraft, agent_running: bool) void {
     switch (node.*) {
         .leaf => |leaf| {
             if (leaf.viewport.isDirty(leaf.buffer.contentVersion())) {
@@ -301,8 +306,20 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_draft
                 // content-dirty clears don't wipe the per-pane prompt
                 // (when one is present).
                 const has_prompt = leafHasPrompt(leaf_drafts, &leaf);
+                const leaf_running = if (has_prompt) agent_running else false;
                 if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
-                    const reserve: u16 = if (has_prompt and leaf.rect.height >= 4) 1 else 0;
+                    // Match the reservation math in drawBufferIntoRect:
+                    // 1 row for the prompt + 1 more for the working
+                    // line when agent_running is true and the pane is
+                    // tall enough. Keeps `Screen.clearRect`'s scope
+                    // identical to the rect the content actually paints
+                    // into, otherwise the dirty-leaf path leaks ghost
+                    // cells per `feedback_screen_clear_path_coverage`.
+                    const reserve: u16 = blk: {
+                        if (!has_prompt or leaf.rect.height < 4) break :blk 0;
+                        if (leaf_running and leaf.rect.height >= 5) break :blk 2;
+                        break :blk 1;
+                    };
                     self.screen.clearRect(
                         leaf.rect.y + 1,
                         leaf.rect.x + 1,
@@ -310,14 +327,14 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_draft
                         leaf.rect.height - 2 - reserve,
                     );
                 }
-                self.drawBufferContent(&leaf, has_prompt);
+                self.drawBufferContent(&leaf, has_prompt, leaf_running);
                 leaf.viewport.clearDirty(leaf.buffer.contentVersion());
                 self.syncTreeSnapshot(leaf.buffer);
             }
         },
         .split => |split| {
-            self.drawDirtyLeaves(split.first, leaf_drafts);
-            self.drawDirtyLeaves(split.second, leaf_drafts);
+            self.drawDirtyLeaves(split.first, leaf_drafts, agent_running);
+            self.drawDirtyLeaves(split.second, leaf_drafts, agent_running);
         },
     }
 }
@@ -362,8 +379,8 @@ fn syncTreeSnapshot(self: *Compositor, buf: Buffer) void {
 /// Conversation-backed panes (one row of the interior is reserved for
 /// the `›` prompt line), false for scratch-backed leaves like the
 /// sessions sidebar (which get the full interior height instead).
-fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, has_prompt: bool) void {
-    self.drawBufferIntoRect(leaf.view, leaf.viewport, leaf.rect, has_prompt);
+fn drawBufferContent(self: *Compositor, leaf: *const Layout.LayoutNode.Leaf, has_prompt: bool, agent_running: bool) void {
+    self.drawBufferIntoRect(leaf.view, leaf.viewport, leaf.rect, has_prompt, agent_running);
 }
 
 /// Render `buf` into `outer`, where `outer` is the chrome-inclusive
@@ -377,15 +394,26 @@ fn drawBufferIntoRect(
     viewport: *Viewport,
     outer: Layout.Rect,
     reserve_prompt_row: bool,
+    /// Tightens the reserved region by one extra row when the focused
+    /// pane's agent is running so the `* Working… (Ns)` line drawn by
+    /// `drawPanePrompt` at `prompt_row - 1` lands in its own row
+    /// instead of clobbering the last content row. Mirrors the
+    /// `outer.height >= 5` guard inside `drawPanePrompt`.
+    agent_running: bool,
 ) void {
     if (outer.width < 3 or outer.height < 3) return;
 
-    const reserve_prompt: u16 = if (reserve_prompt_row and outer.height >= 4) 1 else 0;
+    const reserve_prompt_rows: u16 = blk: {
+        if (!reserve_prompt_row) break :blk 0;
+        if (outer.height < 4) break :blk 0;
+        if (agent_running and outer.height >= 5) break :blk 2;
+        break :blk 1;
+    };
     const rect = Layout.Rect{
         .x = outer.x + 1,
         .y = outer.y + 1,
         .width = outer.width - 2,
-        .height = outer.height - 2 - reserve_prompt,
+        .height = outer.height - 2 - reserve_prompt_rows,
     };
 
     // Compute visible window dimensions
@@ -983,7 +1011,7 @@ fn drawFloats(self: *Compositor, float_drafts: []const FloatDraft, input: InputS
         // ignored by Screen.clearRect itself.
         self.screen.clearRect(rect.y, rect.x, rect.width, rect.height);
 
-        self.drawBufferIntoRect(float.view, float.viewport, rect, false);
+        self.drawBufferIntoRect(float.view, float.viewport, rect, false, false);
         self.drawRoundedBox(rect, fd.focused, float.config.title, float.config.border);
 
         // Insert-mode cursor block for the focused float. Floats today
@@ -2222,7 +2250,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
 
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 40, .height = 11 };
 
-    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true, false);
 
     // Drop a sentinel glyph in the middle of the content rect to mimic a
     // stale render artefact left over from a previous frame.
@@ -2235,7 +2263,7 @@ test "drawBufferIntoRect clears content rect before drawing (Bug F regression)" 
     // Repaint without changing the buffer. The clear should wipe the
     // sentinel even though no logical line in the buffer ever wrote to
     // that row.
-    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true, false);
     try std.testing.expectEqual(@as(u21, ' '), screen.getCellConst(sentinel_row, sentinel_col).codepoint);
 }
 
@@ -2447,7 +2475,7 @@ test "composite: multi-span wrap doesn't drop content (Bug A regression)" {
     // then 'd' lands at content_x=2 on the next row, 'e'3, and the second
     // span 'f' at col 4.
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
-    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true, false);
 
     // First-row content (after the 2-col gutter): 'a' at col 4, 'c' at col 6.
     try std.testing.expectEqual(@as(u21, 'a'), screen.getCellConst(1, 4).codepoint);
@@ -2505,7 +2533,7 @@ test "composite: wrapped continuation lands at content_x, not span tail (Bug B r
     // cluster -> wrap). Continuation restarts at content_x=2 (NO gutter
     // re-indent on wrapped rows): 'l'2,'d'3,' '4,'f'5,'r'6,'o'7,'m'8,...
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 14, .height = 8 };
-    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true, false);
 
     try std.testing.expectEqual(@as(u21, 'h'), screen.getCellConst(1, 4).codepoint);
     try std.testing.expectEqual(@as(u21, 'w'), screen.getCellConst(1, 10).codepoint);
@@ -2583,7 +2611,7 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     try std.testing.expect(probe.leading_skip_rows > 0);
 
     const outer = Layout.Rect{ .x = 0, .y = 0, .width = 8, .height = 6 };
-    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true);
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true, false);
 
     // The user marker gutter (2 cols) occupies the first physical row, so
     // "12345678" wraps to gutter+"123" / "45678". content_y = outer.y + 1 +
@@ -2595,4 +2623,67 @@ test "composite: bottom-anchored mid-line scroll keeps tail visible (Bug C regre
     try std.testing.expectEqual(@as(u21, '6'), screen.getCellConst(bottom_row, 4).codepoint);
     try std.testing.expectEqual(@as(u21, '7'), screen.getCellConst(bottom_row, 5).codepoint);
     try std.testing.expectEqual(@as(u21, '8'), screen.getCellConst(bottom_row, 6).codepoint);
+}
+
+test "working-line does not overlap last content row when agent_running" {
+    const allocator = std.testing.allocator;
+
+    // Build a 10-row, 30-col pane so the geometry is hand-verifiable.
+    const outer = Layout.Rect{ .x = 0, .y = 0, .width = 30, .height = 10 };
+
+    var screen = try Screen.init(allocator, outer.width, outer.height);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    // Fill a Conversation with enough lines that content reaches the
+    // bottom of the pane. 8 lines is more than the 7-row interior (10
+    // - frame[2] - prompt[1]) so the last line lands at the would-be
+    // last interior row.
+    const buf_id: u32 = 1;
+    var cb = try @import("Conversation.zig").init(allocator, buf_id, "test");
+    defer cb.deinit();
+    for (0..8) |i| {
+        var line_buf: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line_buf, "line {d}", .{i});
+        _ = try cb.appendNode(null, .assistant_text, text);
+    }
+
+    var viewport: @import("Viewport.zig") = .{};
+
+    // Drive drawBufferIntoRect with agent_running=true so the working-
+    // line reservation kicks in.
+    compositor.drawBufferIntoRect(cb.view(), &viewport, outer, true, true);
+
+    // After the fix: last content row sits TWO rows above the bottom
+    // frame, leaving one blank row for the working line. Before the
+    // fix: last content row sits one row above (== work_row), which
+    // drawPanePrompt would clobber.
+    const last_content_row = outer.y + outer.height - 4;
+    // Scan across the row for any non-blank cell: a 2-col gutter +
+    // padding precedes the actual text so we can't rely on col 1.
+    var last_has_text = false;
+    var col: u16 = outer.x + 1;
+    while (col < outer.x + outer.width - 1) : (col += 1) {
+        if (screen.getCellConst(last_content_row, col).codepoint != ' ') {
+            last_has_text = true;
+            break;
+        }
+    }
+    try std.testing.expect(last_has_text);
+
+    // After fix: the row that drawPanePrompt would paint into is empty.
+    // Scan it the same way — no glyph anywhere across the interior.
+    const work_row_y = outer.y + outer.height - 3;
+    var work_has_text = false;
+    col = outer.x + 1;
+    while (col < outer.x + outer.width - 1) : (col += 1) {
+        if (screen.getCellConst(work_row_y, col).codepoint != ' ') {
+            work_has_text = true;
+            break;
+        }
+    }
+    try std.testing.expect(!work_has_text);
 }
