@@ -590,11 +590,31 @@ function M._delete_enter()
     })
 end
 
--- Activate the row under the cursor. For session rows this splits
--- the host pane and binds the new leaf to the highlighted session via
--- `zag.sessions.open`. Errors are downgraded to a log line so a
--- cross-project click (v1 limitation) does not punch a Lua exception
--- through to the user.
+-- Activate the row under the cursor. For a session row this collapses
+-- the layout down to a single pane bound to the chosen session: the
+-- sidebar disappears, every prior conversation pane is closed, and the
+-- new session takes the whole screen. Errors are downgraded to a log
+-- line so a cross-project click (v1 limitation) does not punch a Lua
+-- exception through to the user.
+--
+-- Mechanics:
+--   1. Snapshot every existing tiled leaf id. zag.layout.tree returns
+--      `{ root, focus, nodes }` keyed by id; we filter to `kind = "pane"`.
+--      Floats (slash menus, popups) live outside `nodes` and are NOT
+--      in the snapshot, so this pass never collapses a popup the user
+--      has open behind the sidebar.
+--   2. Tear the sidebar down through its own close path so its hooks
+--      and keymaps unregister and the prior global mode is restored.
+--   3. Call zag.sessions.open to split the now-focused leaf with the
+--      chosen session. The split lands on the `.second` side; the new
+--      leaf becomes focused and carries an id that is NOT in the
+--      snapshot.
+--   4. Walk the snapshot and close every leaf id. The sidebar id is
+--      already gone (step 2), and the surviving non-snapshot leaf is
+--      the new session pane. Closes are pcall'd because removing one
+--      leaf can collapse a sibling split, in which case a later
+--      `close(id)` for the now-vanished sibling raises NotFound;
+--      that is expected, not a failure.
 function M._activate()
     local row = state.last_render[state.cursor_row]
     if not row or row.kind ~= "session" then return end
@@ -603,10 +623,42 @@ function M._activate()
             tostring(row.session_id))
         return
     end
+
+    -- pcall every zag.layout / zag.sessions call: headless engines
+    -- (the integration tests use one) have no window manager bound, and
+    -- the bindings raise on entry. Bailing quietly preserves the prior
+    -- behavior of _activate as a no-op in those tests; production runs
+    -- always have a window manager, so every step takes the happy path.
+    local tree_ok, tree = pcall(zag.layout.tree)
+    if not tree_ok or tree == nil then return end
+
+    local old_leaves = {}
+    if tree.nodes then
+        for id, node in pairs(tree.nodes) do
+            if node.kind == "pane" then
+                table.insert(old_leaves, id)
+            end
+        end
+    end
+
+    M.close()
+
     local ok, err = pcall(zag.sessions.open, row.session_id, row.project)
     if not ok then
         zag.log.warn("sessions sidebar: open %s failed: %s",
             tostring(row.session_id), tostring(err))
+        return
+    end
+
+    -- `zag.layout.tree().focus` is the freshly-attached session leaf;
+    -- skip it so the cleanup loop doesn't tear it back down.
+    local after_ok, tree_after = pcall(zag.layout.tree)
+    local keep = (after_ok and tree_after) and tree_after.focus or nil
+
+    for _, id in ipairs(old_leaves) do
+        if id ~= keep then
+            pcall(zag.layout.close, id)
+        end
     end
 end
 
