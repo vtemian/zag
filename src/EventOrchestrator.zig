@@ -242,6 +242,25 @@ fn drainWakePipe(fd: posix.fd_t) void {
     }
 }
 
+/// Fold the parser's escape-disambiguation timeout together with the
+/// working-line heartbeat into a single value for `posix.poll`. The
+/// parser owns ESC semantics: returning `null` means "no pending bytes,
+/// block forever"; returning `0` means "a complete event is queued,
+/// drain now". The heartbeat is purely a ceiling; it can lower the
+/// wait but never raises it, so the parser's contract (pinned by tests
+/// in `src/input/parser.zig:258-283`) is preserved.
+///
+/// Inputs in milliseconds; `null` on either side means "no opinion".
+/// Returns `-1` (block forever) only when both inputs are absent.
+fn pollTimeoutWithHeartbeat(parser_timeout: ?i32, heartbeat_ms: ?i32) i32 {
+    if (parser_timeout) |pt| {
+        if (heartbeat_ms) |hb| return @min(pt, hb);
+        return pt;
+    }
+    if (heartbeat_ms) |hb| return hb;
+    return -1;
+}
+
 /// Pop every finished Lua async job off the completion queue and resume
 /// the owning coroutine in the engine. Despite the name, this does not
 /// just empty a data structure: each call feeds the Lua state machine
@@ -2159,4 +2178,27 @@ test "handlePaste in normal mode with no truncation clears prior status" {
     f.wm.* = orch.window_manager;
 
     try std.testing.expectEqual(@as(u8, 0), f.wm.transient_status_len);
+}
+
+test "pollTimeoutWithHeartbeat returns -1 when neither input is set" {
+    try std.testing.expectEqual(@as(i32, -1), pollTimeoutWithHeartbeat(null, null));
+}
+
+test "pollTimeoutWithHeartbeat returns the heartbeat when parser has no pending bytes" {
+    try std.testing.expectEqual(@as(i32, 250), pollTimeoutWithHeartbeat(null, 250));
+}
+
+test "pollTimeoutWithHeartbeat returns the parser timeout when no agent is running" {
+    try std.testing.expectEqual(@as(i32, 50), pollTimeoutWithHeartbeat(50, null));
+}
+
+test "pollTimeoutWithHeartbeat takes the smaller of parser and heartbeat" {
+    try std.testing.expectEqual(@as(i32, 50), pollTimeoutWithHeartbeat(50, 250));
+    try std.testing.expectEqual(@as(i32, 250), pollTimeoutWithHeartbeat(500, 250));
+}
+
+test "pollTimeoutWithHeartbeat preserves the parser's drain-now signal" {
+    // parser.pollTimeoutMs returns 0 when a complete event is already queued.
+    // The heartbeat must never delay that.
+    try std.testing.expectEqual(@as(i32, 0), pollTimeoutWithHeartbeat(0, 250));
 }
