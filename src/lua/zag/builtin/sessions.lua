@@ -251,16 +251,14 @@ function M._bind_keymaps()
     -- containing 'r' into the filter without losing this binding).
     add { key = "r",     fn = M._r_pressed }
 
-    -- Delete-with-confirm (Task 7.3). The plan originally specified
-    -- `dd` as a vim-style chord, but Keymap.zig has no chord support
-    -- (see "Keymap.zig has no multi-keystroke chord support" note
-    -- above the `<S-g>` binding), so we substitute capital `D`. The
-    -- printable dispatcher above bound lowercase `d` as a filter
-    -- input; this Shift-d binding takes precedence in normal mode
-    -- and routes to the confirm popup. In filter mode capital D is
-    -- still a printable input (the structural handler dispatches on
-    -- state.mode).
-    add { key = "<S-d>", fn = M._D_pressed }
+    -- Delete-with-confirm and new-session. Both keys are also in the
+    -- printable filter set; the structural bind below the loop wins
+    -- in normal mode and dispatches to the action, while the
+    -- per-key dispatcher (`_d_pressed`, `_n_pressed`) feeds the
+    -- letter back into the filter/rename buffer when the sidebar is
+    -- in filter or rename mode.
+    add { key = "d",     fn = M._d_pressed }
+    add { key = "n",     fn = M._n_pressed }
 end
 
 -- The printable-char set accepted in filter mode. Substring-match over
@@ -361,14 +359,25 @@ function M._r_pressed()
     M._rename_enter()
 end
 
--- `D` (capital) dispatcher. In normal mode on a session row: open the
+-- `d` dispatcher. In normal mode on a session row: open the
 -- delete-confirm popup. In filter/rename mode: treat as a literal
--- printable input so the user can type 'D' into the filter or new
+-- printable input so the user can type 'd' into the filter or new
 -- name without losing this binding.
-function M._D_pressed()
-    if state.mode == "filter" then return M._filter_input("D") end
-    if state.mode == "rename" then return M._filter_input("D") end
+function M._d_pressed()
+    if state.mode == "filter" then return M._filter_input("d") end
+    if state.mode == "rename" then return M._filter_input("d") end
     M._delete_enter()
+end
+
+-- `n` dispatcher. In normal mode: tear down the sidebar and replace
+-- the visible layout with a brand-new conversation pane (fresh
+-- session). In filter/rename mode: treat as a literal printable input
+-- so the user can type 'n' into the filter or rename buffer without
+-- losing this binding.
+function M._n_pressed()
+    if state.mode == "filter" then return M._filter_input("n") end
+    if state.mode == "rename" then return M._filter_input("n") end
+    M._new_session()
 end
 
 -- Filter-mode entry. `/` swaps the sidebar into filter mode and
@@ -667,6 +676,60 @@ function M._activate()
 
     for _, id in ipairs(old_leaves) do
         if id ~= keep then
+            pcall(zag.layout.close, id)
+        end
+    end
+end
+
+-- Tear down the sidebar and replace the visible layout with a
+-- fresh conversation pane (which mints a new session via
+-- `SessionManager.createSession` under the hood). Mirrors the
+-- layout-snapshot / sidebar-close / open-new / close-everything-else
+-- choreography in `_activate`; the only difference is the new pane
+-- carries a fresh conversation buffer instead of loading an existing
+-- session id.
+--
+-- Each zag.layout call is pcall'd because integration tests run a
+-- headless engine with no window manager bound, and the bindings
+-- raise on entry; bailing quietly mirrors `_activate`'s no-op-on-
+-- headless contract.
+function M._new_session()
+    local tree_ok, tree = pcall(zag.layout.tree)
+    if not tree_ok or tree == nil then return end
+
+    local old_leaves = {}
+    if tree.nodes then
+        for id, node in pairs(tree.nodes) do
+            if node.kind == "pane" then
+                table.insert(old_leaves, id)
+            end
+        end
+    end
+
+    M.close()
+
+    -- After M.close, focus lands on the prior host pane. Split it
+    -- with a freshly-bound conversation buffer; `createSplitPane`
+    -- in WindowManager mints a new SessionHandle for the new pane
+    -- inside `attachSession`, so the session shows up in the
+    -- sidebar on the next render.
+    local focus_ok, focus_tree = pcall(zag.layout.tree)
+    if not focus_ok or not focus_tree or not focus_tree.focus then return end
+    local host_id = focus_tree.focus
+
+    local split_ok, new_id = pcall(zag.layout.split, host_id, "vertical", {
+        buffer = { type = "conversation" },
+    })
+    if not split_ok or new_id == nil then
+        zag.log.warn("sessions sidebar: new session split failed: %s",
+            tostring(new_id))
+        return
+    end
+
+    -- `zag.layout.split` returns the new leaf's id directly; skip it
+    -- so the cleanup loop doesn't tear down the fresh pane.
+    for _, id in ipairs(old_leaves) do
+        if id ~= new_id then
             pcall(zag.layout.close, id)
         end
     end
