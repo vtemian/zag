@@ -295,6 +295,31 @@ fn anyPaneDirty(self: *const EventOrchestrator) bool {
     return false;
 }
 
+/// True when any pane in this orchestrator owns a running AgentRunner, or
+/// any subagent is in flight in the child registry. Drives the heartbeat
+/// path that keeps the working-line counter advancing while events are
+/// silent (slow LLM call, idle child task) or filtered (streaming-preview
+/// tool_start with null call_id; see AgentRunner.zig:942 and :1044).
+///
+/// `!child_runner_registry.isEmpty()` is sufficient on its own for the
+/// child case: ChildRunnerRegistry holds an entry exactly between
+/// `register()` (after submit succeeds) and the `.done` drain that removes
+/// it, which means a non-empty registry ⇔ at least one child mid-turn.
+///
+/// Floats (extra_floats) are not walked: popups and autocomplete never
+/// carry an AgentRunner.
+fn anyAgentRunning(self: *EventOrchestrator) bool {
+    if (self.window_manager.root_pane.runner) |r| {
+        if (r.isAgentRunning()) return true;
+    }
+    for (self.window_manager.extra_panes.items) |entry| {
+        if (entry.pane.runner) |r| {
+            if (r.isAgentRunning()) return true;
+        }
+    }
+    return !self.child_runner_registry.isEmpty();
+}
+
 /// One iteration of the event loop: poll input, handle resize, drain agent
 /// events, composite, render. Sets `running` to false on quit.
 fn tick(
