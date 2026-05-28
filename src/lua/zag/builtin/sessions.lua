@@ -12,6 +12,13 @@
 
 local M = {}
 
+-- Target panel width in terminal cells. `M.open` and the LayoutResize
+-- hook both clamp the split ratio against this so the sidebar lands at
+-- the same on-screen width regardless of terminal size, and the label
+-- truncation math (see `LABEL_MAX_CELLS` farther down) reads from the
+-- same number so name budgets stay in sync with the panel budget.
+local SIDEBAR_TARGET_CELLS = 40
+
 -- Sidebar state. Persists across toggle.
 local state = {
     pane_id = nil,        -- layout handle of the open sidebar pane, nil if hidden
@@ -83,14 +90,16 @@ function M.open()
     -- root-level split. Going through `split_root` (rather than the
     -- focused-leaf `split`) means the sidebar spans full screen height
     -- even when the user has the layout broken into multiple panes.
-    -- Size the sidebar to roughly 30 cells regardless of terminal
+    -- Size the sidebar to roughly 40 cells regardless of terminal
     -- width and clamp into [0.1, 0.4] so a pathologically narrow
     -- terminal can't collapse the sidebar to 0 cells and a very wide
     -- terminal can't let it dominate the layout. The `cols or 100`
     -- fallback keeps the division safe if a future binding regression
-    -- strips the field.
+    -- strips the field. The 40-cell target matches `SIDEBAR_TARGET_CELLS`
+    -- in the resize hook below and the panel-width math behind
+    -- `LABEL_MAX_CELLS`, so labels fit without word-wrap.
     local cols = tree.cols or 100
-    local target_cells = 30
+    local target_cells = SIDEBAR_TARGET_CELLS
     local ratio = target_cells / cols
     if ratio < 0.1 then ratio = 0.1 end
     if ratio > 0.4 then ratio = 0.4 end
@@ -146,17 +155,18 @@ function M._subscribe_hooks()
         if not state.buffer_id then return end
         M._render()
     end))
-    -- Re-pin the sidebar to ~30 cells after a terminal resize. The
-    -- layout preserves the split ratio across resizes, so without this
-    -- a wider terminal grows the sidebar and a narrower one shrinks it.
-    -- Recompute the same ratio M.open() computes (30 / cols, clamped to
-    -- [0.1, 0.4]) and apply via zag.layout.resize. The handler bails
-    -- early if the sidebar pane was torn down between fire and dispatch.
+    -- Re-pin the sidebar to ~SIDEBAR_TARGET_CELLS cells after a terminal
+    -- resize. The layout preserves the split ratio across resizes, so
+    -- without this a wider terminal grows the sidebar and a narrower
+    -- one shrinks it. Recompute the same ratio M.open() computes
+    -- (target / cols, clamped to [0.1, 0.4]) and apply via
+    -- zag.layout.resize. The handler bails early if the sidebar pane
+    -- was torn down between fire and dispatch.
     table.insert(state.hook_ids, zag.hook("LayoutResize", function(evt)
         if not state.pane_id then return end
         local cols = evt.cols or 0
         if cols <= 0 then return end
-        local ratio = 30 / cols
+        local ratio = SIDEBAR_TARGET_CELLS / cols
         if ratio < 0.1 then ratio = 0.1 end
         if ratio > 0.4 then ratio = 0.4 end
         pcall(zag.layout.resize, state.pane_id, ratio)
@@ -708,18 +718,19 @@ end
 --     "  " for normal rows / "● " for the row whose session is bound
 --     to the focused conversation pane. Added by `_render`, not here.
 --
--- Total width budget in a 30-cell panel:
---     2 (cursor) + 2 (glyph + space) + 3 (date col) + 1 (gap) + 22 (name)
---     = 30 cells. The ellipsis costs one cell, so the byte cap is 21
---     (truncated name = 21 chars + "…" = 22 cells). Names of exactly
---     22 bytes still fit intact because the cap only kicks in when
+-- Total width budget in an N-cell panel:
+--     2 (cursor) + 2 (glyph + space) + 3 (date col) + 1 (gap) + name
+--     = name budget is N - 8. The ellipsis costs one cell, so the
+--     truncation byte cap is (N - 8) - 1. Names of exactly (N - 8)
+--     bytes still fit intact because the cap only kicks in when
 --     truncation would happen.
 --
 -- Pure byte arithmetic on `_truncate_label`: keymap input is ASCII-only
 -- (see `_filter_printables`) and the on-disk deriver lands names at
--- 32 bytes worst-case using word-boundary rewind, so a 21-byte cut can
--- never land mid-codepoint.
-local LABEL_MAX_CELLS = 22
+-- 32 bytes worst-case using word-boundary rewind, so byte truncation
+-- can never land mid-codepoint.
+local PREFIX_CELLS = 8 -- cursor(2) + glyph(2) + date(3) + gap(1)
+local LABEL_MAX_CELLS = SIDEBAR_TARGET_CELLS - PREFIX_CELLS
 local TRUNCATED_NAME_BYTES = LABEL_MAX_CELLS - 1
 local DATE_COL_WIDTH = 3
 

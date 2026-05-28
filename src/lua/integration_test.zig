@@ -1025,7 +1025,7 @@ test "sessions sidebar refreshes on every PaneFocused while sidebar is open" {
 // ratio M.open uses (30 / cols, clamped to [0.1, 0.4]) and calls
 // zag.layout.resize. The test stubs zag.layout.resize so the assertion
 // runs without a live WindowManager.
-test "sessions sidebar re-pins to ~30 cells on LayoutResize" {
+test "sessions sidebar re-pins to ~40 cells on LayoutResize" {
     const allocator = testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1071,8 +1071,8 @@ test "sessions sidebar re-pins to ~30 cells on LayoutResize" {
         \\end
     );
 
-    // Mid-range terminal: 30 / 120 = 0.25, within the clamp band.
-    var ev: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 120, .rows = 40 } };
+    // Mid-range terminal: 40 / 200 = 0.2, within the clamp band.
+    var ev: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 200, .rows = 40 } };
     _ = try engine.fireHook(&ev);
 
     try runLua(&engine,
@@ -1081,14 +1081,14 @@ test "sessions sidebar re-pins to ~30 cells on LayoutResize" {
         \\       .. tostring(_G.resize_calls))
         \\assert(_G.last_id == "n1",
         \\       "resize must target the sidebar pane: " .. tostring(_G.last_id))
-        \\local expected = 30 / 120
+        \\local expected = 40 / 200
         \\assert(math.abs(_G.last_ratio - expected) < 1e-9,
-        \\       "ratio must be 30/cols at mid range, got "
+        \\       "ratio must be 40/cols at mid range, got "
         \\       .. tostring(_G.last_ratio))
     );
 
-    // Narrow terminal: 30 / 50 = 0.6, must clamp DOWN to 0.4.
-    var narrow: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 50, .rows = 24 } };
+    // Narrow terminal: 40 / 60 = 0.66, must clamp DOWN to 0.4.
+    var narrow: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 60, .rows = 24 } };
     _ = try engine.fireHook(&narrow);
 
     try runLua(&engine,
@@ -1097,8 +1097,8 @@ test "sessions sidebar re-pins to ~30 cells on LayoutResize" {
         \\       .. tostring(_G.last_ratio))
     );
 
-    // Wide terminal: 30 / 400 = 0.075, must clamp UP to 0.1.
-    var wide: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 400, .rows = 100 } };
+    // Wide terminal: 40 / 600 = 0.066, must clamp UP to 0.1.
+    var wide: Hooks.HookPayload = .{ .layout_resize = .{ .cols = 600, .rows = 100 } };
     _ = try engine.fireHook(&wide);
 
     try runLua(&engine,
@@ -1347,12 +1347,13 @@ test "sessions sidebar truncates long labels with ellipsis" {
         \\assert(short_row.label == "  ▸ now alpha",
         \\       "short label unexpected: " .. tostring(short_row.label))
         \\
-        \\-- Long label truncates the name to the first 21 bytes plus
+        \\-- Long label truncates the name to the first 31 bytes plus
         \\-- a single '…' codepoint; the prefix layout matches the
-        \\-- short-label row. 21 + 1 ellipsis cell + 8-cell prefix
-        \\-- (cursor + glyph + date + gap) lands at exactly 30 cells.
+        \\-- short-label row. 31 + 1 ellipsis cell + 8-cell prefix
+        \\-- (cursor + glyph + date + gap) lands at exactly 40 cells,
+        \\-- the sidebar's target panel width.
         \\local want = "  ▸ now "
-        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 21)
+        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 31)
         \\    .. "…"
         \\assert(long_row.label == want,
         \\       "long label unexpected:\n  got " .. tostring(long_row.label)
