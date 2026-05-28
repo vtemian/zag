@@ -43,7 +43,7 @@ sink: Sink,
 /// buffer registry, and the session-handle / persistence state.
 conversation: *Conversation,
 /// Heap allocator for transient runner state (event payload dups from
-/// the worker thread, last_info scratch, error formatting).
+/// the worker thread, error formatting).
 allocator: Allocator,
 
 /// Per-turn arena holding the wire-format `[]types.Message` projection
@@ -94,11 +94,6 @@ window_manager: ?*WindowManager = null,
 /// Zero means the handle has not been populated yet (root pane before
 /// main wires it, or a fresh split before `doSplit` links the leaf).
 pane_handle_packed: u32 = 0,
-
-/// Last info message (token counts) for status bar display.
-last_info: [128]u8 = .{0} ** 128,
-/// Length of the last info message.
-last_info_len: u8 = 0,
 
 /// Millisecond timestamp when the current turn's agent thread spawned.
 /// Null between turns. Read by the compositor for the working line.
@@ -528,12 +523,6 @@ fn threadMain(
 pub fn shutdownAll(runners: []const *AgentRunner) void {
     for (runners) |runner| runner.cancelAgent();
     for (runners) |runner| runner.shutdown();
-}
-
-/// Return the last info/status message (e.g., token counts) captured by
-/// the last `.info` event. Empty until an info event has been handled.
-pub fn lastInfo(self: *const AgentRunner) []const u8 {
-    return self.last_info[0..self.last_info_len];
 }
 
 /// Milliseconds since the current turn's agent thread spawned, or 0 when idle.
@@ -1058,11 +1047,10 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             } });
         },
         .info => |text| {
+            // `.info` is freeform telemetry from the agent loop (token
+            // counts, timing). It is still persisted by `persistAgentEvent`
+            // for the JSONL audit log, but no live UI consumer remains.
             defer allocator.free(text);
-            // Store for status bar display, not as a conversation node
-            const len = @min(text.len, self.last_info.len);
-            @memcpy(self.last_info[0..len], text[0..len]);
-            self.last_info_len = @intCast(len);
         },
         .usage => |u| {
             // Live output-token count for the working line. UI-only: not a

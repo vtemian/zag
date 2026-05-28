@@ -416,11 +416,6 @@ fn tick(
     // trigger a redraw the same way a tile does.
     const any_dirty = self.anyPaneDirty();
 
-    // Spinner ticks only when actual events arrive
-    if (any_dirty) {
-        self.window_manager.spinner_frame = (self.window_manager.spinner_frame +% 1) % @as(u8, WindowManager.spinner_chars.len);
-    }
-
     // Skip composite+render when nothing visual changed
     const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
         (maybe_event != null and maybe_event.? != .mouse);
@@ -435,17 +430,15 @@ fn tick(
     }
 
     const focused = self.window_manager.getFocusedPane();
-    // A scratch-focused pane has no runner; the status row should read
-    // "idle" there, not spin a nonexistent agent.
+    // A scratch-focused pane has no runner; running state defaults to false.
     const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
     const elapsed_ms: u64 = if (focused.runner) |r| r.elapsedMs() else 0;
     const output_tokens: u32 = if (focused.runner) |r| r.outputTokens() else 0;
+    // Only transient status toasts (split announces) reach the prompt row;
+    // running state is shown by the working line above the prompt.
     const status = if (self.window_manager.transient_status_len > 0)
         self.window_manager.transient_status[0..self.window_manager.transient_status_len]
-    else if (agent_running) blk: {
-        const info = focused.runner.?.lastInfo();
-        break :blk if (info.len > 0) info else "streaming...";
-    } else "";
+    else "";
     var leaves_buf: [max_visible_leaves]*Layout.LayoutNode = undefined;
     var drafts_buf: [max_visible_leaves]Compositor.LeafDraft = undefined;
     var float_drafts_buf: [max_visible_floats]Compositor.FloatDraft = undefined;
@@ -465,7 +458,6 @@ fn tick(
         .mode = self.window_manager.current_mode,
         .status = status,
         .agent_running = agent_running,
-        .spinner_frame = self.window_manager.spinner_frame,
         .elapsed_ms = elapsed_ms,
         .output_tokens = output_tokens,
     });

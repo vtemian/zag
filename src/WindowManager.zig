@@ -45,9 +45,6 @@ const log = std.log.scoped(.window_manager);
 
 const WindowManager = @This();
 
-/// Characters for the animated spinner.
-pub const spinner_chars = "|/-\\";
-
 /// Buffer + View pair handed to pane creation paths that borrow an
 /// existing buffer (split-with-buffer, float pane). Both projections
 /// must point at the same backing buffer.
@@ -494,8 +491,6 @@ next_scratch_id: u32 = 1,
 transient_status: [64]u8 = undefined,
 /// Number of valid bytes in `transient_status`; zero means no message is active.
 transient_status_len: u8 = 0,
-/// Frame counter for animating the status bar spinner.
-spinner_frame: u8 = 0,
 /// Global editing mode. Insert = typing into input buffer;
 /// Normal = keymap bindings fire, typing is disabled.
 current_mode: Keymap.Mode = .insert,

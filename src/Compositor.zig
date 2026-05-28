@@ -97,13 +97,12 @@ pub const InputState = struct {
     /// Current editing mode; rendered as the `►► INSERT`/`►► NORMAL`
     /// footer marker in the bottom status row.
     mode: Keymap.Mode,
-    /// One-shot status message (split announces, agent lastInfo, etc.).
-    /// Replaces the focused pane's prompt row when non-empty.
+    /// One-shot status message (split announces). Replaces the focused
+    /// pane's prompt row when non-empty.
     status: []const u8 = "",
-    /// Whether the focused pane's agent is running (shows a spinner next
-    /// to the status on the focused pane's prompt row).
+    /// Whether the focused pane's agent is running. Drives the transient
+    /// working line above the prompt; no longer shown as a status overlay.
     agent_running: bool = false,
-    spinner_frame: u8 = 0,
     /// Elapsed ms for the focused running pane (0 when idle).
     elapsed_ms: u64 = 0,
     /// Output tokens for the focused running pane (0 when none yet).
@@ -801,8 +800,8 @@ fn workingLineText(buf: []u8, secs: u64, tokens: u32) []const u8 {
 
 /// Paint one pane's prompt row. No-op when the pane is too short/narrow.
 /// On the focused pane, `input.status` replaces the prompt whenever it's
-/// non-empty (split announces, `lastInfo`, "streaming..."), with an
-/// optional spinner tail when `input.agent_running`.
+/// non-empty (split announces only). The transient working line above the
+/// prompt is the sole running indicator now.
 fn drawPanePrompt(
     self: *Compositor,
     leaf: *const Layout.LayoutNode.Leaf,
@@ -843,9 +842,9 @@ fn drawPanePrompt(
         _ = self.screen.writeStr(work_row, content_x, shown, ws.screen_style, ws.fg);
     }
 
-    // Focused pane: if a global status toast is set, it takes over the
-    // prompt row entirely (with an optional spinner). This preserves the
-    // split-announce / agent-info UX that the global bar used to carry.
+    // Focused pane: a transient status toast (split announces) takes over
+    // the prompt row entirely. Running state is shown by the working line
+    // above, not here.
     if (focused and input.status.len > 0) {
         const resolved = Theme.resolve(self.theme.highlights.status, self.theme);
         const available_status: usize = right_edge - content_x;
@@ -853,12 +852,7 @@ fn drawPanePrompt(
             input.status
         else
             input.status[0..available_status];
-        const col = self.screen.writeStr(prompt_row, content_x, status_shown, resolved.screen_style, resolved.fg);
-        if (input.agent_running and col < right_edge) {
-            const spinner = "|/-\\";
-            const idx: usize = @intCast(input.spinner_frame % 4);
-            _ = self.screen.writeStr(prompt_row, col, spinner[idx .. idx + 1], resolved.screen_style, resolved.fg);
-        }
+        _ = self.screen.writeStr(prompt_row, content_x, status_shown, resolved.screen_style, resolved.fg);
         return;
     }
 
