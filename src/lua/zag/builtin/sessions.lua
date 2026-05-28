@@ -40,6 +40,17 @@ local state = {
                               -- zag.layout.tree() lookup. Production sets
                               -- this to nil; _resolve_current_session_id
                               -- falls back to the tree walk.
+    now_for_test = nil,       -- test seam: pin the "now" timestamp used
+                              -- by the date column so tests can assert
+                              -- a deterministic age bucket. Production
+                              -- leaves this nil; `_collect_rows` falls
+                              -- back to `os.time()`.
+    prior_mode = nil,         -- global editing mode captured at open()
+                              -- time. The sidebar forces mode = "normal"
+                              -- so its j/k bindings dispatch even when
+                              -- the user opened it from the prompt's
+                              -- insert mode. close() restores this so
+                              -- the prompt picks up where it left off.
 }
 
 function M.toggle()
@@ -89,6 +100,17 @@ function M.open()
         ratio = ratio,
     })
     state.pane_id = pane_id
+
+    -- Force normal mode so j/k/l/h/Enter dispatch via the sidebar's
+    -- own keymaps even when the user opened the sidebar from the
+    -- prompt's insert mode. `close()` restores whatever was active
+    -- before, so a user mid-message in the prompt doesn't lose their
+    -- insert-mode context. `zag.mode.get/set` are no-ops in headless
+    -- engines (no window manager bound); the pcall keeps the open
+    -- path quiet there.
+    local ok, prev = pcall(zag.mode.get)
+    state.prior_mode = ok and prev or nil
+    pcall(zag.mode.set, "normal")
 
     M._bind_keymaps()
     M._subscribe_hooks()
@@ -147,15 +169,26 @@ end
 -- src/Keymap.zig: `lookup`) means the user's global `j`/`k` for pane
 -- focus still works in every other buffer. Each id is stashed in
 -- state.keymap_ids so M.close() can unbind them as a set.
+--
+-- Every binding registers in BOTH insert and normal mode. `open()`
+-- already flips the global mode to normal, but the dual registration
+-- is the belt-and-suspenders: it keeps j/k working if any future hook
+-- or focus path drops the user back into insert while the sidebar is
+-- focused. Mode-toggling at the global level still wins for non-sidebar
+-- buffers because these bindings carry `buffer = state.buffer_id`.
 function M._bind_keymaps()
     if not state.buffer_id then return end
     local buf = state.buffer_id
 
     local function add(spec)
-        spec.buffer = buf
-        spec.mode = spec.mode or "normal"
-        local id = zag.keymap(spec)
-        table.insert(state.keymap_ids, id)
+        for _, m in ipairs({ "normal", "insert" }) do
+            local copy = { buffer = buf, mode = m }
+            for k, v in pairs(spec) do
+                if k ~= "buffer" and k ~= "mode" then copy[k] = v end
+            end
+            local id = zag.keymap(copy)
+            table.insert(state.keymap_ids, id)
+        end
     end
 
     -- Filter mode (Task 7.1). Keymap.zig has no `filter` Mode variant
@@ -612,6 +645,55 @@ function M._jump_last()
     M._render()
 end
 
+-- Sidebar row layout for sessions:
+--
+--     "{cursor}{glyph} {date} {name}"
+--      ^^      ^      ^      ^
+--      |      ▸/▾    relative age (2-4 cells, padded to 3) - " 2h"
+--      |             auto-derived from `s.updated_ms`, fixed-width
+--      |             so names stay column-aligned across rows.
+--      |
+--     "  " for normal rows / "● " for the row whose session is bound
+--     to the focused conversation pane. Added by `_render`, not here.
+--
+-- Total width budget in a 30-cell panel:
+--     2 (cursor) + 2 (glyph + space) + 3 (date col) + 1 (gap) + 22 (name)
+--     = 30 cells. Names longer than 22 bytes get an ellipsis suffix.
+--
+-- Pure byte arithmetic on `_truncate_label`: keymap input is ASCII-only
+-- (see `_filter_printables`) and the on-disk deriver lands names at
+-- 32 bytes worst-case using word-boundary rewind, so a 22-byte cut can
+-- never land mid-codepoint.
+local LABEL_MAX_BYTES = 22
+local DATE_COL_WIDTH = 3
+
+local function _truncate_label(s)
+    if #s <= LABEL_MAX_BYTES then return s end
+    return s:sub(1, LABEL_MAX_BYTES) .. "…"
+end
+
+-- Compact relative age. Buckets give a tight 2-3 cell label (4 in the
+-- "11mo" extreme); the date column right-pads to DATE_COL_WIDTH so
+-- shorter values still align with longer ones. `then_ms` and `now_s`
+-- match the units the bindings already expose: `s.updated_ms` is in
+-- milliseconds, `os.time()` is in seconds.
+local function _relative_age(then_ms, now_s)
+    local secs = now_s - math.floor((then_ms or 0) / 1000)
+    if secs < 0 then secs = 0 end
+    if secs < 60        then return "now" end
+    if secs < 3600      then return tostring(math.floor(secs / 60)) .. "m" end
+    if secs < 86400     then return tostring(math.floor(secs / 3600)) .. "h" end
+    if secs < 604800    then return tostring(math.floor(secs / 86400)) .. "d" end
+    if secs < 2419200   then return tostring(math.floor(secs / 604800)) .. "w" end
+    if secs < 31536000  then return tostring(math.floor(secs / 2419200)) .. "mo" end
+    return tostring(math.floor(secs / 31536000)) .. "y"
+end
+
+local function _pad_date(s)
+    if #s >= DATE_COL_WIDTH then return s end
+    return s .. string.rep(" ", DATE_COL_WIDTH - #s)
+end
+
 -- Best-effort extraction of a short prompt snippet from a subagent
 -- task_start's raw JSON tool_input. We have no Lua-side JSON decoder,
 -- so we pull the `prompt` field with a Lua pattern. If the pattern
@@ -672,18 +754,27 @@ function M._collect_rows()
     local rows = {}
     local sessions = zag.sessions.list()
     local filter_lc = state.filter ~= "" and state.filter:lower() or nil
+    -- Sample `os.time()` once per render. Every row's date column is
+    -- "age relative to NOW"; using the same NOW across rows keeps the
+    -- column monotonically increasing top-to-bottom (sessions are
+    -- already sorted by `updated_ms` descending by the binding).
+    local now_s = state.now_for_test or os.time()
     for _, s in ipairs(sessions) do
-        local display = (s.name ~= nil and s.name ~= "") and s.name or string.sub(s.id, 1, 8)
-        local matches = filter_lc == nil or display:lower():find(filter_lc, 1, true) ~= nil
+        local full = (s.name ~= nil and s.name ~= "") and s.name or string.sub(s.id, 1, 8)
+        local matches = filter_lc == nil or full:lower():find(filter_lc, 1, true) ~= nil
         if matches then
             local glyph = state.expanded[s.id] and "▾" or "▸"
+            local age = _pad_date(_relative_age(s.updated_ms, now_s))
+            -- `name` keeps the full label so rename pre-fill and delete
+            -- popup show the untruncated value; `label` is what lands
+            -- in the sidebar buffer and must fit the panel width.
             table.insert(rows, {
                 kind = "session",
                 session_id = s.id,
                 project = s.project,
-                name = display,
+                name = full,
                 depth = 0,
-                label = glyph .. " " .. display,
+                label = glyph .. " " .. age .. " " .. _truncate_label(full),
             })
             if state.expanded[s.id] then
                 for _, child in ipairs(_collect_subagents(s)) do
@@ -832,6 +923,14 @@ function M.close()
     -- filter, mode, rename_buf are deliberately preserved so toggling
     -- the sidebar shut and back open lands the user back where they were.
     state.last_render = {}
+
+    -- Restore the global editing mode the user was in before opening
+    -- the sidebar. Mirrors the save in `open()`; the pcall stays quiet
+    -- in headless engines without a bound window manager.
+    if state.prior_mode ~= nil then
+        pcall(zag.mode.set, state.prior_mode)
+        state.prior_mode = nil
+    end
 end
 
 -- Test-only seam. Production code always reaches `_render` via
@@ -903,6 +1002,16 @@ end
 -- override and re-enable the live tree lookup.
 function M._set_current_for_test(id)
     state.current_session_id = id
+    M._render()
+end
+
+-- Test-only seam: pin the relative-age "now" timestamp so unit tests
+-- can assert an exact label without racing the real-time clock. Pass
+-- a Unix-epoch-second value (or `nil` to clear and resume reading
+-- `os.time()` on every render). The setter triggers a re-render so the
+-- caller can inspect `last_render` immediately afterwards.
+function M._set_now_for_test(now_s)
+    state.now_for_test = now_s
     M._render()
 end
 

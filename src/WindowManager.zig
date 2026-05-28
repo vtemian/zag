@@ -2585,7 +2585,11 @@ fn autoNameSession(self: *WindowManager, pane: Pane) void {
 
     const inputs = conversation.sessionSummaryInputs() orelse return;
 
-    var name_buf: [128]u8 = undefined;
+    // Sized to match the sidebar's display budget: anything longer
+    // word-wraps in the 30-cell panel. The scan terminates on word
+    // boundaries when it runs out of buffer, so we don't store a name
+    // chopped mid-word on disk.
+    var name_buf: [32]u8 = undefined;
     const name = deriveSessionName(&name_buf, inputs.user_text);
     if (name.len == 0) return;
 
@@ -2610,6 +2614,13 @@ fn autoNameSession(self: *WindowManager, pane: Pane) void {
 /// whitespace, and truncate to fit `buf`. Pure function with no IO so
 /// `autoNameSession` runs in microseconds on the main thread.
 ///
+/// Returns an empty slice only when the input has no usable text (all
+/// whitespace or pure punctuation). Mid-word cuts at the buf boundary
+/// are unwound to the previous word boundary so the persisted name
+/// never ends in a chopped fragment. Length is bounded by the caller's
+/// buffer; `autoNameSession` passes a 32-byte buffer sized to the
+/// sidebar.
+///
 /// Replaces a synchronous LLM round-trip that previously blocked the
 /// orchestrator tick for 5-30 seconds on the first turn of every new
 /// session, freezing pane and mode switches behind it.
@@ -2620,6 +2631,7 @@ fn deriveSessionName(buf: []u8, user_text: []const u8) []const u8 {
     var state: State = .leading;
     var written: usize = 0;
     var word_count: usize = 0;
+    var last_word_end: usize = 0;
 
     for (user_text) |b| {
         if (b == '\n' or b == '.' or b == '!' or b == '?') break;
@@ -2628,6 +2640,7 @@ fn deriveSessionName(buf: []u8, user_text: []const u8) []const u8 {
         if (is_space) {
             if (state == .in_word) {
                 word_count += 1;
+                last_word_end = written;
                 if (word_count >= max_words) break;
                 if (written < buf.len) {
                     buf[written] = ' ';
@@ -2639,7 +2652,17 @@ fn deriveSessionName(buf: []u8, user_text: []const u8) []const u8 {
         }
 
         if (state != .in_word) state = .in_word;
-        if (written >= buf.len) break;
+        if (written >= buf.len) {
+            // Buffer is full mid-word. Rewind to the previous word
+            // boundary so we never persist a chopped fragment like
+            // "fix the streaming freeze in comp". With no prior word
+            // boundary (a single word longer than the buffer)
+            // `last_word_end` is 0 and the result comes back empty,
+            // which `autoNameSession` treats as "leave the session
+            // nameless" rather than storing a chopped first syllable.
+            written = last_word_end;
+            break;
+        }
         buf[written] = b;
         written += 1;
     }
@@ -2702,14 +2725,25 @@ test "deriveSessionName preserves a single short word" {
     try std.testing.expectEqualStrings("hello", deriveSessionName(&buf, "hello"));
 }
 
+test "deriveSessionName rewinds to the last word boundary on tight buffer" {
+    // `autoNameSession` passes a 32-byte buffer to keep names sized for
+    // the sidebar. A 5-word prefix longer than the buffer must come back
+    // ending on a word boundary, not chopped mid-word.
+    var buf: [32]u8 = undefined;
+    const out = deriveSessionName(&buf, "fix the streaming freeze in compositor please today");
+    try std.testing.expectEqualStrings("fix the streaming freeze in", out);
+    try std.testing.expect(out.len <= buf.len);
+}
+
 test "deriveSessionName truncates to fit caller buffer" {
-    // Real callers pass Meta.name (128 bytes); make sure a 5-word name
-    // longer than the buffer comes back truncated rather than panicking
-    // or returning an out-of-bounds slice.
+    // Real callers pass autoNameSession's 32-byte buffer; this test
+    // covers the pathological case of a single word longer than the
+    // buffer. With no prior word boundary to rewind to, the result
+    // ends up empty rather than as a mid-word fragment.
     var buf: [10]u8 = undefined;
     const out = deriveSessionName(&buf, "supercalifragilistic word two three four");
     try std.testing.expect(out.len <= buf.len);
-    try std.testing.expectEqualStrings("supercalif", out);
+    try std.testing.expectEqualStrings("", out);
 }
 
 /// Test helper: drop-every-event Sink for tests that construct an

@@ -1277,6 +1277,94 @@ test "sessions sidebar marks the current-session row with a glyph" {
     );
 }
 
+// Labels longer than the sidebar's 24-byte cap render with a trailing
+// ellipsis so the row fits the ~30-cell panel without word-wrapping.
+// `row.name` keeps the full label so rename pre-fill stays editable;
+// only `row.label` (the buffer text) carries the truncation.
+test "sessions sidebar truncates long labels with ellipsis" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+
+    // Short name: 5 bytes, well under the cap.
+    var h_short = try mgr.createSession("test-model");
+    try h_short.rename("alpha");
+    h_short.close();
+
+    // Long name: 40 ASCII bytes, well over the 24-byte cap. Auto-derived
+    // names cannot reach this length (the deriver caps at 24), but a
+    // user can type one via the rename keymap.
+    const long_name = "a-very-long-user-supplied-session-label!";
+    var h_long = try mgr.createSession("test-model");
+    try h_long.rename(long_name);
+    h_long.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\sidebar._set_current_for_test(nil)
+        \\-- Freeze the date column so the test asserts an exact label.
+        \\-- The synthetic sessions are stamped with `os.time()` at create
+        \\-- time, so fixing NOW to (created_at + 0) lands every row at
+        \\-- "now" without depending on wall-clock drift.
+        \\sidebar._set_now_for_test(os.time())
+        \\sidebar._set_filter_for_test("")
+        \\local rows = sidebar._state_for_test().last_render
+        \\
+        \\local short_row, long_row = nil, nil
+        \\for _, r in ipairs(rows) do
+        \\    if r.name == "alpha" then short_row = r end
+        \\    if r.name == "a-very-long-user-supplied-session-label!" then long_row = r end
+        \\end
+        \\assert(short_row ~= nil, "short row missing")
+        \\assert(long_row ~= nil, "long row missing")
+        \\
+        \\-- Short label fits intact: cursor (2) + glyph+space (2) +
+        \\-- date col padded to 3 ('now') + 1 space + name.
+        \\assert(short_row.label == "  ▸ now alpha",
+        \\       "short label unexpected: " .. tostring(short_row.label))
+        \\
+        \\-- Long label truncates the name to the first 22 bytes plus
+        \\-- a single '…' codepoint; the prefix layout matches the
+        \\-- short-label row.
+        \\local want = "  ▸ now "
+        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 22)
+        \\    .. "…"
+        \\assert(long_row.label == want,
+        \\       "long label unexpected:\n  got " .. tostring(long_row.label)
+        \\           .. "\n want " .. want)
+        \\
+        \\-- name stays full so rename pre-fill carries the whole label.
+        \\assert(long_row.name == "a-very-long-user-supplied-session-label!",
+        \\       "row.name should be untruncated: " .. tostring(long_row.name))
+        \\
+        \\sidebar._set_now_for_test(nil)
+    );
+}
+
 // Task 5.1 (sidebar half): when a session row is expanded, the rows
 // iterator emits an indented child row per subagent task_start entry.
 // Collapsing drops them back. The filter (Task 4.1) intentionally
