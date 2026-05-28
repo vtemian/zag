@@ -2208,17 +2208,13 @@ test "sessions sidebar r on a subagent row is a no-op" {
     );
 }
 
-// Task 7.3: delete with confirm popup. `D` (capital) on a session row
-// captures the target and opens a confirm popup. Selecting "yes" calls
-// `zag.sessions.delete(id, project)`; selecting "no" or dismissing is a
-// no-op. The popup lifecycle is owned by `zag.popup.list`, which needs
-// a real window manager. Headless tests can't bind one, so the plugin
-// exposes `state.pending_delete = { target, on_commit, on_cancel }` as
-// a test seam: tests call `_delete_enter_for_test`, inspect the seam,
-// then drive `_delete_commit_for_test("yes" | "no")` to exercise the
-// branch.
+// Delete on a session row removes the JSONL + meta.json immediately;
+// the popup-confirm flow that used to gate this was removed when `d`
+// became an immediate-delete binding. The seam is `_delete_now_for_test`
+// because headless engines can't drive real keypresses through the
+// input parser.
 
-test "sessions sidebar D on a session row captures the delete target" {
+test "sessions sidebar d on a session row deletes the session" {
     const allocator = testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2263,133 +2259,17 @@ test "sessions sidebar D on a session row captures the delete target" {
         \\local st = sidebar._state_for_test()
         \\st.cursor_row = 1
         \\
-        \\sidebar._delete_enter_for_test()
+        \\sidebar._delete_now_for_test()
+        \\
+        \\local after = zag.sessions.list()
+        \\assert(#after == 0,
+        \\       "expected empty list after delete, got " .. tostring(#after))
         \\assert(st.mode == "normal",
-        \\       "D must keep sidebar in normal mode (popup is modal), got " .. tostring(st.mode))
-        \\assert(st.pending_delete ~= nil,
-        \\       "pending_delete must be set after D on a session row")
-        \\assert(st.pending_delete.target.session_id == _test_alpha_id,
-        \\       "pending_delete must capture session id")
-        \\assert(st.pending_delete.target.name == "alpha",
-        \\       "pending_delete must capture session name, got " .. tostring(st.pending_delete.target.name))
-        \\assert(type(st.pending_delete.on_commit) == "function",
-        \\       "pending_delete must expose an on_commit callback")
+        \\       "sidebar mode must stay normal across delete, got " .. tostring(st.mode))
     );
 }
 
-test "sessions sidebar delete commit removes the session" {
-    const allocator = testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
-    defer restoreCwd(orig_cwd);
-
-    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
-    defer if (prev_home) |p| allocator.free(p);
-    setEnvForTest("HOME", fake_home);
-    defer restoreEnvForTest("HOME", prev_home);
-
-    var mgr = try Session.SessionManager.init(allocator);
-    var h_alpha = try mgr.createSession("test-model");
-    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
-    defer allocator.free(alpha_id);
-    h_alpha.close();
-
-    var engine = try LuaEngine.init(allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var buffer_registry = BufferRegistry.init(allocator);
-    defer buffer_registry.deinit();
-    engine.buffer_registry = &buffer_registry;
-
-    _ = engine.lua.pushString(alpha_id);
-    engine.lua.setGlobal("_test_alpha_id");
-
-    try runLua(&engine,
-        \\zag.sessions.rename(_test_alpha_id, "alpha")
-        \\
-        \\local sidebar = require("zag.builtin.sessions")
-        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
-        \\sidebar._attach_buffer_for_test(buf)
-        \\sidebar._set_filter_for_test("")
-        \\
-        \\local st = sidebar._state_for_test()
-        \\st.cursor_row = 1
-        \\
-        \\sidebar._delete_enter_for_test()
-        \\sidebar._delete_commit_for_test("yes")
-        \\
-        \\local after = zag.sessions.list()
-        \\assert(#after == 0, "expected empty list after delete, got " .. tostring(#after))
-        \\assert(st.pending_delete == nil,
-        \\       "pending_delete must clear after commit")
-    );
-}
-
-test "sessions sidebar delete cancel keeps the session" {
-    const allocator = testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
-    defer restoreCwd(orig_cwd);
-
-    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
-    defer if (prev_home) |p| allocator.free(p);
-    setEnvForTest("HOME", fake_home);
-    defer restoreEnvForTest("HOME", prev_home);
-
-    var mgr = try Session.SessionManager.init(allocator);
-    var h_alpha = try mgr.createSession("test-model");
-    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
-    defer allocator.free(alpha_id);
-    h_alpha.close();
-
-    var engine = try LuaEngine.init(allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var buffer_registry = BufferRegistry.init(allocator);
-    defer buffer_registry.deinit();
-    engine.buffer_registry = &buffer_registry;
-
-    _ = engine.lua.pushString(alpha_id);
-    engine.lua.setGlobal("_test_alpha_id");
-
-    try runLua(&engine,
-        \\zag.sessions.rename(_test_alpha_id, "alpha")
-        \\
-        \\local sidebar = require("zag.builtin.sessions")
-        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
-        \\sidebar._attach_buffer_for_test(buf)
-        \\sidebar._set_filter_for_test("")
-        \\
-        \\local st = sidebar._state_for_test()
-        \\st.cursor_row = 1
-        \\
-        \\sidebar._delete_enter_for_test()
-        \\sidebar._delete_commit_for_test("no")
-        \\
-        \\local after = zag.sessions.list()
-        \\assert(#after == 1, "session must survive a 'no' commit, got " .. tostring(#after))
-        \\assert(after[1].name == "alpha",
-        \\       "session name must be preserved after 'no', got " .. tostring(after[1].name))
-        \\assert(st.pending_delete == nil,
-        \\       "pending_delete must clear after commit")
-    );
-}
-
-test "sessions sidebar D on a subagent row is a no-op" {
+test "sessions sidebar d on a subagent row is a no-op" {
     const allocator = testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2440,69 +2320,12 @@ test "sessions sidebar D on a subagent row is a no-op" {
         \\}
         \\st.cursor_row = 2
         \\
-        \\sidebar._delete_enter_for_test()
-        \\assert(st.pending_delete == nil,
-        \\       "D on subagent row must not capture a target")
+        \\sidebar._delete_now_for_test()
         \\
         \\local after = zag.sessions.list()
-        \\assert(#after == 1, "session must not be deleted, got " .. tostring(#after))
-    );
-}
-
-test "sessions sidebar delete cancel via popup dismiss does not delete" {
-    const allocator = testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
-    defer restoreCwd(orig_cwd);
-
-    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
-    defer if (prev_home) |p| allocator.free(p);
-    setEnvForTest("HOME", fake_home);
-    defer restoreEnvForTest("HOME", prev_home);
-
-    var mgr = try Session.SessionManager.init(allocator);
-    var h_alpha = try mgr.createSession("test-model");
-    const alpha_id = try allocator.dupe(u8, h_alpha.id[0..h_alpha.id_len]);
-    defer allocator.free(alpha_id);
-    h_alpha.close();
-
-    var engine = try LuaEngine.init(allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var buffer_registry = BufferRegistry.init(allocator);
-    defer buffer_registry.deinit();
-    engine.buffer_registry = &buffer_registry;
-
-    _ = engine.lua.pushString(alpha_id);
-    engine.lua.setGlobal("_test_alpha_id");
-
-    try runLua(&engine,
-        \\zag.sessions.rename(_test_alpha_id, "alpha")
-        \\
-        \\local sidebar = require("zag.builtin.sessions")
-        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
-        \\sidebar._attach_buffer_for_test(buf)
-        \\sidebar._set_filter_for_test("")
-        \\
-        \\local st = sidebar._state_for_test()
-        \\st.cursor_row = 1
-        \\
-        \\sidebar._delete_enter_for_test()
-        \\-- Simulate the popup being dismissed externally (e.g. Esc):
-        \\-- the popup's on_close fires and the sidebar drops the seam.
-        \\sidebar._delete_dismiss_for_test()
-        \\
-        \\assert(st.pending_delete == nil,
-        \\       "pending_delete must clear after dismiss")
-        \\local after = zag.sessions.list()
-        \\assert(#after == 1, "session must survive a popup dismiss, got " .. tostring(#after))
+        \\assert(#after == 1,
+        \\       "d on subagent row must not delete the parent session, got "
+        \\       .. tostring(#after))
     );
 }
 

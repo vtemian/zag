@@ -30,14 +30,14 @@ local state = {
     mode = "normal",      -- "normal" | "filter" | "rename"
     rename_buf = "",      -- in-progress new name
     rename_target = nil,  -- { session_id, project } captured at rename_enter
-    pending_delete = nil, -- Task 7.3 test seam + state guard. While the
-                          -- confirm popup is open this holds
-                          -- { target = { session_id, project, name },
-                          --   on_commit = fn(item), on_cancel = fn() }.
-                          -- Cleared whenever the popup transitions to
-                          -- closed (commit OR dismiss). state.mode stays
-                          -- "normal" while the popup is up; the popup is
-                          -- modal in its own right.
+    -- Note: the prior `pending_delete` state and `zag.popup.list`-
+    -- driven confirm flow were removed when `d` became an immediate
+    -- delete (see `_delete_now`). The popup helper is meant for
+    -- inline slash/completion menus anchored to a typing pane; with
+    -- `focusable = false` it was effectively a no-op when the
+    -- sidebar itself held focus, which is when `d` is actually
+    -- pressed. Confirm-on-delete can be reintroduced as a sidebar-
+    -- internal mode (similar to the rename overlay) when needed.
     last_render = {},     -- array of { kind, session_id?, depth, label, is_current } for keymap dispatch
     hook_ids = {},        -- registered hook ids, removed on close
     keymap_ids = {},      -- registered buffer-local keymap ids
@@ -366,7 +366,7 @@ end
 function M._d_pressed()
     if state.mode == "filter" then return M._filter_input("d") end
     if state.mode == "rename" then return M._filter_input("d") end
-    M._delete_enter()
+    M._delete_now()
 end
 
 -- `n` dispatcher. In normal mode: tear down the sidebar and replace
@@ -516,97 +516,37 @@ function M._rename_escape()
     M._render()
 end
 
--- Delete-confirm entry. Only fires in normal mode and only when the
--- highlighted row is a session (subagent rows are synthesized from
--- task_start entries inside the parent session's JSONL; there's no
--- "subagent session" to delete).
+-- Delete the session under the cursor immediately, no confirm. Only
+-- fires in normal mode and only when the highlighted row is a session
+-- (subagent rows are synthesized from task_start entries inside the
+-- parent session's JSONL; there's no "subagent session" to delete).
 --
--- The popup is modal in its own right: `state.mode` stays "normal"
--- while it's open so the sidebar's own keymap dispatch keeps working
--- if the user manages to drop focus back to the sidebar (e.g. an
--- async refresh fires). `state.pending_delete` carries the captured
--- target + popup callbacks so headless integration tests can drive
--- the commit/cancel path without a real window manager (the popup
--- requires `zag.layout.float` which is a no-op in headless engines).
+-- Failures from `zag.sessions.delete` (FS error, session in use, etc.)
+-- are caught and logged so the sidebar never crashes on a transient
+-- delete failure. The binding fires a `SessionListChanged` hook on
+-- success; the sidebar's own subscription re-renders, and `_render`'s
+-- cursor clamp keeps the cursor inside the surviving row range.
 --
--- Caveat called out in the plan's risk register: if the session
--- being deleted is currently displayed in some conversation pane, we
--- don't know: the binding has no "is this session bound to any pane"
--- query in v1. The pane will keep displaying the now-stale session
--- (still readable in-memory; the on-disk files are gone). Live with
--- it for v1.
-function M._delete_enter()
+-- Caveat: if the deleted session is currently displayed in some
+-- conversation pane the on-disk files are gone but the pane keeps
+-- showing its cached in-memory transcript. The binding has no
+-- "is this session bound to any pane" query in v1.
+--
+-- This used to open a `zag.popup.list` confirm dialog, but that helper
+-- is designed for inline slash/completion menus and was effectively a
+-- no-op when the sidebar itself held focus (`focusable = false` on
+-- the float). Reintroducing confirm-on-delete should be done as a
+-- sidebar-internal mode (like rename) rather than via the popup helper.
+function M._delete_now()
     if state.mode ~= "normal" then return end
-    if state.pending_delete ~= nil then return end
     local row = state.last_render[state.cursor_row]
     if not row or row.kind ~= "session" then return end
 
-    local target = {
-        session_id = row.session_id,
-        project = row.project,
-        name = row.name or row.session_id,
-    }
-
-    -- `on_commit` is the popup item selection handler. The popup
-    -- helper invokes it with the chosen item; "yes" deletes, "no"
-    -- cancels. Failures from `zag.sessions.delete` (FS error, session
-    -- in use, etc.) are caught here so the sidebar never crashes on
-    -- a transient delete failure; the error surfaces in the log.
-    local function on_commit(item)
-        if item and item.word == "yes" then
-            local ok, err = pcall(zag.sessions.delete, target.session_id, target.project)
-            if not ok then
-                zag.log.warn("sessions sidebar: delete(%s) failed: %s",
-                    tostring(target.session_id), tostring(err))
-            end
-        end
-        -- The popup's `on_close` is what actually clears
-        -- `state.pending_delete`. Doing it here would race with the
-        -- popup teardown order (on_commit fires before on_close).
+    local ok, err = pcall(zag.sessions.delete, row.session_id, row.project)
+    if not ok then
+        zag.log.warn("sessions sidebar: delete(%s) failed: %s",
+            tostring(row.session_id), tostring(err))
     end
-
-    local function on_close()
-        state.pending_delete = nil
-    end
-
-    state.pending_delete = {
-        target = target,
-        on_commit = on_commit,
-        on_cancel = on_close,
-    }
-
-    -- Open the popup. Wrap in pcall so headless engines (no
-    -- WindowManager bound) don't crash when `zag.layout.float`
-    -- raises. The pending_delete seam is set BEFORE this call so
-    -- tests can drive the commit path even when the popup itself
-    -- fails to open.
-    local ok, popup = pcall(require, "zag.popup.list")
-    if not ok or popup == nil then return end
-
-    local pane = state.host_pane or state.pane_id
-    if pane == nil then return end
-
-    local items = {
-        { word = "yes", abbr = "yes, delete " .. target.name },
-        { word = "no",  abbr = "no, cancel" },
-    }
-
-    pcall(popup.open, {
-        pane = pane,
-        items = function(_) return items end,
-        on_commit = on_commit,
-        on_cancel = function() end,
-        on_close = on_close,
-        relative = "cursor",
-        row = 1,
-        col = 0,
-        min_width = 20,
-        max_width = 60,
-        min_height = 1,
-        max_height = 4,
-        border = "rounded",
-        title = "Delete session?",
-    })
 end
 
 -- Activate the row under the cursor. For a session row this collapses
@@ -1118,28 +1058,11 @@ function M._rename_enter_for_test() M._rename_enter() end
 function M._rename_commit_for_test() M._rename_commit() end
 function M._rename_escape_for_test() M._rename_escape() end
 
--- Task 7.3 test seams. The confirm popup is owned by
--- `zag.popup.list`, which needs a real WindowManager to render its
--- float; headless engines can't bind one. The plugin still walks
--- `state.pending_delete = { target, on_commit, on_cancel }` before
--- opening the popup, so tests use these seams to drive each branch
--- without touching the popup helper itself.
-function M._delete_enter_for_test() M._delete_enter() end
-function M._delete_commit_for_test(word)
-    local pending = state.pending_delete
-    if pending == nil then return end
-    pcall(pending.on_commit, { word = word })
-    -- Mirror the popup's teardown order: on_commit fires first, then
-    -- on_close. The production path runs on_close via `popup.list`;
-    -- the test seam runs it explicitly so `state.pending_delete`
-    -- clears the same way it would in production.
-    pcall(pending.on_cancel)
-end
-function M._delete_dismiss_for_test()
-    local pending = state.pending_delete
-    if pending == nil then return end
-    pcall(pending.on_cancel)
-end
+-- Single test seam for the immediate-delete path. The pre-existing
+-- popup-confirm seams (`_delete_commit_for_test`, `_delete_dismiss_for_test`,
+-- and the `pending_delete` snapshot they read) were dropped along with
+-- the popup itself; tests now assert on the post-delete session list.
+function M._delete_now_for_test() M._delete_now() end
 
 -- Test-only seam (Task 6.1). Forces `_resolve_current_session_id`
 -- to return `id` on the next render, bypassing the `zag.layout.tree`
