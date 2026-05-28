@@ -117,6 +117,14 @@ pub const BufferSink = struct {
                     self.buffer.tree.removeNode(node);
                     self.current_assistant_node = null;
                 }
+                // `removeNode` calls `allocator.destroy` on the node, so
+                // `last_assistant_node` (which mirrored the same pointer in
+                // `.assistant_delta`) would dangle. A subsequent
+                // `.thinking_delta` would feed the freed pointer into
+                // `appendNode(parent, ...)` as a use-after-free. Drop it
+                // here so the next thinking_delta falls back to a root
+                // parent like the pre-response case.
+                self.last_assistant_node = null;
             },
             .thinking_delta => |e| {
                 if (self.current_thinking_node) |node| {
@@ -539,4 +547,37 @@ test "pre-response thinking_delta still parents at root" {
     try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
     try std.testing.expectEqual(Conversation.NodeType.thinking, roots[1].node_type);
     try std.testing.expectEqual(Conversation.NodeType.assistant_text, roots[2].node_type);
+}
+
+test "assistant_reset clears last_assistant_node so thinking_delta cannot follow a freed node" {
+    // `.assistant_reset` calls `tree.removeNode` which destroys the
+    // assistant_text node. Before the fix, `last_assistant_node` still
+    // pointed at the freed memory, and a subsequent `.thinking_delta`
+    // fed that dangling pointer into `appendNode(parent, ...)` as a
+    // use-after-free. The fix nulls the slot in the reset handler so
+    // the next thinking_delta falls back to a root parent.
+    const allocator = std.testing.allocator;
+
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .run_start = .{ .user_text = "hello" } });
+    s.push(.{ .assistant_delta = .{ .text = "draft" } });
+    s.push(.assistant_reset);
+    // If `last_assistant_node` were still set, this would crash or
+    // corrupt memory under the testing allocator.
+    s.push(.{ .thinking_delta = .{ .text = "second thought" } });
+    s.push(.thinking_stop);
+    s.push(.run_end);
+
+    // The reset removed the assistant_text node; the new thinking
+    // landed at root because last_assistant_node was cleared.
+    const roots = cb.tree.root_children.items;
+    try std.testing.expectEqual(@as(usize, 2), roots.len);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
+    try std.testing.expectEqual(Conversation.NodeType.thinking, roots[1].node_type);
 }
