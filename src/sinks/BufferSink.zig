@@ -31,6 +31,14 @@ pub const BufferSink = struct {
     /// The assistant node currently accumulating streaming deltas, or
     /// null between turns / after an `assistant_reset`.
     current_assistant_node: ?*Node = null,
+    /// Most recent assistant_text node for this run, kept ALIVE across
+    /// the `.assistant_delta` -> `.thinking_delta` boundary. Lets the
+    /// post-response thinking-delta path parent a new thinking node
+    /// under the assistant instead of appending an orphan at root.
+    /// Cleared on `.run_end` and the next `.run_start` so it never
+    /// crosses turns. See Issue 4 in
+    /// docs/plans/2026-05-28-conversation-layout-fixes.md.
+    last_assistant_node: ?*Node = null,
     /// call_id -> tool_call node. Populated on `tool_use`, drained on
     /// `tool_result`. Keys are owned (duped on insert, freed on remove).
     pending_tool_calls: std.StringHashMapUnmanaged(*Node) = .{},
@@ -70,6 +78,7 @@ pub const BufferSink = struct {
     pub fn resetCorrelation(self: *BufferSink) void {
         self.current_assistant_node = null;
         self.current_thinking_node = null;
+        self.last_assistant_node = null;
         var it = self.pending_tool_calls.iterator();
         while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pending_tool_calls.clearRetainingCapacity();
@@ -84,6 +93,7 @@ pub const BufferSink = struct {
                 _ = self.buffer.appendUserNode(e.user_text) catch return;
                 self.current_assistant_node = null;
                 self.current_thinking_node = null;
+                self.last_assistant_node = null;
                 self.last_tool_call = null;
             },
             .assistant_delta => |e| {
@@ -97,6 +107,10 @@ pub const BufferSink = struct {
                     const node = self.buffer.appendNode(null, .assistant_text, e.text) catch return;
                     self.current_assistant_node = node;
                 }
+                // Survives past the next .thinking_delta so a post-response
+                // extended-thinking block parents under the assistant_text
+                // instead of appearing as an orphan root-level sibling.
+                self.last_assistant_node = self.current_assistant_node;
             },
             .assistant_reset => {
                 if (self.current_assistant_node) |node| {
@@ -108,7 +122,13 @@ pub const BufferSink = struct {
                 if (self.current_thinking_node) |node| {
                     self.buffer.appendToNode(node, e.text) catch return;
                 } else {
-                    const node = self.buffer.appendNode(null, .thinking, e.text) catch return;
+                    // Parent under the most recent assistant_text if one exists
+                    // for this run: extended-thinking events that arrive AFTER
+                    // assistant_delta belong inside the response, not between
+                    // turns. With no assistant yet (pre-response thinking),
+                    // parent at root as before.
+                    const parent = self.last_assistant_node;
+                    const node = self.buffer.appendNode(parent, .thinking, e.text) catch return;
                     // Collapsed even during streaming: the user opts into reasoning content with Ctrl-R.
                     node.collapsed = true;
                     self.current_thinking_node = node;
@@ -126,8 +146,12 @@ pub const BufferSink = struct {
             .tool_use => |e| {
                 // Boundary: close any live assistant/thinking node before
                 // opening a tool call, otherwise later deltas mis-parent.
+                // Tool invocation ends the surrounding assistant context: a
+                // subsequent thinking_delta belongs at root (pre-next-text
+                // reasoning), not nested under the now-stale assistant_text.
                 self.current_assistant_node = null;
                 self.current_thinking_node = null;
+                self.last_assistant_node = null;
                 // Pair the live provider id onto the node itself (Kimi's
                 // `<name>:<index>`, Anthropic's `toolu_*`, ...). The wire
                 // projection reads it back through `Conversation.projectNode`
@@ -457,4 +481,62 @@ test "BufferSink error_event appends an err node" {
     try std.testing.expectEqual(Conversation.NodeType.err, node.node_type);
     const tb = try cb.buffer_registry.asText(node.buffer_id.?);
     try std.testing.expectEqualStrings("boom", tb.bytesView());
+}
+
+test "post-response thinking_delta parents under the assistant_text node" {
+    const allocator = std.testing.allocator;
+
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    // Turn 1: user message, assistant_delta (closes any open thinking),
+    // then a LATE thinking_delta that arrives after the visible reply.
+    s.push(.{ .run_start = .{ .user_text = "hello" } });
+    s.push(.{ .assistant_delta = .{ .text = "hi there" } });
+    s.push(.{ .thinking_delta = .{ .text = "post-response reasoning" } });
+    s.push(.thinking_stop);
+    s.push(.run_end);
+
+    // Tree must be: [user_msg, assistant_text]
+    // The post-response thinking is a CHILD of assistant_text, not a
+    // root sibling.
+    const roots = cb.tree.root_children.items;
+    try std.testing.expectEqual(@as(usize, 2), roots.len);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
+    try std.testing.expectEqual(Conversation.NodeType.assistant_text, roots[1].node_type);
+
+    const assistant = roots[1];
+    try std.testing.expectEqual(@as(usize, 1), assistant.children.items.len);
+    try std.testing.expectEqual(Conversation.NodeType.thinking, assistant.children.items[0].node_type);
+}
+
+test "pre-response thinking_delta still parents at root" {
+    // The opposite-direction contract: when thinking_delta arrives
+    // BEFORE any assistant_delta this turn, last_assistant_node is
+    // still null from the previous turn's run_end, so the new thinking
+    // node parents at root as today.
+    const allocator = std.testing.allocator;
+
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .run_start = .{ .user_text = "hello" } });
+    s.push(.{ .thinking_delta = .{ .text = "let me think" } });
+    s.push(.thinking_stop);
+    s.push(.{ .assistant_delta = .{ .text = "answer" } });
+    s.push(.run_end);
+
+    const roots = cb.tree.root_children.items;
+    try std.testing.expectEqual(@as(usize, 3), roots.len);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
+    try std.testing.expectEqual(Conversation.NodeType.thinking, roots[1].node_type);
+    try std.testing.expectEqual(Conversation.NodeType.assistant_text, roots[2].node_type);
 }
