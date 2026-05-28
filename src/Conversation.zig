@@ -3829,6 +3829,33 @@ test "getWindow matches defaultGetWindow across widths and scroll offsets" {
     }
 }
 
+test "turn_gap row carries null row_style even when adjacent to user_message" {
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+    // Two root siblings: thinking, then user_message. Expect one gap
+    // row in between with null row_style.
+    _ = try cb.appendNode(null, .thinking, "ponder");
+    _ = try cb.appendNode(null, .user_message, "hello");
+
+    const theme = Theme.defaultTheme();
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const lines = try cb.getVisibleLines(frame_arena.allocator(), allocator, &theme, 0, 16);
+
+    // Find the gap row: the first line whose spans are empty OR whose
+    // text content is whitespace-only and not part of either node.
+    var saw_gap = false;
+    for (lines.items) |line| {
+        if (line.spans.len == 0) {
+            try std.testing.expectEqual(@as(?Theme.HighlightSlot, null), line.row_style);
+            saw_gap = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_gap);
+}
+
 test "decorate emits a blank gutter on user_message rows" {
     const allocator = std.testing.allocator;
     var cb = try Conversation.init(allocator, 1, "test");
