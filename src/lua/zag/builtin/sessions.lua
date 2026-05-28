@@ -710,18 +710,22 @@ end
 --
 -- Total width budget in a 30-cell panel:
 --     2 (cursor) + 2 (glyph + space) + 3 (date col) + 1 (gap) + 22 (name)
---     = 30 cells. Names longer than 22 bytes get an ellipsis suffix.
+--     = 30 cells. The ellipsis costs one cell, so the byte cap is 21
+--     (truncated name = 21 chars + "…" = 22 cells). Names of exactly
+--     22 bytes still fit intact because the cap only kicks in when
+--     truncation would happen.
 --
 -- Pure byte arithmetic on `_truncate_label`: keymap input is ASCII-only
 -- (see `_filter_printables`) and the on-disk deriver lands names at
--- 32 bytes worst-case using word-boundary rewind, so a 22-byte cut can
+-- 32 bytes worst-case using word-boundary rewind, so a 21-byte cut can
 -- never land mid-codepoint.
-local LABEL_MAX_BYTES = 22
+local LABEL_MAX_CELLS = 22
+local TRUNCATED_NAME_BYTES = LABEL_MAX_CELLS - 1
 local DATE_COL_WIDTH = 3
 
 local function _truncate_label(s)
-    if #s <= LABEL_MAX_BYTES then return s end
-    return s:sub(1, LABEL_MAX_BYTES) .. "…"
+    if #s <= LABEL_MAX_CELLS then return s end
+    return s:sub(1, TRUNCATED_NAME_BYTES) .. "…"
 end
 
 -- Compact relative age. Buckets give a tight 2-3 cell label (4 in the

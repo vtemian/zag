@@ -1347,11 +1347,12 @@ test "sessions sidebar truncates long labels with ellipsis" {
         \\assert(short_row.label == "  ▸ now alpha",
         \\       "short label unexpected: " .. tostring(short_row.label))
         \\
-        \\-- Long label truncates the name to the first 22 bytes plus
+        \\-- Long label truncates the name to the first 21 bytes plus
         \\-- a single '…' codepoint; the prefix layout matches the
-        \\-- short-label row.
+        \\-- short-label row. 21 + 1 ellipsis cell + 8-cell prefix
+        \\-- (cursor + glyph + date + gap) lands at exactly 30 cells.
         \\local want = "  ▸ now "
-        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 22)
+        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 21)
         \\    .. "…"
         \\assert(long_row.label == want,
         \\       "long label unexpected:\n  got " .. tostring(long_row.label)

@@ -134,6 +134,16 @@ replay_last_tool_call: ?*Node = null,
 /// `handleLoadedEntry` mis-parents tool_results onto the linear
 /// `last_tool_call` and the resulting wire breaks on resume.
 replay_pending_tool_calls: std.StringHashMapUnmanaged(*Node) = .{},
+/// Live coalescing slots for streaming-delta entries during replay.
+/// The provider emits one JSONL row per token; without coalescing,
+/// `handleLoadedEntry` materializes one node per token and the
+/// transcript renders as one word per line. Mirrors `BufferSink`'s
+/// `current_assistant_node` / `current_thinking_node`: each subsequent
+/// same-kind delta `appendToNode`s the open slot, and boundary entries
+/// (user_message, tool_use, task_*, info, err, session_*) reset both
+/// so the NEXT delta opens a fresh node.
+replay_assistant_text: ?*Node = null,
+replay_thinking: ?*Node = null,
 
 /// Create a new empty buffer with the given id and name. The buffer
 /// owns the node tree, the inline `BufferRegistry`, and the session
@@ -858,6 +868,8 @@ pub fn loadFromEntries(self: *Conversation, entries: []const Session.Entry) !voi
     // directly to the Conversation for the duration of the load and
     // tear it down at the end.
     self.replay_last_tool_call = null;
+    self.replay_assistant_text = null;
+    self.replay_thinking = null;
     var it = self.replay_pending_tool_calls.iterator();
     while (it.next()) |kv| {
         self.allocator.free(kv.key_ptr.*);
@@ -905,6 +917,8 @@ fn routeReplayEntry(
 /// nested replays leave no dangling pointer or leaked key behind.
 fn clearReplayChains(self: *Conversation) void {
     self.replay_last_tool_call = null;
+    self.replay_assistant_text = null;
+    self.replay_thinking = null;
     var map_it = self.replay_pending_tool_calls.iterator();
     while (map_it.next()) |kv| {
         self.allocator.free(kv.key_ptr.*);
@@ -923,9 +937,36 @@ fn handleLoadedEntry(
     last_tool_call: *?*Node,
 ) !void {
     switch (entry.entry_type) {
-        .user_message => _ = try self.appendNode(null, .user_message, entry.content),
-        .assistant_text => _ = try self.appendNode(null, .assistant_text, entry.content),
+        .user_message => {
+            // Boundary: a new user turn closes any open streaming-delta
+            // slots so the next assistant/thinking delta opens fresh.
+            self.replay_assistant_text = null;
+            self.replay_thinking = null;
+            _ = try self.appendNode(null, .user_message, entry.content);
+        },
+        .assistant_text => {
+            // Streaming-delta coalescing: the provider emits one JSONL
+            // row per token. Live streaming concats them into one node
+            // via BufferSink.current_assistant_node; replay must mirror
+            // that, otherwise the transcript renders as one word per
+            // line. A new assistant delta also closes any open
+            // `thinking` block, matching the live boundary in
+            // BufferSink.assistant_delta.
+            self.replay_thinking = null;
+            if (self.replay_assistant_text) |node| {
+                try self.appendToNode(node, entry.content);
+            } else {
+                const node = try self.appendNode(null, .assistant_text, entry.content);
+                self.replay_assistant_text = node;
+            }
+        },
         .tool_call => {
+            // Boundary: tool invocations end the surrounding streaming
+            // run so a subsequent assistant_text delta opens a new node
+            // (matches BufferSink.tool_use clearing
+            // current_assistant_node / current_thinking_node).
+            self.replay_assistant_text = null;
+            self.replay_thinking = null;
             // Carry the JSONL-persisted `tool_use_id` onto the tree so the
             // wire projection echoes the model's original ids (matching
             // what the live BufferSink path does for in-flight turns).
@@ -959,8 +1000,16 @@ fn handleLoadedEntry(
             const result_node = try self.appendNode(parent, .tool_result, entry.content);
             result_node.tool_result_is_error = entry.is_error;
         },
-        .info => _ = try self.appendNode(null, .status, entry.content),
-        .err => _ = try self.appendNode(null, .err, entry.content),
+        .info => {
+            self.replay_assistant_text = null;
+            self.replay_thinking = null;
+            _ = try self.appendNode(null, .status, entry.content);
+        },
+        .err => {
+            self.replay_assistant_text = null;
+            self.replay_thinking = null;
+            _ = try self.appendNode(null, .err, entry.content);
+        },
         .session_start, .session_rename => {},
         // `task_start` / `task_end` are audit markers for subagent
         // delegation. The subagent's own output is persisted inline
@@ -981,8 +1030,21 @@ fn handleLoadedEntry(
         // child activity in the transcript on replay. The
         // `task_start` / `task_end` markers above still bracket the
         // delegation in the JSONL stream.
-        .task_message => _ = try self.appendNode(null, .assistant_text, entry.content),
+        .task_message => {
+            // Inline subagent text: same coalescing rule as top-level
+            // assistant_text. Without it a 1000-token child renders as
+            // 1000 separate "▸ word" lines under the parent.
+            self.replay_thinking = null;
+            if (self.replay_assistant_text) |node| {
+                try self.appendToNode(node, entry.content);
+            } else {
+                const node = try self.appendNode(null, .assistant_text, entry.content);
+                self.replay_assistant_text = node;
+            }
+        },
         .task_tool_use => {
+            self.replay_assistant_text = null;
+            self.replay_thinking = null;
             const tool_input_arg: ?[]const u8 = if (entry.tool_input.len > 0) entry.tool_input else null;
             const node = try self.appendToolCallNode(null, entry.tool_name, entry.tool_use_id, tool_input_arg);
             node.collapsed = true;
@@ -1012,13 +1074,24 @@ fn handleLoadedEntry(
             result_node.tool_result_is_error = entry.is_error;
         },
         .thinking => {
-            const node = try self.appendNode(null, .thinking, entry.content);
-            // Replay has no streaming context; collapse so the
-            // transcript reads cleanly and the user opts into
-            // reasoning content with Ctrl-R.
-            node.collapsed = true;
+            // Streaming-delta coalescing for `thinking`. Same shape as
+            // the assistant_text arm: append into the open thinking
+            // node when one exists, otherwise mint a new collapsed
+            // one. A new thinking delta does NOT close the assistant
+            // slot because thinking blocks always precede the visible
+            // turn; the assistant slot is closed when the FIRST visible
+            // assistant_text arrives (see that arm).
+            if (self.replay_thinking) |node| {
+                try self.appendToNode(node, entry.content);
+            } else {
+                const node = try self.appendNode(null, .thinking, entry.content);
+                node.collapsed = true;
+                self.replay_thinking = node;
+            }
         },
         .thinking_redacted => {
+            self.replay_assistant_text = null;
+            self.replay_thinking = null;
             const node = try self.appendNode(null, .thinking_redacted, "");
             node.collapsed = true;
         },
