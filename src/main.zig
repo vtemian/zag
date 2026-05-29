@@ -83,7 +83,7 @@ fn appendStatusLineFmt(
 fn setNonBlocking(fd: posix.fd_t) error{Unexpected}!void {
     const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(usize, 0));
     if (flags < 0) return error.Unexpected;
-    const nonblock_bit: usize = @bitCast(std.c.O{ .NONBLOCK = true });
+    const nonblock_bit: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
     const new_flags: usize = @as(usize, @intCast(flags)) | nonblock_bit;
     if (std.c.fcntl(fd, std.c.F.SETFL, new_flags) < 0) return error.Unexpected;
 }

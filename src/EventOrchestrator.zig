@@ -1275,7 +1275,7 @@ fn drainChildrenToCompletion(self: *EventOrchestrator) void {
         // Yield so a parent agent thread woken by a child's `done` can return
         // from runChild and let its (cancelled) loop push `.done` before the
         // next pass, instead of busy-spinning on a not-yet-finished parent.
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
 }
 

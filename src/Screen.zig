@@ -420,7 +420,15 @@ pub fn render(self: *Screen, file: std.Io.File) !void {
 
     self.render_buf.clearRetainingCapacity();
 
-    const writer = self.render_buf.writer(self.allocator);
+    // 0.16 dropped the ArrayList writer adapter. Drive the diff through an
+    // Allocating writer that borrows the render buffer's backing store, then
+    // sync the grown buffer back into `render_buf` after the diff block so
+    // the retained capacity survives for the next frame's
+    // `clearRetainingCapacity` (the render path stays allocation-free in
+    // steady state).
+    var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.render_buf);
+    defer self.render_buf = aw.toArrayList();
+    const writer = &aw.writer;
 
     var cells_changed: u32 = 0;
     {
@@ -484,7 +492,7 @@ pub fn render(self: *Screen, file: std.Io.File) !void {
                 cells_changed += run_end - col;
 
                 // ANSI cursor positions are 1-indexed.
-                try std.fmt.format(writer, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
+                try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
 
                 if (!stylesEqual(last_style, cur.style) or
                     !optColorsEqual(last_fg, cur.fg) or
@@ -528,12 +536,16 @@ pub fn render(self: *Screen, file: std.Io.File) !void {
     // within one render is capped at `write_deadline_ms`. Past that we
     // drop the frame and let the next render redraw from scratch.
     {
+        // Bytes produced by the diff this frame. Read from the writer (which
+        // owns the buffer until the function-exit `defer` syncs it back into
+        // `render_buf`) rather than `render_buf.items`, which is empty here.
+        const frame = aw.writer.buffered();
         var write_span = trace.span("write");
-        defer write_span.endWithArgs(.{ .bytes = self.render_buf.items.len });
+        defer write_span.endWithArgs(.{ .bytes = frame.len });
         var written: usize = 0;
         var block_started_ms: ?i64 = null;
-        while (written < self.render_buf.items.len) {
-            written += file.write(self.render_buf.items[written..]) catch |err| switch (err) {
+        while (written < frame.len) {
+            written += writeSome(file, frame[written..]) catch |err| switch (err) {
                 error.WouldBlock => {
                     const now_ms = clock.milliTimestamp();
                     if (block_started_ms == null) block_started_ms = now_ms;
@@ -584,6 +596,25 @@ pub fn render(self: *Screen, file: std.Io.File) !void {
         for (self.previous) |*cell| cell.cluster_id = 0;
         self.cluster_bytes.clearRetainingCapacity();
         self.cluster_index.clearRetainingCapacity();
+    }
+}
+
+/// A single non-blocking write to the render fd. 0.16 routes `File` writes
+/// through buffered `std.Io.Writer`s that surface only `error.WriteFailed`
+/// and swallow the `EAGAIN` the render loop needs to detect tty backpressure
+/// (XOFF, a hung SSH pipe). The raw libc `write` keeps the exact short-write
+/// + `WouldBlock` contract the previous `file.write` had, with no allocation.
+const WriteSomeError = error{ WouldBlock, WriteFailed };
+
+fn writeSome(file: std.Io.File, bytes: []const u8) WriteSomeError!usize {
+    while (true) {
+        const rc = std.c.write(file.handle, bytes.ptr, bytes.len);
+        if (rc >= 0) return @intCast(rc);
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.WriteFailed,
+        }
     }
 }
 
@@ -681,21 +712,21 @@ fn writeSgr(writer: anytype, style: Style, fg: Color, bg: Color) !void {
 
     switch (fg) {
         .default => {},
-        .palette => |idx| try std.fmt.format(writer, ";38;5;{d}", .{idx}),
+        .palette => |idx| try writer.print(";38;5;{d}", .{idx}),
         .rgb => |c| if (Terminal.true_color) {
-            try std.fmt.format(writer, ";38;2;{d};{d};{d}", .{ c.r, c.g, c.b });
+            try writer.print(";38;2;{d};{d};{d}", .{ c.r, c.g, c.b });
         } else {
-            try std.fmt.format(writer, ";38;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
+            try writer.print(";38;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
         },
     }
 
     switch (bg) {
         .default => {},
-        .palette => |idx| try std.fmt.format(writer, ";48;5;{d}", .{idx}),
+        .palette => |idx| try writer.print(";48;5;{d}", .{idx}),
         .rgb => |c| if (Terminal.true_color) {
-            try std.fmt.format(writer, ";48;2;{d};{d};{d}", .{ c.r, c.g, c.b });
+            try writer.print(";48;2;{d};{d};{d}", .{ c.r, c.g, c.b });
         } else {
-            try std.fmt.format(writer, ";48;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
+            try writer.print(";48;5;{d}", .{rgbTo256(c.r, c.g, c.b)});
         },
     }
 

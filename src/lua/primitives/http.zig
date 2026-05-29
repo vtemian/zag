@@ -74,13 +74,13 @@ pub const AbortCtx = struct {
         const conn = self.connection.load(.acquire) orelse return;
         if (self.shutdown_done.swap(true, .acq_rel)) return;
 
-        // Pull the fd out of the connection's stream_reader and
-        // shutdown both directions. `shutdown(2)` wakes a blocked
-        // recv with ECONNRESET/ENOTCONN (depending on platform) but
-        // keeps the fd valid so `client.deinit` can still call close
-        // on it without hitting EBADF or, worse, a reused fd.
-        const stream = conn.stream_reader.getStream();
-        std.posix.shutdown(stream.handle, .both) catch |err| {
+        // Shutdown both directions on the connection's stream. `shutdown(2)`
+        // wakes a blocked recv with ECONNRESET/ENOTCONN (depending on
+        // platform) but keeps the fd valid so `client.deinit` can still call
+        // close on it without hitting EBADF or, worse, a reused fd. 0.16 made
+        // getStream private; reach the Stream directly and use its io-aware
+        // shutdown rather than the removed std.posix.shutdown.
+        conn.stream_reader.stream.shutdown(process_io.get(), .both) catch |err| {
             log.debug("http abort: shutdown failed: {s}", .{@errorName(err)});
         };
     }

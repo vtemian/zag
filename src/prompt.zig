@@ -307,9 +307,10 @@ fn findGitToplevel(alloc: Allocator, start: []const u8) !?[]const u8 {
 
         // Check `<slice>/.git` existence. Either a directory (normal
         // repo) or a regular file (linked worktree pointer) qualifies.
-        var dir = std.fs.openDirAbsolute(slice, .{}) catch return null;
-        defer dir.close();
-        if (dir.access(".git", .{})) |_| {
+        const io = process_io.get();
+        var dir = std.Io.Dir.openDirAbsolute(io, slice, .{}) catch return null;
+        defer dir.close(io);
+        if (dir.access(io, ".git", .{})) |_| {
             return try alloc.dupe(u8, slice);
         } else |_| {}
 

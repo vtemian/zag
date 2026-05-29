@@ -732,12 +732,13 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     });
     defer Trajectory.freeTrajectory(traj, gpa);
 
-    const file = try std.fs.cwd().createFile(deps.mode.trajectory_out, .{ .truncate = true });
-    defer file.close();
+    const io = process_io.get();
+    const file = try std.Io.Dir.cwd().createFile(io, deps.mode.trajectory_out, .{ .truncate = true });
+    defer file.close(io);
     var buffer: std.Io.Writer.Allocating = .init(gpa);
     defer buffer.deinit();
     try Trajectory.serialize(traj, gpa, &buffer.writer);
-    try file.writeAll(buffer.written());
+    try file.writeStreamingAll(io, buffer.writer.buffered());
 
     if (agent_err) |e| {
         log.err("headless agent error: {s}", .{e});
