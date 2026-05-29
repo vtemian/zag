@@ -164,12 +164,16 @@ pub const HookDispatcher = struct {
 
         var it = self.registry.iterMatching(payload.kind(), pattern_key);
         while (it.next()) |hook| {
+            // Snapshot the stack so a marshal failure restores exactly
+            // what we pushed (fn + any partial payload table), instead
+            // of trusting a hardcoded pop count.
+            const top = lua.getTop();
             // Stack: [fn]
             _ = lua.rawGetIndex(zlua.registry_index, hook.lua_ref);
             // Stack: [fn, payload_table]
             self.pushPayloadAsTable(lua, payload.*) catch |err| {
                 log.warn("hook payload marshalling failed for {s}: {}", .{ @tagName(payload.kind()), err });
-                lua.pop(1); // pop fn
+                lua.setTop(top); // drop fn + any partial table
                 continue;
             };
             // spawnHookFn consumes [fn, payload] from main stack and
@@ -260,10 +264,14 @@ pub const HookDispatcher = struct {
     /// The caller is responsible for ensuring `lua_ref` resolves to a
     /// Lua function registered via `zag.hook()`.
     fn fireHookSingle(self: *HookDispatcher, lua_ref: i32, payload: *Hooks.HookPayload, lua: *Lua) !void {
+        // Snapshot before pushing so a marshal failure restores the
+        // stack to its entry depth (dropping fn + any partial table)
+        // rather than relying on a hardcoded pop count.
+        const top = lua.getTop();
         _ = lua.rawGetIndex(zlua.registry_index, lua_ref);
         self.pushPayloadAsTable(lua, payload.*) catch |err| {
             log.warn("hook payload marshalling failed for {s}: {}", .{ @tagName(payload.kind()), err });
-            lua.pop(1);
+            lua.setTop(top);
             return;
         };
         lua.protectedCall(.{ .args = 1, .results = 1 }) catch |err| {

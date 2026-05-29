@@ -240,12 +240,24 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
     // here for deterministic sizes from the Lua side.
     if (spec.max_output_bytes > 0) {
         if (stdout_slice.len > spec.max_output_bytes) {
-            const resized = alloc.realloc(stdout_slice, spec.max_output_bytes) catch stdout_slice[0..spec.max_output_bytes];
-            stdout_slice = resized;
+            // realloc may move; on success we get a slice whose .len
+            // matches its allocation, which is what the eventual free
+            // requires. On failure DO NOT alias the original as a
+            // shortened slice; that hands free() a length that no
+            // longer matches the allocation. Keep the full slice and
+            // mark the run truncated so Lua still sees the cap was hit.
+            if (alloc.realloc(stdout_slice, spec.max_output_bytes)) |resized| {
+                stdout_slice = resized;
+            } else |_| {
+                truncated = true;
+            }
         }
         if (stderr_slice.len > spec.max_output_bytes) {
-            const resized = alloc.realloc(stderr_slice, spec.max_output_bytes) catch stderr_slice[0..spec.max_output_bytes];
-            stderr_slice = resized;
+            if (alloc.realloc(stderr_slice, spec.max_output_bytes)) |resized| {
+                stderr_slice = resized;
+            } else |_| {
+                truncated = true;
+            }
         }
     }
 
@@ -377,6 +389,46 @@ test "executeExec cancels in-flight child via aborter" {
     try testing.expect(job.result == null);
     // Must have terminated far short of the 5s sleep and well before 30s timeout.
     try testing.expect(elapsed < 1000);
+}
+
+test "executeExec truncation yields freeable trimmed slices" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    // printf emits 10 bytes; cap at 4. The poller may accumulate a few
+    // bytes past the cap before the loop's truncation kill, so the only
+    // hard guarantee is `<= original output`. What this test really
+    // proves is that the trimmed slices handed to the caller are
+    // freeable under testing.allocator: a length-mismatched free (the
+    // old realloc-failure aliasing bug) trips the allocator here.
+    //
+    // The realloc-FAILURE branch can't be forced with testing.allocator,
+    // so we exercise the success-trim path and rely on the free below to
+    // assert the slice length matches its allocation.
+    var argv_storage = [_][]const u8{ "/bin/sh", "-c", "printf 0123456789" };
+    var job = Job{
+        .kind = .{ .cmd_exec = .{
+            .argv = argv_storage[0..],
+            .max_output_bytes = 4,
+        } },
+        .thread_ref = 0,
+        .scope = root,
+    };
+    executeExec(alloc, &job);
+
+    try testing.expect(job.err_tag == null);
+    try testing.expect(job.result != null);
+    const r = job.result.?.cmd_exec;
+    defer alloc.free(r.stdout);
+    defer alloc.free(r.stderr);
+    // `<= 10` (the unclamped output) is the only race-free bound: the
+    // in-loop cap kill may or may not fire before the 10-byte child
+    // exits within a single poll tick, so we do not assert a hard 4.
+    // The load-bearing check is the deferred free above not tripping
+    // the allocator; that is what the realloc-failure aliasing bug
+    // (a length-mismatched free) used to violate.
+    try testing.expect(r.stdout.len <= 10);
 }
 
 test {

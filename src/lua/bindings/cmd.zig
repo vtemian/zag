@@ -666,9 +666,18 @@ fn cmdHandleLines(co: *Lua) i32 {
     // Validate the handle up front so misuse (calling on a dead
     // handle) errors here rather than at first iteration.
     const ud = co.checkUserdata(CmdHandleUd, 1, CmdHandleUd.METATABLE_NAME);
-    _ = ud.ptr orelse {
+    const h = ud.ptr orelse {
         co.raiseErrorStr("cmd:lines: invalid handle", .{});
     };
+
+    // One consumer per handle: stdout_buf is helper-owned and read
+    // without locking on the iterator fast path. A second `:lines()`
+    // would interleave reads and split lines across iterators while
+    // racing the helper, so reject it instead of corrupting output.
+    if (h.lines_consumed) {
+        co.raiseErrorStr("cmd:lines: already consumed; only one :lines() iterator per handle", .{});
+    }
+    h.lines_consumed = true;
 
     // Build a closure that captures the handle userdata as its
     // single upvalue. The `for` loop in Lua calls this closure
