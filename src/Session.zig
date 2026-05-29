@@ -386,29 +386,20 @@ pub const SessionManager = struct {
         const cwd = std.fs.cwd();
 
         // Read meta
-        var meta = try readMetaFile(meta_path, self.allocator);
+        const meta = try readMetaFile(meta_path, self.allocator);
 
         // Recover from any crash that left the session half-written: truncate
-        // an incomplete trailing JSONL line, remove orphaned .tmp files, and
-        // reconcile meta.message_count against the real line count.
+        // an incomplete trailing JSONL line and remove orphaned .tmp files.
         var sessions = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
             log.err("failed to open sessions dir for recovery: {}", .{e});
             return e;
         };
         defer sessions.close();
 
-        const report = recoverSessionFiles(sessions, id, self.allocator) catch |e| {
+        _ = recoverSessionFiles(sessions, id) catch |e| {
             log.err("session recovery failed: {}", .{e});
             return e;
         };
-
-        if (meta.message_count != report.actual_line_count) {
-            log.warn("session {s}: meta.message_count={d} but JSONL has {d} lines; trusting JSONL", .{
-                id, meta.message_count, report.actual_line_count,
-            });
-            meta.message_count = report.actual_line_count;
-            try writeMetaFile(meta_path, &meta);
-        }
 
         // Open JSONL for appending
         const jsonl_file = cwd.openFile(jsonl_path, .{ .mode = .write_only }) catch |e| {
@@ -1012,11 +1003,9 @@ pub fn loadEntriesAt(allocator: Allocator, project_path: []const u8, id: []const
     return loadEntriesFromPath(allocator, path);
 }
 
-/// Outcome of a session's crash-recovery pass. `actual_line_count` is the
-/// number of complete JSONL lines after truncation, used by `loadSession`
-/// to reconcile against `meta.message_count`.
+/// Outcome of a session's crash-recovery pass: how much of a torn trailing
+/// line was dropped and how many orphan `.tmp` files were removed.
 pub const RecoveryReport = struct {
-    actual_line_count: u32 = 0,
     truncated_bytes: usize = 0,
     orphaned_tmp_cleaned: usize = 0,
 };
@@ -1025,12 +1014,16 @@ pub const RecoveryReport = struct {
 /// last crash left behind:
 ///   1. Truncate an incomplete trailing JSONL line (no final `\n`).
 ///   2. Delete orphan `.tmp` files from a failed atomic meta rename.
-///   3. Report the real line count so the caller can fix `meta.message_count`.
 /// `dir` must be opened with `.iterate = true`.
-pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator) !RecoveryReport {
+///
+/// Step 1 is tail-only on the common path: a file already ending in `\n` is
+/// line-aligned and is left untouched after a single end-byte read. Only a
+/// torn trailing line triggers a bounded backward scan to the last newline,
+/// so an uncrashed open never reads the whole (potentially multi-MiB) file.
+pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8) !RecoveryReport {
     var report: RecoveryReport = .{};
 
-    // Step 1: truncate incomplete final JSONL line, count complete lines.
+    // Step 1: trim an incomplete final JSONL line, if any.
     var jsonl_name_buf: [64]u8 = undefined;
     const jsonl_name = std.fmt.bufPrint(&jsonl_name_buf, "{s}.jsonl", .{id}) catch
         return error.PathTooLong;
@@ -1039,25 +1032,17 @@ pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator
         defer file.close();
         const end_pos = try file.getEndPos();
         if (end_pos > 0) {
-            const content = try allocator.alloc(u8, end_pos);
-            defer allocator.free(content);
-            try file.seekTo(0);
-            const n = try file.readAll(content);
-
-            var last_nl: ?usize = null;
-            for (content[0..n], 0..) |b, i| {
-                if (b == '\n') last_nl = i;
-            }
-            const truncate_to = if (last_nl) |idx| idx + 1 else 0;
-            if (truncate_to < n) {
-                report.truncated_bytes = n - truncate_to;
+            // A trailing newline means the file is line-aligned; nothing to do.
+            try file.seekTo(end_pos - 1);
+            var last_byte: [1]u8 = undefined;
+            const got = try file.readAll(&last_byte);
+            if (got == 1 and last_byte[0] != '\n') {
+                const truncate_to = try lastNewlinePos(file, end_pos);
+                report.truncated_bytes = @intCast(end_pos - truncate_to);
                 try file.setEndPos(truncate_to);
                 log.warn("session {s}: dropped {d} bytes of incomplete trailing JSONL line", .{
                     id, report.truncated_bytes,
                 });
-            }
-            for (content[0..truncate_to]) |b| {
-                if (b == '\n') report.actual_line_count += 1;
             }
         }
     } else |err| switch (err) {
@@ -1080,6 +1065,28 @@ pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator
     }
 
     return report;
+}
+
+/// Byte offset one past the last `\n` in `file`'s `[0, end_pos)` range, or 0
+/// when the range holds no newline. Reads backward in bounded chunks so
+/// trimming a torn trailing line costs a few small reads rather than a scan
+/// of the whole file.
+fn lastNewlinePos(file: std.fs.File, end_pos: u64) !u64 {
+    var buf: [64 * 1024]u8 = undefined;
+    var window_end = end_pos;
+    while (window_end > 0) {
+        const window_start = if (window_end > buf.len) window_end - buf.len else 0;
+        const len: usize = @intCast(window_end - window_start);
+        try file.seekTo(window_start);
+        const n = try file.readAll(buf[0..len]);
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (buf[i] == '\n') return window_start + @as(u64, i) + 1;
+        }
+        window_end = window_start;
+    }
+    return 0;
 }
 
 // -- Internal helpers --------------------------------------------------------
@@ -2564,9 +2571,8 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
     defer iter_dir.close();
 
-    const report = try recoverSessionFiles(iter_dir, "abc", allocator);
+    const report = try recoverSessionFiles(iter_dir, "abc");
 
-    try std.testing.expectEqual(@as(u32, 2), report.actual_line_count);
     try std.testing.expectEqual(@as(usize, "{\"c\":".len), report.truncated_bytes);
 
     const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
@@ -2574,8 +2580,33 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", after);
 }
 
-test "recoverSessionFiles deletes orphan .tmp files for the session" {
+test "recoverSessionFiles trims a torn trailing line longer than the scan window" {
+    // A torn final line bigger than lastNewlinePos's 64 KiB chunk forces the
+    // backward scan to cross window boundaries before finding the last '\n'.
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const head = "{\"a\":1}\n";
+    const torn_len = 70 * 1024;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, head);
+    try body.appendNTimes(allocator, 'x', torn_len);
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = body.items });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc");
+    try std.testing.expectEqual(@as(usize, torn_len), report.truncated_bytes);
+
+    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(head, after);
+}
+
+test "recoverSessionFiles deletes orphan .tmp files for the session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2588,7 +2619,7 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
     defer iter_dir.close();
 
-    const report = try recoverSessionFiles(iter_dir, "abc", allocator);
+    const report = try recoverSessionFiles(iter_dir, "abc");
     try std.testing.expectEqual(@as(usize, 2), report.orphaned_tmp_cleaned);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("abc.meta.json.tmp"));
@@ -2597,7 +2628,7 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     _ = try tmp.dir.statFile("other.meta.json.tmp");
 }
 
-test "recoverSessionFiles reports line count for count reconciliation" {
+test "recoverSessionFiles leaves a clean newline-terminated file untouched" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2608,9 +2639,13 @@ test "recoverSessionFiles reports line count for count reconciliation" {
     var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
     defer iter_dir.close();
 
-    const report = try recoverSessionFiles(iter_dir, "sess", allocator);
-    try std.testing.expectEqual(@as(u32, 4), report.actual_line_count);
+    const report = try recoverSessionFiles(iter_dir, "sess");
     try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
+
+    // The tail-only path must not rewrite a file that already ends in '\n'.
+    const after = try tmp.dir.readFileAlloc(allocator, "sess.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(jsonl_body, after);
 }
 
 test "loader synthesizes ids for pre-migration entries" {
