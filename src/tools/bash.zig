@@ -133,21 +133,24 @@ pub fn execute(
     };
     defer if (sandbox) |sb| freeSandboxArgv(allocator, sb);
 
-    var child = if (sandbox) |sb|
-        std.process.Child.init(sb.argv, allocator)
-    else
-        std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch |err| {
+    const io = process_io.get();
+    // 0.16 moved stdio routing onto the spawn options; `std.process.Child`
+    // no longer has post-init `*_behavior` fields or a `spawn` method.
+    var child = std.process.spawn(io, .{
+        .argv = if (sandbox) |sb| sb.argv else &.{ "/bin/sh", "-c", input.command },
+        .stdin = .inherit,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: failed to spawn shell: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
+    // `child.id` is null only after reap; capture the live pid for the
+    // cancellation SIGKILL below.
+    const child_pid = child.id.?;
 
-    const outcome = collectWithCancel(&child, allocator, cancel) catch |err| {
-        if (child.kill()) |_| {} else |kill_err| log.debug("bash cleanup kill: {s}", .{@errorName(kill_err)});
-        if (child.wait()) |_| {} else |wait_err| log.debug("bash cleanup wait: {s}", .{@errorName(wait_err)});
+    const outcome = collectWithCancel(&child, io, allocator, cancel) catch |err| {
+        child.kill(io);
         const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -156,18 +159,18 @@ pub fn execute(
 
     if (outcome.cancelled) {
         // Escalate straight to SIGKILL: the shell child may have trapped TERM, and cancellation must be unignorable.
-        std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| log.debug("bash cancel kill: {s}", .{@errorName(err)});
-        _ = child.wait() catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
+        std.posix.kill(child_pid, std.posix.SIG.KILL) catch |err| log.debug("bash cancel kill: {s}", .{@errorName(err)});
+        _ = child.wait(io) catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
         return .{ .content = "error: cancelled", .is_error = true, .owned = false };
     }
 
-    const term = child.wait() catch |err| {
+    const term = child.wait(io) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: command wait failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
     const exit_code: u32 = switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 
@@ -202,9 +205,12 @@ const Outcome = struct {
 
 /// Read child stdout/stderr while periodically checking `cancel`.
 ///
-/// Uses `std.Io.poll` with a 50ms timeout so the loop wakes up even if the
-/// child produces no output, giving cancellation a bounded latency.
-/// Returns when both pipes hit EOF (child closed them) or `cancel` fires.
+/// 0.16 removed `std.Io.poll`; the dual-pipe drain runs through an
+/// `Io.File.MultiReader`. `fill(reserve, .{ .duration = 50ms })` blocks one
+/// tick then returns `error.Timeout` so the loop wakes even when the child
+/// produces no output, giving cancellation a bounded latency. The fill stops
+/// on `error.EndOfStream` once both pipes close (child exited) or when
+/// `cancel` fires.
 ///
 /// When either stream's buffered output crosses `max_output_bytes`, the first
 /// `max_output_bytes` are captured into a heap-owned snapshot, the truncated
@@ -212,14 +218,21 @@ const Outcome = struct {
 /// keeps draining without blocking on a full pipe.
 fn collectWithCancel(
     child: *std.process.Child,
+    io: std.Io,
     allocator: Allocator,
     cancel: ?*std.atomic.Value(bool),
 ) !Outcome {
-    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
+    var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    const tick: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromNanoseconds(@intCast(poll_interval_ns)),
+        .clock = .awake,
+    } };
 
     // Snapshots of the first `max_output_bytes` for each stream, taken at the
     // moment the cap is first crossed. Null until that happens.
@@ -229,21 +242,23 @@ fn collectWithCancel(
     errdefer if (stderr_snapshot) |s| allocator.free(s);
 
     var cancelled = false;
-    while (true) {
+    drain: while (true) {
         if (cancel) |flag| {
             if (flag.load(.acquire)) {
                 cancelled = true;
-                break;
+                break :drain;
             }
         }
-        const more = try poller.pollTimeout(poll_interval_ns);
-        if (!more) break;
-        // pollTimeout returns true both when data arrived and when it simply
-        // timed out, so re-check cancel on the next iteration rather than
-        // doing bounds work here.
-        try captureAndDrainOverflow(poller.reader(.stdout), allocator, &stdout_snapshot);
-        try captureAndDrainOverflow(poller.reader(.stderr), allocator, &stderr_snapshot);
+        multi_reader.fill(64, tick) catch |err| switch (err) {
+            error.Timeout => continue :drain,
+            error.EndOfStream => break :drain,
+            else => return err,
+        };
+        try captureAndDrainOverflow(stdout_reader, allocator, &stdout_snapshot);
+        try captureAndDrainOverflow(stderr_reader, allocator, &stderr_snapshot);
     }
+
+    if (!cancelled) try multi_reader.checkAnyError();
 
     const stdout_truncated = stdout_snapshot != null;
     const stderr_truncated = stderr_snapshot != null;
@@ -251,12 +266,12 @@ fn collectWithCancel(
     const stdout = if (stdout_snapshot) |s| blk: {
         stdout_snapshot = null;
         break :blk s;
-    } else try poller.toOwnedSlice(.stdout);
+    } else try multi_reader.toOwnedSlice(0);
     errdefer allocator.free(stdout);
     const stderr = if (stderr_snapshot) |s| blk: {
         stderr_snapshot = null;
         break :blk s;
-    } else try poller.toOwnedSlice(.stderr);
+    } else try multi_reader.toOwnedSlice(1);
 
     return .{
         .stdout = stdout,

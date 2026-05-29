@@ -25,6 +25,7 @@
 const std = @import("std");
 const clock = @import("../../clock.zig");
 const builtin = @import("builtin");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -155,7 +156,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
         return;
     };
 
-    var client = std.http.Client{ .allocator = alloc };
+    var client = std.http.Client{ .allocator = alloc, .io = process_io.get() };
     defer client.deinit();
 
     // Aborter: `abort_ctx` lives on this stack frame. We null the

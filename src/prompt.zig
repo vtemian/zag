@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const llm = @import("llm.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
@@ -237,7 +238,7 @@ pub const EnvSnapshot = struct {
     /// mirrors `cwd`; `is_git_repo` is false; `date_iso` uses the UTC
     /// `std.time.timestamp` result.
     pub fn capture(alloc: Allocator) !EnvSnapshot {
-        const cwd = std.process.getCwdAlloc(alloc) catch |err| blk: {
+        const cwd: []u8 = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch |err| blk: {
             log.warn("env snapshot: getcwd failed: {}", .{err});
             break :blk try alloc.dupe(u8, "");
         };

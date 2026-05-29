@@ -77,17 +77,24 @@ fn appendStatusLineFmt(
     try appendStatusLine(view, text);
 }
 
-/// Set a file descriptor to non-blocking mode.
-fn setNonBlocking(fd: posix.fd_t) !void {
-    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    const nonblock_bit: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock_bit);
+/// Set a file descriptor to non-blocking mode. 0.16 removed
+/// `std.posix.fcntl`; the status-flag read/modify/write goes straight to
+/// libc `fcntl`, mirroring `wake_pipe.setFlag`.
+fn setNonBlocking(fd: posix.fd_t) error{Unexpected}!void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(usize, 0));
+    if (flags < 0) return error.Unexpected;
+    const nonblock_bit: usize = @bitCast(std.c.O{ .NONBLOCK = true });
+    const new_flags: usize = @as(usize, @intCast(flags)) | nonblock_bit;
+    if (std.c.fcntl(fd, std.c.F.SETFL, new_flags) < 0) return error.Unexpected;
 }
 
 /// Post the welcome banner or a resume notice to the root buffer.
 fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
+    const cwd: []const u8 = if (std.Io.Dir.cwd().realPath(process_io.get(), &cwd_buf)) |n|
+        cwd_buf[0..n]
+    else |_|
+        "?";
 
     if (resume_id == null) {
         try appendStatusLineFmt(view, "Welcome to zag",

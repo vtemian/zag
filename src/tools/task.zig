@@ -290,7 +290,7 @@ fn runChild(
             }
             const r = child_runner.drainEvents();
             if (r.finished) break;
-            if (!r.any_drained) std.Thread.sleep(5 * std.time.ns_per_ms);
+            if (!r.any_drained) clock.sleep(5 * std.time.ns_per_ms);
         }
     }
 
