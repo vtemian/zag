@@ -22,6 +22,8 @@
 const std = @import("std");
 const clock = @import("clock.zig");
 const posix = std.posix;
+const wake_pipe = @import("wake_pipe.zig");
+const process_io = @import("process_io.zig");
 const prompt = @import("prompt.zig");
 const types = @import("types.zig");
 const Reminder = @import("Reminder.zig");
@@ -341,12 +343,12 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var root_runner = AgentRunner.init(gpa, root_buffer_sink.sink(), &root_buffer);
     defer root_runner.deinit();
 
-    const wake_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const wake_fds = try wake_pipe.open();
     const wake_read = wake_fds[0];
     const wake_write = wake_fds[1];
     defer {
-        posix.close(wake_read);
-        posix.close(wake_write);
+        wake_pipe.close(wake_read);
+        wake_pipe.close(wake_write);
     }
     root_runner.wake_fd = wake_write;
 
@@ -379,16 +381,17 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var provider = llm.createProviderFromLuaConfig(registry_ptr, default_model, auth_path, gpa) catch |err| {
         // Headless can't run the interactive wizard, so a missing default
         // or credential just exits with a hint pointing at config.lua / auth.
+        const io = process_io.get();
         const stderr_file = std.Io.File.stderr();
         switch (err) {
             error.NoDefaultModel => {
                 const msg = "zag: no default model configured. Set one in ~/.config/zag/config.lua via `zag.set_default_model(\"provider/model\")`.\n";
-                _ = stderr_file.write(msg) catch {};
+                stderr_file.writeStreamingAll(io, msg) catch {};
             },
             error.MissingCredential => {
                 var scratch: [512]u8 = undefined;
                 const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
-                _ = stderr_file.write(message) catch {};
+                stderr_file.writeStreamingAll(io, message) catch {};
             },
             else => {},
         }

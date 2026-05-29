@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const env_mod = @import("env.zig");
+const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const frontmatter = @import("frontmatter.zig");
@@ -128,7 +129,7 @@ pub const SkillRegistry = struct {
         const config_home = std.fmt.allocPrint(alloc, "{s}/.config/zag", .{home}) catch return .{};
         defer alloc.free(config_home);
 
-        const project_root = std.fs.cwd().realpathAlloc(alloc, ".") catch null;
+        const project_root = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch null;
         defer if (project_root) |p| alloc.free(p);
 
         return discover(alloc, config_home, project_root) catch |err| blk: {
@@ -168,7 +169,8 @@ fn walkRoot(
     const root_abs = try std.fs.path.join(alloc, &.{ root, subpath });
     defer alloc.free(root_abs);
 
-    var dir = std.fs.openDirAbsolute(root_abs, .{ .iterate = true }) catch |err| switch (err) {
+    const io = process_io.get();
+    var dir = std.Io.Dir.openDirAbsolute(io, root_abs, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return,
         error.AccessDenied => {
             log.warn("permission denied walking skills root: {s}", .{root_abs});
@@ -179,10 +181,10 @@ fn walkRoot(
             return;
         },
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next() catch |err| {
+    while (iter.next(io) catch |err| {
         log.warn("iterating {s} failed: {}", .{ root_abs, err });
         return;
     }) |entry| {
@@ -190,7 +192,7 @@ fn walkRoot(
 
         const md_relative = try std.fs.path.join(alloc, &.{ entry.name, "SKILL.md" });
         defer alloc.free(md_relative);
-        dir.access(md_relative, .{}) catch continue;
+        dir.access(io, md_relative, .{}) catch continue;
 
         const md_path = try std.fs.path.join(alloc, &.{ root_abs, entry.name, "SKILL.md" });
         // Ownership transfers into the Skill on successful append; free
@@ -215,7 +217,7 @@ fn loadSkill(
     registry: *SkillRegistry,
     md_path: []const u8,
 ) LoadError!void {
-    const src = std.fs.cwd().readFileAlloc(alloc, md_path, 1 * 1024 * 1024) catch |err| {
+    const src = std.Io.Dir.cwd().readFileAlloc(process_io.get(), md_path, alloc, .limited(1 * 1024 * 1024)) catch |err| {
         log.warn("reading {s} failed: {}", .{ md_path, err });
         return error.Skipped;
     };

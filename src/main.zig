@@ -8,6 +8,7 @@
 const std = @import("std");
 const sync = @import("sync.zig");
 const process_io = @import("process_io.zig");
+const wake_pipe = @import("wake_pipe.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const llm = @import("llm.zig");
@@ -270,12 +271,12 @@ pub fn main(start: std.process.Init) !void {
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
     // handler write a byte to wake_write; the orchestrator polls wake_read to
     // break out of its poll() when there is real work to do.
-    const wake_fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const wake_fds = try wake_pipe.open();
     const wake_read = wake_fds[0];
     const wake_write = wake_fds[1];
     defer {
-        std.posix.close(wake_read);
-        std.posix.close(wake_write);
+        wake_pipe.close(wake_read);
+        wake_pipe.close(wake_write);
     }
     root_runner.wake_fd = wake_write;
     Terminal.setWakeFd(wake_write);
@@ -319,7 +320,7 @@ pub fn main(start: std.process.Init) !void {
                 const stderr_file = std.Io.File.stderr();
                 var scratch: [512]u8 = undefined;
                 const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
-                _ = stderr_file.write(message) catch {};
+                stderr_file.writeStreamingAll(io, message) catch {};
             }
             return err;
         };
