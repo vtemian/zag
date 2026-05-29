@@ -1142,17 +1142,20 @@ pub fn runLoginFlowWithCodes(
 }
 
 fn launchBrowser(alloc: Allocator, url: []const u8) !void {
+    _ = alloc;
     const argv: []const []const u8 = switch (builtin.os.tag) {
         .macos => &.{ "open", url },
         .linux => &.{ "xdg-open", url },
         else => return error.UnsupportedPlatform,
     };
-    var child = std.process.Child.init(argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = child.wait() catch {};
+    const io = process_io.get();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    _ = child.wait(io) catch {};
 }
 
 /// Look up `key` in a form-encoded query string. Returns a freshly allocated

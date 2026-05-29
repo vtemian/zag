@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const clock = @import("../clock.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 const Endpoint = @import("../llm.zig").Endpoint;
 const anthropic_provider = @import("../providers/anthropic.zig");
@@ -263,7 +264,7 @@ pub fn httpPostJsonRaw(
     allocator: Allocator,
     timeouts: ?registry.Endpoint.TimeoutConfig,
 ) !RawResponse {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = process_io.get() };
     defer client.deinit();
 
     const uri = std.Uri.parse(url) catch return error.InvalidUri;
@@ -321,7 +322,7 @@ pub fn httpPostJsonRaw(
     if (timeouts) |to| {
         if (req.connection) |conn| {
             socket_timeouts.applySocketTimeouts(
-                conn.stream_reader.getStream().handle,
+                conn.stream_reader.stream.socket.handle,
                 to.read_ms,
                 to.write_ms,
             );

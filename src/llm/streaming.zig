@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const clock = @import("../clock.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 const error_detail = @import("error_detail.zig");
 const error_class = @import("error_class.zig");
@@ -136,7 +137,7 @@ pub const StreamingResponse = struct {
         errdefer allocator.destroy(self);
 
         self.* = .{
-            .client = .{ .allocator = allocator },
+            .client = .{ .allocator = allocator, .io = process_io.get() },
             .req = undefined,
             .body_reader = undefined,
             .transfer_buf = undefined,
@@ -211,7 +212,7 @@ pub const StreamingResponse = struct {
         if (opts.timeouts) |to| {
             if (self.req.connection) |conn| {
                 socket_timeouts.applySocketTimeouts(
-                    conn.stream_reader.getStream().handle,
+                    conn.stream_reader.stream.socket.handle,
                     to.read_ms,
                     to.write_ms,
                 );

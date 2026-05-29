@@ -11,6 +11,7 @@
 //! endpoints (e.g. local Ollama) skip credential capture entirely.
 
 const std = @import("std");
+const process_io = @import("process_io.zig");
 const env_mod = @import("env.zig");
 
 const log = std.log.scoped(.auth_wizard);
@@ -200,26 +201,27 @@ pub fn scaffoldConfigLua(
 ) !void {
     const picked = registry.find(provider_name) orelse return error.UnknownProvider;
 
+    const io = process_io.get();
     const parent = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
-    std.fs.cwd().makePath(parent) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    const file = std.fs.createFileAbsolute(config_path, .{
+    const file = std.Io.Dir.createFileAbsolute(io, config_path, .{
         .exclusive = true,
-        .mode = 0o644,
+        .permissions = .fromMode(0o644),
     }) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
     const body = try renderConfigLua(allocator, picked, chosen_model);
     defer allocator.free(body);
 
     var scratch: [512]u8 = undefined;
-    var w = file.writer(&scratch);
+    var w = file.writer(io, &scratch);
     try w.interface.writeAll(body);
     try w.interface.flush();
 }
@@ -303,7 +305,7 @@ pub fn persistDefaultModel(
         return error.InvalidModelId;
     }
 
-    const existing = std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 20) catch |err| switch (err) {
+    const existing = std.Io.Dir.cwd().readFileAlloc(process_io.get(), config_path, allocator, .limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => &[_]u8{},
         else => return err,
     };
@@ -409,20 +411,25 @@ fn atomicWrite(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     // Ensure parent exists (matches scaffoldConfigLua semantics).
     if (std.fs.path.dirname(path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        cwd.createDirPath(io, parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
 
-    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(body);
-    try file.sync();
+    var file = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+    defer file.close(io);
+    var scratch: [512]u8 = undefined;
+    var w = file.writer(io, &scratch);
+    try w.interface.writeAll(body);
+    try w.interface.flush();
+    try file.sync(io);
 
-    try std.fs.cwd().rename(tmp_path, path);
+    try cwd.rename(tmp_path, cwd, path, io);
 }
 
 /// Cap on how many times `promptChoice` re-asks before giving up. Five is
@@ -1037,7 +1044,7 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
 
     var scaffolded = false;
     if (deps.scaffold_config and deps.forced_provider == null) {
-        const exists = if (std.fs.accessAbsolute(deps.config_path, .{})) |_|
+        const exists = if (std.Io.Dir.accessAbsolute(process_io.get(), deps.config_path, .{})) |_|
             true
         else |err| switch (err) {
             error.FileNotFound => false,
@@ -1144,7 +1151,7 @@ fn exitNoCredentialsForProvider(stderr: std.Io.File, provider_name: []const u8) 
         "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
         .{ provider_name, provider_name },
     ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
-    _ = stderr.write(msg) catch {};
+    stderr.writeStreamingAll(process_io.get(), msg) catch {};
     std.process.exit(1);
 }
 
@@ -1162,15 +1169,16 @@ pub fn runFirstRunWizard(
 ) !llm.ProviderResult {
     const default_model: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
 
+    const io = process_io.get();
     const stderr = std.Io.File.stderr();
-    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+    const is_tty = (std.Io.File{ .handle = std.posix.STDIN_FILENO, .flags = .{ .nonblocking = false } }).isTty(io) catch false;
 
     if (!is_tty) {
         if (default_model) |model_id| {
             const spec = llm.parseModelString(model_id);
             exitNoCredentialsForProvider(stderr, spec.provider_name);
         }
-        _ = stderr.write("zag: no config.lua found and stdin is not a TTY; create ~/.config/zag/config.lua with at least one `require(\"zag.providers.*\")` and a `zag.set_default_model(...)` call.\n") catch {};
+        stderr.writeStreamingAll(io, "zag: no config.lua found and stdin is not a TTY; create ~/.config/zag/config.lua with at least one `require(\"zag.providers.*\")` and a `zag.set_default_model(...)` call.\n") catch {};
         std.process.exit(1);
     }
 
@@ -1183,7 +1191,7 @@ pub fn runFirstRunWizard(
     // Scaffold config.lua only when it's truly absent; a user with a pinned
     // default_model should keep their file untouched.
     const scaffold = blk: {
-        std.fs.accessAbsolute(paths.config_path, .{}) catch |err| switch (err) {
+        std.Io.Dir.accessAbsolute(process_io.get(), paths.config_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk true,
             else => break :blk false,
         };
@@ -1220,7 +1228,7 @@ pub fn runFirstRunWizard(
                 const spec = llm.parseModelString(model_id);
                 exitNoCredentialsForProvider(stderr, spec.provider_name);
             }
-            _ = stderr.write("zag: first-run setup needs an interactive terminal.\n") catch {};
+            stderr.writeStreamingAll(io, "zag: first-run setup needs an interactive terminal.\n") catch {};
             std.process.exit(1);
         }
         return err;
@@ -1247,7 +1255,7 @@ pub fn runFirstRunWizard(
                 // config.lua's default_model points at a different one. After
                 // a successful scaffold, new_default is non-null by construction.
                 const new_model = new_default orelse {
-                    _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
+                    stderr.writeStreamingAll(io, "zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
                     std.process.exit(1);
                 };
                 const new_spec = llm.parseModelString(new_model);
@@ -1257,11 +1265,11 @@ pub fn runFirstRunWizard(
                     "zag: config.lua sets default model to '{s}', but no credential is configured for provider '{s}'. Edit ~/.config/zag/config.lua to use the provider you just added ('{s}').\n",
                     .{ new_model, new_spec.provider_name, result.provider_name },
                 ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
-                _ = stderr.write(msg) catch {};
+                stderr.writeStreamingAll(io, msg) catch {};
                 std.process.exit(1);
             },
             error.NoDefaultModel => {
-                _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
+                stderr.writeStreamingAll(io, "zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
                 std.process.exit(1);
             },
             else => return err,
