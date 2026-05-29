@@ -17,11 +17,20 @@
 //!   write-allowed as literals so normal shell scripts function.
 //! * Lateral movement: ~/.ssh/authorized_keys, ~/.bashrc etc. denied by
 //!   the write scope.
-//! * Network tunneling: outbound network denied except loopback on macOS;
-//!   outbound AF_INET/AF_INET6 socket creation denied entirely on Linux
-//!   via seccomp-bpf. Loopback TCP/UDP is also denied on Linux as a side
-//!   effect of socket-family filtering; AF_UNIX local sockets
-//!   (docker.sock, psql.sock) remain allowed.
+//! * Network tunneling: outbound network is denied, with a deliberate
+//!   per-platform difference in the loopback policy:
+//!     - macOS (seatbelt): outbound AF_INET/AF_INET6 to non-loopback is
+//!       denied; loopback (localhost) outbound is ALLOWED so local-service
+//!       workflows (a dev server, a local DB) keep working. sandbox-exec
+//!       only accepts `*`/`localhost` host literals, so the rule is symbolic.
+//!     - Linux (seccomp-bpf): socket(AF_INET/AF_INET6) is denied entirely,
+//!       which also denies loopback TCP/UDP as a side effect of
+//!       family-level filtering. AF_UNIX local sockets (docker.sock,
+//!       psql.sock) remain allowed. io_uring_setup is denied so a ring
+//!       cannot bypass the family filter via IORING_OP_SOCKET/CONNECT.
+//!   Net: 'strict' means 'no external network'; loopback IP sockets are
+//!   permitted on macOS but not on Linux. Treat this as a known gap, not
+//!   a guarantee of loopback availability under strict mode.
 //!
 //! Platform support (strict mode):
 //! * macOS: sandbox-exec with a generated seatbelt profile (see
@@ -133,6 +142,11 @@ pub fn execute(
         std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    // Run the child as its own process-group leader so cancellation can
+    // SIGKILL the entire group. In strict mode the direct child is the
+    // sandbox wrapper (sandbox-exec on macOS) which fork/execs /bin/sh;
+    // signalling only the wrapper would leave the shell grandchild alive.
+    child.pgid = 0;
 
     child.spawn() catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: failed to spawn shell: {s}", .{@errorName(err)}) catch return types.oomResult();
@@ -140,7 +154,9 @@ pub fn execute(
     };
 
     const outcome = collectWithCancel(&child, allocator, cancel) catch |err| {
-        if (child.kill()) |_| {} else |kill_err| log.debug("bash cleanup kill: {s}", .{@errorName(kill_err)});
+        // Kill the whole group (negative pid) so the sandboxed grandchild
+        // dies too; child.kill() would only signal the wrapper.
+        std.posix.kill(-child.id, std.posix.SIG.KILL) catch |kill_err| log.debug("bash cleanup group kill: {s}", .{@errorName(kill_err)});
         if (child.wait()) |_| {} else |wait_err| log.debug("bash cleanup wait: {s}", .{@errorName(wait_err)});
         const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
@@ -149,8 +165,12 @@ pub fn execute(
     defer allocator.free(outcome.stderr);
 
     if (outcome.cancelled) {
-        // Escalate straight to SIGKILL: the shell child may have trapped TERM, and cancellation must be unignorable.
-        std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| log.debug("bash cancel kill: {s}", .{@errorName(err)});
+        // Escalate straight to SIGKILL on the whole process group (negative
+        // pid): the shell child or the sandbox wrapper's grandchild may have
+        // trapped TERM, and cancellation must be unignorable and reach every
+        // descendant. Without the group target, a sandboxed grandchild would
+        // outlive the cancel.
+        std.posix.kill(-child.id, std.posix.SIG.KILL) catch |err| log.debug("bash cancel group kill: {s}", .{@errorName(err)});
         _ = child.wait() catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
         return .{ .content = "error: cancelled", .is_error = true, .owned = false };
     }
@@ -384,6 +404,21 @@ const SeatbeltInputs = struct {
     home: []const u8,
 };
 
+/// Backslash-escape `"` and `\` so a path can be embedded inside a
+/// double-quoted seatbelt s-expression literal. macOS allows both
+/// characters in path components; without escaping a single one makes
+/// sandbox-exec reject the whole profile and every strict-mode command
+/// dies exit 65 (fail-closed, not a bypass).
+fn escapeSeatbeltLiteral(allocator: Allocator, path: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (path) |c| {
+        if (c == '"' or c == '\\') try out.append(allocator, '\\');
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Generate a seatbelt profile (macOS sandbox-exec DSL) for one bash
 /// invocation. The profile is a Scheme-like s-expression describing
 /// allow/deny rules for file access, network, and process spawn. Order
@@ -392,6 +427,14 @@ const SeatbeltInputs = struct {
 fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
+
+    // Escape the interpolated paths once so a literal `"` or `\` in HOME or
+    // cwd cannot break out of the s-expression string and corrupt the whole
+    // profile (which sandbox-exec rejects wholesale, exit 65 fail-closed).
+    const home_esc = try escapeSeatbeltLiteral(allocator, inputs.home);
+    defer allocator.free(home_esc);
+    const cwd_esc = try escapeSeatbeltLiteral(allocator, inputs.cwd);
+    defer allocator.free(cwd_esc);
 
     try buf.appendSlice(allocator, "(version 1)\n");
     try buf.appendSlice(allocator, "(deny default)\n");
@@ -410,16 +453,16 @@ fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![
     try buf.appendSlice(allocator, "(allow file-read* (subpath \"/\"))\n");
 
     // Deny secrets (ordered AFTER the broad allow so they override).
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.config\"))\n", .{inputs.home});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{home_esc});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{home_esc});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{home_esc});
+    try buf.writer(allocator).print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{home_esc});
+    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.config\"))\n", .{home_esc});
     try buf.appendSlice(allocator, "(deny file-read* (subpath \"/Library/Keychains\"))\n");
     try buf.appendSlice(allocator, "(deny file-read* (subpath \"/private/etc/master.passwd\"))\n");
 
     // Write: cwd, /tmp, plus the standard /dev sinks as literals.
-    try buf.writer(allocator).print("(allow file-write* (subpath \"{s}\"))\n", .{inputs.cwd});
+    try buf.writer(allocator).print("(allow file-write* (subpath \"{s}\"))\n", .{cwd_esc});
     try buf.appendSlice(allocator, "(allow file-write* (subpath \"/tmp\"))\n");
     try buf.appendSlice(allocator, "(allow file-write* (subpath \"/private/tmp\"))\n");
     try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/null\"))\n");
@@ -511,6 +554,54 @@ test "bash kills child on cancel" {
     try std.testing.expectEqualStrings("error: cancelled", result.?.content);
 }
 
+test "bash group-kills sandboxed grandchild on cancel" {
+    // Strict mode runs the shell under sandbox-exec, so the direct child is
+    // the sandbox wrapper and the real /bin/sh (running `sleep 30`) is a
+    // grandchild. A child-only SIGKILL would not reach the grandchild and
+    // this test would hang past the deadline. The process-group kill is what
+    // makes it return; this is a true regression guard for that path.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var strict: Config = .{ .permissive = false };
+    bindConfig(&strict);
+    defer bindConfig(null);
+
+    var cancel: std.atomic.Value(bool) = .{ .raw = false };
+
+    const Runner = struct {
+        fn run(
+            c: *std.atomic.Value(bool),
+            out: *?types.ToolResult,
+            alloc: Allocator,
+        ) void {
+            out.* = execute("{\"command\":\"sleep 30\"}", alloc, c) catch null;
+        }
+    };
+
+    var result: ?types.ToolResult = null;
+    var thread = try std.Thread.spawn(.{}, Runner.run, .{ &cancel, &result, allocator });
+
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    cancel.store(true, .release);
+
+    var timer = try std.time.Timer.start();
+    thread.join();
+    const elapsed_ns = timer.read();
+
+    defer if (result) |r| {
+        if (r.owned) allocator.free(r.content);
+    };
+
+    // 3s ceiling: the sandbox wrapper adds a little startup latency over the
+    // permissive path, so allow a wider flake margin than the 2s used above.
+    try std.testing.expect(elapsed_ns < 3 * std.time.ns_per_s);
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.?.is_error);
+    try std.testing.expectEqualStrings("error: cancelled", result.?.content);
+}
+
 test "bash truncates stdout instead of erroring on overflow" {
     const allocator = std.testing.allocator;
     // Print ~1.3 MiB of A's via /dev/zero + tr to make it printable.
@@ -578,6 +669,34 @@ test "buildSeatbeltProfile allows /dev for read and standard write sinks" {
     try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-read* (subpath \"/\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-write* (literal \"/dev/null\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, profile, "(allow file-write* (literal \"/dev/stderr\"))") != null);
+}
+
+test "buildSeatbeltProfile escapes quote and backslash in home and cwd" {
+    const allocator = std.testing.allocator;
+    // macOS allows `"` and `\` in path components. A raw interpolation would
+    // close the s-expression string early, making sandbox-exec reject the
+    // whole profile (every strict command dies exit 65).
+    const profile = try buildSeatbeltProfile(allocator, .{
+        .cwd = "/Users/te\"st/wo\\rk",
+        .home = "/Users/te\"st",
+    });
+    defer allocator.free(profile);
+
+    // The escaped bytes must be present: a quote becomes \" and a backslash
+    // becomes \\ inside the emitted literal.
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/Users/te\\\"st/.ssh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "/Users/te\\\"st/wo\\\\rk") != null);
+    // The raw unescaped quote must NOT appear directly before /.ssh; finding
+    // the escaped form above already proves escaping, but pin the absence of
+    // an unescaped path literal to guard a future regression.
+    try std.testing.expect(std.mem.indexOf(u8, profile, "(deny file-read* (subpath \"/Users/te\"st/.ssh\"))") == null);
+}
+
+test "escapeSeatbeltLiteral backslash-escapes quote and backslash only" {
+    const allocator = std.testing.allocator;
+    const escaped = try escapeSeatbeltLiteral(allocator, "a\"b\\c/d");
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("a\\\"b\\\\c/d", escaped);
 }
 
 test "buildSeatbeltProfile denies outbound network except loopback" {
