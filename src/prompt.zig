@@ -387,15 +387,15 @@ fn renderBuiltinSkillsCatalog(ctx: *const LayerContext, alloc: Allocator) anyerr
     const registry = ctx.skills orelse return null;
     if (registry.skills.items.len == 0) return null;
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
 
-    try registry.catalog(buf.writer(alloc));
+    try registry.catalog(&aw.writer);
 
     // `SkillRegistry.catalog` writes a trailing newline after the closing
     // tag; `Registry.render` joins layers with "\n\n", so trim the tail
     // to avoid stacking blank lines in the assembled prompt.
-    const written = buf.items;
+    const written = aw.writer.buffered();
     const trimmed_len = if (written.len > 0 and written[written.len - 1] == '\n') written.len - 1 else written.len;
     return try alloc.dupe(u8, written[0..trimmed_len]);
 }

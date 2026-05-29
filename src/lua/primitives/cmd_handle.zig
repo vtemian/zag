@@ -94,6 +94,10 @@ pub const CmdHandle = struct {
     arena: *std.heap.ArenaAllocator,
     /// Long-lived Child. Owned by the helper thread once spawned.
     child: std.process.Child,
+    /// PID recorded at spawn. 0.16 nulls `child.id` once the process is
+    /// reaped, but `:pid()` is documented to keep returning the recorded
+    /// value after reap, so it reads this stable copy instead.
+    pid: std.process.Child.Id = undefined,
     /// Stable storage for the EnvMap when the caller wires env/env_extra.
     /// Child.env_map holds a pointer into this field (not into the
     /// caller's stack frame), so the address must outlive the child.
@@ -217,6 +221,7 @@ pub const CmdHandle = struct {
             .stdout = if (opts.capture_stdout) .pipe else .ignore,
             .stderr = .ignore,
         }) catch |err| return err;
+        self.pid = self.child.id.?;
         errdefer {
             // Spawn succeeded but we failed below; kill-and-reap so we
             // don't strand a child.

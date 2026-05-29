@@ -299,8 +299,8 @@ pub const SessionManager = struct {
     /// silently write tmpdir paths into the user's real
     /// `~/.config/zag/projects.json`.
     pub fn init(allocator: Allocator) !SessionManager {
-        const cwd = std.fs.cwd();
-        cwd.makePath(sessions_dir) catch |e| {
+        const cwd = std.Io.Dir.cwd();
+        cwd.createDirPath(process_io.get(), sessions_dir) catch |e| {
             log.err("failed to create sessions dir: {}", .{e});
             return e;
         };
@@ -326,8 +326,9 @@ pub const SessionManager = struct {
             return error.PathTooLong;
 
         // Create JSONL file
-        const cwd = std.fs.cwd();
-        const jsonl_file = cwd.createFile(jsonl_path, .{ .truncate = true }) catch |e| {
+        const io = process_io.get();
+        const cwd = std.Io.Dir.cwd();
+        const jsonl_file = cwd.createFile(io, jsonl_path, .{ .truncate = true }) catch |e| {
             log.err("failed to create JSONL file: {}", .{e});
             return e;
         };
@@ -347,7 +348,7 @@ pub const SessionManager = struct {
         // Write initial meta.json
         writeMetaFile(meta_path, &meta) catch |e| {
             log.err("failed to write meta.json: {}", .{e});
-            jsonl_file.close();
+            jsonl_file.close(io);
             return e;
         };
 
@@ -387,7 +388,8 @@ pub const SessionManager = struct {
         const meta_path = std.fmt.bufPrint(&meta_path_buf, sessions_dir ++ "/{s}.meta.json", .{id}) catch
             return error.PathTooLong;
 
-        const cwd = std.fs.cwd();
+        const io = process_io.get();
+        const cwd = std.Io.Dir.cwd();
 
         // Read meta
         var meta = try readMetaFile(meta_path, self.allocator);
@@ -395,11 +397,11 @@ pub const SessionManager = struct {
         // Recover from any crash that left the session half-written: truncate
         // an incomplete trailing JSONL line, remove orphaned .tmp files, and
         // reconcile meta.message_count against the real line count.
-        var sessions = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
+        var sessions = cwd.openDir(io, sessions_dir, .{ .iterate = true }) catch |e| {
             log.err("failed to open sessions dir for recovery: {}", .{e});
             return e;
         };
-        defer sessions.close();
+        defer sessions.close(io);
 
         const report = recoverSessionFiles(sessions, id, self.allocator) catch |e| {
             log.err("session recovery failed: {}", .{e});
@@ -415,14 +417,17 @@ pub const SessionManager = struct {
         }
 
         // Open JSONL for appending
-        const jsonl_file = cwd.openFile(jsonl_path, .{ .mode = .write_only }) catch |e| {
+        const jsonl_file = cwd.openFile(io, jsonl_path, .{ .mode = .write_only }) catch |e| {
             log.err("failed to open JSONL file: {}", .{e});
             return e;
         };
-        // Seek to end for appending
-        jsonl_file.seekFromEnd(0) catch |e| {
+        // Position the OS file cursor at EOF so the streaming appends in
+        // `appendEntryLocked` land at the tail. 0.16 moved seeking off
+        // std.Io.File onto the File.Writer, so seek a throwaway streaming
+        // writer's underlying fd to the file's current size.
+        seekFileToEnd(jsonl_file, io) catch |e| {
             log.err("failed to seek to end: {}", .{e});
-            jsonl_file.close();
+            jsonl_file.close(io);
             return e;
         };
 
@@ -441,18 +446,19 @@ pub const SessionManager = struct {
     /// List all sessions, sorted by updated timestamp descending (most recent first).
     /// Caller must free the returned slice.
     pub fn listSessions(self: *SessionManager) ![]Meta {
-        const cwd = std.fs.cwd();
-        var dir = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
+        const io = process_io.get();
+        const cwd = std.Io.Dir.cwd();
+        var dir = cwd.openDir(io, sessions_dir, .{ .iterate = true }) catch |e| {
             if (e == error.FileNotFound) return &.{};
             return e;
         };
-        defer dir.close();
+        defer dir.close(io);
 
         var metas: std.ArrayList(Meta) = .empty;
         errdefer metas.deinit(self.allocator);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".meta.json")) continue;
 
@@ -500,12 +506,13 @@ pub const SessionManager = struct {
         const meta_path = std.fmt.bufPrint(&meta_path_buf, sessions_dir ++ "/{s}.meta.json", .{id}) catch
             return error.PathTooLong;
 
-        const cwd = std.fs.cwd();
-        cwd.deleteFile(jsonl_path) catch |e| switch (e) {
+        const io = process_io.get();
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteFile(io, jsonl_path) catch |e| switch (e) {
             error.FileNotFound => {},
             else => return e,
         };
-        cwd.deleteFile(meta_path) catch |e| switch (e) {
+        cwd.deleteFile(io, meta_path) catch |e| switch (e) {
             error.FileNotFound => {},
             else => return e,
         };
@@ -749,7 +756,7 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
     const path = std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
         return error.PathTooLong;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |e| {
+    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, allocator, .limited(10 * 1024 * 1024)) catch |e| {
         log.err("failed to read session file: {}", .{e});
         return e;
     };
@@ -844,17 +851,18 @@ pub fn listSessionsAt(allocator: Allocator, project_path: []const u8) ![]Meta {
     const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/{s}", .{ project_path, sessions_dir }) catch
         return error.PathTooLong;
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e| switch (e) {
+    const io = process_io.get();
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return &.{},
         else => return e,
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var metas: std.ArrayList(Meta) = .empty;
     errdefer metas.deinit(allocator);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".meta.json")) continue;
 
@@ -875,7 +883,7 @@ pub fn listSessionsAt(allocator: Allocator, project_path: []const u8) ![]Meta {
 /// Used by `listSessionsAt` so cross-project enumeration does not require
 /// chdir'ing into the project root.
 fn readMetaFromDir(dir: std.Io.Dir, name: []const u8, allocator: Allocator) !Meta {
-    const content = try dir.readFileAlloc(allocator, name, 4096);
+    const content = try dir.readFileAlloc(process_io.get(), name, allocator, .limited(4096));
     defer allocator.free(content);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
@@ -946,11 +954,12 @@ pub fn deleteSessionAt(project_path: []const u8, id: []const u8) !void {
         .{ project_path, sessions_dir, id },
     ) catch return error.PathTooLong;
 
-    std.fs.cwd().deleteFile(jsonl_path) catch |e| switch (e) {
+    const io = process_io.get();
+    std.Io.Dir.cwd().deleteFile(io, jsonl_path) catch |e| switch (e) {
         error.FileNotFound => {},
         else => return e,
     };
-    std.fs.cwd().deleteFile(meta_path) catch |e| switch (e) {
+    std.Io.Dir.cwd().deleteFile(io, meta_path) catch |e| switch (e) {
         error.FileNotFound => {},
         else => return e,
     };
@@ -1001,7 +1010,7 @@ pub fn loadEntriesAt(allocator: Allocator, project_path: []const u8, id: []const
         .{ project_path, sessions_dir, id },
     ) catch return error.PathTooLong;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |e| {
+    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, allocator, .limited(10 * 1024 * 1024)) catch |e| {
         log.err("failed to read session file: {}", .{e});
         return e;
     };
@@ -1054,6 +1063,7 @@ pub const RecoveryReport = struct {
 ///   3. Report the real line count so the caller can fix `meta.message_count`.
 /// `dir` must be opened with `.iterate = true`.
 pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator) !RecoveryReport {
+    const io = process_io.get();
     var report: RecoveryReport = .{};
 
     // Step 1: truncate incomplete final JSONL line, count complete lines.
@@ -1061,23 +1071,24 @@ pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator
     const jsonl_name = std.fmt.bufPrint(&jsonl_name_buf, "{s}.jsonl", .{id}) catch
         return error.PathTooLong;
 
-    if (dir.openFile(jsonl_name, .{ .mode = .read_write })) |file| {
-        defer file.close();
-        const end_pos = try file.getEndPos();
+    if (dir.openFile(io, jsonl_name, .{ .mode = .read_write })) |file| {
+        defer file.close(io);
+        const end_pos = (try file.stat(io)).size;
         if (end_pos > 0) {
-            const content = try allocator.alloc(u8, end_pos);
+            var read_buf: [4096]u8 = undefined;
+            var file_reader = file.reader(io, &read_buf);
+            const content = try file_reader.interface.allocRemaining(allocator, .limited(end_pos));
             defer allocator.free(content);
-            try file.seekTo(0);
-            const n = try file.readAll(content);
+            const n = content.len;
 
             var last_nl: ?usize = null;
-            for (content[0..n], 0..) |b, i| {
+            for (content, 0..) |b, i| {
                 if (b == '\n') last_nl = i;
             }
             const truncate_to = if (last_nl) |idx| idx + 1 else 0;
             if (truncate_to < n) {
                 report.truncated_bytes = n - truncate_to;
-                try file.setEndPos(truncate_to);
+                try file.setLength(io, truncate_to);
                 log.warn("session {s}: dropped {d} bytes of incomplete trailing JSONL line", .{
                     id, report.truncated_bytes,
                 });
@@ -1093,11 +1104,11 @@ pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator
 
     // Step 2: delete orphan `.tmp` files belonging to this session.
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, id)) continue;
         if (!std.mem.endsWith(u8, entry.name, ".tmp")) continue;
-        dir.deleteFile(entry.name) catch |e| {
+        dir.deleteFile(io, entry.name) catch |e| {
             log.warn("session {s}: failed to delete orphan {s}: {}", .{ id, entry.name, e });
             continue;
         };
@@ -1334,11 +1345,23 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
     };
 }
 
+/// Move `file`'s OS cursor to its current end. Replaces the removed
+/// `std.Io.File.seekFromEnd(0)`: 0.16 routes seeks through the File.Writer,
+/// and a streaming writer's `seekToUnbuffered` issues the underlying
+/// `fileSeekTo` against the shared fd, which is what subsequent
+/// `writerStreaming` appends read.
+fn seekFileToEnd(file: std.Io.File, io: std.Io) !void {
+    const end_pos = (try file.stat(io)).size;
+    var seek_buf: [0]u8 = undefined;
+    var w = file.writerStreaming(io, &seek_buf);
+    try w.seekToUnbuffered(end_pos);
+}
+
 /// Write a Meta struct to a .meta.json file.
 fn writeMetaFile(path: []const u8, meta: *const Meta) !void {
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const w = stream.writer();
+    var stream = std.Io.Writer.fixed(&buf);
+    const w = &stream;
 
     try w.writeAll("{\"id\":\"");
     try w.writeAll(meta.id[0..meta.id_len]);
@@ -1360,8 +1383,9 @@ fn writeMetaFile(path: []const u8, meta: *const Meta) !void {
     try w.print(",\"status\":\"{s}\"", .{meta.status.toSlice()});
     try w.writeAll("}");
 
-    const json = stream.getWritten();
-    const cwd = std.fs.cwd();
+    const json = stream.buffered();
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
 
     // Write to <path>.tmp, fsync, then atomic-rename onto <path>. POSIX
     // rename is atomic within a filesystem, so readers see either the
@@ -1371,21 +1395,21 @@ fn writeMetaFile(path: []const u8, meta: *const Meta) !void {
         return error.PathTooLong;
 
     {
-        const tmp_file = try cwd.createFile(tmp_path, .{ .truncate = true });
-        defer tmp_file.close();
+        const tmp_file = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+        defer tmp_file.close(io);
         var write_scratch: [256]u8 = undefined;
-        var file_w = tmp_file.writer(&write_scratch);
+        var file_w = tmp_file.writer(io, &write_scratch);
         try file_w.interface.writeAll(json);
         try file_w.interface.flush();
-        try tmp_file.sync();
+        try tmp_file.sync(io);
     }
 
-    try cwd.rename(tmp_path, path);
+    try cwd.rename(tmp_path, cwd, path, io);
 }
 
 /// Read and parse a .meta.json file into a Meta struct.
 fn readMetaFile(path: []const u8, allocator: Allocator) !Meta {
-    const content = try std.fs.cwd().readFileAlloc(allocator, path, 4096);
+    const content = try std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, allocator, .limited(4096));
     defer allocator.free(content);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});

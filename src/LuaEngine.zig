@@ -2120,7 +2120,7 @@ pub const LuaEngine = struct {
             } else {
                 // No completion available yet. 1ms idle matches fireHook's
                 // drain cadence (src/lua/hook_registry.zig:215).
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
     }

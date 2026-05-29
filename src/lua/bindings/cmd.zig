@@ -636,7 +636,7 @@ fn cmdHandlePid(co: *Lua) i32 {
     const h = ud.ptr orelse {
         co.raiseErrorStr("cmd:pid: invalid handle", .{});
     };
-    co.pushInteger(@intCast(h.child.id));
+    co.pushInteger(@intCast(h.pid));
     return 1;
 }
 

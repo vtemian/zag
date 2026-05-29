@@ -45,10 +45,12 @@ pub const Queue = struct {
         self.tail = (self.tail + 1) % self.ring.len;
         self.len += 1;
         if (self.wake_fd >= 0) {
-            _ = std.posix.write(self.wake_fd, &[_]u8{1}) catch |err| switch (err) {
-                error.WouldBlock, error.BrokenPipe => {},
-                else => {},
-            };
+            // 0.16 removed std.posix.write; the self-pipe wake is a single
+            // byte to a non-blocking fd whose errors (EAGAIN, EPIPE) are all
+            // benign here, so write via the raw libc syscall and ignore the
+            // result, matching the wake write in Terminal.zig.
+            const byte: [1]u8 = .{1};
+            _ = std.c.write(self.wake_fd, &byte, 1);
         }
     }
 

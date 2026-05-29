@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const process_io = @import("process_io.zig");
 const types = @import("types.zig");
 
 const log = std.log.scoped(.project_registry);
@@ -50,7 +51,7 @@ pub fn init(allocator: Allocator, config_dir: []const u8) !ProjectRegistry {
     const dir_owned = try allocator.dupe(u8, config_dir);
     errdefer allocator.free(dir_owned);
 
-    std.fs.cwd().makePath(dir_owned) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDirPath(process_io.get(), dir_owned) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -133,7 +134,7 @@ pub fn listProjects(self: *const ProjectRegistry) ![]Project {
 const max_registry_bytes: usize = 1 * 1024 * 1024;
 
 fn loadFromDisk(self: *ProjectRegistry) !void {
-    const data = std.fs.cwd().readFileAlloc(self.allocator, self.file_path, max_registry_bytes) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(process_io.get(), self.file_path, self.allocator, .limited(max_registry_bytes)) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -185,27 +186,28 @@ fn saveAtomic(self: *ProjectRegistry) !void {
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.{d}.tmp", .{ self.file_path, pid }) catch
         return error.PathTooLong;
 
-    const cwd = std.fs.cwd();
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
 
     // Belt-and-suspenders: a stale per-PID tmp from a prior crash in
     // *this* process would otherwise inherit its old contents on
     // createFile.truncate. Unlink first so each save starts clean.
-    cwd.deleteFile(tmp_path) catch |err| switch (err) {
+    cwd.deleteFile(io, tmp_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
     {
-        const tmp_file = try cwd.createFile(tmp_path, .{ .truncate = true });
-        defer tmp_file.close();
+        const tmp_file = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+        defer tmp_file.close(io);
         var scratch: [256]u8 = undefined;
-        var file_w = tmp_file.writer(&scratch);
+        var file_w = tmp_file.writer(io, &scratch);
         try writeRegistry(&file_w.interface, self.projects.items);
         try file_w.interface.flush();
-        try tmp_file.sync();
+        try tmp_file.sync(io);
     }
 
-    try cwd.rename(tmp_path, self.file_path);
+    try cwd.rename(tmp_path, cwd, self.file_path, io);
 }
 
 fn writeRegistry(w: *std.Io.Writer, items: []const Project) !void {
